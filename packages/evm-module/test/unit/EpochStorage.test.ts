@@ -42,7 +42,7 @@ describe('@unit EpochStorage', () => {
     expect(await EpochStorage.version()).to.equal('10.0.4');
   });
 
-  it('Add knowledge value for single epoch, verify totals (node max no longer maintained on add — OT-RFC-51 nit)', async () => {
+  it('Add knowledge value for single epoch, verify totals and running node max', async () => {
     const epoch = 10;
     await EpochStorage.addEpochPublishingAllocation(123, epoch, 500);
     expect(await EpochStorage.getEpochPublishingAllocation(epoch)).to.equal(
@@ -51,13 +51,12 @@ describe('@unit EpochStorage', () => {
     expect(
       await EpochStorage.getNodeEpochPublishingAllocation(123, epoch),
     ).to.equal(500);
-    // OT-RFC-51 (nit): `addEpochPublishingAllocation` no longer maintains the
-    // per-epoch node max (nothing reads it for scoring; the compare/SSTORE was
-    // wasted gas in the seed loop). The getter is retained for ABI stability
-    // and now reads 0.
+    // `addEpochPublishingAllocation` maintains the per-epoch node max so its
+    // public getters stay consistent (Slither uninitialized-state). A single
+    // node with 500 → the running max is 500.
     expect(
       await EpochStorage.getEpochNodeMaxPublishingAllocation(epoch),
-    ).to.equal(0);
+    ).to.equal(500);
   });
 
   it('Add knowledge values to multiple epochs, check accumulated node stats', async () => {
@@ -141,16 +140,16 @@ describe('@unit EpochStorage', () => {
     expect(await EpochStorage.accumulatedRemainder(5)).to.be.gt(0);
   });
 
-  it('Add big knowledge values for multiple identities in same epoch — node max stays 0 (no longer maintained on add, OT-RFC-51 nit)', async () => {
+  it('Add big knowledge values for multiple identities in same epoch — node max tracks the largest', async () => {
     await EpochStorage.addEpochPublishingAllocation(101, 20, 1500);
     await EpochStorage.addEpochPublishingAllocation(202, 20, 3000);
     await EpochStorage.addEpochPublishingAllocation(303, 20, 2800);
-    // The epoch total is still maintained; only the per-node max write was
-    // dropped (OT-RFC-51 nit), so the max getter reads 0.
+    // The epoch total accumulates all three; the per-epoch node max tracks the
+    // single largest per-node allocation = max(1500, 3000, 2800) = 3000.
     expect(await EpochStorage.getEpochPublishingAllocation(20)).to.equal(7300);
     expect(
       await EpochStorage.getEpochNodeMaxPublishingAllocation(20),
-    ).to.equal(0);
+    ).to.equal(3000);
   });
 
   it('Verify getCurrentEpochPool with no tokens added, expecting zero', async () => {
@@ -370,21 +369,21 @@ describe('@unit EpochStorage', () => {
     ).to.equal(500);
   });
 
-  it('getCurrentEpochNodeMaxPublishingAllocation, getPreviousEpochNodeMaxPublishingAllocation read 0 (max no longer maintained on add — OT-RFC-51 nit)', async () => {
+  it('getCurrentEpochNodeMaxPublishingAllocation, getPreviousEpochNodeMaxPublishingAllocation track the per-epoch max', async () => {
     await EpochStorage.addEpochPublishingAllocation(1, 1, 1000);
     await EpochStorage.addEpochPublishingAllocation(2, 1, 500);
     await time.increase(epochSeconds);
     await EpochStorage.addEpochPublishingAllocation(1, 2, 300);
     await EpochStorage.addEpochPublishingAllocation(2, 2, 800);
-    // OT-RFC-51 (nit): the per-epoch node max write was removed from
-    // `addEpochPublishingAllocation`; these getters are retained for ABI
-    // stability and now read 0.
+    // `addEpochPublishingAllocation` maintains the per-epoch node max. Epoch 1
+    // max = max(1000, 500) = 1000; epoch 2 max = max(300, 800) = 800. After the
+    // time.increase, the current epoch is 2 and the previous is 1.
     expect(
       await EpochStorage.getCurrentEpochNodeMaxPublishingAllocation(),
-    ).to.equal(0);
+    ).to.equal(800);
     expect(
       await EpochStorage.getPreviousEpochNodeMaxPublishingAllocation(),
-    ).to.equal(0);
+    ).to.equal(1000);
   });
 
   it('getNodeCurrentEpochPublishingAllocationPercentage, getNodePreviousEpochPublishingAllocationPercentage', async () => {

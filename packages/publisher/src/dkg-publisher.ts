@@ -7,6 +7,7 @@ import { GraphManager, PrivateContentStore } from '@origintrail-official/dkg-sto
 import { DEFAULT_PUBLISH_EPOCHS, MAX_PUBLISH_EPOCHS, type Publisher, type PublishOptions, type PublishResult, type KAManifestEntry, type PhaseCallback, type V10CoreNodeACK } from './publisher.js';
 import { skolemizeByEntity } from './auto-partition.js';
 import { canonicalPublishPayload } from './canonical-publish-payload.js';
+import { partitionCatalogQuads, contextGraphCatalogUri } from '@origintrail-official/dkg-core';
 import { RESERVED_SUBJECT_PREFIXES, findReservedSubjectPrefix, isReservedSubject } from './reserved-subjects.js';
 import { skolemize } from './skolemize.js';
 import {
@@ -60,6 +61,20 @@ export {
 };
 
 const WORKSPACE_OWNER_PREDICATE = 'http://dkg.io/ontology/workspaceOwner';
+
+async function listGraphFamily(store: TripleStore, rootGraph: string): Promise<string[]> {
+  const graphs = await listGraphsByPrefix(store, `${rootGraph}/`);
+  if (await store.hasGraph(rootGraph)) {
+    graphs.unshift(rootGraph);
+  }
+  return graphs;
+}
+
+async function listGraphsByPrefix(store: TripleStore, prefix: string): Promise<string[]> {
+  return store.listGraphsByPrefix
+    ? store.listGraphsByPrefix(prefix)
+    : (await store.listGraphs()).filter((graph) => graph.startsWith(prefix));
+}
 
 /**
  * Minimal structural view of the OT-RFC-43 Option-1 KA-number allocator the
@@ -1927,6 +1942,53 @@ export class DKGPublisher implements Publisher {
       )
       .join('\n');
     const publicByteSize = BigInt(new TextEncoder().encode(nquadsStr).length);
+
+    // the public DCAT catalog entry rides in the merkle root
+    // (kcMerkleRoot, above, covers it) but MUST NOT be encrypted: feed only the
+    // non-catalog (private data) quads to the curated encryptor, so
+    // ciphertextChunksRoot commits the private payload only. No-op for public
+    // CGs and any private CG without a catalog entry (catalogQuads empty ⇒
+    // encryptableNquadsStr === nquadsStr).
+    // Identity-based partition: the ONLY catalog subject is this CG's canonical
+    // DID (round-3 SECURITY). A forged `rdf:type dkg:PrivateContextGraph` on a
+    // user entity no longer routes that entity into the plaintext `_catalog`.
+    const { catalogQuads, otherQuads } = partitionCatalogQuads(allSkolemizedQuads, contextGraphDataUri(contextGraphId));
+    const encryptableNquadsStr = catalogQuads.length === 0
+      ? nquadsStr
+      : otherQuads
+          .map(
+            (q) =>
+              `<${q.subject}> <${q.predicate}> ${q.object.startsWith('"') ? q.object : `<${q.object}>`} <${q.graph}> .`,
+          )
+          .join('\n');
+    // Persist the catalog entry plaintext into the public `_catalog` graph so it
+    // survives the post-publish SWM clear and is queryable/servable (the data
+    // stays encrypted-only). Bounded named graph ⇒ the §7 facet open-serve can
+    // release exactly this and nothing gated.
+    //
+    // B3: this write MUST NOT happen until the publish actually persists. If we
+    // wrote it here (pre-ACK, pre-chain) a failed ACK collection or a reverted
+    // on-chain tx would still leave a public catalog entry exposing a CG whose
+    // verifiable memory never landed. So we only PREPARE the deferred writer
+    // here and invoke it from the exact branches that persist the main publish
+    // result: each intentional-local branch (via `finalizeIntentionalLocalPublish`)
+    // and the confirmed chain-success branch. The chain-failure catch path never
+    // calls it, so a failed publish leaves the `_catalog` graph untouched.
+    const persistCatalogEntry = async (): Promise<void> => {
+      if (catalogQuads.length === 0) return;
+      // Canonical location (shared with projection + open-serve): graph =
+      // contextGraphCatalogUri(contextGraphId) (`<source-cg>/_catalog`), subject =
+      // the context-graph DID. B4: CLEAR/REPLACE — purge any prior catalog
+      // entry for these subjects in this graph before inserting the refreshed
+      // one, so repeated publishes don't accumulate stale catalog triples.
+      const catalogGraph = contextGraphCatalogUri(contextGraphId);
+      const catalogSubjects = new Set(catalogQuads.map((q) => q.subject));
+      for (const subject of catalogSubjects) {
+        await this.store.deleteByPattern({ graph: catalogGraph, subject });
+      }
+      await this.store.insert(catalogQuads.map((q) => ({ ...q, graph: catalogGraph })));
+    };
+
     const merkleRootHex = ethers.hexlify(kcMerkleRoot);
     let publishOperationId = '';
     let ual = '';
@@ -1973,7 +2035,7 @@ export class DKGPublisher implements Publisher {
       ciphertextChunkCount: number;
     } | undefined;
     if (useChunkedInline) {
-      const plaintextBytes = new TextEncoder().encode(nquadsStr);
+      const plaintextBytes = new TextEncoder().encode(encryptableNquadsStr);
       ensurePublishOperationIdentity();
       // batchId = V10 KC merkleRoot. It remains the core-side
       // persistence/sampling key, while publishOperationId is the
@@ -1993,7 +2055,7 @@ export class DKGPublisher implements Publisher {
         ciphertextChunkCount: chunked.ciphertextChunkCount,
       };
     } else if (useEncryptedInline) {
-      const plaintextBytes = new TextEncoder().encode(nquadsStr);
+      const plaintextBytes = new TextEncoder().encode(encryptableNquadsStr);
       const ciphertext = await options.encryptInlinePayload!(plaintextBytes);
       stagingQuads = ciphertext instanceof Uint8Array ? ciphertext : new Uint8Array(ciphertext);
       // For curated CGs the publisher PAYS for ciphertext bytes (cores
@@ -2392,6 +2454,9 @@ export class DKGPublisher implements Publisher {
       this.log.info(ctx, `Storing ${normalizedQuads.length} triples in local store (${reasonLog})`);
       await this.store.insert(normalizedQuads);
       await this.store.insert(tentativeMeta);
+      // B3: only now that the local publish has persisted do we refresh the
+      // public catalog entry (CLEAR/REPLACE — see persistCatalogEntry).
+      await persistCatalogEntry();
     };
 
     // RC11 / PR3: extra intentional-local-only branch for publishes
@@ -2819,6 +2884,12 @@ export class DKGPublisher implements Publisher {
         // (`dkg:authoredBy` bnode + signature quads, spec §9.0.6) is no
         // longer written — zero code readers; the on-chain
         // `KnowledgeBatch.authorAddress` is canonical.
+
+        // B3: the on-chain publish has now confirmed and the verifiable-memory
+        // quads are committed — refresh the public catalog entry here, inside
+        // the success branch, so a failed ACK/chain publish never exposes one
+        // (CLEAR/REPLACE — see persistCatalogEntry).
+        await persistCatalogEntry();
 
         status = 'confirmed';
         onPhase?.('chain:submit', 'end');
@@ -3533,25 +3604,58 @@ export class DKGPublisher implements Publisher {
     const SWM_META_SUFFIX = '/_shared_memory_meta';
     const CG_PREFIX = 'did:dkg:context-graph:';
     try {
-      const contextGraphs = await this.graphManager.listContextGraphs();
+      const allContextGraphs = await listGraphsByPrefix(this.store, CG_PREFIX);
       let total = 0;
 
       // Build list of (ownershipKey, swmMetaGraphUri) pairs: root + sub-graph scoped
       const targets: Array<{ ownershipKey: string; swmMetaGraph: string }> = [];
-      const allGraphs = await this.store.listGraphs();
-      for (const cgId of contextGraphs) {
-        targets.push({ ownershipKey: cgId, swmMetaGraph: this.graphManager.sharedMemoryMetaUri(cgId) });
-
-        // Discover sub-graph SWM meta graphs: did:dkg:context-graph:{cgId}/{sgName}/_shared_memory_meta
-        const sgPrefix = `${CG_PREFIX}${cgId}/`;
-        for (const g of allGraphs) {
-          if (g.startsWith(sgPrefix) && g.endsWith(SWM_META_SUFFIX)) {
-            const middle = g.slice(sgPrefix.length, g.length - SWM_META_SUFFIX.length);
-            if (middle && !middle.includes('/')) {
-              targets.push({ ownershipKey: `${cgId}\0${middle}`, swmMetaGraph: g });
-            }
+      const targetKeys = new Set<string>();
+      const swmMetaGraphs = allContextGraphs
+        .filter((graph) => graph.endsWith(SWM_META_SUFFIX))
+        .map((graph) => ({
+          graph,
+          cgPath: graph.slice(CG_PREFIX.length, graph.length - SWM_META_SUFFIX.length),
+        }))
+        .filter(({ cgPath }) => cgPath.length > 0);
+      for (const { graph, cgPath } of swmMetaGraphs) {
+        // Derive the ownership key from EXPLICIT registration metadata, not a
+        // naive last-slash split. A wallet-scoped root CG id is slash-shaped
+        // (`<addr>/<name>`), so its root-level SWM-meta graph
+        // (`<addr>/<name>/_shared_memory_meta`) is BYTE-IDENTICAL to the
+        // sub-graph SWM-meta graph for root `<addr>`, sub `<name>`
+        // (`<addr>/<name>/_shared_memory_meta`). The last-slash split alone
+        // cannot tell them apart, and the previous code mis-keyed a slash-shaped
+        // root as `<addr>\0<name>` whenever a sub-graph named `<name>` happened
+        // to be registered under `<addr>` — splitting that root's ownership from
+        // the key the write path (`_shareImpl`, plain `contextGraphId`) used.
+        //
+        // Resolution order (must reproduce the write-side `ownershipKey`):
+        //   1. The FULL cgPath is itself a registered root CG → root SWM,
+        //      key = cgPath. Explicit root registration wins the collision; it
+        //      matches the wallet-scoped `<addr>/<name>` convention.
+        //   2. else last-slash split; the trailing segment is registered as a
+        //      sub-graph of the leading part → key = `<root>\0<sub>`.
+        //   3. else → root, key = cgPath.
+        // Identical to the prior behaviour on every non-colliding input
+        // (`42`→root, `42/tasks`→sub, sub-graphs under slash-shaped roots→sub);
+        // only the genuine collision now resolves toward the explicit root.
+        let ownershipKey = cgPath;
+        if (!(await this.isContextGraphRegistered(cgPath))) {
+          const slash = cgPath.lastIndexOf('/');
+          const rootId = slash > 0 ? cgPath.slice(0, slash) : '';
+          const subGraphName = slash > 0 ? cgPath.slice(slash + 1) : '';
+          const isRegisteredSubGraph =
+            rootId.length > 0 &&
+            subGraphName.length > 0 &&
+            !subGraphName.includes('/') &&
+            await this.isSubGraphRegistered(rootId, subGraphName);
+          if (isRegisteredSubGraph) {
+            ownershipKey = `${rootId}\0${subGraphName}`;
           }
         }
+        if (targetKeys.has(ownershipKey)) continue;
+        targetKeys.add(ownershipKey);
+        targets.push({ ownershipKey, swmMetaGraph: graph });
       }
 
       for (const { ownershipKey, swmMetaGraph } of targets) {
@@ -3772,9 +3876,9 @@ export class DKGPublisher implements Publisher {
 
     try {
       const peerToAddress = new Map<string, string | null>();
-      const allGraphs = await this.store.listGraphs();
+      const allGraphs = await listGraphsByPrefix(this.store, CG_PREFIX);
       // GH #748 Codex round 6 (user report): enumerate `_shared_memory_meta`
-      // graphs directly via `store.listGraphs()`. The earlier approach used
+      // graphs directly from the store's context-graph prefix. The earlier approach used
       // `graphManager.listContextGraphs()`, but that helper filters out CG
       // IDs containing a slash (storage/graph-manager.ts:104) to dedupe
       // sub-graph paths — which also excludes legitimate curated CGs of the
@@ -4157,6 +4261,29 @@ export class DKGPublisher implements Publisher {
   }
 
   /**
+   * Is `contextGraphId` declared as a ROOT context graph in local storage?
+   *
+   * Reads the explicit registration triple `<did:dkg:context-graph:<id>> a
+   * dkg:ContextGraph`, which `createContextGraph` writes into the CG's own
+   * `_meta` graph (curated/private CGs) or the ONTOLOGY data graph (public CGs)
+   * — so the ASK is intentionally cross-graph (`GRAPH ?g`) to find it in either
+   * place. The subject-URI shape (`did:dkg:context-graph:<id>`) is identical for
+   * a root and a sub-graph, so the `dkg:ContextGraph` rdf:type is the ONLY thing
+   * that distinguishes a registered root from a registered sub-graph. Used by
+   * `reconstructSharedMemoryOwnership` to disambiguate a slash-shaped root CG id
+   * (`<addr>/<name>`) from a `<root>/<sub-graph>` SWM-meta graph.
+   */
+  private async isContextGraphRegistered(contextGraphId: string): Promise<boolean> {
+    const cgUri = contextGraphDataUri(contextGraphId);
+    const registered = await this.store.query(
+      `ASK { GRAPH ?g {
+        <${assertSafeIri(cgUri)}> a <http://dkg.io/ontology/ContextGraph> .
+      } }`,
+    );
+    return registered.type === 'boolean' && registered.value;
+  }
+
+  /**
    * Throws if `subGraphName` is provided but not registered in the CG's `_meta` graph.
    * Mirrors the registration check in `publish()` for mutation paths that would
    * otherwise create new orphaned sub-graph state.
@@ -4223,8 +4350,7 @@ export class DKGPublisher implements Publisher {
    * graph is intentionally excluded — it is not under the `/` prefix).
    */
   private async swmGraphsUnder(bucketGraph: string): Promise<string[]> {
-    const all = await this.store.listGraphs();
-    return all.filter((g) => g === bucketGraph || g.startsWith(`${bucketGraph}/`));
+    return listGraphFamily(this.store, bucketGraph);
   }
 
   async assertionCreate(

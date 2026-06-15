@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it, expect, afterEach, beforeAll, afterAll, vi } from 'vitest';
+import { describe, it, expect, afterEach, beforeAll, afterAll } from 'vitest';
 import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { DKGAgent, type ContextGraphSub, type ContextGraphSubscriptionStore } from '../src/index.js';
 import { DKGAgentBase } from '../src/dkg-agent-base.js';
@@ -11,6 +11,12 @@ import { type ChainAdapter, type ContextGraphOnChain } from '@origintrail-offici
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 import { ethers } from 'ethers';
+
+function recorder<A extends unknown[], R>(impl: (...args: A) => R) {
+  const calls: A[] = [];
+  const fn = (...args: A): R => { calls.push(args); return impl(...args); };
+  return Object.assign(fn, { calls });
+}
 
 let _fileSnapshot: string;
 beforeAll(async () => {
@@ -204,9 +210,10 @@ describe('ensureContextGraphLocal', () => {
       },
     ]);
 
-    const allowlistSpy = vi
-      .spyOn(agent, 'callerIsAllowlistedAgentParticipant')
-      .mockRejectedValue(new Error('allowlist lookup should be skipped for curator'));
+    const allowlistSpy = recorder(async () => {
+      throw new Error('allowlist lookup should be skipped for curator');
+    });
+    (agent as any).callerIsAllowlistedAgentParticipant = allowlistSpy;
 
     const probe = await agent.probeContextGraphWritePreflight(contextGraphId, {
       callerAgentAddress: caller,
@@ -218,11 +225,11 @@ describe('ensureContextGraphLocal', () => {
       accessPolicy: 'private',
       callerAuthorized: true,
     });
-    expect(allowlistSpy).not.toHaveBeenCalled();
+    expect(allowlistSpy.calls).toEqual([]);
   }, 15000);
 
   it('does not scan loadAll during exact write preflight when indexed subscription load is unavailable', async () => {
-    const loadAll = vi.fn(async () => {
+    const loadAll = recorder(async () => {
       throw new Error('loadAll scan should not run in write preflight');
     });
     const result = await createTestAgent({
@@ -236,7 +243,7 @@ describe('ensureContextGraphLocal', () => {
 
     const probe = await agent.probeContextGraphWritePreflight('loadless-cg');
 
-    expect(loadAll).not.toHaveBeenCalled();
+    expect(loadAll.calls).toEqual([]);
     expect(probe.persistedSubscription).toBeUndefined();
   }, 15000);
 });
@@ -525,7 +532,7 @@ describe('listContextGraphs merge', () => {
       subscribed: true,
       synced: false,
     } satisfies ContextGraphSub, { persist: false });
-    vi.spyOn(agent, 'contextGraphHasLocalContent').mockImplementation(async (contextGraphId) => {
+    (agent as any).contextGraphHasLocalContent = recorder(async (contextGraphId: string) => {
       if (contextGraphId === 'slow-local-content-cg') {
         return new Promise<boolean>(() => {});
       }
@@ -675,7 +682,7 @@ describe('listContextGraphs merge', () => {
       },
     ]);
 
-    vi.spyOn(agent as any, 'getContextGraphOnChainId').mockImplementation(async (id: string) => {
+    (agent as any).getContextGraphOnChainId = recorder(async (id: string) => {
       if (id === 'broken-enrichment-row') return new Promise<undefined>(() => {});
       return undefined;
     });
@@ -722,7 +729,7 @@ describe('listContextGraphs merge', () => {
     } satisfies ContextGraphSub);
 
     const originalQuery = store.query.bind(store);
-    vi.spyOn(store, 'query').mockImplementation(async (query: string) => {
+    (store as any).query = recorder(async (query: string) => {
       if (query.includes(`<${metaGraph}>`) && query.includes('SELECT ?name ?desc ?creator ?created ?curator ?access')) {
         return new Promise<any>(() => {});
       }
@@ -873,10 +880,12 @@ describe('listContextGraphs merge', () => {
       onChainId: '0xabc123',
     } satisfies ContextGraphSub, { persist: false });
 
-    const legacyPrivacy = vi.spyOn(agent, 'isPrivateContextGraph');
+    const origIsPrivate = (agent as any).isPrivateContextGraph.bind(agent);
+    const legacyPrivacy = recorder((...a: unknown[]) => origIsPrivate(...a));
+    (agent as any).isPrivateContextGraph = legacyPrivacy;
     const rows = await agent.listContextGraphs();
     expect(rows.find(p => p.id === id)).toBeDefined();
-    expect(legacyPrivacy.mock.calls.filter(([contextGraphId]) => contextGraphId === id)).toHaveLength(0);
+    expect(legacyPrivacy.calls.filter(([contextGraphId]) => contextGraphId === id)).toHaveLength(0);
   }, 15000);
 
   it('drops storage-only rows from scoped output when policy enrichment times out', async () => {
@@ -895,7 +904,7 @@ describe('listContextGraphs merge', () => {
     ]);
 
     const originalQuery = store.query.bind(store);
-    vi.spyOn(store, 'query').mockImplementation(async (query: string) => {
+    (store as any).query = recorder(async (query: string) => {
       if (query.includes('SELECT ?policy WHERE') && query.includes(DKG_ONTOLOGY.DKG_ACCESS_POLICY)) {
         return new Promise<any>(() => {});
       }
@@ -1012,7 +1021,7 @@ describe('listContextGraphs merge', () => {
     ]);
 
     const originalAllowlist = agent.callerIsAllowlistedAgentParticipant.bind(agent);
-    vi.spyOn(agent, 'callerIsAllowlistedAgentParticipant').mockImplementation(async (contextGraphId, wallet) => {
+    (agent as any).callerIsAllowlistedAgentParticipant = recorder(async (contextGraphId: string, wallet: string) => {
       if (contextGraphId === id && ethers.getAddress(wallet) === ethers.getAddress(caller)) {
         return new Promise<boolean>(() => {});
       }
@@ -1063,7 +1072,7 @@ describe('listContextGraphs merge', () => {
 
       const originalQuery = store.query.bind(store);
       let definitionScans = 0;
-      vi.spyOn(store, 'query').mockImplementation(async (query: string) => {
+      (store as any).query = recorder(async (query: string) => {
         if (query.includes('SELECT ?ctxGraph ?name ?desc ?creator ?created ?curator ?access')) {
           definitionScans += 1;
         }
@@ -1120,7 +1129,7 @@ describe('listContextGraphs merge', () => {
 
     const originalQuery = store.query.bind(store);
     let definitionScans = 0;
-    vi.spyOn(store, 'query').mockImplementation(async (query: string, options?: any) => {
+    (store as any).query = recorder(async (query: string, options?: any) => {
       if (query.includes('SELECT ?ctxGraph ?name ?desc ?creator ?created ?curator ?access')) {
         definitionScans += 1;
       }
@@ -1173,7 +1182,7 @@ describe('listContextGraphs merge', () => {
 
     const originalQuery = agent.store.query.bind(agent.store);
     let definitionScans = 0;
-    vi.spyOn(agent.store, 'query').mockImplementation(async (query: string, options?: any) => {
+    (agent.store as any).query = recorder(async (query: string, options?: any) => {
       if (query.includes('SELECT ?ctxGraph ?name ?desc ?creator ?created ?curator ?access')) {
         definitionScans += 1;
       }
@@ -1221,7 +1230,7 @@ describe('listContextGraphs merge', () => {
 
       const originalQuery = store.query.bind(store);
       let definitionScans = 0;
-      vi.spyOn(store, 'query').mockImplementation(async (query: string, options?: any) => {
+      (store as any).query = recorder(async (query: string, options?: any) => {
         if (query.includes('SELECT ?ctxGraph ?name ?desc ?creator ?created ?curator ?access')) {
           definitionScans += 1;
         }
@@ -1324,7 +1333,9 @@ describe('listContextGraphs merge', () => {
       value: 50,
       configurable: true,
     });
-    const dateNow = vi.spyOn(Date, 'now').mockReturnValue(10_000);
+    const originalDateNow = Date.now;
+    let dateNowValue = 10_000;
+    Date.now = () => dateNowValue;
     try {
       const result = await createTestAgent();
       agent = result.agent;
@@ -1356,10 +1367,10 @@ describe('listContextGraphs merge', () => {
       ]);
 
       let monotonicNow = 1_000;
-      vi.spyOn(agent as any, 'listContextGraphsCacheNow').mockImplementation(() => monotonicNow);
+      (agent as any).listContextGraphsCacheNow = recorder(() => monotonicNow);
       const originalQuery = store.query.bind(store);
       let definitionScans = 0;
-      vi.spyOn(store, 'query').mockImplementation(async (query: string, options?: any) => {
+      (store as any).query = recorder(async (query: string, options?: any) => {
         if (query.includes('SELECT ?ctxGraph ?name ?desc ?creator ?created ?curator ?access')) {
           definitionScans += 1;
         }
@@ -1367,12 +1378,12 @@ describe('listContextGraphs merge', () => {
       });
 
       expect((await agent.listContextGraphs({ callerAgentAddress: null })).find(p => p.id === id)).toBeDefined();
-      dateNow.mockReturnValue(1);
+      dateNowValue = 1;
       monotonicNow += 51;
       expect((await agent.listContextGraphs({ callerAgentAddress: null })).find(p => p.id === id)).toBeDefined();
       expect(definitionScans).toBe(2);
     } finally {
-      dateNow.mockRestore();
+      Date.now = originalDateNow;
       Object.defineProperty(DKGAgentBase, 'LIST_CONTEXT_GRAPHS_CACHE_TTL_MS', {
         value: originalTtl,
         configurable: true,
@@ -1400,7 +1411,7 @@ describe('listContextGraphs merge', () => {
       const id = 'slow-catalog-scan-cg';
       const uri = contextGraphDataGraphUri(id);
       const originalQuery = store.query.bind(store);
-      vi.spyOn(store, 'query').mockImplementation(async (query: string, options?: any) => {
+      (store as any).query = recorder(async (query: string, options?: any) => {
         if (query.includes('SELECT ?ctxGraph ?name ?desc ?creator ?created ?curator ?access ?isSystem')) {
           await new Promise(resolve => setTimeout(resolve, 20));
           return {
@@ -1449,7 +1460,7 @@ describe('listContextGraphs merge', () => {
       const originalQuery = store.query.bind(store);
       let sawAbort = false;
       let scanSettled: Promise<void> | undefined;
-      vi.spyOn(store, 'query').mockImplementation(async (query: string, options?: any) => {
+      (store as any).query = recorder(async (query: string, options?: any) => {
         if (query.includes('SELECT ?ctxGraph ?name ?desc ?creator ?created ?curator ?access ?isSystem')) {
           scanSettled = new Promise(resolve => setTimeout(resolve, 20));
           await scanSettled;
@@ -1494,7 +1505,7 @@ describe('listContextGraphs merge', () => {
 
       let sawAbort = false;
       let scanSettled: Promise<void> | undefined;
-      vi.spyOn(store, 'listGraphs').mockImplementation(async (options?: any) => {
+      (store as any).listGraphs = recorder(async (options?: any) => {
         scanSettled = new Promise(resolve => setTimeout(resolve, 20));
         await scanSettled;
         sawAbort = options?.signal?.aborted === true;
@@ -1537,7 +1548,7 @@ describe('listContextGraphs merge', () => {
       const id = 'pre-dispatch-budget-cg';
       const uri = contextGraphDataGraphUri(id);
       const originalQuery = store.query.bind(store);
-      vi.spyOn(store, 'query').mockImplementation(async (query: string, options?: any) => {
+      (store as any).query = recorder(async (query: string, options?: any) => {
         if (query.includes('SELECT ?ctxGraph ?name ?desc ?creator ?created ?curator ?access ?isSystem')) {
           const startedAt = performance.now();
           while (performance.now() - startedAt < 8) {
@@ -1598,7 +1609,7 @@ describe('listContextGraphs merge', () => {
       const originalAllowlist = agent.callerIsAllowlistedAgentParticipant.bind(agent);
       let targetCalls = 0;
       let signalSeen: AbortSignal | undefined;
-      vi.spyOn(agent, 'callerIsAllowlistedAgentParticipant').mockImplementation(async (contextGraphId, caller, options) => {
+      (agent as any).callerIsAllowlistedAgentParticipant = recorder(async (contextGraphId: string, caller: string, options?: { signal?: AbortSignal }) => {
         if (contextGraphId === id && ethers.getAddress(caller) === ethers.getAddress(member)) {
           targetCalls += 1;
           signalSeen = options?.signal;
@@ -1646,7 +1657,7 @@ describe('listContextGraphs merge', () => {
 
     const originalAllowlist = agent.callerIsAllowlistedAgentParticipant.bind(agent);
     let targetCalls = 0;
-    vi.spyOn(agent, 'callerIsAllowlistedAgentParticipant').mockImplementation(async (contextGraphId, caller) => {
+    (agent as any).callerIsAllowlistedAgentParticipant = recorder(async (contextGraphId: string, caller: string) => {
       if (contextGraphId === id && ethers.getAddress(caller) === ethers.getAddress(member)) {
         targetCalls += 1;
         if (targetCalls === 1) return new Promise<boolean>(() => {});
@@ -1676,7 +1687,7 @@ describe('listContextGraphs merge', () => {
     const identityId = 424242n;
     let registered = true;
     let registrationCalls = 0;
-    vi.spyOn(chainAdapter, 'isOperationalWalletRegistered').mockImplementation(async (actualIdentityId, actualAddress) => {
+    (chainAdapter as any).isOperationalWalletRegistered = recorder(async (actualIdentityId: bigint, actualAddress: string) => {
       registrationCalls += 1;
       expect(actualIdentityId).toBe(identityId);
       expect(ethers.getAddress(actualAddress)).toBe(ethers.getAddress(member));
@@ -1742,7 +1753,7 @@ describe('listContextGraphs merge', () => {
       allowedAgents: [agent.getDefaultAgentAddress()!],
     });
 
-    vi.spyOn(agent, 'callerIsAllowlistedAgentParticipant').mockImplementation(async (contextGraphId, caller) => {
+    (agent as any).callerIsAllowlistedAgentParticipant = recorder(async (contextGraphId: string, caller: string) => {
       if (contextGraphId === id && ethers.getAddress(caller) === ethers.getAddress(stranger)) {
         throw new Error('simulated store failure');
       }
@@ -1809,7 +1820,7 @@ describe('listContextGraphs merge', () => {
       releaseDefinitionScan = resolve;
     });
     let definitionScans = 0;
-    vi.spyOn(result.store, 'query').mockImplementation(async (query: string, options?: any) => {
+    (result.store as any).query = recorder(async (query: string, options?: any) => {
       if (query.includes('SELECT ?ctxGraph ?name ?desc ?creator ?created ?curator ?access ?isSystem')) {
         definitionScans += 1;
         if (definitionScans === 1) {

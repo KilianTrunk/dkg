@@ -16,7 +16,7 @@ function recorder<A extends unknown[], R>(impl: (...args: A) => R) {
  * Same rotating bank used by p2p-resilience.test.ts — these are
  * syntactically valid libp2p peer IDs, so `peerIdFromString` succeeds.
  * No real dial ever lands because every libp2p call we depend on is
- * either recorder-replaced or short-circuited by the test harness.
+ * either spied or short-circuited by the test harness.
  */
 const SYNTHETIC_PEER_IDS = [
   '12D3KooWSmU3owJvB9sFw8uApDgKrv2VBMecsGGvgAc4Gq6hB57M',
@@ -544,12 +544,12 @@ describe('runSyncOnConnect callbacks', () => {
     const remotePeer = freshPeerIdString();
     let contextGraphs = ['cg-a'];
     const secondDurableError = new Error('newly discovered durable sync failed');
-    const syncResults: Array<() => Promise<number>> = [
+    const syncFromPeerResults: Array<() => Promise<number>> = [
       async () => 7,
       async () => { throw secondDurableError; },
     ];
-    const syncFromPeer = recorder((..._args: [string, string[]?]): Promise<number> => {
-      const next = syncResults.shift() ?? (async () => 0);
+    const syncFromPeer = recorder((..._args: unknown[]) => {
+      const next = syncFromPeerResults.shift() ?? (async () => 0);
       return next();
     });
     let caught: unknown;
@@ -828,7 +828,7 @@ describe('DKGAgent sync retry — periodic reconciler', () => {
 
       const remotePeer = freshPeerIdString();
       const origGetPeers = agent.node.libp2p.getPeers.bind(agent.node.libp2p);
-      vi.spyOn(agent.node.libp2p, 'getPeers').mockImplementation(
+      (agent.node.libp2p as any).getPeers = recorder(
         () => [...origGetPeers(), peerIdFromString(remotePeer)],
       );
 
@@ -1001,10 +1001,8 @@ describe('DKGAgent sync retry — periodic reconciler', () => {
       );
       const getPeerProtocols = recorder(async () => ['/ipfs/id/1.0.0']);
       (agent as any).getPeerProtocols = getPeerProtocols;
-      // Pure observe: call through to the real trySyncFromPeer so it runs
-      // its production logic against the controlled getPeerProtocols above.
       const origTrySync = (agent as any).trySyncFromPeer.bind(agent);
-      const trySync = recorder((...args: unknown[]) => origTrySync(...args));
+      const trySync = recorder((...a: unknown[]) => origTrySync(...a));
       (agent as any).trySyncFromPeer = trySync;
 
       const backoffMap = (agent as any).syncReconcilerBackoff as Map<
@@ -1165,7 +1163,7 @@ describe('DKGAgent sync state lifecycle', () => {
       (agent as any).lastSuccessfulSyncAt.set(remotePeer, Date.now());
       (agent as any).syncReconcilerBackoff.set(remotePeer, { failures: 3, nextRetryAt: Date.now() + 100_000 });
 
-      // Replace getPeers so the close handler considers the peer fully gone.
+      // Stub getPeers so the close handler considers the peer fully gone.
       (agent.node.libp2p as any).getPeers = recorder(() => []);
 
       agent.node.libp2p.dispatchEvent(new CustomEvent('connection:close', {
@@ -1274,7 +1272,7 @@ describe('DKGAgent sync state lifecycle', () => {
         nextRetryAt: now - 20 * 60_000,
       });
       (agent as any).lastSyncDisconnectedAt.set(remotePeer, now - 20 * 60_000);
-      vi.spyOn(agent.node.libp2p, 'getPeers').mockReturnValue([]);
+      (agent.node.libp2p as any).getPeers = recorder(() => []);
 
       (agent as any).pruneSyncReconcilerState(now);
 
@@ -1298,15 +1296,15 @@ describe('DKGAgent sync state lifecycle', () => {
       await agent.start();
 
       const remotePeer = freshPeerIdString();
-      vi.spyOn(agent.node.libp2p, 'getPeers').mockReturnValue([peerIdFromString(remotePeer)]);
-      vi.spyOn(agent as any, 'getPeerProtocols').mockResolvedValue([PROTOCOL_SYNC]);
+      (agent.node.libp2p as any).getPeers = recorder(() => [peerIdFromString(remotePeer)]);
+      (agent as any).getPeerProtocols = recorder(async () => [PROTOCOL_SYNC]);
       (agent as any).skippedNoSyncPeers.add(remotePeer);
       (agent as any).syncReconcilerBackoff.set(remotePeer, {
         failures: 2,
         nextRetryAt: Date.now() - 60_000,
       });
 
-      const syncFromPeerDetailed = vi.fn(async () => ({
+      const syncFromPeerDetailed = recorder(async () => ({
         insertedTriples: 0,
         fetchedMetaTriples: 0,
         fetchedDataTriples: 0,
@@ -1350,7 +1348,7 @@ describe('DKGAgent sync state lifecycle', () => {
       await flushMicrotasks();
       await new Promise(r => setTimeout(r, 0));
 
-      expect(syncFromPeerDetailed).toHaveBeenCalledTimes(1);
+      expect(syncFromPeerDetailed.calls).toHaveLength(1);
       expect((agent as any).skippedNoSyncPeers.has(remotePeer)).toBe(false);
       expect((agent as any).syncReconcilerBackoff.has(remotePeer)).toBe(false);
       expect((agent as any).lastSuccessfulSyncAt.has(remotePeer)).toBe(false);
@@ -1360,7 +1358,7 @@ describe('DKGAgent sync state lifecycle', () => {
       await flushMicrotasks();
       await new Promise(r => setTimeout(r, 0));
 
-      expect(syncFromPeerDetailed).toHaveBeenCalledTimes(2);
+      expect(syncFromPeerDetailed.calls).toHaveLength(2);
       expect((agent as any).syncReconcilerBackoff.has(remotePeer)).toBe(false);
       expect((agent as any).lastSuccessfulSyncAt.has(remotePeer)).toBe(false);
       expect((agent as any).lastSyncProgressAt.has(remotePeer)).toBe(false);
@@ -1380,7 +1378,7 @@ describe('DKGAgent sync state lifecycle', () => {
 
       const peerA = freshPeerIdString();
       const origGetPeers = agent.node.libp2p.getPeers.bind(agent.node.libp2p);
-      vi.spyOn(agent.node.libp2p, 'getPeers').mockImplementation(
+      (agent.node.libp2p as any).getPeers = recorder(
         () => [...origGetPeers(), peerIdFromString(peerA)],
       );
 
@@ -1453,7 +1451,7 @@ describe('DKGAgent sync transport — off the messenger substrate (node-ui.db bl
         throw new Error('sync requester must not use sendReliable');
       });
       (agent as any).messenger = { sendToPeer, sendReliable };
-      (agent as any).buildSyncRequest = recorder(async () => new Uint8Array([1, 2, 3]));
+      (agent as any).buildSyncRequest = recorder(async (..._args: unknown[]) => new Uint8Array([1, 2, 3]));
 
       const result = await (agent as any).fetchSyncPages(
         createOperationContext('sync'),

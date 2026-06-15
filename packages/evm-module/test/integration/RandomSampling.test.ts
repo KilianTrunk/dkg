@@ -125,11 +125,11 @@ async function calculateExpectedNodeScore(
   let totalKnowledgeValue = 0n;
   const startEpoch = currentEpoch >= 3n ? currentEpoch - 3n : 0n;
   for (let e = startEpoch; e <= currentEpoch; e++) {
-    nodeKnowledgeValue += await EpochStorage.getNodeEpochProducedKnowledgeValue(
+    nodeKnowledgeValue += await EpochStorage.getNodeEpochPublishingAllocation(
       identityId,
       e,
     );
-    totalKnowledgeValue += await EpochStorage.getEpochProducedKnowledgeValue(e);
+    totalKnowledgeValue += await EpochStorage.getEpochPublishingAllocation(e);
   }
   const publishingFactor =
     totalKnowledgeValue > 0n
@@ -2408,13 +2408,13 @@ describe.skip('@integration RandomSampling (OBSOLETE: V8 stake pipeline)', () =>
 
       // Verify publishing factor
       const publishingFactor =
-        await EpochStorage.getNodeCurrentEpochProducedKnowledgeValue(
+        await EpochStorage.getNodeCurrentEpochPublishingAllocation(
           publishingNodeId,
         );
       expect(publishingFactor > 0n).to.equal(true);
 
       const nonPublishingFactor =
-        await EpochStorage.getNodeCurrentEpochProducedKnowledgeValue(
+        await EpochStorage.getNodeCurrentEpochPublishingAllocation(
           nonPublishingNodeId,
         );
       expect(nonPublishingFactor).to.equal(0n);
@@ -2454,7 +2454,7 @@ describe.skip('@integration RandomSampling (OBSOLETE: V8 stake pipeline)', () =>
 
       // Verify the max publishing value is indeed > 0 in our setup
       const maxNodePub =
-        await EpochStorage.getCurrentEpochNodeMaxProducedKnowledgeValue();
+        await EpochStorage.getCurrentEpochNodeMaxPublishingAllocation();
       expect(maxNodePub).to.be.equal(0n);
 
       const actualNodeScore =

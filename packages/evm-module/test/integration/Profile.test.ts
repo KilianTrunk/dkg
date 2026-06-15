@@ -62,7 +62,7 @@ async function ensureNodeHasChunksThisEpoch(
   chunkSize: number,
 ): Promise<void> {
   const produced =
-    await contracts.epochStorage.getNodeCurrentEpochProducedKnowledgeValue(
+    await contracts.epochStorage.getNodeCurrentEpochPublishingAllocation(
       nodeId,
     );
 

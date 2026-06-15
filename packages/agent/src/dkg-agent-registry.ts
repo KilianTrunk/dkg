@@ -1475,9 +1475,10 @@ export class AgentRegistryMethods extends DKGAgentBase {
 
   async createPublishingConvictionAccount(this: DKGAgent,
     committedTRAC: bigint,
+    primaryNode: bigint = 0n,
   ): Promise<({ accountId: bigint } & TxResult) | null> {
     if (typeof this.chain.createPublishingConvictionAccount !== 'function') return null;
-    return this.chain.createPublishingConvictionAccount(committedTRAC);
+    return this.chain.createPublishingConvictionAccount(committedTRAC, primaryNode);
   }
 
   async topUpPublishingConvictionAccount(this: DKGAgent, accountId: bigint, amount: bigint): Promise<TxResult | null> {

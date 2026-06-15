@@ -875,7 +875,7 @@ export interface ChainAdapter {
   // Wraps `DKGPublishingConvictionNFT`. Optional; owner-gated writes
   // MUST surface the owner revert (→ 403), never swallow it.
 
-  createPublishingConvictionAccount?(committedTRAC: bigint): Promise<{ accountId: bigint } & TxResult>;
+  createPublishingConvictionAccount?(committedTRAC: bigint, primaryNode?: bigint): Promise<{ accountId: bigint } & TxResult>;
   topUpPublishingConvictionAccount?(accountId: bigint, amount: bigint): Promise<TxResult>;
   registerPublishingConvictionAgent?(accountId: bigint, agent: string): Promise<TxResult>;
   deregisterPublishingConvictionAgent?(accountId: bigint, agent: string): Promise<TxResult>;

@@ -26,7 +26,11 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
     string private constant _NAME = "RandomSampling";
-    string private constant _VERSION = "10.0.4";
+    // 10.0.5 — OT-RFC-51 "Publishing Allocation": the publishing factor
+    //          P(t) is fed by committed PCA publishing allocation over a
+    //          single current-epoch window (was a 4-epoch realized-publishing
+    //          sum). Coefficients / S(t) / A(t) unchanged.
+    string private constant _VERSION = "10.0.5";
     uint256 public constant SCALE18 = 1e18;
 
     /// @notice Maximum number of in-CG resamples when the picker hits an
@@ -732,16 +736,18 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
         uint256 stakeRatio18 = (nodeEffectiveStake * SCALE18) / stakeCap;
         uint256 stakeFactor18 = Math.sqrt(stakeRatio18 * SCALE18);
 
-        // 2. Publishing factor P(t) = K_n / K_total over 4 epochs (RFC-26 Section 4.2)
-        // Sum knowledge value over epochs (t-3, t-2, t-1, t)
-        uint256 nodeKnowledgeValue = 0;
-        uint256 totalKnowledgeValue = 0;
-        uint256 startEpoch = currentEpoch >= 3 ? currentEpoch - 3 : 0;
-        for (uint256 e = startEpoch; e <= currentEpoch; e++) {
-            nodeKnowledgeValue += uint256(epochStorage.getNodeEpochProducedKnowledgeValue(identityId, e));
-            totalKnowledgeValue += uint256(epochStorage.getEpochProducedKnowledgeValue(e));
-        }
-        uint256 publishingFactor18 = totalKnowledgeValue > 0 ? (nodeKnowledgeValue * SCALE18) / totalKnowledgeValue : 0;
+        // 2. Publishing factor P(t) = K_n / K_total (RFC-26 Section 4.2,
+        //    re-based by OT-RFC-51 "Publishing Allocation").
+        //
+        //    OT-RFC-51: the publishing factor is now fed by COMMITTED PCA
+        //    "publishing allocation" rather than realized publishing, over a
+        //    single (current-epoch) window instead of the prior 4-epoch sum.
+        //    `K_n` = the current epoch's allocation seeded to this node by
+        //    its designated PCAs; `K_total` = the network-wide current-epoch
+        //    allocation. Coefficients / S(t) / A(t) below are unchanged.
+        uint256 nodeKV = epochStorage.getNodeEpochPublishingAllocation(identityId, currentEpoch);
+        uint256 totalKV = epochStorage.getEpochPublishingAllocation(currentEpoch);
+        uint256 publishingFactor18 = totalKV > 0 ? (nodeKV * SCALE18) / totalKV : 0;
 
         // 3. Ask alignment factor A(t) = 1 - |nodeAsk - networkPrice| / networkPrice (RFC-26 Section 4.3)
         // Rewards nodes whose ask is close to the network reference price:

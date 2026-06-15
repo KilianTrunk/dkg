@@ -17,9 +17,12 @@ describe('context graph subscription diagnostics route', () => {
     dormantIds: ['cg-064', 'cg-065', 'cg-066', 'cg-067', 'cg-068', 'cg-069'],
     completedAt: 1_700_000_000_000,
   };
+  let rehydrationStatus: typeof rehydration | null = null;
+  let subscriptions: Map<string, any>;
 
   beforeEach(async () => {
-    const subscriptions = new Map<string, any>([
+    rehydrationStatus = rehydration;
+    subscriptions = new Map<string, any>([
       ['cg-000', { subscribed: true, synced: true, coreHosted: false }],
       ['cg-hosted', { subscribed: true, synced: false, coreHosted: true }],
       ['cg-discoverable', { subscribed: false, synced: false, coreHosted: false }],
@@ -27,7 +30,12 @@ describe('context graph subscription diagnostics route', () => {
     ]);
     const agent = {
       getSubscribedContextGraphs: () => subscriptions,
-      getContextGraphSubscriptionRehydrationStatus: () => rehydration,
+      getContextGraphSubscriptionRehydrationStatus: () => rehydrationStatus,
+      clearContextGraphSubscriptions: async () => {
+        rehydrationStatus = null;
+        subscriptions.clear();
+        return 6;
+      },
       resolveAgentByToken: (token?: string) => token === 'agent-token'
         ? '0x1111111111111111111111111111111111111111'
         : undefined,
@@ -119,5 +127,24 @@ describe('context graph subscription diagnostics route', () => {
 
     expect(response.status).toBe(403);
     expect(body.error).toContain('node-level admin token');
+  });
+
+  it('returns null rehydration diagnostics after the admin clears the backlog', async () => {
+    const deleteResponse = await fetch(`${baseUrl}/api/context-graph/subscriptions`, {
+      method: 'DELETE',
+      headers: { authorization: 'Bearer admin-token' },
+    });
+    expect(deleteResponse.status).toBe(200);
+    expect(await deleteResponse.json()).toEqual({ cleared: 6 });
+
+    const response = await fetch(`${baseUrl}/api/context-graph/subscriptions`, {
+      headers: { authorization: 'Bearer admin-token' },
+    });
+    const body = await response.json() as any;
+
+    expect(response.status).toBe(200);
+    expect(body.count).toBe(0);
+    expect(body.subscriptions).toEqual([]);
+    expect(body.rehydration).toBeNull();
   });
 });

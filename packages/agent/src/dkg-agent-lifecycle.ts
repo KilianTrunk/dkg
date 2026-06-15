@@ -3572,12 +3572,14 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     next: ContextGraphSub,
     options?: { persist?: boolean },
   ): ContextGraphSub {
+    const existing = this.subscribedContextGraphs.get(contextGraphId);
     this.invalidateListContextGraphsCache();
     this.subscribedContextGraphs.set(contextGraphId, next);
     if (!next.subscribed && !next.coreHosted) {
       this.clearVmReconcileStateForContextGraph(contextGraphId);
     }
     if (options?.persist !== false) {
+      this.clearContextGraphSubscriptionRehydrationStatusIfBacklogChanged(contextGraphId, existing, next);
       this.persistContextGraphSubscription(contextGraphId);
       if (next.subscribed) {
         this.persistLocalNodeMembership(contextGraphId);
@@ -3594,9 +3596,28 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     this.setContextGraphSubscription(contextGraphId, { ...existing, ...patch });
   }
 
+  clearContextGraphSubscriptionRehydrationStatusIfBacklogChanged(this: DKGAgent,
+    contextGraphId: string,
+    existing?: ContextGraphSub,
+    next?: ContextGraphSub,
+  ): void {
+    const status = this.contextGraphSubscriptionRehydrationStatus;
+    if (!status) return;
+    if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) return;
+    const wasDormant = status.dormantIds.includes(contextGraphId);
+    const subscriptionShapeChanged = !existing || !next ||
+      existing.subscribed !== next.subscribed ||
+      existing.coreHosted !== next.coreHosted;
+    if (wasDormant || subscriptionShapeChanged) {
+      this.contextGraphSubscriptionRehydrationStatus = null;
+    }
+  }
+
   deleteContextGraphSubscription(this: DKGAgent, contextGraphId: string): boolean {
+    const existing = this.subscribedContextGraphs.get(contextGraphId);
     this.invalidateListContextGraphsCache();
     this.forceClearVmReconcileStateForContextGraph(contextGraphId);
+    this.clearContextGraphSubscriptionRehydrationStatusIfBacklogChanged(contextGraphId, existing);
     return this.subscribedContextGraphs.delete(contextGraphId);
   }
 
@@ -3935,6 +3956,9 @@ export class LifecycleSyncMethods extends DKGAgentBase {
           );
         }
       }
+    }
+    if (cleared > 0) {
+      this.contextGraphSubscriptionRehydrationStatus = null;
     }
 
     this.log.info(

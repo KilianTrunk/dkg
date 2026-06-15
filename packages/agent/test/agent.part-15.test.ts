@@ -247,6 +247,8 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
           capDisabled: false,
           dormantIds: rows.slice(64).map((r) => r.id),
         });
+        expect(await agent.clearContextGraphSubscriptions()).toBe(173);
+        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toBeNull();
       } finally {
         await agent.stop().catch(() => {});
       }

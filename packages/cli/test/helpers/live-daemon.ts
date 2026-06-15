@@ -177,3 +177,54 @@ export async function postJson(
     return { status: res.status, body: text };
   }
 }
+
+/** GET a daemon route with auth, returning {status, body} (body parsed if JSON). */
+export async function getJson(
+  daemon: LiveDaemon,
+  path: string,
+): Promise<{ status: number; body: any }> {
+  const res = await fetch(`${daemon.base}${path}`, { headers: authHeaders(daemon) });
+  const text = await res.text();
+  try {
+    return { status: res.status, body: JSON.parse(text) };
+  } catch {
+    return { status: res.status, body: text };
+  }
+}
+
+/**
+ * POST a real multipart/form-data body to a daemon route (postJson can't —
+ * import-file routes parse multipart, not JSON). Builds a real boundary-encoded
+ * body so the daemon runs its real parseMultipart, not a fake.
+ */
+export async function postMultipart(
+  daemon: LiveDaemon,
+  path: string,
+  parts: Array<{ name: string; filename?: string; contentType?: string; value: string }>,
+): Promise<{ status: number; body: any }> {
+  const boundary = `dkgLiveDaemon${Date.now().toString(36)}`;
+  const chunks: Buffer[] = [];
+  for (const p of parts) {
+    let header = `--${boundary}\r\nContent-Disposition: form-data; name="${p.name}"`;
+    if (p.filename !== undefined) header += `; filename="${p.filename}"`;
+    header += '\r\n';
+    if (p.contentType) header += `Content-Type: ${p.contentType}\r\n`;
+    header += '\r\n';
+    chunks.push(Buffer.from(header, 'utf-8'), Buffer.from(p.value, 'utf-8'), Buffer.from('\r\n', 'utf-8'));
+  }
+  chunks.push(Buffer.from(`--${boundary}--\r\n`, 'utf-8'));
+  const res = await fetch(`${daemon.base}${path}`, {
+    method: 'POST',
+    headers: {
+      ...(daemon.token ? { Authorization: `Bearer ${daemon.token}` } : {}),
+      'Content-Type': `multipart/form-data; boundary=${boundary}`,
+    },
+    body: Buffer.concat(chunks),
+  });
+  const text = await res.text();
+  try {
+    return { status: res.status, body: JSON.parse(text) };
+  } catch {
+    return { status: res.status, body: text };
+  }
+}

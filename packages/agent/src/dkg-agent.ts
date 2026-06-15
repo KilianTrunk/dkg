@@ -572,9 +572,17 @@ export class DKGAgent extends DKGAgentBase {
       (!configuredPublisherAddress || publisherAddressMatchesLegacyKey),
     );
     let agentRef: DKGAgent | undefined;
-    const agentStore = createListContextGraphsCacheInvalidatingStore(store, () => {
-      agentRef?.invalidateListContextGraphsCache();
-    });
+    const agentStore = createListContextGraphsCacheInvalidatingStore(
+      store,
+      () => {
+        agentRef?.invalidateListContextGraphsCache();
+      },
+      (quads) => {
+        if (!agentRef) return;
+        if (quads) agentRef.contextGraphMetaProjection.markDirtyFromQuads(quads);
+        else agentRef.contextGraphMetaProjection.markAllDirty();
+      },
+    );
 
     const publisher = new DKGPublisher({
       store: agentStore,
@@ -1144,6 +1152,7 @@ export class DKGAgent extends DKGAgentBase {
         graph: ontoGraph,
       }]);
 
+      this.contextGraphMetaProjection.markDirty(p.name);
       this.log.info(ctx, `Discovered on-chain context graph "${p.name}" (${p.contextGraphId.slice(0, 16)}…) — auto-subscribed (synced=false)`);
       discovered++;
     }

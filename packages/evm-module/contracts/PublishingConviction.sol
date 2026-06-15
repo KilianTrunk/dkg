@@ -459,6 +459,14 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
         PublishingMathLib.ActiveSinkRange[3] memory ranges = _scheduleFor(acct);
         uint256 lockEpochs = uint256(acct.lockDurationEpochs);
         uint256 lastEpoch = uint256(acct.createdAtEpoch) + lockEpochs;
+        // Effects before interactions (checks-effects-interactions): persist the
+        // new designation BEFORE the external EpochStorage moves below. The move
+        // loop uses only the locals captured above (oldNode/newNode/ranges/acct),
+        // so this reordering is behaviour-preserving; it also clears Slither's
+        // reentrancy finding (the EpochStorage callees are Hub-registered
+        // onlyContracts storage, but CEI ordering is the right discipline).
+        publishingConvictionStorage.setPrimaryNodeData(accountId, newNode, currentEpoch);
+
         for (uint256 e = uint256(currentEpoch) + 1; e <= lastEpoch; e++) {
             uint96 amount = _amountForEpoch(ranges, acct.committedTRAC, lockEpochs, e);
             if (amount == 0) continue;
@@ -471,8 +479,6 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
                 epochStorage.addEpochPublishingAllocation(newNode, e, amount);
             }
         }
-
-        publishingConvictionStorage.setPrimaryNodeData(accountId, newNode, currentEpoch);
 
         emit PrimaryNodeChanged(accountId, oldNode, newNode, currentEpoch);
     }

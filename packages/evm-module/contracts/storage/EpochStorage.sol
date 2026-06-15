@@ -67,14 +67,17 @@ contract EpochStorage is INamed, IVersioned, HubDependent {
         nodesEpochPublishingAllocation[identityId][epoch] += amount;
         epochPublishingAllocation[epoch] += amount;
 
-        // OT-RFC-51 (nit): the per-epoch node max is no longer maintained on
-        // the add path. Nothing reads it for scoring — RandomSampling reads
-        // only `getNodeEpochPublishingAllocation` / `getEpochPublishingAllocation`
-        // — and `createAccount` seeds via this mutator up to `lockDurationEpochs`
-        // (<=60) times, so the compare/SSTORE was pure wasted gas. The
-        // `epochNodeMaxPublishingAllocation` mapping and its getters are kept
-        // for storage-layout / ABI stability; they now read 0 unless some other
-        // contract writes them (none currently does).
+        // Maintain the per-epoch node max so its (public) getters stay
+        // consistent. The OT-RFC-51 scoring path does NOT read it
+        // (RandomSampling reads only getNodeEpochPublishingAllocation /
+        // getEpochPublishingAllocation), but the mapping cannot be removed —
+        // it precedes `nodesPaidOut` in this persistent (non-fresh-state)
+        // storage layout — and leaving it written-nowhere/read-in-getters
+        // trips Slither's uninitialized-state finding. The compare/SSTORE is
+        // negligible against the surrounding accounting.
+        if (nodesEpochPublishingAllocation[identityId][epoch] > epochNodeMaxPublishingAllocation[epoch]) {
+            epochNodeMaxPublishingAllocation[epoch] = nodesEpochPublishingAllocation[identityId][epoch];
+        }
 
         emit EpochPublishingAllocationAdded(identityId, epoch, amount);
     }

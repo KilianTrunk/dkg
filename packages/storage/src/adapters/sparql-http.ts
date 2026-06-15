@@ -397,7 +397,8 @@ export class SparqlHttpStore implements TripleStore {
       return [...this.listGraphsCache];
     }
 
-    const inFlight = this.listGraphsInFlight ?? this.refreshListGraphsCache(options);
+    const refreshOptions = options?.source ? { source: options.source } : undefined;
+    const inFlight = this.listGraphsInFlight ?? this.refreshListGraphsCache(refreshOptions);
     const graphs = await raceAgainstAbort(inFlight, options?.signal);
     return [...graphs];
   }

@@ -290,6 +290,45 @@ describe('ContextGraphMetaProjection', () => {
     expect(queryCalls).toBeGreaterThan(0);
   });
 
+  it('does not let the first caller abort poison a shared in-flight rebuild', async () => {
+    let queryStarted!: () => void;
+    const started = new Promise<void>((resolve) => { queryStarted = resolve; });
+    let releaseQuery!: () => void;
+    const blockedQuery = new Promise<void>((resolve) => { releaseQuery = resolve; });
+    let queryCalls = 0;
+    const store = {
+      async query(_sparql: string, options?: { signal?: AbortSignal }) {
+        queryCalls += 1;
+        if (queryCalls === 1) {
+          queryStarted();
+          await new Promise<void>((resolve, reject) => {
+            const onAbort = () => {
+              reject(options?.signal?.reason);
+            };
+            options?.signal?.addEventListener('abort', onAbort, { once: true });
+            blockedQuery.then(() => {
+              options?.signal?.removeEventListener('abort', onAbort);
+              resolve();
+            }, reject);
+          });
+        }
+        return { type: 'bindings', bindings: [] };
+      },
+    } as unknown as TripleStore;
+    const projection = new ContextGraphMetaProjection(store);
+    const firstCaller = new AbortController();
+    const first = projection.get('projection-first-abort-shared', { signal: firstCaller.signal });
+    await started;
+
+    const second = projection.get('projection-first-abort-shared');
+    firstCaller.abort(new Error('first caller aborted'));
+
+    await expect(first).rejects.toThrow('first caller aborted');
+    releaseQuery();
+    await expect(second).resolves.toMatchObject({ id: 'projection-first-abort-shared' });
+    expect(queryCalls).toBeGreaterThan(0);
+  });
+
   it('projects sub-graph registrations from the context graph meta graph', async () => {
     const store = new OxigraphStore();
     const projection = new ContextGraphMetaProjection(store);

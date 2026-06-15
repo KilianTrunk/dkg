@@ -381,6 +381,55 @@ describe('SparqlHttpStore (test server)', () => {
       expect(listGraphsHits).toBe(2);
     });
 
+    it('does not let one aborted managed listGraphs caller poison the shared refresh', async () => {
+      const originalFetch = globalThis.fetch;
+      let fetchStarted!: () => void;
+      let resolveFetch!: (response: Response) => void;
+      let rejectFetch!: (reason?: unknown) => void;
+      const started = new Promise<void>((resolve) => {
+        fetchStarted = resolve;
+      });
+      const pendingFetch = new Promise<Response>((resolve, reject) => {
+        resolveFetch = resolve;
+        rejectFetch = reject;
+      });
+      globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+        fetchStarted();
+        init?.signal?.addEventListener('abort', () => {
+          // If the shared refresh is incorrectly wired to the first caller's
+          // signal, this makes the second caller observe the poisoned promise.
+          rejectFetch(init.signal?.reason);
+        }, { once: true });
+        return pendingFetch;
+      }) as typeof fetch;
+      try {
+        const store = new SparqlHttpStore({
+          queryEndpoint: 'http://example.test/query',
+          managedByDkg: true,
+          timeout: 30_000,
+        });
+        const firstCaller = new AbortController();
+        const first = store.listGraphs({ signal: firstCaller.signal });
+        await started;
+
+        firstCaller.abort(new Error('first caller aborted'));
+        await expect(first).rejects.toThrow(/first caller aborted/);
+
+        const second = store.listGraphs();
+        resolveFetch(new Response(JSON.stringify({
+          head: { vars: ['g'] },
+          results: { bindings: [{ g: { type: 'uri', value: 'http://ex.org/g1' } }] },
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/sparql-results+json' },
+        }));
+
+        await expect(second).resolves.toEqual(['http://ex.org/g1']);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
     it('uses GraphSetIndexStore as the only cache owner for managed factory stores', async () => {
       listGraphsHits = 0;
       const store = await createTripleStore({

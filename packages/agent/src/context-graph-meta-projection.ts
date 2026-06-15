@@ -116,7 +116,8 @@ export class ContextGraphMetaProjection {
     const entry = existing ?? { dirty: true, invalidationVersion: 0 };
     const rebuildVersion = entry.invalidationVersion;
     entry.dirty = false;
-    const inflight = this.rebuild(contextGraphId, options)
+    const rebuildOptions = options.source ? { source: options.source } : {};
+    const inflight = this.rebuild(contextGraphId, rebuildOptions)
       .then((record) => {
         entry.value = record;
         entry.inflight = undefined;

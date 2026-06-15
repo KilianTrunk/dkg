@@ -1,12 +1,28 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { Messenger } from '../src/p2p/messenger.js';
 import type { ProtocolRouter } from '@origintrail-official/dkg-core';
 
 const PEER_A = '12D3KooWAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
 const PEER_B = '12D3KooWQz2bQbQueABKRSjV9koF8VYsXk5TdCsUmPf5zAEZg3q6';
 
+function recorder<A extends unknown[], R>(impl: (...args: A) => R) {
+  const calls: A[] = [];
+  const fn = (...args: A): R => {
+    calls.push(args);
+    return impl(...args);
+  };
+  return Object.assign(fn, { calls });
+}
+
+type RouterSendRecorder = ReturnType<
+  typeof recorder<
+    [string, string, Uint8Array, number | undefined],
+    Promise<Uint8Array>
+  >
+>;
+
 interface MockSetup {
-  routerSendMock: ReturnType<typeof vi.fn>;
+  routerSendMock: RouterSendRecorder;
 }
 
 function makeMessenger(overrides: Partial<MockSetup> = {}): {
@@ -16,7 +32,7 @@ function makeMessenger(overrides: Partial<MockSetup> = {}): {
   const mocks: MockSetup = {
     routerSendMock:
       overrides.routerSendMock ??
-      vi.fn(async () => new Uint8Array([0x01, 0x02])),
+      recorder(async () => new Uint8Array([0x01, 0x02])),
   };
 
   const messenger = new Messenger({
@@ -36,12 +52,12 @@ describe('Messenger.sendToPeer', () => {
       new Uint8Array([0xff]),
     );
 
-    expect(mocks.routerSendMock).toHaveBeenCalledWith(
+    expect(mocks.routerSendMock.calls.at(-1)).toEqual([
       PEER_B,
       '/dkg/test/1.0.0',
       expect.any(Uint8Array),
       undefined,
-    );
+    ]);
     expect(out).toEqual(new Uint8Array([0x01, 0x02]));
   });
 
@@ -52,17 +68,17 @@ describe('Messenger.sendToPeer', () => {
       timeoutMs: 5000,
     });
 
-    expect(mocks.routerSendMock).toHaveBeenCalledWith(
+    expect(mocks.routerSendMock.calls.at(-1)).toEqual([
       PEER_A,
       '/dkg/test/1.0.0',
       expect.any(Uint8Array),
       5000,
-    );
+    ]);
   });
 
   it('propagates router.send errors to the caller', async () => {
     const { messenger } = makeMessenger({
-      routerSendMock: vi.fn(async () => {
+      routerSendMock: recorder(async () => {
         throw new Error('transport boom');
       }),
     });

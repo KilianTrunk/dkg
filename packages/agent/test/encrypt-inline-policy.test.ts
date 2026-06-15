@@ -4,37 +4,27 @@
  * Numeric context graph ids are chain-owned policy surfaces. If the
  * daemon cannot read chain truth for one of them, publishing must fail
  * closed instead of falling back to plaintext.
+ *
+ * NO MOCKS: every method under test is the REAL DKGAgent.prototype method,
+ * bound onto a lightweight `agentLike` so the production decision tree runs.
+ * The injected collaborators (chain access-policy/liveness getters, the
+ * logger, the publisher, gossip, the resolve-helper seams) are plain
+ * hand-rolled recorders the agent is designed to call — not vitest mocks.
  */
 import { describe, it, expect } from 'vitest';
 import { ethers } from 'ethers';
-import { MockChainAdapter } from '@origintrail-official/dkg-chain';
 import { DKGAgent } from '../src/dkg-agent.js';
 
-/**
- * Hand-rolled call recorder: a real function that runs `impl` and records
- * every argument tuple it was invoked with. Replaces the vitest spy/mock API
- * with a plain observable seam — `rec.calls` holds the argument tuples in
- * invocation order, so the assertions read the same intent as the former
- * `toHaveBeenCalledWith` / `not.toHaveBeenCalled` checks.
- */
 function recorder<A extends unknown[], R>(impl: (...args: A) => R) {
   const calls: A[] = [];
-  const fn = (...args: A): R => { calls.push(args); return impl(...args); };
+  const fn = (...args: A): R => {
+    calls.push(args);
+    return impl(...args);
+  };
   return Object.assign(fn, { calls });
 }
 
-/**
- * Build a REAL DKGAgent on the in-memory mock chain so the policy probe runs
- * against production code (real `store`, real `getContextGraphOnChainId` /
- * `contextGraphExists` / `isPrivateContextGraph` / `resolveOnChainAccessPolicyState`
- * / `readLiveOnChainAccessPolicy`). The numeric-id cases need a controlled
- * chain seam: the default mock returns `isContextGraphActiveOnChain(id) ===
- * false` for slots that were never minted, so we reassign the two chain
- * methods with recorders to drive each scenario (live/not-live, public/
- * curated, getter-throws, getter-absent). That is a real agent with a
- * controlled chain seam, not a mock of the agent.
- */
-async function makeAgent(opts: {
+function makeAgentLike(opts: {
   isPrivate?: boolean;
   accessPolicy?: 0 | 1;
   accessPolicyError?: Error;
@@ -44,64 +34,68 @@ async function makeAgent(opts: {
   // the slot is registered & live; `false` → unknown / not live; `'absent'` →
   // the probe isn't implemented.
   activeOnChain?: boolean | 'absent';
-} = {}): Promise<DKGAgent> {
-  const agent = await DKGAgent.create({
-    name: 'EncryptInlinePolicyTest',
-    chainAdapter: new MockChainAdapter(),
-  });
-  const chain = (agent as any).chain as Record<string, unknown>;
-
-  // Observe log.warn (test 3 asserts the fail-closed diagnostic) by replacing
-  // the method with a recorder that swallows the call. Each test builds a
-  // fresh agent, so there is nothing to restore afterward.
-  (agent as any).log.warn = recorder((..._args: unknown[]) => undefined);
-
-  // Chain seam: getContextGraphAccessPolicy. Present unless the test models a
-  // minimal adapter that never implemented the getter.
+} = {}) {
+  const log = {
+    info: recorder(() => undefined),
+    warn: recorder(() => undefined),
+    error: recorder(() => undefined),
+    debug: recorder(() => undefined),
+  };
+  const chain: Record<string, unknown> = {};
   if (opts.exposeAccessPolicy !== false) {
-    chain.getContextGraphAccessPolicy = recorder(async (..._args: [bigint]) => {
+    chain.getContextGraphAccessPolicy = recorder(async () => {
       if (opts.accessPolicyError) throw opts.accessPolicyError;
       return opts.accessPolicy ?? 0;
     });
-  } else {
-    // `delete` can't remove MockChainAdapter's PROTOTYPE method, so shadow it
-    // with an own `undefined` property — production gates on
-    // `typeof chain.getContextGraphAccessPolicy === 'function'`, which then
-    // reads false and takes the fail-closed "access-policy is unknown" branch.
-    chain.getContextGraphAccessPolicy = undefined;
   }
-
-  // Chain seam: isContextGraphActiveOnChain liveness probe.
   if (opts.activeOnChain !== 'absent') {
-    chain.isContextGraphActiveOnChain = recorder(async (..._args: [bigint]) => opts.activeOnChain ?? true);
-  } else {
-    // Same prototype-shadowing as above for the probe-absent branch.
-    chain.isContextGraphActiveOnChain = undefined;
+    chain.isContextGraphActiveOnChain = recorder(async () => opts.activeOnChain ?? true);
   }
-
-  // isPrivateContextGraph drives the 'unregistered' / 'unknown' local-curated
-  // fallback. Override with a recorder so the harness controls the local ACL
-  // signal (the real store has no CG seeded). Default `false` → public/local.
-  (agent as any).isPrivateContextGraph = recorder(async (..._args: [string]) => opts.isPrivate ?? false);
-
-  return agent;
+  const agentLike = {
+    log,
+    chain,
+    onChainAccessPolicyCache: new Map<string, 0 | 1>(),
+    isPrivateContextGraph: recorder(async () => opts.isPrivate ?? false),
+  } as any;
+  // `probeIsCurated` now consults the on-chain-public override first; bind
+  // the real prototype method so the harness exercises production code.
+  agentLike.isContextGraphPublicOnChain = (DKGAgent.prototype as any).isContextGraphPublicOnChain;
+  // #884 review: a bare-numeric id is trusted as public ONLY after a LIVE
+  // on-chain proof (isContextGraphActiveOnChain) — the chain returns
+  // access-policy 0 (= public) for UNKNOWN ids, so an unregistered numeric id
+  // must never be classified public. The probe above (default live) lets the
+  // public-CG cases pass; the registration-proof case opts out with `false`.
+  // isContextGraphPublicOnChain / probeIsCurated route their chain reads
+  // through readLiveOnChainAccessPolicy (which wraps raceChainPolicyRead) —
+  // bind both so `this.readLiveOnChainAccessPolicy` / `this.raceChainPolicyRead`
+  // exist on the harness.
+  agentLike.readLiveOnChainAccessPolicy = (DKGAgent.prototype as any).readLiveOnChainAccessPolicy;
+  agentLike.resolveOnChainAccessPolicyState = (DKGAgent.prototype as any).resolveOnChainAccessPolicyState;
+  agentLike.localCgMatchesOnChainSlot = (DKGAgent.prototype as any).localCgMatchesOnChainSlot;
+  agentLike.raceChainPolicyRead = (DKGAgent.prototype as any).raceChainPolicyRead;
+  return agentLike;
 }
 
 async function resolveEncryptInlinePayload(
-  agent: DKGAgent,
+  agentLike: any,
   contextGraphId: string,
   publishContextGraphId?: string,
 ) {
   // RFC-39 / LU-11 refactor extracted the access-policy probe + curated
   // bootstrap into the private helper `_resolveCuratedChainKeyContext`,
   // which `_resolveEncryptInlinePayload` now delegates to before returning
-  // either the AEAD callback or `undefined`. We run the real production method
-  // on a real agent, so the helper and every collaborator already exist on
-  // the instance. All test cases in this file short-circuit inside the policy
-  // probe (public CG → undefined, unknown policy → throw) so they never touch
-  // the curated bootstrap dependencies (`createAndDistributeSwmSenderKeyEpoch`
-  // etc.).
-  return (agent as any)._resolveEncryptInlinePayload(
+  // either the AEAD callback or `undefined`. The lightweight `agentLike`
+  // harness in this file does not extend `DKGAgent.prototype`, so we must
+  // also bind the helper here — otherwise the first call throws
+  // `TypeError: this._resolveCuratedChainKeyContext is not a function`
+  // before any of the policy assertions below can run. All test cases in
+  // this file short-circuit inside the policy probe (public CG → undefined,
+  // unknown policy → throw) so they never touch the curated bootstrap
+  // dependencies (`createAndDistributeSwmSenderKeyEpoch` etc.).
+  agentLike._resolveCuratedChainKeyContext = (DKGAgent.prototype as any)
+    ._resolveCuratedChainKeyContext;
+  return (DKGAgent.prototype as any)._resolveEncryptInlinePayload.call(
+    agentLike,
     contextGraphId,
     undefined,
     undefined,
@@ -111,51 +105,39 @@ async function resolveEncryptInlinePayload(
 
 describe('DKGAgent._resolveEncryptInlinePayload policy lookup', () => {
   it('keeps non-numeric local public CGs on the plaintext path', async () => {
-    const agent = await makeAgent({ exposeAccessPolicy: false });
-    try {
-      await expect(resolveEncryptInlinePayload(agent, 'local-public-cg')).resolves.toBeUndefined();
-    } finally {
-      await agent.stop().catch(() => {});
-    }
+    const agentLike = makeAgentLike({ exposeAccessPolicy: false });
+
+    await expect(resolveEncryptInlinePayload(agentLike, 'local-public-cg')).resolves.toBeUndefined();
   });
 
   it('uses chain policy for numeric public CGs before choosing plaintext', async () => {
-    const agent = await makeAgent({ accessPolicy: 0 });
-    try {
-      await expect(resolveEncryptInlinePayload(agent, '42')).resolves.toBeUndefined();
-      expect((agent as any).chain.getContextGraphAccessPolicy.calls.at(-1)).toEqual([42n]);
-      expect((agent as any).onChainAccessPolicyCache.get('42')).toBe(0);
-    } finally {
-      await agent.stop().catch(() => {});
-    }
+    const agentLike = makeAgentLike({ accessPolicy: 0 });
+
+    await expect(resolveEncryptInlinePayload(agentLike, '42')).resolves.toBeUndefined();
+    expect(agentLike.chain.getContextGraphAccessPolicy.calls.at(-1)).toEqual([42n]);
+    expect(agentLike.onChainAccessPolicyCache.get('42')).toBe(0);
   });
 
   it('fails closed when numeric target CG policy lookup is unavailable', async () => {
-    const agent = await makeAgent({
+    const agentLike = makeAgentLike({
       accessPolicyError: new Error('rpc unavailable'),
     });
-    try {
-      await expect(resolveEncryptInlinePayload(agent, '42')).rejects.toThrow(
-        /publish access-policy is unknown/,
-      );
-      expect((agent as any).log.warn.calls.at(-1)).toEqual([
-        expect.anything(),
-        expect.stringContaining('treating as UNKNOWN'),
-      ]);
-    } finally {
-      await agent.stop().catch(() => {});
-    }
+
+    await expect(resolveEncryptInlinePayload(agentLike, '42')).rejects.toThrow(
+      /publish access-policy is unknown/,
+    );
+    expect(agentLike.log.warn.calls.at(-1)).toEqual([
+      expect.anything(),
+      expect.stringContaining('treating as UNKNOWN'),
+    ]);
   });
 
   it('fails closed when numeric target CG policy getter is missing', async () => {
-    const agent = await makeAgent({ exposeAccessPolicy: false });
-    try {
-      await expect(resolveEncryptInlinePayload(agent, '42')).rejects.toThrow(
-        /publish access-policy is unknown/,
-      );
-    } finally {
-      await agent.stop().catch(() => {});
-    }
+    const agentLike = makeAgentLike({ exposeAccessPolicy: false });
+
+    await expect(resolveEncryptInlinePayload(agentLike, '42')).rejects.toThrow(
+      /publish access-policy is unknown/,
+    );
   });
 
   it('does NOT classify an UNREGISTERED (not live) numeric id as public (liveness gate) (#884 review)', async () => {
@@ -164,74 +146,67 @@ describe('DKGAgent._resolveEncryptInlinePayload policy lookup', () => {
     // gate must short-circuit isContextGraphPublicOnChain to false BEFORE any
     // access-policy read — proving the suite exercises the live-on-chain proof
     // rather than blanket-trusting numeric strings.
-    const agent = await makeAgent({ accessPolicy: 0, activeOnChain: false });
-    try {
-      await expect(
-        (agent as any).isContextGraphPublicOnChain('999'),
-      ).resolves.toBe(false);
-      expect((agent as any).chain.getContextGraphAccessPolicy.calls).toEqual([]);
-    } finally {
-      await agent.stop().catch(() => {});
-    }
+    const agentLike = makeAgentLike({ accessPolicy: 0, activeOnChain: false });
+    await expect(
+      (DKGAgent.prototype as any).isContextGraphPublicOnChain.call(agentLike, '999'),
+    ).resolves.toBe(false);
+    expect(agentLike.chain.getContextGraphAccessPolicy.calls).toEqual([]);
   });
 
   it('fails closed when a remap target numeric CG policy cannot be resolved', async () => {
-    const agent = await makeAgent({
+    const agentLike = makeAgentLike({
       accessPolicyError: new Error('rpc unavailable'),
     });
-    try {
-      await expect(resolveEncryptInlinePayload(agent, 'local-public-cg', '42')).rejects.toThrow(
-        /target CG "42" curated=unknown/,
-      );
-    } finally {
-      await agent.stop().catch(() => {});
-    }
+
+    await expect(resolveEncryptInlinePayload(agentLike, 'local-public-cg', '42')).rejects.toThrow(
+      /target CG "42" curated=unknown/,
+    );
   });
 
   it('treats an explicit numeric remap target as a raw on-chain slot', async () => {
-    const contextGraphExists = vi.fn(async (id: string) => {
+    const contextGraphExists = recorder(async (id: string) => {
       if (id === '42') throw new Error('numeric local lookup should not run');
       return false;
     });
     const agentLike = {
       ...makeAgentLike({ accessPolicy: 0 }),
-      getContextGraphOnChainId: vi.fn(async () => null),
+      getContextGraphOnChainId: recorder(async () => null),
       contextGraphExists,
     };
 
     await expect(resolveEncryptInlinePayload(agentLike, 'local-public-cg', '42')).resolves.toBeUndefined();
-    expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(42n);
-    expect(contextGraphExists).not.toHaveBeenCalledWith('42');
+    expect(agentLike.chain.getContextGraphAccessPolicy.calls.at(-1)).toEqual([42n]);
+    expect(contextGraphExists.calls).not.toContainEqual(['42']);
   });
 });
 
 describe('DKGAgent._publish inline encryption routing', () => {
   it('does not trust caller accessPolicy=public to bypass chain-confirmed encryption resolution', async () => {
-    const encryptInlinePayload = vi.fn(async (plaintext: Uint8Array) => plaintext);
-    const encryptInlineChunked = vi.fn();
-    const publisherPublish = vi.fn(async () => ({
+    const encryptInlinePayload = recorder(async (plaintext: Uint8Array) => plaintext);
+    const encryptInlineChunked = recorder(() => undefined);
+    const publisherPublish = recorder(async () => ({
       status: 'confirmed',
       kaId: '1',
     }));
     const agentLike = {
       log: {
-        info: vi.fn(),
-        warn: vi.fn(),
-        error: vi.fn(),
-        debug: vi.fn(),
+        info: recorder(() => undefined),
+        warn: recorder(() => undefined),
+        error: recorder(() => undefined),
+        debug: recorder(() => undefined),
       },
       subscribedContextGraphs: new Set(['local-cg']),
-      contextGraphExists: vi.fn(async () => true),
-      createV10ACKProvider: vi.fn(() => undefined),
-      getContextGraphOnChainId: vi.fn(async () => '42'),
+      contextGraphExists: recorder(async () => true),
+      createV10ACKProvider: recorder(() => undefined),
+      getContextGraphOnChainId: recorder(async () => '42'),
       chain: {},
       peerId: 'peer-1',
       publisher: {
         publish: publisherPublish,
       },
-      broadcastPublish: vi.fn(async () => undefined),
-      _resolveEncryptInlinePayload: vi.fn(async () => encryptInlinePayload),
-      _resolveEncryptInlineChunked: vi.fn(async () => encryptInlineChunked),
+      broadcastPublish: recorder(async () => undefined),
+      _resolveEncryptInlinePayload: recorder(async () => encryptInlinePayload),
+      _resolveEncryptInlineChunked: recorder(async () => encryptInlineChunked),
     } as any;
 
     await (DKGAgent.prototype as any)._publish.call(
@@ -246,54 +221,48 @@ describe('DKGAgent._publish inline encryption routing', () => {
       },
     );
 
-    expect(agentLike._resolveEncryptInlinePayload).toHaveBeenCalledWith(
+    expect(agentLike._resolveEncryptInlinePayload.calls.at(-1)).toEqual([
       'local-cg',
       'sg-a',
       undefined,
       '42',
-    );
-    expect(agentLike._resolveEncryptInlineChunked).toHaveBeenCalledWith(
+    ]);
+    expect(agentLike._resolveEncryptInlineChunked.calls.at(-1)).toEqual([
       'local-cg',
       'sg-a',
       undefined,
       '42',
-    );
-    expect(publisherPublish).toHaveBeenCalledWith(expect.objectContaining({
-      accessPolicy: 'public',
-      publisherNodeIdentityIdOverride: 0n,
-      encryptInlinePayload,
-      encryptInlineChunked,
-    }));
+    ]);
+    expect(publisherPublish.calls.at(-1)).toEqual([
+      expect.objectContaining({
+        accessPolicy: 'public',
+        publisherNodeIdentityIdOverride: 0n,
+        encryptInlinePayload,
+        encryptInlineChunked,
+      }),
+    ]);
   });
 });
 
 describe('DKGAgent._resolveEncryptInlineChunked nonce domain', () => {
   it('uses publishOperationId, not batchId, as the chunked AEAD nonce domain', async () => {
     const signer = ethers.Wallet.createRandom();
-    // The chunked-emit closure consults a handful of DI seams
-    // (`_resolveCuratedChainKeyContext` for the chainKey, `gossipWireIdFor` /
-    // `gossip.publish` for the SWM fan-out, `resolveWorkspaceGossipSigningAgent`
-    // for the envelope signer). This test isolates the AEAD nonce-domain
-    // behaviour, so each seam is a hand-rolled recorder rather than a real
-    // gossip/curated-CG stack: the chainKey is fixed and the signer is a real
-    // ethers wallet so the only variable across the two emits is the
-    // publishOperationId.
     const agentLike = {
       log: {
-        info: recorder((..._args: unknown[]) => undefined),
-        warn: recorder((..._args: unknown[]) => undefined),
-        error: recorder((..._args: unknown[]) => undefined),
-        debug: recorder((..._args: unknown[]) => undefined),
+        info: recorder(() => undefined),
+        warn: recorder(() => undefined),
+        error: recorder(() => undefined),
+        debug: recorder(() => undefined),
       },
       gossip: {
-        publish: recorder(async (..._args: unknown[]) => {}),
+        publish: recorder(async () => {}),
       },
       gossipWireIdFor: recorder((cgId: string) => cgId),
-      _resolveCuratedChainKeyContext: recorder(async (..._args: unknown[]) => ({
+      _resolveCuratedChainKeyContext: recorder(async () => ({
         chainKey: new Uint8Array(32).fill(7),
         aeadCgId: '42',
       })),
-      resolveWorkspaceGossipSigningAgent: recorder(async (..._args: unknown[]) => ({
+      resolveWorkspaceGossipSigningAgent: recorder(async () => ({
         privateKey: signer.privateKey,
         agentAddress: signer.address,
       })),

@@ -702,6 +702,15 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
         // (agents/ontology — the network control plane).
         expect([...persisted.keys()].filter((k) => k.startsWith('clear-cg-'))).toHaveLength(5);
         expect(agent.getSubscribedContextGraphs().get('clear-cg-0')?.subscribed).toBe(true);
+        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
+          persistedTotal: 6,
+          systemExcluded: 0,
+          hostedActivated: 1,
+          hostedActivatedIds: ['hosted-cg'],
+          activated: 6,
+          dormant: 0,
+          dormantIds: [],
+        });
         for (const sys of systemIds) {
           expect(agent.getSubscribedContextGraphs().get(sys)?.subscribed).toBe(true);
         }
@@ -729,7 +738,95 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
         // just like the rehydration cap, so host-mode/reconcile is never dropped).
         expect(agent.getSubscribedContextGraphs().get('hosted-cg')?.subscribed).toBe(true);
         expect(persisted.has('hosted-cg')).toBe(true);
+        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
+          persistedTotal: 1,
+          systemExcluded: 0,
+          hostedActivated: 1,
+          hostedActivatedIds: ['hosted-cg'],
+          activated: 1,
+          dormant: 0,
+          dormantIds: [],
+        });
       } finally {
+        await agent.stop().catch(() => {});
+      }
+    });
+
+
+    it('invalidates pending persisted callbacks before clearing subscriptions', async () => {
+      const rows = Array.from({ length: 64 }, (_, i) => ({
+        id: `preclear-cg-${String(i).padStart(3, '0')}`,
+        name: `Preclear CG ${i}`,
+        subscribed: true,
+        synced: false,
+        sharedMemorySynced: false,
+        metaSynced: false,
+        syncScoped: true,
+      }));
+      const persisted = new Map<string, any>(rows.map((r) => [r.id, { ...r }]));
+      const saveResolvers: Array<{ id: string; resolve: () => void }> = [];
+      const subscriptionStore = {
+        loadAll: async () => [...persisted.values()],
+        save: async (record: any) => new Promise<void>((resolve) => {
+          saveResolvers.push({
+            id: record.id,
+            resolve: () => {
+              persisted.set(record.id, { ...record });
+              resolve();
+            },
+          });
+        }),
+        delete: async (id: string) => {
+          if (!persisted.has(id)) throw new Error(`missing ${id}`);
+          persisted.delete(id);
+        },
+      };
+      const agent = await DKGAgent.create({
+        name: 'ClearSubscriptionsPendingSave',
+        listenHost: '127.0.0.1',
+        chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+        contextGraphSubscriptionStore: subscriptionStore,
+      });
+      try {
+        await agent.start();
+        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
+          persistedTotal: 64,
+          activated: 64,
+          dormant: 0,
+          dormantIds: [],
+        });
+        const startupSaveCount = saveResolvers.length;
+
+        agent.setContextGraphSubscription('preclear-created', {
+          name: 'Preclear Created',
+          subscribed: true,
+          synced: false,
+          sharedMemorySynced: false,
+          metaSynced: false,
+        });
+        expect(saveResolvers.slice(startupSaveCount).map((entry) => entry.id)).toEqual([
+          'preclear-created',
+        ]);
+
+        expect(await agent.clearContextGraphSubscriptions()).toBe(64);
+        expect(agent.getSubscribedContextGraphs().get('preclear-created')).toBeUndefined();
+        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
+          persistedTotal: 0,
+          activated: 0,
+          dormant: 0,
+          dormantIds: [],
+        });
+
+        saveResolvers.find((entry) => entry.id === 'preclear-created')?.resolve();
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
+          persistedTotal: 0,
+          activated: 0,
+          dormant: 0,
+          dormantIds: [],
+        });
+      } finally {
+        for (const { resolve } of saveResolvers) resolve();
         await agent.stop().catch(() => {});
       }
     });

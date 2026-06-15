@@ -3939,7 +3939,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
         this.contextGraphSubscriptionRehydrationAccountedIds.add(row.id);
       }
       this.contextGraphSubscriptionRehydrationStatus = {
-        persistedTotal: persistedRows.length,
+        persistedTotal: rows.length,
         systemExcluded: persistedRows.length - rows.length,
         hostedActivated: hostedRows.length,
         hostedActivatedIds: hostedRows.map((r) => r.id),
@@ -4033,6 +4033,10 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       }
     }
     const total = persistedUserIds.length;
+    // Cancel any in-flight save callbacks that started before this bulk clear.
+    for (const id of new Set([...persistedUserIds, ...activeUserIds])) {
+      this.nextContextGraphSubscriptionPersistRevision(id);
+    }
 
     // Tear down active in-memory USER subscriptions (gossip topics + sync scope),
     // then REMOVE the registry entry. `unsubscribeFromContextGraph` only flips

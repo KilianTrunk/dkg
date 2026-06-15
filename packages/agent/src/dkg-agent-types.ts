@@ -658,7 +658,9 @@ export interface ContextGraphSubscriptionStore {
 }
 
 export interface ContextGraphSubscriptionRehydrationStatus {
+  /** Non-system persisted rows governed by the rehydration cap. */
   persistedTotal: number;
+  /** Persisted system rows seen during rehydration; excluded from cap math. */
   systemExcluded: number;
   hostedActivated: number;
   hostedActivatedIds: string[];

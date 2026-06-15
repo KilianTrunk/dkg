@@ -88,7 +88,13 @@ type RandomSamplingFixture = {
  *
  * Where:
  * - S(t) = sqrt(nodeStake / stakeCap) - sublinear stake scaling
- * - P(t) = K_n / K_total - publishing share over 4 epochs
+ * - P(t) = K_n / K_total - publishing share over the CURRENT EPOCH ONLY
+ *   (OT-RFC-51 narrowed the window from 4 epochs to 1, and re-based the input
+ *   from realized publishing to committed publishing allocation; the input
+ *   swap is invisible to this helper since it just reads the renamed
+ *   accumulator getters, but the window change must mirror
+ *   `RandomSampling._calculateNodeScore`, which now reads a single
+ *   `currentEpoch` bucket).
  * - A(t) = 1 - |nodeAsk - networkPrice| / networkPrice - ask alignment
  * - c = 0.002 (STAKE_BASELINE_COEFFICIENT) - small baseline so non-publishers
  *   still receive minimal rewards proportional to stake
@@ -120,17 +126,19 @@ async function calculateExpectedNodeScore(
   const stakeRatio = (cappedStake * SCALING_FACTOR) / stakeCap;
   const stakeFactor = sqrt(stakeRatio * SCALING_FACTOR);
 
-  // 2. Publishing Factor P(t) = K_n / K_total over 4 epochs (RFC-26 Section 4.2)
-  let nodeKnowledgeValue = 0n;
-  let totalKnowledgeValue = 0n;
-  const startEpoch = currentEpoch >= 3n ? currentEpoch - 3n : 0n;
-  for (let e = startEpoch; e <= currentEpoch; e++) {
-    nodeKnowledgeValue += await EpochStorage.getNodeEpochPublishingAllocation(
+  // 2. Publishing Factor P(t) = K_n / K_total over the CURRENT EPOCH ONLY
+  //    (OT-RFC-51 §4 / D1: window narrowed 4 -> 1). Mirrors
+  //    `RandomSampling._calculateNodeScore`, which reads a single
+  //    `getNodeEpochPublishingAllocation(id, currentEpoch)` /
+  //    `getEpochPublishingAllocation(currentEpoch)` rather than summing
+  //    `[currentEpoch-3 .. currentEpoch]`.
+  const nodeKnowledgeValue =
+    await EpochStorage.getNodeEpochPublishingAllocation(
       identityId,
-      e,
+      currentEpoch,
     );
-    totalKnowledgeValue += await EpochStorage.getEpochPublishingAllocation(e);
-  }
+  const totalKnowledgeValue =
+    await EpochStorage.getEpochPublishingAllocation(currentEpoch);
   const publishingFactor =
     totalKnowledgeValue > 0n
       ? (nodeKnowledgeValue * SCALING_FACTOR) / totalKnowledgeValue
@@ -2350,7 +2358,14 @@ describe.skip('@integration RandomSampling (OBSOLETE: V8 stake pipeline)', () =>
     });
 
     it('Should demonstrate publishing factor impact on score', async () => {
-      // Setup: Create nodes and test publishing factor contribution
+      // OT-RFC-51: the publishing factor P(t) is now fed by committed
+      // PUBLISHING ALLOCATION (credited to a node when a PCA designates it as
+      // its `primaryNode`), NOT by realized publishing. A `createKnowledgeAsset`
+      // call no longer credits K_n (the realized-credit blocks were removed
+      // from KnowledgeAssetsLifecycle), so this test credits allocation via the
+      // renamed accumulator (`addEpochPublishingAllocation`) — the same write
+      // path `PublishingConviction` uses when seeding a PCA's primaryNode —
+      // and asserts the resulting CURRENT-EPOCH P(t) lifts the node's score.
       const nodeStake = (await ParametersStorage.minimumStake()) * 3n;
       const askLowerBoundBefore = await AskStorage.getAskLowerBound();
       const nodeAsk = askLowerBoundBefore / SCALING_FACTOR + 10n; // Slightly above lower bound
@@ -2363,41 +2378,25 @@ describe.skip('@integration RandomSampling (OBSOLETE: V8 stake pipeline)', () =>
         KnowledgeCollection,
       };
 
-      // Node 1: Will have publishing activity
-      const { node: publishingNode, identityId: publishingNodeId } =
+      // Node 1: will receive a publishing allocation (PCA primaryNode analog)
+      const { identityId: publishingNodeId } =
         await setupNodeWithStakeAndAsk(nodeIdCounter, nodeStake, nodeAsk, deps);
       nodeIdCounter += 2;
 
-      // Node 2: Will have no publishing activity
+      // Node 2: no allocation
       const { identityId: nonPublishingNodeId } =
         await setupNodeWithStakeAndAsk(nodeIdCounter, nodeStake, nodeAsk, deps);
       nodeIdCounter += 2;
 
-      // Create receiving nodes
-      const receivingNodes = [];
-      const receivingNodesIdentityIds = [];
-      for (let i = 0; i < 3; i++) {
-        const { node, identityId } = await setupNodeWithStakeAndAsk(
-          nodeIdCounter,
-          await ParametersStorage.minimumStake(),
-          nodeAsk,
-          deps,
-        );
-        nodeIdCounter += 2;
-        receivingNodes.push(node);
-        receivingNodesIdentityIds.push(identityId);
-      }
-
-      // Create knowledge collection with publishing node (gives it publishing factor)
-      const kcCreator = accounts[95];
-      await createKnowledgeAsset(
-        kcCreator,
-        publishingNode,
-        publishingNodeId,
-        receivingNodes,
-        receivingNodesIdentityIds,
-        deps,
-        merkleRoot,
+      // Credit current-epoch publishing allocation onto node 1. The
+      // `onlyContracts` gate on `addEpochPublishingAllocation` also accepts
+      // `hub.owner()` (the deployer / accounts[0]), so the test can drive it
+      // directly without minting a PCA through the full conviction stack.
+      const currentEpoch = await Chronos.getCurrentEpoch();
+      await EpochStorage.connect(accounts[0]).addEpochPublishingAllocation(
+        BigInt(publishingNodeId),
+        currentEpoch,
+        parseEther('1000'),
       );
 
       // Calculate scores
@@ -2406,7 +2405,7 @@ describe.skip('@integration RandomSampling (OBSOLETE: V8 stake pipeline)', () =>
       const nonPublishingScore =
         await RandomSampling.calculateNodeScore(nonPublishingNodeId);
 
-      // Verify publishing factor
+      // Verify publishing allocation (current epoch only — 1-epoch window)
       const publishingFactor =
         await EpochStorage.getNodeCurrentEpochPublishingAllocation(
           publishingNodeId,
@@ -2420,7 +2419,7 @@ describe.skip('@integration RandomSampling (OBSOLETE: V8 stake pipeline)', () =>
       expect(nonPublishingFactor).to.equal(0n);
       expect(publishingFactor > nonPublishingFactor).to.equal(true);
 
-      // Node with publishing activity should have higher score
+      // Node with allocation should have higher score (P(t) > 0 vs P(t) = 0)
       expect(publishingScore > nonPublishingScore).to.equal(true);
     });
 
@@ -2452,7 +2451,9 @@ describe.skip('@integration RandomSampling (OBSOLETE: V8 stake pipeline)', () =>
       );
       nodeIdCounter += 2;
 
-      // Verify the max publishing value is indeed > 0 in our setup
+      // OT-RFC-51: no PCA designated this node (and realized publishing no
+      // longer credits K_n), so the current-epoch max publishing allocation is
+      // 0 — and a node with P(t) = 0 scores only on the baseline + stake terms.
       const maxNodePub =
         await EpochStorage.getCurrentEpochNodeMaxPublishingAllocation();
       expect(maxNodePub).to.be.equal(0n);

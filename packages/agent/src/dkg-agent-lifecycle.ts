@@ -237,8 +237,9 @@ import { createCursorState, type CursorState } from './reconcile-cursor.js';
  * Default cap on how many persisted context-graph subscriptions are activated
  * (gossip-subscribed + sync-tracked) on startup. A large backlog of stale
  * subscriptions otherwise fans out store-touching gossip/sync work that
- * starves authenticated store-backed routes (issue #997). Override via
- * `DKGAgentConfig.maxRehydratedContextGraphSubscriptions` (0 disables).
+ * starves authenticated store-backed routes (issue #997). Rows beyond the cap
+ * remain persisted/dormant and are exposed through subscription diagnostics.
+ * Override via `DKGAgentConfig.maxRehydratedContextGraphSubscriptions` (0 disables).
  */
 const DEFAULT_MAX_REHYDRATED_SUBSCRIPTIONS = 64;
 /** Yield to the event loop every N activations so concurrent store work can interleave. */
@@ -343,6 +344,7 @@ import {
   type ChatSendResult,
   type ContextGraphSub,
   type ContextGraphSubscriptionRecord,
+  type ContextGraphSubscriptionRehydrationStatus,
   type ContextGraphSubscriptionStore,
   type ContextGraphMemberPrincipalType,
   type ContextGraphMemberStatus,
@@ -3702,6 +3704,15 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     });
   }
 
+  getContextGraphSubscriptionRehydrationStatus(this: DKGAgent): ContextGraphSubscriptionRehydrationStatus | null {
+    const status = this.contextGraphSubscriptionRehydrationStatus;
+    if (!status) return null;
+    return {
+      ...status,
+      dormantIds: [...status.dormantIds],
+    };
+  }
+
   async rehydrateContextGraphSubscriptions(this: DKGAgent): Promise<void> {
     const store = this.config.contextGraphSubscriptionStore;
     if (!store) return;
@@ -3713,7 +3724,8 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       // would let them consume activation slots and leave USER subscriptions
       // dormant. Exclude them from the rehydration set entirely.
       const systemContextGraphs = new Set<string>(Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]);
-      const rows = (await store.loadAll()).filter((r) => !systemContextGraphs.has(r.id));
+      const persistedRows = await store.loadAll();
+      const rows = persistedRows.filter((r) => !systemContextGraphs.has(r.id));
       // Cap how many subscriptions we ACTIVATE on boot. Activation
       // (in-memory restore + sync-track + gossip subscribe + member persist)
       // does store-touching work per row; a large stale backlog fans this out
@@ -3749,13 +3761,17 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       // reconcile / host-mode path depends on it — so EXEMPT them from the cap.
       // The cap (a #997 anti-wedge measure) applies only to the non-hosted
       // user-subscription backlog, which is what fans out and starves the store
-      // on boot. Prioritise subscribed rows within the capped set.
-      const hostedRows = rows.filter((r) => r.coreHosted);
+      // on boot. Sort every group explicitly so the dormant set is stable and
+      // operator diagnostics identify the same IDs across restarts.
+      const byId = (a: ContextGraphSubscriptionRecord, b: ContextGraphSubscriptionRecord): number =>
+        a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+      const hostedRows = rows.filter((r) => r.coreHosted).sort(byId);
       const userRows = [...rows.filter((r) => !r.coreHosted)].sort(
-        (a, b) => (b.subscribed ? 1 : 0) - (a.subscribed ? 1 : 0),
+        (a, b) => (b.subscribed ? 1 : 0) - (a.subscribed ? 1 : 0) || byId(a, b),
       );
       const cappedUserRows = cap > 0 ? userRows.slice(0, cap) : userRows;
       const toActivate = [...hostedRows, ...cappedUserRows];
+      const dormantRows = cap > 0 ? userRows.slice(cap) : [];
       for (let i = 0; i < toActivate.length; i++) {
         const row = toActivate[i];
         this.setContextGraphSubscription(row.id, {
@@ -3769,6 +3785,9 @@ export class LifecycleSyncMethods extends DKGAgentBase {
           lastReconciledOrdinal: row.lastReconciledOrdinal,
           coreHosted: row.coreHosted,
         }, { persist: false });
+        if (row.onChainHash) {
+          this.recordCgWireId(row.id, row.onChainHash);
+        }
         if (row.syncScoped) {
           this.trackSyncContextGraph(row.id);
         }
@@ -3782,11 +3801,22 @@ export class LifecycleSyncMethods extends DKGAgentBase {
           await new Promise<void>((resolve) => setTimeout(resolve, 0));
         }
       }
-      const skipped = userRows.length - cappedUserRows.length;
+      const skipped = dormantRows.length;
+      this.contextGraphSubscriptionRehydrationStatus = {
+        persistedTotal: persistedRows.length,
+        systemExcluded: persistedRows.length - rows.length,
+        hostedActivated: hostedRows.length,
+        activated: toActivate.length,
+        dormant: skipped,
+        activationCap: cap,
+        capDisabled: cap === 0,
+        dormantIds: dormantRows.map((r) => r.id),
+        completedAt: Date.now(),
+      };
       if (rows.length > 0) {
         this.log.info(
           ctx,
-          `Rehydrated ${toActivate.length} of ${rows.length} persisted context-graph subscription(s)` +
+          `Rehydrated ${toActivate.length} of ${rows.length} non-system persisted context-graph subscription(s)` +
             (skipped > 0
               ? ` (${skipped} non-hosted left dormant — over the ${cap} activation cap; ` +
                 `${hostedRows.length} hosted always restored)`
@@ -3798,7 +3828,8 @@ export class LifecycleSyncMethods extends DKGAgentBase {
           ctx,
           `${skipped} context-graph subscription(s) left dormant to avoid store contention (#997). ` +
             `Prune stale ones via 'DELETE /api/context-graph/subscriptions', or raise ` +
-            `maxRehydratedContextGraphSubscriptions.`,
+            `maxRehydratedContextGraphSubscriptions. Inspect ` +
+            `'GET /api/context-graph/subscriptions' for dormant ids.`,
         );
       }
     } catch (err) {

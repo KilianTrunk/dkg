@@ -657,6 +657,18 @@ export interface ContextGraphSubscriptionStore {
   delete(contextGraphId: string): Promise<void>;
 }
 
+export interface ContextGraphSubscriptionRehydrationStatus {
+  persistedTotal: number;
+  systemExcluded: number;
+  hostedActivated: number;
+  activated: number;
+  dormant: number;
+  activationCap: number;
+  capDisabled: boolean;
+  dormantIds: string[];
+  completedAt: number;
+}
+
 export interface ContextGraphWritePreflightProbe {
   exists: boolean;
   hasLocalContent: boolean;
@@ -1005,12 +1017,13 @@ export interface DKGAgentConfig {
   /** Durable local store for paged sync checkpoints. Defaults to in-memory. */
   syncCheckpointStore?: SyncCheckpointStore;
   /**
-   * Cap on how many persisted context-graph subscriptions are *activated*
-   * (gossip-subscribed + sync-tracked) when rehydrating at startup. A large
-   * backlog of stale subscriptions otherwise fans out store-touching gossip
-   * /sync work that starves authenticated store-backed routes (issue #997).
-   * Subscriptions beyond the cap stay persisted but inactive and can be
-   * pruned via `DELETE /api/context-graph/subscriptions`. Default
+   * Intentional cap on how many persisted context-graph subscriptions are
+   * *activated* (gossip-subscribed + sync-tracked) when rehydrating at startup.
+   * A large backlog of stale subscriptions otherwise fans out store-touching
+   * gossip/sync work that starves authenticated store-backed routes (issue
+   * #997). Rows beyond the cap stay persisted but inactive, are reported via
+   * subscription diagnostics, and can be pruned via
+   * `DELETE /api/context-graph/subscriptions`. Default
    * `DEFAULT_MAX_REHYDRATED_SUBSCRIPTIONS`. `0` disables the cap.
    */
   maxRehydratedContextGraphSubscriptions?: number;

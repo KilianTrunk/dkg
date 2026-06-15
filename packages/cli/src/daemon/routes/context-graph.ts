@@ -1653,9 +1653,8 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
   }
 
   // GET /api/context-graph/subscriptions — list the node's ACTIVE in-memory
-  // context-graph subscriptions (diagnostics for #997: see how many are live).
-  // The total PERSISTED backlog is reported in the boot log ("Rehydrated X of
-  // Y"); anything beyond the activation cap is dormant until pruned below.
+  // context-graph subscriptions plus startup rehydration diagnostics (#997/#1180).
+  // Rows beyond the activation cap are persisted/dormant, not gossip/sync active.
   if (req.method === "GET" && path === "/api/context-graph/subscriptions") {
     // Operator-only: this is a NODE-WIDE view, so an agent-scoped token would
     // otherwise be able to enumerate OTHER agents' subscribed/private CG IDs.
@@ -1683,7 +1682,11 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
             coreHosted: s?.coreHosted === true,
           }))
       : [];
-    return jsonResponse(res, 200, { count: subscriptions.length, subscriptions });
+    return jsonResponse(res, 200, {
+      count: subscriptions.length,
+      subscriptions,
+      rehydration: agent.getContextGraphSubscriptionRehydrationStatus?.() ?? null,
+    });
   }
 
   // DELETE /api/context-graph/subscriptions — operator recovery for #997: tear

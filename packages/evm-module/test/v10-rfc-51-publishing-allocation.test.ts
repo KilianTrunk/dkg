@@ -152,26 +152,26 @@ describe('@integration OT-RFC-51 Publishing Allocation', function () {
   };
 
   it('(a) seeds per-epoch publishing allocation summing to committedTRAC; (b) setPrimaryNode moves future epochs net-zero on K_total; (c) realized publish does not credit K_n', async () => {
-    // ---- Node setup: two real, staked nodes in the sharding table ----
+    // ---- Node setup: real, staked nodes in the sharding table ----
+    // node1 = publishingNode; node2 = a separate dedicated node (accounts[7]/[8])
+    // so it never overlaps the publish ACK-quorum receiving set.
     const publishingNode = getDefaultPublishingNode(accounts);
     const receivingNodes = getDefaultReceivingNodes(accounts);
+    const node2Accounts = { admin: accounts[7], operational: accounts[8] };
+
     const { identityId: node1Id } = await createProfile(ProfileContract, publishingNode);
-    const { identityId: node2Id } = await createProfile(ProfileContract, receivingNodes[0]);
     const receiverProfiles = [];
-    for (let i = 1; i < receivingNodes.length; i++) {
+    for (let i = 0; i < receivingNodes.length; i++) {
       receiverProfiles.push(await createProfile(ProfileContract, receivingNodes[i]));
     }
     const receiverIdentityIds = receiverProfiles.map((p) => p.identityId);
+    const { identityId: node2Id } = await createProfile(ProfileContract, node2Accounts);
 
     await stakeV10(publishingNode.operational, node1Id, MIN_STAKE);
-    await stakeV10(receivingNodes[0].operational, node2Id, MIN_STAKE);
-    for (let i = 1; i < receivingNodes.length; i++) {
-      await stakeV10(
-        receivingNodes[i].operational,
-        receiverProfiles[i - 1].identityId,
-        MIN_STAKE,
-      );
+    for (let i = 0; i < receivingNodes.length; i++) {
+      await stakeV10(receivingNodes[i].operational, receiverProfiles[i].identityId, MIN_STAKE);
     }
+    await stakeV10(node2Accounts.operational, node2Id, MIN_STAKE);
 
     // ========================================================================
     // (a) createAccount with a real primary node seeds publishing allocation

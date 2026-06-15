@@ -230,7 +230,7 @@ export class ContextGraphMetaProjection {
       hasLegacyParticipantGate: false,
     };
 
-    const graphUris = [ontologyGraph, agentsGraph, metaGraph];
+    const graphUris = [metaGraph, agentsGraph, ontologyGraph];
     for (const graphUri of graphUris) {
       await this.loadContextGraphFacts(graphUri, uri, record, options);
     }

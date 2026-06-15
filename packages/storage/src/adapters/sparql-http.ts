@@ -107,6 +107,12 @@ export interface SparqlHttpStoreOptions {
    * Marker used by higher-level daemon flows to distinguish daemon-owned
    * endpoints from operator-provided URLs. Graph-list indexing is handled by
    * GraphSetIndexStore rather than this adapter.
+   *
+   * Compatibility note: direct `new SparqlHttpStore({ managedByDkg: true })`
+   * callers no longer get adapter-local `listGraphs()` caching. Use
+   * `createTripleStore({ backend: 'sparql-http', options: { managedByDkg: true } })`
+   * or wrap this store in `GraphSetIndexStore` to preserve the managed-endpoint
+   * graph-list index/revalidation behavior.
    */
   managedByDkg?: boolean;
   /** Emit sampled slow-query events after this duration. Default 10_000 ms; set 0 to disable. */

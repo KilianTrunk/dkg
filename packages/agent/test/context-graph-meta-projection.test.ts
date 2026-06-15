@@ -43,6 +43,47 @@ describe('ContextGraphMetaProjection', () => {
     ].sort());
   });
 
+  it('lets root _meta scalar fields override older ontology and agents declarations', async () => {
+    const store = new OxigraphStore();
+    const projection = new ContextGraphMetaProjection(store);
+    const id = 'projection-meta-authoritative';
+    const uri = contextGraphDataGraphUri(id);
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+    const agentsGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.AGENTS);
+    const metaGraph = contextGraphMetaGraphUri(id);
+
+    await store.insert([
+      { subject: uri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH, graph: ontologyGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.SCHEMA_NAME, object: '"Old ontology name"', graph: ontologyGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_CURATOR, object: 'did:dkg:agent:0x0000000000000000000000000000000000000001', graph: ontologyGraph },
+      { subject: uri, predicate: `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId`, object: '"101"', graph: ontologyGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH, graph: agentsGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.SCHEMA_DESCRIPTION, object: '"Old agents description"', graph: agentsGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_CREATOR, object: 'did:dkg:agent:0x0000000000000000000000000000000000000002', graph: agentsGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH, graph: metaGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.SCHEMA_NAME, object: '"Fresh meta name"', graph: metaGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.SCHEMA_DESCRIPTION, object: '"Fresh meta description"', graph: metaGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_CREATOR, object: 'did:dkg:agent:0x0000000000000000000000000000000000000003', graph: metaGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_CURATOR, object: 'did:dkg:agent:0x0000000000000000000000000000000000000004', graph: metaGraph },
+      { subject: uri, predicate: `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId`, object: '"202"', graph: metaGraph },
+    ]);
+
+    const meta = await projection.get(id);
+    expect(meta.name).toBe('Fresh meta name');
+    expect(meta.description).toBe('Fresh meta description');
+    expect(meta.creator).toBe('did:dkg:agent:0x0000000000000000000000000000000000000003');
+    expect(meta.curator).toBe('did:dkg:agent:0x0000000000000000000000000000000000000004');
+    expect(meta.onChainId).toBe('202');
+    expect(meta.creators).toEqual([
+      'did:dkg:agent:0x0000000000000000000000000000000000000003',
+      'did:dkg:agent:0x0000000000000000000000000000000000000002',
+    ]);
+    expect(meta.curators).toEqual([
+      'did:dkg:agent:0x0000000000000000000000000000000000000004',
+      'did:dkg:agent:0x0000000000000000000000000000000000000001',
+    ]);
+  });
+
   it('loads AGENTS graph policy rows and invalidates allowlist mutations', async () => {
     const store = new OxigraphStore();
     const projection = new ContextGraphMetaProjection(store);

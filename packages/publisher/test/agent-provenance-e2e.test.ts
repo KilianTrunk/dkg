@@ -21,7 +21,9 @@
  *   - **Diagram 3** — PCA-discounted publish through the publisher
  *     pipeline (the discount path was previously only Solidity-unit-tested).
  *   - **Diagram 6** — mode (e) delegated attribution to a non-self
- *     identity, plus the validation-revert case (fake id 9999).
+ *     identity. Under RFC-51 publisherNodeIdentityId is unvalidated and
+ *     ignored at publish, so the former fake-id (9999) validation-revert
+ *     case now asserts the publish CONFIRMS instead of reverting.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { OxigraphStore } from '@origintrail-official/dkg-storage';
@@ -79,8 +81,9 @@ beforeAll(async () => {
   }
 
   // Stake the receiver nodes so they're in the sharding table — required
-  // for mode (e) attribution validation (`shardingTable.nodeExists`) and
-  // for ACK quorum on multi-node publishes. RC11 / PR1: the Hardhat
+  // for ACK quorum on multi-node publishes (RFC-51 removed the per-publish
+  // `shardingTable.nodeExists(publisherNodeIdentityId)` attribution check,
+  // so staking is no longer needed for that). RC11 / PR1: the Hardhat
   // harness now stakes REC1..REC3 at `spawnHardhatEnv` time (so the
   // in-memory V10ACKProvider can collect a 3-of-N quorum), so the
   // per-test loop below would double-stake and revert. Skip it now
@@ -552,9 +555,10 @@ describe('Diagram 6 — attribution modes via per-publish override', () => {
       quads: [q(`${ENTITY}/D6e`, 'http://schema.org/name', '"ModeE"')],
       publisherNodeIdentityIdOverride: targetId,
     });
-    // The discriminating coverage that survives RFC-51: a valid non-self
-    // override is ACCEPTED on-chain (confirmed), contrasted with mode (d)
-    // (override=0, no attribution) and the revert test below (fake id reverts).
+    // RFC-51: publisherNodeIdentityId is unvalidated/ignored at publish, so
+    // a valid non-self override, override=0 (mode (d)), and even a fake id
+    // (the test below) all confirm — none reverts and none moves any K_n.
+    // The override is recorded only as a self-claimed attribution field.
     expect(result.status).toBe('confirmed');
 
     const afterSelf: bigint = await epochStorage().getNodeEpochPublishingAllocation(coreId, epoch);
@@ -568,20 +572,22 @@ describe('Diagram 6 — attribution modes via per-publish override', () => {
     expect(afterTarget).toBe(beforeTarget);
   });
 
-  it('validation revert — fake non-existent identity id reverts on chain', async () => {
+  it('fake non-existent identity id is now unvalidated — publish confirms (RFC-51)', async () => {
     const fakeId = 999999n;
 
     const publisher = makePublisher();
-    // RC11 / PR2: the publisher now re-throws chain reverts verbatim
-    // (no silent tentative downgrade). The T-VAL contract revert
-    // surfaces directly to the caller as a CALL_EXCEPTION.
-    await expect(
-      publishSealed(publisher, {
-        contextGraphId: CONTEXT_GRAPH,
-        quads: [q(`${ENTITY}/D6revert`, 'http://schema.org/name', '"FakeId"')],
-        publisherNodeIdentityIdOverride: fakeId,
-      }),
-    ).rejects.toThrow();
+    // RFC-51: the realized-publish credit block that ran
+    // `shardingTable.nodeExists(publisherNodeIdentityId)` was removed. The
+    // field is now vestigial — unvalidated and ignored at publish time
+    // (attribution is the PCA's primaryNode, seeded at account creation).
+    // A fake id therefore no longer reverts the publish; it just resolves.
+    // (Pre-RFC-51 this asserted the publish rejected with a CALL_EXCEPTION.)
+    const result = await publishSealed(publisher, {
+      contextGraphId: CONTEXT_GRAPH,
+      quads: [q(`${ENTITY}/D6revert`, 'http://schema.org/name', '"FakeId"')],
+      publisherNodeIdentityIdOverride: fakeId,
+    });
+    expect(result.status).toBe('confirmed');
   });
 });
 

@@ -2086,12 +2086,13 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
       if (!metaRead.ok) {
         cacheable = false;
         // Projection is the authoritative privacy source. The pre-projection
-        // seed in `privacyByUri` can come from possibly-stale ONTOLOGY
-        // discovery and may be stale-public for a CG that is authoritatively
-        // private (_meta/AGENTS). If projection times out, drop the seed so
-        // resolveRowPrivacy() routes through the scoped legacy authoritative
+        // seed in `privacyByUri` can come from possibly-stale ONTOLOGY discovery
+        // and may be stale-public for a CG that is authoritatively private
+        // (_meta/AGENTS). If projection times out, drop only stale-public seeds
+        // so resolveRowPrivacy() routes through the scoped legacy authoritative
         // lookup / fail-closed path instead of serving it as explicit-public.
-        privacyByUri.delete(r.uri);
+        // Preserve existing private seeds as a conservative fail-closed signal.
+        if (privacyByUri.get(r.uri) === 'public') privacyByUri.delete(r.uri);
         return r;
       }
       const meta = metaRead.value;

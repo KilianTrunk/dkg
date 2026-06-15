@@ -1005,6 +1005,70 @@ describe('listContextGraphs merge', () => {
     }
   }, 15000);
 
+  it('preserves private discovery seeds when authoritative projection lookup times out', async () => {
+    const originalRowBudget = DKGAgentBase.LIST_CONTEXT_GRAPHS_ROW_BUDGET_MS;
+    Object.defineProperty(DKGAgentBase, 'LIST_CONTEXT_GRAPHS_ROW_BUDGET_MS', {
+      value: 25,
+      configurable: true,
+    });
+    try {
+      const result = await createTestAgent();
+      const localAgent = result.agent;
+      agent = localAgent;
+      await localAgent.start();
+
+      const id = 'projection-timeout-private-seed';
+      const uri = contextGraphDataGraphUri(id);
+      const agentsGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.AGENTS);
+      await result.store.insert([
+        {
+          subject: uri,
+          predicate: DKG_ONTOLOGY.RDF_TYPE,
+          object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH,
+          graph: agentsGraph,
+        },
+        {
+          subject: uri,
+          predicate: DKG_ONTOLOGY.SCHEMA_NAME,
+          object: '"Projection Timeout Private Seed"',
+          graph: agentsGraph,
+        },
+        {
+          subject: uri,
+          predicate: DKG_ONTOLOGY.DKG_ACCESS_POLICY,
+          object: '"private"',
+          graph: agentsGraph,
+        },
+      ]);
+
+      const originalGetCgMeta = localAgent.getCgMeta.bind(localAgent);
+      let blockedProjectionReads = 0;
+      const getCgMetaSpy = vi.spyOn(localAgent, 'getCgMeta').mockImplementation(async (
+        contextGraphId: string,
+        options?: { signal?: AbortSignal },
+      ) => {
+        if (contextGraphId === id && blockedProjectionReads === 0) {
+          blockedProjectionReads += 1;
+          return new Promise<any>(() => {});
+        }
+        return originalGetCgMeta(contextGraphId, options);
+      });
+      try {
+        const rows = await localAgent.listContextGraphs();
+        expect(rows.find(p => p.id === id)).toBeUndefined();
+        expect(blockedProjectionReads).toBe(1);
+        expect((localAgent as any).listContextGraphsCache.size).toBe(0);
+      } finally {
+        getCgMetaSpy.mockRestore();
+      }
+    } finally {
+      Object.defineProperty(DKGAgentBase, 'LIST_CONTEXT_GRAPHS_ROW_BUDGET_MS', {
+        value: originalRowBudget,
+        configurable: true,
+      });
+    }
+  }, 15000);
+
   it('keeps storage-only rows in scoped output when legacy privacy lookup confirms public', async () => {
     const store = new OxigraphStore();
     const result = await createTestAgent({ store });

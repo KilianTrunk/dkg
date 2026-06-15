@@ -172,38 +172,64 @@ export class ContextGraphMetaProjection {
     assertSafeIri(agentsGraph);
 
     const result = await this.store.query(`
-      SELECT DISTINCT ?ctxGraph ?source WHERE {
-        {
-          GRAPH <${ontologyGraph}> {
-            ?ctxGraph <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}> .
-            BIND("ontology" AS ?source)
-          }
-        } UNION {
-          GRAPH <${agentsGraph}> {
-            ?ctxGraph <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}> .
-            BIND("agents" AS ?source)
-          }
-        } UNION {
+      SELECT DISTINCT ?ctxGraph WHERE {
+        VALUES ?sourceGraph { <${ontologyGraph}> <${agentsGraph}> }
+        GRAPH ?sourceGraph {
+          ?ctxGraph <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}> .
+        }
+      }
+    `, options);
+
+    const ids = new Set<string>();
+    if (result.type === 'bindings') {
+      for (const row of result.bindings) {
+        const uri = typeof row['ctxGraph'] === 'string' ? stripTerm(row['ctxGraph']) : '';
+        const id = contextGraphIdFromContextGraphUri(uri);
+        if (id) ids.add(id);
+      }
+    }
+
+    for (const id of await this.listRootMetaDeclaredContextGraphIds(options)) {
+      ids.add(id);
+    }
+
+    return [...ids].sort();
+  }
+
+  private async listRootMetaDeclaredContextGraphIds(options: QueryOptions): Promise<string[]> {
+    const graphUris = (await this.listGraphsByPrefix(CONTEXT_GRAPH_PREFIX, options))
+      .filter((graphUri) => {
+        const id = contextGraphIdFromMetaGraphUri(graphUri);
+        return id !== null && isRootContextGraphId(id);
+      });
+    if (graphUris.length === 0) return [];
+
+    const ids = new Set<string>();
+    for (const chunk of chunks(graphUris, 128)) {
+      for (const graphUri of chunk) assertSafeIri(graphUri);
+      const result = await this.store.query(`
+        SELECT DISTINCT ?ctxGraph WHERE {
+          VALUES ?g { ${chunk.map((graphUri) => `<${graphUri}>`).join(' ')} }
           GRAPH ?g {
             ?ctxGraph <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}> .
             FILTER(STRSTARTS(STR(?ctxGraph), "${CONTEXT_GRAPH_PREFIX}"))
             FILTER(STR(?g) = CONCAT(STR(?ctxGraph), "/_meta"))
-            BIND("meta" AS ?source)
           }
         }
+      `, options);
+      if (result.type !== 'bindings') continue;
+      for (const row of result.bindings) {
+        const uri = typeof row['ctxGraph'] === 'string' ? stripTerm(row['ctxGraph']) : '';
+        const id = contextGraphIdFromContextGraphUri(uri);
+        if (id && isRootContextGraphId(id)) ids.add(id);
       }
-    `, options);
-    if (result.type !== 'bindings') return [];
-
-    const ids = new Set<string>();
-    for (const row of result.bindings) {
-      const uri = typeof row['ctxGraph'] === 'string' ? stripTerm(row['ctxGraph']) : '';
-      const id = contextGraphIdFromContextGraphUri(uri);
-      const source = typeof row['source'] === 'string' ? stripTerm(row['source']) : '';
-      if (source === 'meta' && id && !isRootContextGraphId(id)) continue;
-      if (id) ids.add(id);
     }
     return [...ids].sort();
+  }
+
+  private async listGraphsByPrefix(prefix: string, options: QueryOptions): Promise<string[]> {
+    if (this.store.listGraphsByPrefix) return this.store.listGraphsByPrefix(prefix, options);
+    return (await this.store.listGraphs(options)).filter((graphUri) => graphUri.startsWith(prefix));
   }
 
   private async rebuild(contextGraphId: string, options: QueryOptions): Promise<ContextGraphMetaRecord> {
@@ -429,6 +455,14 @@ function contextGraphIdFromContextGraphUri(uri: string): string | null {
 function isRootContextGraphId(id: string): boolean {
   if (!id.includes('/')) return true;
   return /^0x[0-9a-fA-F]{40}\/[^/]+$/.test(id);
+}
+
+function chunks<T>(items: readonly T[], size: number): T[][] {
+  const result: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    result.push([...items.slice(i, i + size)]);
+  }
+  return result;
 }
 
 function contextGraphIdFromMetaGraphUri(uri: string): string | null {

@@ -1984,6 +1984,60 @@ describe('listContextGraphs merge', () => {
       }
     }
   }, 15000);
+
+  it('listContextGraphs projection mode reuses the graph index and cached projected metadata', async () => {
+    const previous = process.env.DKG_LIST_CONTEXT_GRAPHS_PROJECTION;
+    process.env.DKG_LIST_CONTEXT_GRAPHS_PROJECTION = '1';
+    try {
+      const result = await createTestAgent();
+      agent = result.agent;
+      await agent.start();
+
+      const owner = agent.getDefaultAgentAddress()!;
+      await agent.ensureContextGraphLocal({
+        id: 'projection-list-perf-public',
+        name: 'Projection List Perf Public',
+      });
+      await agent.createContextGraph({
+        id: 'projection-list-perf-private',
+        name: 'Projection List Perf Private',
+        accessPolicy: 1,
+        allowedAgents: [owner],
+      });
+
+      const listGraphsSpy = vi.spyOn(result.store, 'listGraphs');
+      const listGraphsByPrefixSpy = vi.spyOn(result.store, 'listGraphsByPrefix');
+      const querySpy = vi.spyOn(result.store, 'query');
+      const projectionRecordQueries = () => querySpy.mock.calls.filter(([query]) => {
+        const text = String(query);
+        return text.includes('SELECT ?p ?o WHERE') ||
+          text.includes('SELECT ?subGraph ?name ?createdBy ?createdAt ?description WHERE');
+      }).length;
+      const unboundMetaDiscoveryScans = () => querySpy.mock.calls.filter(([query]) => {
+        const text = String(query);
+        return text.includes('GRAPH ?g') && !text.includes('VALUES ?g');
+      }).length;
+
+      await agent.listContextGraphs({ callerAgentAddress: owner });
+      const firstListGraphsCalls = listGraphsSpy.mock.calls.length;
+      const firstPrefixCalls = listGraphsByPrefixSpy.mock.calls.length;
+      const firstProjectionRecordQueries = projectionRecordQueries();
+
+      await agent.listContextGraphs({ callerAgentAddress: owner });
+
+      expect(firstPrefixCalls).toBeGreaterThan(0);
+      expect(listGraphsByPrefixSpy.mock.calls.length).toBeGreaterThan(firstPrefixCalls);
+      expect(listGraphsSpy.mock.calls.length).toBe(firstListGraphsCalls);
+      expect(projectionRecordQueries()).toBe(firstProjectionRecordQueries);
+      expect(unboundMetaDiscoveryScans()).toBe(0);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.DKG_LIST_CONTEXT_GRAPHS_PROJECTION;
+      } else {
+        process.env.DKG_LIST_CONTEXT_GRAPHS_PROJECTION = previous;
+      }
+    }
+  }, 15000);
 });
 
 describe('discoverContextGraphsFromChain', () => {

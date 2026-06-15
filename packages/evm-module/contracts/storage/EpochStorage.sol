@@ -67,9 +67,14 @@ contract EpochStorage is INamed, IVersioned, HubDependent {
         nodesEpochPublishingAllocation[identityId][epoch] += amount;
         epochPublishingAllocation[epoch] += amount;
 
-        if (nodesEpochPublishingAllocation[identityId][epoch] > epochNodeMaxPublishingAllocation[epoch]) {
-            epochNodeMaxPublishingAllocation[epoch] = nodesEpochPublishingAllocation[identityId][epoch];
-        }
+        // OT-RFC-51 (nit): the per-epoch node max is no longer maintained on
+        // the add path. Nothing reads it for scoring — RandomSampling reads
+        // only `getNodeEpochPublishingAllocation` / `getEpochPublishingAllocation`
+        // — and `createAccount` seeds via this mutator up to `lockDurationEpochs`
+        // (<=60) times, so the compare/SSTORE was pure wasted gas. The
+        // `epochNodeMaxPublishingAllocation` mapping and its getters are kept
+        // for storage-layout / ABI stability; they now read 0 unless some other
+        // contract writes them (none currently does).
 
         emit EpochPublishingAllocationAdded(identityId, epoch, amount);
     }

@@ -231,7 +231,13 @@ describe('GitHub-shaped /api/knowledge-assets routes (OT-RFC-43 §10.5)', () => 
     }));
     const publishFromSharedMemory = vi.fn();
     const publishFromFinalizedAssertion = vi.fn();
-    const agent = makeAssertionAgent({ publish, publishFromSharedMemory, publishFromFinalizedAssertion });
+    const getContextGraphOnChainId = vi.fn(async () => '7');
+    const agent = makeAssertionAgent({
+      publish,
+      publishFromSharedMemory,
+      publishFromFinalizedAssertion,
+      getContextGraphOnChainId,
+    });
     const ctx = ctxFor('POST', '/api/knowledge-assets/publish', {
       contextGraphId: 'cg',
       quads,
@@ -240,6 +246,7 @@ describe('GitHub-shaped /api/knowledge-assets routes (OT-RFC-43 §10.5)', () => 
       allowedPeers: ['12D3peer1'],
       publishEpochs: 5,
       publisherNodeIdentityIdOverride: '0',
+      onChainContextGraphId: '7',
     }, agent);
 
     await handleKnowledgeAssetsRoutes(ctx);
@@ -251,7 +258,9 @@ describe('GitHub-shaped /api/knowledge-assets routes (OT-RFC-43 §10.5)', () => 
       allowedPeers: ['12D3peer1'],
       publishEpochs: 5,
       publisherNodeIdentityIdOverride: 0n,
+      onChainContextGraphId: '7',
     }));
+    expect(getContextGraphOnChainId).toHaveBeenCalledWith('cg');
     expect(publishFromSharedMemory).not.toHaveBeenCalled();
     expect(publishFromFinalizedAssertion).not.toHaveBeenCalled();
     expect(body(ctx)).toMatchObject({
@@ -264,6 +273,42 @@ describe('GitHub-shaped /api/knowledge-assets routes (OT-RFC-43 §10.5)', () => 
       batchId: '9',
       publisherAddress: '0xabc',
     });
+  });
+
+  it('POST /api/knowledge-assets/publish rejects malformed onChainContextGraphId before direct publish', async () => {
+    const publish = vi.fn();
+    const getContextGraphOnChainId = vi.fn(async () => '7');
+    const agent = makeAssertionAgent({ publish, getContextGraphOnChainId });
+    const ctx = ctxFor('POST', '/api/knowledge-assets/publish', {
+      contextGraphId: 'cg',
+      quads: [{ subject: 'urn:s', predicate: 'urn:p', object: '"v"', graph: '' }],
+      onChainContextGraphId: 'not-a-number',
+    }, agent);
+
+    await handleKnowledgeAssetsRoutes(ctx);
+
+    expect(status(ctx)).toBe(400);
+    expect(body(ctx).error).toContain('onChainContextGraphId');
+    expect(publish).not.toHaveBeenCalled();
+    expect(getContextGraphOnChainId).not.toHaveBeenCalled();
+  });
+
+  it('POST /api/knowledge-assets/publish rejects onChainContextGraphId mismatches against trusted mapping', async () => {
+    const publish = vi.fn();
+    const getContextGraphOnChainId = vi.fn(async () => '8');
+    const agent = makeAssertionAgent({ publish, getContextGraphOnChainId });
+    const ctx = ctxFor('POST', '/api/knowledge-assets/publish', {
+      contextGraphId: 'cg',
+      quads: [{ subject: 'urn:s', predicate: 'urn:p', object: '"v"', graph: '' }],
+      onChainContextGraphId: '7',
+    }, agent);
+
+    await handleKnowledgeAssetsRoutes(ctx);
+
+    expect(status(ctx)).toBe(400);
+    expect(body(ctx).error).toContain('does not match the trusted mapping');
+    expect(getContextGraphOnChainId).toHaveBeenCalledWith('cg');
+    expect(publish).not.toHaveBeenCalled();
   });
 
   it('POST /api/knowledge-assets/publish rejects bare string object terms before core SPARQL', async () => {

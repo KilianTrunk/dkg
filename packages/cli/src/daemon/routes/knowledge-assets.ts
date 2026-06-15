@@ -408,6 +408,41 @@ function resolveFinalizedPublishOptions(
   };
 }
 
+async function verifyDirectPublishOnChainContextGraphId(
+  agent: RequestContext["agent"],
+  contextGraphId: string,
+  onChainContextGraphId: string | undefined,
+  res: RequestContext["res"],
+): Promise<string | undefined | null> {
+  if (onChainContextGraphId === undefined) return undefined;
+  let resolvedOnChainContextGraphId: string | null | undefined;
+  try {
+    resolvedOnChainContextGraphId = await agent.getContextGraphOnChainId(contextGraphId);
+  } catch (err) {
+    jsonResponse(res, 400, {
+      error:
+        `Unable to verify "onChainContextGraphId" for context graph "${contextGraphId}": ${err instanceof Error ? err.message : String(err)}`,
+    });
+    return null;
+  }
+  const normalizedResolved = String(resolvedOnChainContextGraphId ?? "").trim();
+  if (!/^[1-9]\d*$/.test(normalizedResolved)) {
+    jsonResponse(res, 400, {
+      error:
+        `"onChainContextGraphId" cannot be supplied for context graph "${contextGraphId}" because no trusted positive on-chain mapping is available`,
+    });
+    return null;
+  }
+  if (BigInt(normalizedResolved) !== BigInt(onChainContextGraphId)) {
+    jsonResponse(res, 400, {
+      error:
+        `"onChainContextGraphId" (${onChainContextGraphId}) does not match the trusted mapping for context graph "${contextGraphId}" (${normalizedResolved})`,
+    });
+    return null;
+  }
+  return normalizedResolved;
+}
+
 export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<void> {
   const { req, res, agent, path, url, requestToken, requestAgentAddress, emitMemoryGraphChanged } = ctx;
   if (path !== PREFIX && !path.startsWith(`${PREFIX}/`)) return;
@@ -501,6 +536,7 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       accessPolicy,
       allowedPeers,
       subGraphName,
+      onChainContextGraphId,
     } = parsed.value;
     const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
       agent,
@@ -515,13 +551,20 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       clearSharedMemoryAfter: _ignoredClearSharedMemoryAfter,
       ...directPublishControls
     } = publishControls;
+    const verifiedOnChainContextGraphId = await verifyDirectPublishOnChainContextGraphId(
+      agent,
+      resolvedContextGraphId,
+      onChainContextGraphId,
+      res,
+    );
+    if (verifiedOnChainContextGraphId === null) return;
     try {
       const pub: any = await agent.publish(resolvedContextGraphId, quads, privateQuads, {
         accessPolicy,
         allowedPeers,
         subGraphName,
-        ...(typeof raw.onChainContextGraphId === "string" && raw.onChainContextGraphId.trim().length > 0
-          ? { onChainContextGraphId: raw.onChainContextGraphId.trim() }
+        ...(verifiedOnChainContextGraphId !== undefined
+          ? { onChainContextGraphId: verifiedOnChainContextGraphId }
           : {}),
         ...directPublishControls,
       });

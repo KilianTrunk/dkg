@@ -281,6 +281,8 @@ export interface PublishOpts {
   publishEpochs?: number;
   /** Optional known numeric on-chain context graph id for direct publish callers. */
   onChainContextGraphId?: string;
+  /** RFC-001 §4 per-publish attribution override; `0n` = mode d. */
+  publisherNodeIdentityIdOverride?: bigint;
 }
 
 export interface PublishAsyncOpts extends PublishOpts {
@@ -292,8 +294,6 @@ export interface PublishAsyncOpts extends PublishOpts {
   priorVersion?: string;
   /** V10 selective-disclosure: per-entity kaRoot instead of flat-hash KC. */
   entityProofs?: boolean;
-  /** RFC-001 §4 per-publish attribution override; `0n` = mode d. */
-  publisherNodeIdentityIdOverride?: bigint;
   localOnly?: boolean;
   /** Registered local agent whose key signs the seal. Mirrors sync `assertionFinalize`. */
   authorAgentAddress?: string;

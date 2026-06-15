@@ -34,6 +34,7 @@ export interface PublishRequestBody {
   accessPolicy?: PublishAccessPolicy;
   allowedPeers?: string[];
   subGraphName?: string;
+  onChainContextGraphId?: string;
 }
 
 import type { CorsAllowlist } from './state.js';
@@ -126,7 +127,7 @@ export function parsePublishRequestBody(
   }
 
   const payload = parsed as Record<string, unknown>;
-  const { quads, privateQuads, accessPolicy, allowedPeers, subGraphName } =
+  const { quads, privateQuads, accessPolicy, allowedPeers, subGraphName, onChainContextGraphId } =
     payload;
   const contextGraphId = payload.contextGraphId as unknown;
 
@@ -220,6 +221,17 @@ export function parsePublishRequestBody(
     }
   }
 
+  let normalizedOnChainContextGraphId: string | undefined;
+  if (onChainContextGraphId !== undefined) {
+    if (typeof onChainContextGraphId !== "string" || !/^[1-9]\d*$/.test(onChainContextGraphId.trim())) {
+      return {
+        ok: false,
+        error: 'Invalid "onChainContextGraphId" (must be a positive integer string)',
+      };
+    }
+    normalizedOnChainContextGraphId = onChainContextGraphId.trim();
+  }
+
   return {
     ok: true,
     value: {
@@ -229,6 +241,7 @@ export function parsePublishRequestBody(
       accessPolicy,
       allowedPeers,
       subGraphName: subGraphName as string | undefined,
+      onChainContextGraphId: normalizedOnChainContextGraphId,
     },
   };
 }

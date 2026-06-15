@@ -1246,27 +1246,22 @@ export class PublishMethods extends DKGAgentBase {
     // the AEAD key derives from the canonical id consumers will use to
     // verify/decrypt the published KC. Falls back to the source id when
     // there's no remap, which is the common case.
-    const encryptInlinePayload = opts?.accessPolicy === 'public'
-      ? undefined
-      : await this._resolveEncryptInlinePayload(
-        contextGraphId,
-        opts?.subGraphName,
-        undefined,
-        onChainId ?? undefined,
-      );
+    const encryptInlinePayload = await this._resolveEncryptInlinePayload(
+      contextGraphId,
+      opts?.subGraphName,
+      undefined,
+      onChainId ?? undefined,
+    );
     // OT-RFC-38 LU-11 — also resolve the chunked emitter for curated
     // CGs. When set, the publisher prefers this path: chunks fan out
     // via SWM gossip and the V2 ACK carries only the commitment.
-    // Public CGs short-circuit to `undefined` here just like the
-    // single-blob resolver above.
-    const encryptInlineChunked = opts?.accessPolicy === 'public'
-      ? undefined
-      : await this._resolveEncryptInlineChunked(
-        contextGraphId,
-        opts?.subGraphName,
-        undefined,
-        onChainId ?? undefined,
-      );
+    // Public CGs resolve to `undefined` inside the chain-confirmed resolver.
+    const encryptInlineChunked = await this._resolveEncryptInlineChunked(
+      contextGraphId,
+      opts?.subGraphName,
+      undefined,
+      onChainId ?? undefined,
+    );
 
     const result = await this.publisher.publish({
       contextGraphId,
@@ -1280,6 +1275,7 @@ export class PublishMethods extends DKGAgentBase {
       onPhase,
       skipContextGraphEnsure: true,
       v10ACKProvider,
+      publisherNodeIdentityIdOverride: opts?.publisherNodeIdentityIdOverride,
       publishContextGraphId: onChainId ?? undefined,
       publishEpochs: opts?.publishEpochs,
       precomputedAttestation,

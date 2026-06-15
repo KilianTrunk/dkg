@@ -165,6 +165,68 @@ describe('DKGAgent._resolveEncryptInlinePayload policy lookup', () => {
   });
 });
 
+describe('DKGAgent._publish inline encryption routing', () => {
+  it('does not trust caller accessPolicy=public to bypass chain-confirmed encryption resolution', async () => {
+    const encryptInlinePayload = vi.fn(async (plaintext: Uint8Array) => plaintext);
+    const encryptInlineChunked = vi.fn();
+    const publisherPublish = vi.fn(async () => ({
+      status: 'confirmed',
+      kaId: '1',
+    }));
+    const agentLike = {
+      log: {
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+      subscribedContextGraphs: new Set(['local-cg']),
+      contextGraphExists: vi.fn(async () => true),
+      createV10ACKProvider: vi.fn(() => undefined),
+      getContextGraphOnChainId: vi.fn(async () => '42'),
+      chain: {},
+      peerId: 'peer-1',
+      publisher: {
+        publish: publisherPublish,
+      },
+      broadcastPublish: vi.fn(async () => undefined),
+      _resolveEncryptInlinePayload: vi.fn(async () => encryptInlinePayload),
+      _resolveEncryptInlineChunked: vi.fn(async () => encryptInlineChunked),
+    } as any;
+
+    await (DKGAgent.prototype as any)._publish.call(
+      agentLike,
+      'local-cg',
+      [{ subject: 's', predicate: 'p', object: 'o', graph: 'g' }],
+      undefined,
+      {
+        accessPolicy: 'public',
+        subGraphName: 'sg-a',
+        publisherNodeIdentityIdOverride: 0n,
+      },
+    );
+
+    expect(agentLike._resolveEncryptInlinePayload).toHaveBeenCalledWith(
+      'local-cg',
+      'sg-a',
+      undefined,
+      '42',
+    );
+    expect(agentLike._resolveEncryptInlineChunked).toHaveBeenCalledWith(
+      'local-cg',
+      'sg-a',
+      undefined,
+      '42',
+    );
+    expect(publisherPublish).toHaveBeenCalledWith(expect.objectContaining({
+      accessPolicy: 'public',
+      publisherNodeIdentityIdOverride: 0n,
+      encryptInlinePayload,
+      encryptInlineChunked,
+    }));
+  });
+});
+
 describe('DKGAgent._resolveEncryptInlineChunked nonce domain', () => {
   it('uses publishOperationId, not batchId, as the chunked AEAD nonce domain', async () => {
     const signer = ethers.Wallet.createRandom();

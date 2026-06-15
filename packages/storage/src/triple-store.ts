@@ -40,6 +40,8 @@ export type QueryResult = SelectResult | ConstructResult | AskResult;
 export type QueryCancellationMode = 'interruptible' | 'pre-dispatch';
 
 export interface QueryOptions {
+  /** Human-readable caller tag used by adapters for diagnostics/telemetry. */
+  source?: string;
   /**
    * Best-effort caller cancellation. Async backends should reject promptly when
    * aborted; synchronous embedded backends may only observe the signal before
@@ -47,6 +49,8 @@ export interface QueryOptions {
    */
   signal?: AbortSignal;
 }
+
+export type TripleStoreQueryOptions = QueryOptions;
 
 export interface TripleStore {
   /**

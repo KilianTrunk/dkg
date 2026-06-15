@@ -586,7 +586,10 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
       FILTER(!STRENDS(STR(?g), "/_meta"))
       FILTER(!STRENDS(STR(?g), "/_shared_memory_meta"))
     }`;
-    const result = await this.store.query(sparql, { signal: options.signal });
+    const result = await this.store.query(sparql, {
+      signal: options.signal,
+      source: 'agent.contextGraphHasLocalContent',
+    });
     if (result.type === 'boolean') return result.value;
     return result.type === 'bindings' && result.bindings.length > 0;
   }

@@ -7,7 +7,7 @@
  * There is NO mock chain adapter and NO fake daemon context — every request
  * below is a true HTTP round-trip against the production route handlers running
  * inside a real daemon process. This is the harness route/behaviour tests use
- * instead of hand-building a `RequestContext` with `vi.fn()` agent stubs (which
+ * instead of hand-building a `RequestContext` with fabricated agent stubs (which
  * return canned data and silently drift from the real daemon).
  *
  * Edge role is deliberate: these are HTTP-layer tests, so the daemon must not

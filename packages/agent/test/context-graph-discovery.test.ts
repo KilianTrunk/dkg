@@ -896,7 +896,7 @@ describe('listContextGraphs merge', () => {
 
     const originalQuery = store.query.bind(store);
     vi.spyOn(store, 'query').mockImplementation(async (query: string) => {
-      if (query.includes('SELECT ?policy WHERE') && query.includes(DKG_ONTOLOGY.DKG_ACCESS_POLICY)) {
+      if (query.includes('SELECT ?p ?o WHERE') && query.includes('did:dkg:context-graph:policy-unknown-storage')) {
         return new Promise<any>(() => {});
       }
       return originalQuery(query);
@@ -1873,6 +1873,36 @@ describe('listContextGraphs merge', () => {
     expect((agent as any).store).not.toBe(store);
     expect((agent as any).store.innerStore).toBe(store);
   }, 15000);
+
+  it('listContextGraphs applies the same privacy rules to AGENTS-declared private CGs', async () => {
+    const result = await createTestAgent();
+    agent = result.agent;
+    await agent.start();
+
+    const id = 'agents-declared-private';
+    const myWallet = agent.getDefaultAgentAddress()!;
+    const uri = contextGraphDataGraphUri(id);
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+    const agentsGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.AGENTS);
+    const metaGraph = contextGraphMetaGraphUri(id);
+    await result.store.insert([
+      { subject: uri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH, graph: ontologyGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_ACCESS_POLICY, object: '"public"', graph: ontologyGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH, graph: agentsGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.SCHEMA_NAME, object: '"Agents Declared Private"', graph: agentsGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_ACCESS_POLICY, object: '"private"', graph: agentsGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_CURATOR, object: `did:dkg:agent:${myWallet}`, graph: agentsGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_ALLOWED_AGENT, object: `"${myWallet}"`, graph: metaGraph },
+    ]);
+
+    const otherWallet = ethers.Wallet.createRandom().address;
+    expect((await agent.listContextGraphs()).find(p => p.id === id)).toBeUndefined();
+    expect((await agent.listContextGraphs({ callerAgentAddress: otherWallet })).find(p => p.id === id)).toBeUndefined();
+    const visible = (await agent.listContextGraphs({ callerAgentAddress: myWallet })).find(p => p.id === id);
+    expect(visible).toBeDefined();
+    expect(visible?.accessPolicy).toBe('private');
+  }, 15000);
+
 });
 
 describe('discoverContextGraphsFromChain', () => {

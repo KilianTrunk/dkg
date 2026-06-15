@@ -405,6 +405,7 @@ import {
   deserializePendingSenderKeyEntry,
 } from './dkg-agent-swm-state.js';
 import { DKGAgentBase } from './dkg-agent-base.js';
+import type { ContextGraphMetaRecord } from './context-graph-meta-projection.js';
 import type { DKGAgent } from './dkg-agent.js';
 
 function syncAuthAbortError(reason: unknown): Error {
@@ -425,6 +426,14 @@ function throwIfSyncAuthAborted(signal: AbortSignal | undefined): void {
 }
 
 export class ContextGraphResolveMethods extends DKGAgentBase {
+  async getCgMeta(
+    this: DKGAgent,
+    contextGraphId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<ContextGraphMetaRecord> {
+    return this.contextGraphMetaProjection.get(contextGraphId, { signal: options.signal });
+  }
+
   /**
    * Check whether a context graph exists in local storage. Definition triples in
    * ONTOLOGY/_meta count, and storage-backed graph presence also counts so local
@@ -604,20 +613,8 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
    * optimistic denial inference, not access control decisions).
    */
   async contextGraphIsCurated(this: DKGAgent, contextGraphId: string): Promise<boolean> {
-    const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
-    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
-    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
     try {
-      const res = await this.store.query(
-        `SELECT ?ap WHERE {
-          { GRAPH <${ontologyGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?ap } }
-          UNION
-          { GRAPH <${cgMetaGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?ap } }
-        } LIMIT 1`,
-      );
-      if (res.type !== 'bindings' || res.bindings.length === 0) return false;
-      const ap = res.bindings[0]?.['ap']?.replace(/^"|"$/g, '');
-      return ap === 'private';
+      return (await this.getExplicitAccessPolicy(contextGraphId)) === 'private';
     } catch {
       return false;
     }
@@ -1228,27 +1225,9 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
     if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) {
       return null;
     }
-    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
-    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
-    const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
-    const result = await this.store.query(
-      `SELECT ?policy WHERE {
-        {
-          GRAPH <${ontologyGraph}> {
-            <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?policy
-          }
-        } UNION {
-          GRAPH <${cgMetaGraph}> {
-            <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?policy
-          }
-        }
-      } LIMIT 1`,
-      { signal: options.signal },
-    );
-    if (result.type !== 'bindings' || result.bindings.length === 0) return null;
-    const policyValue = result.bindings[0]?.['policy'];
-    if (policyValue === '"public"') return 'public';
-    if (policyValue === '"private"') return 'private';
+    const policyValue = (await this.getCgMeta(contextGraphId, { signal: options.signal })).accessPolicy?.trim().toLowerCase();
+    if (policyValue === 'public') return 'public';
+    if (policyValue === 'private') return 'private';
     // Defensive: any unknown literal (e.g. a future policy value the
     // older agent code doesn't recognize) is reported as `null` so
     // callers fall through to the legacy heuristic instead of
@@ -1317,9 +1296,6 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
       return false;
     }
 
-    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
-    const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
-
     // Issue #865 — explicit `accessPolicy` ALWAYS wins over the allowlist
     // heuristic below. The previous behavior fell through to the ASK
     // check whenever `policy` was anything other than `"private"`, which
@@ -1353,23 +1329,8 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
     // the legacy peer-ID model need to be recognized here so the
     // store-discovery path doesn't misclassify a freshly-invited CG
     // as "open / discoverable only" and skip the same-connect catchup.
-    const allowlistResult = await this.store.query(
-      `ASK WHERE {
-        GRAPH <${cgMetaGraph}> {
-          { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ALLOWED_AGENT}> ?agent }
-          UNION
-          { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT}> ?participantAgent }
-          UNION
-          { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ALLOWED_PEER}> ?peer }
-        }
-      }`,
-      { signal: options.signal },
-    );
-    if (allowlistResult.type === 'boolean' && allowlistResult.value === true) {
-      return true;
-    }
-
-    return false;
+    const meta = await this.getCgMeta(contextGraphId, { signal: options.signal });
+    return meta.hasAgentGate || meta.hasPeerGate;
   }
 
   async getPrivateContextGraphParticipants(
@@ -1386,49 +1347,21 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
       seen.add(key);
       merged.push(value);
     };
+    const meta = await this.getCgMeta(contextGraphId, { signal: options.signal });
+    const revoked = new Set(meta.revokedAgents.map((agent) => agent.toLowerCase()));
+    const addAgent = (value: string | undefined) => {
+      if (!value || revoked.has(value.toLowerCase())) return;
+      add(value);
+    };
 
     const localAgentParticipants = this.subscribedContextGraphs.get(contextGraphId)?.participantAgents;
     if (localAgentParticipants) {
-      for (const p of localAgentParticipants) add(p);
+      for (const p of localAgentParticipants) addAgent(p);
     }
 
-    const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
-    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
-
-    // V10 agent model: local allowedAgent entries plus explicit on-chain
-    // participantAgent entries both grant local curated access.
-    const agentResult = await this.store.query(
-      `SELECT ?agent WHERE {
-        GRAPH <${cgMetaGraph}> {
-          { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ALLOWED_AGENT}> ?agent }
-          UNION
-          { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT}> ?agent }
-        }
-      }`,
-      { signal: options.signal },
-    );
-    if (agentResult.type === 'bindings') {
-      for (const row of agentResult.bindings) {
-        const raw = row['agent'];
-        if (typeof raw === 'string') add(raw.replace(/^"|"$/g, ''));
-      }
-    }
-
-    // Legacy identity model: participantIdentityIds (numeric IDs as strings)
-    const metaResult = await this.store.query(
-      `SELECT ?identityId WHERE {
-        GRAPH <${cgMetaGraph}> {
-          <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_IDENTITY_ID}> ?identityId
-        }
-      }`,
-      { signal: options.signal },
-    );
-    if (metaResult.type === 'bindings') {
-      for (const row of metaResult.bindings) {
-        const raw = row['identityId'];
-        if (typeof raw === 'string') add(raw.replace(/^"|"$/g, ''));
-      }
-    }
+    for (const agent of meta.allowedAgents) addAgent(agent);
+    for (const agent of meta.participantAgents) addAgent(agent);
+    for (const identityId of meta.participantIdentityIds) add(identityId);
 
     if (merged.length > 0) return merged;
 
@@ -1969,10 +1902,11 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
 
     const storedRead = await withBudget(
       async (signal) => {
-        const graphs = await this.store.listGraphs({ signal });
+        const graphs = this.store.listGraphsByPrefix
+          ? await this.store.listGraphsByPrefix(prefix, { signal })
+          : (await this.store.listGraphs({ signal })).filter((graph) => graph.startsWith(prefix));
         const contextGraphs = new Set<string>();
         for (const graph of graphs) {
-          if (!graph.startsWith(prefix)) continue;
           const rest = graph.slice(prefix.length);
           const id = rest.endsWith('/_meta')
             ? rest.slice(0, -6)
@@ -2034,10 +1968,40 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
     let rows = Array.from(seen.values());
 
     /**
-     * Open CGs replicate `DKG_CREATOR`/name/policy on ONTOLOGY but keep `DKG_CURATOR` in `_meta` only,
-     * so list rows lack `curator` and the sidebar cannot classify "mine" without a Bearer-scoped pass.
-     * Backfill once (parallelised) — also removes duplicate SPARQL in the involvement pass below.
+     * Normalize metadata through the keyed projection before privacy filtering.
+     * Raw discovery can see stale ONTOLOGY and authoritative AGENTS/_meta rows
+     * for the same CG; projection gives private policy precedence.
      */
+    const projectedRows = await Promise.allSettled(rows.map(async (r) => {
+      const metaRead = await withBudget(
+        (signal) => this.getCgMeta(r.id, { signal }),
+        `projection lookup for ${r.id}`,
+      );
+      if (!metaRead.ok) {
+        cacheable = false;
+        return r;
+      }
+      const meta = metaRead.value;
+      const accessPolicy = meta.accessPolicy ?? r.accessPolicy;
+      const privacy = policyPrivacy(accessPolicy);
+      if (privacy !== 'unknown') privacyByUri.set(r.uri, privacy);
+      return {
+        ...r,
+        name: meta.name ?? r.name,
+        description: meta.description ?? r.description,
+        creator: meta.creator ?? r.creator,
+        curator: meta.curator ?? r.curator,
+        ...(accessPolicy ? { accessPolicy } : {}),
+        createdAt: meta.createdAt ?? r.createdAt,
+        isSystem: meta.isSystem || r.isSystem,
+        onChainId: meta.onChainId ?? r.onChainId,
+      };
+    }));
+    rows = projectedRows.map((entry) => {
+      if (entry.status === 'fulfilled') return entry.value;
+      throw entry.reason;
+    });
+
     const curatorBackfills = await Promise.allSettled(rows.map(async (r) => {
       if (r.curator?.trim()) return r;
       const c = await optional(

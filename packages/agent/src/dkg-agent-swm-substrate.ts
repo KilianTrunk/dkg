@@ -470,7 +470,10 @@ export class SwmSubstrateMethods extends DKGAgentBase {
    * devnet where storage cores otherwise auto-subscribe to everything they
    * host, masking the host-only fill path.
    */
-  unsubscribeFromContextGraph(this: DKGAgent, contextGraphId: string): void {
+  unsubscribeFromContextGraph(this: DKGAgent,
+    contextGraphId: string,
+    options?: { updateRehydrationStatus?: boolean },
+  ): void {
     const existing = this.subscribedContextGraphs.get(contextGraphId);
     if (!existing) return;
 
@@ -517,7 +520,7 @@ export class SwmSubstrateMethods extends DKGAgentBase {
     this.setContextGraphSubscription(
       contextGraphId,
       { ...existing, subscribed: false },
-      { persist: true },
+      { persist: true, updateRehydrationStatus: options?.updateRehydrationStatus },
     );
 
     void this.reconcileSwmHostModeSubscription(contextGraphId).catch((err) => {

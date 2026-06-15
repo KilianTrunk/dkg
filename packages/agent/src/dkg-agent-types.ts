@@ -661,6 +661,7 @@ export interface ContextGraphSubscriptionRehydrationStatus {
   persistedTotal: number;
   systemExcluded: number;
   hostedActivated: number;
+  hostedActivatedIds: string[];
   activated: number;
   dormant: number;
   activationCap: number;

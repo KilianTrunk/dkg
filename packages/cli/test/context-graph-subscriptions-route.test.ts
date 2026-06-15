@@ -9,7 +9,8 @@ describe('context graph subscription diagnostics route', () => {
   const rehydration = {
     persistedTotal: 70,
     systemExcluded: 2,
-    hostedActivated: 1,
+    hostedActivated: 2,
+    hostedActivatedIds: ['cg-hosted', 'cg-host-only'],
     activated: 64,
     dormant: 6,
     activationCap: 64,
@@ -33,8 +34,17 @@ describe('context graph subscription diagnostics route', () => {
       getSubscribedContextGraphs: () => subscriptions,
       getContextGraphSubscriptionRehydrationStatus: () => rehydrationStatus,
       clearContextGraphSubscriptions: async () => {
-        rehydrationStatus = null;
-        subscriptions.clear();
+        rehydrationStatus = rehydrationStatus
+          ? {
+              ...rehydrationStatus,
+              persistedTotal: 2,
+              activated: 2,
+              dormant: 0,
+              dormantIds: [],
+            }
+          : null;
+        subscriptions.delete('cg-000');
+        subscriptions.delete('cg-discoverable');
         return 6;
       },
       resolveAgentByToken: (token?: string) => token === 'agent-token'
@@ -112,11 +122,10 @@ describe('context graph subscription diagnostics route', () => {
     const body = await response.json() as any;
 
     expect(response.status).toBe(200);
-    expect(body.count).toBe(3);
+    expect(body.count).toBe(2);
     expect(body.subscriptions).toEqual([
       { contextGraphId: 'cg-000', subscribed: true, synced: true, coreHosted: false },
       { contextGraphId: 'cg-hosted', subscribed: true, synced: false, coreHosted: true },
-      { contextGraphId: 'cg-host-only', subscribed: false, synced: false, coreHosted: true },
     ]);
     expect(body.rehydration).toEqual(rehydration);
   });
@@ -131,7 +140,7 @@ describe('context graph subscription diagnostics route', () => {
     expect(body.error).toContain('node-level admin token');
   });
 
-  it('returns null rehydration diagnostics after the admin clears the backlog', async () => {
+  it('returns updated rehydration diagnostics after the admin clears the backlog', async () => {
     const deleteResponse = await fetch(`${baseUrl}/api/context-graph/subscriptions`, {
       method: 'DELETE',
       headers: { authorization: 'Bearer admin-token' },
@@ -145,8 +154,16 @@ describe('context graph subscription diagnostics route', () => {
     const body = await response.json() as any;
 
     expect(response.status).toBe(200);
-    expect(body.count).toBe(0);
-    expect(body.subscriptions).toEqual([]);
-    expect(body.rehydration).toBeNull();
+    expect(body.count).toBe(1);
+    expect(body.subscriptions).toEqual([
+      { contextGraphId: 'cg-hosted', subscribed: true, synced: false, coreHosted: true },
+    ]);
+    expect(body.rehydration).toEqual({
+      ...rehydration,
+      persistedTotal: 2,
+      activated: 2,
+      dormant: 0,
+      dormantIds: [],
+    });
   });
 });

@@ -1669,12 +1669,12 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     const map = agent.getSubscribedContextGraphs?.();
     const subscriptions = map
       ? [...map.entries()]
-          // ACTIVE USER / hosted entries only. Exclude (a) discoverable-only
-          // registry entries (`subscribed: false` and not `coreHosted`) and
-          // (b) the always-on AGENTS/ONTOLOGY system CGs — which the startup
-          // cap/log also exclude — while retaining host-only rows so the
-          // `rehydration.hostedActivated` count is inspectable in the payload.
-          .filter(([id, s]) => (s?.subscribed === true || s?.coreHosted === true) && !systemContextGraphs.has(id))
+          // ACTIVE USER subscriptions only. Exclude discoverable/host-only
+          // registry entries and the always-on AGENTS/ONTOLOGY system CGs.
+          // Host-only boot activations are exposed separately through
+          // `rehydration.hostedActivatedIds` so the legacy subscriptions
+          // contract stays subscribed-only.
+          .filter(([id, s]) => s?.subscribed === true && !systemContextGraphs.has(id))
           .map(([id, s]) => ({
             contextGraphId: id,
             subscribed: s?.subscribed === true,

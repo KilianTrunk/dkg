@@ -241,6 +241,7 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
           persistedTotal: 173,
           systemExcluded: 0,
           hostedActivated: 0,
+          hostedActivatedIds: [],
           activated: 64,
           dormant: 109,
           activationCap: 64,
@@ -248,7 +249,14 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
           dormantIds: rows.slice(64).map((r) => r.id),
         });
         expect(await agent.clearContextGraphSubscriptions()).toBe(173);
-        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toBeNull();
+        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
+          persistedTotal: 0,
+          hostedActivated: 0,
+          hostedActivatedIds: [],
+          activated: 0,
+          dormant: 0,
+          dormantIds: [],
+        });
       } finally {
         await agent.stop().catch(() => {});
       }
@@ -329,6 +337,59 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
       }
     });
 
+    it('updates only the affected dormant rehydration diagnostic after a successful persisted write', async () => {
+      const rows = Array.from({ length: 66 }, (_, i) => ({
+        id: `one-write-cg-${String(i).padStart(3, '0')}`,
+        name: `One Write CG ${i}`,
+        subscribed: true,
+        synced: false,
+        sharedMemorySynced: false,
+        metaSynced: false,
+        syncScoped: true,
+      }));
+      const saved: any[] = [];
+      const subscriptionStore = {
+        loadAll: async () => rows,
+        save: async (record: any) => {
+          saved.push(record);
+        },
+        delete: async () => {},
+      };
+      const agent = await DKGAgent.create({
+        name: 'CapRehydrationOneWrite',
+        listenHost: '127.0.0.1',
+        chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+        contextGraphSubscriptionStore: subscriptionStore,
+      });
+      try {
+        await agent.start();
+        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
+          activated: 64,
+          dormant: 2,
+          dormantIds: ['one-write-cg-064', 'one-write-cg-065'],
+        });
+
+        agent.setContextGraphSubscription('one-write-cg-064', {
+          name: 'One Write CG 64',
+          subscribed: true,
+          synced: false,
+          sharedMemorySynced: false,
+          metaSynced: false,
+        });
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+        expect(saved.map((r) => r.id)).toContain('one-write-cg-064');
+        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
+          persistedTotal: 66,
+          activated: 65,
+          dormant: 1,
+          dormantIds: ['one-write-cg-065'],
+        });
+      } finally {
+        await agent.stop().catch(() => {});
+      }
+    });
+
     it('disables the rehydration activation cap when configured with zero', async () => {
       const rows = Array.from({ length: 70 }, (_, i) => ({
         id: `uncapped-cg-${String(i).padStart(3, '0')}`,
@@ -364,6 +425,7 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
           dormant: 0,
           activationCap: 0,
           capDisabled: true,
+          hostedActivatedIds: [],
           dormantIds: [],
         });
       } finally {
@@ -436,6 +498,7 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
         expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
           persistedTotal: rows.length,
           hostedActivated: hosted.length,
+          hostedActivatedIds: hosted.map((r) => r.id),
           activated: hosted.length + cap,
           dormant: user.length - cap,
           activationCap: cap,

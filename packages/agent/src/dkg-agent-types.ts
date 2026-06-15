@@ -279,6 +279,8 @@ export interface PublishOpts {
   subGraphName?: string;
   /** Optional on-chain publish lifetime override in epochs. */
   publishEpochs?: number;
+  /** Optional known numeric on-chain context graph id for direct publish callers. */
+  onChainContextGraphId?: string;
 }
 
 export interface PublishAsyncOpts extends PublishOpts {

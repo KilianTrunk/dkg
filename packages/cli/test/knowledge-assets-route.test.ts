@@ -220,6 +220,132 @@ function makePromoteJob(over: Record<string, any> = {}): any {
 }
 
 describe('GitHub-shaped /api/knowledge-assets routes (OT-RFC-43 §10.5)', () => {
+  it('POST /api/knowledge-assets/publish calls direct agent.publish with explicit quads', async () => {
+    const quads = [{ subject: 'urn:s', predicate: 'urn:p', object: '"v"', graph: '' }];
+    const privateQuads = [{ subject: 'urn:s', predicate: 'urn:secret', object: '"secret"', graph: '' }];
+    const publish = vi.fn(async () => ({
+      kaId: 9n,
+      status: 'confirmed',
+      kaManifest: [{ tokenId: 1n, rootEntity: 'urn:s' }],
+      onChainResult: { txHash: '0xtx', blockNumber: 12, batchId: 9n, publisherAddress: '0xabc' },
+    }));
+    const publishFromSharedMemory = vi.fn();
+    const publishFromFinalizedAssertion = vi.fn();
+    const agent = makeAssertionAgent({ publish, publishFromSharedMemory, publishFromFinalizedAssertion });
+    const ctx = ctxFor('POST', '/api/knowledge-assets/publish', {
+      contextGraphId: 'cg',
+      quads,
+      privateQuads,
+      accessPolicy: 'allowList',
+      allowedPeers: ['12D3peer1'],
+      publishEpochs: 5,
+      publisherNodeIdentityIdOverride: '0',
+    }, agent);
+
+    await handleKnowledgeAssetsRoutes(ctx);
+
+    expect(status(ctx)).toBe(200);
+    expect(agent.listContextGraphs).toHaveBeenCalledOnce();
+    expect(publish).toHaveBeenCalledWith('cg', quads, privateQuads, expect.objectContaining({
+      accessPolicy: 'allowList',
+      allowedPeers: ['12D3peer1'],
+      publishEpochs: 5,
+      publisherNodeIdentityIdOverride: 0n,
+    }));
+    expect(publishFromSharedMemory).not.toHaveBeenCalled();
+    expect(publishFromFinalizedAssertion).not.toHaveBeenCalled();
+    expect(body(ctx)).toMatchObject({
+      mode: 'direct',
+      kaId: '9',
+      status: 'confirmed',
+      kas: [{ tokenId: '1', rootEntity: 'urn:s' }],
+      txHash: '0xtx',
+      blockNumber: 12,
+      batchId: '9',
+      publisherAddress: '0xabc',
+    });
+  });
+
+  it('POST /api/knowledge-assets/publish rejects bare string object terms before core SPARQL', async () => {
+    const publish = vi.fn();
+    const agent = makeAssertionAgent({ publish });
+    const ctx = ctxFor('POST', '/api/knowledge-assets/publish', {
+      contextGraphId: 'cg',
+      quads: [{ subject: 'urn:s', predicate: 'urn:p', object: 'bare literal', graph: 'urn:g' }],
+    }, agent);
+
+    await handleKnowledgeAssetsRoutes(ctx);
+
+    expect(status(ctx)).toBe(400);
+    expect(body(ctx).error).toContain('quads[0].object');
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  it('POST /api/knowledge-assets/publish fails closed when write preflight cannot resolve the context graph', async () => {
+    const publish = vi.fn();
+    const agent = makeAssertionAgent({
+      publish,
+      listContextGraphs: vi.fn(async () => []),
+      contextGraphExists: vi.fn(async () => false),
+    });
+    const ctx = ctxFor('POST', '/api/knowledge-assets/publish', {
+      contextGraphId: 'shadow-cg',
+      quads: [{ subject: 'urn:s', predicate: 'urn:p', object: '"v"', graph: '' }],
+    }, agent);
+
+    await handleKnowledgeAssetsRoutes(ctx);
+
+    expect(status(ctx)).toBe(400);
+    expect(body(ctx)).toMatchObject({ code: 'CONTEXT_GRAPH_NOT_FOUND' });
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  it('POST /api/knowledge-assets/publish returns 207 when direct publish mints but context-graph binding fails', async () => {
+    const agent = makeAssertionAgent({
+      publish: vi.fn(async () => ({
+        kaId: 9n,
+        status: 'confirmed',
+        ual: 'did:dkg:hardhat:31337/0xabc/9',
+        onChainResult: { txHash: '0xtx' },
+        contextGraphError: 'CG value bind failed',
+      })),
+    });
+    const ctx = ctxFor('POST', '/api/knowledge-assets/publish', {
+      contextGraphId: 'cg',
+      quads: [{ subject: 'urn:s', predicate: 'urn:p', object: '"v"', graph: '' }],
+    }, agent);
+
+    await handleKnowledgeAssetsRoutes(ctx);
+
+    expect(status(ctx)).toBe(207);
+    expect(body(ctx)).toMatchObject({
+      mode: 'direct',
+      status: 'confirmed',
+      contextGraphError: 'CG value bind failed',
+      error: 'CG value bind failed',
+    });
+  });
+
+  it('POST /api/knowledge-assets/publish returns 502 when direct publish is tentative', async () => {
+    const agent = makeAssertionAgent({
+      publish: vi.fn(async () => ({
+        kaId: 9n,
+        status: 'tentative',
+        ual: 'did:dkg:hardhat:31337/0xabc/9',
+      })),
+    });
+    const ctx = ctxFor('POST', '/api/knowledge-assets/publish', {
+      contextGraphId: 'cg',
+      quads: [{ subject: 'urn:s', predicate: 'urn:p', object: '"v"', graph: '' }],
+    }, agent);
+
+    await handleKnowledgeAssetsRoutes(ctx);
+
+    expect(status(ctx)).toBe(502);
+    expect(body(ctx)).toMatchObject({ mode: 'direct', status: 'tentative' });
+    expect(body(ctx).error).toContain('did not confirm');
+  });
+
   it('POST /api/knowledge-assets creates a KA + opens a WM draft', async () => {
     // A fresh KA: no prior lifecycle descriptor, so alreadyExists is false.
     const agent = makeAssertionAgent({ assertion: { history: vi.fn(async () => null) } });

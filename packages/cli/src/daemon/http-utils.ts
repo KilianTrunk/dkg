@@ -99,6 +99,18 @@ export function isPublishQuad(value: unknown): value is PublishQuad {
   );
 }
 
+function validatePublishQuadObjectTerms(
+  label: string,
+  quads: PublishQuad[],
+): string | null {
+  const badIndex = quads.findIndex((q) => {
+    const object = q.object.trim();
+    return !object.startsWith('"') && !isSafeIri(object);
+  });
+  if (badIndex === -1) return null;
+  return `Invalid "${label}[${badIndex}].object": RDF object must be a quoted literal term or absolute IRI`;
+}
+
 export function parsePublishRequestBody(
   body: string,
 ): { ok: true; value: PublishRequestBody } | { ok: false; error: string } {
@@ -135,6 +147,8 @@ export function parsePublishRequestBody(
       error: 'Missing or invalid "quads" (must be a non-empty quad array)',
     };
   }
+  const quadObjectError = validatePublishQuadObjectTerms("quads", quads);
+  if (quadObjectError) return { ok: false, error: quadObjectError };
 
   if (
     privateQuads !== undefined &&
@@ -144,6 +158,10 @@ export function parsePublishRequestBody(
       ok: false,
       error: 'Invalid "privateQuads" (must be a quad array)',
     };
+  }
+  if (privateQuads !== undefined) {
+    const privateQuadObjectError = validatePublishQuadObjectTerms("privateQuads", privateQuads);
+    if (privateQuadObjectError) return { ok: false, error: privateQuadObjectError };
   }
 
   if (

@@ -169,6 +169,12 @@ export interface PublishOptions {
   entityProofs?: boolean;
   /** Optional callback invoked at each phase boundary for instrumentation. */
   onPhase?: PhaseCallback;
+  /**
+   * Skip the publisher-level context-graph graph creation/ensure step.
+   * Only callers that already validated the target context graph should set
+   * this; it avoids re-entering store-backed graph discovery on direct publish.
+   */
+  skipContextGraphEnsure?: boolean;
   /** Override the data graph URI (used for context graph publishing). */
   targetGraphUri?: string;
   /** Override the meta graph URI (used for context graph publishing). */

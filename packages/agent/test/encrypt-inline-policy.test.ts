@@ -147,6 +147,22 @@ describe('DKGAgent._resolveEncryptInlinePayload policy lookup', () => {
       /target CG "42" curated=unknown/,
     );
   });
+
+  it('treats an explicit numeric remap target as a raw on-chain slot', async () => {
+    const contextGraphExists = vi.fn(async (id: string) => {
+      if (id === '42') throw new Error('numeric local lookup should not run');
+      return false;
+    });
+    const agentLike = {
+      ...makeAgentLike({ accessPolicy: 0 }),
+      getContextGraphOnChainId: vi.fn(async () => null),
+      contextGraphExists,
+    };
+
+    await expect(resolveEncryptInlinePayload(agentLike, 'local-public-cg', '42')).resolves.toBeUndefined();
+    expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(42n);
+    expect(contextGraphExists).not.toHaveBeenCalledWith('42');
+  });
 });
 
 describe('DKGAgent._resolveEncryptInlineChunked nonce domain', () => {

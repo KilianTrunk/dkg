@@ -34,6 +34,7 @@ import {
   validateEntities,
   validateOptionalSubGraphName,
   validateRequiredContextGraphId,
+  parsePublishRequestBody,
   normalizeContextGraphIdOrUri,
   resolveRequiredWriteContextGraphId,
 } from "../http-utils.js";
@@ -480,6 +481,84 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
     callerAgentAddress: writePreflightCallerAgentAddress,
     allowLocalExactFallback: !writePreflightCallerAgentAddress,
   };
+
+  // ── POST /api/knowledge-assets/publish — explicit-quads one-shot publish ──
+  //
+  // This is intentionally separate from the assertion/SWM lifecycle routes. If
+  // the caller already has the exact quads to publish, use agent.publish()
+  // directly so the publisher's ACK/direct-payload path owns availability. The
+  // SWM/finalized-assertion methods below remain only for callers that have
+  // explicitly staged or finalized the target content first.
+  if (method === "POST" && path === `${PREFIX}/publish`) {
+    const rawBody = await readBody(req);
+    const parsed = parsePublishRequestBody(rawBody);
+    if (!parsed.ok) return jsonResponse(res, 400, { error: parsed.error });
+    const raw = JSON.parse(rawBody) as Record<string, unknown>;
+    const {
+      contextGraphId,
+      quads,
+      privateQuads,
+      accessPolicy,
+      allowedPeers,
+      subGraphName,
+    } = parsed.value;
+    const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+      agent,
+      contextGraphId,
+      res,
+      writePreflightContextGraphOpts,
+    );
+    if (!resolvedContextGraphId) return;
+    const publishControls = resolveFinalizedPublishOptions(ctx, raw);
+    if (publishControls === null) return;
+    const {
+      clearSharedMemoryAfter: _ignoredClearSharedMemoryAfter,
+      ...directPublishControls
+    } = publishControls;
+    try {
+      const pub: any = await agent.publish(resolvedContextGraphId, quads, privateQuads, {
+        accessPolicy,
+        allowedPeers,
+        subGraphName,
+        ...(typeof raw.onChainContextGraphId === "string" && raw.onChainContextGraphId.trim().length > 0
+          ? { onChainContextGraphId: raw.onChainContextGraphId.trim() }
+          : {}),
+        ...directPublishControls,
+      });
+      const { httpStatus, reason } = classifyVmPublish(pub);
+      if (httpStatus === 200) {
+        recordActivityAndNotify(ctx, {
+          contextGraphId: resolvedContextGraphId,
+          kind: "published",
+          actorAgentAddress: requestAgentAddress,
+          subGraphName,
+        });
+      }
+      const chain = pub?.onChainResult;
+      const kaManifest = Array.isArray(pub?.kaManifest) ? pub.kaManifest : [];
+      return jsonResponse(res, httpStatus, {
+        ...pub,
+        mode: "direct",
+        kaId: pub?.kaId != null ? String(pub.kaId) : pub?.kaId,
+        status: pub?.status,
+        kas: kaManifest.map((ka: any) => ({
+          tokenId: String(ka.tokenId),
+          rootEntity: ka.rootEntity,
+        })),
+        ...(chain?.txHash ? { txHash: chain.txHash } : {}),
+        ...(chain?.blockNumber !== undefined ? { blockNumber: chain.blockNumber } : {}),
+        ...(chain?.batchId !== undefined ? { batchId: String(chain.batchId) } : {}),
+        ...(chain?.publisherAddress ? { publisherAddress: chain.publisherAddress } : {}),
+        ...(typeof pub?.contextGraphError === "string" ? { contextGraphError: pub.contextGraphError } : {}),
+        ...(reason ? { error: reason } : {}),
+      });
+    } catch (e: any) {
+      if (isPayloadTooLargeError(e)) {
+        return jsonResponse(res, 413, payloadTooLargeResponseBody(e));
+      }
+      return jsonResponse(res, 500, { error: e?.message ?? String(e) });
+    }
+  }
 
   // ── POST /api/knowledge-assets — create KA + open WM draft (atomic shortcut) ──
   if (method === "POST" && path === PREFIX) {

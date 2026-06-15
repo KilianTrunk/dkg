@@ -367,6 +367,32 @@ function collectTrustSubjectsForRoots(
   return [...subjects];
 }
 
+function isNoDataInSwmFailure(err: unknown): boolean {
+  const seen = new Set<unknown>();
+  const stack: unknown[] = [err];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (current == null || seen.has(current)) continue;
+    seen.add(current);
+    if (current instanceof Error) {
+      if (`${current.name} ${current.message}`.includes('NO_DATA_IN_SWM')) return true;
+      stack.push((current as Error & { cause?: unknown }).cause);
+    } else if (typeof current === 'object') {
+      const record = current as Record<string, unknown>;
+      for (const key of ['reason', 'code', 'message', 'legacyMessage', 'declineCode', 'declineMessage']) {
+        const value = record[key];
+        if (typeof value === 'string' && value.includes('NO_DATA_IN_SWM')) return true;
+      }
+      const peerOutcomes = record.peerOutcomes;
+      if (Array.isArray(peerOutcomes)) stack.push(...peerOutcomes);
+      if ('cause' in record) stack.push(record.cause);
+    } else if (String(current).includes('NO_DATA_IN_SWM')) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export class DKGPublisher implements Publisher {
   private readonly store: TripleStore;
   private readonly chain: ChainAdapter;
@@ -1327,7 +1353,20 @@ export class DKGPublisher implements Publisher {
       reservedKaId: options?.reservedKaId,
       [INTERNAL_ORIGIN_TOKEN]: true,
     };
-    const publishResult = await this.publish(internalPublishOptions);
+    let publishResult: PublishResult;
+    try {
+      publishResult = await this.publish(internalPublishOptions);
+    } catch (err) {
+      if (!isNoDataInSwmFailure(err)) throw err;
+      this.log.warn(
+        ctx,
+        'publishFromSWM core-node verification failed with NO_DATA_IN_SWM; retrying via direct publish with inline quads',
+      );
+      publishResult = await this.publish({
+        ...internalPublishOptions,
+        fromSharedMemory: false,
+      });
+    }
 
     // Per-cgId data promotion: copy quads + KA meta from the default
     // `<NAME>/data` + `<NAME>/_meta` graphs into `<NAME>/context/<cgId>/data`
@@ -1813,7 +1852,11 @@ export class DKGPublisher implements Publisher {
     onPhase?.('prepare', 'start');
     onPhase?.('prepare:ensureContextGraph', 'start');
     this.log.info(ctx, `Preparing publish: ${quads.length} public triples, ${privateQuads.length} private`);
-    await this.graphManager.ensureContextGraph(contextGraphId);
+    if (options.skipContextGraphEnsure) {
+      this.log.info(ctx, `Skipping context graph ensure for prevalidated direct publish: ${contextGraphId}`);
+    } else {
+      await this.graphManager.ensureContextGraph(contextGraphId);
+    }
     onPhase?.('prepare:ensureContextGraph', 'end');
 
     onPhase?.('prepare:partition', 'start');

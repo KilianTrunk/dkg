@@ -350,6 +350,20 @@ describe('localAgentIntegrations config round-trip', () => {
     expect(loaded.relayReservationCount).toBe(5);
   });
 
+  it('round-trips syncAgentsMeta=false through saveConfig/loadConfig (edge store-load optimization)', async () => {
+    await saveConfig({
+      name: 'test-node',
+      apiPort: 9200,
+      listenPort: 0,
+      nodeRole: 'edge',
+      syncAgentsMeta: false,
+    });
+
+    const loaded = await loadConfig();
+    expect(loaded.nodeRole).toBe('edge');
+    expect(loaded.syncAgentsMeta).toBe(false);
+  });
+
   it('omits relayReservationCount when not set (so DKGNode.start() applies the default)', async () => {
     await saveConfig({
       name: 'test-node',

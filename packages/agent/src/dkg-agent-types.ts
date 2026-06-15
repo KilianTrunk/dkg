@@ -279,6 +279,10 @@ export interface PublishOpts {
   subGraphName?: string;
   /** Optional on-chain publish lifetime override in epochs. */
   publishEpochs?: number;
+  /** Optional known numeric on-chain context graph id for direct publish callers. */
+  onChainContextGraphId?: string;
+  /** RFC-001 §4 per-publish attribution override; `0n` = mode d. */
+  publisherNodeIdentityIdOverride?: bigint;
 }
 
 export interface PublishAsyncOpts extends PublishOpts {
@@ -290,8 +294,6 @@ export interface PublishAsyncOpts extends PublishOpts {
   priorVersion?: string;
   /** V10 selective-disclosure: per-entity kaRoot instead of flat-hash KC. */
   entityProofs?: boolean;
-  /** RFC-001 §4 per-publish attribution override; `0n` = mode d. */
-  publisherNodeIdentityIdOverride?: bigint;
   localOnly?: boolean;
   /** Registered local agent whose key signs the seal. Mirrors sync `assertionFinalize`. */
   authorAgentAddress?: string;
@@ -807,6 +809,13 @@ export interface DKGAgentConfig {
   sharedMemoryPublicSnapshotStorage?: SharedMemoryPublicSnapshotStorageConfig;
   /** When false, peer-connect sync skips SWM catch-up and relies on gossip for new SWM writes. */
   syncSharedMemoryOnConnect?: boolean;
+  /**
+   * When false, durable sync skips the large system `agents/_meta` graph while
+   * still syncing `agents` data as the phonebook. Defaults to true for
+   * compatibility; only honored for edge nodes that do not need full KA/KC
+   * lifecycle metadata for the system agents graph. Core nodes always sync it.
+   */
+  syncAgentsMeta?: boolean;
   /** Node deployment tier: 'core' (cloud, relay) or 'edge' (personal, behind NAT). Default: 'edge'. */
   nodeRole?: 'core' | 'edge';
   /**

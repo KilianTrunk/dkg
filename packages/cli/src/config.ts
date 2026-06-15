@@ -471,6 +471,13 @@ export interface DkgConfig {
   /** Disable expensive peer-connect SWM catch-up for bulk benchmark/devnet runs. */
   syncSharedMemoryOnConnect?: boolean;
   /**
+   * Keep durable sync of `did:dkg:context-graph:agents/_meta` enabled by
+   * default. Edge-node operators can set this to false to sync the `agents`
+   * phonebook data without pulling the large system KA/KC lifecycle metadata.
+   * Ignored on core nodes, which always sync system graph metadata.
+   */
+  syncAgentsMeta?: boolean;
+  /**
    * Generic local agent integration registry used by node-owned connect/install
    * flows. Framework-specific bridges (OpenClaw now, Hermes next) should store
    * status/capabilities here instead of relying on one-off config flags.

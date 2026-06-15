@@ -175,6 +175,41 @@ describe('publishFromSharedMemory multi-root selection (OT-RFC-44 / Design B: on
     ]);
   });
 
+  it('falls back to direct publish when SWM ACKs fail with NO_DATA_IN_SWM', async () => {
+    const { publisher, store, publishSpy } = await makePublisher();
+    const fallbackResult: PublishResult = {
+      kaId: 2n,
+      ual: 'did:dkg:0x0000000000000000000000000000000000000001/2',
+      merkleRoot: new Uint8Array(32),
+      kaManifest: [
+        {
+          tokenId: 2n,
+          rootEntity: 'urn:test:root:one',
+          privateTripleCount: 0,
+        },
+      ],
+      status: 'tentative',
+      publicQuads: [],
+    };
+    publishSpy.mockReset();
+    publishSpy
+      .mockRejectedValueOnce(new Error('storage_ack_insufficient: STORAGE_ACK_DECLINE:NO_DATA_IN_SWM'))
+      .mockResolvedValueOnce(fallbackResult);
+    await store.insert([
+      q('urn:test:root:one', 'http://schema.org/name', '"ready"'),
+    ]);
+
+    await expect(publisher.publishFromSharedMemory(CONTEXT_GRAPH, 'all'))
+      .resolves.toMatchObject({ kaId: 2n, status: 'tentative' });
+
+    expect(publishSpy).toHaveBeenCalledTimes(2);
+    expect(publishSpy.mock.calls[0][0]).toMatchObject({ fromSharedMemory: true });
+    expect(publishSpy.mock.calls[1][0]).toMatchObject({ fromSharedMemory: false });
+    expect(publishSpy.mock.calls[1][0].quads).toEqual([
+      { subject: 'urn:test:root:one', predicate: 'http://schema.org/name', object: '"ready"', graph: '' },
+    ]);
+  });
+
   it('publishes both explicit rootEntities as one KA when they resolve to multiple payload roots (OT-RFC-44)', async () => {
     const { publisher, store, publishSpy } = await makePublisher();
     await store.insert([

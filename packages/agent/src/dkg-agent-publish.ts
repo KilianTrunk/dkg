@@ -2729,6 +2729,27 @@ export class PublishMethods extends DKGAgentBase {
         const payload = new Uint8Array(input.batchId.length + ct.length);
         payload.set(input.batchId, 0);
         payload.set(ct, input.batchId.length);
+        const persistCanonical = this.canonicalChunkStoreCgIdOrNull(contextGraphId);
+        const chunksGraph = ciphertextChunkStoreGraph(persistCanonical ?? contextGraphId);
+        const subject = ciphertextChunkStoreSubject(input.batchId, i);
+        const literal = `"${Buffer.from(ct).toString('base64')}"`;
+        try {
+          await this.store.insert([{
+            subject,
+            predicate: CIPHERTEXT_CHUNK_PREDICATE,
+            object: literal,
+            graph: chunksGraph,
+          }]);
+        } catch (err) {
+          log.warn(
+            ctx,
+            `LU-11: failed to persist local ciphertext chunk cgId=${contextGraphId} ` +
+            `batchId=${batchIdHex.slice(0, 18)}... op=${input.publishOperationId} chunkIndex=${i}: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          throw err;
+        }
         const timestamp = new Date().toISOString();
         const signingPayload = computeGossipSigningPayloadV2(
           GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED,

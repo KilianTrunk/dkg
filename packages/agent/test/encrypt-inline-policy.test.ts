@@ -7,6 +7,17 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { ethers } from 'ethers';
+import { OxigraphStore } from '@origintrail-official/dkg-storage';
+import {
+  ACK_PROTOCOL_VERSION_V2_LU11,
+  ciphertextChunkStoreGraph,
+  ciphertextChunkStoreSubject,
+  CIPHERTEXT_CHUNK_PREDICATE,
+  decodeStorageACK,
+  encodePublishIntent,
+  isStorageACKDecline,
+} from '@origintrail-official/dkg-core';
+import { StorageACKHandler } from '@origintrail-official/dkg-publisher';
 import { DKGAgent } from '../src/dkg-agent.js';
 
 function makeAgentLike(opts: {
@@ -237,6 +248,10 @@ describe('DKGAgent._resolveEncryptInlineChunked nonce domain', () => {
         error: vi.fn(),
         debug: vi.fn(),
       },
+      store: {
+        insert: vi.fn(async () => {}),
+      },
+      canonicalChunkStoreCgIdOrNull: vi.fn((cgId: string) => cgId),
       gossip: {
         publish: vi.fn(async () => {}),
       },
@@ -273,5 +288,98 @@ describe('DKGAgent._resolveEncryptInlineChunked nonce domain', () => {
 
     expect(Buffer.from(first.ciphertextChunksRoot).toString('hex'))
       .not.toBe(Buffer.from(second.ciphertextChunksRoot).toString('hex'));
+  });
+
+  it('persists emitted chunks locally before gossip so local self-ACK does not depend on loopback', async () => {
+    const gossipSigner = ethers.Wallet.createRandom();
+    const ackSigner = ethers.Wallet.createRandom();
+    const store = new OxigraphStore();
+    const insertSpy = vi.spyOn(store, 'insert');
+    const canonicalSwmCgId = '0x0609dca0015B271455C89D37501f530c89814a78';
+    const swmGraphId = `${canonicalSwmCgId}/test-kafka-endpoint-registration`;
+    const targetOnChainCgId = '40';
+    const batchId = ethers.getBytes(ethers.id('lu11-self-ack-batch'));
+
+    const agentLike = {
+      log: {
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+      store,
+      canonicalChunkStoreCgIdOrNull: vi.fn((raw: string) => (raw === swmGraphId ? canonicalSwmCgId : null)),
+      gossip: {
+        publish: vi.fn(async () => {}),
+      },
+      gossipWireIdFor: vi.fn((cgId: string) => cgId),
+      _resolveCuratedChainKeyContext: vi.fn(async () => ({
+        chainKey: new Uint8Array(32).fill(7),
+        aeadCgId: targetOnChainCgId,
+      })),
+      resolveWorkspaceGossipSigningAgent: vi.fn(async () => ({
+        privateKey: gossipSigner.privateKey,
+        agentAddress: gossipSigner.address,
+      })),
+    } as any;
+
+    const encryptInlineChunked = await (DKGAgent.prototype as any)
+      ._resolveEncryptInlineChunked.call(agentLike, swmGraphId, undefined, undefined, targetOnChainCgId);
+    expect(encryptInlineChunked).toBeDefined();
+
+    const result = await encryptInlineChunked({
+      plaintextNquads: new TextEncoder().encode('<urn:self> <urn:p> "ack" <urn:g> .\n'),
+      batchId,
+      publishOperationId: 'publish-op-self-ack',
+    });
+
+    expect(result.ciphertextChunkCount).toBe(1);
+    expect(insertSpy).toHaveBeenCalledTimes(1);
+    expect(insertSpy.mock.invocationCallOrder[0])
+      .toBeLessThan(agentLike.gossip.publish.mock.invocationCallOrder[0]);
+    expect(insertSpy.mock.calls[0][0][0]).toMatchObject({
+      subject: ciphertextChunkStoreSubject(batchId, 0),
+      predicate: CIPHERTEXT_CHUNK_PREDICATE,
+      graph: ciphertextChunkStoreGraph(canonicalSwmCgId),
+    });
+
+    const handler = new StorageACKHandler(
+      store as any,
+      {
+        nodeRole: 'core',
+        nodeIdentityId: 7n,
+        signerWallet: ackSigner,
+        chainId: 31337n,
+        kav10Address: '0x000000000000000000000000000000000000c10a',
+        contextGraphSharedMemoryUri: (cgId: string) => `did:dkg:context-graph:${cgId}/_shared_memory`,
+        isCgCurated: async () => true,
+        normalizeContextGraphIdForChunkStore: (raw: string) => (
+          raw === swmGraphId ? canonicalSwmCgId : null
+        ),
+        _v2ChunkLookupRetryPolicyForTests: { maxRetries: 0, delayMs: 0 },
+      },
+      { emit: vi.fn(), on: vi.fn(), off: vi.fn() } as any,
+    );
+
+    const intent = encodePublishIntent({
+      merkleRoot: batchId,
+      contextGraphId: targetOnChainCgId,
+      swmGraphId,
+      publisherPeerId: 'local-publisher-peer',
+      publicByteSize: result.totalCiphertextBytes,
+      isPrivate: false,
+      kaCount: 1,
+      merkleLeafCount: 1,
+      rootEntities: ['urn:self'],
+      stagingQuads: new Uint8Array(0),
+      ackProtocolVersion: ACK_PROTOCOL_VERSION_V2_LU11,
+      ciphertextChunksRoot: result.ciphertextChunksRoot,
+      ciphertextChunkCount: result.ciphertextChunkCount,
+    });
+
+    const ack = decodeStorageACK(await handler.handler(intent, { toString: () => 'local-publisher-peer' } as any));
+
+    expect(isStorageACKDecline(ack)).toBe(false);
+    expect(ack.contextGraphId).toBe(targetOnChainCgId);
   });
 });

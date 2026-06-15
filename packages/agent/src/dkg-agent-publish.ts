@@ -1180,7 +1180,7 @@ export class PublishMethods extends DKGAgentBase {
     this.log.info(ctx, `Starting publish to context graph "${contextGraphId}" with ${quads.length} triples`);
 
     const isSystem = contextGraphId === SYSTEM_CONTEXT_GRAPHS.AGENTS || contextGraphId === SYSTEM_CONTEXT_GRAPHS.ONTOLOGY;
-    if (!isSystem) {
+    if (!isSystem && !this.subscribedContextGraphs.has(contextGraphId)) {
       const exists = await this.contextGraphExists(contextGraphId);
       if (!exists) {
         throw new Error(
@@ -1190,7 +1190,7 @@ export class PublishMethods extends DKGAgentBase {
     }
     const v10ACKProvider = this.createV10ACKProvider(contextGraphId);
 
-    const onChainId = await this.getContextGraphOnChainId(contextGraphId);
+    const onChainId = opts?.onChainContextGraphId ?? await this.getContextGraphOnChainId(contextGraphId);
 
     // RFC-001 §9.x — sign-at-creation. The publisher refuses on-chain
     // publishes without a `precomputedAttestation`, so the agent
@@ -1255,8 +1255,7 @@ export class PublishMethods extends DKGAgentBase {
     // OT-RFC-38 LU-11 — also resolve the chunked emitter for curated
     // CGs. When set, the publisher prefers this path: chunks fan out
     // via SWM gossip and the V2 ACK carries only the commitment.
-    // Public CGs short-circuit to `undefined` here just like the
-    // single-blob resolver above.
+    // Public CGs resolve to `undefined` inside the chain-confirmed resolver.
     const encryptInlineChunked = await this._resolveEncryptInlineChunked(
       contextGraphId,
       opts?.subGraphName,
@@ -1274,7 +1273,9 @@ export class PublishMethods extends DKGAgentBase {
       subGraphName: opts?.subGraphName,
       operationCtx: ctx,
       onPhase,
+      skipContextGraphEnsure: true,
       v10ACKProvider,
+      publisherNodeIdentityIdOverride: opts?.publisherNodeIdentityIdOverride,
       publishContextGraphId: onChainId ?? undefined,
       publishEpochs: opts?.publishEpochs,
       precomputedAttestation,
@@ -2437,7 +2438,7 @@ export class PublishMethods extends DKGAgentBase {
   ): Promise<{ chainKey: Uint8Array; aeadCgId: string; senderAddress: string } | undefined> {
     const ctx = createOperationContext('publish');
     const targetCgId = publishContextGraphId ?? contextGraphId;
-    const probeIsCurated = async (cgId: string): Promise<boolean | null> => {
+    const probeIsCurated = async (cgId: string, opts?: { rawOnChainSlot?: boolean }): Promise<boolean | null> => {
       // Consume the SHARED tri-state resolver (the same one behind the
       // SWM-gossip gate) so the publish-inline path can never DIVERGE from it,
       // and — critically (#884 review 🔴 GZh-c) — so a genuine UNKNOWN is
@@ -2447,7 +2448,12 @@ export class PublishMethods extends DKGAgentBase {
       // fails closed.
       let policyState: 0 | 1 | 'unregistered' | 'unknown';
       try {
-        policyState = await this.resolveOnChainAccessPolicyState(cgId, ctx);
+        if (opts?.rawOnChainSlot && /^\d+$/.test(cgId.trim())) {
+          const policy = await this.readLiveOnChainAccessPolicy(cgId.trim(), ctx);
+          policyState = policy === 0 || policy === 1 ? policy : 'unknown';
+        } else {
+          policyState = await this.resolveOnChainAccessPolicyState(cgId, ctx);
+        }
       } catch (err) {
         this.log.warn(ctx, `${logPrefix}: chain access-policy probe for ${cgId} failed — treating as UNKNOWN (fail-closed): ${err instanceof Error ? err.message : String(err)}`);
         return null;
@@ -2480,11 +2486,19 @@ export class PublishMethods extends DKGAgentBase {
       } catch { /* fall through to the plaintext-inline default */ }
       return false;
     };
-    const sourceIsCurated = await probeIsCurated(contextGraphId);
-    const targetIsCurated = targetCgId === contextGraphId
-      ? sourceIsCurated
-      : await probeIsCurated(targetCgId);
-    if (targetIsCurated == null || (targetCgId !== contextGraphId && sourceIsCurated == null)) {
+    const explicitRawTarget = publishContextGraphId !== undefined && /^\d+$/.test(targetCgId.trim());
+    let sourceIsCurated: boolean | null;
+    let targetIsCurated: boolean | null;
+    if (targetCgId !== contextGraphId && explicitRawTarget) {
+      targetIsCurated = await probeIsCurated(targetCgId, { rawOnChainSlot: true });
+      sourceIsCurated = targetIsCurated ? null : await probeIsCurated(contextGraphId);
+    } else {
+      sourceIsCurated = await probeIsCurated(contextGraphId);
+      targetIsCurated = targetCgId === contextGraphId
+        ? sourceIsCurated
+        : await probeIsCurated(targetCgId);
+    }
+    if (targetIsCurated == null || (targetCgId !== contextGraphId && sourceIsCurated == null && !targetIsCurated)) {
       throw new Error(
         `${logPrefix}: publish access-policy is unknown — ` +
         `source CG "${contextGraphId}" curated=${sourceIsCurated ?? 'unknown'}, ` +
@@ -2492,7 +2506,14 @@ export class PublishMethods extends DKGAgentBase {
         `Refusing to choose plaintext vs encrypted inline payload without chain-confirmed policy.`,
       );
     }
-    if (targetCgId !== contextGraphId && sourceIsCurated !== targetIsCurated) {
+    if (targetCgId !== contextGraphId && sourceIsCurated == null && targetIsCurated) {
+      this.log.warn(
+        ctx,
+        `${logPrefix}: source CG "${contextGraphId}" access-policy is unknown, but explicit target ` +
+        `on-chain CG "${targetCgId}" is chain-confirmed curated; selecting encrypted direct publish payload.`,
+      );
+    }
+    if (targetCgId !== contextGraphId && sourceIsCurated != null && sourceIsCurated !== targetIsCurated) {
       throw new Error(
         `${logPrefix}: remap publish source/target access-policy mismatch — ` +
         `source CG "${contextGraphId}" curated=${sourceIsCurated}, ` +

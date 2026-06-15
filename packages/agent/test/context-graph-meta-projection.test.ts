@@ -14,6 +14,7 @@ describe('ContextGraphMetaProjection', () => {
     const ontologyId = 'projection-list-ontology';
     const agentsId = 'projection-list-agents';
     const metaId = '0x0000000000000000000000000000000000000abc/projection-list-meta';
+    const metaSubGraphId = `${metaId}/tasks`;
 
     await store.insert([
       {
@@ -33,6 +34,12 @@ describe('ContextGraphMetaProjection', () => {
         predicate: DKG_ONTOLOGY.RDF_TYPE,
         object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH,
         graph: contextGraphMetaGraphUri(metaId),
+      },
+      {
+        subject: contextGraphDataGraphUri(metaSubGraphId),
+        predicate: DKG_ONTOLOGY.RDF_TYPE,
+        object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH,
+        graph: contextGraphMetaGraphUri(metaSubGraphId),
       },
     ]);
 
@@ -258,6 +265,31 @@ describe('ContextGraphMetaProjection', () => {
     expect(queryCalls).toBeGreaterThan(4);
   });
 
+  it('honors caller cancellation while waiting on a shared in-flight rebuild', async () => {
+    let releaseQuery!: () => void;
+    const blockedQuery = new Promise<void>((resolve) => { releaseQuery = resolve; });
+    let queryCalls = 0;
+    const store = {
+      async query() {
+        queryCalls += 1;
+        await blockedQuery;
+        return { type: 'bindings', bindings: [] };
+      },
+    } as unknown as TripleStore;
+    const projection = new ContextGraphMetaProjection(store);
+    const first = projection.get('projection-abort-inflight');
+    await Promise.resolve();
+
+    const controller = new AbortController();
+    const second = projection.get('projection-abort-inflight', { signal: controller.signal });
+    controller.abort(new Error('projection aborted'));
+
+    await expect(second).rejects.toThrow('projection aborted');
+    releaseQuery();
+    await expect(first).resolves.toMatchObject({ id: 'projection-abort-inflight' });
+    expect(queryCalls).toBeGreaterThan(0);
+  });
+
   it('projects sub-graph registrations from the context graph meta graph', async () => {
     const store = new OxigraphStore();
     const projection = new ContextGraphMetaProjection(store);
@@ -287,6 +319,34 @@ describe('ContextGraphMetaProjection', () => {
         description: 'Task memory',
       },
     ]);
+  });
+
+  it('returns defensive copies of cached array metadata', async () => {
+    const store = new OxigraphStore();
+    const projection = new ContextGraphMetaProjection(store);
+    const id = 'projection-defensive-copy';
+    const uri = contextGraphDataGraphUri(id);
+    const metaGraph = contextGraphMetaGraphUri(id);
+    const registration = generateSubGraphRegistration({
+      contextGraphId: id,
+      subGraphName: 'copy-safe',
+      createdBy: 'projection-test',
+      timestamp: new Date('2026-01-01T00:00:00.000Z'),
+    });
+
+    await store.insert([
+      { subject: uri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH, graph: metaGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_ALLOWED_PEER, object: '"12D3KooWCopySafePeer111111111111111111111111"', graph: metaGraph },
+      ...registration,
+    ]);
+
+    const first = await projection.get(id);
+    first.allowedPeers.push('poisoned-peer');
+    first.subGraphs[0]!.name = 'poisoned-subgraph';
+
+    const second = await projection.get(id);
+    expect(second.allowedPeers).toEqual(['12D3KooWCopySafePeer111111111111111111111111']);
+    expect(second.subGraphs[0]?.name).toBe('copy-safe');
   });
 
   it('filters projected revoked agents from private participant authorization lists', async () => {

@@ -106,10 +106,10 @@ export class ContextGraphMetaProjection {
 
   async get(contextGraphId: string, options: QueryOptions = {}): Promise<ContextGraphMetaRecord> {
     const existing = this.entries.get(contextGraphId);
-    if (existing?.value && !existing.dirty) return existing.value;
+    if (existing?.value && !existing.dirty) return cloneMetaRecord(existing.value);
     if (existing?.inflight) {
-      if (!existing.dirty) return existing.inflight;
-      await existing.inflight;
+      if (!existing.dirty) return cloneMetaRecord(await raceAgainstAbort(existing.inflight, options.signal));
+      await raceAgainstAbort(existing.inflight, options.signal);
       return this.get(contextGraphId, options);
     }
 
@@ -133,7 +133,7 @@ export class ContextGraphMetaProjection {
 
     entry.inflight = inflight;
     this.entries.set(contextGraphId, entry);
-    return inflight;
+    return cloneMetaRecord(await raceAgainstAbort(inflight, options.signal));
   }
 
   markDirty(contextGraphId: string): void {
@@ -172,20 +172,23 @@ export class ContextGraphMetaProjection {
     assertSafeIri(agentsGraph);
 
     const result = await this.store.query(`
-      SELECT DISTINCT ?ctxGraph WHERE {
+      SELECT DISTINCT ?ctxGraph ?source WHERE {
         {
           GRAPH <${ontologyGraph}> {
             ?ctxGraph <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}> .
+            BIND("ontology" AS ?source)
           }
         } UNION {
           GRAPH <${agentsGraph}> {
             ?ctxGraph <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}> .
+            BIND("agents" AS ?source)
           }
         } UNION {
           GRAPH ?g {
             ?ctxGraph <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}> .
             FILTER(STRSTARTS(STR(?ctxGraph), "${CONTEXT_GRAPH_PREFIX}"))
             FILTER(STR(?g) = CONCAT(STR(?ctxGraph), "/_meta"))
+            BIND("meta" AS ?source)
           }
         }
       }
@@ -196,6 +199,8 @@ export class ContextGraphMetaProjection {
     for (const row of result.bindings) {
       const uri = typeof row['ctxGraph'] === 'string' ? stripTerm(row['ctxGraph']) : '';
       const id = contextGraphIdFromContextGraphUri(uri);
+      const source = typeof row['source'] === 'string' ? stripTerm(row['source']) : '';
+      if (source === 'meta' && id && !isRootContextGraphId(id)) continue;
       if (id) ids.add(id);
     }
     return [...ids].sort();
@@ -421,9 +426,49 @@ function contextGraphIdFromContextGraphUri(uri: string): string | null {
   return tail;
 }
 
+function isRootContextGraphId(id: string): boolean {
+  if (!id.includes('/')) return true;
+  return /^0x[0-9a-fA-F]{40}\/[^/]+$/.test(id);
+}
+
 function contextGraphIdFromMetaGraphUri(uri: string): string | null {
   if (!uri.startsWith(CONTEXT_GRAPH_PREFIX) || !uri.endsWith('/_meta')) return null;
   const tail = uri.slice(CONTEXT_GRAPH_PREFIX.length, -'/_meta'.length);
   if (!tail) return null;
   return tail;
+}
+
+function cloneMetaRecord(record: ContextGraphMetaRecord): ContextGraphMetaRecord {
+  return {
+    ...record,
+    creators: [...record.creators],
+    curators: [...record.curators],
+    allowedPeers: [...record.allowedPeers],
+    allowedAgents: [...record.allowedAgents],
+    participantAgents: [...record.participantAgents],
+    participantIdentityIds: [...record.participantIdentityIds],
+    revokedAgents: [...record.revokedAgents],
+    subGraphs: record.subGraphs.map((subGraph) => ({ ...subGraph })),
+  };
+}
+
+function raceAgainstAbort<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return work;
+  throwIfAborted(signal);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      const reason = signal.reason;
+      reject(reason instanceof Error ? reason : new Error(String(reason ?? 'aborted')));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    work.then(resolve, reject).finally(() => {
+      signal.removeEventListener('abort', onAbort);
+    });
+  });
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return;
+  const reason = signal.reason;
+  throw reason instanceof Error ? reason : new Error(String(reason ?? 'aborted'));
 }

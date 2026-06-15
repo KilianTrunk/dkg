@@ -53,6 +53,7 @@ export class GraphSetIndexStore implements TripleStore {
   }
 
   private readonly inner: TripleStore;
+  private readonly enabled: boolean;
   private readonly revalidateMs: number;
   private readonly now: () => number;
   private readonly onMutation?: (event: GraphSetMutationEvent) => void;
@@ -64,12 +65,17 @@ export class GraphSetIndexStore implements TripleStore {
 
   constructor(inner: TripleStore, options: GraphSetIndexStoreOptions = {}) {
     this.inner = inner;
+    this.enabled = options.enabled !== false;
     this.revalidateMs = Math.max(0, options.revalidateMs ?? DEFAULT_GRAPH_SET_REVALIDATE_MS);
     this.now = options.now ?? (() => performance.now());
     this.onMutation = options.onMutation;
   }
 
   async insert(quads: Quad[]): Promise<void> {
+    if (!this.enabled) {
+      await this.inner.insert(quads);
+      return;
+    }
     await this.inner.insert(quads);
     const touched = namedGraphsFromQuads(quads);
     if (touched.length === 0) return;
@@ -78,6 +84,10 @@ export class GraphSetIndexStore implements TripleStore {
   }
 
   async delete(quads: Quad[]): Promise<void> {
+    if (!this.enabled) {
+      await this.inner.delete(quads);
+      return;
+    }
     await this.inner.delete(quads);
     const touched = namedGraphsFromQuads(quads);
     if (touched.length === 0) return;
@@ -86,6 +96,9 @@ export class GraphSetIndexStore implements TripleStore {
   }
 
   async deleteByPattern(pattern: Partial<Quad>): Promise<number> {
+    if (!this.enabled) {
+      return this.inner.deleteByPattern(pattern);
+    }
     const removed = await this.inner.deleteByPattern(pattern);
     if (removed <= 0) return removed;
     this.bumpMutation();
@@ -99,6 +112,9 @@ export class GraphSetIndexStore implements TripleStore {
   }
 
   async query(sparql: string, options?: QueryOptions): Promise<QueryResult> {
+    if (!this.enabled) {
+      return this.inner.query(sparql, options);
+    }
     const result = await this.inner.query(sparql, options);
     if (isSparqlUpdate(sparql)) {
       this.bumpMutation();
@@ -110,6 +126,9 @@ export class GraphSetIndexStore implements TripleStore {
   }
 
   async hasGraph(graphUri: string): Promise<boolean> {
+    if (!this.enabled) {
+      return this.inner.hasGraph(graphUri);
+    }
     const hasGraph = await this.inner.hasGraph(graphUri);
     const indexed = this.graphs?.has(graphUri);
     if (this.graphs && indexed !== hasGraph) {
@@ -125,22 +144,38 @@ export class GraphSetIndexStore implements TripleStore {
   }
 
   async dropGraph(graphUri: string): Promise<void> {
+    if (!this.enabled) {
+      await this.inner.dropGraph(graphUri);
+      return;
+    }
     await this.inner.dropGraph(graphUri);
     this.bumpMutation();
     this.removeGraphs([graphUri], 'dropGraph');
   }
 
   async listGraphs(options?: QueryOptions): Promise<string[]> {
+    if (!this.enabled) {
+      return this.inner.listGraphs(options);
+    }
     const graphs = await this.ensureGraphSet(options);
     return [...graphs];
   }
 
   async listGraphsByPrefix(prefix: string, options?: QueryOptions): Promise<string[]> {
+    if (!this.enabled) {
+      if (this.inner.listGraphsByPrefix) {
+        return this.inner.listGraphsByPrefix(prefix, options);
+      }
+      return (await this.inner.listGraphs(options)).filter((graph) => graph.startsWith(prefix));
+    }
     const graphs = await this.ensureGraphSet(options);
     return [...graphs].filter((graph) => graph.startsWith(prefix));
   }
 
   async deleteBySubjectPrefix(graphUri: string, prefix: string): Promise<number> {
+    if (!this.enabled) {
+      return this.inner.deleteBySubjectPrefix(graphUri, prefix);
+    }
     const removed = await this.inner.deleteBySubjectPrefix(graphUri, prefix);
     if (removed <= 0) return removed;
     this.bumpMutation();

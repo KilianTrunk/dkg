@@ -1482,21 +1482,11 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
     contextGraphId: string,
     options: { signal?: AbortSignal } = {},
   ): Promise<string | undefined> {
-    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
-    const contextGraphUri = contextGraphDataGraphUri(contextGraphId);
-
-    const curatorResult = await this.store.query(
-      `SELECT ?curator WHERE {
-        GRAPH <${cgMetaGraph}> {
-          <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_CURATOR}> ?curator
-        }
-      } LIMIT 1`,
-      { signal: options.signal },
-    );
-    if (curatorResult.type !== 'bindings' || curatorResult.bindings.length === 0) {
+    const meta = await this.getCgMeta(contextGraphId, { signal: options.signal });
+    const curatorDid = meta.curator ?? meta.curators[0] ?? '';
+    if (!curatorDid) {
       return undefined;
     }
-    const curatorDid = (curatorResult.bindings[0] as Record<string, string>)['curator'] ?? '';
     const didPrefix = 'did:dkg:agent:';
     if (!curatorDid.startsWith(didPrefix)) {
       return undefined;
@@ -1512,31 +1502,20 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
     if (curatorIdentifier.startsWith('0x')) {
       let resolved = false;
 
-      // Preferred: look up the creator peer ID from the ontology definition
-      // graph or the _meta graph. The dkg:creator triple uses the libp2p
-      // peer ID while dkg:curator uses the wallet address.
-      const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
-      const creatorResult = await this.store.query(
-        `SELECT ?creator WHERE {
-          {
-            GRAPH <${ontologyGraph}> {
-              <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_CREATOR}> ?creator
-            }
-          } UNION {
-            GRAPH <${cgMetaGraph}> {
-              <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_CREATOR}> ?creator
-            }
-          }
-        } LIMIT 1`,
-        { signal: options.signal },
-      );
-      if (creatorResult.type === 'bindings' && creatorResult.bindings.length > 0) {
-        const creatorDid = (creatorResult.bindings[0] as Record<string, string>)['creator'] ?? '';
+      // Preferred: use the same projected metadata resolution as privacy and
+      // listing reads. AGENTS-only declarations can mark a graph private, so
+      // the refresh path must be able to discover their creator route too.
+      const creatorCandidates = [
+        meta.creator,
+        ...meta.creators,
+      ].filter((value): value is string => Boolean(value));
+      for (const creatorDid of creatorCandidates) {
         if (creatorDid.startsWith(didPrefix)) {
           const creatorId = creatorDid.slice(didPrefix.length);
           if (!creatorId.startsWith('0x')) {
             curatorPeerId = creatorId;
             resolved = true;
+            break;
           }
         }
       }

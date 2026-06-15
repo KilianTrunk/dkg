@@ -58,6 +58,8 @@ describe('Genesis Knowledge', () => {
         predicate: DKG_ONTOLOGY.DKG_CURATOR,
         object: `did:dkg:agent:${agent.peerId}`,
       }]);
+      (agent as unknown as { contextGraphMetaProjection: { markDirty(id: string): void } })
+        .contextGraphMetaProjection.markDirty('register-legacy-peer-curator');
       await expect(agent.registerContextGraph('register-legacy-peer-curator', { callerAgentAddress: nonDefaultAddr }))
         .resolves.toMatchObject({ onChainId: expect.any(String) });
 
@@ -75,6 +77,8 @@ describe('Genesis Knowledge', () => {
           object: 'did:dkg:agent:12D3KooWForeignCreatorPeer111111111111111111111111',
         },
       ]);
+      (agent as unknown as { contextGraphMetaProjection: { markDirty(id: string): void } })
+        .contextGraphMetaProjection.markDirty('register-foreign-peer-only');
 
       await expect(agent.registerContextGraph('register-foreign-peer-only'))
         .rejects.toThrow(/has no address-scoped curator/);

@@ -311,6 +311,38 @@ describe('ContextGraphMetaProjection', () => {
     expect(participants).toEqual([active, 'identity:legacy']);
   });
 
+  it('routes AGENTS-only wallet curators through projected creator peer metadata', async () => {
+    const store = new OxigraphStore();
+    const projection = new ContextGraphMetaProjection(store);
+    const id = 'projection-agents-curator-route';
+    const uri = contextGraphDataGraphUri(id);
+    const agentsGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.AGENTS);
+    const curatorAddress = '0x0000000000000000000000000000000000000abc';
+    const creatorPeerId = '12D3KooWAgentsCreatorPeer111111111111111111111111';
+
+    await store.insert([
+      { subject: uri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH, graph: agentsGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_ACCESS_POLICY, object: '"private"', graph: agentsGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_CURATOR, object: `did:dkg:agent:${curatorAddress}`, graph: agentsGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_CREATOR, object: `did:dkg:agent:${creatorPeerId}`, graph: agentsGraph },
+    ]);
+
+    const agentLike = {
+      getCgMeta: (contextGraphId: string) => projection.get(contextGraphId),
+      discovery: {
+        findAgents: async () => {
+          throw new Error('registry fallback should not be needed');
+        },
+      },
+    };
+
+    const curatorPeerId = await (DKGAgent.prototype as unknown as {
+      resolveCuratorPeerId(this: unknown, contextGraphId: string): Promise<string | undefined>;
+    }).resolveCuratorPeerId.call(agentLike, id);
+
+    expect(curatorPeerId).toBe(creatorPeerId);
+  });
+
   it('filters projected revoked agents from registration participant agents', async () => {
     const revoked = '0x0000000000000000000000000000000000000111';
     const active = '0x0000000000000000000000000000000000000222';

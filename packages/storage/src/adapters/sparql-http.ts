@@ -75,8 +75,24 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   throw reason instanceof Error ? reason : new Error(String(reason ?? 'aborted'));
 }
 
+function raceAgainstAbort<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return work;
+  throwIfAborted(signal);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      const reason = signal.reason;
+      reject(reason instanceof Error ? reason : new Error(String(reason ?? 'aborted')));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    work.then(resolve, reject).finally(() => {
+      signal.removeEventListener('abort', onAbort);
+    });
+  });
+}
+
 const DEFAULT_SLOW_QUERY_THRESHOLD_MS = 10_000;
 const DEFAULT_SLOW_QUERY_SAMPLE_RATE = 1;
+const MANAGED_LIST_GRAPHS_CACHE_MS = 30_000;
 const monotonicNow = (): number => performance.now();
 
 export interface SparqlHttpQueryOptions extends QueryOptions {
@@ -105,14 +121,14 @@ export interface SparqlHttpStoreOptions {
   auth?: string;
   /**
    * Marker used by higher-level daemon flows to distinguish daemon-owned
-   * endpoints from operator-provided URLs. Graph-list indexing is handled by
-   * GraphSetIndexStore rather than this adapter.
+   * endpoints from operator-provided URLs.
    *
    * Compatibility note: direct `new SparqlHttpStore({ managedByDkg: true })`
-   * callers no longer get adapter-local `listGraphs()` caching. Use
+   * callers keep the legacy adapter-local `listGraphs()` cache. The
    * `createTripleStore({ backend: 'sparql-http', options: { managedByDkg: true } })`
-   * or wrap this store in `GraphSetIndexStore` to preserve the managed-endpoint
-   * graph-list index/revalidation behavior.
+   * path suppresses that adapter-local cache and wraps the store in
+   * GraphSetIndexStore so managed daemon flows still have a single graph-list
+   * index/revalidation owner.
    */
   managedByDkg?: boolean;
   /** Emit sampled slow-query events after this duration. Default 10_000 ms; set 0 to disable. */
@@ -135,11 +151,17 @@ export class SparqlHttpStore implements TripleStore {
   private readonly updateEndpoint: string;
   private readonly timeout: number;
   private readonly headers: Record<string, string>;
+  private readonly managedByDkg: boolean;
 
   private readonly now: () => number;
   private readonly slowQueryThresholdMs: number;
   private readonly slowQuerySampleRate: number;
   private readonly onSlowQuery?: (event: SparqlHttpSlowQueryEvent) => void;
+  private listGraphsCache: string[] | null = null;
+  private listGraphsCachedAt = 0;
+  private listGraphsGeneration = 0;
+  private listGraphsInFlight: Promise<string[]> | null = null;
+
   constructor(options: SparqlHttpStoreOptions) {
     if (!options.queryEndpoint?.trim()) {
       throw new Error('sparql-http adapter requires options.queryEndpoint');
@@ -147,6 +169,7 @@ export class SparqlHttpStore implements TripleStore {
     this.queryEndpoint = options.queryEndpoint.replace(/\/$/, '');
     this.updateEndpoint = (options.updateEndpoint ?? options.queryEndpoint).replace(/\/$/, '');
     this.timeout = options.timeout ?? 30_000;
+    this.managedByDkg = options.managedByDkg === true;
     this.now = options.now ?? monotonicNow;
     this.slowQueryThresholdMs = normalizeNonNegativeNumber(
       options.slowQueryThresholdMs,
@@ -221,6 +244,7 @@ export class SparqlHttpStore implements TripleStore {
       const text = await res.text().catch(() => '');
       throw new Error(`SPARQL HTTP insert failed (${res.status}): ${text.slice(0, 300)}`);
     }
+    this.invalidateListGraphsCache();
   }
 
   async delete(quads: DKGQuad[]): Promise<void> {
@@ -239,6 +263,7 @@ export class SparqlHttpStore implements TripleStore {
       const text = await res.text().catch(() => '');
       throw new Error(`SPARQL HTTP delete failed (${res.status}): ${text.slice(0, 300)}`);
     }
+    this.invalidateListGraphsCache();
   }
 
   async deleteByPattern(pattern: Partial<DKGQuad>): Promise<number> {
@@ -261,6 +286,7 @@ export class SparqlHttpStore implements TripleStore {
       const text = await res.text().catch(() => '');
       throw new Error(`SPARQL HTTP deleteByPattern failed (${res.status}): ${text.slice(0, 300)}`);
     }
+    this.invalidateListGraphsCache();
     const after = await this.countQuads(graphUri);
     return Math.max(0, before - after);
   }
@@ -274,6 +300,7 @@ export class SparqlHttpStore implements TripleStore {
       const text = await res.text().catch(() => '');
       throw new Error(`SPARQL HTTP deleteBySubjectPrefix failed (${res.status}): ${text.slice(0, 300)}`);
     }
+    this.invalidateListGraphsCache();
     const after = await this.countQuads(graphUri);
     return Math.max(0, before - after);
   }
@@ -355,15 +382,59 @@ export class SparqlHttpStore implements TripleStore {
       const text = await res.text().catch(() => '');
       throw new Error(`SPARQL HTTP dropGraph failed (${res.status}): ${text.slice(0, 300)}`);
     }
+    this.invalidateListGraphsCache();
   }
 
   async listGraphs(options?: QueryOptions): Promise<string[]> {
+    if (!this.managedByDkg) {
+      return this.listGraphsDirect(options);
+    }
+    throwIfAborted(options?.signal);
+    if (
+      this.listGraphsCache &&
+      this.now() - this.listGraphsCachedAt < MANAGED_LIST_GRAPHS_CACHE_MS
+    ) {
+      return [...this.listGraphsCache];
+    }
+
+    const inFlight = this.listGraphsInFlight ?? this.refreshListGraphsCache(options);
+    const graphs = await raceAgainstAbort(inFlight, options?.signal);
+    return [...graphs];
+  }
+
+  private async listGraphsDirect(options?: QueryOptions): Promise<string[]> {
     throwIfAborted(options?.signal);
     const r = await this.query(
       'SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }',
       { ...options, source: options?.source ?? 'sparql-http.listGraphs' },
     );
     return r.type === 'bindings' ? r.bindings.map((b) => b.g).filter(Boolean) : [];
+  }
+
+  private refreshListGraphsCache(options?: QueryOptions): Promise<string[]> {
+    const generation = this.listGraphsGeneration;
+    const task = (async () => {
+      try {
+        const graphs = await this.listGraphsDirect(options);
+        const cached = [...graphs];
+        if (generation === this.listGraphsGeneration) {
+          this.listGraphsCache = cached;
+          this.listGraphsCachedAt = this.now();
+        }
+        return cached;
+      } finally {
+        if (this.listGraphsGeneration === generation) this.listGraphsInFlight = null;
+      }
+    })();
+    this.listGraphsInFlight = task;
+    return task;
+  }
+
+  private invalidateListGraphsCache(): void {
+    this.listGraphsGeneration++;
+    this.listGraphsCache = null;
+    this.listGraphsCachedAt = 0;
+    this.listGraphsInFlight = null;
   }
 
   async countQuads(graphUri?: string): Promise<number> {

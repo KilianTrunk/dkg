@@ -358,7 +358,7 @@ describe('SparqlHttpStore (test server)', () => {
   });
 
   describe('listGraphs()', () => {
-    it('scans directly even when managedByDkg is set; GraphSetIndexStore owns caching', async () => {
+    it('preserves adapter-local listGraphs caching for direct managedByDkg callers', async () => {
       listGraphsHits = 0;
       const store = new SparqlHttpStore({
         queryEndpoint: queryUrl,
@@ -369,7 +369,41 @@ describe('SparqlHttpStore (test server)', () => {
       const b = await store.listGraphs();
       expect(a).toContain('http://ex.org/g1');
       expect(b).toContain('http://ex.org/g1');
+      expect(listGraphsHits).toBe(1);
+
+      await store.insert([{
+        subject: 'http://ex.org/s',
+        predicate: 'http://ex.org/p',
+        object: '"v"',
+        graph: 'http://ex.org/g2',
+      }]);
+      await expect(store.listGraphs()).resolves.toContain('http://ex.org/g1');
       expect(listGraphsHits).toBe(2);
+    });
+
+    it('uses GraphSetIndexStore as the only cache owner for managed factory stores', async () => {
+      listGraphsHits = 0;
+      const store = await createTripleStore({
+        backend: 'sparql-http',
+        options: {
+          queryEndpoint: queryUrl,
+          updateEndpoint: updateUrl,
+          managedByDkg: true,
+        },
+        graphSetIndex: { revalidateMs: 0 },
+      });
+      try {
+        expect(typeof store.listGraphsByPrefix).toBe('function');
+        await expect(store.listGraphsByPrefix!('http://ex.org/')).resolves.toEqual([
+          'http://ex.org/g1',
+        ]);
+        await expect(store.listGraphsByPrefix!('http://ex.org/')).resolves.toEqual([
+          'http://ex.org/g1',
+        ]);
+        expect(listGraphsHits).toBe(2);
+      } finally {
+        await store.close();
+      }
     });
   });
 });

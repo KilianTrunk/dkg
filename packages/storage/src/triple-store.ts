@@ -194,7 +194,7 @@ export async function createTripleStore(
         `Registered: [${[...adapterRegistry.keys()].join(', ')}]`,
     );
   }
-  const store = await factory(config.options);
+  const store = await factory(resolveAdapterOptions(config));
   const largeLiteralStorage = resolveLargeLiteralStorageOptions(config);
   const withLargeLiteralStorage = largeLiteralStorage
     ? new SharedMemoryLiteralBlobStore(store, largeLiteralStorage)
@@ -202,16 +202,34 @@ export async function createTripleStore(
   return wrapGraphSetIndex(withLargeLiteralStorage, config);
 }
 
+function resolveAdapterOptions(config: TripleStoreConfig): Record<string, unknown> | undefined {
+  if (
+    config.backend !== 'sparql-http' ||
+    config.options?.managedByDkg !== true ||
+    isGraphSetIndexExplicitlyDisabled(config.graphSetIndex) ||
+    !shouldEnableGraphSetIndex(config)
+  ) {
+    return config.options;
+  }
+  return { ...config.options, managedByDkg: false };
+}
+
 function wrapGraphSetIndex(
   store: TripleStore,
   config: TripleStoreConfig,
 ): TripleStore {
   const graphSetIndex = config.graphSetIndex;
-  if (graphSetIndex === false) return store;
-  if (typeof graphSetIndex === 'object' && graphSetIndex.enabled === false) return store;
+  if (isGraphSetIndexExplicitlyDisabled(graphSetIndex)) return store;
   if (!shouldEnableGraphSetIndex(config)) return store;
   const options = typeof graphSetIndex === 'object' ? graphSetIndex : undefined;
   return new GraphSetIndexStore(store, options);
+}
+
+function isGraphSetIndexExplicitlyDisabled(
+  graphSetIndex: TripleStoreConfig['graphSetIndex'],
+): boolean {
+  return graphSetIndex === false ||
+    (typeof graphSetIndex === 'object' && graphSetIndex.enabled === false);
 }
 
 function shouldEnableGraphSetIndex(config: TripleStoreConfig): boolean {

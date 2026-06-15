@@ -88,6 +88,26 @@ describe('GraphSetIndexStore', () => {
     expect(counting.listGraphsCalls).toBe(1);
   });
 
+  it('honors enabled false for direct callers by passing graph reads through', async () => {
+    const inner = new OxigraphStore();
+    const counting = new CountingStore(inner);
+    const events: unknown[] = [];
+    const store = new GraphSetIndexStore(counting, {
+      enabled: false,
+      onMutation: (event) => events.push(event),
+    });
+
+    await store.insert([q('did:dkg:context-graph:disabled')]);
+    await expect(store.listGraphsByPrefix('did:dkg:context-graph:dis')).resolves.toEqual([
+      'did:dkg:context-graph:disabled',
+    ]);
+    await expect(store.listGraphsByPrefix('did:dkg:context-graph:dis')).resolves.toEqual([
+      'did:dkg:context-graph:disabled',
+    ]);
+    expect(counting.listGraphsCalls).toBe(2);
+    expect(events).toEqual([]);
+  });
+
   it('maintains the graph set through local insert/delete/drop/deleteBySubjectPrefix mutators', async () => {
     const counting = new CountingStore(new OxigraphStore());
     const store = new GraphSetIndexStore(counting);

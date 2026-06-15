@@ -3622,6 +3622,35 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     return true;
   }
 
+  beginContextGraphSubscriptionPersistRevision(this: DKGAgent, contextGraphId: string, revision?: number): void {
+    if (revision == null) return;
+    let pending = this.contextGraphSubscriptionPersistPendingRevisions.get(contextGraphId);
+    if (!pending) {
+      pending = new Set<number>();
+      this.contextGraphSubscriptionPersistPendingRevisions.set(contextGraphId, pending);
+    }
+    pending.add(revision);
+  }
+
+  finishContextGraphSubscriptionPersistRevision(this: DKGAgent, contextGraphId: string, revision?: number): void {
+    if (revision == null) return;
+    const pending = this.contextGraphSubscriptionPersistPendingRevisions.get(contextGraphId);
+    pending?.delete(revision);
+    if (pending && pending.size > 0) return;
+    this.contextGraphSubscriptionPersistPendingRevisions.delete(contextGraphId);
+    this.clearContextGraphSubscriptionPersistRevisionStateIfIdle(contextGraphId);
+  }
+
+  clearContextGraphSubscriptionPersistRevisionStateIfIdle(this: DKGAgent, contextGraphId: string): void {
+    if ((this.contextGraphSubscriptionPersistPendingRevisions.get(contextGraphId)?.size ?? 0) > 0) return;
+    const sub = this.subscribedContextGraphs.get(contextGraphId);
+    if (sub?.subscribed === true || sub?.coreHosted === true) return;
+    if (this.contextGraphSubscriptionRehydrationAccountedIds.has(contextGraphId)) return;
+    this.contextGraphSubscriptionPersistRevisions.delete(contextGraphId);
+    this.contextGraphSubscriptionPersistAppliedRevisions.delete(contextGraphId);
+    this.contextGraphSubscriptionPersistCanceledRevisions.delete(contextGraphId);
+  }
+
   updateContextGraphSubscriptionRehydrationStatusAfterPersist(this: DKGAgent,
     contextGraphId: string,
     next?: ContextGraphSub,
@@ -3723,6 +3752,9 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       dormantIds,
       completedAt: Date.now(),
     };
+    for (const id of clearedSet) {
+      this.clearContextGraphSubscriptionPersistRevisionStateIfIdle(id);
+    }
   }
 
   deleteContextGraphSubscription(this: DKGAgent, contextGraphId: string): boolean {
@@ -3753,6 +3785,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     // the host-only record MUST survive restart so a Core that was offline
     // during a publish remembers it hosts the CG and fills its gap. Drop the
     // row only when the node neither subscribes to nor hosts the CG.
+    this.beginContextGraphSubscriptionPersistRevision(contextGraphId, options?.revision);
     if (!sub?.subscribed && !sub?.coreHosted) {
       void store.delete(contextGraphId)
         .then(() => {
@@ -3768,6 +3801,9 @@ export class LifecycleSyncMethods extends DKGAgentBase {
             createOperationContext('system'),
             `Failed to delete persisted context-graph subscription for "${contextGraphId}": ${err instanceof Error ? err.message : String(err)}`,
           );
+        })
+        .finally(() => {
+          this.finishContextGraphSubscriptionPersistRevision(contextGraphId, options?.revision);
         });
       return;
     }
@@ -3795,6 +3831,8 @@ export class LifecycleSyncMethods extends DKGAgentBase {
         createOperationContext('system'),
         `Failed to persist context-graph subscription for "${contextGraphId}": ${err instanceof Error ? err.message : String(err)}`,
       );
+    }).finally(() => {
+      this.finishContextGraphSubscriptionPersistRevision(contextGraphId, options?.revision);
     });
   }
 

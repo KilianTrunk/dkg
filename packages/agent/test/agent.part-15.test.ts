@@ -831,6 +831,14 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
           dormant: 0,
           dormantIds: [],
         });
+        for (const mapName of [
+          'contextGraphSubscriptionPersistRevisions',
+          'contextGraphSubscriptionPersistAppliedRevisions',
+          'contextGraphSubscriptionPersistCanceledRevisions',
+          'contextGraphSubscriptionPersistPendingRevisions',
+        ]) {
+          expect((agent as any)[mapName].has('clear-cg-0')).toBe(false);
+        }
       } finally {
         await agent.stop().catch(() => {});
       }
@@ -909,6 +917,14 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
           dormant: 0,
           dormantIds: [],
         });
+        for (const mapName of [
+          'contextGraphSubscriptionPersistRevisions',
+          'contextGraphSubscriptionPersistAppliedRevisions',
+          'contextGraphSubscriptionPersistCanceledRevisions',
+          'contextGraphSubscriptionPersistPendingRevisions',
+        ]) {
+          expect((agent as any)[mapName].has('preclear-created')).toBe(false);
+        }
       } finally {
         for (const { resolve } of saveResolvers) resolve();
         await agent.stop().catch(() => {});

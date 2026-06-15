@@ -2677,6 +2677,7 @@ export class PublishMethods extends DKGAgentBase {
         ciphertextChunksRoot: Uint8Array;
         ciphertextChunkCount: number;
         totalCiphertextBytes: number;
+        ciphertextChunks: Uint8Array[];
       }>)
     | undefined
   > {
@@ -2705,6 +2706,7 @@ export class PublishMethods extends DKGAgentBase {
       ciphertextChunksRoot: Uint8Array;
       ciphertextChunkCount: number;
       totalCiphertextBytes: number;
+      ciphertextChunks: Uint8Array[];
     }> => {
       if (input.batchId.length !== 32) {
         throw new Error(
@@ -2793,6 +2795,7 @@ export class PublishMethods extends DKGAgentBase {
         ciphertextChunksRoot: root,
         ciphertextChunkCount: leafCount,
         totalCiphertextBytes,
+        ciphertextChunks,
       };
     };
   }

@@ -440,6 +440,10 @@ function stripTerm(value: string): string {
 function applyAccessPolicy(record: ContextGraphMetaRecord, value: string): void {
   const normalized = value.trim().toLowerCase();
   if (normalized === 'private' || normalized === 'public') {
+    // First value wins because rebuild() loads _meta, then AGENTS, then ONTOLOGY.
+    // This is safe for CG-level policy: curated writers put private in _meta,
+    // public writers put public in ONTOLOGY, gossip drops /_meta quads, and
+    // AGENTS precedes ONTOLOGY to preserve agents-declared-private rows.
     record.accessPolicy ??= normalized;
     return;
   }

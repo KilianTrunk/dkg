@@ -430,6 +430,10 @@ type InternalContextGraphListRow = ListContextGraphsRow & {
 };
 
 function listContextGraphsProjectionEnabled(): boolean {
+  // Before enabling this default-on: thread the caller signal into getCgMeta
+  // and wrap per-row reads in withBudget (per A1's LIST_CONTEXT_GRAPHS_*_BUDGET_MS);
+  // this projection path currently lacks the per-read budgets/abort-signal the
+  // legacy path has. (Track C security review.)
   const raw = process.env.DKG_LIST_CONTEXT_GRAPHS_PROJECTION?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
 }
@@ -497,6 +501,10 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
   }
 
   async listContextGraphsFromProjection(this: DKGAgent, opts?: { callerAgentAddress?: string | null }): Promise<ListContextGraphsRow[]> {
+    // Before enabling this default-on: thread the caller signal into getCgMeta
+    // and wrap per-row reads in withBudget (per A1's LIST_CONTEXT_GRAPHS_*_BUDGET_MS);
+    // this projection path currently lacks the per-read budgets/abort-signal the
+    // legacy path has. (Track C security review.)
     const candidateIds = new Set(await this.contextGraphMetaProjection.listDeclaredContextGraphIds());
     for (const [id] of this.subscribedContextGraphs) {
       candidateIds.add(id);
@@ -2067,7 +2075,8 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
     /**
      * Normalize metadata through the keyed projection before privacy filtering.
      * Raw discovery can see stale ONTOLOGY and authoritative AGENTS/_meta rows
-     * for the same CG; projection gives private policy precedence.
+     * for the same CG; projection resolves policy with _meta-first source
+     * precedence, then AGENTS, then ONTOLOGY.
      */
     const projectedRows = await Promise.allSettled(rows.map(async (r) => {
       const metaRead = await withBudget(

@@ -1591,6 +1591,10 @@ export class SharedMemoryHandler {
 
     const projected = await this.contextGraphMetaOracle?.(contextGraphId);
     if (projected?.accessPolicy) {
+      // Projection uses _meta-first source precedence. This SWM gate keeps that
+      // safe because curated writers put private in _meta, public writers put
+      // public in ONTOLOGY, gossip drops /_meta quads, and AGENTS precedes
+      // ONTOLOGY to preserve agents-declared-private rows.
       return projected.accessPolicy.trim().toLowerCase() === 'private';
     }
 

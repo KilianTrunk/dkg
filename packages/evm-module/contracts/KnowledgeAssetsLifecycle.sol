@@ -516,7 +516,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         uint256 convictionAccountId = publishingConvictionNFT.agentToAccountId(msg.sender);
         bool useConviction;
         if (convictionAccountId != 0) {
-            (,,,, uint40 expiresAtTimestamp, uint16 lockDurationEpochs,,,) =
+            (,,,, uint40 expiresAtTimestamp, uint16 lockDurationEpochs,,,,,) =
                 publishingConvictionNFT.accounts(convictionAccountId);
             useConviction =
                 block.timestamp < uint256(expiresAtTimestamp) &&
@@ -1263,7 +1263,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         uint256 convictionAccountId = publishingConvictionNFT.agentToAccountId(msg.sender);
         bool useConviction;
         if (convictionAccountId != 0) {
-            (,,,, uint40 expiresAtTimestamp, uint16 lockDurationEpochs,,,) =
+            (,,,, uint40 expiresAtTimestamp, uint16 lockDurationEpochs,,,,,) =
                 publishingConvictionNFT.accounts(convictionAccountId);
             useConviction =
                 block.timestamp < uint256(expiresAtTimestamp) &&

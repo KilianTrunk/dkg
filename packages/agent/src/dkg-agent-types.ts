@@ -669,7 +669,10 @@ export interface ContextGraphSubscriptionRehydrationStatus {
   activationCap: number;
   capDisabled: boolean;
   dormantIds: string[];
+  /** Startup rehydration completion timestamp; remains stable after boot. */
   completedAt: number;
+  /** Most recent timestamp for post-boot diagnostic count/id updates. */
+  updatedAt: number;
 }
 
 export interface ContextGraphWritePreflightProbe {

@@ -17,6 +17,7 @@ describe('context graph subscription diagnostics route', () => {
     capDisabled: false,
     dormantIds: ['cg-064', 'cg-065', 'cg-066', 'cg-067', 'cg-068', 'cg-069'],
     completedAt: 1_700_000_000_000,
+    updatedAt: 1_700_000_000_000,
   };
   let rehydrationStatus: typeof rehydration | null = null;
   let subscriptions: Map<string, any>;
@@ -41,7 +42,7 @@ describe('context graph subscription diagnostics route', () => {
               activated: 2,
               dormant: 0,
               dormantIds: [],
-              completedAt: 1_700_000_000_001,
+              updatedAt: 1_700_000_000_001,
             }
           : null;
         subscriptions.delete('cg-000');
@@ -165,7 +166,8 @@ describe('context graph subscription diagnostics route', () => {
       activated: 2,
       dormant: 0,
       dormantIds: [],
-      completedAt: 1_700_000_000_001,
+      completedAt: 1_700_000_000_000,
+      updatedAt: 1_700_000_000_001,
     });
   });
 });

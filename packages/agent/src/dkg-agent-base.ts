@@ -891,6 +891,7 @@ export class DKGAgentBase {
   protected readonly contextGraphSubscriptionPersistAppliedRevisions = new Map<string, number>();
   protected readonly contextGraphSubscriptionPersistCanceledRevisions = new Map<string, number>();
   protected readonly contextGraphSubscriptionPersistPendingRevisions = new Map<string, Set<number>>();
+  protected readonly contextGraphSubscriptionPersistChains = new Map<string, Promise<void>>();
   protected readonly listContextGraphsCache = new Map<string, {
     expiresAt: number;
     rows: Array<Record<string, unknown>>;

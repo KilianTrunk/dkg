@@ -3578,14 +3578,16 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       this.clearVmReconcileStateForContextGraph(contextGraphId);
     }
     if (options?.persist !== false) {
-      const revision = this.nextContextGraphSubscriptionPersistRevision(contextGraphId);
-      this.persistContextGraphSubscription(
-        contextGraphId,
-        {
-          revision,
-          updateRehydrationStatus: options?.updateRehydrationStatus !== false,
-        },
-      );
+      if (this.config.contextGraphSubscriptionStore) {
+        const revision = this.nextContextGraphSubscriptionPersistRevision(contextGraphId);
+        this.persistContextGraphSubscription(
+          contextGraphId,
+          {
+            revision,
+            updateRehydrationStatus: options?.updateRehydrationStatus !== false,
+          },
+        );
+      }
       if (next.subscribed) {
         this.persistLocalNodeMembership(contextGraphId);
       } else {
@@ -3608,6 +3610,10 @@ export class LifecycleSyncMethods extends DKGAgentBase {
   }
 
   cancelContextGraphSubscriptionPersistRevisions(this: DKGAgent, contextGraphId: string): void {
+    if (!this.config.contextGraphSubscriptionStore) {
+      this.clearContextGraphSubscriptionPersistRevisionStateIfIdle(contextGraphId);
+      return;
+    }
     const revision = this.nextContextGraphSubscriptionPersistRevision(contextGraphId);
     this.contextGraphSubscriptionPersistCanceledRevisions.set(contextGraphId, revision);
   }
@@ -3632,6 +3638,23 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     pending.add(revision);
   }
 
+  enqueueContextGraphSubscriptionPersistWrite(
+    this: DKGAgent,
+    contextGraphId: string,
+    write: () => Promise<void>,
+  ): Promise<void> {
+    const previous = this.contextGraphSubscriptionPersistChains.get(contextGraphId) ?? Promise.resolve();
+    const run = previous.then(write);
+    const chain = run.catch(() => undefined);
+    this.contextGraphSubscriptionPersistChains.set(contextGraphId, chain);
+    void chain.finally(() => {
+      if (this.contextGraphSubscriptionPersistChains.get(contextGraphId) !== chain) return;
+      this.contextGraphSubscriptionPersistChains.delete(contextGraphId);
+      this.clearContextGraphSubscriptionPersistRevisionStateIfIdle(contextGraphId);
+    });
+    return run;
+  }
+
   finishContextGraphSubscriptionPersistRevision(this: DKGAgent, contextGraphId: string, revision?: number): void {
     if (revision == null) return;
     const pending = this.contextGraphSubscriptionPersistPendingRevisions.get(contextGraphId);
@@ -3643,9 +3666,11 @@ export class LifecycleSyncMethods extends DKGAgentBase {
 
   clearContextGraphSubscriptionPersistRevisionStateIfIdle(this: DKGAgent, contextGraphId: string): void {
     if ((this.contextGraphSubscriptionPersistPendingRevisions.get(contextGraphId)?.size ?? 0) > 0) return;
+    if (this.contextGraphSubscriptionPersistChains.has(contextGraphId)) return;
     const sub = this.subscribedContextGraphs.get(contextGraphId);
     if (sub?.subscribed === true || sub?.coreHosted === true) return;
     if (this.contextGraphSubscriptionRehydrationAccountedIds.has(contextGraphId)) return;
+    this.contextGraphSubscriptionPersistPendingRevisions.delete(contextGraphId);
     this.contextGraphSubscriptionPersistRevisions.delete(contextGraphId);
     this.contextGraphSubscriptionPersistAppliedRevisions.delete(contextGraphId);
     this.contextGraphSubscriptionPersistCanceledRevisions.delete(contextGraphId);
@@ -3697,7 +3722,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       activated,
       dormant: dormantIds.length,
       dormantIds,
-      completedAt: Date.now(),
+      updatedAt: Date.now(),
     };
   }
 
@@ -3750,7 +3775,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       activated,
       dormant: dormantIds.length,
       dormantIds,
-      completedAt: Date.now(),
+      updatedAt: Date.now(),
     };
     for (const id of clearedSet) {
       this.clearContextGraphSubscriptionPersistRevisionStateIfIdle(id);
@@ -3764,6 +3789,10 @@ export class LifecycleSyncMethods extends DKGAgentBase {
   }
 
   persistContextGraphSubscriptionState(this: DKGAgent, contextGraphId: string): void {
+    if (!this.config.contextGraphSubscriptionStore) {
+      this.clearContextGraphSubscriptionPersistRevisionStateIfIdle(contextGraphId);
+      return;
+    }
     this.persistContextGraphSubscription(contextGraphId, {
       revision: this.nextContextGraphSubscriptionPersistRevision(contextGraphId),
       updateRehydrationStatus: false,
@@ -3779,7 +3808,10 @@ export class LifecycleSyncMethods extends DKGAgentBase {
   ): void {
     this.invalidateListContextGraphsCache();
     const store = this.config.contextGraphSubscriptionStore;
-    if (!store) return;
+    if (!store) {
+      this.clearContextGraphSubscriptionPersistRevisionStateIfIdle(contextGraphId);
+      return;
+    }
     const sub = this.subscribedContextGraphs.get(contextGraphId);
     // Persist member subscriptions AND (Phase D) public CGs this Core hosts —
     // the host-only record MUST survive restart so a Core that was offline
@@ -3787,7 +3819,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     // row only when the node neither subscribes to nor hosts the CG.
     this.beginContextGraphSubscriptionPersistRevision(contextGraphId, options?.revision);
     if (!sub?.subscribed && !sub?.coreHosted) {
-      void store.delete(contextGraphId)
+      void this.enqueueContextGraphSubscriptionPersistWrite(contextGraphId, () => store.delete(contextGraphId))
         .then(() => {
           if (
             options?.updateRehydrationStatus === true &&
@@ -3807,7 +3839,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
         });
       return;
     }
-    void store.save({
+    const record = {
       id: contextGraphId,
       name: sub.name,
       subscribed: sub.subscribed,
@@ -3819,21 +3851,23 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       lastReconciledOrdinal: sub.lastReconciledOrdinal,
       coreHosted: sub.coreHosted,
       syncScoped: (this.config.syncContextGraphs ?? []).includes(contextGraphId),
-    }).then(() => {
-      if (
-        options?.updateRehydrationStatus === true &&
-        this.claimContextGraphSubscriptionPersistRevision(contextGraphId, options.revision)
-      ) {
-        this.updateContextGraphSubscriptionRehydrationStatusAfterPersist(contextGraphId, sub);
-      }
-    }).catch((err) => {
-      this.log.warn(
-        createOperationContext('system'),
-        `Failed to persist context-graph subscription for "${contextGraphId}": ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }).finally(() => {
-      this.finishContextGraphSubscriptionPersistRevision(contextGraphId, options?.revision);
-    });
+    };
+    void this.enqueueContextGraphSubscriptionPersistWrite(contextGraphId, () => store.save(record))
+      .then(() => {
+        if (
+          options?.updateRehydrationStatus === true &&
+          this.claimContextGraphSubscriptionPersistRevision(contextGraphId, options.revision)
+        ) {
+          this.updateContextGraphSubscriptionRehydrationStatusAfterPersist(contextGraphId, sub);
+        }
+      }).catch((err) => {
+        this.log.warn(
+          createOperationContext('system'),
+          `Failed to persist context-graph subscription for "${contextGraphId}": ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }).finally(() => {
+        this.finishContextGraphSubscriptionPersistRevision(contextGraphId, options?.revision);
+      });
   }
 
   normalizeMembershipPrincipal(this: DKGAgent,
@@ -4001,6 +4035,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       for (const row of rows) {
         this.contextGraphSubscriptionRehydrationAccountedIds.add(row.id);
       }
+      const completedAt = Date.now();
       this.contextGraphSubscriptionRehydrationStatus = {
         persistedTotal: rows.length,
         systemExcluded: persistedRows.length - rows.length,
@@ -4011,7 +4046,8 @@ export class LifecycleSyncMethods extends DKGAgentBase {
         activationCap: cap,
         capDisabled: cap === 0,
         dormantIds: dormantRows.map((r) => r.id),
-        completedAt: Date.now(),
+        completedAt,
+        updatedAt: completedAt,
       };
       if (rows.length > 0) {
         this.log.info(
@@ -4095,9 +4131,14 @@ export class LifecycleSyncMethods extends DKGAgentBase {
         );
       }
     }
-    const total = persistedUserIds.length;
+    const activeUserIdsWithPendingStoreWrite = store
+      ? activeUserIds.filter((id) => this.contextGraphSubscriptionPersistChains.has(id))
+      : [];
+    const storeDeleteIds = [...new Set([...persistedUserIds, ...activeUserIdsWithPendingStoreWrite])];
+    const total = storeDeleteIds.length;
+    const idsToCancel = store ? [...new Set([...storeDeleteIds, ...activeUserIds])] : [];
     // Cancel any in-flight save callbacks that started before this bulk clear.
-    for (const id of new Set([...persistedUserIds, ...activeUserIds])) {
+    for (const id of idsToCancel) {
       this.cancelContextGraphSubscriptionPersistRevisions(id);
     }
 
@@ -4130,9 +4171,9 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     let failed = 0;
     if (store) {
       cleared = 0;
-      for (const id of persistedUserIds) {
+      for (const id of storeDeleteIds) {
         try {
-          await store.delete(id);
+          await this.enqueueContextGraphSubscriptionPersistWrite(id, () => store.delete(id));
           cleared++;
           clearedIds.push(id);
         } catch (err) {

@@ -387,13 +387,14 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
           dormant: 1,
           dormantIds: ['one-write-cg-065'],
         });
-        expect(afterStatus?.completedAt).toBeGreaterThanOrEqual(beforeStatus?.completedAt ?? 0);
+        expect(afterStatus?.completedAt).toBe(beforeStatus?.completedAt);
+        expect(afterStatus?.updatedAt).toBeGreaterThanOrEqual(beforeStatus?.updatedAt ?? 0);
       } finally {
         await agent.stop().catch(() => {});
       }
     });
 
-    it('ignores stale persisted-write callbacks when a newer write supersedes the same context graph', async () => {
+    it('serializes a queued delete after an earlier same-context save', async () => {
       const rows = Array.from({ length: 65 }, (_, i) => ({
         id: `stale-write-cg-${String(i).padStart(3, '0')}`,
         name: `Stale Write CG ${i}`,
@@ -444,13 +445,14 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
         await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
         expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
-          persistedTotal: 64,
+          persistedTotal: 65,
           activated: 64,
-          dormant: 0,
-          dormantIds: [],
+          dormant: 1,
+          dormantIds: ['stale-write-cg-064'],
         });
         expect(saveResolvers).toHaveLength(startupSaveCount + 1);
         saveResolvers[startupSaveCount]();
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
         await new Promise<void>((resolve) => setTimeout(resolve, 0));
         expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
           persistedTotal: 64,
@@ -464,7 +466,7 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
       }
     });
 
-    it('accounts a new subscription from the latest persisted callback when an earlier callback is stale', async () => {
+    it('serializes same-context persisted writes so the newest saved state wins', async () => {
       const rows = Array.from({ length: 64 }, (_, i) => ({
         id: `new-race-cg-${String(i).padStart(3, '0')}`,
         name: `New Race CG ${i}`,
@@ -474,11 +476,18 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
         metaSynced: false,
         syncScoped: true,
       }));
+      const persisted = new Map<string, any>(rows.map((r) => [r.id, { ...r }]));
       const saveResolvers: Array<{ id: string; resolve: () => void }> = [];
       const subscriptionStore = {
-        loadAll: async () => rows,
+        loadAll: async () => [...persisted.values()],
         save: async (record: any) => new Promise<void>((resolve) => {
-          saveResolvers.push({ id: record.id, resolve });
+          saveResolvers.push({
+            id: record.id,
+            resolve: () => {
+              persisted.set(record.id, { ...record });
+              resolve();
+            },
+          });
         }),
         delete: async () => {},
       };
@@ -512,11 +521,17 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
           sharedMemorySynced: false,
           metaSynced: false,
         });
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        expect(saveResolvers.slice(startupSaveCount).map((entry) => entry.id)).toEqual([
+          'new-race-created',
+        ]);
+
+        saveResolvers[startupSaveCount].resolve();
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
         expect(saveResolvers.slice(startupSaveCount).map((entry) => entry.id)).toEqual([
           'new-race-created',
           'new-race-created',
         ]);
-
         saveResolvers[startupSaveCount + 1].resolve();
         await new Promise<void>((resolve) => setTimeout(resolve, 0));
         expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
@@ -525,22 +540,14 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
           dormant: 0,
           dormantIds: [],
         });
-
-        saveResolvers[startupSaveCount].resolve();
-        await new Promise<void>((resolve) => setTimeout(resolve, 0));
-        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
-          persistedTotal: 65,
-          activated: 65,
-          dormant: 0,
-          dormantIds: [],
-        });
+        expect(persisted.get('new-race-created')?.synced).toBe(true);
       } finally {
         for (const { resolve } of saveResolvers) resolve();
         await agent.stop().catch(() => {});
       }
     });
 
-    it('accounts an older successful callback when a newer persisted write fails', async () => {
+    it('keeps an older successful persistence when a queued newer write fails', async () => {
       const rows = Array.from({ length: 64 }, (_, i) => ({
         id: `fail-race-cg-${String(i).padStart(3, '0')}`,
         name: `Fail Race CG ${i}`,
@@ -596,19 +603,10 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
           sharedMemorySynced: false,
           metaSynced: false,
         });
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
         expect(saveResolvers.slice(startupSaveCount).map((entry) => entry.id)).toEqual([
           'fail-race-created',
-          'fail-race-created',
         ]);
-
-        saveResolvers[startupSaveCount + 1].reject();
-        await new Promise<void>((resolve) => setTimeout(resolve, 0));
-        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
-          persistedTotal: 64,
-          activated: 64,
-          dormant: 0,
-          dormantIds: [],
-        });
 
         saveResolvers[startupSaveCount].resolve();
         await new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -618,6 +616,20 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
           dormant: 0,
           dormantIds: [],
         });
+        expect(saveResolvers.slice(startupSaveCount).map((entry) => entry.id)).toEqual([
+          'fail-race-created',
+          'fail-race-created',
+        ]);
+
+        saveResolvers[startupSaveCount + 1].reject();
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
+          persistedTotal: 65,
+          activated: 65,
+          dormant: 0,
+          dormantIds: [],
+        });
+        expect(persisted.get('fail-race-created')?.synced).toBe(false);
       } finally {
         for (const { resolve } of saveResolvers) resolve();
         await agent.stop().catch(() => {});
@@ -836,6 +848,7 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
           'contextGraphSubscriptionPersistAppliedRevisions',
           'contextGraphSubscriptionPersistCanceledRevisions',
           'contextGraphSubscriptionPersistPendingRevisions',
+          'contextGraphSubscriptionPersistChains',
         ]) {
           expect((agent as any)[mapName].has('clear-cg-0')).toBe(false);
         }
@@ -896,21 +909,29 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
           sharedMemorySynced: false,
           metaSynced: false,
         });
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
         expect(saveResolvers.slice(startupSaveCount).map((entry) => entry.id)).toEqual([
           'preclear-created',
         ]);
 
-        expect(await agent.clearContextGraphSubscriptions()).toBe(64);
+        let clearSettled = false;
+        const clearPromise = agent.clearContextGraphSubscriptions().then((cleared) => {
+          clearSettled = true;
+          return cleared;
+        });
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        expect(clearSettled).toBe(false);
+
+        saveResolvers.find((entry) => entry.id === 'preclear-created')?.resolve();
+        expect(await clearPromise).toBe(65);
         expect(agent.getSubscribedContextGraphs().get('preclear-created')).toBeUndefined();
+        expect(persisted.has('preclear-created')).toBe(false);
         expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
           persistedTotal: 0,
           activated: 0,
           dormant: 0,
           dormantIds: [],
         });
-
-        saveResolvers.find((entry) => entry.id === 'preclear-created')?.resolve();
-        await new Promise<void>((resolve) => setTimeout(resolve, 0));
         expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
           persistedTotal: 0,
           activated: 0,
@@ -922,11 +943,51 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
           'contextGraphSubscriptionPersistAppliedRevisions',
           'contextGraphSubscriptionPersistCanceledRevisions',
           'contextGraphSubscriptionPersistPendingRevisions',
+          'contextGraphSubscriptionPersistChains',
         ]) {
           expect((agent as any)[mapName].has('preclear-created')).toBe(false);
         }
       } finally {
         for (const { resolve } of saveResolvers) resolve();
+        await agent.stop().catch(() => {});
+      }
+    });
+
+    it('does not allocate subscription persist revision state without a subscription store', async () => {
+      const agent = await DKGAgent.create({
+        name: 'StorelessSubscriptionRevisionCleanup',
+        listenHost: '127.0.0.1',
+        chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+      });
+      try {
+        await agent.start();
+        agent.setContextGraphSubscription('storeless-transient', {
+          name: 'Storeless Transient',
+          subscribed: true,
+          synced: false,
+          sharedMemorySynced: false,
+          metaSynced: false,
+        });
+        agent.persistContextGraphSubscriptionState('storeless-transient');
+        agent.setContextGraphSubscription('storeless-transient', {
+          name: 'Storeless Transient',
+          subscribed: false,
+          synced: false,
+          sharedMemorySynced: false,
+          metaSynced: false,
+        });
+        expect(await agent.clearContextGraphSubscriptions()).toBe(0);
+
+        for (const mapName of [
+          'contextGraphSubscriptionPersistRevisions',
+          'contextGraphSubscriptionPersistAppliedRevisions',
+          'contextGraphSubscriptionPersistCanceledRevisions',
+          'contextGraphSubscriptionPersistPendingRevisions',
+          'contextGraphSubscriptionPersistChains',
+        ]) {
+          expect((agent as any)[mapName].has('storeless-transient')).toBe(false);
+        }
+      } finally {
         await agent.stop().catch(() => {});
       }
     });

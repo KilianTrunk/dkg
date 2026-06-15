@@ -63,11 +63,13 @@ describe('Genesis Knowledge', () => {
 
       await agent.createContextGraph({ id: 'register-foreign-peer-only', name: 'Foreign Peer Only' });
       const contextGraphUri = 'did:dkg:context-graph:register-foreign-peer-only';
-      await store.deleteByPattern({ graph: 'did:dkg:context-graph:register-foreign-peer-only/_meta', subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_CURATOR });
+      const foreignMetaGraph = 'did:dkg:context-graph:register-foreign-peer-only/_meta';
+      await store.deleteByPattern({ graph: foreignMetaGraph, subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_CURATOR });
+      await store.deleteByPattern({ graph: foreignMetaGraph, subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_CREATOR });
       await store.deleteByPattern({ graph: 'did:dkg:context-graph:ontology', subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_CREATOR });
       await store.insert([
         {
-          graph: 'did:dkg:context-graph:ontology',
+          graph: foreignMetaGraph,
           subject: contextGraphUri,
           predicate: DKG_ONTOLOGY.DKG_CREATOR,
           object: 'did:dkg:agent:12D3KooWForeignCreatorPeer111111111111111111111111',

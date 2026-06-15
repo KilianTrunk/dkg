@@ -84,6 +84,69 @@ describe('ContextGraphMetaProjection', () => {
     ]);
   });
 
+  it('lets root _meta public access policy override older private declarations', async () => {
+    const store = new OxigraphStore();
+    const projection = new ContextGraphMetaProjection(store);
+    const id = 'projection-meta-public-after-private';
+    const uri = contextGraphDataGraphUri(id);
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+    const agentsGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.AGENTS);
+    const metaGraph = contextGraphMetaGraphUri(id);
+
+    await store.insert([
+      { subject: uri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH, graph: ontologyGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_ACCESS_POLICY, object: '"private"', graph: ontologyGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH, graph: agentsGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_ACCESS_POLICY, object: '"private"', graph: agentsGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH, graph: metaGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_ACCESS_POLICY, object: '"public"', graph: metaGraph },
+    ]);
+
+    expect((await projection.get(id)).accessPolicy).toBe('public');
+  });
+
+  it('preserves case-sensitive projected metadata while folding address-only lists', async () => {
+    const store = new OxigraphStore();
+    const projection = new ContextGraphMetaProjection(store);
+    const id = 'projection-case-sensitive-metadata';
+    const uri = contextGraphDataGraphUri(id);
+    const metaGraph = contextGraphMetaGraphUri(id);
+    const address = '0x0000000000000000000000000000000000000aBc';
+    const addressVariant = '0x0000000000000000000000000000000000000AbC';
+    const peer = '12D3KooWCaseSensitivePeer';
+    const peerVariant = '12d3koowcasesensitivepeer';
+
+    await store.insert([
+      { subject: uri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH, graph: metaGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_ALLOWED_PEER, object: `"${peer}"`, graph: metaGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_ALLOWED_PEER, object: `"${peerVariant}"`, graph: metaGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_CREATOR, object: `"did:dkg:agent:${peer}"`, graph: metaGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_CREATOR, object: `"did:dkg:agent:${peerVariant}"`, graph: metaGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_PARTICIPANT_IDENTITY_ID, object: `"identity:${peer}"`, graph: metaGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_PARTICIPANT_IDENTITY_ID, object: `"identity:${peerVariant}"`, graph: metaGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_ALLOWED_AGENT, object: `"${address}"`, graph: metaGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_ALLOWED_AGENT, object: `"${addressVariant}"`, graph: metaGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT, object: `"${address}"`, graph: metaGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT, object: `"${addressVariant}"`, graph: metaGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_REVOKED_AGENT, object: `"${address}"`, graph: metaGraph },
+      { subject: uri, predicate: DKG_ONTOLOGY.DKG_REVOKED_AGENT, object: `"${addressVariant}"`, graph: metaGraph },
+    ]);
+
+    const meta = await projection.get(id);
+    expect(meta.allowedPeers).toHaveLength(2);
+    expect(meta.allowedPeers).toEqual(expect.arrayContaining([peer, peerVariant]));
+    expect(meta.creators).toHaveLength(2);
+    expect(meta.creators).toEqual(expect.arrayContaining([`did:dkg:agent:${peer}`, `did:dkg:agent:${peerVariant}`]));
+    expect(meta.participantIdentityIds).toHaveLength(2);
+    expect(meta.participantIdentityIds).toEqual(expect.arrayContaining([`identity:${peer}`, `identity:${peerVariant}`]));
+    expect(meta.allowedAgents).toHaveLength(1);
+    expect(meta.allowedAgents[0]?.toLowerCase()).toBe(address.toLowerCase());
+    expect(meta.participantAgents).toHaveLength(1);
+    expect(meta.participantAgents[0]?.toLowerCase()).toBe(address.toLowerCase());
+    expect(meta.revokedAgents).toHaveLength(1);
+    expect(meta.revokedAgents[0]?.toLowerCase()).toBe(address.toLowerCase());
+  });
+
   it('loads AGENTS graph policy rows and invalidates allowlist mutations', async () => {
     const store = new OxigraphStore();
     const projection = new ContextGraphMetaProjection(store);

@@ -298,16 +298,16 @@ export class ContextGraphMetaProjection {
         pushUnique(record.allowedPeers, object);
         break;
       case DKG_ONTOLOGY.DKG_ALLOWED_AGENT:
-        pushUnique(record.allowedAgents, object);
+        pushUniqueCaseInsensitive(record.allowedAgents, object);
         break;
       case DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT:
-        pushUnique(record.participantAgents, object);
+        pushUniqueCaseInsensitive(record.participantAgents, object);
         break;
       case DKG_ONTOLOGY.DKG_PARTICIPANT_IDENTITY_ID:
         pushUnique(record.participantIdentityIds, object);
         break;
       case DKG_ONTOLOGY.DKG_REVOKED_AGENT:
-        pushUnique(record.revokedAgents, object);
+        pushUniqueCaseInsensitive(record.revokedAgents, object);
         break;
       case `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId`:
         record.onChainId ??= object;
@@ -391,6 +391,11 @@ export class ContextGraphMetaProjection {
 }
 
 function pushUnique(target: string[], value: string): void {
+  if (target.includes(value)) return;
+  target.push(value);
+}
+
+function pushUniqueCaseInsensitive(target: string[], value: string): void {
   const key = value.toLowerCase();
   if (target.some((existing) => existing.toLowerCase() === key)) return;
   target.push(value);
@@ -402,12 +407,8 @@ function stripTerm(value: string): string {
 
 function applyAccessPolicy(record: ContextGraphMetaRecord, value: string): void {
   const normalized = value.trim().toLowerCase();
-  if (normalized === 'private') {
-    record.accessPolicy = 'private';
-    return;
-  }
-  if (normalized === 'public') {
-    if (record.accessPolicy !== 'private') record.accessPolicy = 'public';
+  if (normalized === 'private' || normalized === 'public') {
+    record.accessPolicy ??= normalized;
     return;
   }
   record.accessPolicy ??= value;

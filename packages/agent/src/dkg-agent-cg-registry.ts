@@ -416,7 +416,11 @@ export class ContextGraphRegistryMethods extends DKGAgentBase {
     return owned !== undefined && owned.size > 0;
   }
 
-  async getContextGraphOnChainId(this: DKGAgent, contextGraphId: string): Promise<string | null> {
+  async getContextGraphOnChainId(
+    this: DKGAgent,
+    contextGraphId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<string | null> {
     const subscribed = this.subscribedContextGraphs.get(contextGraphId)?.onChainId;
     if (subscribed) return subscribed;
 
@@ -424,6 +428,7 @@ export class ContextGraphRegistryMethods extends DKGAgentBase {
     const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
     const result = await this.store.query(
       `SELECT ?id WHERE { GRAPH <${ontologyGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId> ?id } } LIMIT 1`,
+      { signal: options.signal },
     );
     if (result.type !== 'bindings' || result.bindings.length === 0) return null;
     const value = result.bindings[0]?.['id'];
@@ -768,11 +773,16 @@ export class ContextGraphRegistryMethods extends DKGAgentBase {
    * Get the peer allowlist for a context graph (if curated).
    * Returns null if no allowlist is set (open CG).
    */
-  async getContextGraphAllowedPeers(this: DKGAgent, contextGraphId: string): Promise<string[] | null> {
+  async getContextGraphAllowedPeers(
+    this: DKGAgent,
+    contextGraphId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<string[] | null> {
     const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
     const contextGraphUri = contextGraphDataGraphUri(contextGraphId);
     const result = await this.store.query(
       `SELECT ?peer WHERE { GRAPH <${cgMetaGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ALLOWED_PEER}> ?peer } }`,
+      { signal: options.signal },
     );
     if (result.type !== 'bindings' || result.bindings.length === 0) {
       return null;
@@ -1041,6 +1051,10 @@ export class ContextGraphRegistryMethods extends DKGAgentBase {
       );
     }
 
+    // Read-both note (RFC ka-metadata-trim P3.1): the first pattern matches
+    // the collapsed shape (`rootEntity` directly on the UAL target), the
+    // second the legacy `<ual>/<n> partOf <ual>` token rows synced from older
+    // nodes. Both were already queried here — no migration needed.
     const rootPatterns = namespaces.flatMap((ns) => [
       `GRAPH <${metaGraph}> { ${target} <${ns}rootEntity> ?root . }`,
       `GRAPH <${metaGraph}> { ?ka <${ns}partOf> ${target} ; <${ns}rootEntity> ?root . }`,

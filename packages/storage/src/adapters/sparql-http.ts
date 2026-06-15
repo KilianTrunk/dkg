@@ -24,6 +24,7 @@
 import type {
   TripleStore,
   Quad as DKGQuad,
+  QueryOptions,
   QueryResult,
   SelectResult,
   ConstructResult,
@@ -39,6 +40,62 @@ import { performance } from 'node:perf_hooks';
  * would defeat the outage re-validation guarantee).
  */
 const monotonicNow = (): number => performance.now();
+
+function composeAbortSignals(
+  primary: AbortSignal | undefined,
+  secondary: AbortSignal | undefined,
+): AbortSignal | undefined {
+  if (!primary) return secondary;
+  if (!secondary) return primary;
+  const AnyImpl = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
+  if (AnyImpl) return AnyImpl([primary, secondary]);
+  const combined = new AbortController();
+  let settled = false;
+  const cleanup = () => {
+    primary.removeEventListener('abort', forwardPrimary);
+    secondary.removeEventListener('abort', forwardSecondary);
+  };
+  const forwardPrimary = () => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    combined.abort(primary.reason);
+  };
+  const forwardSecondary = () => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    combined.abort(secondary.reason);
+  };
+  if (primary.aborted) combined.abort(primary.reason);
+  else if (secondary.aborted) combined.abort(secondary.reason);
+  else {
+    primary.addEventListener('abort', forwardPrimary, { once: true });
+    secondary.addEventListener('abort', forwardSecondary, { once: true });
+  }
+  return combined.signal;
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return;
+  const reason = signal.reason;
+  throw reason instanceof Error ? reason : new Error(String(reason ?? 'aborted'));
+}
+
+function raceAgainstAbort<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return work;
+  throwIfAborted(signal);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      const reason = signal.reason;
+      reject(reason instanceof Error ? reason : new Error(String(reason ?? 'aborted')));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    work.then(resolve, reject).finally(() => {
+      signal.removeEventListener('abort', onAbort);
+    });
+  });
+}
 
 /**
  * R6-A: how long a managed-endpoint `listGraphs()` result may be served from
@@ -84,6 +141,8 @@ export interface SparqlHttpStoreOptions {
 }
 
 export class SparqlHttpStore implements TripleStore {
+  readonly queryCancellation = 'interruptible' as const;
+
   private readonly queryEndpoint: string;
   private readonly updateEndpoint: string;
   private readonly timeout: number;
@@ -151,7 +210,7 @@ export class SparqlHttpStore implements TripleStore {
     this.graphListCacheGen++;
   }
 
-  private async postQuery(sparql: string, accept: string): Promise<Response> {
+  private async postQuery(sparql: string, accept: string, options?: QueryOptions): Promise<Response> {
     // Direct POST (W3C SPARQL 1.1 Protocol §2.1.3): the query is the raw
     // request body with `application/sparql-query`, not URL-encoded form
     // data. Form-encoded bodies (`query=...`) are parsed by the server's
@@ -159,11 +218,13 @@ export class SparqlHttpStore implements TripleStore {
     // `maxFormContentSize` (~200 KB) and rejects larger payloads with
     // HTTP 400 "Unable to parse form content". The direct-POST body is not
     // form parsed, so large queries are not capped.
+    const timeoutSignal = AbortSignal.timeout(this.timeout);
+    const signal = composeAbortSignals(options?.signal, timeoutSignal) ?? timeoutSignal;
     const res = await fetch(this.queryEndpoint, {
       method: 'POST',
       headers: { ...this.headers, 'Content-Type': 'application/sparql-query', Accept: accept },
       body: sparql,
-      signal: AbortSignal.timeout(this.timeout),
+      signal,
     });
     return res;
   }
@@ -265,17 +326,18 @@ export class SparqlHttpStore implements TripleStore {
     return Math.max(0, before - after);
   }
 
-  async query(sparql: string): Promise<QueryResult> {
+  async query(sparql: string, options?: QueryOptions): Promise<QueryResult> {
+    throwIfAborted(options?.signal);
     const trimmed = sparql.trim();
     const upper = trimmed.toUpperCase();
     const isAsk = upper.startsWith('ASK');
     const isConstruct = upper.startsWith('CONSTRUCT') || upper.startsWith('DESCRIBE');
 
     if (isConstruct) {
-      return this.queryConstruct(trimmed);
+      return this.queryConstruct(trimmed, options);
     }
 
-    const res = await this.postQuery(trimmed, 'application/sparql-results+json');
+    const res = await this.postQuery(trimmed, 'application/sparql-results+json', options);
     if (!res.ok) {
       const text = await res.text().catch(() => '');
       throw new Error(`SPARQL HTTP query failed (${res.status}): ${text.slice(0, 300)}`);
@@ -300,8 +362,8 @@ export class SparqlHttpStore implements TripleStore {
     return { type: 'bindings', bindings } satisfies SelectResult;
   }
 
-  private async queryConstruct(sparql: string): Promise<ConstructResult> {
-    const res = await this.postQuery(sparql, 'application/n-quads, text/n-quads');
+  private async queryConstruct(sparql: string, options?: QueryOptions): Promise<ConstructResult> {
+    const res = await this.postQuery(sparql, 'application/n-quads, text/n-quads', options);
     if (!res.ok) {
       const text = await res.text().catch(() => '');
       throw new Error(`SPARQL HTTP construct failed (${res.status}): ${text.slice(0, 300)}`);
@@ -330,7 +392,8 @@ export class SparqlHttpStore implements TripleStore {
     this.invalidateGraphListCache(); // the graph is gone from listGraphs
   }
 
-  async listGraphs(): Promise<string[]> {
+  async listGraphs(options?: QueryOptions): Promise<string[]> {
+    throwIfAborted(options?.signal);
     // R6-A: on a managed (daemon-owned) endpoint the graph set only changes
     // when *we* write, so serve a warm cache and skip the full
     // `SELECT DISTINCT ?g` quad-store scan — the dominant idle-node CPU cost
@@ -350,7 +413,7 @@ export class SparqlHttpStore implements TripleStore {
     // External (non-managed) endpoint: never cache (an outside writer could
     // add a graph we'd miss), so just scan.
     if (!this.cacheGraphList) {
-      return [...(await this.scanGraphs(this.graphListCacheGen))];
+      return [...(await this.scanGraphs(this.graphListCacheGen, options))];
     }
     // Managed, cold/expired cache: coalesce concurrent callers onto one
     // in-flight scan so a startup or TTL-boundary burst doesn't fan out into
@@ -359,22 +422,21 @@ export class SparqlHttpStore implements TripleStore {
     // arriving after a write must not join the pre-write scan (it would observe
     // a stale graph set); it starts a fresh one instead.
     if (this.graphListInflight && this.graphListInflightGen === this.graphListCacheGen) {
-      return [...(await this.graphListInflight)];
+      return [...(await raceAgainstAbort(this.graphListInflight, options?.signal))];
     }
     const startGen = this.graphListCacheGen;
-    const scan = this.scanGraphs(startGen);
-    this.graphListInflight = scan;
-    this.graphListInflightGen = startGen;
-    try {
-      return [...(await scan)];
-    } finally {
+    let scan!: Promise<string[]>;
+    scan = this.scanGraphs(startGen).finally(() => {
       // Clear only if a newer scan hasn't already replaced this one, so a
       // post-write rebuild started while this scan was resolving isn't lost.
       if (this.graphListInflight === scan) {
         this.graphListInflight = null;
         this.graphListInflightGen = -1;
       }
-    }
+    });
+    this.graphListInflight = scan;
+    this.graphListInflightGen = startGen;
+    return [...(await raceAgainstAbort(scan, options?.signal))];
   }
 
   /**
@@ -383,8 +445,8 @@ export class SparqlHttpStore implements TripleStore {
    * (`startGen` vs the current generation) discards a snapshot that may predate
    * that write so the next call rebuilds.
    */
-  private async scanGraphs(startGen: number): Promise<string[]> {
-    const r = await this.query('SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }');
+  private async scanGraphs(startGen: number, options?: QueryOptions): Promise<string[]> {
+    const r = await this.query('SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }', options);
     const graphs = r.type === 'bindings' ? r.bindings.map((b) => b.g).filter(Boolean) : [];
     if (this.cacheGraphList && startGen === this.graphListCacheGen) {
       this.graphListCache = graphs;

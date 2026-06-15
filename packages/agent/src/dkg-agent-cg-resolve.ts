@@ -246,6 +246,32 @@ type JoinApprovalRetryEntry = {
   nextAttemptAt: number;
   lastError: string;
 };
+type ListContextGraphsRow = {
+  id: string;
+  uri: string;
+  name: string;
+  description?: string;
+  creator?: string;
+  curator?: string;
+  accessPolicy?: string;
+  createdAt?: string;
+  isSystem: boolean;
+  subscribed: boolean;
+  synced: boolean;
+  onChainId?: string;
+  callerInvolved?: boolean;
+};
+type ListContextGraphsUncachedResult = {
+  rows: ListContextGraphsRow[];
+  cacheable: boolean;
+};
+type ListContextGraphsPrivacy = 'public' | 'private' | 'unknown';
+class ListContextGraphsBudgetExceeded extends Error {
+  constructor(label: string) {
+    super(`${label} exceeded listContextGraphs budget`);
+    this.name = 'ListContextGraphsBudgetExceeded';
+  }
+}
 import { multiaddr } from '@multiformats/multiaddr';
 import { buildCclPolicyQuads, buildPolicyApprovalQuads, buildPolicyRevocationQuads, hashCclPolicy, type CclPolicyRecord, type PolicyApprovalBinding } from './ccl-policy.js';
 import { CclEvaluator, parseCclPolicy, validateCclPolicy, type CclEvaluationResult, type CclFactTuple } from './ccl-evaluator.js';
@@ -331,6 +357,7 @@ import {
   type ContextGraphSub,
   type ContextGraphSubscriptionRecord,
   type ContextGraphSubscriptionStore,
+  type ContextGraphWritePreflightProbe,
   type ContextGraphMemberPrincipalType,
   type ContextGraphMemberStatus,
   type ContextGraphMembershipRecord,
@@ -380,6 +407,23 @@ import {
 import { DKGAgentBase } from './dkg-agent-base.js';
 import type { DKGAgent } from './dkg-agent.js';
 
+function syncAuthAbortError(reason: unknown): Error {
+  if (reason instanceof Error) {
+    if (reason.name === 'AbortError') return reason;
+    const err = new Error(reason.message || 'aborted');
+    err.name = 'AbortError';
+    (err as Error & { cause?: unknown }).cause = reason;
+    return err;
+  }
+  const err = new Error(typeof reason === 'string' ? reason : 'aborted');
+  err.name = 'AbortError';
+  return err;
+}
+
+function throwIfSyncAuthAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw syncAuthAbortError(signal.reason);
+}
+
 export class ContextGraphResolveMethods extends DKGAgentBase {
   /**
    * Check whether a context graph exists in local storage. Definition triples in
@@ -420,7 +464,11 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
    * content is the normal state for any non-trivial project so the root
    * data graph is routinely empty.
    */
-  async contextGraphHasLocalContent(this: DKGAgent, contextGraphId: string): Promise<boolean> {
+  async contextGraphHasLocalContent(
+    this: DKGAgent,
+    contextGraphId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<boolean> {
     const prefix = `did:dkg:context-graph:${contextGraphId}`;
     // ASK is cheap on Oxigraph; the FILTER keeps us inside this CG's
     // namespace and excludes `_meta` / `_shared_memory_meta` bookkeeping
@@ -431,9 +479,120 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
       FILTER(!STRENDS(STR(?g), "/_meta"))
       FILTER(!STRENDS(STR(?g), "/_shared_memory_meta"))
     }`;
-    const result = await this.store.query(sparql);
+    const result = await this.store.query(sparql, { signal: options.signal });
     if (result.type === 'boolean') return result.value;
     return result.type === 'bindings' && result.bindings.length > 0;
+  }
+
+  async probeContextGraphWritePreflight(
+    this: DKGAgent,
+    contextGraphId: string,
+    opts?: { callerAgentAddress?: string | null },
+  ): Promise<ContextGraphWritePreflightProbe> {
+    const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+    const agentsGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.AGENTS);
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const metaSubjectUri = contextGraphDataGraphUri(contextGraphId);
+    const subscriptionStore = this.config.contextGraphSubscriptionStore;
+
+    const persistedSubscriptionPromise = subscriptionStore?.load
+      ? subscriptionStore.load(contextGraphId)
+      : Promise.resolve(null);
+    const declarationPromise = this.store.query(`
+      SELECT ?access ?curator WHERE {
+        {
+          GRAPH <${ontologyGraph}> {
+            <${contextGraphUri}> <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}> .
+            OPTIONAL { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?access }
+            OPTIONAL { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_CURATOR}> ?curator }
+          }
+        } UNION {
+          GRAPH <${agentsGraph}> {
+            <${contextGraphUri}> <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}> .
+            OPTIONAL { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?access }
+            OPTIONAL { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_CURATOR}> ?curator }
+          }
+        } UNION {
+          GRAPH <${cgMetaGraph}> {
+            <${metaSubjectUri}> <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}> .
+            OPTIONAL { <${metaSubjectUri}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?access }
+            OPTIONAL { <${metaSubjectUri}> <${DKG_ONTOLOGY.DKG_CURATOR}> ?curator }
+          }
+        }
+      }
+    `);
+
+    const [exists, hasLocalContent, persistedSubscription, declarationResult] = await Promise.all([
+      this.contextGraphExists(contextGraphId),
+      this.contextGraphHasLocalContent(contextGraphId),
+      persistedSubscriptionPromise,
+      declarationPromise,
+    ]);
+
+    let accessPolicy: 'public' | 'private' | undefined;
+    let declarationFound = false;
+    const curators: string[] = [];
+    if (declarationResult.type === 'bindings') {
+      declarationFound = declarationResult.bindings.length > 0;
+      let sawPublic = false;
+      let sawPrivate = false;
+      for (const row of declarationResult.bindings as Record<string, string>[]) {
+        const access = row['access'];
+        if (typeof access === 'string') {
+          const normalized = stripLiteral(access).trim().toLowerCase();
+          if (normalized === 'private') sawPrivate = true;
+          if (normalized === 'public') sawPublic = true;
+        }
+        const curator = row['curator'];
+        if (typeof curator === 'string' && curator.trim()) curators.push(curator);
+      }
+      if (sawPrivate) accessPolicy = 'private';
+      else if (sawPublic) accessPolicy = 'public';
+    }
+
+    let checksum: string | null = null;
+    const rawCaller = opts?.callerAgentAddress?.trim();
+    if (rawCaller) {
+      const didPrefix = 'did:dkg:agent:';
+      const rawAddress = rawCaller.startsWith(didPrefix) ? rawCaller.slice(didPrefix.length) : rawCaller;
+      if (ethers.isAddress(rawAddress)) checksum = ethers.getAddress(rawAddress);
+    }
+
+    let callerAuthorized: boolean | undefined;
+    if (checksum && declarationFound) {
+      if (accessPolicy === 'public') {
+        callerAuthorized = true;
+      } else if (accessPolicy === 'private') {
+        const curatorMatch = curators.some((curator) =>
+          this.curatorDidMatchesChecksumAgent(curator, checksum),
+        );
+        callerAuthorized = curatorMatch
+          || await this.callerIsAllowlistedAgentParticipant(contextGraphId, checksum);
+      }
+    }
+
+    const inMemorySubscription = this.subscribedContextGraphs.get(contextGraphId);
+    return {
+      exists,
+      hasLocalContent,
+      ...(inMemorySubscription
+        ? { inMemorySubscription: {
+            subscribed: inMemorySubscription.subscribed,
+            synced: inMemorySubscription.synced,
+          } }
+        : {}),
+      ...(persistedSubscription
+        ? { persistedSubscription: {
+            subscribed: persistedSubscription.subscribed,
+            synced: persistedSubscription.synced,
+          } }
+        : {}),
+      declarationFound,
+      ...(accessPolicy ? { accessPolicy } : {}),
+      ...(curators[0] ? { curator: curators[0] } : {}),
+      ...(callerAuthorized !== undefined ? { callerAuthorized } : {}),
+    };
   }
 
   /**
@@ -489,6 +648,7 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
         requesterAgentAddress: parsed.requesterAgentAddress,
         requesterSignatureR: parsed.requesterSignatureR,
         requesterSignatureVS: parsed.requesterSignatureVS,
+        syncSessionId: typeof parsed.syncSessionId === 'string' ? parsed.syncSessionId : undefined,
         // Phase C: unsigned delta hint. Validated/normalised in the responder.
         sinceBatchId: typeof parsed.sinceBatchId === 'string' ? parsed.sinceBatchId : undefined,
       };
@@ -503,19 +663,27 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
     const includeSharedMemory = ctxGraphPart.startsWith('workspace:');
     const contextGraphId = includeSharedMemory ? ctxGraphPart.slice('workspace:'.length) : (ctxGraphPart || SYSTEM_CONTEXT_GRAPHS.AGENTS);
     const phase = normalizeSyncPhase(parts[3]);
-    // Phase C: the `|since|<n>` keyed token is ALWAYS the final two segments
-    // emitted by `buildSyncRequestEnvelope` (after the optional phase/snapshot
-    // suffix). Match only that trailing position — scanning every segment would
-    // misparse an ordinary segment literally equal to "since" (e.g. a CG or
-    // snapshotRef named "since") as a delta marker and turn a full sync into a
-    // partial response. Old encoders never emit the suffix.
+    // Phase C: parse only the trailing keyed tokens emitted by
+    // `buildSyncRequestEnvelope` (after the optional phase/snapshot suffix).
+    // Scanning every segment would misparse ordinary values literally equal to
+    // "since" or "session" as control tokens. Old encoders never emit them.
     let sinceBatchId: string | undefined;
+    let syncSessionId: string | undefined;
+    let tail = parts.length;
     if (
-      parts.length >= 2 &&
-      parts[parts.length - 2] === 'since' &&
-      /^\d+$/.test(parts[parts.length - 1])
+      tail >= 2 &&
+      parts[tail - 2] === 'since' &&
+      /^\d+$/.test(parts[tail - 1])
     ) {
-      sinceBatchId = parts[parts.length - 1];
+      sinceBatchId = parts[tail - 1];
+      tail -= 2;
+    }
+    if (
+      tail >= 2 &&
+      parts[tail - 2] === 'session' &&
+      parts[tail - 1].length > 0
+    ) {
+      syncSessionId = parts[tail - 1];
     }
     return {
       contextGraphId,
@@ -524,6 +692,7 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
       includeSharedMemory,
       phase,
       snapshotRef: phase === 'snapshot' ? parts[4] : undefined,
+      syncSessionId,
       sinceBatchId,
     };
   }
@@ -600,6 +769,7 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
     phase: SyncPhase = 'data',
     snapshotRef?: string,
     sinceBatchId?: string,
+    syncSessionId?: string,
   ): Promise<Uint8Array> {
     const isPrivate = await this.isPrivateContextGraph(contextGraphId);
 
@@ -625,6 +795,7 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
       // is gap-safe only when it comes from a CONTIGUOUS watermark, so it is
       // supplied explicitly by callers, never auto-derived from local MAX().
       sinceBatchId: phase === 'data' && !includeSharedMemory ? sinceBatchId : undefined,
+      syncSessionId: phase === 'snapshot' ? undefined : syncSessionId,
       needsAuth,
       computeSyncDigest: this.computeSyncDigest.bind(this),
       getIdentityId: () => this.chain.getIdentityId(),
@@ -669,8 +840,15 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
     );
   }
 
-  public async authorizeSyncRequest(this: DKGAgent, request: SyncRequestEnvelope, remotePeerId: string): Promise<boolean> {
-    const isPrivate = await this.isPrivateContextGraph(request.contextGraphId);
+  public async authorizeSyncRequest(
+    this: DKGAgent,
+    request: SyncRequestEnvelope,
+    remotePeerId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<boolean> {
+    throwIfSyncAuthAborted(options.signal);
+    const isPrivate = await this.isPrivateContextGraph(request.contextGraphId, { signal: options.signal });
+    throwIfSyncAuthAborted(options.signal);
     if (!isPrivate) {
       return true;
     }
@@ -683,13 +861,24 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
       syncAuthMaxAgeMs: SYNC_AUTH_MAX_AGE_MS,
       seenRequestIds: this.seenPrivateSyncRequestIds,
       computeSyncDigest: this.computeSyncDigest.bind(this),
-      verifyIdentity: typeof verifyIdentity === 'function' ? verifyIdentity.bind(this.chain) : undefined,
-      getParticipants: (contextGraphId) => this.getPrivateContextGraphParticipants(contextGraphId),
-      getAllowedPeers: (contextGraphId) => this.getContextGraphAllowedPeers(contextGraphId),
-      getAgentGateAddresses: (contextGraphId) => this.getContextGraphAgentGateAddresses(contextGraphId),
-      getAllowedDelegateePeers: (contextGraphId) => this.getContextGraphAllowedDelegateePeers(contextGraphId),
-      getAllowedDelegateeKeys: (contextGraphId) => this.getContextGraphAllowedDelegateeKeys(contextGraphId),
-      refreshMetaFromCurator: (contextGraphId) => this.refreshMetaFromCurator(contextGraphId),
+      verifyIdentity: typeof verifyIdentity === 'function'
+        ? async (recoveredAddress, claimedIdentityId, lookupOptions) => {
+            // Chain/RPC verifiers are not actually abortable in ethers. Do not
+            // race them against request aborts: that would free responder
+            // capacity while the RPC keeps running in the background.
+            throwIfSyncAuthAborted(lookupOptions?.signal);
+            const valid = await verifyIdentity.call(this.chain, recoveredAddress, claimedIdentityId);
+            throwIfSyncAuthAborted(lookupOptions?.signal);
+            return valid;
+          }
+        : undefined,
+      getParticipants: (contextGraphId, lookupOptions) => this.getPrivateContextGraphParticipants(contextGraphId, lookupOptions),
+      getAllowedPeers: (contextGraphId, lookupOptions) => this.getContextGraphAllowedPeers(contextGraphId, lookupOptions),
+      getAgentGateAddresses: (contextGraphId, lookupOptions) => this.getContextGraphAgentGateAddresses(contextGraphId, lookupOptions),
+      getAllowedDelegateePeers: (contextGraphId, lookupOptions) => this.getContextGraphAllowedDelegateePeers(contextGraphId, lookupOptions),
+      getAllowedDelegateeKeys: (contextGraphId, lookupOptions) => this.getContextGraphAllowedDelegateeKeys(contextGraphId, lookupOptions),
+      refreshMetaFromCurator: (contextGraphId, lookupOptions) => this.refreshMetaFromCurator(contextGraphId, lookupOptions),
+      signal: options.signal,
       logWarn: (ctx, message) => this.log.warn(ctx, message),
       logInfo: (ctx, message) => this.log.info(ctx, message),
     });
@@ -1034,6 +1223,7 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
    */
   async getExplicitAccessPolicy(this: DKGAgent,
     contextGraphId: string,
+    options: { signal?: AbortSignal } = {},
   ): Promise<'public' | 'private' | null> {
     if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) {
       return null;
@@ -1053,6 +1243,7 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
           }
         }
       } LIMIT 1`,
+      { signal: options.signal },
     );
     if (result.type !== 'bindings' || result.bindings.length === 0) return null;
     const policyValue = result.bindings[0]?.['policy'];
@@ -1118,7 +1309,10 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
     );
   }
 
-  async isPrivateContextGraph(this: DKGAgent, contextGraphId: string): Promise<boolean> {
+  async isPrivateContextGraph(this: DKGAgent,
+    contextGraphId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<boolean> {
     if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) {
       return false;
     }
@@ -1146,7 +1340,7 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
     // Codex review on #873 — policy lookup now delegated to the
     // shared `getExplicitAccessPolicy()` helper so this routing
     // function and the invite-path warning helper can never drift.
-    const policy = await this.getExplicitAccessPolicy(contextGraphId);
+    const policy = await this.getExplicitAccessPolicy(contextGraphId, { signal: options.signal });
     if (policy === 'private') return true;
     if (policy === 'public') return false;
     // policy === null falls through to the legacy heuristic below.
@@ -1169,6 +1363,7 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
           { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ALLOWED_PEER}> ?peer }
         }
       }`,
+      { signal: options.signal },
     );
     if (allowlistResult.type === 'boolean' && allowlistResult.value === true) {
       return true;
@@ -1177,7 +1372,11 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
     return false;
   }
 
-  async getPrivateContextGraphParticipants(this: DKGAgent, contextGraphId: string): Promise<string[] | null> {
+  async getPrivateContextGraphParticipants(
+    this: DKGAgent,
+    contextGraphId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<string[] | null> {
     const merged: string[] = [];
     const seen = new Set<string>();
     const add = (value: string | undefined) => {
@@ -1206,6 +1405,7 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
           { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT}> ?agent }
         }
       }`,
+      { signal: options.signal },
     );
     if (agentResult.type === 'bindings') {
       for (const row of agentResult.bindings) {
@@ -1221,6 +1421,7 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
           <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_IDENTITY_ID}> ?identityId
         }
       }`,
+      { signal: options.signal },
     );
     if (metaResult.type === 'bindings') {
       for (const row of metaResult.bindings) {
@@ -1242,7 +1443,11 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
    * newly added participants. Rate-limited to avoid abuse.
    * Returns true if meta was refreshed, false if skipped or failed.
    */
-  public async resolveCuratorPeerId(this: DKGAgent, contextGraphId: string): Promise<string | undefined> {
+  public async resolveCuratorPeerId(
+    this: DKGAgent,
+    contextGraphId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<string | undefined> {
     const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
     const contextGraphUri = contextGraphDataGraphUri(contextGraphId);
 
@@ -1252,6 +1457,7 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
           <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_CURATOR}> ?curator
         }
       } LIMIT 1`,
+      { signal: options.signal },
     );
     if (curatorResult.type !== 'bindings' || curatorResult.bindings.length === 0) {
       return undefined;
@@ -1288,6 +1494,7 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
             }
           }
         } LIMIT 1`,
+        { signal: options.signal },
       );
       if (creatorResult.type === 'bindings' && creatorResult.bindings.length > 0) {
         const creatorDid = (creatorResult.bindings[0] as Record<string, string>)['creator'] ?? '';
@@ -1304,7 +1511,9 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
       // share the same wallet address, but better than failing outright)
       if (!resolved) {
         try {
+          throwIfSyncAuthAborted(options.signal);
           const agents = await this.discovery.findAgents();
+          throwIfSyncAuthAborted(options.signal);
           const match = agents.find(
             (a) => a.agentAddress?.toLowerCase() === curatorIdentifier.toLowerCase(),
           );
@@ -1312,7 +1521,10 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
             curatorPeerId = match.peerId;
             resolved = true;
           }
-        } catch { /* registry unavailable */ }
+        } catch {
+          throwIfSyncAuthAborted(options.signal);
+          /* registry unavailable */
+        }
       }
 
       if (!resolved) return undefined;
@@ -1321,7 +1533,12 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
     return curatorPeerId;
   }
 
-  async refreshMetaFromCurator(this: DKGAgent, contextGraphId: string): Promise<boolean> {
+  async refreshMetaFromCurator(
+    this: DKGAgent,
+    contextGraphId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<boolean> {
+    throwIfSyncAuthAborted(options.signal);
     const now = Date.now();
     const lastRefresh = this.metaRefreshTimestamps.get(contextGraphId) ?? 0;
     if (now - lastRefresh < META_REFRESH_COOLDOWN_MS) {
@@ -1330,7 +1547,8 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
 
     const ctx = createOperationContext('sync');
     const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
-    const curatorPeerId = await this.resolveCuratorPeerId(contextGraphId);
+    const curatorPeerId = await this.resolveCuratorPeerId(contextGraphId, options);
+    throwIfSyncAuthAborted(options.signal);
     if (!curatorPeerId) {
       return false;
     }
@@ -1350,23 +1568,28 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
         const pid = peerIdFromString(curatorPeerId);
 
         try {
-          await this.node.libp2p.dial(pid);
+          await this.node.libp2p.dial(pid, { signal: options.signal });
+          throwIfSyncAuthAborted(options.signal);
           connections = this.node.libp2p.getConnections();
           isConnected = connections.some((c) => c.remotePeer.toString() === curatorPeerId);
         } catch { /* direct dial failed, try relay */ }
 
         if (!isConnected) {
+          throwIfSyncAuthAborted(options.signal);
           const agent = await this.discovery.findAgentByPeerId(curatorPeerId);
+          throwIfSyncAuthAborted(options.signal);
           if (agent?.relayAddress) {
             const { multiaddr } = await import('@multiformats/multiaddr');
             const circuitAddr = multiaddr(`${agent.relayAddress}/p2p-circuit/p2p/${curatorPeerId}`);
             await this.node.libp2p.peerStore.merge(pid, { multiaddrs: [circuitAddr] });
-            await this.node.libp2p.dial(pid);
+            await this.node.libp2p.dial(pid, { signal: options.signal });
+            throwIfSyncAuthAborted(options.signal);
             connections = this.node.libp2p.getConnections();
             isConnected = connections.some((c) => c.remotePeer.toString() === curatorPeerId);
           }
         }
       } catch (err) {
+        throwIfSyncAuthAborted(options.signal);
         this.log.warn(ctx, `Failed to dial curator ${curatorPeerId.slice(-8)} for meta refresh: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
@@ -1377,9 +1600,21 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
 
     try {
       const deadline = Date.now() + 10_000;
-      const metaResult = await this.fetchSyncPages(ctx, curatorPeerId, contextGraphId, false, 'meta', cgMetaGraph, deadline);
+      const metaResult = await this.fetchSyncPages(
+        ctx,
+        curatorPeerId,
+        contextGraphId,
+        false,
+        'meta',
+        cgMetaGraph,
+        deadline,
+        undefined,
+        undefined,
+        options.signal,
+      );
+      throwIfSyncAuthAborted(options.signal);
       if (metaResult.quads.length > 0) {
-        await this.store.insert(metaResult.quads);
+        await this.insertSyncedQuadsAndInvalidateListCache(metaResult.quads);
         this.syncCheckpoints.delete(metaResult.checkpointKey);
         this.log.info(ctx, `Meta refresh for "${contextGraphId}": ${metaResult.quads.length} triples from curator ${curatorPeerId.slice(-8)}`);
         return true;
@@ -1387,6 +1622,7 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
       this.syncCheckpoints.delete(metaResult.checkpointKey);
       return false;
     } catch (err) {
+      throwIfSyncAuthAborted(options.signal);
       this.log.warn(ctx, `Meta refresh for "${contextGraphId}" failed: ${err instanceof Error ? err.message : String(err)}`);
       return false;
     } finally {
@@ -1405,31 +1641,127 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
    * With a valid `callerAgentAddress` option, each row includes `callerInvolved`.
    * With no usable caller wallet, omit that field entirely so callers can infer membership from `curator`.
    */
-  async listContextGraphs(this: DKGAgent, opts?: { callerAgentAddress?: string | null }): Promise<Array<{
-    id: string;
-    uri: string;
-    name: string;
-    description?: string;
-    creator?: string;
-    /** Wallet-scoped curator DID (from _meta / ontology), if present. */
-    curator?: string;
-    /** Declared access policy literal, e.g. public / private. */
-    accessPolicy?: string;
-    createdAt?: string;
-    isSystem: boolean;
-    subscribed: boolean;
-    synced: boolean;
-    onChainId?: string;
-    /**
-     * When `callerAgentAddress` is omitted or invalid: property is omitted —
-     * clients fall back to comparing `curator` to identity (listing was not scoped to a caller).
-     * When a valid caller is provided: explicit true/false.
-     */
-    callerInvolved?: boolean;
-  }>> {
+  async listContextGraphs(this: DKGAgent, opts?: { callerAgentAddress?: string | null }): Promise<ListContextGraphsRow[]> {
+    const scopedListing = opts !== undefined;
+    let checksum: string | null = null;
+    const rawCaller = opts?.callerAgentAddress?.trim();
+    if (rawCaller && ethers.isAddress(rawCaller)) {
+      try {
+        checksum = ethers.getAddress(rawCaller);
+      } catch {
+        checksum = null;
+      }
+    }
+
+    const cloneRows = (rows: ListContextGraphsRow[]): ListContextGraphsRow[] => rows.map((row) => ({ ...row }));
+    const cacheKey = checksum
+      ? `wallet:${checksum.toLowerCase()}`
+      : scopedListing ? 'no-wallet' : 'owner-unscoped';
+    const cacheEnabled = this.listContextGraphsCacheAllowed()
+      && DKGAgentBase.LIST_CONTEXT_GRAPHS_CACHE_TTL_MS > 0;
+    const cacheTtlMs = cacheEnabled ? DKGAgentBase.LIST_CONTEXT_GRAPHS_CACHE_TTL_MS : 0;
+    if (cacheEnabled) {
+      const cached = this.listContextGraphsCache.get(cacheKey);
+      if (cached) {
+        if (cached.expiresAt > this.listContextGraphsCacheNow()) {
+          this.listContextGraphsCache.delete(cacheKey);
+          this.listContextGraphsCache.set(cacheKey, cached);
+          return cloneRows(cached.rows as ListContextGraphsRow[]);
+        }
+        this.listContextGraphsCache.delete(cacheKey);
+      }
+    }
+
+    if (cacheEnabled) {
+      const inFlight = this.listContextGraphsInFlight.get(cacheKey);
+      if (inFlight) {
+        return cloneRows((await inFlight) as ListContextGraphsRow[]);
+      }
+    }
+
+    const generation = this.listContextGraphsCacheGeneration;
+    const task = (async () => {
+      const result = await this.listContextGraphsUncached(checksum, scopedListing);
+      const rows = result.rows;
+      if (cacheEnabled && result.cacheable && this.listContextGraphsCacheGeneration === generation) {
+        this.listContextGraphsCache.set(cacheKey, {
+          expiresAt: this.listContextGraphsCacheNow() + cacheTtlMs,
+          rows: cloneRows(rows) as Array<Record<string, unknown>>,
+        });
+        while (this.listContextGraphsCache.size > DKGAgentBase.LIST_CONTEXT_GRAPHS_CACHE_MAX) {
+          const oldest = this.listContextGraphsCache.keys().next().value;
+          if (!oldest) break;
+          this.listContextGraphsCache.delete(oldest);
+        }
+      }
+      return rows;
+    })();
+
+    if (cacheEnabled) {
+      this.listContextGraphsInFlight.set(cacheKey, task as Promise<Array<Record<string, unknown>>>);
+    }
+    try {
+      return cloneRows(await task);
+    } finally {
+      if (cacheEnabled && this.listContextGraphsInFlight.get(cacheKey) === task) {
+        this.listContextGraphsInFlight.delete(cacheKey);
+      }
+    }
+  }
+
+  protected async listContextGraphsUncached(this: DKGAgent, checksum: string | null, scopedListing: boolean): Promise<ListContextGraphsUncachedResult> {
     const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
     const agentsGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.AGENTS);
-    const result = await this.store.query(`
+    const rowBudgetMs = Math.max(1, DKGAgentBase.LIST_CONTEXT_GRAPHS_ROW_BUDGET_MS);
+    const scanBudgetMs = Math.max(rowBudgetMs, DKGAgentBase.LIST_CONTEXT_GRAPHS_SCAN_BUDGET_MS);
+    const authBudgetMs = Math.max(rowBudgetMs, DKGAgentBase.LIST_CONTEXT_GRAPHS_AUTH_BUDGET_MS);
+    let cacheable = true;
+
+    const withBudget = async <T>(
+      work: (signal: AbortSignal) => Promise<T>,
+      label: string,
+      budgetMs = rowBudgetMs,
+    ): Promise<{ ok: true; value: T } | { ok: false; error: unknown }> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const controller = new AbortController();
+      const timeoutError = new ListContextGraphsBudgetExceeded(label);
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => {
+            // For pre-dispatch stores this signal cannot interrupt an in-flight
+            // synchronous native query, but it still bounds async work wrapped in
+            // the same lookup, such as chain/RPC membership checks.
+            controller.abort(timeoutError);
+            reject(timeoutError);
+          },
+          budgetMs,
+        );
+      });
+      try {
+        const value = await Promise.race([
+          Promise.resolve().then(() => work(controller.signal)),
+          timeout,
+        ]);
+        return { ok: true, value };
+      } catch (error) {
+        if (!(error instanceof ListContextGraphsBudgetExceeded)) {
+          throw error;
+        }
+        return { ok: false, error };
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+
+    const optional = async <T>(work: (signal: AbortSignal) => Promise<T>, label: string): Promise<T | undefined> => {
+      const result = await withBudget(work, label);
+      if (result.ok) return result.value;
+      cacheable = false;
+      return undefined;
+    };
+
+    const initialRead = await withBudget(
+      (signal) => this.store.query(`
       SELECT ?ctxGraph ?name ?desc ?creator ?created ?curator ?access ?isSystem WHERE {
         {
           GRAPH <${ontologyGraph}> {
@@ -1455,16 +1787,33 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
           }
         }
       }
-    `);
+    `, { signal }),
+      'ontology/agents definition scan',
+      scanBudgetMs,
+    );
+    if (!initialRead.ok) {
+      throw initialRead.error instanceof Error
+        ? initialRead.error
+        : new Error(`listContextGraphs primary definition scan failed: ${String(initialRead.error)}`);
+    }
+    const result = initialRead.value;
 
     const prefix = 'did:dkg:context-graph:';
-    const seen = new Map<string, {
-      id: string; uri: string; name: string; description?: string;
-      creator?: string; curator?: string; accessPolicy?: string; createdAt?: string; isSystem: boolean;
-      subscribed: boolean; synced: boolean; onChainId?: string;
-    }>();
+    const seen = new Map<string, ListContextGraphsRow>();
+    const privacyByUri = new Map<string, ListContextGraphsPrivacy>();
+    const policyPrivacy = (value: unknown): ListContextGraphsPrivacy => {
+      if (typeof value !== 'string') return 'unknown';
+      const normalized = stripLiteral(value).trim().replace(/^["']|["']$/g, '').toLowerCase();
+      if (normalized === 'public' || normalized === 'private') return normalized;
+      return 'unknown';
+    };
+    const rememberRow = (row: ListContextGraphsRow, privacy: ListContextGraphsPrivacy): void => {
+      if (seen.has(row.uri)) return;
+      seen.set(row.uri, row);
+      privacyByUri.set(row.uri, privacy);
+    };
 
-    if (result.type === 'bindings') {
+    if (result?.type === 'bindings') {
       const byUri = new Map<string, Record<string, string>>();
       for (const row of result.bindings as Record<string, string>[]) {
         const uri = row['ctxGraph'] ?? '';
@@ -1472,20 +1821,24 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
         byUri.set(uri, row);
       }
       // Parallel lookups — sequential await per ontology row multiplied list latency noticeably.
-      await Promise.all([...byUri.values()].map(async (row) => {
+      const definitionSettled = await Promise.allSettled([...byUri.values()].map(async (row) => {
         const uri = row['ctxGraph'] ?? '';
         if (seen.has(uri)) return;
         const id = uri.startsWith(prefix) ? uri.slice(prefix.length) : uri;
         const sub = this.subscribedContextGraphs.get(id);
-        const onChainId = sub?.onChainId ?? (await this.getContextGraphOnChainId(id)) ?? undefined;
-        seen.set(uri, {
+        const onChainId = sub?.onChainId ?? (await optional(
+          (signal) => this.getContextGraphOnChainId(id, { signal }),
+          `on-chain id lookup for ${id}`,
+        )) ?? undefined;
+        const accessPolicy = row['access'] ? stripLiteral(row['access']) : undefined;
+        rememberRow({
           id,
           uri,
           name: stripLiteral(row['name'] ?? id),
           description: row['desc'] ? stripLiteral(row['desc']) : undefined,
           creator: row['creator'],
           ...(row['curator'] ? { curator: row['curator'] } : {}),
-          ...(row['access'] ? { accessPolicy: stripLiteral(row['access']) } : {}),
+          ...(accessPolicy ? { accessPolicy } : {}),
           createdAt: row['created'] ? stripLiteral(row['created']) : undefined,
           isSystem: !!row['isSystem'],
           subscribed: sub?.subscribed ?? false,
@@ -1500,8 +1853,11 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
           // `markContextGraphSubscriptionState` at routes/context-graph.ts:1301).
           synced: sub?.synced ?? false,
           ...(onChainId ? { onChainId } : {}),
-        });
+        }, policyPrivacy(row['access']));
       }));
+      for (const entry of definitionSettled) {
+        if (entry.status === 'rejected') throw entry.reason;
+      }
     }
 
     // Curated CGs store their definition in their own _meta graph, not in
@@ -1513,7 +1869,8 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
 
       const metaGraph = contextGraphMetaGraphUri(id);
       const pUri = contextGraphDataGraphUri(id);
-      const metaResult = await this.store.query(`
+      const metaRead = await withBudget(
+        (signal) => this.store.query(`
         SELECT ?name ?desc ?creator ?created ?curator ?access WHERE {
           GRAPH <${metaGraph}> {
             <${pUri}> <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}> .
@@ -1525,25 +1882,33 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
             OPTIONAL { <${pUri}> <${DKG_ONTOLOGY.DKG_CREATED_AT}> ?created }
           }
         } LIMIT 1
-      `);
+      `, { signal }),
+        `meta declaration lookup for ${id}`,
+      );
+      if (!metaRead.ok) cacheable = false;
+      const metaResult = metaRead.ok ? metaRead.value : undefined;
 
-      if (metaResult.type === 'bindings' && metaResult.bindings.length > 0) {
+      if (metaResult?.type === 'bindings' && metaResult.bindings.length > 0) {
         const row = metaResult.bindings[0] as Record<string, string>;
-        const onChainId = sub.onChainId ?? (await this.getContextGraphOnChainId(id)) ?? undefined;
-        seen.set(uri, {
+        const onChainId = sub.onChainId ?? (await optional(
+          (signal) => this.getContextGraphOnChainId(id, { signal }),
+          `on-chain id lookup for ${id}`,
+        )) ?? undefined;
+        const accessPolicy = row['access'] ? stripLiteral(row['access']) : undefined;
+        rememberRow({
           id,
           uri,
           name: stripLiteral(row['name'] ?? sub.name ?? id),
           description: row['desc'] ? stripLiteral(row['desc']) : undefined,
           creator: row['creator'],
           ...(row['curator'] ? { curator: row['curator'] } : {}),
-          ...(row['access'] ? { accessPolicy: stripLiteral(row['access']) } : {}),
+          ...(accessPolicy ? { accessPolicy } : {}),
           createdAt: row['created'] ? stripLiteral(row['created']) : undefined,
           isSystem: false,
           subscribed: sub.subscribed,
           synced: sub.synced,
           ...(onChainId ? { onChainId } : {}),
-        });
+        }, policyPrivacy(row['access']));
         continue;
       }
 
@@ -1583,11 +1948,15 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
         // only the root caused legitimate synced projects to be
         // hidden as phantoms here (Codex tier-4m follow-up to N29,
         // same issue in a separate call site).
-        const hasContent = await this.contextGraphHasLocalContent(id);
-        if (!hasContent) continue;
+        const contentRead = await withBudget(
+          (signal) => this.contextGraphHasLocalContent(id, { signal }),
+          `local content probe for ${id}`,
+        );
+        if (!contentRead.ok) cacheable = false;
+        if (contentRead.ok && !contentRead.value) continue;
       }
 
-      seen.set(uri, {
+      rememberRow({
         id,
         uri,
         name: sub.name ?? id,
@@ -1595,27 +1964,71 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
         subscribed: sub.subscribed,
         synced: sub.synced,
         ...(sub.onChainId ? { onChainId: sub.onChainId } : {}),
-      });
+      }, 'unknown');
     }
 
-    const graphManager = new GraphManager(this.store);
-    const storedContextGraphs = await graphManager.listContextGraphs();
+    const storedRead = await withBudget(
+      async (signal) => {
+        const graphs = await this.store.listGraphs({ signal });
+        const contextGraphs = new Set<string>();
+        for (const graph of graphs) {
+          if (!graph.startsWith(prefix)) continue;
+          const rest = graph.slice(prefix.length);
+          const id = rest.endsWith('/_meta')
+            ? rest.slice(0, -6)
+            : rest.endsWith('/_private')
+              ? rest.slice(0, -9)
+              : rest.endsWith('/_shared_memory_meta')
+                ? rest.slice(0, -20)
+                : rest.endsWith('/_shared_memory')
+                  ? rest.slice(0, -15)
+                  : rest;
+          if (!id.includes('/')) contextGraphs.add(id);
+        }
+        return [...contextGraphs];
+      },
+      'storage context graph scan',
+      scanBudgetMs,
+    );
+    if (!storedRead.ok) {
+      throw storedRead.error instanceof Error
+        ? storedRead.error
+        : new Error(`listContextGraphs storage graph scan failed: ${String(storedRead.error)}`);
+    }
+    const storedContextGraphs = storedRead.value;
     for (const id of storedContextGraphs) {
       const uri = `${prefix}${id}`;
       if (seen.has(uri)) continue;
       if (id === SYSTEM_CONTEXT_GRAPHS.AGENTS || id === SYSTEM_CONTEXT_GRAPHS.ONTOLOGY) continue;
 
+      const contentRead = await withBudget(
+        (signal) => this.contextGraphHasLocalContent(id, { signal }),
+        `storage content probe for ${id}`,
+      );
+      if (!contentRead.ok) cacheable = false;
+      if (contentRead.ok && !contentRead.value) continue;
+
       const sub = this.subscribedContextGraphs.get(id);
-      const onChainId = sub?.onChainId ?? (await this.getContextGraphOnChainId(id)) ?? undefined;
-      seen.set(uri, {
+      const onChainId = sub?.onChainId ?? (await optional(
+        (signal) => this.getContextGraphOnChainId(id, { signal }),
+        `on-chain id lookup for ${id}`,
+      )) ?? undefined;
+      const policyRead = await withBudget(
+        (signal) => this.getExplicitAccessPolicy(id, { signal }),
+        `access policy lookup for storage row ${id}`,
+      );
+      if (!policyRead.ok) cacheable = false;
+      const accessPolicy = policyRead.ok && policyRead.value ? policyRead.value : undefined;
+      rememberRow({
         id,
         uri,
         name: sub?.name ?? id,
         isSystem: false,
         subscribed: sub?.subscribed ?? false,
         synced: sub?.synced ?? false,
+        ...(accessPolicy ? { accessPolicy } : {}),
         ...(onChainId ? { onChainId } : {}),
-      });
+      }, accessPolicy ?? 'unknown');
     }
 
     let rows = Array.from(seen.values());
@@ -1625,47 +2038,103 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
      * so list rows lack `curator` and the sidebar cannot classify "mine" without a Bearer-scoped pass.
      * Backfill once (parallelised) — also removes duplicate SPARQL in the involvement pass below.
      */
-    rows = await Promise.all(rows.map(async (r) => {
+    const curatorBackfills = await Promise.allSettled(rows.map(async (r) => {
       if (r.curator?.trim()) return r;
-      const c = await this.getContextGraphCurator(r.id);
+      const c = await optional(
+        (signal) => this.getContextGraphCurator(r.id, { signal }),
+        `curator lookup for ${r.id}`,
+      );
       return c ? { ...r, curator: c } : r;
     }));
+    rows = curatorBackfills.map((entry, index) => {
+      if (entry.status === 'fulfilled') return entry.value;
+      throw entry.reason;
+    });
 
-    let checksum: string | null = null;
-    const rawCaller = opts?.callerAgentAddress?.trim();
-    if (rawCaller && ethers.isAddress(rawCaller)) {
-      try {
-        checksum = ethers.getAddress(rawCaller);
-      } catch {
-        checksum = null;
+    const resolveRowPrivacy = async (row: ListContextGraphsRow): Promise<ListContextGraphsPrivacy> => {
+      const explicitPrivacy = privacyByUri.get(row.uri) ?? 'unknown';
+      if (explicitPrivacy !== 'unknown') return explicitPrivacy;
+      if (!scopedListing) return 'unknown';
+      const legacyRead = await withBudget(
+        (signal) => this.isPrivateContextGraph(row.id, { signal }),
+        `legacy privacy lookup for ${row.id}`,
+      );
+      if (!legacyRead.ok) {
+        cacheable = false;
+        return 'unknown';
+      }
+      return legacyRead.value ? 'private' : 'public';
+    };
+    const privacySettled = await Promise.allSettled(rows.map(async (row) => ({
+      uri: row.uri,
+      privacy: await resolveRowPrivacy(row),
+    })));
+    const resolvedPrivacyByUri = new Map<string, ListContextGraphsPrivacy>();
+    for (const entry of privacySettled) {
+      if (entry.status === 'fulfilled') {
+        resolvedPrivacyByUri.set(entry.value.uri, entry.value.privacy);
+      } else {
+        throw entry.reason;
       }
     }
-
-    // Privacy filter: curated/private CGs must never leak past the daemon to a non-member
-    // caller. With no caller wallet (Bearer absent), drop all private rows; with a caller,
-    // keep private rows only when they are curator or allowlisted participant.
-    const isPrivateRow = (ap?: string): boolean => {
-      if (!ap?.trim()) return false;
-      const t = ap.trim().replace(/^["']|["']$/g, '').toLowerCase();
-      return t === 'private';
-    };
+    const rowPrivacy = (row: ListContextGraphsRow): ListContextGraphsPrivacy =>
+      resolvedPrivacyByUri.get(row.uri) ?? 'unknown';
 
     if (!checksum) {
       // Without a caller wallet we still leave `callerInvolved` unset so the UI can use the
       // curator-vs-identity fallback for OPEN graphs.
-      return rows.filter((r) => !isPrivateRow(r.accessPolicy));
+      return {
+        rows: rows.filter((r) => {
+          const privacy = rowPrivacy(r);
+          if (privacy === 'private') return false;
+          if (privacy === 'unknown') return !scopedListing;
+          return true;
+        }),
+        cacheable,
+      };
     }
 
-    const annotated = await Promise.all(rows.map(async (r) => {
+    const annotatedSettled = await Promise.allSettled(rows.map(async (r): Promise<{
+      row: ListContextGraphsRow;
+      privacy: ListContextGraphsPrivacy;
+    }> => {
+      const privacy = rowPrivacy(r);
       const curatorMatch = this.curatorDidMatchesChecksumAgent(r.curator, checksum);
-      const allowlisted = await this.callerIsAllowlistedAgentParticipant(r.id, checksum);
+      if (curatorMatch) {
+        return { row: { ...r, callerInvolved: true }, privacy };
+      }
+      let usedLiveChainAuth = false;
+      const allowlistRead = await withBudget(
+        (signal) => this.callerIsAllowlistedAgentParticipant(r.id, checksum, {
+          onChainLookup: () => { usedLiveChainAuth = true; },
+          signal,
+        }),
+        `allowlist lookup for ${r.id}`,
+        authBudgetMs,
+      );
+      if (usedLiveChainAuth) cacheable = false;
+      if (!allowlistRead.ok) cacheable = false;
       // `callerInvolved` must reflect ONLY the provided caller wallet.
       // Using local node identity (`creatorIsSelf`) leaks curated rows to unrelated callers.
-      const involved = curatorMatch || allowlisted;
-      return { ...r, callerInvolved: involved };
+      if (!allowlistRead.ok) return { row: r, privacy };
+      return { row: { ...r, callerInvolved: allowlistRead.value }, privacy };
     }));
+    const annotated = annotatedSettled.map((entry, index) => {
+      if (entry.status === 'fulfilled') return entry.value;
+      throw entry.reason;
+    });
 
-    return annotated.filter((r) => !isPrivateRow(r.accessPolicy) || r.callerInvolved === true);
+    return {
+      rows: annotated
+        .filter(({ row, privacy }) => {
+          if (row.callerInvolved === true) return true;
+          if (privacy === 'unknown') return false;
+          if (privacy === 'private') return false;
+          return true;
+        })
+        .map(({ row }) => row),
+      cacheable,
+    };
   }
 
 }

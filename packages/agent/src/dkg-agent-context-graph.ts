@@ -652,6 +652,7 @@ export class ContextGraphMethods extends DKGAgentBase {
     );
 
     await this.store.insert(quads);
+    this.invalidateListContextGraphsCache();
     await gm.ensureContextGraph(opts.id);
 
     // Force the triple-store flush BEFORE the SQLite caches are written.
@@ -911,6 +912,7 @@ export class ContextGraphMethods extends DKGAgentBase {
         { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_CREATOR, object: creatorPeerDid, graph: defGraph },
         { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_CURATOR, object: curatorDid, graph: cgMetaGraph },
       ]);
+      this.invalidateListContextGraphsCache();
       this.log.info(ctx, `Stamped local node as creator contact and address curator for "${id}" (registration-time lazy stamp)`);
       return curatorDid;
     };
@@ -1106,8 +1108,16 @@ export class ContextGraphMethods extends DKGAgentBase {
       if (typeof this.chain.isContextGraphActiveOnChain === 'function') {
         try {
           onChainLive = await this.chain.isContextGraphActiveOnChain(BigInt(existingOnChainId));
-        } catch {
-          onChainLive = false;
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          this.log.warn(
+            ctx,
+            `Context graph "${id}" has local on-chain id ${existingOnChainId}, but liveness could not be verified: ${reason}`,
+          );
+          throw new Error(
+            `Context graph "${id}" has local on-chain id ${existingOnChainId}, but liveness could not be verified. ` +
+            `Refusing to re-register until the existing slot can be checked: ${reason}`,
+          );
         }
       }
       if (onChainLive) {
@@ -1134,7 +1144,8 @@ export class ContextGraphMethods extends DKGAgentBase {
       });
       const sub = this.subscribedContextGraphs.get(id);
       if (sub) {
-        this.setContextGraphSubscription(id, { ...sub, onChainId: undefined });
+        this.forceClearVmReconcileStateForContextGraph(id);
+        this.setContextGraphSubscription(id, { ...sub, onChainId: undefined, lastReconciledOrdinal: 0 });
       }
     }
 
@@ -1391,6 +1402,7 @@ export class ContextGraphMethods extends DKGAgentBase {
       // topic without re-reading the chain event.
       { subject: contextGraphUri, predicate: `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainHash`, object: `"${nameHash}"`, graph: cgMetaGraph },
     ]);
+    this.invalidateListContextGraphsCache();
     // We no longer persist `publishAuthorityAccountId` locally even on
     // success (Codex PR #502 round-6 follow-through): with the
     // stored-value fallback gone, nothing reads it. A CG can only
@@ -1517,6 +1529,7 @@ export class ContextGraphMethods extends DKGAgentBase {
     });
 
     await this.store.insert(quadsToInsert);
+    this.invalidateListContextGraphsCache();
 
     // Issue #865 — log a clear warning AFTER the allowlist quad has
     // landed on a CG with an explicit `accessPolicy="public"` triple.
@@ -1679,6 +1692,7 @@ export class ContextGraphMethods extends DKGAgentBase {
     }
 
     await this.store.insert(quadsToInsert);
+    this.invalidateListContextGraphsCache();
 
     // Issue #865 — companion warning to the peer-invite path above.
     // Allowlist writes on explicit-public CGs are allowed (the
@@ -1769,6 +1783,7 @@ export class ContextGraphMethods extends DKGAgentBase {
       predicate: DKG_ONTOLOGY.DKG_REVOKED_AGENT,
       object: `"${agentAddress}"`,
     }]);
+    this.invalidateListContextGraphsCache();
     this.deleteContextGraphMember(contextGraphId, 'agent', agentAddress);
     this.queueSharedMemoryGossipSubscription(contextGraphId);
     // Drop any cached sender-key send state for this CG so the next
@@ -1846,6 +1861,7 @@ export class ContextGraphMethods extends DKGAgentBase {
       { subject: contextGraphUri, predicate: schemaName, object: escaped, graph: ontologyGraph },
       { subject: contextGraphUri, predicate: schemaName, object: escaped, graph: cgMetaGraph },
     ]);
+    this.invalidateListContextGraphsCache();
 
     this.log.info(ctx, `Renamed context graph "${contextGraphId}" to "${trimmed}"`);
   }

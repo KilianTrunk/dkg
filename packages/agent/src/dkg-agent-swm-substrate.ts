@@ -472,7 +472,7 @@ export class SwmSubstrateMethods extends DKGAgentBase {
    */
   unsubscribeFromContextGraph(this: DKGAgent,
     contextGraphId: string,
-    options?: { updateRehydrationStatus?: boolean },
+    options?: { persist?: boolean; updateRehydrationStatus?: boolean },
   ): void {
     const existing = this.subscribedContextGraphs.get(contextGraphId);
     if (!existing) return;
@@ -520,7 +520,7 @@ export class SwmSubstrateMethods extends DKGAgentBase {
     this.setContextGraphSubscription(
       contextGraphId,
       { ...existing, subscribed: false },
-      { persist: true, updateRehydrationStatus: options?.updateRehydrationStatus },
+      { persist: options?.persist ?? true, updateRehydrationStatus: options?.updateRehydrationStatus },
     );
 
     void this.reconcileSwmHostModeSubscription(contextGraphId).catch((err) => {

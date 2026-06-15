@@ -464,6 +464,82 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
       }
     });
 
+    it('accounts a new subscription from the latest persisted callback when an earlier callback is stale', async () => {
+      const rows = Array.from({ length: 64 }, (_, i) => ({
+        id: `new-race-cg-${String(i).padStart(3, '0')}`,
+        name: `New Race CG ${i}`,
+        subscribed: true,
+        synced: false,
+        sharedMemorySynced: false,
+        metaSynced: false,
+        syncScoped: true,
+      }));
+      const saveResolvers: Array<{ id: string; resolve: () => void }> = [];
+      const subscriptionStore = {
+        loadAll: async () => rows,
+        save: async (record: any) => new Promise<void>((resolve) => {
+          saveResolvers.push({ id: record.id, resolve });
+        }),
+        delete: async () => {},
+      };
+      const agent = await DKGAgent.create({
+        name: 'CapRehydrationNewRace',
+        listenHost: '127.0.0.1',
+        chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+        contextGraphSubscriptionStore: subscriptionStore,
+      });
+      try {
+        await agent.start();
+        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
+          persistedTotal: 64,
+          activated: 64,
+          dormant: 0,
+          dormantIds: [],
+        });
+        const startupSaveCount = saveResolvers.length;
+
+        agent.setContextGraphSubscription('new-race-created', {
+          name: 'New Race Created',
+          subscribed: true,
+          synced: false,
+          sharedMemorySynced: false,
+          metaSynced: false,
+        });
+        agent.setContextGraphSubscription('new-race-created', {
+          name: 'New Race Created',
+          subscribed: true,
+          synced: true,
+          sharedMemorySynced: false,
+          metaSynced: false,
+        });
+        expect(saveResolvers.slice(startupSaveCount).map((entry) => entry.id)).toEqual([
+          'new-race-created',
+          'new-race-created',
+        ]);
+
+        saveResolvers[startupSaveCount + 1].resolve();
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
+          persistedTotal: 65,
+          activated: 65,
+          dormant: 0,
+          dormantIds: [],
+        });
+
+        saveResolvers[startupSaveCount].resolve();
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
+          persistedTotal: 65,
+          activated: 65,
+          dormant: 0,
+          dormantIds: [],
+        });
+      } finally {
+        for (const { resolve } of saveResolvers) resolve();
+        await agent.stop().catch(() => {});
+      }
+    });
+
     it('disables the rehydration activation cap when configured with zero', async () => {
       const rows = Array.from({ length: 70 }, (_, i) => ({
         id: `uncapped-cg-${String(i).padStart(3, '0')}`,
@@ -608,7 +684,10 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
       const subscriptionStore = {
         loadAll: async () => [...persisted.values()],
         save: async (r: any) => { persisted.set(r.id, { ...r }); },
-        delete: async (id: string) => { persisted.delete(id); },
+        delete: async (id: string) => {
+          if (!persisted.has(id)) throw new Error(`missing ${id}`);
+          persisted.delete(id);
+        },
       };
       const agent = await DKGAgent.create({
         name: 'ClearSubscriptions',

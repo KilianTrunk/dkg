@@ -3572,7 +3572,6 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     next: ContextGraphSub,
     options?: { persist?: boolean; updateRehydrationStatus?: boolean },
   ): ContextGraphSub {
-    const existing = this.subscribedContextGraphs.get(contextGraphId);
     this.invalidateListContextGraphsCache();
     this.subscribedContextGraphs.set(contextGraphId, next);
     if (!next.subscribed && !next.coreHosted) {
@@ -3583,8 +3582,6 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       this.persistContextGraphSubscription(
         contextGraphId,
         {
-          existing,
-          next,
           revision,
           updateRehydrationStatus: options?.updateRehydrationStatus !== false,
         },
@@ -3616,7 +3613,6 @@ export class LifecycleSyncMethods extends DKGAgentBase {
 
   updateContextGraphSubscriptionRehydrationStatusAfterPersist(this: DKGAgent,
     contextGraphId: string,
-    existing?: ContextGraphSub,
     next?: ContextGraphSub,
   ): void {
     const status = this.contextGraphSubscriptionRehydrationStatus;
@@ -3626,8 +3622,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     const sortIds = (ids: string[]): string[] => [...ids].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
     const wasDormant = status.dormantIds.includes(contextGraphId);
     const hostedActivatedIds = status.hostedActivatedIds ?? [];
-    const wasHosted = hostedActivatedIds.includes(contextGraphId);
-    const wasPersisted = wasDormant || wasHosted || existing?.subscribed === true || existing?.coreHosted === true;
+    const wasAccounted = this.contextGraphSubscriptionRehydrationAccountedIds.has(contextGraphId);
     const isPersisted = next?.subscribed === true || next?.coreHosted === true;
 
     let persistedTotal = status.persistedTotal;
@@ -3641,15 +3636,17 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     if (isPersisted) {
       if (wasDormant) {
         activated += 1;
-      } else if (!wasPersisted) {
+      } else if (!wasAccounted) {
         persistedTotal += 1;
         activated += 1;
       }
-    } else if (wasPersisted) {
+      this.contextGraphSubscriptionRehydrationAccountedIds.add(contextGraphId);
+    } else if (wasAccounted) {
       persistedTotal = Math.max(0, persistedTotal - 1);
       if (!wasDormant) {
         activated = Math.max(0, activated - 1);
       }
+      this.contextGraphSubscriptionRehydrationAccountedIds.delete(contextGraphId);
     }
 
     this.contextGraphSubscriptionRehydrationStatus = {
@@ -3681,8 +3678,10 @@ export class LifecycleSyncMethods extends DKGAgentBase {
 
     for (const id of new Set(clearedIds)) {
       if (systemContextGraphs.has(id)) continue;
+      const wasAccounted = this.contextGraphSubscriptionRehydrationAccountedIds.delete(id);
       const wasDormant = removeFrom(dormantIds, id);
       removeFrom(hostedActivatedIds, id);
+      if (!wasAccounted) continue;
       persistedTotal = Math.max(0, persistedTotal - 1);
       if (!wasDormant) {
         activated = Math.max(0, activated - 1);
@@ -3717,8 +3716,6 @@ export class LifecycleSyncMethods extends DKGAgentBase {
   persistContextGraphSubscription(this: DKGAgent,
     contextGraphId: string,
     options?: {
-      existing?: ContextGraphSub;
-      next?: ContextGraphSub;
       revision?: number;
       updateRehydrationStatus?: boolean;
     },
@@ -3738,7 +3735,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
             options?.updateRehydrationStatus === true &&
             this.canApplyContextGraphSubscriptionPersistRevision(contextGraphId, options.revision)
           ) {
-            this.updateContextGraphSubscriptionRehydrationStatusAfterPersist(contextGraphId, options.existing, undefined);
+            this.updateContextGraphSubscriptionRehydrationStatusAfterPersist(contextGraphId, undefined);
           }
         })
         .catch((err) => {
@@ -3766,7 +3763,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
         options?.updateRehydrationStatus === true &&
         this.canApplyContextGraphSubscriptionPersistRevision(contextGraphId, options.revision)
       ) {
-        this.updateContextGraphSubscriptionRehydrationStatusAfterPersist(contextGraphId, options.existing, sub);
+        this.updateContextGraphSubscriptionRehydrationStatusAfterPersist(contextGraphId, sub);
       }
     }).catch((err) => {
       this.log.warn(
@@ -3937,6 +3934,10 @@ export class LifecycleSyncMethods extends DKGAgentBase {
         }
       }
       const skipped = dormantRows.length;
+      this.contextGraphSubscriptionRehydrationAccountedIds.clear();
+      for (const row of rows) {
+        this.contextGraphSubscriptionRehydrationAccountedIds.add(row.id);
+      }
       this.contextGraphSubscriptionRehydrationStatus = {
         persistedTotal: persistedRows.length,
         systemExcluded: persistedRows.length - rows.length,
@@ -4042,7 +4043,8 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     // + coreHosted CGs, so this only drops the cleared non-hosted user entries.)
     for (const id of activeUserIds) {
       try {
-        this.unsubscribeFromContextGraph(id, { updateRehydrationStatus: false });
+        this.unsubscribeFromContextGraph(id, { persist: false, updateRehydrationStatus: false });
+        this.deleteContextGraphMember(id, 'node', this.peerId);
       } catch {
         /* best-effort teardown */
       }

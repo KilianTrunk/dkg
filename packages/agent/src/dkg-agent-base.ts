@@ -886,6 +886,7 @@ export class DKGAgentBase {
   protected started = false;
   protected readonly subscribedContextGraphs = new Map<string, ContextGraphSub>();
   protected contextGraphSubscriptionRehydrationStatus: ContextGraphSubscriptionRehydrationStatus | null = null;
+  protected readonly contextGraphSubscriptionPersistRevisions = new Map<string, number>();
   protected readonly listContextGraphsCache = new Map<string, {
     expiresAt: number;
     rows: Array<Record<string, unknown>>;

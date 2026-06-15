@@ -3579,9 +3579,15 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       this.clearVmReconcileStateForContextGraph(contextGraphId);
     }
     if (options?.persist !== false) {
+      const revision = this.nextContextGraphSubscriptionPersistRevision(contextGraphId);
       this.persistContextGraphSubscription(
         contextGraphId,
-        options?.updateRehydrationStatus === false ? undefined : { existing, next },
+        {
+          existing,
+          next,
+          revision,
+          updateRehydrationStatus: options?.updateRehydrationStatus !== false,
+        },
       );
       if (next.subscribed) {
         this.persistLocalNodeMembership(contextGraphId);
@@ -3596,6 +3602,16 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     const existing = this.subscribedContextGraphs.get(contextGraphId);
     if (!existing) return;
     this.setContextGraphSubscription(contextGraphId, { ...existing, ...patch });
+  }
+
+  nextContextGraphSubscriptionPersistRevision(this: DKGAgent, contextGraphId: string): number {
+    const revision = (this.contextGraphSubscriptionPersistRevisions.get(contextGraphId) ?? 0) + 1;
+    this.contextGraphSubscriptionPersistRevisions.set(contextGraphId, revision);
+    return revision;
+  }
+
+  canApplyContextGraphSubscriptionPersistRevision(this: DKGAgent, contextGraphId: string, revision?: number): boolean {
+    return revision != null && this.contextGraphSubscriptionPersistRevisions.get(contextGraphId) === revision;
   }
 
   updateContextGraphSubscriptionRehydrationStatusAfterPersist(this: DKGAgent,
@@ -3644,6 +3660,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       activated,
       dormant: dormantIds.length,
       dormantIds,
+      completedAt: Date.now(),
     };
   }
 
@@ -3680,6 +3697,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       activated,
       dormant: dormantIds.length,
       dormantIds,
+      completedAt: Date.now(),
     };
   }
 
@@ -3690,12 +3708,20 @@ export class LifecycleSyncMethods extends DKGAgentBase {
   }
 
   persistContextGraphSubscriptionState(this: DKGAgent, contextGraphId: string): void {
-    this.persistContextGraphSubscription(contextGraphId);
+    this.persistContextGraphSubscription(contextGraphId, {
+      revision: this.nextContextGraphSubscriptionPersistRevision(contextGraphId),
+      updateRehydrationStatus: false,
+    });
   }
 
   persistContextGraphSubscription(this: DKGAgent,
     contextGraphId: string,
-    options?: { existing?: ContextGraphSub; next?: ContextGraphSub },
+    options?: {
+      existing?: ContextGraphSub;
+      next?: ContextGraphSub;
+      revision?: number;
+      updateRehydrationStatus?: boolean;
+    },
   ): void {
     this.invalidateListContextGraphsCache();
     const store = this.config.contextGraphSubscriptionStore;
@@ -3708,7 +3734,10 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     if (!sub?.subscribed && !sub?.coreHosted) {
       void store.delete(contextGraphId)
         .then(() => {
-          if (options) {
+          if (
+            options?.updateRehydrationStatus === true &&
+            this.canApplyContextGraphSubscriptionPersistRevision(contextGraphId, options.revision)
+          ) {
             this.updateContextGraphSubscriptionRehydrationStatusAfterPersist(contextGraphId, options.existing, undefined);
           }
         })
@@ -3733,7 +3762,10 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       coreHosted: sub.coreHosted,
       syncScoped: (this.config.syncContextGraphs ?? []).includes(contextGraphId),
     }).then(() => {
-      if (options) {
+      if (
+        options?.updateRehydrationStatus === true &&
+        this.canApplyContextGraphSubscriptionPersistRevision(contextGraphId, options.revision)
+      ) {
         this.updateContextGraphSubscriptionRehydrationStatusAfterPersist(contextGraphId, options.existing, sub);
       }
     }).catch((err) => {

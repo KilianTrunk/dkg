@@ -41,6 +41,7 @@ describe('context graph subscription diagnostics route', () => {
               activated: 2,
               dormant: 0,
               dormantIds: [],
+              completedAt: 1_700_000_000_001,
             }
           : null;
         subscriptions.delete('cg-000');
@@ -164,6 +165,7 @@ describe('context graph subscription diagnostics route', () => {
       activated: 2,
       dormant: 0,
       dormantIds: [],
+      completedAt: 1_700_000_000_001,
     });
   });
 });

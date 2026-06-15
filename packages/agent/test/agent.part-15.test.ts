@@ -363,7 +363,8 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
       });
       try {
         await agent.start();
-        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
+        const beforeStatus = agent.getContextGraphSubscriptionRehydrationStatus();
+        expect(beforeStatus).toMatchObject({
           activated: 64,
           dormant: 2,
           dormantIds: ['one-write-cg-064', 'one-write-cg-065'],
@@ -379,13 +380,86 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
         await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
         expect(saved.map((r) => r.id)).toContain('one-write-cg-064');
-        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
+        const afterStatus = agent.getContextGraphSubscriptionRehydrationStatus();
+        expect(afterStatus).toMatchObject({
           persistedTotal: 66,
           activated: 65,
           dormant: 1,
           dormantIds: ['one-write-cg-065'],
         });
+        expect(afterStatus?.completedAt).toBeGreaterThanOrEqual(beforeStatus?.completedAt ?? 0);
       } finally {
+        await agent.stop().catch(() => {});
+      }
+    });
+
+    it('ignores stale persisted-write callbacks when a newer write supersedes the same context graph', async () => {
+      const rows = Array.from({ length: 65 }, (_, i) => ({
+        id: `stale-write-cg-${String(i).padStart(3, '0')}`,
+        name: `Stale Write CG ${i}`,
+        subscribed: true,
+        synced: false,
+        sharedMemorySynced: false,
+        metaSynced: false,
+        syncScoped: true,
+      }));
+      const saveResolvers: Array<() => void> = [];
+      const subscriptionStore = {
+        loadAll: async () => rows,
+        save: async () => new Promise<void>((resolve) => {
+          saveResolvers.push(resolve);
+        }),
+        delete: async () => {},
+      };
+      const agent = await DKGAgent.create({
+        name: 'CapRehydrationStaleWrite',
+        listenHost: '127.0.0.1',
+        chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+        contextGraphSubscriptionStore: subscriptionStore,
+      });
+      try {
+        await agent.start();
+        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
+          persistedTotal: 65,
+          activated: 64,
+          dormant: 1,
+          dormantIds: ['stale-write-cg-064'],
+        });
+        const startupSaveCount = saveResolvers.length;
+
+        agent.setContextGraphSubscription('stale-write-cg-064', {
+          name: 'Stale Write CG 64',
+          subscribed: true,
+          synced: false,
+          sharedMemorySynced: false,
+          metaSynced: false,
+        });
+        agent.setContextGraphSubscription('stale-write-cg-064', {
+          name: 'Stale Write CG 64',
+          subscribed: false,
+          synced: false,
+          sharedMemorySynced: false,
+          metaSynced: false,
+        });
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
+          persistedTotal: 64,
+          activated: 64,
+          dormant: 0,
+          dormantIds: [],
+        });
+        expect(saveResolvers).toHaveLength(startupSaveCount + 1);
+        saveResolvers[startupSaveCount]();
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
+          persistedTotal: 64,
+          activated: 64,
+          dormant: 0,
+          dormantIds: [],
+        });
+      } finally {
+        for (const resolve of saveResolvers) resolve();
         await agent.stop().catch(() => {});
       }
     });

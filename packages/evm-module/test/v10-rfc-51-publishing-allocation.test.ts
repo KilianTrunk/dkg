@@ -16,7 +16,13 @@ import {
   ContextGraphs,
   ContextGraphStorage,
   DKGPublishingConvictionNFT,
+  RandomSampling,
+  ConvictionStakingStorage,
+  ParametersStorage,
+  ProfileStorage,
+  AskStorage,
 } from '../typechain';
+import { sqrt } from './helpers/math-helpers';
 import { createProfile } from './helpers/profile-helpers';
 import {
   getDefaultPublishingNode,
@@ -57,7 +63,93 @@ type Fixture = {
   ContextGraphs: ContextGraphs;
   ContextGraphStorage: ContextGraphStorage;
   PublishingConvictionNFT: DKGPublishingConvictionNFT;
+  RandomSampling: RandomSampling;
+  ConvictionStakingStorage: ConvictionStakingStorage;
+  ParametersStorage: ParametersStorage;
+  ProfileStorage: ProfileStorage;
+  AskStorage: AskStorage;
 };
+
+const SCALE18 = 10n ** 18n;
+
+/**
+ * JS mirror of `RandomSampling._calculateNodeScore`. Computes the expected
+ * 18-decimal node score from the SAME on-chain inputs the contract reads, so
+ * the test asserts the live scoring path rather than a hand-rolled constant:
+ *
+ *   nodeScore(t) = S(t) * (c + 0.86 * P(t) + 0.60 * A(t) * P(t))
+ *
+ * with the OT-RFC-51 single-current-epoch publishing-allocation window:
+ *   S(t) = sqrt(min(effStake, stakeCap) / stakeCap)          (sublinear stake)
+ *   P(t) = K_n / K_total   over the CURRENT EPOCH ONLY        (RFC-51 §4 / D1)
+ *   A(t) = 1 - |ask - networkPrice| / networkPrice           (ask alignment)
+ *   c    = 0.002 (STAKE_BASELINE_COEFFICIENT)
+ *
+ * All operations mirror the contract's integer order-of-operations exactly
+ * (including OZ Math.sqrt's round-down via the Babylonian `sqrt` helper) so
+ * the expected value is byte-identical to the on-chain result.
+ */
+async function expectedNodeScore(
+  identityId: bigint,
+  deps: {
+    ConvictionStakingStorage: ConvictionStakingStorage;
+    ParametersStorage: ParametersStorage;
+    ProfileStorage: ProfileStorage;
+    AskStorage: AskStorage;
+    EpochStorage: EpochStorage;
+    Chronos: Chronos;
+  },
+): Promise<{ score: bigint; stakeFactor: bigint; inner: bigint; p: bigint }> {
+  const currentEpoch = await deps.Chronos.getCurrentEpoch();
+
+  // 1. Stake factor S(t) = sqrt(min(effStake, stakeCap) / stakeCap)
+  const effStake = await deps.ConvictionStakingStorage.getNodeEffectiveStake(
+    identityId,
+  );
+  const stakeCap = BigInt(await deps.ParametersStorage.maximumStake());
+  const capped = effStake > stakeCap ? stakeCap : effStake;
+  const stakeRatio18 = (capped * SCALE18) / stakeCap;
+  const stakeFactor18 = sqrt(stakeRatio18 * SCALE18);
+
+  // 2. Publishing factor P(t) = K_n / K_total over the current epoch only.
+  const nodeKV = BigInt(
+    await deps.EpochStorage.getNodeEpochPublishingAllocation(
+      identityId,
+      currentEpoch,
+    ),
+  );
+  const totalKV = BigInt(
+    await deps.EpochStorage.getEpochPublishingAllocation(currentEpoch),
+  );
+  const publishingFactor18 = totalKV > 0n ? (nodeKV * SCALE18) / totalKV : 0n;
+
+  // 3. Ask alignment factor A(t).
+  const nodeAsk = BigInt(await deps.ProfileStorage.getAsk(identityId));
+  const networkPrice = BigInt(await deps.AskStorage.getPricePerKbEpoch());
+  let askAlignmentFactor18 = 0n;
+  if (networkPrice > 0n) {
+    const deviation =
+      nodeAsk > networkPrice ? nodeAsk - networkPrice : networkPrice - nodeAsk;
+    const deviationRatio18 = (deviation * SCALE18) / networkPrice;
+    askAlignmentFactor18 =
+      deviationRatio18 >= SCALE18 ? 0n : SCALE18 - deviationRatio18;
+  }
+
+  const baselineComponent18 = (2n * SCALE18) / 1000n;
+  const publishingComponent18 = (86n * publishingFactor18) / 100n;
+  const askPublishingComponent18 =
+    (60n * askAlignmentFactor18 * publishingFactor18) / (100n * SCALE18);
+
+  const inner18 =
+    baselineComponent18 + publishingComponent18 + askPublishingComponent18;
+  const score18 = (stakeFactor18 * inner18) / SCALE18;
+  return {
+    score: score18,
+    stakeFactor: stakeFactor18,
+    inner: inner18,
+    p: publishingFactor18,
+  };
+}
 
 async function deployFixture(): Promise<Fixture> {
   await hre.deployments.fixture([
@@ -74,6 +166,10 @@ async function deployFixture(): Promise<Fixture> {
     'DKGPublishingConvictionNFT',
     'DKGStakingConvictionNFT',
     'StakingV10',
+    // RandomSampling transitively pulls in RandomSamplingStorage,
+    // ProfileStorage, AskStorage, ParametersStorage and
+    // ConvictionStakingStorage — everything `calculateNodeScore` reads.
+    'RandomSampling',
   ]);
 
   const accounts = await hre.ethers.getSigners();
@@ -101,6 +197,15 @@ async function deployFixture(): Promise<Fixture> {
     PublishingConvictionNFT: await hre.ethers.getContract<DKGPublishingConvictionNFT>(
       'DKGPublishingConvictionNFT',
     ),
+    RandomSampling: await hre.ethers.getContract<RandomSampling>('RandomSampling'),
+    ConvictionStakingStorage: await hre.ethers.getContract<ConvictionStakingStorage>(
+      'ConvictionStakingStorage',
+    ),
+    ParametersStorage: await hre.ethers.getContract<ParametersStorage>(
+      'ParametersStorage',
+    ),
+    ProfileStorage: await hre.ethers.getContract<ProfileStorage>('ProfileStorage'),
+    AskStorage: await hre.ethers.getContract<AskStorage>('AskStorage'),
   };
 }
 
@@ -125,6 +230,11 @@ describe('@integration OT-RFC-51 Publishing Allocation', function () {
   let CGFacade: ContextGraphs;
   let CGS: ContextGraphStorage;
   let EpochStorageContract: EpochStorage;
+  let RandomSamplingContract: RandomSampling;
+  let CSS: ConvictionStakingStorage;
+  let ParametersStorageContract: ParametersStorage;
+  let ProfileStorageContract: ProfileStorage;
+  let AskStorageContract: AskStorage;
   let kav10Address: string;
 
   beforeEach(async () => {
@@ -141,6 +251,11 @@ describe('@integration OT-RFC-51 Publishing Allocation', function () {
     CGFacade = f.ContextGraphs;
     CGS = f.ContextGraphStorage;
     EpochStorageContract = f.EpochStorage;
+    RandomSamplingContract = f.RandomSampling;
+    CSS = f.ConvictionStakingStorage;
+    ParametersStorageContract = f.ParametersStorage;
+    ProfileStorageContract = f.ProfileStorage;
+    AskStorageContract = f.AskStorage;
     kav10Address = await KAV10.getAddress();
   });
 
@@ -336,5 +451,277 @@ describe('@integration OT-RFC-51 Publishing Allocation', function () {
     expect(
       await EpochStorageContract.getNodeEpochPublishingAllocation(node1Id, pubEpoch),
     ).to.equal(n1PrePublish[pubEpoch.toString()]);
+  });
+
+  // ==========================================================================
+  // (d) NODE SCORE: publishing allocation drives RandomSampling node score
+  // ==========================================================================
+  // This is the one RFC-51 behaviour with no other RUNNING test. The V8-flow
+  // `test/integration/RandomSampling.test.ts` suite is `describe.skip`-ped
+  // (tombstone: V8 staking pipeline incompatible with V10 CSS scoring), so the
+  // allocation -> P(t) -> score path is exercised here against live contracts.
+  //
+  // Setup primitive shared by the score cases: three V10 nodes with EQUAL
+  // effective stake (same MIN_STAKE, same lock tier 1) so S(t) is identical and
+  // factors out of every ratio. Returns their identityIds.
+  const setupThreeEqualStakeNodes = async () => {
+    const nodeA = { admin: accounts[1], operational: accounts[2] };
+    const nodeB = { admin: accounts[3], operational: accounts[4] };
+    const nodeC = { admin: accounts[5], operational: accounts[6] };
+
+    const { identityId: aId } = await createProfile(ProfileContract, nodeA);
+    const { identityId: bId } = await createProfile(ProfileContract, nodeB);
+    const { identityId: cId } = await createProfile(ProfileContract, nodeC);
+
+    await stakeV10(nodeA.operational, aId, MIN_STAKE);
+    await stakeV10(nodeB.operational, bId, MIN_STAKE);
+    await stakeV10(nodeC.operational, cId, MIN_STAKE);
+
+    // Equal stake + equal tier => equal effective stake (read at the same
+    // block.timestamp via the contract's simulated settle). Assert it, since a
+    // zero effective stake here would make every downstream score 0 and the
+    // task's blocker condition would apply.
+    const effA = await CSS.getNodeEffectiveStake(aId);
+    const effB = await CSS.getNodeEffectiveStake(bId);
+    const effC = await CSS.getNodeEffectiveStake(cId);
+    expect(effA).to.be.gt(0n);
+    expect(effA).to.equal(effB);
+    expect(effB).to.equal(effC);
+
+    return { aId: BigInt(aId), bId: BigInt(bId), cId: BigInt(cId) };
+  };
+
+  const scoreDeps = () => ({
+    ConvictionStakingStorage: CSS,
+    ParametersStorage: ParametersStorageContract,
+    ProfileStorage: ProfileStorageContract,
+    AskStorage: AskStorageContract,
+    EpochStorage: EpochStorageContract,
+    Chronos,
+  });
+
+  it('(d.1) allocation drives calculateNodeScore: equal stake, 3:1 seeded allocation => scoreA > scoreB and each matches the (c + 0.86*P) formula', async () => {
+    const { aId, bId } = await setupThreeEqualStakeNodes();
+
+    // Seed a 3:1 publishing allocation into the CURRENT epoch directly (the
+    // onlyContracts gate accepts hub.owner() = accounts[0]). The current epoch
+    // must be read AFTER staking — staking advances block.timestamp but not the
+    // epoch boundary.
+    const epoch = await Chronos.getCurrentEpoch();
+    const K_A = ethers.parseEther('30000');
+    const K_B = ethers.parseEther('10000');
+    await EpochStorageContract.connect(accounts[0]).addEpochPublishingAllocation(
+      aId,
+      epoch,
+      K_A,
+    );
+    await EpochStorageContract.connect(accounts[0]).addEpochPublishingAllocation(
+      bId,
+      epoch,
+      K_B,
+    );
+
+    // Control the denominator: with a fresh fixture and only these two seeds,
+    // K_total for the epoch is exactly K_A + K_B.
+    const kTotal = BigInt(
+      await EpochStorageContract.getEpochPublishingAllocation(epoch),
+    );
+    expect(kTotal).to.equal(K_A + K_B);
+    expect(
+      BigInt(
+        await EpochStorageContract.getNodeEpochPublishingAllocation(aId, epoch),
+      ),
+    ).to.equal(K_A);
+    expect(
+      BigInt(
+        await EpochStorageContract.getNodeEpochPublishingAllocation(bId, epoch),
+      ),
+    ).to.equal(K_B);
+
+    // Live on-chain scores.
+    const scoreA = await RandomSamplingContract.calculateNodeScore(aId);
+    const scoreB = await RandomSamplingContract.calculateNodeScore(bId);
+
+    // Allocation must make nodeA's score strictly greater than nodeB's.
+    expect(scoreA).to.be.gt(scoreB);
+    expect(scoreA).to.be.gt(0n);
+    expect(scoreB).to.be.gt(0n);
+
+    // Each live score must equal the value derived from the SAME inputs the
+    // contract reads (mirrors `_calculateNodeScore` exactly => byte-identical).
+    const expA = await expectedNodeScore(aId, scoreDeps());
+    const expB = await expectedNodeScore(bId, scoreDeps());
+    expect(scoreA).to.equal(expA.score);
+    expect(scoreB).to.equal(expB.score);
+
+    // P(t) ratio: nodeA holds 3/4 of K_total, nodeB holds 1/4.
+    expect(expA.p).to.equal((3n * SCALE18) / 4n); // 0.75e18
+    expect(expB.p).to.equal((1n * SCALE18) / 4n); // 0.25e18
+
+    // Inner term = c + 0.86 * P(t) (A(t)=0 here: ask=0 => deviation >= 1 or
+    // networkPrice=0). Equal stake => stakeFactor identical => the score ratio
+    // equals the inner ratio. The baseline c shifts the ratio strictly BELOW
+    // the raw 3:1 P ratio (~2.98:1), proving c participates, not just P.
+    expect(expA.stakeFactor).to.equal(expB.stakeFactor);
+    const baseline18 = (2n * SCALE18) / 1000n; // c = 0.002e18
+    expect(expA.inner).to.equal(baseline18 + (86n * expA.p) / 100n);
+    expect(expB.inner).to.equal(baseline18 + (86n * expB.p) / 100n);
+
+    // Score ratio (scaled by SCALE18) tracks the inner ratio (equal stake
+    // factors out) and sits strictly below the raw 3:1 — i.e. the baseline c in
+    // (c + 0.86*P) genuinely shapes it. The score ratio is computed from two
+    // separately floored on-chain scores, so it matches the inner ratio only up
+    // to a few wei of fixed-point rounding (assert ~equal within a tight bound,
+    // not byte-exact — the per-node `score == expected` checks above are the
+    // byte-exact ones).
+    const scoreRatio18 = (scoreA * SCALE18) / scoreB;
+    const innerRatio18 = (expA.inner * SCALE18) / expB.inner;
+    const ratioDelta =
+      scoreRatio18 > innerRatio18
+        ? scoreRatio18 - innerRatio18
+        : innerRatio18 - scoreRatio18;
+    expect(ratioDelta).to.be.lt(1000n); // < 1e-15 of the ratio
+    expect(scoreRatio18).to.be.lt(3n * SCALE18); // strictly under 3:1
+    expect(scoreRatio18).to.be.gt((29n * SCALE18) / 10n); // ~2.98 > 2.9
+  });
+
+  it('(d.2) a staked node with ZERO allocation has P(t)=0 => inner score ~= baseline c only, far below an allocated peer', async () => {
+    const { aId, cId } = await setupThreeEqualStakeNodes();
+
+    // Seed allocation ONLY to nodeA. nodeC gets nothing => P_C = 0. Crucially
+    // K_total > 0 (from nodeA), so this is the real divisor case, not the
+    // degenerate `totalKV == 0` short-circuit.
+    const epoch = await Chronos.getCurrentEpoch();
+    const K_A = ethers.parseEther('40000');
+    await EpochStorageContract.connect(accounts[0]).addEpochPublishingAllocation(
+      aId,
+      epoch,
+      K_A,
+    );
+    expect(
+      BigInt(await EpochStorageContract.getEpochPublishingAllocation(epoch)),
+    ).to.equal(K_A);
+    expect(
+      BigInt(
+        await EpochStorageContract.getNodeEpochPublishingAllocation(cId, epoch),
+      ),
+    ).to.equal(0n);
+
+    const scoreA = await RandomSamplingContract.calculateNodeScore(aId);
+    const scoreC = await RandomSamplingContract.calculateNodeScore(cId);
+
+    const expA = await expectedNodeScore(aId, scoreDeps());
+    const expC = await expectedNodeScore(cId, scoreDeps());
+
+    // Live scores match the formula.
+    expect(scoreA).to.equal(expA.score);
+    expect(scoreC).to.equal(expC.score);
+
+    // nodeC's P(t) is exactly 0; its inner term is the bare baseline c=0.002e18.
+    const baseline18 = (2n * SCALE18) / 1000n;
+    expect(expC.p).to.equal(0n);
+    expect(expC.inner).to.equal(baseline18);
+
+    // nodeA (P=1, sole allocator) inner = c + 0.86 => ~431x the zero-alloc node.
+    expect(expA.p).to.equal(SCALE18);
+    expect(expA.inner).to.equal(baseline18 + (86n * SCALE18) / 100n);
+    expect(scoreA).to.be.gt(scoreC);
+    // Concretely "much smaller": zero-alloc score is < 1% of the allocated one.
+    expect(scoreC * 100n).to.be.lt(scoreA);
+  });
+
+  it('(d.3) setPrimaryNode shifts the FUTURE-epoch score: after moving allocation A->B and advancing one epoch, calculateNodeScore favors nodeB', async () => {
+    // Use the real PCA path (createAccount -> setPrimaryNode) so the on-chain
+    // move mutator is what drives the score change, not a direct seed.
+    const { aId, bId } = await setupThreeEqualStakeNodes();
+
+    const creator = getDefaultKCCreator(accounts);
+    await Token.connect(accounts[0]).transfer(creator.address, COMMITTED_TRAC);
+    await Token.connect(creator).approve(await NFT.getAddress(), COMMITTED_TRAC);
+
+    // Seed all future epochs' allocation onto nodeA via a real PCA.
+    await NFT.connect(creator).createAccount(COMMITTED_TRAC, Number(aId));
+    const accountId = await NFT.totalSupply();
+    const acct = await NFT.accounts(accountId);
+    const createdAtEpoch = acct[1];
+    const lockDurationEpochs = BigInt(acct[5]);
+    const lastEpoch = createdAtEpoch + lockDurationEpochs;
+
+    // Before the move: at the current epoch nodeA is the sole allocator, so it
+    // outscores nodeB (which has equal stake but zero allocation).
+    {
+      const epochNow = await Chronos.getCurrentEpoch();
+      expect(
+        BigInt(
+          await EpochStorageContract.getNodeEpochPublishingAllocation(
+            aId,
+            epochNow,
+          ),
+        ),
+      ).to.be.gt(0n);
+      const sA = await RandomSamplingContract.calculateNodeScore(aId);
+      const sB = await RandomSamplingContract.calculateNodeScore(bId);
+      expect(sA).to.be.gt(sB);
+    }
+
+    // Advance one full chain epoch so the once-per-epoch rate limit clears and
+    // we land on a FUTURE epoch (>= changeEpoch + 1) that the move retargets.
+    const epochLength = await Chronos.epochLength();
+    await time.increase(epochLength);
+    const moveEpoch = await Chronos.getCurrentEpoch();
+    expect(moveEpoch).to.be.gt(createdAtEpoch);
+
+    // Move FUTURE epochs' allocation from nodeA to nodeB.
+    await NFT.connect(creator).setPrimaryNode(accountId, Number(bId));
+    expect((await NFT.accounts(accountId))[9]).to.equal(bId); // primaryNode = B
+
+    // The move retargets epochs >= moveEpoch + 1. Advance into one of those so
+    // the CURRENT-epoch score read (which is all calculateNodeScore inspects)
+    // sees nodeB holding the allocation. Guard the fixture has room to advance.
+    expect(moveEpoch + 1n).to.be.lte(lastEpoch);
+    await time.increase(epochLength);
+    const futureEpoch = await Chronos.getCurrentEpoch();
+    expect(futureEpoch).to.be.gte(moveEpoch + 1n);
+
+    // In this future epoch the allocation now sits on nodeB, not nodeA.
+    expect(
+      BigInt(
+        await EpochStorageContract.getNodeEpochPublishingAllocation(
+          aId,
+          futureEpoch,
+        ),
+      ),
+    ).to.equal(0n);
+    expect(
+      BigInt(
+        await EpochStorageContract.getNodeEpochPublishingAllocation(
+          bId,
+          futureEpoch,
+        ),
+      ),
+    ).to.be.gt(0n);
+
+    // Effective stake is still equal across one epoch (boost has not expired),
+    // so the score flip is purely from the allocation move, not from S(t).
+    const effA = await CSS.getNodeEffectiveStake(aId);
+    const effB = await CSS.getNodeEffectiveStake(bId);
+    expect(effA).to.be.gt(0n);
+    expect(effA).to.equal(effB);
+
+    // The score now favors nodeB: the move shifted the live score, not just the
+    // stored accumulator.
+    const scoreA = await RandomSamplingContract.calculateNodeScore(aId);
+    const scoreB = await RandomSamplingContract.calculateNodeScore(bId);
+    expect(scoreB).to.be.gt(scoreA);
+
+    // And both match the formula on these post-move inputs.
+    const expA = await expectedNodeScore(aId, scoreDeps());
+    const expB = await expectedNodeScore(bId, scoreDeps());
+    expect(scoreA).to.equal(expA.score);
+    expect(scoreB).to.equal(expB.score);
+    // nodeA is now the zero-allocation node => inner = baseline c only.
+    const baseline18 = (2n * SCALE18) / 1000n;
+    expect(expA.inner).to.equal(baseline18);
+    expect(expB.p).to.be.gt(0n);
   });
 });

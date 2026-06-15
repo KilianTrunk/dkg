@@ -1672,6 +1672,24 @@ export async function runDaemonInner(
               },
               log,
             }),
+            publishEncryptionFactory: async (publishOptions) => {
+              const encryptInlinePayload = await agent._resolveEncryptInlinePayload(
+                publishOptions.contextGraphId,
+                publishOptions.subGraphName,
+                undefined,
+                publishOptions.publishContextGraphId,
+              );
+              const encryptInlineChunked = await agent._resolveEncryptInlineChunked(
+                publishOptions.contextGraphId,
+                publishOptions.subGraphName,
+                undefined,
+                publishOptions.publishContextGraphId,
+              );
+              return {
+                encryptInlinePayload,
+                encryptInlineChunked,
+              };
+            },
             log,
           });
           publisherRuntime = runtime;

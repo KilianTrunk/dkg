@@ -125,6 +125,7 @@ import {
   type QueryRequest, type QueryResponse, type QueryAccessConfig, type LookupType,
 } from '@origintrail-official/dkg-query';
 import { DKGAgentWallet, type AgentWallet } from './agent-wallet.js';
+import { buildAckVerifyIdentity, buildAckVerifyIdentityDetailed } from './v10-ack-verifier.js';
 
 import { ProfileManager } from './profile-manager.js';
 import { DiscoveryClient, type SkillSearchOptions, type DiscoveredAgent, type DiscoveredOffering } from './discovery.js';
@@ -1325,29 +1326,12 @@ export class DKGAgent extends DKGAgentBase {
         // negotiation (fast, no error logs on the remote side).
         return connected;
       },
-      verifyIdentity: typeof this.chain.verifyACKIdentity === 'function'
-        ? async (recoveredAddress: string, claimedIdentityId: bigint) => {
-            try {
-              return await this.chain.verifyACKIdentity!(recoveredAddress, claimedIdentityId);
-            } catch {
-              return false;
-            }
-          }
-        : undefined,
-      // Surface the structured verifier when the chain adapter implements
-      // it. Translates a thrown chain-side exception into an explicit
-      // `'rpc-error'` reason so the ACKCollector can log infra failures
-      // distinctly from definitive key/stake rejections — pre-PR this
-      // try/catch swallowed RPC errors as `false`, conflating them.
-      verifyIdentityDetailed: typeof this.chain.verifyACKIdentityDetailed === 'function'
-        ? async (recoveredAddress: string, claimedIdentityId: bigint) => {
-            try {
-              return await this.chain.verifyACKIdentityDetailed!(recoveredAddress, claimedIdentityId);
-            } catch {
-              return { valid: false, reason: 'rpc-error' as const };
-            }
-          }
-        : undefined,
+      // Surface the legacy boolean + structured identity verifiers. The
+      // closures (swallow-to-false for the boolean, throw→`'rpc-error'`
+      // for the structured one) live in `./v10-ack-verifier.js` so the
+      // translation contract is unit-testable without mocking ACKCollector.
+      verifyIdentity: buildAckVerifyIdentity(this.chain),
+      verifyIdentityDetailed: buildAckVerifyIdentityDetailed(this.chain),
       log: (msg: string) => {
         const ctx = createOperationContext('publish');
         this.log.info(ctx, msg);

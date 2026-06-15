@@ -250,6 +250,12 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
     /// @notice OT-RFC-51: `setPrimaryNode` called more than once in the same
     ///         chain epoch (rate-limit: at most once per epoch).
     error PrimaryNodeChangeRateLimited(uint256 accountId, uint40 lastChangeEpoch);
+    /// @notice OT-RFC-51: `setPrimaryNode` called with `newNode == 0`. There is
+    ///         no "clear designation" semantic — `primaryNode == 0` can only
+    ///         mean never-seeded. Clearing would desync the stored node from
+    ///         the still-seeded future buckets and let a later re-designation
+    ///         double-credit `K_n`/`K_total` (which has no decrement path).
+    error ZeroPrimaryNode();
 
     // solhint-disable-next-line no-empty-blocks
     constructor(address hubAddress) ContractStatus(hubAddress) {}
@@ -431,7 +437,14 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
         if (currentEpoch <= acct.lastPrimaryNodeChangeEpoch) {
             revert PrimaryNodeChangeRateLimited(accountId, acct.lastPrimaryNodeChangeEpoch);
         }
-        if (newNode != 0 && !shardingTableStorage.nodeExists(newNode)) {
+        // OT-RFC-51: no "clear designation" semantic. Allowing newNode == 0
+        // would null the stored primaryNode while leaving the old node's
+        // future buckets seeded (the move loop credits/decrements neither when
+        // newNode == 0), and a later re-designation would take the add-branch
+        // and double-credit K_n / K_total with no offsetting decrement
+        // (K_total has no decrement path). Reject it.
+        if (newNode == 0) revert ZeroPrimaryNode();
+        if (!shardingTableStorage.nodeExists(newNode)) {
             revert PrimaryNodeNotInShardingTable(newNode);
         }
 
@@ -449,17 +462,14 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
         for (uint256 e = uint256(currentEpoch) + 1; e <= lastEpoch; e++) {
             uint96 amount = _amountForEpoch(ranges, acct.committedTRAC, lockEpochs, e);
             if (amount == 0) continue;
-            if (oldNode != 0 && newNode != 0) {
+            // newNode is guaranteed non-zero by the guard above.
+            if (oldNode != 0) {
                 epochStorage.moveEpochPublishingAllocation(oldNode, newNode, e, amount);
-            } else if (newNode != 0) {
-                // No prior node was seeded for these epochs; just credit new.
+            } else {
+                // First designation of a PCA created with primaryNode == 0:
+                // no prior node was seeded for these epochs, so credit new.
                 epochStorage.addEpochPublishingAllocation(newNode, e, amount);
             }
-            // (oldNode != 0 && newNode == 0): clearing designation. The RFC
-            // does not call for a removal mutator, so leave the old node's
-            // future allocation in place — `setPrimaryNode(_, 0)` is not an
-            // expected path (the NFT wrapper never forwards a 0 here) but is
-            // handled defensively as a no-op on the move.
         }
 
         publishingConvictionStorage.setPrimaryNodeData(accountId, newNode, currentEpoch);

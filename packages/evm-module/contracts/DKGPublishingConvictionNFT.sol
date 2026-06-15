@@ -141,6 +141,8 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
     error ZeroAddressDependency(string name);
     error OnlyKnowledgeAssetsV10(address caller);
     error NotAccountOwner(uint256 accountId, address caller);
+    /// @notice OT-RFC-51 defense-in-depth: `setPrimaryNode` called with `newNode == 0`.
+    error ZeroPrimaryNode();
     error InvalidAmount();
     error TokenTransferFailed();
 
@@ -259,6 +261,10 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
      */
     function setPrimaryNode(uint256 accountId, uint72 newNode) external {
         _requireOwner(accountId);
+        // OT-RFC-51 defense-in-depth: there is no clear-designation semantic.
+        // The logic contract also rejects this; guard here so a 0 can never
+        // reach it (see PublishingConviction.ZeroPrimaryNode).
+        if (newNode == 0) revert ZeroPrimaryNode();
         _publishingConviction().setPrimaryNode(accountId, newNode);
     }
 

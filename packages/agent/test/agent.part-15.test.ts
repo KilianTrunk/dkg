@@ -254,9 +254,9 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
       }
     });
 
-    it('uses deterministic subscribed-first ordering when a custom rehydration cap is configured', async () => {
+    it('uses deterministic id ordering when a custom rehydration cap is configured', async () => {
       const rows = [
-        { id: 'cap-cg-c', name: 'C', subscribed: false, synced: false, sharedMemorySynced: false, metaSynced: false, syncScoped: true },
+        { id: 'cap-cg-c', name: 'C', subscribed: true, synced: false, sharedMemorySynced: false, metaSynced: false, syncScoped: true },
         { id: 'cap-cg-b', name: 'B', subscribed: true, synced: false, sharedMemorySynced: false, metaSynced: false, syncScoped: true },
         { id: 'cap-cg-a', name: 'A', subscribed: true, synced: false, sharedMemorySynced: false, metaSynced: false, syncScoped: true },
         { id: 'cap-cg-d', name: 'D', subscribed: true, synced: false, sharedMemorySynced: false, metaSynced: false, syncScoped: true },
@@ -281,9 +281,49 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
         expect(subs.get('cap-cg-c')).toBeUndefined();
         expect(subs.get('cap-cg-d')).toBeUndefined();
         expect(agent.getContextGraphSubscriptionRehydrationStatus()?.dormantIds).toEqual([
-          'cap-cg-d',
           'cap-cg-c',
+          'cap-cg-d',
         ]);
+      } finally {
+        await agent.stop().catch(() => {});
+      }
+    });
+
+    it('keeps rehydration diagnostics when a persisted subscription delete fails', async () => {
+      const rows = Array.from({ length: 65 }, (_, i) => ({
+        id: `failed-delete-cg-${String(i).padStart(3, '0')}`,
+        name: `Failed Delete CG ${i}`,
+        subscribed: true,
+        synced: false,
+        sharedMemorySynced: false,
+        metaSynced: false,
+        syncScoped: true,
+      }));
+      const subscriptionStore = {
+        loadAll: async () => rows,
+        save: async () => {},
+        delete: async () => {
+          throw new Error('delete failed');
+        },
+      };
+      const agent = await DKGAgent.create({
+        name: 'CapRehydrationDeleteFailure',
+        listenHost: '127.0.0.1',
+        chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+        contextGraphSubscriptionStore: subscriptionStore,
+      });
+      try {
+        await agent.start();
+        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
+          activated: 64,
+          dormant: 1,
+        });
+        agent.unsubscribeFromContextGraph('failed-delete-cg-000');
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
+          activated: 64,
+          dormant: 1,
+        });
       } finally {
         await agent.stop().catch(() => {});
       }

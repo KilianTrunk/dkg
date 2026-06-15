@@ -25,6 +25,7 @@ describe('context graph subscription diagnostics route', () => {
     subscriptions = new Map<string, any>([
       ['cg-000', { subscribed: true, synced: true, coreHosted: false }],
       ['cg-hosted', { subscribed: true, synced: false, coreHosted: true }],
+      ['cg-host-only', { subscribed: false, synced: false, coreHosted: true }],
       ['cg-discoverable', { subscribed: false, synced: false, coreHosted: false }],
       [SYSTEM_CONTEXT_GRAPHS.AGENTS, { subscribed: true, synced: true, coreHosted: false }],
     ]);
@@ -111,10 +112,11 @@ describe('context graph subscription diagnostics route', () => {
     const body = await response.json() as any;
 
     expect(response.status).toBe(200);
-    expect(body.count).toBe(2);
+    expect(body.count).toBe(3);
     expect(body.subscriptions).toEqual([
       { contextGraphId: 'cg-000', subscribed: true, synced: true, coreHosted: false },
       { contextGraphId: 'cg-hosted', subscribed: true, synced: false, coreHosted: true },
+      { contextGraphId: 'cg-host-only', subscribed: false, synced: false, coreHosted: true },
     ]);
     expect(body.rehydration).toEqual(rehydration);
   });

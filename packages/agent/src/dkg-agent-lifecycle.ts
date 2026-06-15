@@ -3579,8 +3579,9 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       this.clearVmReconcileStateForContextGraph(contextGraphId);
     }
     if (options?.persist !== false) {
-      this.clearContextGraphSubscriptionRehydrationStatusIfBacklogChanged(contextGraphId, existing, next);
-      this.persistContextGraphSubscription(contextGraphId);
+      const clearRehydrationStatusOnSuccess =
+        this.shouldClearContextGraphSubscriptionRehydrationStatusOnPersist(contextGraphId, existing, next);
+      this.persistContextGraphSubscription(contextGraphId, { clearRehydrationStatusOnSuccess });
       if (next.subscribed) {
         this.persistLocalNodeMembership(contextGraphId);
       } else {
@@ -3596,28 +3597,24 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     this.setContextGraphSubscription(contextGraphId, { ...existing, ...patch });
   }
 
-  clearContextGraphSubscriptionRehydrationStatusIfBacklogChanged(this: DKGAgent,
+  shouldClearContextGraphSubscriptionRehydrationStatusOnPersist(this: DKGAgent,
     contextGraphId: string,
     existing?: ContextGraphSub,
     next?: ContextGraphSub,
-  ): void {
+  ): boolean {
     const status = this.contextGraphSubscriptionRehydrationStatus;
-    if (!status) return;
-    if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) return;
+    if (!status) return false;
+    if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) return false;
     const wasDormant = status.dormantIds.includes(contextGraphId);
     const subscriptionShapeChanged = !existing || !next ||
       existing.subscribed !== next.subscribed ||
       existing.coreHosted !== next.coreHosted;
-    if (wasDormant || subscriptionShapeChanged) {
-      this.contextGraphSubscriptionRehydrationStatus = null;
-    }
+    return wasDormant || subscriptionShapeChanged;
   }
 
   deleteContextGraphSubscription(this: DKGAgent, contextGraphId: string): boolean {
-    const existing = this.subscribedContextGraphs.get(contextGraphId);
     this.invalidateListContextGraphsCache();
     this.forceClearVmReconcileStateForContextGraph(contextGraphId);
-    this.clearContextGraphSubscriptionRehydrationStatusIfBacklogChanged(contextGraphId, existing);
     return this.subscribedContextGraphs.delete(contextGraphId);
   }
 
@@ -3625,7 +3622,10 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     this.persistContextGraphSubscription(contextGraphId);
   }
 
-  persistContextGraphSubscription(this: DKGAgent, contextGraphId: string): void {
+  persistContextGraphSubscription(this: DKGAgent,
+    contextGraphId: string,
+    options?: { clearRehydrationStatusOnSuccess?: boolean },
+  ): void {
     this.invalidateListContextGraphsCache();
     const store = this.config.contextGraphSubscriptionStore;
     if (!store) return;
@@ -3635,12 +3635,18 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     // during a publish remembers it hosts the CG and fills its gap. Drop the
     // row only when the node neither subscribes to nor hosts the CG.
     if (!sub?.subscribed && !sub?.coreHosted) {
-      void store.delete(contextGraphId).catch((err) => {
-        this.log.warn(
-          createOperationContext('system'),
-          `Failed to delete persisted context-graph subscription for "${contextGraphId}": ${err instanceof Error ? err.message : String(err)}`,
-        );
-      });
+      void store.delete(contextGraphId)
+        .then(() => {
+          if (options?.clearRehydrationStatusOnSuccess) {
+            this.contextGraphSubscriptionRehydrationStatus = null;
+          }
+        })
+        .catch((err) => {
+          this.log.warn(
+            createOperationContext('system'),
+            `Failed to delete persisted context-graph subscription for "${contextGraphId}": ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
       return;
     }
     void store.save({
@@ -3655,6 +3661,10 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       lastReconciledOrdinal: sub.lastReconciledOrdinal,
       coreHosted: sub.coreHosted,
       syncScoped: (this.config.syncContextGraphs ?? []).includes(contextGraphId),
+    }).then(() => {
+      if (options?.clearRehydrationStatusOnSuccess) {
+        this.contextGraphSubscriptionRehydrationStatus = null;
+      }
     }).catch((err) => {
       this.log.warn(
         createOperationContext('system'),

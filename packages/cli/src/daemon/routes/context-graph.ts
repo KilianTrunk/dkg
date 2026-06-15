@@ -1669,15 +1669,15 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     const map = agent.getSubscribedContextGraphs?.();
     const subscriptions = map
       ? [...map.entries()]
-          // ACTIVE USER subscriptions only. Exclude (a) discoverable-only /
-          // unsubscribed registry entries (`subscribed: false`) and (b) the
-          // always-on AGENTS/ONTOLOGY system CGs — which the startup cap/log also
-          // exclude — so `count` and the payload match the rehydrated
-          // user-subscription total rather than running ≥2 higher.
-          .filter(([id, s]) => s?.subscribed === true && !systemContextGraphs.has(id))
+          // ACTIVE USER / hosted entries only. Exclude (a) discoverable-only
+          // registry entries (`subscribed: false` and not `coreHosted`) and
+          // (b) the always-on AGENTS/ONTOLOGY system CGs — which the startup
+          // cap/log also exclude — while retaining host-only rows so the
+          // `rehydration.hostedActivated` count is inspectable in the payload.
+          .filter(([id, s]) => (s?.subscribed === true || s?.coreHosted === true) && !systemContextGraphs.has(id))
           .map(([id, s]) => ({
             contextGraphId: id,
-            subscribed: true,
+            subscribed: s?.subscribed === true,
             synced: s?.synced === true,
             coreHosted: s?.coreHosted === true,
           }))

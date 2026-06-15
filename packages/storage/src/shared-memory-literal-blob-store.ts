@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import type {
   ConstructResult,
   Quad,
-  QueryOptions,
+  TripleStoreQueryOptions,
   QueryResult,
   SelectResult,
   TripleStore,
@@ -76,7 +76,7 @@ export class SharedMemoryLiteralBlobStore implements TripleStore {
     return removed;
   }
 
-  async query(sparql: string, options?: QueryOptions): Promise<QueryResult> {
+  async query(sparql: string, options?: TripleStoreQueryOptions): Promise<QueryResult> {
     const rewritten = this.rewriteLargeLiteralConstants(sparql);
     if (!rewritten) {
       const result = await this.inner.query(sparql, options);
@@ -102,8 +102,14 @@ export class SharedMemoryLiteralBlobStore implements TripleStore {
     return this.inner.dropGraph(graphUri);
   }
 
-  async listGraphs(options?: QueryOptions): Promise<string[]> {
+  async listGraphs(options?: TripleStoreQueryOptions): Promise<string[]> {
     return this.inner.listGraphs(options);
+  }
+
+  async listGraphsByPrefix(prefix: string): Promise<string[]> {
+    return this.inner.listGraphsByPrefix
+      ? this.inner.listGraphsByPrefix(prefix)
+      : (await this.inner.listGraphs()).filter((graph) => graph.startsWith(prefix));
   }
 
   async deleteBySubjectPrefix(graphUri: string, prefix: string): Promise<number> {

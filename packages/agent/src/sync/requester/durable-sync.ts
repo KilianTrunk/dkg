@@ -4,6 +4,7 @@ import type { OperationContext } from '@origintrail-official/dkg-core';
 import type { Quad } from '@origintrail-official/dkg-storage';
 import type { PhaseCallback } from '@origintrail-official/dkg-publisher';
 import { didSyncPeerRespond, isSyncTransportFailure } from '../error-tags.js';
+import { getSyncCheckpointKey } from '../checkpoint/state.js';
 import type { SyncPageResult } from './page-fetch.js';
 
 export interface DurableSyncSummary {
@@ -40,6 +41,7 @@ interface DurableSyncContext {
    * but have very different operator meanings.
    */
   onAccessDenied?: (contextGraphId: string) => void;
+  syncAgentsMeta?: boolean;
   createContextGraphSyncDeadline: (remainingContextGraphs: number) => number;
   fetchSyncPages: (
     ctx: OperationContext,
@@ -84,6 +86,7 @@ export async function runDurableSync(context: DurableSyncContext): Promise<Durab
     contextGraphIds,
     onPhase,
     onAccessDenied,
+    syncAgentsMeta = true,
     createContextGraphSyncDeadline,
     fetchSyncPages,
     sinceBatchIdFor,
@@ -158,8 +161,22 @@ export async function runDurableSync(context: DurableSyncContext): Promise<Durab
 
       startPhase('fetch');
       const fetchStartedAt = Date.now();
-      const metaResult = await fetchSyncPages(ctx, remotePeerId, pid, false, 'meta', metaGraph, deadline);
-      peerRespondedForContextGraph = true;
+      const skipAgentsMeta = pid === SYSTEM_CONTEXT_GRAPHS.AGENTS && syncAgentsMeta === false;
+      if (skipAgentsMeta) {
+        logInfo(ctx, `Skipping agents meta sync from ${remotePeerId} (syncAgentsMeta=false)`);
+      }
+      const metaResult: SyncPageResult = skipAgentsMeta
+        ? {
+            quads: [],
+            bytesReceived: 0,
+            resumedFromOffset: 0,
+            nextOffset: 0,
+            checkpointKey: getSyncCheckpointKey(remotePeerId, pid, false, 'meta'),
+            completed: true,
+            timedOut: false,
+          }
+        : await fetchSyncPages(ctx, remotePeerId, pid, false, 'meta', metaGraph, deadline);
+      if (!skipAgentsMeta) peerRespondedForContextGraph = true;
       const dataResult = await fetchSyncPages(ctx, remotePeerId, pid, false, 'data', dataGraph, deadline, undefined, sinceBatchIdFor?.(pid));
       peerRespondedForContextGraph = true;
       endPhase();

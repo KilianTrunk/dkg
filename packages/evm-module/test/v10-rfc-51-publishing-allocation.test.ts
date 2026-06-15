@@ -105,6 +105,12 @@ async function deployFixture(): Promise<Fixture> {
 }
 
 describe('@integration OT-RFC-51 Publishing Allocation', function () {
+  // The fixture deploys the full V10 stack (Profile/Identity/CG/conviction/
+  // staking) and the test runs a complete publish flow; under load this far
+  // exceeds Mocha's 40s default. `hardhat.node.config.ts` (used by the repo's
+  // run-tests.js) does not raise the timeout, so set it per-suite here.
+  this.timeout(600000);
+
   const COMMITTED_TRAC = ethers.parseEther('50000'); // 20% discount tier
   const MIN_STAKE = ethers.parseEther('50000');
 

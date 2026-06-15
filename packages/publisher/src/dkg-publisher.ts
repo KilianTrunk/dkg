@@ -2014,6 +2014,7 @@ export class DKGPublisher implements Publisher {
     let chunkedCommitment: {
       ciphertextChunksRoot: Uint8Array;
       ciphertextChunkCount: number;
+      ciphertextChunks?: Uint8Array[];
     } | undefined;
     if (useChunkedInline) {
       const plaintextBytes = new TextEncoder().encode(nquadsStr);
@@ -2034,6 +2035,7 @@ export class DKGPublisher implements Publisher {
       chunkedCommitment = {
         ciphertextChunksRoot: chunked.ciphertextChunksRoot,
         ciphertextChunkCount: chunked.ciphertextChunkCount,
+        ciphertextChunks: chunked.ciphertextChunks,
       };
     } else if (useEncryptedInline) {
       const plaintextBytes = new TextEncoder().encode(nquadsStr);

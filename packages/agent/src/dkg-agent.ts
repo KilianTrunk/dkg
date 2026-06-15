@@ -1441,6 +1441,7 @@ export class DKGAgent extends DKGAgentBase {
       chunkedCommitment?: {
         ciphertextChunksRoot: Uint8Array;
         ciphertextChunkCount: number;
+        ciphertextChunks?: Uint8Array[];
       },
     ) => {
       // Fail loud on non-numeric or non-positive CG ids: V10 publish requires

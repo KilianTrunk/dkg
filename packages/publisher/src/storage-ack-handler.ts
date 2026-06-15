@@ -427,17 +427,33 @@ export class StorageACKHandler {
       const graphClause = chunkStoreGraph
         ? `GRAPH <${chunkStoreGraph}>`
         : 'GRAPH ?g';
+      const suppliedCiphertextChunks = Array.isArray(intent.ciphertextChunks)
+        ? intent.ciphertextChunks
+        : [];
+      const fallbackChunksToPersist: Array<{ index: number; bytes: Uint8Array }> = [];
+      let usedIntentCiphertextFallback = false;
       const loadChunk = async (i: number): Promise<Uint8Array | null> => {
         const subject = ciphertextChunkStoreSubject(merkleRoot, i);
         const sparql = `SELECT ?o WHERE { ${graphClause} { <${subject}> <${CIPHERTEXT_CHUNK_PREDICATE}> ?o } } LIMIT 1`;
         const result = await this.store.query(sparql);
-        if (result.type !== 'bindings' || result.bindings.length === 0) return null;
-        const literal = result.bindings[0]?.['o'];
-        if (typeof literal !== 'string') return null;
-        const base64 = literal.startsWith('"') && literal.endsWith('"')
-          ? literal.slice(1, -1)
-          : literal;
-        return Buffer.from(base64, 'base64');
+        if (result.type === 'bindings' && result.bindings.length > 0) {
+          const literal = result.bindings[0]?.['o'];
+          if (typeof literal === 'string') {
+            const base64 = literal.startsWith('"') && literal.endsWith('"')
+              ? literal.slice(1, -1)
+              : literal;
+            return Buffer.from(base64, 'base64');
+          }
+        }
+
+        const supplied = suppliedCiphertextChunks[i];
+        if (supplied === undefined) return null;
+        const bytes = supplied instanceof Uint8Array
+          ? supplied
+          : new Uint8Array(supplied as ArrayLike<number>);
+        usedIntentCiphertextFallback = true;
+        fallbackChunksToPersist.push({ index: i, bytes });
+        return bytes;
       };
       let pending = Array.from({ length: claimedChunkCount }, (_, i) => i);
       let missing: number[] = [];
@@ -484,9 +500,26 @@ export class StorageACKHandler {
       if (!bytesEqual(computed.root, claimedRoot)) {
         return this.encodeDecline(
           cgId,
-          STORAGE_ACK_DECLINE_CODES.CIPHERTEXT_ROOT_MISMATCH,
+          usedIntentCiphertextFallback
+            ? STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM
+            : STORAGE_ACK_DECLINE_CODES.CIPHERTEXT_ROOT_MISMATCH,
           `V2 chunked ACK root mismatch: recomputed root=${ethers.hexlify(computed.root).slice(0, 18)}... does not match publisher claim=${ethers.hexlify(claimedRoot).slice(0, 18)}...`,
         );
+      }
+      if (chunkStoreGraph && fallbackChunksToPersist.length > 0) {
+        try {
+          await this.store.insert(fallbackChunksToPersist.map(({ index, bytes }) => ({
+            subject: ciphertextChunkStoreSubject(merkleRoot, index),
+            predicate: CIPHERTEXT_CHUNK_PREDICATE,
+            object: `"${Buffer.from(bytes).toString('base64')}"`,
+            graph: chunkStoreGraph,
+          })));
+        } catch (err) {
+          console.warn(
+            '[StorageACKHandler] failed to persist V2 ciphertextChunks fallback:',
+            err instanceof Error ? err.message : String(err),
+          );
+        }
       }
 
       // OT-RFC-43 / V10: every publish mints exactly ONE Knowledge Asset.

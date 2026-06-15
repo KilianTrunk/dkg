@@ -911,7 +911,7 @@ export class ContextGraphRegistryMethods extends DKGAgentBase {
 
     // Drop assertion graphs under the sub-graph prefix
     const sgPrefix = `did:dkg:context-graph:${contextGraphId}/${subGraphName}/assertion/`;
-    const allGraphs = await this.store.listGraphs();
+    const allGraphs = await listGraphsByPrefix(this.store, sgPrefix);
     for (const g of allGraphs) {
       if (g.startsWith(sgPrefix)) {
         try { await this.store.dropGraph(g); } catch { /* graph may not exist */ }
@@ -1107,4 +1107,10 @@ export class ContextGraphRegistryMethods extends DKGAgentBase {
 
   // ── ENDORSE ─���────────────────────────────────────────────────────────
 
+}
+
+async function listGraphsByPrefix(store: TripleStore, prefix: string): Promise<string[]> {
+  return store.listGraphsByPrefix
+    ? store.listGraphsByPrefix(prefix)
+    : (await store.listGraphs()).filter((graph) => graph.startsWith(prefix));
 }

@@ -208,7 +208,8 @@ import { reconcileWarmCoreConnections, type WarmCoreAgent } from './p2p/warm-cor
 import { fetchSyncPages, type SyncPageResult } from './sync/requester/page-fetch.js';
 import { getSyncCheckpointKey } from './sync/checkpoint/state.js';
 import { runDurableSync } from './sync/requester/durable-sync.js';
-import { runSharedMemorySync } from './sync/requester/shared-memory-sync.js';
+import { runSharedMemorySync, sharedMemoryOwnershipKeyFromGraph } from './sync/requester/shared-memory-sync.js';
+import { recoverContextGraphSwm, type RecoverContextGraphSwmResult } from './sync/requester/swm-recovery.js';
 import { buildSyncRequestEnvelope, type SyncPhase } from './sync/auth/request-build.js';
 import { authorizePrivateSyncRequest } from './sync/auth/request-authorize.js';
 import { registerSyncHandler } from './sync/responder/sync-handler.js';
@@ -394,6 +395,18 @@ import {
 } from './dkg-agent-swm-state.js';
 import { DKGAgentBase } from './dkg-agent-base.js';
 import type { DKGAgent } from './dkg-agent.js';
+
+const DEFAULT_HOST_MODE_RECONCILE_JITTER_RATIO = 0.15;
+
+function jitteredIntervalMs(intervalMs: number, ratio: number | undefined): number {
+  const normalizedRatio =
+    typeof ratio === 'number' && Number.isFinite(ratio)
+      ? Math.min(1, Math.max(0, ratio))
+      : DEFAULT_HOST_MODE_RECONCILE_JITTER_RATIO;
+  if (normalizedRatio === 0) return intervalMs;
+  const delta = intervalMs * normalizedRatio;
+  return Math.max(1, Math.round(intervalMs - delta + Math.random() * delta * 2));
+}
 
 export class LifecycleSyncMethods extends DKGAgentBase {
   async start(this: DKGAgent): Promise<void> {
@@ -2039,6 +2052,10 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     // store's TTL/cap prune.
     if (this.swmHostModeStore) {
       const reconcileEveryMs = this.config.swmHostMode?.reconcileIntervalMs ?? 30_000;
+      const reconcileTimerMs = jitteredIntervalMs(
+        reconcileEveryMs,
+        this.config.swmHostMode?.reconcileJitterRatio,
+      );
       const pruneEveryMs = this.config.swmHostMode?.pruneIntervalMs ?? 5 * 60_000;
       this.reconcileHostModeSubscriptions().catch(() => {});
       this.hostModeReconcilerTimer = setInterval(() => {
@@ -2046,7 +2063,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
           const msg = err instanceof Error ? err.message : String(err);
           this.log.warn(createOperationContext('system'), `Host-mode reconciler tick failed: ${msg}`);
         });
-      }, reconcileEveryMs);
+      }, reconcileTimerMs);
       if (this.hostModeReconcilerTimer.unref) this.hostModeReconcilerTimer.unref();
       this.hostModePruneTimer = setInterval(() => {
         this.swmHostModeStore?.prune().catch((err: unknown) => {
@@ -2798,7 +2815,10 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       fetchSyncPages: this.fetchSyncPages.bind(this),
       sinceBatchIdFor,
       processDurableBatchInWorker: this.processDurableBatchInWorker.bind(this),
-      storeInsert: (quads) => this.store.insert(quads),
+      storeInsert: async (quads) => {
+        await this.store.insert(quads);
+        this.contextGraphMetaProjection.markDirtyFromQuads(quads);
+      },
       deleteCheckpoint: (key) => this.syncCheckpoints.delete(key),
       setCheckpoint: (key, offset) => this.syncCheckpoints.set(key, offset),
       logInfo: (opCtx, message) => this.log.info(opCtx, message),
@@ -2822,6 +2842,9 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     snapshotRef?: string,
     sinceBatchId?: string,
     signal?: AbortSignal,
+    // R9/R10 — member SWM recovery marker. Forks the checkpoint namespace (R10)
+    // and the request envelope auth mode (R9). Only the recovery driver sets it.
+    recovery?: boolean,
   ): Promise<SyncPageResult> {
     return fetchSyncPages({
       ctx,
@@ -2833,6 +2856,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       snapshotRef,
       sinceBatchId,
       deadline,
+      recovery,
       syncPageTimeoutMs: SYNC_PAGE_TIMEOUT_MS,
       syncRouterAttempts: SYNC_ROUTER_ATTEMPTS,
       syncPageRetryAttempts: SYNC_PAGE_RETRY_ATTEMPTS,
@@ -2954,7 +2978,10 @@ export class LifecycleSyncMethods extends DKGAgentBase {
         const graphManager = new GraphManager(this.store);
         await graphManager.ensureContextGraph(contextGraphId);
       },
-      storeInsert: (quads) => this.store.insert(quads),
+      storeInsert: async (quads) => {
+        await this.store.insert(quads);
+        this.contextGraphMetaProjection.markDirtyFromQuads(quads);
+      },
       publicSnapshotStore: this.publicSnapshotStore,
       deleteCheckpoint: (key) => this.syncCheckpoints.delete(key),
       setCheckpoint: (key, offset) => this.syncCheckpoints.set(key, offset),
@@ -2967,6 +2994,66 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       logInfo: (opCtx, message) => this.log.info(opCtx, message),
       logWarn: (opCtx, message) => this.log.warn(opCtx, message),
       logDebug: (opCtx, message) => this.log.debug(opCtx, message),
+    });
+  }
+
+  /**
+   * recover ONE context graph's `_shared_memory` to current
+   * state from a single authoritative peer (member / anchor), applying via
+   * REPLACE rather than the shared incremental union path (which corrupts a
+   * non-empty store). Invoked by the member-recovery driver after the frontier
+   * detects a full / cross-epoch gap; isolated from `runSharedMemorySync` so the
+   * incremental path is untouched.
+   */
+  async recoverContextGraphSwmFromPeer(this: DKGAgent,
+    remotePeerId: string,
+    contextGraphId: string,
+  ): Promise<RecoverContextGraphSwmResult> {
+    const ctx = createOperationContext('sync');
+    const admission = await getSharedMemorySubGraphAdmission(
+      this.store, contextGraphId, this.listSubGraphs(contextGraphId),
+    );
+    return recoverContextGraphSwm({
+      ctx,
+      remotePeerId,
+      contextGraphId,
+      deadline: this.createContextGraphSyncDeadline(1),
+      // R9/R10 — pin recovery=true at the lifecycle boundary so swm-recovery's
+      // deps signature stays unchanged. This forks BOTH the checkpoint namespace
+      // (R10: a distinct `|recovery` cursor that never mutates the shared
+      // incremental-sync cursor) AND the request envelope auth mode (R9: the
+      // responder gates via the strict members-only `isMemberRecoveryAuthorized`).
+      fetchSyncPages: (ctx2, remotePeerId2, contextGraphId2, includeSharedMemory2, phase2, graphUri2, deadline2) =>
+        this.fetchSyncPages(ctx2, remotePeerId2, contextGraphId2, includeSharedMemory2, phase2, graphUri2, deadline2, undefined, undefined, undefined, true),
+      processSharedMemoryBatch: (wsDataQuads, wsMetaQuads, cgId, registered, excluded) =>
+        this.getOrCreateSyncVerifyWorker().processSharedMemoryBatch(wsDataQuads, wsMetaQuads, cgId, registered, excluded),
+      // SwmRecoveryStore: mark the meta projection dirty on insert (parity with
+      // runSharedMemorySync's storeInsert); deletes pass through to the store.
+      store: {
+        insert: async (quads) => {
+          await this.store.insert(quads);
+          this.contextGraphMetaProjection.markDirtyFromQuads(quads);
+        },
+        deleteByPattern: (pattern) => this.store.deleteByPattern(pattern),
+        deleteBySubjectPrefix: (graph, prefix) => this.store.deleteBySubjectPrefix(graph, prefix),
+      },
+      ensureContextGraph: async (cgId) => {
+        const graphManager = new GraphManager(this.store);
+        await graphManager.ensureContextGraph(cgId);
+      },
+      setCheckpoint: (key, offset) => this.syncCheckpoints.set(key, offset),
+      deleteCheckpoint: (key) => this.syncCheckpoints.delete(key),
+      getRegisteredSubGraphNames: async () => admission.registered,
+      getExcludedSubGraphNames: async () => admission.excluded,
+      // R2 — hydrate the Rule-4 ownership cache (same map runSharedMemorySync uses).
+      ensureOwnedMap: (ownershipKey) => {
+        if (!this.workspaceOwnedEntities.has(ownershipKey)) {
+          this.workspaceOwnedEntities.set(ownershipKey, new Map());
+        }
+        return this.workspaceOwnedEntities.get(ownershipKey)!;
+      },
+      logInfo: (opCtx, message) => this.log.info(opCtx, message),
+      logWarn: (opCtx, message) => this.log.warn(opCtx, message),
     });
   }
 
@@ -4054,7 +4141,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
           }
 
           // Uniform layout: span the per-KA …/_shared_memory/{addr}/{number} graphs + bucket.
-          const wsGraphs = (await this.store.listGraphs()).filter(g => g === wsGraph || g.startsWith(`${wsGraph}/`));
+          const wsGraphs = await listGraphFamily(this.store, wsGraph);
           for (const re of rootEntities) {
             for (const g of wsGraphs) {
               // Exact root only; then skolemized descendants only (prefix would over-delete e.g. urn:foo vs urn:foobar)
@@ -4077,8 +4164,22 @@ export class LifecycleSyncMethods extends DKGAgentBase {
             graphDeleted += ownerDeleted;
           }
 
-          const ownedSet = this.workspaceOwnedEntities.get(pid);
-          if (ownedSet) {
+          // Evict every per-subgraph ownership key for the expired roots.
+          // SWM data now spans the root workspace graph plus the per-KA /
+          // subgraph `…/_shared_memory/{addr}/{number}` graphs (wsGraphs), and
+          // ownership is cached under one key per graph family:
+          // `pid` for the root/bucket and `${pid}\0${subGraph}` for per-subgraph
+          // graphs (see sharedMemoryOwnershipKeyFromGraph). Only clearing the
+          // `pid`-keyed map would leave the per-subgraph entries behind, so an
+          // expired root could still look owned and mis-arbitrate later writes.
+          const ownershipKeys = new Set<string>();
+          for (const g of wsGraphs) {
+            const ownershipKey = sharedMemoryOwnershipKeyFromGraph(pid, g);
+            if (ownershipKey) ownershipKeys.add(ownershipKey);
+          }
+          for (const ownershipKey of ownershipKeys) {
+            const ownedSet = this.workspaceOwnedEntities.get(ownershipKey);
+            if (!ownedSet) continue;
             for (const re of rootEntities) {
               ownedSet.delete(re);
             }
@@ -4097,6 +4198,20 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     return totalDeleted;
   }
 
+}
+
+async function listGraphFamily(store: TripleStore, rootGraph: string): Promise<string[]> {
+  const graphs = await listGraphsByPrefix(store, `${rootGraph}/`);
+  if (await store.hasGraph(rootGraph)) {
+    graphs.unshift(rootGraph);
+  }
+  return graphs;
+}
+
+async function listGraphsByPrefix(store: TripleStore, prefix: string): Promise<string[]> {
+  return store.listGraphsByPrefix
+    ? store.listGraphsByPrefix(prefix)
+    : (await store.listGraphs()).filter((graph) => graph.startsWith(prefix));
 }
 
 async function getSharedMemorySubGraphAdmission(

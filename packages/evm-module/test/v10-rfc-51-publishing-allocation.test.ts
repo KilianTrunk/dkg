@@ -16,11 +16,13 @@ import {
   ContextGraphs,
   ContextGraphStorage,
   DKGPublishingConvictionNFT,
+  PublishingConviction,
   RandomSampling,
   ConvictionStakingStorage,
   ParametersStorage,
   ProfileStorage,
   AskStorage,
+  DKGKnowledgeAssets,
 } from '../typechain';
 import { sqrt } from './helpers/math-helpers';
 import { createProfile } from './helpers/profile-helpers';
@@ -31,6 +33,7 @@ import {
 } from './helpers/setup-helpers';
 import {
   buildPublishParams,
+  buildUpdateParams,
   packReservedKaId,
   DEFAULT_CHAIN_ID,
 } from './helpers/v10-kc-helpers';
@@ -63,11 +66,13 @@ type Fixture = {
   ContextGraphs: ContextGraphs;
   ContextGraphStorage: ContextGraphStorage;
   PublishingConvictionNFT: DKGPublishingConvictionNFT;
+  PublishingConviction: PublishingConviction;
   RandomSampling: RandomSampling;
   ConvictionStakingStorage: ConvictionStakingStorage;
   ParametersStorage: ParametersStorage;
   ProfileStorage: ProfileStorage;
   AskStorage: AskStorage;
+  DKGKnowledgeAssets: DKGKnowledgeAssets;
 };
 
 const SCALE18 = 10n ** 18n;
@@ -151,6 +156,69 @@ async function expectedNodeScore(
   };
 }
 
+/**
+ * JS mirror of `PublishingConviction._scheduleFor` + `_amountForEpoch` — the
+ * single source of truth for the per-epoch publishing-allocation seed schedule.
+ *
+ * Reproduces the contract's integer order-of-operations EXACTLY so each epoch's
+ * expected allocation is byte-identical:
+ *   - partial creation epoch (anchorEpoch)        -> ranges[0].tokenAmount
+ *   - each full epoch [anchor+1 .. anchor+N-1]     -> committedTRAC / N
+ *   - dust-corrected final epoch (anchor+N)        -> ranges[2].tokenAmount
+ * where N = lockDurationEpochs and `timeRemainingInCurrentEpoch` is derived from
+ * the STORED account fields (`timestampForEpoch(anchor+1) - createdAtTimestamp`),
+ * matching `_scheduleFor` — not a live `timeUntilNextEpoch` read.
+ *
+ * Returns a map epoch -> expected amount for [anchor, anchor + N]; epochs with a
+ * zero amount are still present (value 0n).
+ */
+async function expectedSeedSchedule(
+  committedTRAC: bigint,
+  anchorEpoch: bigint,
+  lockDurationEpochs: bigint,
+  createdAtTimestamp: bigint,
+  Chronos_: Chronos,
+): Promise<Map<bigint, bigint>> {
+  const epochLength = BigInt(await Chronos_.epochLength());
+  const nextEpochStart = BigInt(
+    await Chronos_.timestampForEpoch(anchorEpoch + 1n),
+  );
+  const timeRemainingInCurrentEpoch =
+    nextEpochStart > createdAtTimestamp
+      ? nextEpochStart - createdAtTimestamp
+      : 0n;
+
+  // prorateActiveSink, mirrored exactly (see PublishingMathLib.prorateActiveSink).
+  const N = lockDurationEpochs;
+  const baseTokensPerFullEpoch = committedTRAC / N;
+  const currentEpochAllocation =
+    (baseTokensPerFullEpoch * timeRemainingInCurrentEpoch) / epochLength;
+  let finalEpochAllocation = baseTokensPerFullEpoch - currentEpochAllocation;
+  const numberOfFullEpochs = N - 1n;
+  const totalTokensForFullEpochs = baseTokensPerFullEpoch * numberOfFullEpochs;
+  const totalAllocated =
+    currentEpochAllocation + totalTokensForFullEpochs + finalEpochAllocation;
+  if (totalAllocated < committedTRAC) {
+    finalEpochAllocation += committedTRAC - totalAllocated;
+  }
+
+  // _amountForEpoch mapping (partial-first / each-full / dust-corrected-final).
+  const schedule = new Map<bigint, bigint>();
+  const lastEpoch = anchorEpoch + N;
+  for (let e = anchorEpoch; e <= lastEpoch; e++) {
+    let amount = 0n;
+    if (e === anchorEpoch) {
+      amount = currentEpochAllocation; // ranges[0]
+    } else if (e >= anchorEpoch + 1n && e <= anchorEpoch + numberOfFullEpochs) {
+      amount = baseTokensPerFullEpoch; // each full epoch (= committedTRAC / N)
+    } else if (e === lastEpoch) {
+      amount = finalEpochAllocation; // ranges[2], dust-corrected
+    }
+    schedule.set(e, amount);
+  }
+  return schedule;
+}
+
 async function deployFixture(): Promise<Fixture> {
   await hre.deployments.fixture([
     'Token',
@@ -197,6 +265,9 @@ async function deployFixture(): Promise<Fixture> {
     PublishingConvictionNFT: await hre.ethers.getContract<DKGPublishingConvictionNFT>(
       'DKGPublishingConvictionNFT',
     ),
+    PublishingConviction: await hre.ethers.getContract<PublishingConviction>(
+      'PublishingConviction',
+    ),
     RandomSampling: await hre.ethers.getContract<RandomSampling>('RandomSampling'),
     ConvictionStakingStorage: await hre.ethers.getContract<ConvictionStakingStorage>(
       'ConvictionStakingStorage',
@@ -206,6 +277,9 @@ async function deployFixture(): Promise<Fixture> {
     ),
     ProfileStorage: await hre.ethers.getContract<ProfileStorage>('ProfileStorage'),
     AskStorage: await hre.ethers.getContract<AskStorage>('AskStorage'),
+    DKGKnowledgeAssets: await hre.ethers.getContract<DKGKnowledgeAssets>(
+      'DKGKnowledgeAssets',
+    ),
   };
 }
 
@@ -235,6 +309,8 @@ describe('@integration OT-RFC-51 Publishing Allocation', function () {
   let ParametersStorageContract: ParametersStorage;
   let ProfileStorageContract: ProfileStorage;
   let AskStorageContract: AskStorage;
+  let LogicContract: PublishingConviction;
+  let DKGKnowledgeAssetsContract: DKGKnowledgeAssets;
   let kav10Address: string;
 
   beforeEach(async () => {
@@ -256,6 +332,8 @@ describe('@integration OT-RFC-51 Publishing Allocation', function () {
     ParametersStorageContract = f.ParametersStorage;
     ProfileStorageContract = f.ProfileStorage;
     AskStorageContract = f.AskStorage;
+    LogicContract = f.PublishingConviction;
+    DKGKnowledgeAssetsContract = f.DKGKnowledgeAssets;
     kav10Address = await KAV10.getAddress();
   });
 
@@ -723,5 +801,528 @@ describe('@integration OT-RFC-51 Publishing Allocation', function () {
     const baseline18 = (2n * SCALE18) / 1000n;
     expect(expA.inner).to.equal(baseline18);
     expect(expB.p).to.be.gt(0n);
+  });
+
+  // ==========================================================================
+  // Shared setup for the publish/update + access-control cases below: real,
+  // staked publishing + receiving nodes, a dedicated node2, plus a PCA owned by
+  // `creator` with `node1` as the designated primary node and `creator`
+  // registered as its own publishing agent over an open CG. Mirrors the
+  // (a)/(b)/(c) setup so the publish quorum + conviction-funded path all work.
+  // ==========================================================================
+  const setupPcaAndPublishCG = async () => {
+    const publishingNode = getDefaultPublishingNode(accounts);
+    const receivingNodes = getDefaultReceivingNodes(accounts);
+    const node2Accounts = { admin: accounts[7], operational: accounts[8] };
+
+    const { identityId: node1Id } = await createProfile(
+      ProfileContract,
+      publishingNode,
+    );
+    const receiverProfiles = [];
+    for (let i = 0; i < receivingNodes.length; i++) {
+      receiverProfiles.push(
+        await createProfile(ProfileContract, receivingNodes[i]),
+      );
+    }
+    const receiverIdentityIds = receiverProfiles.map((p) => p.identityId);
+    const { identityId: node2Id } = await createProfile(
+      ProfileContract,
+      node2Accounts,
+    );
+
+    await stakeV10(publishingNode.operational, node1Id, MIN_STAKE);
+    for (let i = 0; i < receivingNodes.length; i++) {
+      await stakeV10(
+        receivingNodes[i].operational,
+        receiverProfiles[i].identityId,
+        MIN_STAKE,
+      );
+    }
+    await stakeV10(node2Accounts.operational, node2Id, MIN_STAKE);
+
+    const creator = getDefaultKCCreator(accounts);
+    await Token.connect(accounts[0]).transfer(creator.address, COMMITTED_TRAC);
+    await Token.connect(creator).approve(await NFT.getAddress(), COMMITTED_TRAC);
+
+    await NFT.connect(creator).createAccount(COMMITTED_TRAC, node1Id);
+    const accountId = await NFT.totalSupply();
+    const acct = await NFT.accounts(accountId);
+    const createdAtEpoch = acct[1];
+    const lockDurationEpochs = BigInt(acct[5]);
+
+    await NFT.connect(creator).registerAgent(accountId, creator.address);
+
+    await CGFacade.connect(creator).createContextGraph(
+      [],
+      0,
+      0,
+      1, // open publish policy
+      ethers.ZeroAddress,
+      0,
+      ethers.ZeroHash,
+    );
+    const cgId = await CGS.getLatestContextGraphId();
+
+    return {
+      publishingNode,
+      receivingNodes,
+      receiverIdentityIds,
+      node1Id,
+      node2Id,
+      creator,
+      accountId,
+      acct,
+      createdAtEpoch,
+      lockDurationEpochs,
+      cgId,
+    };
+  };
+
+  // ==========================================================================
+  // TASK 2(a) — the UPDATE path also realizes-off: KAV10.update() with
+  // deltaTokenAmount > 0 and publisherNodeIdentityId = node1Id must NOT credit
+  // any per-node publishing allocation (the removed credit was reachable via
+  // _executeUpdateCore's value-delta section, formerly
+  // addEpochProducedKnowledgeValue(publisherNodeIdentityId, ...)).
+  // ==========================================================================
+  it('(a.update) KAV10.update() with deltaTokenAmount>0 does not credit per-node publishing allocation (realized publishing off on the update path)', async () => {
+    const s = await setupPcaAndPublishCG();
+
+    const epochsForPublish = Number(s.lockDurationEpochs);
+    const initialTokenAmount = ethers.parseEther('1000');
+    const merkleRoot = ethers.keccak256(ethers.toUtf8Bytes('rfc51-upd-publish'));
+    const reservedKaId = packReservedKaId(s.creator.address, 1);
+
+    const p = await buildPublishParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address,
+      receivingNodes: s.receivingNodes,
+      publisherIdentityId: s.node1Id,
+      receiverIdentityIds: s.receiverIdentityIds,
+      author: s.creator,
+      contextGraphId: s.cgId,
+      merkleRoot,
+      knowledgeAssetsAmount: 1,
+      byteSize: 1000,
+      epochs: epochsForPublish,
+      tokenAmount: initialTokenAmount,
+      isImmutable: false,
+      publishOperationId: 'rfc51-upd-publish-op',
+      reservedKaId,
+    });
+    await (await KAV10.connect(s.creator).publish(p)).wait();
+
+    const kaId = BigInt(reservedKaId);
+    const firstEpoch = s.createdAtEpoch;
+    const lastEpoch = s.createdAtEpoch + s.lockDurationEpochs;
+
+    // Snapshot per-node allocation for BOTH nodes across the full credited
+    // window (plus a couple of trailing epochs) just before the update.
+    const n1PreUpdate: Record<string, bigint> = {};
+    const n2PreUpdate: Record<string, bigint> = {};
+    for (let e = firstEpoch; e <= lastEpoch + 2n; e++) {
+      n1PreUpdate[e.toString()] =
+        await EpochStorageContract.getNodeEpochPublishingAllocation(s.node1Id, e);
+      n2PreUpdate[e.toString()] =
+        await EpochStorageContract.getNodeEpochPublishingAllocation(s.node2Id, e);
+    }
+
+    // A paid update: newTokenAmount > current => deltaTokenAmount > 0. Names
+    // node1 as publisherNodeIdentityId. The conviction window may already be
+    // partially drawn by the publish; the update is allowed to fall through to
+    // direct spend — either payment path runs _executeUpdateCore's value-delta
+    // section, which is where the removed K_n credit lived.
+    await Token.connect(accounts[0]).transfer(
+      s.creator.address,
+      ethers.parseEther('1000'),
+    );
+    await Token.connect(s.creator).approve(
+      kav10Address,
+      ethers.parseEther('1000'),
+    );
+
+    const up = await buildUpdateParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address,
+      receivingNodes: s.receivingNodes,
+      publisherIdentityId: s.node1Id,
+      receiverIdentityIds: s.receiverIdentityIds,
+      contextGraphId: s.cgId,
+      id: kaId,
+      preUpdateMerkleRootCount: 1n,
+      newMerkleRoot: ethers.keccak256(ethers.toUtf8Bytes('rfc51-upd-new-root')),
+      newByteSize: 1000n,
+      newTokenAmount: initialTokenAmount + ethers.parseEther('500'),
+      mintKnowledgeAssetsAmount: 0n,
+      knowledgeAssetsToBurn: [],
+      updateOperationId: 'rfc51-upd-op',
+      author: s.creator,
+    });
+
+    const tx = await KAV10.connect(s.creator).update(up);
+    const receipt = await tx.wait();
+    expect(receipt!.status).to.equal(1);
+
+    // The update carried a positive delta and named node1, but RFC-51 removed
+    // the realized-publishing K_n credit on the update path too. Every per-node
+    // allocation is byte-identical to the pre-update snapshot for both nodes.
+    for (let e = firstEpoch; e <= lastEpoch + 2n; e++) {
+      expect(
+        await EpochStorageContract.getNodeEpochPublishingAllocation(s.node1Id, e),
+        `node1 allocation at epoch ${e} must be unchanged by update`,
+      ).to.equal(n1PreUpdate[e.toString()]);
+      expect(
+        await EpochStorageContract.getNodeEpochPublishingAllocation(s.node2Id, e),
+        `node2 allocation at epoch ${e} must be unchanged by update`,
+      ).to.equal(n2PreUpdate[e.toString()]);
+    }
+  });
+
+  // ==========================================================================
+  // TASK 1 — blocker revert coverage (verifies commit 717b83ba0).
+  //   - NFT.setPrimaryNode(accountId, 0) reverts ZeroPrimaryNode (wrapper guard)
+  //   - direct PublishingConviction.setPrimaryNode(accountId, 0) from the NFT
+  //     context reverts ZeroPrimaryNode (logic-contract guard), reached by
+  //     impersonating the registered NFT after the rate-limit epoch has cleared
+  //   - the legitimate createAccount(0) -> setPrimaryNode(realNode) late-
+  //     designation (oldNode==0 add-branch) still seeds correctly
+  // ==========================================================================
+  it('(task1) setPrimaryNode(_, 0) reverts ZeroPrimaryNode on both the NFT wrapper and the logic contract; late designation from primaryNode==0 still seeds', async () => {
+    const nodeA = { admin: accounts[1], operational: accounts[2] };
+    const { identityId: nodeAId } = await createProfile(ProfileContract, nodeA);
+    await stakeV10(nodeA.operational, nodeAId, MIN_STAKE);
+
+    const creator = getDefaultKCCreator(accounts);
+    await Token.connect(accounts[0]).transfer(creator.address, COMMITTED_TRAC);
+    await Token.connect(creator).approve(await NFT.getAddress(), COMMITTED_TRAC);
+
+    // PCA created with primaryNode == 0 (the legitimate never-seeded sentinel).
+    await NFT.connect(creator).createAccount(COMMITTED_TRAC, 0);
+    const accountId = await NFT.totalSupply();
+    const acct0 = await NFT.accounts(accountId);
+    expect(acct0[9]).to.equal(0n); // primaryNode == 0
+    const createdAtEpoch = acct0[1];
+    const lockDurationEpochs = BigInt(acct0[5]);
+    const createdAtTimestamp = acct0[3];
+
+    // primaryNode == 0 => nothing seeded onto any node yet.
+    const lastEpoch = createdAtEpoch + lockDurationEpochs;
+    for (let e = createdAtEpoch; e <= lastEpoch; e++) {
+      expect(
+        await EpochStorageContract.getNodeEpochPublishingAllocation(nodeAId, e),
+      ).to.equal(0n);
+      expect(await EpochStorageContract.getEpochPublishingAllocation(e)).to.equal(
+        0n,
+      );
+    }
+
+    // --- Wrapper guard: NFT.setPrimaryNode(accountId, 0) reverts. ---
+    await expect(
+      NFT.connect(creator).setPrimaryNode(accountId, 0),
+    ).to.be.revertedWithCustomError(NFT, 'ZeroPrimaryNode');
+
+    // Advance one full chain epoch so the once-per-epoch rate limit clears
+    // (lastPrimaryNodeChangeEpoch was set to createdAtEpoch at creation). The
+    // rate-limit check runs BEFORE the newNode==0 check in the logic contract,
+    // so without this advance the direct call would revert RateLimited first.
+    const epochLength = await Chronos.epochLength();
+    await time.increase(epochLength);
+
+    // --- Logic-contract guard: a direct PublishingConviction.setPrimaryNode(
+    //     accountId, 0) from the NFT context reverts ZeroPrimaryNode. The logic
+    //     entry point is onlyConvictionNFT, so impersonate the Hub-registered
+    //     NFT address to reach it directly (the wrapper would otherwise short-
+    //     circuit a 0 before forwarding). ---
+    const nftAddress = await NFT.getAddress();
+    await hre.network.provider.send('hardhat_setBalance', [
+      nftAddress,
+      '0x56BC75E2D63100000', // 100 ETH
+    ]);
+    const nftSigner = await hre.ethers.getImpersonatedSigner(nftAddress);
+    await expect(
+      LogicContract.connect(nftSigner).setPrimaryNode(accountId, 0),
+    ).to.be.revertedWithCustomError(LogicContract, 'ZeroPrimaryNode');
+    await hre.network.provider.send('hardhat_stopImpersonatingAccount', [
+      nftAddress,
+    ]);
+
+    // --- Legitimate late designation: setPrimaryNode(realNode) takes the
+    //     oldNode==0 add-branch and seeds the future epochs onto nodeA. ---
+    const changeEpoch = await Chronos.getCurrentEpoch();
+    await NFT.connect(creator).setPrimaryNode(accountId, nodeAId);
+    const acct1 = await NFT.accounts(accountId);
+    expect(acct1[9]).to.equal(BigInt(nodeAId)); // primaryNode updated
+    expect(acct1[10]).to.equal(changeEpoch); // change-epoch cursor updated
+
+    // The add-branch only credits FUTURE epochs (e >= changeEpoch + 1) within
+    // the lock. Expected per-epoch amounts come from the SAME stored-field
+    // schedule the contract uses (anchored at createdAtEpoch).
+    const schedule = await expectedSeedSchedule(
+      COMMITTED_TRAC,
+      createdAtEpoch,
+      lockDurationEpochs,
+      createdAtTimestamp,
+      Chronos,
+    );
+    let seededSum = 0n;
+    for (let e = createdAtEpoch; e <= lastEpoch; e++) {
+      const nodeNow = await EpochStorageContract.getNodeEpochPublishingAllocation(
+        nodeAId,
+        e,
+      );
+      const totalNow = await EpochStorageContract.getEpochPublishingAllocation(e);
+      if (e >= changeEpoch + 1n) {
+        // Future epoch: seeded onto nodeA via the add-branch.
+        expect(nodeNow).to.equal(schedule.get(e));
+      } else {
+        // Current/past epoch: nothing was ever seeded (created with node==0).
+        expect(nodeNow).to.equal(0n);
+      }
+      // nodeA is the sole contributor, so K_total == nodeA's allocation.
+      expect(totalNow).to.equal(nodeNow);
+      seededSum += nodeNow;
+    }
+    // At least one future epoch was seeded (test is not vacuous).
+    expect(seededSum).to.be.gt(0n);
+    // And every credited epoch matched the canonical schedule, so the late-
+    // designation add-branch is byte-identical to the create-time seed for the
+    // epochs it touches.
+    expect(changeEpoch + 1n).to.be.lte(lastEpoch);
+  });
+
+  // ==========================================================================
+  // TASK 2(b) — access-control / guard reverts.
+  // ==========================================================================
+  it('(b) access-control reverts: rate limit, non-existent node, onlyConvictionNFT, NotAccountOwner, EpochStorage onlyContracts', async () => {
+    const nodeA = { admin: accounts[1], operational: accounts[2] };
+    const nodeB = { admin: accounts[3], operational: accounts[4] };
+    const { identityId: nodeAId } = await createProfile(ProfileContract, nodeA);
+    const { identityId: nodeBId } = await createProfile(ProfileContract, nodeB);
+    await stakeV10(nodeA.operational, nodeAId, MIN_STAKE);
+    await stakeV10(nodeB.operational, nodeBId, MIN_STAKE);
+
+    const creator = getDefaultKCCreator(accounts);
+    await Token.connect(accounts[0]).transfer(creator.address, COMMITTED_TRAC);
+    await Token.connect(creator).approve(await NFT.getAddress(), COMMITTED_TRAC);
+    await NFT.connect(creator).createAccount(COMMITTED_TRAC, nodeAId);
+    const accountId = await NFT.totalSupply();
+
+    // --- PrimaryNodeChangeRateLimited: a second setPrimaryNode in the same
+    //     epoch as a prior change. Advance one epoch first so the first
+    //     setPrimaryNode succeeds (createAccount stamped the change epoch);
+    //     the immediate second call in that same epoch then trips the limit. ---
+    const epochLength = await Chronos.epochLength();
+    await time.increase(epochLength);
+    await NFT.connect(creator).setPrimaryNode(accountId, nodeBId); // succeeds
+    await expect(
+      NFT.connect(creator).setPrimaryNode(accountId, nodeAId),
+    ).to.be.revertedWithCustomError(
+      LogicContract,
+      'PrimaryNodeChangeRateLimited',
+    );
+
+    // --- PrimaryNodeNotInShardingTable: setPrimaryNode to a non-existent node.
+    //     Advance an epoch so the rate limit does not mask this revert. ---
+    await time.increase(epochLength);
+    const bogusNodeId = 999999;
+    await expect(
+      NFT.connect(creator).setPrimaryNode(accountId, bogusNodeId),
+    ).to.be.revertedWithCustomError(
+      LogicContract,
+      'PrimaryNodeNotInShardingTable',
+    );
+
+    // --- PrimaryNodeNotInShardingTable: createAccount with a non-existent
+    //     primary node. ---
+    const creator2 = accounts[10];
+    await Token.connect(accounts[0]).transfer(creator2.address, COMMITTED_TRAC);
+    await Token.connect(creator2).approve(await NFT.getAddress(), COMMITTED_TRAC);
+    await expect(
+      NFT.connect(creator2).createAccount(COMMITTED_TRAC, bogusNodeId),
+    ).to.be.revertedWithCustomError(
+      LogicContract,
+      'PrimaryNodeNotInShardingTable',
+    );
+
+    // --- OnlyConvictionNFT: a direct (non-NFT) EOA call to the logic
+    //     contract's createAccount / setPrimaryNode. ---
+    await expect(
+      LogicContract.connect(creator).createAccount(
+        creator.address,
+        accountId,
+        COMMITTED_TRAC,
+        nodeAId,
+      ),
+    ).to.be.revertedWithCustomError(LogicContract, 'OnlyConvictionNFT');
+    await expect(
+      LogicContract.connect(creator).setPrimaryNode(accountId, nodeAId),
+    ).to.be.revertedWithCustomError(LogicContract, 'OnlyConvictionNFT');
+
+    // --- NotAccountOwner: NFT.setPrimaryNode from a non-owner signer. ---
+    await expect(
+      NFT.connect(accounts[11]).setPrimaryNode(accountId, nodeBId),
+    ).to.be.revertedWithCustomError(NFT, 'NotAccountOwner');
+
+    // --- EpochStorage.moveEpochPublishingAllocation from an unauthorized EOA.
+    //     `onlyContracts` accepts the hub owner (accounts[0]) and Hub-registered
+    //     contracts, so use a plain non-owner EOA to actually trip the gate. ---
+    await expect(
+      EpochStorageContract.connect(accounts[12]).moveEpochPublishingAllocation(
+        nodeAId,
+        nodeBId,
+        await Chronos.getCurrentEpoch(),
+        1n,
+      ),
+    ).to.be.revertedWithCustomError(EpochStorageContract, 'UnauthorizedAccess');
+  });
+
+  // ==========================================================================
+  // TASK 2(c) — per-epoch proration is asserted individually for EACH seeded
+  // epoch (partial-first / each-full / dust-corrected-final), for BOTH a
+  // boundary-aligned mint and a mid-epoch mint, so a total-conserving
+  // mis-distribution cannot pass (the existing (a) test only checks the
+  // lifetime sum).
+  // ==========================================================================
+  const assertSeedSchedule = async (
+    nodeId: number,
+    acct: Awaited<ReturnType<DKGPublishingConvictionNFT['accounts']['staticCall']>>,
+  ) => {
+    const committedTRAC = acct[0];
+    const createdAtEpoch = acct[1];
+    const createdAtTimestamp = acct[3];
+    const lockDurationEpochs = BigInt(acct[5]);
+    const lastEpoch = createdAtEpoch + lockDurationEpochs;
+
+    const schedule = await expectedSeedSchedule(
+      committedTRAC,
+      createdAtEpoch,
+      lockDurationEpochs,
+      createdAtTimestamp,
+      Chronos,
+    );
+
+    // Assert EACH epoch's seeded value individually against the canonical
+    // schedule — not just the lifetime sum.
+    let sum = 0n;
+    let nonZeroFullEpochs = 0;
+    const baseTokensPerFullEpoch = committedTRAC / lockDurationEpochs;
+    for (let e = createdAtEpoch; e <= lastEpoch; e++) {
+      const onChain =
+        await EpochStorageContract.getNodeEpochPublishingAllocation(nodeId, e);
+      const expected = schedule.get(e) ?? 0n;
+      expect(onChain, `seeded amount at epoch ${e}`).to.equal(expected);
+      // K_total == node's allocation (sole contributor on a fresh fixture).
+      expect(
+        await EpochStorageContract.getEpochPublishingAllocation(e),
+      ).to.equal(onChain);
+      sum += onChain;
+      // Count the interior full epochs that carry the exact per-full amount.
+      if (
+        e >= createdAtEpoch + 1n &&
+        e <= createdAtEpoch + (lockDurationEpochs - 1n)
+      ) {
+        expect(onChain, `full epoch ${e} == committedTRAC / N`).to.equal(
+          baseTokensPerFullEpoch,
+        );
+        if (onChain > 0n) nonZeroFullEpochs++;
+      }
+    }
+    // Conservation still holds across the lock.
+    expect(sum).to.equal(committedTRAC);
+    // The schedule genuinely spans full epochs (not a degenerate single-epoch
+    // case), so the per-epoch checks above are load-bearing.
+    expect(nonZeroFullEpochs).to.be.gt(0);
+    return { createdAtTimestamp, lockDurationEpochs };
+  };
+
+  it('(c.proration) seeds each epoch per the canonical schedule — boundary-aligned mint (start of epoch): partial-first == a full slice, every full epoch==committedTRAC/N, dust-corrected final', async () => {
+    const nodeA = { admin: accounts[1], operational: accounts[2] };
+    const { identityId: nodeAId } = await createProfile(ProfileContract, nodeA);
+    await stakeV10(nodeA.operational, nodeAId, MIN_STAKE);
+
+    const creator = getDefaultKCCreator(accounts);
+    await Token.connect(accounts[0]).transfer(creator.address, COMMITTED_TRAC);
+    await Token.connect(creator).approve(await NFT.getAddress(), COMMITTED_TRAC);
+
+    // Align the mint to a chain-epoch boundary: jump to (just after) the start
+    // of the next epoch so timeRemainingInCurrentEpoch ~= epochLength and the
+    // partial-first allocation equals a FULL per-epoch slice (ranges[0] ==
+    // baseTokensPerFullEpoch). This is the start-of-epoch boundary case; the
+    // mid-epoch case below exercises a strict-fraction partial-first.
+    const timeUntilNext = await Chronos.timeUntilNextEpoch();
+    await time.increase(timeUntilNext);
+
+    await NFT.connect(creator).createAccount(COMMITTED_TRAC, nodeAId);
+    const accountId = await NFT.totalSupply();
+    const acct = await NFT.accounts(accountId);
+
+    const { createdAtTimestamp } = await assertSeedSchedule(nodeAId, acct);
+    // Sanity: this really was (near) a boundary mint — the time the account had
+    // left in its creation epoch is the full epoch length (or all-but-a-block).
+    const epochLength = BigInt(await Chronos.epochLength());
+    const nextEpochStart = BigInt(
+      await Chronos.timestampForEpoch(BigInt(acct[1]) + 1n),
+    );
+    const remaining = nextEpochStart - BigInt(createdAtTimestamp);
+    expect(remaining).to.be.gt((epochLength * 99n) / 100n);
+  });
+
+  it('(c.proration) seeds each epoch per the canonical schedule — mid-epoch mint: nonzero partial-first, every full epoch==committedTRAC/N, dust-corrected final', async () => {
+    const nodeA = { admin: accounts[1], operational: accounts[2] };
+    const { identityId: nodeAId } = await createProfile(ProfileContract, nodeA);
+    await stakeV10(nodeA.operational, nodeAId, MIN_STAKE);
+
+    const creator = getDefaultKCCreator(accounts);
+    await Token.connect(accounts[0]).transfer(creator.address, COMMITTED_TRAC);
+    await Token.connect(creator).approve(await NFT.getAddress(), COMMITTED_TRAC);
+
+    // Land mid-epoch: advance to ~40% into the current epoch so
+    // timeRemainingInCurrentEpoch is a strict, non-trivial fraction of the
+    // epoch length => a nonzero partial-first allocation strictly below a full
+    // per-epoch slice.
+    const epochLength = BigInt(await Chronos.epochLength());
+    const timeUntilNext = BigInt(await Chronos.timeUntilNextEpoch());
+    // Move so that ~40% of the epoch remains after the mint.
+    const advanceBy = timeUntilNext - (epochLength * 40n) / 100n;
+    if (advanceBy > 0n) {
+      await time.increase(advanceBy);
+    }
+
+    await NFT.connect(creator).createAccount(COMMITTED_TRAC, nodeAId);
+    const accountId = await NFT.totalSupply();
+    const acct = await NFT.accounts(accountId);
+
+    const createdAtEpoch = acct[1];
+    const lockDurationEpochs = BigInt(acct[5]);
+    const baseTokensPerFullEpoch = COMMITTED_TRAC / lockDurationEpochs;
+
+    const { createdAtTimestamp } = await assertSeedSchedule(nodeAId, acct);
+
+    // The partial-first allocation must be a STRICT fraction: > 0 and < a full
+    // per-epoch slice (proving the mint really landed mid-epoch and the
+    // per-epoch assertions are non-degenerate).
+    const partialFirst =
+      await EpochStorageContract.getNodeEpochPublishingAllocation(
+        nodeAId,
+        createdAtEpoch,
+      );
+    expect(partialFirst).to.be.gt(0n);
+    expect(partialFirst).to.be.lt(baseTokensPerFullEpoch);
+
+    // And the dust-corrected final epoch absorbs the complementary remainder:
+    // partial-first + final == one full per-epoch slice (+ any rounding dust),
+    // i.e. final == baseTokensPerFullEpoch - partialFirst + dust.
+    const finalEpoch = createdAtEpoch + lockDurationEpochs;
+    const finalAmount =
+      await EpochStorageContract.getNodeEpochPublishingAllocation(
+        nodeAId,
+        finalEpoch,
+      );
+    const dust = COMMITTED_TRAC - baseTokensPerFullEpoch * lockDurationEpochs;
+    expect(finalAmount).to.equal(
+      baseTokensPerFullEpoch - partialFirst + dust,
+    );
+    expect(createdAtTimestamp).to.be.gt(0n);
   });
 });

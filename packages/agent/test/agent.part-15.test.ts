@@ -540,6 +540,90 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
       }
     });
 
+    it('accounts an older successful callback when a newer persisted write fails', async () => {
+      const rows = Array.from({ length: 64 }, (_, i) => ({
+        id: `fail-race-cg-${String(i).padStart(3, '0')}`,
+        name: `Fail Race CG ${i}`,
+        subscribed: true,
+        synced: false,
+        sharedMemorySynced: false,
+        metaSynced: false,
+        syncScoped: true,
+      }));
+      const persisted = new Map<string, any>(rows.map((r) => [r.id, { ...r }]));
+      const saveResolvers: Array<{ id: string; resolve: () => void; reject: () => void }> = [];
+      const subscriptionStore = {
+        loadAll: async () => [...persisted.values()],
+        save: async (record: any) => new Promise<void>((resolve, reject) => {
+          saveResolvers.push({
+            id: record.id,
+            resolve: () => {
+              persisted.set(record.id, { ...record });
+              resolve();
+            },
+            reject: () => reject(new Error('save failed')),
+          });
+        }),
+        delete: async () => {},
+      };
+      const agent = await DKGAgent.create({
+        name: 'CapRehydrationFailedLatestRace',
+        listenHost: '127.0.0.1',
+        chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+        contextGraphSubscriptionStore: subscriptionStore,
+      });
+      try {
+        await agent.start();
+        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
+          persistedTotal: 64,
+          activated: 64,
+          dormant: 0,
+          dormantIds: [],
+        });
+        const startupSaveCount = saveResolvers.length;
+
+        agent.setContextGraphSubscription('fail-race-created', {
+          name: 'Fail Race Created',
+          subscribed: true,
+          synced: false,
+          sharedMemorySynced: false,
+          metaSynced: false,
+        });
+        agent.setContextGraphSubscription('fail-race-created', {
+          name: 'Fail Race Created',
+          subscribed: true,
+          synced: true,
+          sharedMemorySynced: false,
+          metaSynced: false,
+        });
+        expect(saveResolvers.slice(startupSaveCount).map((entry) => entry.id)).toEqual([
+          'fail-race-created',
+          'fail-race-created',
+        ]);
+
+        saveResolvers[startupSaveCount + 1].reject();
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
+          persistedTotal: 64,
+          activated: 64,
+          dormant: 0,
+          dormantIds: [],
+        });
+
+        saveResolvers[startupSaveCount].resolve();
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
+          persistedTotal: 65,
+          activated: 65,
+          dormant: 0,
+          dormantIds: [],
+        });
+      } finally {
+        for (const { resolve } of saveResolvers) resolve();
+        await agent.stop().catch(() => {});
+      }
+    });
+
     it('disables the rehydration activation cap when configured with zero', async () => {
       const rows = Array.from({ length: 70 }, (_, i) => ({
         id: `uncapped-cg-${String(i).padStart(3, '0')}`,
@@ -827,6 +911,59 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
         });
       } finally {
         for (const { resolve } of saveResolvers) resolve();
+        await agent.stop().catch(() => {});
+      }
+    });
+
+
+    it('downgrades failed active deletes to dormant rehydration diagnostics during clear', async () => {
+      const failedId = 'clear-fail-cg-0';
+      const successId = 'clear-fail-cg-1';
+      const persisted = new Map<string, any>([failedId, successId].map((id) => [id, {
+        id,
+        name: id,
+        subscribed: true,
+        synced: false,
+        sharedMemorySynced: false,
+        metaSynced: false,
+        syncScoped: true,
+      }]));
+      const subscriptionStore = {
+        loadAll: async () => [...persisted.values()],
+        save: async (record: any) => { persisted.set(record.id, { ...record }); },
+        delete: async (id: string) => {
+          if (id === failedId) throw new Error('delete failed');
+          if (!persisted.has(id)) throw new Error(`missing ${id}`);
+          persisted.delete(id);
+        },
+      };
+      const agent = await DKGAgent.create({
+        name: 'ClearSubscriptionsPartialFailure',
+        listenHost: '127.0.0.1',
+        chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+        contextGraphSubscriptionStore: subscriptionStore,
+      });
+      try {
+        await agent.start();
+        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
+          persistedTotal: 2,
+          activated: 2,
+          dormant: 0,
+          dormantIds: [],
+        });
+
+        expect(await agent.clearContextGraphSubscriptions()).toBe(1);
+        expect(agent.getSubscribedContextGraphs().get(failedId)).toBeUndefined();
+        expect(agent.getSubscribedContextGraphs().get(successId)).toBeUndefined();
+        expect(persisted.has(failedId)).toBe(true);
+        expect(persisted.has(successId)).toBe(false);
+        expect(agent.getContextGraphSubscriptionRehydrationStatus()).toMatchObject({
+          persistedTotal: 1,
+          activated: 0,
+          dormant: 1,
+          dormantIds: [failedId],
+        });
+      } finally {
         await agent.stop().catch(() => {});
       }
     });

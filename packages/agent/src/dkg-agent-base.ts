@@ -888,6 +888,8 @@ export class DKGAgentBase {
   protected contextGraphSubscriptionRehydrationStatus: ContextGraphSubscriptionRehydrationStatus | null = null;
   protected readonly contextGraphSubscriptionRehydrationAccountedIds = new Set<string>();
   protected readonly contextGraphSubscriptionPersistRevisions = new Map<string, number>();
+  protected readonly contextGraphSubscriptionPersistAppliedRevisions = new Map<string, number>();
+  protected readonly contextGraphSubscriptionPersistCanceledRevisions = new Map<string, number>();
   protected readonly listContextGraphsCache = new Map<string, {
     expiresAt: number;
     rows: Array<Record<string, unknown>>;

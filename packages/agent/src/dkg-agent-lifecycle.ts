@@ -3607,8 +3607,19 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     return revision;
   }
 
-  canApplyContextGraphSubscriptionPersistRevision(this: DKGAgent, contextGraphId: string, revision?: number): boolean {
-    return revision != null && this.contextGraphSubscriptionPersistRevisions.get(contextGraphId) === revision;
+  cancelContextGraphSubscriptionPersistRevisions(this: DKGAgent, contextGraphId: string): void {
+    const revision = this.nextContextGraphSubscriptionPersistRevision(contextGraphId);
+    this.contextGraphSubscriptionPersistCanceledRevisions.set(contextGraphId, revision);
+  }
+
+  claimContextGraphSubscriptionPersistRevision(this: DKGAgent, contextGraphId: string, revision?: number): boolean {
+    if (revision == null) return false;
+    const canceledRevision = this.contextGraphSubscriptionPersistCanceledRevisions.get(contextGraphId) ?? 0;
+    if (revision <= canceledRevision) return false;
+    const appliedRevision = this.contextGraphSubscriptionPersistAppliedRevisions.get(contextGraphId) ?? 0;
+    if (revision <= appliedRevision) return false;
+    this.contextGraphSubscriptionPersistAppliedRevisions.set(contextGraphId, revision);
+    return true;
   }
 
   updateContextGraphSubscriptionRehydrationStatusAfterPersist(this: DKGAgent,
@@ -3661,7 +3672,10 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     };
   }
 
-  updateContextGraphSubscriptionRehydrationStatusAfterClear(this: DKGAgent, clearedIds: Iterable<string>): void {
+  updateContextGraphSubscriptionRehydrationStatusAfterClear(this: DKGAgent,
+    clearedIds: Iterable<string>,
+    deactivatedIds: Iterable<string> = [],
+  ): void {
     const status = this.contextGraphSubscriptionRehydrationStatus;
     if (!status) return;
     const systemContextGraphs = new Set<string>(Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]);
@@ -3675,8 +3689,9 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     };
     let persistedTotal = status.persistedTotal;
     let activated = status.activated;
+    const clearedSet = new Set(clearedIds);
 
-    for (const id of new Set(clearedIds)) {
+    for (const id of clearedSet) {
       if (systemContextGraphs.has(id)) continue;
       const wasAccounted = this.contextGraphSubscriptionRehydrationAccountedIds.delete(id);
       const wasDormant = removeFrom(dormantIds, id);
@@ -3687,6 +3702,16 @@ export class LifecycleSyncMethods extends DKGAgentBase {
         activated = Math.max(0, activated - 1);
       }
     }
+    for (const id of new Set(deactivatedIds)) {
+      if (systemContextGraphs.has(id) || clearedSet.has(id)) continue;
+      if (!this.contextGraphSubscriptionRehydrationAccountedIds.has(id)) continue;
+      removeFrom(hostedActivatedIds, id);
+      if (!dormantIds.includes(id)) {
+        activated = Math.max(0, activated - 1);
+        dormantIds.push(id);
+      }
+    }
+    dormantIds.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 
     this.contextGraphSubscriptionRehydrationStatus = {
       ...status,
@@ -3733,7 +3758,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
         .then(() => {
           if (
             options?.updateRehydrationStatus === true &&
-            this.canApplyContextGraphSubscriptionPersistRevision(contextGraphId, options.revision)
+            this.claimContextGraphSubscriptionPersistRevision(contextGraphId, options.revision)
           ) {
             this.updateContextGraphSubscriptionRehydrationStatusAfterPersist(contextGraphId, undefined);
           }
@@ -3761,7 +3786,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     }).then(() => {
       if (
         options?.updateRehydrationStatus === true &&
-        this.canApplyContextGraphSubscriptionPersistRevision(contextGraphId, options.revision)
+        this.claimContextGraphSubscriptionPersistRevision(contextGraphId, options.revision)
       ) {
         this.updateContextGraphSubscriptionRehydrationStatusAfterPersist(contextGraphId, sub);
       }
@@ -4035,7 +4060,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     const total = persistedUserIds.length;
     // Cancel any in-flight save callbacks that started before this bulk clear.
     for (const id of new Set([...persistedUserIds, ...activeUserIds])) {
-      this.nextContextGraphSubscriptionPersistRevision(id);
+      this.cancelContextGraphSubscriptionPersistRevisions(id);
     }
 
     // Tear down active in-memory USER subscriptions (gossip topics + sync scope),
@@ -4062,6 +4087,8 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     // gone" while stale rows survive in the store.
     let cleared = persistedUserIds.length;
     const clearedIds: string[] = [];
+    const deactivatedIds: string[] = [];
+    const activeUserIdSet = new Set(activeUserIds);
     let failed = 0;
     if (store) {
       cleared = 0;
@@ -4072,6 +4099,9 @@ export class LifecycleSyncMethods extends DKGAgentBase {
           clearedIds.push(id);
         } catch (err) {
           failed++;
+          if (activeUserIdSet.has(id)) {
+            deactivatedIds.push(id);
+          }
           this.log.warn(
             ctx,
             `clearContextGraphSubscriptions: failed to delete persisted subscription "${id}": ` +
@@ -4080,8 +4110,8 @@ export class LifecycleSyncMethods extends DKGAgentBase {
         }
       }
     }
-    if (cleared > 0) {
-      this.updateContextGraphSubscriptionRehydrationStatusAfterClear(clearedIds);
+    if (cleared > 0 || deactivatedIds.length > 0) {
+      this.updateContextGraphSubscriptionRehydrationStatusAfterClear(clearedIds, deactivatedIds);
     }
 
     this.log.info(

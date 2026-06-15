@@ -909,6 +909,102 @@ describe('listContextGraphs merge', () => {
     expect(ownerLocal.find(p => p.id === 'policy-unknown-storage')).toBeDefined();
   }, 15000);
 
+  it('drops stale public discovery seeds from scoped output when authoritative projection lookup times out', async () => {
+    const originalRowBudget = DKGAgentBase.LIST_CONTEXT_GRAPHS_ROW_BUDGET_MS;
+    const originalAuthBudget = DKGAgentBase.LIST_CONTEXT_GRAPHS_AUTH_BUDGET_MS;
+    Object.defineProperty(DKGAgentBase, 'LIST_CONTEXT_GRAPHS_ROW_BUDGET_MS', {
+      value: 25,
+      configurable: true,
+    });
+    Object.defineProperty(DKGAgentBase, 'LIST_CONTEXT_GRAPHS_AUTH_BUDGET_MS', {
+      value: 25,
+      configurable: true,
+    });
+    try {
+      const assertScopedTimeoutDropsRow = async (callerAgentAddress: string | null) => {
+        const store = sparqlHttpStoreBackedBy(new OxigraphStore());
+        const result = await createTestAgent({ store });
+        agent = result.agent;
+        await agent.start();
+        try {
+          const id = 'projection-timeout-stale-public-private';
+          const uri = contextGraphDataGraphUri(id);
+          const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+          const metaGraph = contextGraphMetaGraphUri(id);
+          await store.insert([
+            {
+              subject: uri,
+              predicate: DKG_ONTOLOGY.RDF_TYPE,
+              object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH,
+              graph: ontologyGraph,
+            },
+            {
+              subject: uri,
+              predicate: DKG_ONTOLOGY.SCHEMA_NAME,
+              object: '"Projection Timeout Stale Public"',
+              graph: ontologyGraph,
+            },
+            {
+              subject: uri,
+              predicate: DKG_ONTOLOGY.DKG_ACCESS_POLICY,
+              object: '"public"',
+              graph: ontologyGraph,
+            },
+            {
+              subject: uri,
+              predicate: DKG_ONTOLOGY.RDF_TYPE,
+              object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH,
+              graph: metaGraph,
+            },
+            {
+              subject: uri,
+              predicate: DKG_ONTOLOGY.DKG_ACCESS_POLICY,
+              object: '"private"',
+              graph: metaGraph,
+            },
+          ]);
+
+          const originalQuery = store.query.bind(store);
+          let blockedProjectionReads = 0;
+          vi.spyOn(store, 'query').mockImplementation(async (query: string, options?: any) => {
+            if (
+              blockedProjectionReads === 0
+              && query.includes('SELECT ?p ?o WHERE')
+              && query.includes(`<${metaGraph}>`)
+              && query.includes(`<${uri}> ?p ?o`)
+            ) {
+              blockedProjectionReads += 1;
+              return new Promise<any>(() => {});
+            }
+            return originalQuery(query, options);
+          });
+
+          const rows = await agent.listContextGraphs({ callerAgentAddress });
+          expect(rows.find(p => p.id === id)).toBeUndefined();
+          expect(blockedProjectionReads).toBe(1);
+          expect((agent as any).listContextGraphsCache.size).toBe(0);
+        } finally {
+          await result.agent.stop().catch(() => {});
+          if (agent === result.agent) {
+            agent = undefined;
+          }
+        }
+      };
+
+      await assertScopedTimeoutDropsRow(null);
+      await assertScopedTimeoutDropsRow(ethers.Wallet.createRandom().address);
+    } finally {
+      Object.defineProperty(DKGAgentBase, 'LIST_CONTEXT_GRAPHS_ROW_BUDGET_MS', {
+        value: originalRowBudget,
+        configurable: true,
+      });
+      Object.defineProperty(DKGAgentBase, 'LIST_CONTEXT_GRAPHS_AUTH_BUDGET_MS', {
+        value: originalAuthBudget,
+        configurable: true,
+      });
+    }
+  }, 15000);
+
   it('keeps storage-only rows in scoped output when legacy privacy lookup confirms public', async () => {
     const store = new OxigraphStore();
     const result = await createTestAgent({ store });

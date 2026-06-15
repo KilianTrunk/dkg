@@ -2795,6 +2795,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       contextGraphIds,
       onPhase,
       onAccessDenied,
+      syncAgentsMeta: this.config.nodeRole === 'core' ? true : this.config.syncAgentsMeta,
       createContextGraphSyncDeadline: this.createContextGraphSyncDeadline.bind(this),
       fetchSyncPages: this.fetchSyncPages.bind(this),
       sinceBatchIdFor,

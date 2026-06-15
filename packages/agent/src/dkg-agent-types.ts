@@ -807,6 +807,13 @@ export interface DKGAgentConfig {
   sharedMemoryPublicSnapshotStorage?: SharedMemoryPublicSnapshotStorageConfig;
   /** When false, peer-connect sync skips SWM catch-up and relies on gossip for new SWM writes. */
   syncSharedMemoryOnConnect?: boolean;
+  /**
+   * When false, durable sync skips the large system `agents/_meta` graph while
+   * still syncing `agents` data as the phonebook. Defaults to true for
+   * compatibility; only honored for edge nodes that do not need full KA/KC
+   * lifecycle metadata for the system agents graph. Core nodes always sync it.
+   */
+  syncAgentsMeta?: boolean;
   /** Node deployment tier: 'core' (cloud, relay) or 'edge' (personal, behind NAT). Default: 'edge'. */
   nodeRole?: 'core' | 'edge';
   /**

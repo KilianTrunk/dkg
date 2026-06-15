@@ -163,7 +163,7 @@ function epochStorage() {
   return new ethers.Contract(
     epsAddress,
     [
-      'function getNodeEpochProducedKnowledgeValue(uint72 identityId, uint256 epoch) view returns (uint96)',
+      'function getNodeEpochPublishingAllocation(uint72 identityId, uint256 epoch) view returns (uint96)',
     ],
     provider,
   );
@@ -252,7 +252,7 @@ describe('Diagram 1 — EOA author attestation, end-to-end on real Hardhat', () 
   it('confirmed publish writes author + attribution + cgValue side-effects', async () => {
     const author = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
     const epoch = await chronos().getCurrentEpoch();
-    const epsBefore: bigint = await epochStorage().getNodeEpochProducedKnowledgeValue(coreId, epoch);
+    const epsBefore: bigint = await epochStorage().getNodeEpochPublishingAllocation(coreId, epoch);
 
     const publisher = makePublisher();
 
@@ -276,7 +276,7 @@ describe('Diagram 1 — EOA author attestation, end-to-end on real Hardhat', () 
     expect(root.merkleRoot).toBeTruthy();
 
     // (iii) Eps incremented for the daemon's identityId (mode a)
-    const epsAfter: bigint = await epochStorage().getNodeEpochProducedKnowledgeValue(coreId, epoch);
+    const epsAfter: bigint = await epochStorage().getNodeEpochPublishingAllocation(coreId, epoch);
     expect(epsAfter).toBeGreaterThan(epsBefore);
   });
 });
@@ -488,7 +488,7 @@ describe('Diagram 5 — chain canonical author via DKGAgent.getKnowledgeCollecti
 describe('Diagram 6 — attribution modes via per-publish override', () => {
   it('mode (a) default — daemon attributes to its own id, Eps incremented for that id', async () => {
     const epoch = await chronos().getCurrentEpoch();
-    const before: bigint = await epochStorage().getNodeEpochProducedKnowledgeValue(coreId, epoch);
+    const before: bigint = await epochStorage().getNodeEpochPublishingAllocation(coreId, epoch);
 
     const publisher = makePublisher();
     const result = await publishSealed(publisher, {
@@ -497,7 +497,7 @@ describe('Diagram 6 — attribution modes via per-publish override', () => {
     });
     expect(result.status).toBe('confirmed');
 
-    const after: bigint = await epochStorage().getNodeEpochProducedKnowledgeValue(coreId, epoch);
+    const after: bigint = await epochStorage().getNodeEpochPublishingAllocation(coreId, epoch);
     expect(after).toBeGreaterThan(before);
   });
 
@@ -507,7 +507,7 @@ describe('Diagram 6 — attribution modes via per-publish override', () => {
     const allNodeIds = [coreId, ...ctx.receiverIds.map((id) => BigInt(id))];
     const before: Record<string, bigint> = {};
     for (const id of allNodeIds) {
-      before[id.toString()] = await epochStorage().getNodeEpochProducedKnowledgeValue(id, epoch);
+      before[id.toString()] = await epochStorage().getNodeEpochPublishingAllocation(id, epoch);
     }
 
     const publisher = makePublisher();
@@ -520,7 +520,7 @@ describe('Diagram 6 — attribution modes via per-publish override', () => {
 
     // No core's Eps moved — mode (d) is genuinely no-attribution.
     for (const id of allNodeIds) {
-      const after: bigint = await epochStorage().getNodeEpochProducedKnowledgeValue(id, epoch);
+      const after: bigint = await epochStorage().getNodeEpochPublishingAllocation(id, epoch);
       expect(after).toBe(before[id.toString()]);
     }
   });
@@ -531,8 +531,8 @@ describe('Diagram 6 — attribution modes via per-publish override', () => {
 
     const targetId = BigInt(ctx.receiverIds[0]!);
     const epoch = await chronos().getCurrentEpoch();
-    const beforeSelf: bigint = await epochStorage().getNodeEpochProducedKnowledgeValue(coreId, epoch);
-    const beforeTarget: bigint = await epochStorage().getNodeEpochProducedKnowledgeValue(targetId, epoch);
+    const beforeSelf: bigint = await epochStorage().getNodeEpochPublishingAllocation(coreId, epoch);
+    const beforeTarget: bigint = await epochStorage().getNodeEpochPublishingAllocation(targetId, epoch);
 
     const publisher = makePublisher();
     const result = await publishSealed(publisher, {
@@ -542,8 +542,8 @@ describe('Diagram 6 — attribution modes via per-publish override', () => {
     });
     expect(result.status).toBe('confirmed');
 
-    const afterSelf: bigint = await epochStorage().getNodeEpochProducedKnowledgeValue(coreId, epoch);
-    const afterTarget: bigint = await epochStorage().getNodeEpochProducedKnowledgeValue(targetId, epoch);
+    const afterSelf: bigint = await epochStorage().getNodeEpochPublishingAllocation(coreId, epoch);
+    const afterTarget: bigint = await epochStorage().getNodeEpochPublishingAllocation(targetId, epoch);
 
     // Daemon's own Eps unchanged; target node's Eps incremented.
     expect(afterSelf).toBe(beforeSelf);

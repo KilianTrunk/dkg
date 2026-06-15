@@ -489,7 +489,7 @@ async function detectDevnet(): Promise<DevnetState | null> {
   );
   const eps = new ethers.Contract(
     addrs.epsAddress,
-    ['function getNodeEpochProducedKnowledgeValue(uint72, uint256) view returns (uint96)'],
+    ['function getNodeEpochPublishingAllocation(uint72, uint256) view returns (uint96)'],
     provider,
   );
   const chronos = new ethers.Contract(
@@ -570,7 +570,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
   //      - publish status == confirmed
   //      - kas.getLatestMerkleRootAuthor(kaId) == node5.submitter.address
   //      - nft.windowSpent(accountId, currentBillingWindow) increased
-  //      - eps.getNodeEpochProducedKnowledgeValue(core1.id, epoch) increased
+  //      - eps.getNodeEpochPublishingAllocation(core1.id, epoch) increased
   // =========================================================================
   it('mode (a) — edge op-wallet on core1 PCA, attribution to core1, NFT windowSpent grows', async () => {
     const s = state.v!;
@@ -589,7 +589,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
     const beforeSpent: bigint =
       (await s.nft.windowSpent(accountId, beforeWindow)) +
       (await s.nft.windowSpent(accountId, beforeWindow + 1n));
-    const beforeEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core1.identityId, epoch);
+    const beforeEps: bigint = await s.eps.getNodeEpochPublishingAllocation(core1.identityId, epoch);
     const beforeBalance = await sumOpBalances(s.token, edge);
 
     // 4. Publish from edge attributing to core1.
@@ -617,7 +617,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
         : 0n);
     expect(afterSpent - beforeSpent).toBeGreaterThan(0n);
 
-    const afterEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core1.identityId, epoch);
+    const afterEps: bigint = await s.eps.getNodeEpochPublishingAllocation(core1.identityId, epoch);
     expect(afterEps).toBeGreaterThan(beforeEps);
 
     // Op-wallet pool TRAC must NOT decrement — PCA covered the cost.
@@ -682,7 +682,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
     const beforeSpent: bigint =
       (await s.nft.windowSpent(accountId, beforeWindow)) +
       (await s.nft.windowSpent(accountId, beforeWindow + 1n));
-    const beforeEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core1.identityId, epoch);
+    const beforeEps: bigint = await s.eps.getNodeEpochPublishingAllocation(core1.identityId, epoch);
 
     const file = makeNquadsFile('mode-a-strict');
     const result = await publishViaCli(edge, CONTEXT_GRAPH, file, {
@@ -707,7 +707,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
         : 0n);
     expect(afterSpent - beforeSpent).toBeGreaterThan(0n);
 
-    const afterEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core1.identityId, epoch);
+    const afterEps: bigint = await s.eps.getNodeEpochPublishingAllocation(core1.identityId, epoch);
     expect(afterEps).toBeGreaterThan(beforeEps);
 
     // The strict invariant: every edge op-wallet's TRAC balance is STILL
@@ -737,7 +737,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
 
     const epoch: bigint = await s.chronos.getCurrentEpoch();
     const beforeBalance = await sumOpBalances(s.token, edge);
-    const beforeEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core3.identityId, epoch);
+    const beforeEps: bigint = await s.eps.getNodeEpochPublishingAllocation(core3.identityId, epoch);
 
     const file = makeNquadsFile('mode-c');
     const result = await publishViaCli(edge, CONTEXT_GRAPH, file, {
@@ -754,7 +754,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
     }
 
     // core3 Eps incremented.
-    const afterEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core3.identityId, epoch);
+    const afterEps: bigint = await s.eps.getNodeEpochPublishingAllocation(core3.identityId, epoch);
     expect(afterEps).toBeGreaterThan(beforeEps);
 
     // Author is one of the op wallets.
@@ -777,7 +777,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
       .filter((id) => id > 0n);
     const beforeEps: Record<string, bigint> = {};
     for (const id of allCoreIds) {
-      beforeEps[id.toString()] = await s.eps.getNodeEpochProducedKnowledgeValue(id, epoch);
+      beforeEps[id.toString()] = await s.eps.getNodeEpochPublishingAllocation(id, epoch);
     }
 
     const file = makeNquadsFile('mode-d');
@@ -786,7 +786,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
     expect(result.status.toLowerCase()).toBe('confirmed');
 
     for (const id of allCoreIds) {
-      const after: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(id, epoch);
+      const after: bigint = await s.eps.getNodeEpochPublishingAllocation(id, epoch);
       expect(after).toBe(beforeEps[id.toString()]);
     }
   }, 120_000);
@@ -814,7 +814,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
     if (core1.identityId === 0n) throw new Error('core1 has no identity');
 
     const epoch: bigint = await s.chronos.getCurrentEpoch();
-    const beforeEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core1.identityId, epoch);
+    const beforeEps: bigint = await s.eps.getNodeEpochPublishingAllocation(core1.identityId, epoch);
 
     const file = makeNquadsFile('mode-fallthrough');
     const result = await publishViaCli(edge, CONTEXT_GRAPH, file, {
@@ -825,7 +825,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
     expect(result.kaId).toBeDefined();
 
     // Attribution preserved regardless of cost-coverage branch.
-    const afterEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core1.identityId, epoch);
+    const afterEps: bigint = await s.eps.getNodeEpochPublishingAllocation(core1.identityId, epoch);
     expect(afterEps).toBeGreaterThan(beforeEps);
 
     // Author = one of the op wallets (msg.sender).
@@ -893,7 +893,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
 
     // 2. Snapshot pre-publish state.
     const epoch: bigint = await s.chronos.getCurrentEpoch();
-    const beforeEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core2.identityId, epoch);
+    const beforeEps: bigint = await s.eps.getNodeEpochPublishingAllocation(core2.identityId, epoch);
 
     // 3. Write a single triple to SWM via the agent's token, then publish.
     const ts = Date.now();
@@ -966,7 +966,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
     expect(isCoreWallet).toBe(false);
 
     // Attribution still flows to core2 (the routing node).
-    const afterEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core2.identityId, epoch);
+    const afterEps: bigint = await s.eps.getNodeEpochPublishingAllocation(core2.identityId, epoch);
     expect(afterEps).toBeGreaterThan(beforeEps);
   }, 180_000);
 });

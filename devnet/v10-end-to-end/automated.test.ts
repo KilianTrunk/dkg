@@ -393,7 +393,7 @@ async function detectDevnet(): Promise<DevnetState | null> {
   const eps = new ethers.Contract(
     addrs.epsAddress,
     [
-      'function getNodeEpochProducedKnowledgeValue(uint72, uint256) view returns (uint96)',
+      'function getNodeEpochPublishingAllocation(uint72, uint256) view returns (uint96)',
     ],
     provider,
   );
@@ -850,7 +850,7 @@ describe('V10 chain — combined end-to-end devnet validation', () => {
         (await s.nft.windowSpent(accountId, beforeWindow)) +
         (await s.nft.windowSpent(accountId, beforeWindow + 1n));
       const beforeEps: bigint =
-        await s.eps.getNodeEpochProducedKnowledgeValue(
+        await s.eps.getNodeEpochPublishingAllocation(
           core1.identityId,
           epoch,
         );
@@ -881,7 +881,7 @@ describe('V10 chain — combined end-to-end devnet validation', () => {
           ? await s.nft.windowSpent(accountId, afterWindow)
           : 0n);
       expect(afterSpent - beforeSpent).toBeGreaterThan(0n);
-      const afterEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(
+      const afterEps: bigint = await s.eps.getNodeEpochPublishingAllocation(
         core1.identityId,
         epoch,
       );

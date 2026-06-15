@@ -119,12 +119,12 @@ async function calculateExpectedNodeScore(
   const startEpoch = currentEpoch >= 3n ? currentEpoch - 3n : 0n;
   for (let e = startEpoch; e <= currentEpoch; e++) {
     nodeKnowledgeValue +=
-      await contracts.epochStorage.getNodeEpochProducedKnowledgeValue(
+      await contracts.epochStorage.getNodeEpochPublishingAllocation(
         nodeId,
         e,
       );
     totalKnowledgeValue +=
-      await contracts.epochStorage.getEpochProducedKnowledgeValue(e);
+      await contracts.epochStorage.getEpochPublishingAllocation(e);
   }
   const publishingFactor18 =
     totalKnowledgeValue > 0n

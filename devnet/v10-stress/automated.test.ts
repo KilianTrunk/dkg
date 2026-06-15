@@ -417,7 +417,7 @@ async function detectDevnet(maxNodes = 6): Promise<DevnetState | null> {
   const eps = new ethers.Contract(
     addrs.epsAddress,
     [
-      'function getNodeEpochProducedKnowledgeValue(uint72, uint256) view returns (uint96)',
+      'function getNodeEpochPublishingAllocation(uint72, uint256) view returns (uint96)',
     ],
     provider,
   );
@@ -930,9 +930,9 @@ describe('V10 chain — stress + scenario validation', () => {
 
     const epochAtStart: bigint = await s.chronos.getCurrentEpoch();
     const beforeEpsCore1: bigint =
-      await s.eps.getNodeEpochProducedKnowledgeValue(core1.identityId, epochAtStart);
+      await s.eps.getNodeEpochPublishingAllocation(core1.identityId, epochAtStart);
     const beforeEpsCore2: bigint =
-      await s.eps.getNodeEpochProducedKnowledgeValue(core2.identityId, epochAtStart);
+      await s.eps.getNodeEpochPublishingAllocation(core2.identityId, epochAtStart);
     // Lazy-settlement bookkeeping uses billing-window index, not chain
     // epoch. Sum the window at-snapshot plus the next 2 windows so a
     // long-running stress phase that walks past one or two boundaries
@@ -1143,7 +1143,7 @@ describe('V10 chain — stress + scenario validation', () => {
 
     // Attribution to core2 must have grown.
     const afterEpsCore2: bigint =
-      await s.eps.getNodeEpochProducedKnowledgeValue(core2.identityId, epochAtStart);
+      await s.eps.getNodeEpochPublishingAllocation(core2.identityId, epochAtStart);
     expect(afterEpsCore2).toBeGreaterThan(beforeEpsCore2);
 
     // ── 2g: WM → SWM → VM third-party publisher (25 via edge → core1 PCA) ──
@@ -1197,7 +1197,7 @@ describe('V10 chain — stress + scenario validation', () => {
     // bookkeeping; sum the same window range we sampled at-snapshot so
     // window crossings during the stress phase are still counted).
     const afterEpsCore1: bigint =
-      await s.eps.getNodeEpochProducedKnowledgeValue(core1.identityId, epochAtStart);
+      await s.eps.getNodeEpochPublishingAllocation(core1.identityId, epochAtStart);
     expect(afterEpsCore1).toBeGreaterThan(beforeEpsCore1);
     const afterWindow: bigint = BigInt(
       await s.nft.getCurrentBillingWindow(pcaAccountId),

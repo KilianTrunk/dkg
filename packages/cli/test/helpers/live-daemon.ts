@@ -178,6 +178,97 @@ export async function postJson(
   }
 }
 
+export interface EventStream {
+  /** All SSE frames received so far (excluding heartbeat comments). */
+  events: Array<{ event: string; data: any }>;
+  /**
+   * Resolve with the first frame (past or future) matching `predicate`, or
+   * reject after `timeoutMs`. Lets a test perform an op then await its event.
+   */
+  waitFor(predicate: (f: { event: string; data: any }) => boolean, timeoutMs?: number): Promise<{ event: string; data: any }>;
+  close(): void;
+}
+
+/**
+ * Subscribe to the daemon's real `GET /api/events` Server-Sent-Events stream
+ * and collect frames. This is how memory-graph / notification emissions are
+ * observed end-to-end: the route handler calls `emitMemoryGraphChanged`, the
+ * daemon `sseBroadcast`s a `memory_graph_changed` frame, and it arrives here —
+ * the real emit pipeline, no injected emitter stub.
+ */
+export async function openEventStream(daemon: LiveDaemon): Promise<EventStream> {
+  const controller = new AbortController();
+  const res = await fetch(`${daemon.base}/api/events`, {
+    headers: daemon.token ? { Authorization: `Bearer ${daemon.token}` } : {},
+    signal: controller.signal,
+  });
+  if (!res.ok || !res.body) throw new Error(`/api/events not ok: ${res.status}`);
+
+  const events: Array<{ event: string; data: any }> = [];
+  const waiters: Array<{ predicate: (f: any) => boolean; resolve: (f: any) => void }> = [];
+
+  const pushFrame = (frame: { event: string; data: any }) => {
+    events.push(frame);
+    for (let i = waiters.length - 1; i >= 0; i--) {
+      if (waiters[i].predicate(frame)) {
+        waiters[i].resolve(frame);
+        waiters.splice(i, 1);
+      }
+    }
+  };
+
+  // Drain the stream in the background, parsing SSE frames (blocks separated by
+  // a blank line; `event:` + `data:` lines; `:`-prefixed comments = heartbeats).
+  (async () => {
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx: number;
+        while ((idx = buf.indexOf('\n\n')) >= 0) {
+          const block = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          let event = 'message';
+          const dataLines: string[] = [];
+          for (const line of block.split('\n')) {
+            if (line.startsWith(':')) continue; // heartbeat/comment
+            if (line.startsWith('event:')) event = line.slice(6).trim();
+            else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+          }
+          if (dataLines.length === 0) continue;
+          let data: any = dataLines.join('\n');
+          try { data = JSON.parse(data); } catch { /* leave as string */ }
+          pushFrame({ event, data });
+        }
+      }
+    } catch { /* aborted on close() */ }
+  })();
+
+  return {
+    events,
+    waitFor(predicate, timeoutMs = 8000) {
+      const existing = events.find(predicate);
+      if (existing) return Promise.resolve(existing);
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          const i = waiters.findIndex((w) => w.resolve === wrapped);
+          if (i >= 0) waiters.splice(i, 1);
+          reject(new Error('Timed out waiting for SSE frame'));
+        }, timeoutMs);
+        const wrapped = (f: any) => { clearTimeout(timer); resolve(f); };
+        waiters.push({ predicate, resolve: wrapped });
+      });
+    },
+    close() {
+      controller.abort();
+    },
+  };
+}
+
 /** GET a daemon route with auth, returning {status, body} (body parsed if JSON). */
 export async function getJson(
   daemon: LiveDaemon,

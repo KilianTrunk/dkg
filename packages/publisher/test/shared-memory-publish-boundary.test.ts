@@ -176,7 +176,7 @@ describe('publishFromSharedMemory multi-root selection (OT-RFC-44 / Design B: on
   });
 
   it('falls back to direct publish when SWM ACKs fail with NO_DATA_IN_SWM', async () => {
-    const { publisher, store, publishSpy } = await makePublisher();
+    const { publisher, store } = await makePublisher();
     const fallbackResult: PublishResult = {
       kaId: 2n,
       ual: 'did:dkg:0x0000000000000000000000000000000000000001/2',
@@ -191,10 +191,17 @@ describe('publishFromSharedMemory multi-root selection (OT-RFC-44 / Design B: on
       status: 'tentative',
       publicQuads: [],
     };
-    publishSpy.mockReset();
-    publishSpy
-      .mockRejectedValueOnce(new Error('storage_ack_insufficient: STORAGE_ACK_DECLINE:NO_DATA_IN_SWM'))
-      .mockResolvedValueOnce(fallbackResult);
+    // First publish (from SWM) rejects with the SWM-ack failure; the direct-
+    // publish fallback then resolves. Drive both outcomes from a queue on a
+    // fresh recorder that replaces the default makePublisher() one.
+    const outcomes: Array<() => Promise<PublishResult>> = [
+      async () => {
+        throw new Error('storage_ack_insufficient: STORAGE_ACK_DECLINE:NO_DATA_IN_SWM');
+      },
+      async () => fallbackResult,
+    ];
+    const publishSpy = recorder(async (..._args: Parameters<DKGPublisher['publish']>) => outcomes.shift()!());
+    (publisher as unknown as { publish: typeof publishSpy }).publish = publishSpy;
     await store.insert([
       q('urn:test:root:one', 'http://schema.org/name', '"ready"'),
     ]);
@@ -202,10 +209,10 @@ describe('publishFromSharedMemory multi-root selection (OT-RFC-44 / Design B: on
     await expect(publisher.publishFromSharedMemory(CONTEXT_GRAPH, 'all'))
       .resolves.toMatchObject({ kaId: 2n, status: 'tentative' });
 
-    expect(publishSpy).toHaveBeenCalledTimes(2);
-    expect(publishSpy.mock.calls[0][0]).toMatchObject({ fromSharedMemory: true });
-    expect(publishSpy.mock.calls[1][0]).toMatchObject({ fromSharedMemory: false });
-    expect(publishSpy.mock.calls[1][0].quads).toEqual([
+    expect(publishSpy.calls).toHaveLength(2);
+    expect(publishSpy.calls[0][0]).toMatchObject({ fromSharedMemory: true });
+    expect(publishSpy.calls[1][0]).toMatchObject({ fromSharedMemory: false });
+    expect((publishSpy.calls[1][0] as any).quads).toEqual([
       { subject: 'urn:test:root:one', predicate: 'http://schema.org/name', object: '"ready"', graph: '' },
     ]);
   });

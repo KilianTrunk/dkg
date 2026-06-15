@@ -1920,6 +1920,7 @@ describe('listContextGraphs merge', () => {
       const privateUri = contextGraphDataGraphUri(privateId);
       const gateOnlyUri = contextGraphDataGraphUri(gateOnlyId);
       const metaOnlyUri = contextGraphDataGraphUri(metaOnlyId);
+      const policyUnknownUri = contextGraphDataGraphUri(policyUnknownId);
       const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
       const agentsGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.AGENTS);
       const privateMetaGraph = contextGraphMetaGraphUri(privateId);
@@ -1937,6 +1938,9 @@ describe('listContextGraphs merge', () => {
         { subject: gateOnlyUri, predicate: DKG_ONTOLOGY.DKG_ALLOWED_AGENT, object: `"${myWallet}"`, graph: gateOnlyMetaGraph },
         { subject: metaOnlyUri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH, graph: contextGraphMetaGraphUri(metaOnlyId) },
         { subject: metaOnlyUri, predicate: DKG_ONTOLOGY.SCHEMA_NAME, object: '"Projection Meta Only"', graph: contextGraphMetaGraphUri(metaOnlyId) },
+        { subject: policyUnknownUri, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH, graph: agentsGraph },
+        { subject: policyUnknownUri, predicate: DKG_ONTOLOGY.SCHEMA_NAME, object: '"Projection Unknown Policy"', graph: agentsGraph },
+        { subject: policyUnknownUri, predicate: DKG_ONTOLOGY.DKG_ACCESS_POLICY, object: '"membersOnly"', graph: agentsGraph },
         { subject: 'urn:projection-list-policy-unknown:root', predicate: DKG_ONTOLOGY.SCHEMA_NAME, object: '"Policy Unknown"', graph: contextGraphSharedMemoryUri(policyUnknownId) },
       ]);
       await agent.share(implicitPublicId, [
@@ -1952,6 +1956,7 @@ describe('listContextGraphs merge', () => {
       expect(unscoped.find(p => p.id === privateId)).toBeUndefined();
       expect(unscoped.find(p => p.id === gateOnlyId)).toBeUndefined();
       expect(unscoped.find(p => p.id === metaOnlyId)?.name).toBe('Projection Meta Only');
+      expect(unscoped.find(p => p.id === policyUnknownId)?.accessPolicy).toBe('membersOnly');
       expect((await agent.listContextGraphs({ callerAgentAddress: null })).find(p => p.id === policyUnknownId)).toBeUndefined();
 
       const otherWallet = ethers.Wallet.createRandom().address;

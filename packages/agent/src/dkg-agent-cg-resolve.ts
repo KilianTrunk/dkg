@@ -434,10 +434,15 @@ function listContextGraphsProjectionEnabled(): boolean {
   return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
 }
 
-function isPrivateContextGraphListRow(accessPolicy?: string): boolean {
-  if (!accessPolicy?.trim()) return false;
+function contextGraphListRowPrivacy(accessPolicy?: string): ListContextGraphsPrivacy {
+  if (!accessPolicy?.trim()) return 'unknown';
   const t = accessPolicy.trim().replace(/^["']|["']$/g, '').toLowerCase();
-  return t === 'private';
+  if (t === 'private' || t === 'public') return t;
+  return 'unknown';
+}
+
+function isPrivateContextGraphListRow(accessPolicy?: string): boolean {
+  return contextGraphListRowPrivacy(accessPolicy) === 'private';
 }
 
 async function applyContextGraphListPrivacy(
@@ -459,7 +464,12 @@ async function applyContextGraphListPrivacy(
 
   if (!checksum) {
     return visibleRows
-      .filter((r) => !isPrivateContextGraphListRow(r.accessPolicy))
+      .filter((r) => {
+        const privacy = contextGraphListRowPrivacy(r.accessPolicy);
+        if (privacy === 'private') return false;
+        if (privacy === 'unknown') return !scopedList;
+        return true;
+      })
       .map(({ policyKnown: _policyKnown, ...row }) => row);
   }
 
@@ -470,7 +480,10 @@ async function applyContextGraphListPrivacy(
   }));
 
   return annotated
-    .filter((r) => !isPrivateContextGraphListRow(r.accessPolicy) || r.callerInvolved === true)
+    .filter((r) => {
+      if (r.callerInvolved === true) return true;
+      return contextGraphListRowPrivacy(r.accessPolicy) === 'public';
+    })
     .map(({ policyKnown: _policyKnown, ...row }) => row);
 }
 

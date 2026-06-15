@@ -120,6 +120,11 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
     //           `setPrimaryNode` re-designates the node, moving FUTURE-epoch
     //           allocation net-zero on K_total. Adds a `ShardingTableStorage`
     //           dependency for `nodeExists` validation.
+    //           Gas: the seed/move proration schedule is computed ONCE per
+    //           call (`_scheduleFor`) and indexed per epoch (`_amountForEpoch`)
+    //           instead of recomputing `prorateActiveSink` + chronos reads on
+    //           every loop iteration. Behavior-preserving: per-epoch amounts
+    //           are byte-identical, so seed and move stay net-zero on K_total.
     string private constant _VERSION = "10.0.3";
 
     uint256 public constant BPS_DENOMINATOR = 10_000;
@@ -376,11 +381,15 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
 
         // OT-RFC-51: prorate-seed the committed TRAC as per-epoch publishing
         // allocation onto the designated node. The seeded total over the
-        // lock equals `committedTRAC` by construction (see `_perEpochAmount`).
+        // lock equals `committedTRAC` by construction (see `_scheduleFor`).
+        // The proration schedule is computed ONCE (it is loop-invariant) and
+        // each epoch's amount is read off it via `_amountForEpoch`.
         if (primaryNode != 0) {
-            uint256 lastEpoch = uint256(currentEpoch) + uint256(lockDurationEpochs);
+            PublishingMathLib.ActiveSinkRange[3] memory ranges = _scheduleFor(acct);
+            uint256 lockEpochs = uint256(lockDurationEpochs);
+            uint256 lastEpoch = uint256(currentEpoch) + lockEpochs;
             for (uint256 e = uint256(currentEpoch); e <= lastEpoch; e++) {
-                uint96 amount = _perEpochAmount(acct, e);
+                uint96 amount = _amountForEpoch(ranges, committedTRAC, lockEpochs, e);
                 if (amount > 0) {
                     epochStorage.addEpochPublishingAllocation(primaryNode, e, amount);
                 }
@@ -429,10 +438,16 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
         uint72 oldNode = acct.primaryNode;
 
         // Move only FUTURE epochs within the lock. The schedule's last
-        // credited epoch is `createdAtEpoch + lockDurationEpochs`.
-        uint256 lastEpoch = uint256(acct.createdAtEpoch) + uint256(acct.lockDurationEpochs);
+        // credited epoch is `createdAtEpoch + lockDurationEpochs`. The
+        // proration schedule is computed ONCE (it is loop-invariant and
+        // anchored to the stored `Account`, so it byte-matches the
+        // create-time seed) and each epoch's amount is read off it via
+        // `_amountForEpoch` — making each move exactly reverse its seed.
+        PublishingMathLib.ActiveSinkRange[3] memory ranges = _scheduleFor(acct);
+        uint256 lockEpochs = uint256(acct.lockDurationEpochs);
+        uint256 lastEpoch = uint256(acct.createdAtEpoch) + lockEpochs;
         for (uint256 e = uint256(currentEpoch) + 1; e <= lastEpoch; e++) {
-            uint96 amount = _perEpochAmount(acct, e);
+            uint96 amount = _amountForEpoch(ranges, acct.committedTRAC, lockEpochs, e);
             if (amount == 0) continue;
             if (oldNode != 0 && newNode != 0) {
                 epochStorage.moveEpochPublishingAllocation(oldNode, newNode, e, amount);
@@ -462,16 +477,17 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
     ///      amount and the `moveEpochPublishingAllocation` subtraction would
     ///      underflow.
     ///
-    ///      Returns the allocation credited to epoch `e`:
-    ///        - createdAtEpoch              -> currentEpochAllocation (partial)
-    ///        - createdAtEpoch+1 .. +(N-1)  -> baseTokensPerFullEpoch (each)
-    ///        - createdAtEpoch+N            -> finalEpochAllocation (dust-corrected)
-    ///      where N = lockDurationEpochs. Any other epoch returns 0.
-    ///      Sum over [createdAtEpoch, createdAtEpoch+N] == committedTRAC.
-    function _perEpochAmount(
-        PublishingConvictionStorage.Account memory acct,
-        uint256 e
-    ) internal view returns (uint96) {
+    ///      Computed ONCE per call (the proration + the two chronos reads are
+    ///      loop-invariant — they depend only on the stored `Account`, never on
+    ///      the per-epoch cursor), then the seed / move loops index each epoch's
+    ///      amount off the returned ranges via {_amountForEpoch}. This is the
+    ///      gas-hoist of OT-RFC-51's first pass: `prorateActiveSink` +
+    ///      `timestampForEpoch` + `epochLength` previously ran on every loop
+    ///      iteration (O(lockDurationEpochs) redundant work) for a result that
+    ///      does not change across the loop.
+    function _scheduleFor(
+        PublishingConvictionStorage.Account memory acct
+    ) internal view returns (PublishingMathLib.ActiveSinkRange[3] memory ranges) {
         uint40 anchorEpoch = acct.createdAtEpoch;
         uint256 epochs = uint256(acct.lockDurationEpochs);
         // Time the account had remaining in its creation epoch, derived from
@@ -482,14 +498,35 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
                 ? nextEpochStart - uint256(acct.createdAtTimestamp)
                 : 0;
 
-        PublishingMathLib.ActiveSinkRange[3] memory ranges = PublishingMathLib.prorateActiveSink(
+        ranges = PublishingMathLib.prorateActiveSink(
             acct.committedTRAC,
             anchorEpoch,
             epochs,
             chronos.epochLength(),
             timeRemainingInCurrentEpoch
         );
+    }
 
+    /// @dev OT-RFC-51 per-epoch reader over a precomputed {_scheduleFor}
+    ///      result. PURE — no external reads — so the seed / move loops pay the
+    ///      proration cost exactly once (in {_scheduleFor}) and only this cheap
+    ///      branch per epoch. Returns the allocation credited to epoch `e`:
+    ///        - createdAtEpoch              -> currentEpochAllocation (partial)
+    ///        - createdAtEpoch+1 .. +(N-1)  -> baseTokensPerFullEpoch (each)
+    ///        - createdAtEpoch+N            -> finalEpochAllocation (dust-corrected)
+    ///      where N = lockDurationEpochs. Any other epoch returns 0.
+    ///      Sum over [createdAtEpoch, createdAtEpoch+N] == committedTRAC.
+    ///
+    ///      The returned values are BYTE-IDENTICAL to the prior per-iteration
+    ///      `_perEpochAmount(acct, e)` (partial-first = `ranges[0].tokenAmount`,
+    ///      each full epoch = `committedTRAC / epochs`, final =
+    ///      `ranges[2].tokenAmount`), so seed and move can never drift.
+    function _amountForEpoch(
+        PublishingMathLib.ActiveSinkRange[3] memory ranges,
+        uint96 committedTRAC,
+        uint256 epochs,
+        uint256 e
+    ) internal pure returns (uint96) {
         // ranges[0]: partial creation epoch (single epoch).
         if (ranges[0].tokenAmount > 0 && e == uint256(ranges[0].startEpoch)) {
             return ranges[0].tokenAmount;
@@ -502,7 +539,7 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
             e >= uint256(ranges[1].startEpoch) &&
             e <= uint256(ranges[1].endEpoch)
         ) {
-            return uint96(uint256(acct.committedTRAC) / epochs);
+            return uint96(uint256(committedTRAC) / epochs);
         }
         // ranges[2]: final partial epoch (dust-corrected) at anchor+epochs.
         if (ranges[2].tokenAmount > 0 && e == uint256(ranges[2].startEpoch)) {

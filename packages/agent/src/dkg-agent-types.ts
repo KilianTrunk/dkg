@@ -161,6 +161,18 @@ export interface SyncRequestEnvelope {
    * like `phase`/`snapshotRef`), so it's additive and backward-compatible.
    */
   sinceBatchId?: string;
+  /**
+   * R9 (SECURITY) — UNSIGNED member-recovery marker. When set, the responder
+   * authorizes via the strict members-only `isMemberRecoveryAuthorized`
+   * hard-deny gate (a FRESH `_meta` agent-gate read) and MUST NOT fall through
+   * to the weaker participant/peer fallback. Unsigned because it only ever
+   * ESCALATES strictness (an attacker setting it faces the harder gate;
+   * stripping it reverts to the normal path the member already passes), and the
+   * responder decides on the cryptographically RECOVERED signer — never on this
+   * flag or the (forgeable) `requesterAgentAddress` claim. Kept in lockstep with
+   * the duplicate `SyncRequestEnvelope` in `sync/auth/request-build.ts`.
+   */
+  recovery?: boolean;
 }
 
 // ── Public error classes ────────────────────────────────────────────
@@ -801,6 +813,18 @@ export type ReplicationEventSink = (event: ReplicationEvent) => void;
 
 export interface DKGAgentConfig {
   name: string;
+  /**
+   * public-projection enable flag. When set, a private CG's confirmed VM
+   * publishes emit/refresh a verifiable public projection (the floor: existence,
+   * UAL, access class, committed root) into the SOURCE CG's OWN `_catalog` graph
+   * (`<source-cg>/_catalog`) — the exact named graph open-serve reads — binding
+   * the private CG into the public discovery surface without disclosing its
+   * contents. NB despite the name the projection is NOT written into the named
+   * target CG: the configured value acts only as (a) an on/off switch and (b) a
+   * self-projection guard (a publish whose own CG id equals this value is
+   * skipped). See `emitPublicProjectionAfterPublish` (B7/B8). Unset → off.
+   */
+  publicProjectionContextGraphId?: string;
   framework?: string;
   description?: string;
   listenPort?: number;

@@ -7,6 +7,7 @@ import { GraphManager, PrivateContentStore } from '@origintrail-official/dkg-sto
 import { DEFAULT_PUBLISH_EPOCHS, MAX_PUBLISH_EPOCHS, type Publisher, type PublishOptions, type PublishResult, type KAManifestEntry, type PhaseCallback, type V10CoreNodeACK } from './publisher.js';
 import { skolemizeByEntity } from './auto-partition.js';
 import { canonicalPublishPayload } from './canonical-publish-payload.js';
+import { partitionCatalogQuads, contextGraphCatalogUri } from '@origintrail-official/dkg-core';
 import { RESERVED_SUBJECT_PREFIXES, findReservedSubjectPrefix, isReservedSubject } from './reserved-subjects.js';
 import { skolemize } from './skolemize.js';
 import {
@@ -1984,6 +1985,53 @@ export class DKGPublisher implements Publisher {
       )
       .join('\n');
     const publicByteSize = BigInt(new TextEncoder().encode(nquadsStr).length);
+
+    // the public DCAT catalog entry rides in the merkle root
+    // (kcMerkleRoot, above, covers it) but MUST NOT be encrypted: feed only the
+    // non-catalog (private data) quads to the curated encryptor, so
+    // ciphertextChunksRoot commits the private payload only. No-op for public
+    // CGs and any private CG without a catalog entry (catalogQuads empty ⇒
+    // encryptableNquadsStr === nquadsStr).
+    // Identity-based partition: the ONLY catalog subject is this CG's canonical
+    // DID (round-3 SECURITY). A forged `rdf:type dkg:PrivateContextGraph` on a
+    // user entity no longer routes that entity into the plaintext `_catalog`.
+    const { catalogQuads, otherQuads } = partitionCatalogQuads(allSkolemizedQuads, contextGraphDataUri(contextGraphId));
+    const encryptableNquadsStr = catalogQuads.length === 0
+      ? nquadsStr
+      : otherQuads
+          .map(
+            (q) =>
+              `<${q.subject}> <${q.predicate}> ${q.object.startsWith('"') ? q.object : `<${q.object}>`} <${q.graph}> .`,
+          )
+          .join('\n');
+    // Persist the catalog entry plaintext into the public `_catalog` graph so it
+    // survives the post-publish SWM clear and is queryable/servable (the data
+    // stays encrypted-only). Bounded named graph ⇒ the §7 facet open-serve can
+    // release exactly this and nothing gated.
+    //
+    // B3: this write MUST NOT happen until the publish actually persists. If we
+    // wrote it here (pre-ACK, pre-chain) a failed ACK collection or a reverted
+    // on-chain tx would still leave a public catalog entry exposing a CG whose
+    // verifiable memory never landed. So we only PREPARE the deferred writer
+    // here and invoke it from the exact branches that persist the main publish
+    // result: each intentional-local branch (via `finalizeIntentionalLocalPublish`)
+    // and the confirmed chain-success branch. The chain-failure catch path never
+    // calls it, so a failed publish leaves the `_catalog` graph untouched.
+    const persistCatalogEntry = async (): Promise<void> => {
+      if (catalogQuads.length === 0) return;
+      // Canonical location (shared with projection + open-serve): graph =
+      // contextGraphCatalogUri(contextGraphId) (`<source-cg>/_catalog`), subject =
+      // the context-graph DID. B4: CLEAR/REPLACE — purge any prior catalog
+      // entry for these subjects in this graph before inserting the refreshed
+      // one, so repeated publishes don't accumulate stale catalog triples.
+      const catalogGraph = contextGraphCatalogUri(contextGraphId);
+      const catalogSubjects = new Set(catalogQuads.map((q) => q.subject));
+      for (const subject of catalogSubjects) {
+        await this.store.deleteByPattern({ graph: catalogGraph, subject });
+      }
+      await this.store.insert(catalogQuads.map((q) => ({ ...q, graph: catalogGraph })));
+    };
+
     const merkleRootHex = ethers.hexlify(kcMerkleRoot);
     let publishOperationId = '';
     let ual = '';
@@ -2023,6 +2071,21 @@ export class DKGPublisher implements Publisher {
     // without needing per-call flag plumbing. A future commit can drop
     // the LU-5 single-blob callback once chunked is the only path.
     const useChunkedInline = useEncryptedInline && typeof options.encryptInlineChunked === 'function';
+    // A curated publish (encryption enabled) must carry private payload beyond the
+    // public catalog entry. A catalog-only publish — every quad is a catalog entry
+    // on the context-graph's own DID, reachable because that DID namespace is not
+    // reserved — partitions to empty `otherQuads`, leaving `encryptableNquadsStr`
+    // empty. That would otherwise throw an opaque "rejects empty plaintext" deep in
+    // the chunked encryptor (sliceIntoCiphertextChunks). Reject early, with an
+    // actionable message: the catalog entry alone cannot satisfy the required
+    // ciphertext commitment. Public CGs never enter this branch (no encryptor).
+    if (useEncryptedInline && encryptableNquadsStr.length === 0) {
+      throw new Error(
+        `Curated publish for context graph "${contextGraphId}" has no private payload to encrypt — ` +
+        `every quad is a public catalog entry on the context-graph DID. A curated context graph must ` +
+        `publish private content; the catalog entry alone cannot satisfy the required ciphertext commitment.`,
+      );
+    }
     let stagingQuads: Uint8Array | undefined;
     let stagingByteSize = publicByteSize;
     let chunkedCommitment: {
@@ -2031,7 +2094,7 @@ export class DKGPublisher implements Publisher {
       ciphertextChunks?: Uint8Array[];
     } | undefined;
     if (useChunkedInline) {
-      const plaintextBytes = new TextEncoder().encode(nquadsStr);
+      const plaintextBytes = new TextEncoder().encode(encryptableNquadsStr);
       ensurePublishOperationIdentity();
       // batchId = V10 KC merkleRoot. It remains the core-side
       // persistence/sampling key, while publishOperationId is the
@@ -2052,7 +2115,7 @@ export class DKGPublisher implements Publisher {
         ciphertextChunks: chunked.ciphertextChunks,
       };
     } else if (useEncryptedInline) {
-      const plaintextBytes = new TextEncoder().encode(nquadsStr);
+      const plaintextBytes = new TextEncoder().encode(encryptableNquadsStr);
       const ciphertext = await options.encryptInlinePayload!(plaintextBytes);
       stagingQuads = ciphertext instanceof Uint8Array ? ciphertext : new Uint8Array(ciphertext);
       // For curated CGs the publisher PAYS for ciphertext bytes (cores
@@ -2451,6 +2514,9 @@ export class DKGPublisher implements Publisher {
       this.log.info(ctx, `Storing ${normalizedQuads.length} triples in local store (${reasonLog})`);
       await this.store.insert(normalizedQuads);
       await this.store.insert(tentativeMeta);
+      // B3: only now that the local publish has persisted do we refresh the
+      // public catalog entry (CLEAR/REPLACE — see persistCatalogEntry).
+      await persistCatalogEntry();
     };
 
     // RC11 / PR3: extra intentional-local-only branch for publishes
@@ -2878,6 +2944,12 @@ export class DKGPublisher implements Publisher {
         // (`dkg:authoredBy` bnode + signature quads, spec §9.0.6) is no
         // longer written — zero code readers; the on-chain
         // `KnowledgeBatch.authorAddress` is canonical.
+
+        // B3: the on-chain publish has now confirmed and the verifiable-memory
+        // quads are committed — refresh the public catalog entry here, inside
+        // the success branch, so a failed ACK/chain publish never exposes one
+        // (CLEAR/REPLACE — see persistCatalogEntry).
+        await persistCatalogEntry();
 
         status = 'confirmed';
         onPhase?.('chain:submit', 'end');
@@ -3606,18 +3678,41 @@ export class DKGPublisher implements Publisher {
         }))
         .filter(({ cgPath }) => cgPath.length > 0);
       for (const { graph, cgPath } of swmMetaGraphs) {
-        const slash = cgPath.lastIndexOf('/');
-        const rootId = slash > 0 ? cgPath.slice(0, slash) : '';
-        const subGraphName = slash > 0 ? cgPath.slice(slash + 1) : '';
-        const isRegisteredSubGraph =
-          rootId.length > 0 &&
-          subGraphName.length > 0 &&
-          !subGraphName.includes('/') &&
-          await this.isSubGraphRegistered(rootId, subGraphName);
-        const ownershipKey =
-          isRegisteredSubGraph
-            ? `${rootId}\0${subGraphName}`
-            : cgPath;
+        // Derive the ownership key from EXPLICIT registration metadata, not a
+        // naive last-slash split. A wallet-scoped root CG id is slash-shaped
+        // (`<addr>/<name>`), so its root-level SWM-meta graph
+        // (`<addr>/<name>/_shared_memory_meta`) is BYTE-IDENTICAL to the
+        // sub-graph SWM-meta graph for root `<addr>`, sub `<name>`
+        // (`<addr>/<name>/_shared_memory_meta`). The last-slash split alone
+        // cannot tell them apart, and the previous code mis-keyed a slash-shaped
+        // root as `<addr>\0<name>` whenever a sub-graph named `<name>` happened
+        // to be registered under `<addr>` — splitting that root's ownership from
+        // the key the write path (`_shareImpl`, plain `contextGraphId`) used.
+        //
+        // Resolution order (must reproduce the write-side `ownershipKey`):
+        //   1. The FULL cgPath is itself a registered root CG → root SWM,
+        //      key = cgPath. Explicit root registration wins the collision; it
+        //      matches the wallet-scoped `<addr>/<name>` convention.
+        //   2. else last-slash split; the trailing segment is registered as a
+        //      sub-graph of the leading part → key = `<root>\0<sub>`.
+        //   3. else → root, key = cgPath.
+        // Identical to the prior behaviour on every non-colliding input
+        // (`42`→root, `42/tasks`→sub, sub-graphs under slash-shaped roots→sub);
+        // only the genuine collision now resolves toward the explicit root.
+        let ownershipKey = cgPath;
+        if (!(await this.isContextGraphRegistered(cgPath))) {
+          const slash = cgPath.lastIndexOf('/');
+          const rootId = slash > 0 ? cgPath.slice(0, slash) : '';
+          const subGraphName = slash > 0 ? cgPath.slice(slash + 1) : '';
+          const isRegisteredSubGraph =
+            rootId.length > 0 &&
+            subGraphName.length > 0 &&
+            !subGraphName.includes('/') &&
+            await this.isSubGraphRegistered(rootId, subGraphName);
+          if (isRegisteredSubGraph) {
+            ownershipKey = `${rootId}\0${subGraphName}`;
+          }
+        }
         if (targetKeys.has(ownershipKey)) continue;
         targetKeys.add(ownershipKey);
         targets.push({ ownershipKey, swmMetaGraph: graph });
@@ -4221,6 +4316,43 @@ export class DKGPublisher implements Publisher {
           <http://schema.org/name> ${JSON.stringify(subGraphName)} ;
           <http://dkg.io/ontology/createdBy> ?createdBy .
       } }`,
+    );
+    return registered.type === 'boolean' && registered.value;
+  }
+
+  /**
+   * Is `contextGraphId` declared as a ROOT context graph in local storage?
+   *
+   * Reads the explicit registration triple `<did:dkg:context-graph:<id>> a
+   * dkg:ContextGraph`, which `createContextGraph` writes into the CG's own
+   * `_meta` graph (curated/private CGs) or the ONTOLOGY data graph (public CGs)
+   * — so the ASK is intentionally cross-graph (`GRAPH ?g`) to find it in either
+   * place. The subject-URI shape (`did:dkg:context-graph:<id>`) is identical for
+   * a root and a sub-graph, so the `dkg:ContextGraph` rdf:type is the ONLY thing
+   * that distinguishes a registered root from a registered sub-graph. Used by
+   * `reconstructSharedMemoryOwnership` to disambiguate a slash-shaped root CG id
+   * (`<addr>/<name>`) from a `<root>/<sub-graph>` SWM-meta graph.
+   */
+  private async isContextGraphRegistered(contextGraphId: string): Promise<boolean> {
+    const cgUri = contextGraphDataUri(contextGraphId);
+    // SECURITY (Codex #1171): registration's `<cgUri> a dkg:ContextGraph` triple is
+    // written ONLY into the system ONTOLOGY data graph (public CGs + every publish)
+    // or the CG's own `_meta` graph (curated CGs) — see createContextGraph `defGraph`
+    // (= isCurated ? cgMeta : ontology) and the publish ontology emitter. It is NEVER
+    // written into a user-authored data/sub-graph. The previous cross-graph
+    // `ASK { GRAPH ?g … }` matched ANY graph, so a publisher could author
+    // `<cgUri> a dkg:ContextGraph` in their own content graph (the rdf:type OBJECT is
+    // not a reserved IRI) and SPOOF registration — making reconstructSharedMemoryOwnership
+    // treat a sub-graph as a registered root and derive the wrong ownership key after
+    // restart. Scope the ASK to exactly the two authoritative graphs.
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    const registered = await this.store.query(
+      `ASK {
+        { GRAPH <${assertSafeIri(ontologyGraph)}> { <${assertSafeIri(cgUri)}> a <http://dkg.io/ontology/ContextGraph> . } }
+        UNION
+        { GRAPH <${assertSafeIri(metaGraph)}> { <${assertSafeIri(cgUri)}> a <http://dkg.io/ontology/ContextGraph> . } }
+      }`,
     );
     return registered.type === 'boolean' && registered.value;
   }

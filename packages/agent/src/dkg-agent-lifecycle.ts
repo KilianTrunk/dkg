@@ -208,7 +208,8 @@ import { reconcileWarmCoreConnections, type WarmCoreAgent } from './p2p/warm-cor
 import { fetchSyncPages, type SyncPageResult } from './sync/requester/page-fetch.js';
 import { getSyncCheckpointKey } from './sync/checkpoint/state.js';
 import { runDurableSync } from './sync/requester/durable-sync.js';
-import { runSharedMemorySync } from './sync/requester/shared-memory-sync.js';
+import { runSharedMemorySync, sharedMemoryOwnershipKeyFromGraph } from './sync/requester/shared-memory-sync.js';
+import { recoverContextGraphSwm, type RecoverContextGraphSwmResult } from './sync/requester/swm-recovery.js';
 import { buildSyncRequestEnvelope, type SyncPhase } from './sync/auth/request-build.js';
 import { authorizePrivateSyncRequest } from './sync/auth/request-authorize.js';
 import { registerSyncHandler } from './sync/responder/sync-handler.js';
@@ -2842,6 +2843,9 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     snapshotRef?: string,
     sinceBatchId?: string,
     signal?: AbortSignal,
+    // R9/R10 — member SWM recovery marker. Forks the checkpoint namespace (R10)
+    // and the request envelope auth mode (R9). Only the recovery driver sets it.
+    recovery?: boolean,
   ): Promise<SyncPageResult> {
     return fetchSyncPages({
       ctx,
@@ -2853,6 +2857,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       snapshotRef,
       sinceBatchId,
       deadline,
+      recovery,
       syncPageTimeoutMs: SYNC_PAGE_TIMEOUT_MS,
       syncRouterAttempts: SYNC_ROUTER_ATTEMPTS,
       syncPageRetryAttempts: SYNC_PAGE_RETRY_ATTEMPTS,
@@ -2917,33 +2922,104 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     contextGraphIds: string[],
   ): Promise<SharedMemorySyncResult> {
     const ctx = createOperationContext('sync');
-    const allowedContextGraphIds: string[] = [];
-    for (const contextGraphId of contextGraphIds) {
-      if (await this.canUseSharedMemoryForContextGraph(contextGraphId)) {
-        allowedContextGraphIds.push(contextGraphId);
-      } else {
-        this.log.warn(ctx, `Skipping SWM sync for unauthorized or unconfirmed context graph "${contextGraphId}"`);
+    // M2 (curator-leader convergence): a PRIVATE CG converges by REPLACE-recovering the
+    // current state from its CURATOR (the authoritative SWM replica), never the
+    // bidirectional mesh union-sync — which corrupts a reconnecting member into {old,new}
+    // AND pollutes the curator back (proven on devnet). PUBLIC CGs keep the union path
+    // (correct for cold-start / empty target).
+    const publicContextGraphIds: string[] = [];
+    const privateRecoverFromCurator: string[] = [];
+    // Memoized agent-registry lookup: resolve a curator WALLET -> its libp2p peer
+    // via the AGENTS registry (the authoritative agent->peer map), bypassing the
+    // dkg:curator/dkg:creator `_meta` triples — a member that pre-created the CG
+    // self-stamps both, which would otherwise resolve the member AS the curator.
+    let cachedAgents: Array<{ agentAddress?: string; peerId: string }> | undefined;
+    // Resolve EVERY libp2p peer the AGENTS registry advertises for a curator
+    // wallet, not the first match: `findAgents()` is not a unique wallet->peer
+    // map (agent registration is consent-free, so several URIs can share a
+    // wallet, and a restarted curator can linger under a stale peerId). The
+    // caller only needs to know whether the CONNECTING peer is among them, so a
+    // first-match pick could resolve a stale/wrong peer and wrongly defer (or,
+    // for a same-wallet Byzantine advertiser, mis-gate) recovery.
+    const resolveAgentPeers = async (agentAddrLower: string): Promise<string[]> => {
+      if (!cachedAgents) {
+        try {
+          cachedAgents = await this.discovery.findAgents();
+        } catch {
+          cachedAgents = [];
+        }
       }
+      return cachedAgents
+        .filter((a) => a.agentAddress?.toLowerCase() === agentAddrLower)
+        .map((a) => a.peerId);
+    };
+    for (const contextGraphId of contextGraphIds) {
+      if (!(await this.canUseSharedMemoryForContextGraph(contextGraphId))) {
+        this.log.warn(ctx, `Skipping SWM sync for unauthorized or unconfirmed context graph "${contextGraphId}"`);
+        continue;
+      }
+      if (await this.isPrivateContextGraph(contextGraphId)) {
+        // The curator (curator-leader) is the authoritative SWM replica; it never
+        // reverse-syncs a CG it owns. Decide curatorship AND resolve the curator's
+        // peer by the STRUCTURAL curator — the wallet-scoped id prefix `0x<addr>` —
+        // NOT the dkg:curator/dkg:creator triples. A member that locally pre-created
+        // the CG (the rfc38 multi-member onboarding pattern) self-stamps its OWN
+        // wallet as a dkg:curator triple and its OWN peer as dkg:creator, which makes
+        // BOTH isCuratorOf() and resolveCuratorPeerId() resolve the member AS the
+        // curator — so the gate would skip the member's own recovery and it would
+        // silently never converge (a zero-byte-core durability failure). The id
+        // prefix is authoritative; only the node owning that agent is the curator.
+        const structuralCuratorDid = deriveCuratorDidFromCgId(contextGraphId);
+        if (structuralCuratorDid) {
+          const structuralAgent = structuralCuratorDid.slice('did:dkg:agent:'.length).toLowerCase();
+          if ([...this.localAgents.keys()].some((addr) => addr.toLowerCase() === structuralAgent)) {
+            this.log.debug(ctx, `SWM sync: skipping "${contextGraphId}" — local node is the curator (never reverse-syncs a CG it owns)`);
+            continue;
+          }
+          // Resolve the structural curator's peer via the agent registry. On a
+          // reconnect the registry may not be populated yet, so refresh meta once.
+          let curatorPeers = await resolveAgentPeers(structuralAgent);
+          if (curatorPeers.length === 0) {
+            await this.refreshMetaFromCurator(contextGraphId).catch(() => undefined);
+            cachedAgents = undefined; // force a fresh registry read after the refresh
+            curatorPeers = await resolveAgentPeers(structuralAgent);
+          }
+          if (curatorPeers.length === 0) {
+            this.log.info(ctx, `SWM recovery skipped for private CG "${contextGraphId.slice(0, 28)}": curator (${structuralAgent.slice(0, 10)}) peer not resolved yet`);
+          } else if (!curatorPeers.includes(remotePeerId)) {
+            this.log.info(ctx, `SWM recovery deferred for private CG "${contextGraphId.slice(0, 28)}": connecting peer ${remotePeerId.slice(0, 12)} is not among the curator's ${curatorPeers.length} registered peer(s)`);
+          } else {
+            this.log.info(ctx, `SWM recovery ENQUEUED for private CG "${contextGraphId.slice(0, 28)}" from curator peer ${remotePeerId.slice(0, 12)}`);
+            privateRecoverFromCurator.push(contextGraphId);
+          }
+          continue;
+        }
+        // Legacy non-wallet-scoped CG (no structural curator): fall back to the
+        // triple-based curator resolution.
+        if (await this.isCuratorOf(contextGraphId)) {
+          this.log.debug(ctx, `SWM sync: skipping "${contextGraphId}" — local node is the curator (never reverse-syncs a CG it owns)`);
+          continue;
+        }
+        let curatorPeerId = await this.resolveCuratorPeerId(contextGraphId);
+        if (!curatorPeerId) {
+          await this.refreshMetaFromCurator(contextGraphId).catch(() => undefined);
+          curatorPeerId = await this.resolveCuratorPeerId(contextGraphId);
+        }
+        if (!curatorPeerId) {
+          this.log.info(ctx, `SWM recovery skipped for private CG "${contextGraphId.slice(0, 28)}": curator peerId not resolved`);
+        } else if (curatorPeerId === this.peerId) {
+          this.log.info(ctx, `SWM recovery skipped for private CG "${contextGraphId.slice(0, 28)}": local node resolves AS the curator`);
+        } else if (curatorPeerId !== remotePeerId) {
+          this.log.info(ctx, `SWM recovery deferred for private CG "${contextGraphId.slice(0, 28)}": connecting peer is not the curator`);
+        } else {
+          this.log.info(ctx, `SWM recovery ENQUEUED for private CG "${contextGraphId.slice(0, 28)}" from curator ${curatorPeerId.slice(0, 12)}`);
+          privateRecoverFromCurator.push(contextGraphId);
+        }
+        continue;
+      }
+      publicContextGraphIds.push(contextGraphId);
     }
-    if (allowedContextGraphIds.length === 0) {
-      return {
-        insertedTriples: 0,
-        fetchedMetaTriples: 0,
-        fetchedDataTriples: 0,
-        insertedMetaTriples: 0,
-        insertedDataTriples: 0,
-        bytesReceived: 0,
-        resumedPhases: 0,
-        timedOutPhases: 0,
-        completedPhases: 0,
-        checkpointAdvances: 0,
-        emptyResponses: 0,
-        droppedDataTriples: 0,
-        failedPeers: 0,
-        failedPhases: 0,
-        deniedPhases: 0,
-      };
-    }
+
     const subGraphAdmissionByContextGraph = new Map<string, Promise<{ registered: string[]; excluded: string[] }>>();
     const getSubGraphAdmission = (contextGraphId: string) => {
       let admission = subGraphAdmissionByContextGraph.get(contextGraphId);
@@ -2954,39 +3030,145 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       return admission;
     };
 
-    return runSharedMemorySync({
+    const summary: SharedMemorySyncResult = publicContextGraphIds.length === 0
+      ? {
+          insertedTriples: 0, fetchedMetaTriples: 0, fetchedDataTriples: 0,
+          insertedMetaTriples: 0, insertedDataTriples: 0, bytesReceived: 0,
+          resumedPhases: 0, timedOutPhases: 0, completedPhases: 0, checkpointAdvances: 0,
+          emptyResponses: 0, droppedDataTriples: 0, failedPeers: 0, failedPhases: 0, deniedPhases: 0,
+        }
+      : await runSharedMemorySync({
+          ctx,
+          remotePeerId,
+          contextGraphIds: publicContextGraphIds,
+          createContextGraphSyncDeadline: this.createContextGraphSyncDeadline.bind(this),
+          fetchSyncPages: this.fetchSyncPages.bind(this),
+          processSharedMemoryBatch: (wsDataQuads, wsMetaQuads, contextGraphId, registeredSubGraphNames, excludedSubGraphNames) =>
+            this.getOrCreateSyncVerifyWorker().processSharedMemoryBatch(
+              wsDataQuads,
+              wsMetaQuads,
+              contextGraphId,
+              registeredSubGraphNames,
+              excludedSubGraphNames,
+            ),
+          getRegisteredSubGraphNames: async (contextGraphId) => (await getSubGraphAdmission(contextGraphId)).registered,
+          getExcludedSubGraphNames: async (contextGraphId) => (await getSubGraphAdmission(contextGraphId)).excluded,
+          ensureContextGraph: async (contextGraphId) => {
+            const graphManager = new GraphManager(this.store);
+            await graphManager.ensureContextGraph(contextGraphId);
+          },
+          storeInsert: async (quads) => {
+            await this.store.insert(quads);
+            this.contextGraphMetaProjection.markDirtyFromQuads(quads);
+          },
+          publicSnapshotStore: this.publicSnapshotStore,
+          deleteCheckpoint: (key) => this.syncCheckpoints.delete(key),
+          setCheckpoint: (key, offset) => this.syncCheckpoints.set(key, offset),
+          ensureOwnedMap: (contextGraphId) => {
+            if (!this.workspaceOwnedEntities.has(contextGraphId)) {
+              this.workspaceOwnedEntities.set(contextGraphId, new Map());
+            }
+            return this.workspaceOwnedEntities.get(contextGraphId)!;
+          },
+          logInfo: (opCtx, message) => this.log.info(opCtx, message),
+          logWarn: (opCtx, message) => this.log.warn(opCtx, message),
+          logDebug: (opCtx, message) => this.log.debug(opCtx, message),
+        });
+
+    // PRIVATE CGs: REPLACE-recover the current state from the curator (= remotePeerId,
+    // gated above to be the curator and not self). Reuses the all-or-nothing recovery.
+    for (const contextGraphId of privateRecoverFromCurator) {
+      try {
+        const r = await this.recoverContextGraphSwmFromPeer(remotePeerId, contextGraphId);
+        summary.insertedDataTriples += r.insertedDataQuads;
+        summary.insertedMetaTriples += r.insertedMetaQuads;
+        summary.insertedTriples += r.insertedDataQuads + r.insertedMetaQuads;
+        summary.droppedDataTriples += r.droppedDataTriples;
+        // `recoverContextGraphSwmFromPeer` signals a partial / deadline-bounded
+        // fetch with `completed === false` WITHOUT throwing (all-or-nothing
+        // REPLACE mutates nothing on a partial). The on-connect accounting and
+        // the catch-up runner key success off the phase counters, so an
+        // incomplete recovery that left `failedPhases`/`completedPhases` at 0
+        // would be reported clean — stamping `lastSuccessfulSyncAt` and
+        // suppressing the next retry while the member stays stale. Count an
+        // incomplete recovery as a failed phase (forces a prompt retry); count a
+        // complete one as a completed phase so an idempotent 0-insert REPLACE
+        // still registers as progress.
+        if (r.completed) {
+          summary.completedPhases += 1;
+        } else {
+          summary.failedPhases += 1;
+        }
+      } catch (err) {
+        this.log.warn(ctx, `Curator-recovery for private CG "${contextGraphId}" from ${remotePeerId} failed: ${err instanceof Error ? err.message : String(err)}`);
+        summary.failedPeers += 1;
+      }
+    }
+
+    return summary;
+  }
+
+  /**
+   * recover ONE context graph's `_shared_memory` to current
+   * state from a single authoritative peer (member / anchor), applying via
+   * REPLACE rather than the shared incremental union path (which corrupts a
+   * non-empty store). Invoked by the member-recovery driver after the frontier
+   * detects a full / cross-epoch gap; isolated from `runSharedMemorySync` so the
+   * incremental path is untouched.
+   */
+  async recoverContextGraphSwmFromPeer(this: DKGAgent,
+    remotePeerId: string,
+    contextGraphId: string,
+  ): Promise<RecoverContextGraphSwmResult> {
+    const ctx = createOperationContext('sync');
+    const admission = await getSharedMemorySubGraphAdmission(
+      this.store, contextGraphId, this.listSubGraphs(contextGraphId),
+    );
+    return recoverContextGraphSwm({
       ctx,
       remotePeerId,
-      contextGraphIds: allowedContextGraphIds,
-      createContextGraphSyncDeadline: this.createContextGraphSyncDeadline.bind(this),
-      fetchSyncPages: this.fetchSyncPages.bind(this),
-      processSharedMemoryBatch: (wsDataQuads, wsMetaQuads, contextGraphId, registeredSubGraphNames, excludedSubGraphNames) =>
-        this.getOrCreateSyncVerifyWorker().processSharedMemoryBatch(
-          wsDataQuads,
-          wsMetaQuads,
-          contextGraphId,
-          registeredSubGraphNames,
-          excludedSubGraphNames,
-        ),
-      getRegisteredSubGraphNames: async (contextGraphId) => (await getSubGraphAdmission(contextGraphId)).registered,
-      getExcludedSubGraphNames: async (contextGraphId) => (await getSubGraphAdmission(contextGraphId)).excluded,
-      ensureContextGraph: async (contextGraphId) => {
-        const graphManager = new GraphManager(this.store);
-        await graphManager.ensureContextGraph(contextGraphId);
+      contextGraphId,
+      deadline: this.createContextGraphSyncDeadline(1),
+      // R9/R10 — pin recovery=true at the lifecycle boundary so swm-recovery's
+      // deps signature stays unchanged. This forks BOTH the checkpoint namespace
+      // (R10: a distinct `|recovery` cursor that never mutates the shared
+      // incremental-sync cursor) AND the request envelope auth mode (R9: the
+      // responder gates via the strict members-only `isMemberRecoveryAuthorized`).
+      fetchSyncPages: (ctx2, remotePeerId2, contextGraphId2, includeSharedMemory2, phase2, graphUri2, deadline2) =>
+        this.fetchSyncPages(ctx2, remotePeerId2, contextGraphId2, includeSharedMemory2, phase2, graphUri2, deadline2, undefined, undefined, undefined, true),
+      processSharedMemoryBatch: (wsDataQuads, wsMetaQuads, cgId, registered, excluded) =>
+        this.getOrCreateSyncVerifyWorker().processSharedMemoryBatch(wsDataQuads, wsMetaQuads, cgId, registered, excluded),
+      // SwmRecoveryStore: invalidate the list cache + mark the meta projection
+      // dirty on insert (parity with runSharedMemorySync's
+      // insertSyncedQuadsAndInvalidateListCache); deletes pass through to the store.
+      store: {
+        insert: async (quads) => {
+          await this.store.insert(quads);
+          if (quads.length > 0) {
+            this.invalidateListContextGraphsCache();
+            this.contextGraphMetaProjection.markDirtyFromQuads(quads);
+          }
+        },
+        deleteByPattern: (pattern) => this.store.deleteByPattern(pattern),
+        deleteBySubjectPrefix: (graph, prefix) => this.store.deleteBySubjectPrefix(graph, prefix),
       },
-      storeInsert: (quads) => this.insertSyncedQuadsAndInvalidateListCache(quads),
-      publicSnapshotStore: this.publicSnapshotStore,
-      deleteCheckpoint: (key) => this.syncCheckpoints.delete(key),
+      ensureContextGraph: async (cgId) => {
+        const graphManager = new GraphManager(this.store);
+        await graphManager.ensureContextGraph(cgId);
+      },
       setCheckpoint: (key, offset) => this.syncCheckpoints.set(key, offset),
-      ensureOwnedMap: (contextGraphId) => {
-        if (!this.workspaceOwnedEntities.has(contextGraphId)) {
-          this.workspaceOwnedEntities.set(contextGraphId, new Map());
+      deleteCheckpoint: (key) => this.syncCheckpoints.delete(key),
+      getRegisteredSubGraphNames: async () => admission.registered,
+      getExcludedSubGraphNames: async () => admission.excluded,
+      // R2 — hydrate the Rule-4 ownership cache (same map runSharedMemorySync uses).
+      ensureOwnedMap: (ownershipKey) => {
+        if (!this.workspaceOwnedEntities.has(ownershipKey)) {
+          this.workspaceOwnedEntities.set(ownershipKey, new Map());
         }
-        return this.workspaceOwnedEntities.get(contextGraphId)!;
+        return this.workspaceOwnedEntities.get(ownershipKey)!;
       },
       logInfo: (opCtx, message) => this.log.info(opCtx, message),
       logWarn: (opCtx, message) => this.log.warn(opCtx, message),
-      logDebug: (opCtx, message) => this.log.debug(opCtx, message),
     });
   }
 
@@ -4393,8 +4575,22 @@ export class LifecycleSyncMethods extends DKGAgentBase {
             graphDeleted += ownerDeleted;
           }
 
-          const ownedSet = this.workspaceOwnedEntities.get(pid);
-          if (ownedSet) {
+          // Evict every per-subgraph ownership key for the expired roots.
+          // SWM data now spans the root workspace graph plus the per-KA /
+          // subgraph `…/_shared_memory/{addr}/{number}` graphs (wsGraphs), and
+          // ownership is cached under one key per graph family:
+          // `pid` for the root/bucket and `${pid}\0${subGraph}` for per-subgraph
+          // graphs (see sharedMemoryOwnershipKeyFromGraph). Only clearing the
+          // `pid`-keyed map would leave the per-subgraph entries behind, so an
+          // expired root could still look owned and mis-arbitrate later writes.
+          const ownershipKeys = new Set<string>();
+          for (const g of wsGraphs) {
+            const ownershipKey = sharedMemoryOwnershipKeyFromGraph(pid, g);
+            if (ownershipKey) ownershipKeys.add(ownershipKey);
+          }
+          for (const ownershipKey of ownershipKeys) {
+            const ownedSet = this.workspaceOwnedEntities.get(ownershipKey);
+            if (!ownedSet) continue;
             for (const re of rootEntities) {
               ownedSet.delete(re);
             }
@@ -4413,6 +4609,20 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     return totalDeleted;
   }
 
+}
+
+async function listGraphFamily(store: TripleStore, rootGraph: string): Promise<string[]> {
+  const graphs = await listGraphsByPrefix(store, `${rootGraph}/`);
+  if (await store.hasGraph(rootGraph)) {
+    graphs.unshift(rootGraph);
+  }
+  return graphs;
+}
+
+async function listGraphsByPrefix(store: TripleStore, prefix: string): Promise<string[]> {
+  return store.listGraphsByPrefix
+    ? store.listGraphsByPrefix(prefix)
+    : (await store.listGraphs()).filter((graph) => graph.startsWith(prefix));
 }
 
 async function getSharedMemorySubGraphAdmission(

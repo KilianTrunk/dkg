@@ -91,7 +91,9 @@ describe('ContextGraphMetaProjection', () => {
     ]);
   });
 
-  it('lets root _meta public access policy override older private declarations', async () => {
+  it('keeps a CG private once any source declares private, even if root _meta later declares public (one-way ratchet)', async () => {
+    // Privacy is a one-way ratchet (product decision 2026-06-16): a later `public`
+    // declaration must NOT downgrade a CG that any source already declared private.
     const store = new OxigraphStore();
     const projection = new ContextGraphMetaProjection(store);
     const id = 'projection-meta-public-after-private';
@@ -109,7 +111,7 @@ describe('ContextGraphMetaProjection', () => {
       { subject: uri, predicate: DKG_ONTOLOGY.DKG_ACCESS_POLICY, object: '"public"', graph: metaGraph },
     ]);
 
-    expect((await projection.get(id)).accessPolicy).toBe('public');
+    expect((await projection.get(id)).accessPolicy).toBe('private');
   });
 
   it('preserves case-sensitive projected metadata while folding address-only lists', async () => {

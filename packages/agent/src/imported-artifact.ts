@@ -70,6 +70,14 @@ export interface ReadAssertionArtifactParams {
   cache?: boolean;
 }
 
+export interface AssertionArtifactAvailabilityParams {
+  contextGraphId: string;
+  assertionUri: string;
+  kind: AssertionArtifactKind;
+  hash: string;
+  subGraphName?: string;
+}
+
 function validateContentHash(hash: string): boolean {
   return /^(?:sha256:|keccak256:)?[0-9a-f]{64}$/i.test(hash);
 }
@@ -424,6 +432,29 @@ export class ImportedArtifactMethods extends DKGAgentBase {
       PROTOCOL_GET_ASSERTION_ARTIFACT,
       (data, peerIdObj) => this.handleGetImportedArtifact(data, peerIdObj.toString()),
     );
+  }
+
+  async hasLocalAssertionArtifact(this: DKGAgent, params: AssertionArtifactAvailabilityParams): Promise<boolean> {
+    const linked = await resolveLinkedArtifact(this, params);
+    if (linked === 'hash_mismatch' || !linked) return false;
+    const store = this.config.importedArtifactByteStore;
+    if (!store) return false;
+    const stat = await store.stat(linked.hash);
+    return Boolean(stat);
+  }
+
+  async discoverAssertionArtifactCandidates(this: DKGAgent, _params: AssertionArtifactAvailabilityParams): Promise<string[]> {
+    const rawPeers = this.node?.libp2p?.getPeers?.() ?? [];
+    const peers = rawPeers
+      .map((peer: unknown) => peer?.toString?.() ?? String(peer))
+      .filter((peerId: string) => peerId && peerId !== this.peerId);
+    const uniquePeers = [...new Set(peers)];
+    if (typeof this.getPeerProtocols !== 'function') return uniquePeers;
+    const candidates = await Promise.all(uniquePeers.map(async (peerId) => {
+      const protocols = await this.getPeerProtocols(peerId).catch((): string[] => []);
+      return protocols.includes(PROTOCOL_GET_ASSERTION_ARTIFACT) ? peerId : null;
+    }));
+    return candidates.filter((peerId): peerId is string => Boolean(peerId));
   }
 
   async handleGetImportedArtifact(this: DKGAgent, data: Uint8Array, fromPeerId: string): Promise<Uint8Array> {

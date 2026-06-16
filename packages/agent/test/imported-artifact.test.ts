@@ -3,6 +3,7 @@ import { ethers } from 'ethers';
 import {
   IMPORTED_ARTIFACT_AUTH_PURPOSE,
   IMPORTED_ARTIFACT_MAX_PAGE_BYTES,
+  PROTOCOL_GET_ASSERTION_ARTIFACT,
   computeImportedArtifactSelector,
   ImportedArtifactMethods,
   type ImportedArtifactRequest,
@@ -138,6 +139,16 @@ function fakeAgent(args: {
         stat: vi.fn(async () => ({ size: args.bytes?.length ?? 0 })),
         readRange: vi.fn(async (_hash: string, offset: number, length: number) =>
           (args.bytes ?? Buffer.alloc(0)).subarray(offset, offset + length)),
+      },
+    },
+    node: {
+      libp2p: {
+        getPeers: vi.fn(() => [
+          { toString: () => 'peer-local' },
+          { toString: () => 'peer-a' },
+          { toString: () => 'peer-a' },
+          { toString: () => 'peer-b' },
+        ]),
       },
     },
     store: {
@@ -340,6 +351,50 @@ describe('generic imported artifact peer handler', () => {
       contentType: 'text/markdown',
       bytesB64: Buffer.from('markdown').toString('base64'),
     });
+  });
+
+  it('exposes local availability only for linked imported-artifact bytes', async () => {
+    const agent = fakeAgent({ bytes: Buffer.from('abcdef') });
+
+    await expect(ImportedArtifactMethods.prototype.hasLocalAssertionArtifact.call(agent, {
+      contextGraphId,
+      assertionUri,
+      kind: 'source',
+      hash,
+    })).resolves.toBe(true);
+
+    await expect(ImportedArtifactMethods.prototype.hasLocalAssertionArtifact.call(agent, {
+      contextGraphId,
+      assertionUri,
+      kind: 'source',
+      hash: `keccak256:${'b'.repeat(64)}`,
+    })).resolves.toBe(false);
+  });
+
+  it('discovers unique connected artifact candidates without including itself', async () => {
+    const agent = fakeAgent({ bytes: Buffer.from('abcdef') });
+
+    await expect(ImportedArtifactMethods.prototype.discoverAssertionArtifactCandidates.call(agent, {
+      contextGraphId,
+      assertionUri,
+      kind: 'source',
+      hash,
+    })).resolves.toEqual(['peer-a', 'peer-b']);
+  });
+
+  it('filters discovered artifact candidates by protocol support when peer protocols are available', async () => {
+    const agent = {
+      ...fakeAgent({ bytes: Buffer.from('abcdef') }),
+      getPeerProtocols: vi.fn(async (peerId: string) =>
+        peerId === 'peer-a' ? [PROTOCOL_GET_ASSERTION_ARTIFACT] : ['/other/protocol']),
+    };
+
+    await expect(ImportedArtifactMethods.prototype.discoverAssertionArtifactCandidates.call(agent, {
+      contextGraphId,
+      assertionUri,
+      kind: 'source',
+      hash,
+    })).resolves.toEqual(['peer-a']);
   });
 
   it('builds unsigned selector-bound requests for public + open artifact reads', async () => {

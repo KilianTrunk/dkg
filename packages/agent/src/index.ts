@@ -119,6 +119,7 @@ export {
   computeImportedArtifactSelector,
   IMPORTED_ARTIFACT_AUTH_PURPOSE,
   IMPORTED_ARTIFACT_MAX_PAGE_BYTES,
+  type AssertionArtifactAvailabilityParams,
   type ImportedArtifactRequest,
   type ImportedArtifactResponse,
   type ReadAssertionArtifactParams,

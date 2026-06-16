@@ -76,6 +76,11 @@ type AssertionArtifactResolution = ImportedArtifactResolution & {
   contentType: string;
 };
 
+type AssertionArtifactRemoteResult = {
+  remote: Awaited<ReturnType<NonNullable<RequestContext['agent']['fetchAndVerifyAssertionArtifact']>>>;
+  sourcePeerId: string;
+};
+
 function normalizeAssertionArtifactKind(raw: unknown): AssertionArtifactKind {
   if (raw === 'source' || raw === 'markdown' || raw === 'original') return raw;
   throw new ImportArtifactRouteError(400, '"kind" must be one of "source", "markdown", or "original"');
@@ -103,6 +108,60 @@ function verifyArtifactBytesHash(hash: string, bytes: Buffer): boolean {
   }
   const sha = createHash('sha256').update(bytes).digest('hex');
   return hash === sha || hash === `sha256:${sha}`;
+}
+
+function orderedArtifactCandidatePeers(sourcePeerId: string | undefined, discovered: string[]): string[] {
+  const candidates: string[] = [];
+  if (sourcePeerId) candidates.push(sourcePeerId);
+  for (const peerId of discovered) {
+    if (peerId && !candidates.includes(peerId)) candidates.push(peerId);
+  }
+  return candidates;
+}
+
+async function discoverArtifactCandidatePeers(
+  agent: RequestContext['agent'],
+  resolved: AssertionArtifactResolution,
+): Promise<string[]> {
+  if (typeof agent.discoverAssertionArtifactCandidates !== 'function') return [];
+  return agent.discoverAssertionArtifactCandidates({
+    contextGraphId: resolved.contextGraphId,
+    assertionUri: resolved.assertionUri,
+    kind: resolved.kind,
+    hash: resolved.hash,
+    ...(resolved.subGraphName ? { subGraphName: resolved.subGraphName } : {}),
+  });
+}
+
+async function fetchFirstVerifiedAssertionArtifact(
+  agent: RequestContext['agent'],
+  resolved: AssertionArtifactResolution,
+  opts: {
+    sourcePeerIds: string[];
+    offset: number;
+    maxBytes: number;
+    cache: boolean;
+  },
+): Promise<AssertionArtifactRemoteResult | null> {
+  if (typeof agent.fetchAndVerifyAssertionArtifact !== 'function') return null;
+  let fallback: AssertionArtifactRemoteResult | null = null;
+  for (const sourcePeerId of opts.sourcePeerIds) {
+    const remote = await agent.fetchAndVerifyAssertionArtifact({
+      contextGraphId: resolved.contextGraphId,
+      assertionUri: resolved.assertionUri,
+      kind: resolved.kind,
+      hash: resolved.hash,
+      offset: opts.offset,
+      maxBytes: opts.maxBytes,
+      ...(resolved.subGraphName ? { subGraphName: resolved.subGraphName } : {}),
+      sourcePeerId,
+      cache: opts.cache,
+    });
+    const result = { remote, sourcePeerId };
+    if (remote.verifiedBytes) return result;
+    fallback ??= result;
+  }
+  return fallback;
 }
 
 async function resolveAssertionArtifact(
@@ -231,7 +290,9 @@ export async function handleKaImportArtifactRead(ctx: RequestContext): Promise<v
     const sourcePeerId = typeof raw.sourcePeerId === 'string' && raw.sourcePeerId.trim()
       ? raw.sourcePeerId.trim()
       : undefined;
-    if (!sourcePeerId || typeof agent.fetchAndVerifyAssertionArtifact !== 'function') {
+    const discoveredPeerIds = await discoverArtifactCandidatePeers(agent, resolved);
+    const sourcePeerIds = orderedArtifactCandidatePeers(sourcePeerId, discoveredPeerIds);
+    if (sourcePeerIds.length === 0 || typeof agent.fetchAndVerifyAssertionArtifact !== 'function') {
       return jsonResponse(res, 200, {
         status: sourcePeerId ? 'unavailable' : 'fetchable',
         contextGraphId: resolved.contextGraphId,
@@ -244,22 +305,33 @@ export async function handleKaImportArtifactRead(ctx: RequestContext): Promise<v
           ...(sourcePeerId ? { peerId: sourcePeerId } : {}),
           agentAddress: resolved.assertionAgentAddress,
         },
-        reason: sourcePeerId ? 'Artifact bytes are not available locally or from the requested peer' : 'Artifact bytes are not local; provide sourcePeerId to fetch from a peer',
+        reason: sourcePeerId
+          ? 'Artifact bytes are not available locally or from the requested peer'
+          : 'Artifact bytes are not local and no connected peer candidate is available',
       });
     }
 
     const cache = raw.cache !== false && offset === 0;
-    const remote = await agent.fetchAndVerifyAssertionArtifact({
-      contextGraphId: resolved.contextGraphId,
-      assertionUri: resolved.assertionUri,
-      kind: resolved.kind,
-      hash: resolved.hash,
+    const fetched = await fetchFirstVerifiedAssertionArtifact(agent, resolved, {
+      sourcePeerIds,
       offset,
       maxBytes,
-      ...(resolved.subGraphName ? { subGraphName: resolved.subGraphName } : {}),
-      sourcePeerId,
       cache,
     });
+    if (!fetched) {
+      return jsonResponse(res, 200, {
+        status: 'fetchable',
+        contextGraphId: resolved.contextGraphId,
+        assertionUri: resolved.assertionUri,
+        kind: resolved.kind,
+        hash: resolved.hash,
+        contentType: resolved.contentType,
+        offset,
+        source: { agentAddress: resolved.assertionAgentAddress },
+        reason: 'Artifact bytes are not local and no connected peer candidate is available',
+      });
+    }
+    const { remote, sourcePeerId: fetchedSourcePeerId } = fetched;
     const page = remote.response;
     if (page.denied) {
       return jsonResponse(res, 200, {
@@ -268,7 +340,7 @@ export async function handleKaImportArtifactRead(ctx: RequestContext): Promise<v
         assertionUri: resolved.assertionUri,
         kind: resolved.kind,
         hash: resolved.hash,
-        source: { peerId: sourcePeerId, agentAddress: resolved.assertionAgentAddress },
+        source: { peerId: fetchedSourcePeerId, agentAddress: resolved.assertionAgentAddress },
         reason: 'denied',
       });
     }
@@ -279,7 +351,7 @@ export async function handleKaImportArtifactRead(ctx: RequestContext): Promise<v
         assertionUri: resolved.assertionUri,
         kind: resolved.kind,
         hash: resolved.hash,
-        source: { peerId: sourcePeerId, agentAddress: resolved.assertionAgentAddress },
+        source: { peerId: fetchedSourcePeerId, agentAddress: resolved.assertionAgentAddress },
       });
     }
     if (page.unavailable || page.bytesB64 == null) {
@@ -289,7 +361,7 @@ export async function handleKaImportArtifactRead(ctx: RequestContext): Promise<v
         assertionUri: resolved.assertionUri,
         kind: resolved.kind,
         hash: resolved.hash,
-        source: { peerId: sourcePeerId, agentAddress: resolved.assertionAgentAddress },
+        source: { peerId: fetchedSourcePeerId, agentAddress: resolved.assertionAgentAddress },
       });
     }
 
@@ -301,7 +373,7 @@ export async function handleKaImportArtifactRead(ctx: RequestContext): Promise<v
           assertionUri: resolved.assertionUri,
           kind: resolved.kind,
           hash: resolved.hash,
-          source: { peerId: sourcePeerId, agentAddress: resolved.assertionAgentAddress },
+          source: { peerId: fetchedSourcePeerId, agentAddress: resolved.assertionAgentAddress },
         });
       }
       await fileStore.put(remote.verifiedBytes, resolved.contentType);
@@ -319,7 +391,7 @@ export async function handleKaImportArtifactRead(ctx: RequestContext): Promise<v
       nextOffset: page.nextOffset,
       truncated: page.truncated,
       bytesB64: page.bytesB64,
-      source: { peerId: sourcePeerId, agentAddress: resolved.assertionAgentAddress },
+      source: { peerId: fetchedSourcePeerId, agentAddress: resolved.assertionAgentAddress },
       ...(remote.verifiedBytes ? {} : { reason: 'Remote page fetched but full artifact was not cache-promoted' }),
     });
   } catch (err) {

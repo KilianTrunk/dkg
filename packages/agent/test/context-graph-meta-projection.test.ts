@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { DKG_ONTOLOGY, SYSTEM_CONTEXT_GRAPHS, contextGraphDataGraphUri, contextGraphMetaGraphUri } from '@origintrail-official/dkg-core';
+import { DKG_ONTOLOGY, SYSTEM_CONTEXT_GRAPHS, contextGraphCatalogUri, contextGraphDataGraphUri, contextGraphDataUri, contextGraphMetaGraphUri } from '@origintrail-official/dkg-core';
 import { OxigraphStore, type Quad, type TripleStore } from '@origintrail-official/dkg-storage';
 import { generateSubGraphRegistration } from '@origintrail-official/dkg-publisher';
 import { ContextGraphMetaProjection } from '../src/context-graph-meta-projection.js';
@@ -460,5 +460,76 @@ describe('ContextGraphMetaProjection', () => {
     }).getContextGraphParticipantAgentAddresses.call(agentLike, 'projection-agents-private');
 
     expect(participants).toEqual([active]);
+  });
+
+  // ── OT-RFC-49 catalog read-path (grafted onto main's Track-C in the merge) ──
+
+  it('honours a CG known only through its public _catalog floor (declared + private)', async () => {
+    const store = new OxigraphStore();
+    const projection = new ContextGraphMetaProjection(store);
+    const id = '0x0000000000000000000000000000000000000abc/catalog-only-cg';
+    const subject = contextGraphDataUri(id);
+    const catalogGraph = contextGraphCatalogUri(id);
+
+    await store.insert([
+      { subject, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_PRIVATE_CONTEXT_GRAPH, graph: catalogGraph },
+      { subject, predicate: DKG_ONTOLOGY.DCT_ACCESS_RIGHTS, object: DKG_ONTOLOGY.ACCESS_RIGHT_RESTRICTED, graph: catalogGraph },
+    ]);
+
+    const record = await projection.get(id);
+    expect(record.declared).toBe(true);
+    expect(record.accessPolicy).toBe('private');
+  });
+
+  it('surfaces a catalog-only CG in listDeclaredContextGraphIds', async () => {
+    const store = new OxigraphStore();
+    const projection = new ContextGraphMetaProjection(store);
+    const id = '0x0000000000000000000000000000000000000abc/catalog-discoverable';
+    await store.insert([
+      { subject: contextGraphDataUri(id), predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_PRIVATE_CONTEXT_GRAPH, graph: contextGraphCatalogUri(id) },
+    ]);
+    expect(await projection.listDeclaredContextGraphIds()).toContain(id);
+  });
+
+  it('NEVER lets an untrusted _catalog graph feed authz fields (only the disclosure floor)', async () => {
+    // A peer-fetched _catalog is untrusted: a hostile catalog carrying
+    // creator/allowlist predicates must NOT inject them; only rdf:type +
+    // dct:accessRights (the floor) are honoured (CATALOG_META_PREDICATES filter).
+    const store = new OxigraphStore();
+    const projection = new ContextGraphMetaProjection(store);
+    const id = '0x0000000000000000000000000000000000000abc/hostile-catalog';
+    const subject = contextGraphDataUri(id);
+    const catalogGraph = contextGraphCatalogUri(id);
+    const attacker = '0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
+
+    await store.insert([
+      { subject, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_PRIVATE_CONTEXT_GRAPH, graph: catalogGraph },
+      // hostile authz facts smuggled into the catalog graph — must be ignored
+      { subject, predicate: DKG_ONTOLOGY.DKG_CREATOR, object: `did:dkg:agent:${attacker}`, graph: catalogGraph },
+      { subject, predicate: DKG_ONTOLOGY.DKG_ALLOWED_AGENT, object: `"${attacker}"`, graph: catalogGraph },
+      { subject, predicate: DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT, object: `"${attacker}"`, graph: catalogGraph },
+    ]);
+
+    const record = await projection.get(id);
+    expect(record.declared).toBe(true);
+    expect(record.accessPolicy).toBe('private');
+    expect(record.creator).toBeUndefined();
+    expect(record.creators).toEqual([]);
+    expect(record.allowedAgents).toEqual([]);
+    expect(record.participantAgents).toEqual([]);
+    expect(record.hasAgentGate).toBe(false);
+  });
+
+  it('keeps a CG private when _meta says public but the catalog floor is private (ratchet across sources)', async () => {
+    const store = new OxigraphStore();
+    const projection = new ContextGraphMetaProjection(store);
+    const id = '0x0000000000000000000000000000000000000abc/meta-public-catalog-private';
+    const subject = contextGraphDataUri(id);
+    await store.insert([
+      { subject, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_CONTEXT_GRAPH, graph: contextGraphMetaGraphUri(id) },
+      { subject, predicate: DKG_ONTOLOGY.DKG_ACCESS_POLICY, object: '"public"', graph: contextGraphMetaGraphUri(id) },
+      { subject, predicate: DKG_ONTOLOGY.RDF_TYPE, object: DKG_ONTOLOGY.DKG_PRIVATE_CONTEXT_GRAPH, graph: contextGraphCatalogUri(id) },
+    ]);
+    expect((await projection.get(id)).accessPolicy).toBe('private');
   });
 });

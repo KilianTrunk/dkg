@@ -117,7 +117,7 @@ const FINALIZE_ONLY_CREATE_FIELDS = [
  * carry "Invalid"/"Unsafe" text and must stay 500 (parity with the legacy
  * publish path, which never down-classified them).
  */
-export function respondAssertionError(res: RequestContext["res"], e: any): void {
+function respondAssertionError(res: RequestContext["res"], e: any): void {
   if (isPayloadTooLargeError(e)) {
     jsonResponse(res, 413, payloadTooLargeResponseBody(e));
     return;
@@ -289,7 +289,7 @@ const MAX_PUBLISH_EPOCHS = 0xffffffff;
 //   confirmed, no contextGraphError → 200 (fully done)
 //   confirmed + contextGraphError   → 207 (partial: KA minted on-chain, context-graph binding failed)
 //   tentative | failed              → 502 (publish did not confirm)
-export function classifyVmPublish(pub: unknown): { httpStatus: 200 | 207 | 502; reason?: string } {
+function classifyVmPublish(pub: unknown): { httpStatus: 200 | 207 | 502; reason?: string } {
   const p = (pub ?? {}) as { status?: unknown; contextGraphError?: unknown };
   const cgError = typeof p.contextGraphError === "string" && p.contextGraphError.length > 0 ? p.contextGraphError : undefined;
   if (p.status === "confirmed" && !cgError) return { httpStatus: 200 };

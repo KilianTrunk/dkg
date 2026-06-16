@@ -16,8 +16,10 @@
  * the REAL one. Two un-provokable concerns are split out:
  *   - `classifyVmPublish` / `respondAssertionError` outcome-mapping branches
  *     that need a real 207/502/AssertionNotPersisted/payload-too-large (which
- *     a single happy node can't manufacture) are exported from the route and
- *     covered by a pure-unit table — testing the REAL functions, no agent mock.
+ *     a single happy node can't manufacture). The route keeps these helpers
+ *     module-private, so — to stay strictly test-only (no source `export`) —
+ *     they are NOT unit-tested here; the reachable 400/409 branches are
+ *     covered via the live daemon, the rest documented at the bottom.
  *   - genuinely multi-node behaviours (a confirmed vm/publish MINT needs
  *     StorageACK quorum from core peers — an edge node 500s "no connected core
  *     peers"; cross-node B3 pointer divergence; the async-promote worker
@@ -41,7 +43,6 @@ import {
   postMultipart,
   type LiveDaemon,
 } from './helpers/live-daemon.js';
-import { classifyVmPublish, respondAssertionError } from '../src/daemon/routes/knowledge-assets.js';
 
 // Local (off-chain) CG — enough for create/write/quads/descriptor/import.
 const LOCAL = `ka-loc-${Date.now().toString(36)}`;
@@ -570,75 +571,14 @@ describe('/api/knowledge-assets routes (real daemon, real chain)', () => {
   });
 });
 
-// ── Pure-unit: the exported outcome-mapping helpers ───────────────────
-// These branches depend on a publisher RESULT shape (207 contextGraphError /
-// 502 tentative-or-failed) or a specific engine error class (AssertionNot-
-// PersistedError, payload-too-large) that a single happy node can't
-// manufacture. Testing the REAL exported functions removes the agent mock
-// entirely — no canned daemon, just the real classifiers fed real inputs.
-describe('classifyVmPublish (real function)', () => {
-  it('confirmed with no context-graph error → 200', () => {
-    expect(classifyVmPublish({ status: 'confirmed' })).toEqual({ httpStatus: 200 });
-  });
-  it('confirmed WITH a context-graph error → 207 (partial)', () => {
-    expect(classifyVmPublish({ status: 'confirmed', contextGraphError: 'bind failed' })).toEqual({ httpStatus: 207, reason: 'bind failed' });
-  });
-  it('tentative → 502 (did not confirm)', () => {
-    expect(classifyVmPublish({ status: 'tentative' }).httpStatus).toBe(502);
-  });
-  it('failed → 502', () => {
-    expect(classifyVmPublish({ status: 'failed' }).httpStatus).toBe(502);
-  });
-  it('unknown/missing status → 502', () => {
-    expect(classifyVmPublish({}).httpStatus).toBe(502);
-  });
-});
-
-describe('respondAssertionError (real function)', () => {
-  // A plain capture for node's ServerResponse — records status+body written by
-  // the real jsonResponse the helper calls. This is pure output capture, not a
-  // service double.
-  function captureRes() {
-    const captured = { statusCode: 0, body: '' };
-    return {
-      res: {
-        writeHead(status: number) {
-          captured.statusCode = status;
-          return this;
-        },
-        end(body?: string) {
-          captured.body = body ?? '';
-          return this;
-        },
-      } as unknown as Parameters<typeof respondAssertionError>[0],
-      captured,
-    };
-  }
-
-  it('AssertionNotPersistedError → 409', () => {
-    const { res, captured } = captureRes();
-    respondAssertionError(res, { name: 'AssertionNotPersistedError', message: 'not persisted' });
-    expect(captured.statusCode).toBe(409);
-    expect(JSON.parse(captured.body).code).toBe('ASSERTION_NOT_PERSISTED');
-  });
-
-  it.each([
-    ['a ReservedNamespaceError', { name: 'ReservedNamespaceError', message: 'reserved namespace' }],
-    ['a "not found" message', { message: 'assertion not found' }],
-    ['an "Invalid" message', { message: 'Invalid graph URI' }],
-    ['an "Unsafe" message', { message: 'Unsafe IRI' }],
-  ])('%s → 400', (_label, err) => {
-    const { res, captured } = captureRes();
-    respondAssertionError(res, err);
-    expect(captured.statusCode).toBe(400);
-  });
-
-  it('a genuinely unexpected error → 500 (not down-classified)', () => {
-    const { res, captured } = captureRes();
-    respondAssertionError(res, { message: 'disk on fire' });
-    expect(captured.statusCode).toBe(500);
-  });
-});
+// NOT COVERED HERE (test-only PR — no source `export` added): the
+// classifyVmPublish (207 partial / 502 tentative-or-failed) and
+// respondAssertionError (409 AssertionNotPersisted / payload-too-large)
+// outcome-mapping branches depend on a publisher RESULT shape or a specific
+// engine error class a single happy edge node can't manufacture; the
+// functions are module-private, so unit-testing them would require an
+// `export` (a source change). The REACHABLE 400/409 branches are covered
+// via the live daemon above; the rest are documented devnet-tier below.
 
 /**
  * DEVNET-TIER (not single-edge-daemon): these need real cross-node behaviour a

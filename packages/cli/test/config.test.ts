@@ -626,7 +626,7 @@ describe('resolveChainConfig (field-level merge)', () => {
 
   it('normalizes operator approvalPolicy string shorthand', () => {
     expect(resolveChainConfig(
-      { chain: { approvalPolicy: 'unlimited' as any } },
+      { chain: { approvalPolicy: 'unlimited' } },
       { chain: fullNetworkChain },
     )?.approvalPolicy).toEqual({ mode: 'unlimited' });
   });

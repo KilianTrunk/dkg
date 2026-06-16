@@ -864,14 +864,12 @@ function isPlainConfigObject(value: unknown): value is Record<string, unknown> {
   return proto === Object.prototype || proto === null;
 }
 
-function requireApprovalPolicyConfig(
-  policy: ApprovalPolicyConfig | undefined,
-): ApprovalPolicyConfig | undefined {
-  if (policy === undefined) return undefined;
+function requireApprovalPolicyConfig(policy: unknown): ApprovalPolicyConfig | undefined {
+  if (policy === undefined || policy === null) return undefined;
   if (!isPlainConfigObject(policy)) {
     throw new Error(`chain.approvalPolicy must be an object (got: ${JSON.stringify(policy)})`);
   }
-  return policy;
+  return policy as ApprovalPolicyConfig;
 }
 
 /**

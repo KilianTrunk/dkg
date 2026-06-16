@@ -636,6 +636,16 @@ describe('resolveChainConfig (field-level merge)', () => {
     )).toThrow(/chain\.approvalPolicy must be an object/);
   });
 
+  it('treats null operator approvalPolicy as unset', () => {
+    const merged = resolveChainConfig(
+      { chain: { approvalPolicy: null as any } },
+      { chain: fullNetworkChain },
+    );
+
+    expect(merged?.approvalPolicy).toBeUndefined();
+    expect(merged?.rpcUrl).toBe(fullNetworkChain.rpcUrl);
+  });
+
   it('returns a partial block when only config supplies fields (no network)', () => {
     const merged = resolveChainConfig(
       { chain: { rpcUrl: 'https://standalone.example/rpc' } },

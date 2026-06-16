@@ -864,8 +864,18 @@ function isPlainConfigObject(value: unknown): value is Record<string, unknown> {
   return proto === Object.prototype || proto === null;
 }
 
+function isApprovalPolicyMode(value: unknown): value is NonNullable<ApprovalPolicyConfig['mode']> {
+  return value === 'per-publish' || value === 'replenishing' || value === 'unlimited';
+}
+
 function requireApprovalPolicyConfig(policy: unknown): ApprovalPolicyConfig | undefined {
   if (policy === undefined || policy === null) return undefined;
+  if (typeof policy === 'string') {
+    if (isApprovalPolicyMode(policy)) return { mode: policy };
+    throw new Error(
+      `chain.approvalPolicy must be an object or a valid mode string (got: ${JSON.stringify(policy)})`,
+    );
+  }
   if (!isPlainConfigObject(policy)) {
     throw new Error(`chain.approvalPolicy must be an object (got: ${JSON.stringify(policy)})`);
   }

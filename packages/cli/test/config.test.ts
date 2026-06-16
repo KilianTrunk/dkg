@@ -624,11 +624,18 @@ describe('resolveChainConfig (field-level merge)', () => {
     )?.approvalPolicy).toEqual(operatorApprovalPolicy);
   });
 
-  it('rejects non-object operator approvalPolicy values', () => {
-    expect(() => resolveChainConfig(
+  it('normalizes operator approvalPolicy string shorthand', () => {
+    expect(resolveChainConfig(
       { chain: { approvalPolicy: 'unlimited' as any } },
       { chain: fullNetworkChain },
-    )).toThrow(/chain\.approvalPolicy must be an object/);
+    )?.approvalPolicy).toEqual({ mode: 'unlimited' });
+  });
+
+  it('rejects malformed non-object operator approvalPolicy values', () => {
+    expect(() => resolveChainConfig(
+      { chain: { approvalPolicy: 'forever' as any } },
+      { chain: fullNetworkChain },
+    )).toThrow(/chain\.approvalPolicy must be an object or a valid mode string/);
 
     expect(() => resolveChainConfig(
       { chain: { approvalPolicy: [] as any } },

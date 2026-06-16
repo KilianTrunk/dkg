@@ -4659,17 +4659,3 @@ async function isKnownContextGraphUri(store: TripleStore, contextGraphUri: strin
   `);
   return result.type === 'boolean' && result.value;
 }
-
-async function listGraphFamily(store: TripleStore, rootGraph: string): Promise<string[]> {
-  const graphs = await listGraphsByPrefix(store, `${rootGraph}/`);
-  if (await store.hasGraph(rootGraph)) {
-    graphs.unshift(rootGraph);
-  }
-  return graphs;
-}
-
-async function listGraphsByPrefix(store: TripleStore, prefix: string): Promise<string[]> {
-  return store.listGraphsByPrefix
-    ? store.listGraphsByPrefix(prefix)
-    : (await store.listGraphs()).filter((graph) => graph.startsWith(prefix));
-}

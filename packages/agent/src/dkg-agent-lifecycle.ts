@@ -2917,6 +2917,66 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     return result.insertedTriples;
   }
 
+  /**
+   * Resolve the CURATOR's libp2p peer id(s) for a context graph, for the WRITE
+   * path's strict curator-ack gate (OT-RFC-49 curator-leader: a private-CG write
+   * is durable iff the curator applied it). Mirrors the reconnect gate's
+   * structural-then-legacy resolution (syncSharedMemoryFromPeerDetailed) but is
+   * standalone + single-CG: it does NOT memoize across a batch and does NOT
+   * compare against a connecting peer — the write path just needs "who is the
+   * curator, is it me, and what peer(s) do I send the reliable apply to".
+   *
+   * - `curatorIsLocal`: this node owns the curator agent → no remote leg needed
+   *   (a curator never reverse-confirms a CG it owns; the local commit IS authority).
+   * - `peerIds`: the curator's advertised peer(s) from the AGENTS registry
+   *   (structural path) or the single resolved curator peer (legacy triple path).
+   *   Empty → curator not resolvable right now → caller must treat the write as
+   *   UNCONFIRMED (never silently confirmed).
+   * - `legacyTripleResolved`: true when resolution fell back to the
+   *   dkg:curator/dkg:creator triples (member-self-stamp defect possible) — the
+   *   caller MUST degrade an ambiguous legacy result to unconfirmed, never confirm.
+   */
+  async resolveCuratorPeerIdsForCg(this: DKGAgent,
+    contextGraphId: string,
+  ): Promise<{ peerIds: string[]; curatorIsLocal: boolean; legacyTripleResolved: boolean }> {
+    const structuralCuratorDid = deriveCuratorDidFromCgId(contextGraphId);
+    if (structuralCuratorDid) {
+      const structuralAgent = structuralCuratorDid.slice('did:dkg:agent:'.length).toLowerCase();
+      if ([...this.localAgents.keys()].some((addr) => addr.toLowerCase() === structuralAgent)) {
+        return { peerIds: [], curatorIsLocal: true, legacyTripleResolved: false };
+      }
+      const resolve = async (): Promise<string[]> => {
+        let agents: Array<{ agentAddress?: string; peerId: string }>;
+        try {
+          agents = await this.discovery.findAgents();
+        } catch {
+          agents = [];
+        }
+        return agents
+          .filter((a) => a.agentAddress?.toLowerCase() === structuralAgent)
+          .map((a) => a.peerId);
+      };
+      let curatorPeers = await resolve();
+      if (curatorPeers.length === 0) {
+        await this.refreshMetaFromCurator(contextGraphId).catch(() => undefined);
+        curatorPeers = await resolve();
+      }
+      return { peerIds: curatorPeers, curatorIsLocal: false, legacyTripleResolved: false };
+    }
+    // Legacy non-wallet-scoped CG: fall back to triple-based curator resolution.
+    if (await this.isCuratorOf(contextGraphId)) {
+      return { peerIds: [], curatorIsLocal: true, legacyTripleResolved: true };
+    }
+    let curatorPeerId = await this.resolveCuratorPeerId(contextGraphId);
+    if (!curatorPeerId) {
+      await this.refreshMetaFromCurator(contextGraphId).catch(() => undefined);
+      curatorPeerId = await this.resolveCuratorPeerId(contextGraphId);
+    }
+    if (!curatorPeerId) return { peerIds: [], curatorIsLocal: false, legacyTripleResolved: true };
+    if (curatorPeerId === this.peerId) return { peerIds: [], curatorIsLocal: true, legacyTripleResolved: true };
+    return { peerIds: [curatorPeerId], curatorIsLocal: false, legacyTripleResolved: true };
+  }
+
   async syncSharedMemoryFromPeerDetailed(this: DKGAgent,
     remotePeerId: string,
     contextGraphIds: string[],

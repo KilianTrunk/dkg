@@ -479,6 +479,14 @@ export interface DkgConfig {
   /** Disable expensive peer-connect SWM catch-up for bulk benchmark/devnet runs. */
   syncSharedMemoryOnConnect?: boolean;
   /**
+   * STRICT curator-ack gate (OT-RFC-49 curator-leader), default OFF. When true,
+   * a non-`localOnly` write to a PRIVATE context graph must be applied+ack'd by
+   * the CG's curator before it commits locally; an unconfirmed write is rejected
+   * (HTTP 503) and not persisted, closing the silent same-root-update loss.
+   * Public CGs / `localOnly` / a node that IS the curator are unaffected.
+   */
+  swmAwaitCuratorAck?: boolean;
+  /**
    * Keep durable sync of `did:dkg:context-graph:agents/_meta` enabled by
    * default. Edge-node operators can set this to false to sync the `agents`
    * phonebook data without pulling the large system KA/KC lifecycle metadata.

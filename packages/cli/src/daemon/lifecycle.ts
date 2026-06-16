@@ -1248,6 +1248,7 @@ export async function runDaemonInner(
     largeLiteralStorage: runtimeLargeLiteralStorage,
     sharedMemoryPublicSnapshotStorage: runtimeSnapshotStorage,
     syncSharedMemoryOnConnect: config.syncSharedMemoryOnConnect,
+    swmAwaitCuratorAck: config.swmAwaitCuratorAck,
     syncAgentsMeta: role === 'core' ? true : config.syncAgentsMeta,
     queryAccess: config.queryAccess,
     chainAdapter: mockChainAdapter,

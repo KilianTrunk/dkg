@@ -825,6 +825,18 @@ export interface DKGAgentConfig {
    * skipped). See `emitPublicProjectionAfterPublish` (B7/B8). Unset → off.
    */
   publicProjectionContextGraphId?: string;
+  /**
+   * STRICT curator-ack gate (OT-RFC-49 curator-leader), default OFF. When true,
+   * a non-`localOnly` write to a PRIVATE context graph must be applied+ack'd by
+   * the CG's curator (the authoritative replica) BEFORE it is committed locally;
+   * if the curator does not confirm, the write is rejected (`CuratorUnconfirmedError`
+   * → HTTP 503) and nothing is persisted — closing the silent same-root-update
+   * loss that otherwise hides until the next reconnect REPLACE. Public CGs,
+   * `localOnly` writes, and a node that IS the curator are unaffected. Phase-1
+   * default-off lets the gate soak before it becomes the default. Per-call
+   * `share({ awaitCuratorAck })` overrides this.
+   */
+  swmAwaitCuratorAck?: boolean;
   framework?: string;
   description?: string;
   listenPort?: number;

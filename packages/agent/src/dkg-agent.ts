@@ -1825,7 +1825,7 @@ export class DKGAgent extends DKGAgentBase {
       ): Promise<{ seeded: number; fromLayer: 'swm' | 'vm'; entities: number }> {
         return agent.publisher.assertionPullFrom(contextGraphId, name, agentAddress, sourceLayer, opts);
       },
-      async promote(contextGraphId: string, name: string, opts?: { entities?: string[] | 'all'; subGraphName?: string; authorAgentAddress?: string; preSignedAuthorAttestation?: PreSignedAuthorAttestation }): Promise<{ promotedCount: number }> {
+      async promote(contextGraphId: string, name: string, opts?: { entities?: string[] | 'all'; subGraphName?: string; authorAgentAddress?: string; preSignedAuthorAttestation?: PreSignedAuthorAttestation; awaitCuratorAck?: boolean; curatorAckTimeoutMs?: number }): Promise<{ promotedCount: number }> {
         // Seal-before-share: the on-chain publish path
         // (`publishFromFinalizedAssertion`) requires a FINALIZED assertion, and
         // the seal must be computed over the Working-Memory content BEFORE
@@ -1885,12 +1885,25 @@ export class DKGAgent extends DKGAgentBase {
         // Without this, private/agent-gated CGs receive plaintext
         // gossip and the new `SharedMemoryHandler` check rejects it.
         const gossipSigner = await agent.resolveWorkspaceGossipSigningAgent(contextGraphId);
+        // Strict curator-ack gate (OT-RFC-49 curator-leader) for the WM→SWM
+        // promote path — the same confirmer as share()/conditionalShare(). When
+        // armed (private CG, gate enabled, curator remote), assertionPromote
+        // requires the curator's applied-ack BEFORE it moves WM→SWM, so an
+        // unconfirmed promote aborts (CuratorUnconfirmedError → 503) leaving WM
+        // intact instead of silently committing a write the curator never got.
+        const confirmBeforeCommit = await agent.buildCuratorAckConfirmer(
+          contextGraphId,
+          gossipSigner,
+          { awaitCuratorAck: opts?.awaitCuratorAck, curatorAckTimeoutMs: opts?.curatorAckTimeoutMs },
+          createOperationContext('share'),
+        );
         const { promotedCount, gossipMessage } = await agent.publisher.assertionPromote(
           contextGraphId, name, agentAddress,
           {
             ...opts,
             publisherPeerId: agent.node.peerId.toString(),
             senderAgentAddress: gossipSigner?.agentAddress,
+            confirmBeforeCommit,
           },
         );
         if (gossipMessage) {

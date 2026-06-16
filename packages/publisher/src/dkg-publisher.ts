@@ -44,6 +44,8 @@ import {
   ReservedNamespaceError,
   AssertionNotPersistedError,
   MultiRootPublishNotAtomicError,
+  CuratorUnconfirmedError,
+  CuratorRejectedError,
   type CASCondition,
 } from './errors.js';
 
@@ -57,6 +59,8 @@ export {
   ReservedNamespaceError,
   AssertionNotPersistedError,
   MultiRootPublishNotAtomicError,
+  CuratorUnconfirmedError,
+  CuratorRejectedError,
   type CASCondition,
 };
 
@@ -221,6 +225,19 @@ export interface ShareOptions {
   subGraphName?: string;
   localOnly?: boolean;
   senderAgentAddress?: string;
+  /**
+   * Strict curator-ack gate (OT-RFC-49 curator-leader). When provided, the
+   * share path calls this AFTER building the signed wire message but BEFORE any
+   * destructive store mutation, passing the exact message that would be
+   * published. If it resolves `applied: false`, the write is ABORTED with NO
+   * local persistence — `CuratorRejectedError` when `rejected: true`, otherwise
+   * `CuratorUnconfirmedError`. The agent injects this to require the curator (the
+   * authoritative replica) to have applied the write before the member commits
+   * it locally, so a write the curator never received is never silently accepted.
+   * Omitted (the default) preserves the legacy best-effort, commit-then-fan-out
+   * behaviour for public CGs, `localOnly` writes, and non-gated callers.
+   */
+  confirmBeforeCommit?: (message: Uint8Array) => Promise<{ applied: boolean; rejected?: boolean }>;
 }
 
 /** @deprecated Use ShareOptions */
@@ -986,6 +1003,21 @@ export class DKGPublisher implements Publisher {
           hint,
         hint,
       });
+    }
+
+    // Strict curator-ack gate (OT-RFC-49 curator-leader). Runs AFTER the wire
+    // message is fully built + size-checked (above) and BEFORE the first
+    // destructive mutation (below) — the build/commit seam the message was
+    // deliberately pre-encoded for ("BEFORE any destructive SWM mutations").
+    // The agent injects a confirmer that reliably delivers `message` to the
+    // curator and waits for an applied-ack; a non-confirmation aborts here with
+    // ZERO orphaned state, so the member never holds a value the curator lacks.
+    if (options.confirmBeforeCommit) {
+      const confirmation = await options.confirmBeforeCommit(message);
+      if (!confirmation.applied) {
+        if (confirmation.rejected) throw new CuratorRejectedError(contextGraphId);
+        throw new CuratorUnconfirmedError(contextGraphId);
+      }
     }
 
     // Delete-then-insert for upserted entities (replace old triples).
@@ -4684,7 +4716,19 @@ export class DKGPublisher implements Publisher {
     contextGraphId: string,
     name: string,
     agentAddress: string,
-    opts?: { entities?: string[] | 'all'; subGraphName?: string; publisherPeerId?: string; senderAgentAddress?: string },
+    opts?: {
+      entities?: string[] | 'all';
+      subGraphName?: string;
+      publisherPeerId?: string;
+      senderAgentAddress?: string;
+      /**
+       * Strict curator-ack gate (OT-RFC-49 curator-leader), same contract as
+       * `ShareOptions.confirmBeforeCommit`: called after the gossip message is
+       * built and BEFORE the WM→SWM mutation. `applied: false` aborts the promote
+       * (CuratorUnconfirmedError / CuratorRejectedError) leaving WM intact.
+       */
+      confirmBeforeCommit?: (message: Uint8Array) => Promise<{ applied: boolean; rejected?: boolean }>;
+    },
   ): Promise<{ promotedCount: number; gossipMessage?: Uint8Array }> {
     await this.ensureSubGraphRegistered(contextGraphId, opts?.subGraphName);
     const graphUri = await this.wmGraphUri(contextGraphId, agentAddress, name, opts?.subGraphName);
@@ -4884,6 +4928,24 @@ export class DKGPublisher implements Publisher {
         });
       }
       gossipMessage = wrapped;
+    }
+
+    // Strict curator-ack gate (OT-RFC-49 curator-leader) for the WM→SWM promote
+    // path — the same confirm-before-commit seam as `_shareImpl`, here between the
+    // gossip-message build (above) and the SWM mutation (below). A non-confirmation
+    // aborts the promote with NO SWM mutation, leaving WM intact for retry. NB:
+    // unlike share()/_shareImpl this method holds no per-CG write lock, so the gate
+    // guarantees confirm-before-persist but not cross-write serialization —
+    // acceptable, since concurrent promotes of one assertion are not a supported
+    // pattern and the silent-loss property is confirm-or-abort. Fail closed if the
+    // message is somehow absent (cannot confirm what we cannot send).
+    if (opts?.confirmBeforeCommit) {
+      if (!gossipMessage) throw new CuratorUnconfirmedError(contextGraphId);
+      const confirmation = await opts.confirmBeforeCommit(gossipMessage);
+      if (!confirmation.applied) {
+        if (confirmation.rejected) throw new CuratorRejectedError(contextGraphId);
+        throw new CuratorUnconfirmedError(contextGraphId);
+      }
     }
 
     // OT-RFC-46 §17.4 / rc.17 D6 — workspaceOwner is now an ADVISORY hint, not a

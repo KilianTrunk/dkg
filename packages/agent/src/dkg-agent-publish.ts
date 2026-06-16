@@ -1473,18 +1473,25 @@ export class PublishMethods extends DKGAgentBase {
    * When localOnly is false (default), replicates via GossipSub shared memory topic.
    * When localOnly is true, stores locally without broadcasting — use for private data.
    */
-  async share(this: DKGAgent, contextGraphId: string, quads: Quad[], opts?: { localOnly?: boolean; operationCtx?: OperationContext; subGraphName?: string; callerAgentAddress?: string }): Promise<{ shareOperationId: string }> {
+  async share(this: DKGAgent, contextGraphId: string, quads: Quad[], opts?: { localOnly?: boolean; operationCtx?: OperationContext; subGraphName?: string; callerAgentAddress?: string; awaitCuratorAck?: boolean; curatorAckTimeoutMs?: number }): Promise<{ shareOperationId: string }> {
     const ctx = opts?.operationCtx ?? createOperationContext('share');
     const sgLabel = opts?.subGraphName ? ` (sub-graph: ${opts.subGraphName})` : '';
     this.log.info(ctx, `Sharing ${quads.length} quads to SWM for context graph ${contextGraphId}${sgLabel}${opts?.localOnly ? ' (local-only)' : ''}`);
     const shouldCreateImplicitContextGraph = await this.shouldCreateImplicitSharedMemoryContextGraph(contextGraphId);
     const gossipSigner = opts?.localOnly ? null : await this.resolveWorkspaceGossipSigningAgent(contextGraphId);
+
+    // Strict curator-ack gate (OT-RFC-49 curator-leader): require the curator's
+    // applied-ack BEFORE the local commit for a gated private-CG write (see
+    // buildCuratorAckConfirmer). Undefined → legacy best-effort path.
+    const confirmBeforeCommit = await this.buildCuratorAckConfirmer(contextGraphId, gossipSigner, opts, ctx);
+
     const { shareOperationId, message } = await this.publisher.writeToWorkspace(contextGraphId, quads, {
       publisherPeerId: this.node.peerId.toString(),
       operationCtx: ctx,
       subGraphName: opts?.subGraphName,
       localOnly: opts?.localOnly,
       senderAgentAddress: gossipSigner?.agentAddress,
+      confirmBeforeCommit,
     });
     if (shouldCreateImplicitContextGraph) {
       await this.ensureImplicitSharedMemoryContextGraph(contextGraphId, {
@@ -1495,9 +1502,101 @@ export class PublishMethods extends DKGAgentBase {
       // rc.9 PR-D: pass shareOperationId so publishWorkspaceGossip
       // can register the share with SwmAckQuorum and the watchdog
       // can fire substrate top-up if gossip-side acks miss quorum.
+      // (When the curator-ack gate confirmed above, the curator already
+      // holds this write; the fan-out here is the cross-version safety net
+      // + propagation to the OTHER members. A redundant curator delivery is
+      // idempotent — swm.redundantApplies.)
       await this.publishWorkspaceGossip(contextGraphId, message, ctx, gossipSigner, shareOperationId);
     }
     return { shareOperationId };
+  }
+
+  /**
+   * Build the strict curator-ack gate's `confirmBeforeCommit` callback for a
+   * private-CG SWM write (OT-RFC-49 curator-leader), or `undefined` when the gate
+   * does not apply. The callback runs inside the publisher's `_shareImpl`, under
+   * the per-CG write lock, between message-build and the first store mutation —
+   * so the lock is held across the curator round-trip (writes serialize through
+   * the curator) and a non-confirmation aborts the write with zero local state.
+   *
+   * Returns `undefined` (legacy best-effort path, no gate) when: the write is
+   * `localOnly`; the gate is off (per-call `awaitCuratorAck` ?? config
+   * `swmAwaitCuratorAck` ?? false); the CG is public; or this node IS the curator
+   * (its own commit is authoritative — a curator never confirms with itself).
+   * Shared by `share()`, `conditionalShare()`, and the WM→SWM `promote()` path
+   * (all flow through the publisher's `confirmBeforeCommit` seam). Public because
+   * the mixin-split `promote()` lives in a different class (cf. publishWorkspaceGossip).
+   */
+  async buildCuratorAckConfirmer(this: DKGAgent,
+    contextGraphId: string,
+    gossipSigner: Parameters<DKGAgent['encodeWorkspaceGossipMessage']>[2],
+    opts: { localOnly?: boolean; awaitCuratorAck?: boolean; curatorAckTimeoutMs?: number } | undefined,
+    ctx: OperationContext,
+  ): Promise<((message: Uint8Array) => Promise<{ applied: boolean; rejected?: boolean }>) | undefined> {
+    const wantCuratorAck = !opts?.localOnly
+      && (opts?.awaitCuratorAck ?? this.config.swmAwaitCuratorAck ?? false);
+    if (!wantCuratorAck) return undefined;
+    if (!(await this.isPrivateContextGraph(contextGraphId))) return undefined;
+    const curator = await this.resolveCuratorPeerIdsForCg(contextGraphId);
+    if (curator.curatorIsLocal) return undefined;
+    const timeoutMs = opts?.curatorAckTimeoutMs ?? DKGAgentBase.SWM_CURATOR_ACK_TIMEOUT_MS;
+    return async (message: Uint8Array) => {
+      // The publisher hands us the INNER workspace payload. The curator's
+      // PROTOCOL_SWM_UPDATE handler expects the SAME signed gossip-message
+      // envelope the substrate fan-out sends (encodeWorkspaceGossipMessage),
+      // NOT the raw inner bytes — sending the inner bytes fails protobuf decode
+      // on the receiver (a permanent rejection). Encode identically.
+      const wireMessage = await this.encodeWorkspaceGossipMessage(contextGraphId, message, gossipSigner);
+      return this.confirmCuratorApplied(contextGraphId, curator.peerIds, wireMessage, timeoutMs, ctx);
+    };
+  }
+
+  /**
+   * STRICT curator-ack confirmer for a gated SWM write (OT-RFC-49 curator-leader).
+   * Reliably delivers the exact wire `message` to the curator's peer(s) and waits
+   * for an applied-ack. Returns `{ applied: true }` ONLY on a `delivered` (empty)
+   * reply — which the receiver returns ONLY after it persisted the write
+   * (`handleSwmUpdate`: empty reply ⇔ `outcome.applied`). `{ applied: false,
+   * rejected: true }` on the 0x01 permanent-rejection sentinel; `{ applied: false }`
+   * for an unresolved curator, a timeout, a transient (0x02) rejection, or a send
+   * throw — every "not definitely applied" case fails CLOSED so the publisher
+   * aborts the write with no local persistence. A `delivered` from ANY advertised
+   * curator peer wins (the write landed); rejection only when no peer applied it.
+   */
+  private async confirmCuratorApplied(this: DKGAgent,
+    contextGraphId: string,
+    curatorPeerIds: string[],
+    message: Uint8Array,
+    timeoutMs: number,
+    ctx: OperationContext,
+  ): Promise<{ applied: boolean; rejected?: boolean }> {
+    if (curatorPeerIds.length === 0) {
+      this.log.info(ctx, `SWM curator-ack: curator peer unresolved for "${contextGraphId.slice(0, 28)}" — write cannot be confirmed (fail-closed)`);
+      return { applied: false };
+    }
+    let sawRejection = false;
+    for (const peerId of curatorPeerIds) {
+      try {
+        const sendResult = await this.messenger.sendReliable(peerId, PROTOCOL_SWM_UPDATE, message, {
+          messageId: `swm-curator-confirm-${ctx.operationId}-${peerId.slice(0, 8)}`,
+          timeoutMs,
+        });
+        const classified = classifySendResult(peerId, sendResult);
+        if (classified.outcome === 'delivered') {
+          return { applied: true };
+        }
+        if (classified.outcome === 'rejected') {
+          // Permanent refusal from a curator peer (allowlist / signature /
+          // validation). Keep trying the curator's other advertised peers in
+          // case this one is stale/wrong, but remember it for the verdict.
+          sawRejection = true;
+        }
+        // retryable / failed / queued / inFlight → not confirmed; try next peer.
+      } catch (err) {
+        this.log.debug(ctx, `SWM curator-ack: send to ${peerId.slice(0, 12)} threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    return sawRejection ? { applied: false, rejected: true } : { applied: false };
   }
 
   /**
@@ -1509,13 +1608,15 @@ export class PublishMethods extends DKGAgentBase {
     contextGraphId: string,
     quads: Quad[],
     conditions: CASCondition[],
-    opts?: { localOnly?: boolean; operationCtx?: OperationContext; subGraphName?: string; callerAgentAddress?: string },
+    opts?: { localOnly?: boolean; operationCtx?: OperationContext; subGraphName?: string; callerAgentAddress?: string; awaitCuratorAck?: boolean; curatorAckTimeoutMs?: number },
   ): Promise<{ shareOperationId: string }> {
     const ctx = opts?.operationCtx ?? createOperationContext('share');
     const sgLabel = opts?.subGraphName ? ` (sub-graph: ${opts.subGraphName})` : '';
     this.log.info(ctx, `CAS write: ${quads.length} quads, ${conditions.length} conditions for ${contextGraphId}${sgLabel}`);
     const shouldCreateImplicitContextGraph = await this.shouldCreateImplicitSharedMemoryContextGraph(contextGraphId);
     const gossipSigner = opts?.localOnly ? null : await this.resolveWorkspaceGossipSigningAgent(contextGraphId);
+    // Strict curator-ack gate — same seam as share() (both flow through _shareImpl).
+    const confirmBeforeCommit = await this.buildCuratorAckConfirmer(contextGraphId, gossipSigner, opts, ctx);
     const { shareOperationId, message } = await this.publisher.writeConditionalToWorkspace(contextGraphId, quads, {
       publisherPeerId: this.node.peerId.toString(),
       operationCtx: ctx,
@@ -1523,6 +1624,7 @@ export class PublishMethods extends DKGAgentBase {
       subGraphName: opts?.subGraphName,
       localOnly: opts?.localOnly,
       senderAgentAddress: gossipSigner?.agentAddress,
+      confirmBeforeCommit,
     });
     if (shouldCreateImplicitContextGraph) {
       await this.ensureImplicitSharedMemoryContextGraph(contextGraphId, {

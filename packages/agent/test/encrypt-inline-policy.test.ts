@@ -4,12 +4,6 @@
  * Numeric context graph ids are chain-owned policy surfaces. If the
  * daemon cannot read chain truth for one of them, publishing must fail
  * closed instead of falling back to plaintext.
- *
- * NO MOCKS: every method under test is the REAL DKGAgent.prototype method,
- * bound onto a lightweight `agentLike` so the production decision tree runs.
- * The injected collaborators (chain access-policy/liveness getters, the
- * logger, the publisher, gossip, the resolve-helper seams) are plain
- * hand-rolled recorders the agent is designed to call — not vitest mocks.
  */
 import { describe, it, expect } from 'vitest';
 import { ethers } from 'ethers';
@@ -26,13 +20,19 @@ import {
 import { StorageACKHandler } from '@origintrail-official/dkg-publisher';
 import { DKGAgent } from '../src/dkg-agent.js';
 
+// Hand-rolled call recorder (replaces vitest spy factories): wraps an
+// implementation, records every argument tuple on `.calls`, captures a
+// monotonic invocation sequence on `.order`, and returns the impl's result.
+let invocationSeq = 0;
 function recorder<A extends unknown[], R>(impl: (...args: A) => R) {
   const calls: A[] = [];
+  const order: number[] = [];
   const fn = (...args: A): R => {
     calls.push(args);
+    order.push(invocationSeq++);
     return impl(...args);
   };
-  return Object.assign(fn, { calls });
+  return Object.assign(fn, { calls, order });
 }
 
 function makeAgentLike(opts: {
@@ -244,14 +244,12 @@ describe('DKGAgent._publish inline encryption routing', () => {
       undefined,
       '42',
     ]);
-    expect(publisherPublish.calls.at(-1)).toEqual([
-      expect.objectContaining({
-        accessPolicy: 'public',
-        publisherNodeIdentityIdOverride: 0n,
-        encryptInlinePayload,
-        encryptInlineChunked,
-      }),
-    ]);
+    expect(publisherPublish.calls.at(-1)).toEqual([expect.objectContaining({
+      accessPolicy: 'public',
+      publisherNodeIdentityIdOverride: 0n,
+      encryptInlinePayload,
+      encryptInlineChunked,
+    })]);
   });
 });
 
@@ -266,9 +264,9 @@ describe('DKGAgent._resolveEncryptInlineChunked nonce domain', () => {
         debug: recorder(() => undefined),
       },
       store: {
-        insert: vi.fn(async () => {}),
+        insert: recorder(async () => {}),
       },
-      canonicalChunkStoreCgIdOrNull: vi.fn((cgId: string) => cgId),
+      canonicalChunkStoreCgIdOrNull: recorder((cgId: string) => cgId),
       gossip: {
         publish: recorder(async () => {}),
       },
@@ -311,7 +309,12 @@ describe('DKGAgent._resolveEncryptInlineChunked nonce domain', () => {
     const gossipSigner = ethers.Wallet.createRandom();
     const ackSigner = ethers.Wallet.createRandom();
     const store = new OxigraphStore();
-    const insertSpy = vi.spyOn(store, 'insert');
+    // Pure-observe recorder over the real store.insert: records calls +
+    // invocation order, then calls through so the real OxigraphStore actually
+    // persists (the StorageACKHandler below reads the chunks back).
+    const insertOrig = (store as any).insert.bind(store);
+    const insertSpy = recorder((...args: unknown[]) => insertOrig(...args));
+    (store as any).insert = insertSpy;
     const canonicalSwmCgId = '0x0609dca0015B271455C89D37501f530c89814a78';
     const swmGraphId = `${canonicalSwmCgId}/test-kafka-endpoint-registration`;
     const targetOnChainCgId = '40';
@@ -319,22 +322,22 @@ describe('DKGAgent._resolveEncryptInlineChunked nonce domain', () => {
 
     const agentLike = {
       log: {
-        info: vi.fn(),
-        warn: vi.fn(),
-        error: vi.fn(),
-        debug: vi.fn(),
+        info: recorder(() => undefined),
+        warn: recorder(() => undefined),
+        error: recorder(() => undefined),
+        debug: recorder(() => undefined),
       },
       store,
-      canonicalChunkStoreCgIdOrNull: vi.fn((raw: string) => (raw === swmGraphId ? canonicalSwmCgId : null)),
+      canonicalChunkStoreCgIdOrNull: recorder((raw: string) => (raw === swmGraphId ? canonicalSwmCgId : null)),
       gossip: {
-        publish: vi.fn(async () => {}),
+        publish: recorder(async () => {}),
       },
-      gossipWireIdFor: vi.fn((cgId: string) => cgId),
-      _resolveCuratedChainKeyContext: vi.fn(async () => ({
+      gossipWireIdFor: recorder((cgId: string) => cgId),
+      _resolveCuratedChainKeyContext: recorder(async () => ({
         chainKey: new Uint8Array(32).fill(7),
         aeadCgId: targetOnChainCgId,
       })),
-      resolveWorkspaceGossipSigningAgent: vi.fn(async () => ({
+      resolveWorkspaceGossipSigningAgent: recorder(async () => ({
         privateKey: gossipSigner.privateKey,
         agentAddress: gossipSigner.address,
       })),
@@ -351,10 +354,10 @@ describe('DKGAgent._resolveEncryptInlineChunked nonce domain', () => {
     });
 
     expect(result.ciphertextChunkCount).toBe(1);
-    expect(insertSpy).toHaveBeenCalledTimes(1);
-    expect(insertSpy.mock.invocationCallOrder[0])
-      .toBeLessThan(agentLike.gossip.publish.mock.invocationCallOrder[0]);
-    expect(insertSpy.mock.calls[0][0][0]).toMatchObject({
+    expect(insertSpy.calls).toHaveLength(1);
+    expect(insertSpy.order[0])
+      .toBeLessThan(agentLike.gossip.publish.order[0]);
+    expect(insertSpy.calls[0][0][0]).toMatchObject({
       subject: ciphertextChunkStoreSubject(batchId, 0),
       predicate: CIPHERTEXT_CHUNK_PREDICATE,
       graph: ciphertextChunkStoreGraph(canonicalSwmCgId),
@@ -375,7 +378,7 @@ describe('DKGAgent._resolveEncryptInlineChunked nonce domain', () => {
         ),
         _v2ChunkLookupRetryPolicyForTests: { maxRetries: 0, delayMs: 0 },
       },
-      { emit: vi.fn(), on: vi.fn(), off: vi.fn() } as any,
+      { emit: recorder(() => undefined), on: recorder(() => undefined), off: recorder(() => undefined) } as any,
     );
 
     const intent = encodePublishIntent({

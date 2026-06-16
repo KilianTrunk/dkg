@@ -3,6 +3,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, afterEach, beforeAll, afterAll } from 'vitest';
 import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
+
+function recorder<A extends unknown[], R>(impl: (...a: A) => R) {
+  const calls: A[] = [];
+  const fn = (...a: A): R => {
+    calls.push(a);
+    return impl(...a);
+  };
+  return Object.assign(fn, { calls });
+}
 import { DKGAgent, type ContextGraphSub, type ContextGraphSubscriptionStore } from '../src/index.js';
 import { DKGAgentBase } from '../src/dkg-agent-base.js';
 import { OxigraphStore, SharedMemoryLiteralBlobStore, SparqlHttpStore, registerTripleStoreAdapter, type TripleStore, type TripleStoreConfig } from '@origintrail-official/dkg-storage';
@@ -11,12 +20,6 @@ import { type ChainAdapter, type ContextGraphOnChain } from '@origintrail-offici
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 import { ethers } from 'ethers';
-
-function recorder<A extends unknown[], R>(impl: (...args: A) => R) {
-  const calls: A[] = [];
-  const fn = (...args: A): R => { calls.push(args); return impl(...args); };
-  return Object.assign(fn, { calls });
-}
 
 let _fileSnapshot: string;
 beforeAll(async () => {
@@ -880,8 +883,8 @@ describe('listContextGraphs merge', () => {
       onChainId: '0xabc123',
     } satisfies ContextGraphSub, { persist: false });
 
-    const origIsPrivate = (agent as any).isPrivateContextGraph.bind(agent);
-    const legacyPrivacy = recorder((...a: unknown[]) => origIsPrivate(...a));
+    const isPrivateOrig = (agent as any).isPrivateContextGraph.bind(agent);
+    const legacyPrivacy = recorder((...a: unknown[]) => isPrivateOrig(...a));
     (agent as any).isPrivateContextGraph = legacyPrivacy;
     const rows = await agent.listContextGraphs();
     expect(rows.find(p => p.id === id)).toBeDefined();
@@ -975,7 +978,7 @@ describe('listContextGraphs merge', () => {
 
           const originalQuery = store.query.bind(store);
           let blockedProjectionReads = 0;
-          vi.spyOn(store, 'query').mockImplementation(async (query: string, options?: any) => {
+          (store as any).query = recorder(async (query: string, options?: any) => {
             if (
               blockedProjectionReads === 0
               && query.includes('SELECT ?p ?o WHERE')
@@ -1052,7 +1055,7 @@ describe('listContextGraphs merge', () => {
 
       const originalGetCgMeta = localAgent.getCgMeta.bind(localAgent);
       let blockedProjectionReads = 0;
-      const getCgMetaSpy = vi.spyOn(localAgent, 'getCgMeta').mockImplementation(async (
+      const getCgMetaSpy = recorder(async (
         contextGraphId: string,
         options?: { signal?: AbortSignal },
       ) => {
@@ -1062,14 +1065,11 @@ describe('listContextGraphs merge', () => {
         }
         return originalGetCgMeta(contextGraphId, options);
       });
-      try {
-        const rows = await localAgent.listContextGraphs();
-        expect(rows.find(p => p.id === id)).toBeUndefined();
-        expect(blockedProjectionReads).toBe(1);
-        expect((localAgent as any).listContextGraphsCache.size).toBe(0);
-      } finally {
-        getCgMetaSpy.mockRestore();
-      }
+      (localAgent as any).getCgMeta = getCgMetaSpy;
+      const rows = await localAgent.listContextGraphs();
+      expect(rows.find(p => p.id === id)).toBeUndefined();
+      expect(blockedProjectionReads).toBe(1);
+      expect((localAgent as any).listContextGraphsCache.size).toBe(0);
     } finally {
       Object.defineProperty(DKGAgentBase, 'LIST_CONTEXT_GRAPHS_ROW_BUDGET_MS', {
         value: originalRowBudget,
@@ -1495,7 +1495,7 @@ describe('listContextGraphs merge', () => {
     });
     const originalDateNow = Date.now;
     let dateNowValue = 10_000;
-    Date.now = () => dateNowValue;
+    Date.now = recorder(() => dateNowValue);
     try {
       const result = await createTestAgent();
       agent = result.agent;
@@ -2176,29 +2176,35 @@ describe('listContextGraphs merge', () => {
         allowedAgents: [owner],
       });
 
-      const listGraphsSpy = vi.spyOn(result.store, 'listGraphs');
-      const listGraphsByPrefixSpy = vi.spyOn(result.store, 'listGraphsByPrefix');
-      const querySpy = vi.spyOn(result.store, 'query');
-      const projectionRecordQueries = () => querySpy.mock.calls.filter(([query]) => {
+      const listGraphsOrig = (result.store as any).listGraphs.bind(result.store);
+      const listGraphsSpy = recorder((...a: unknown[]) => listGraphsOrig(...a));
+      (result.store as any).listGraphs = listGraphsSpy;
+      const listGraphsByPrefixOrig = (result.store as any).listGraphsByPrefix.bind(result.store);
+      const listGraphsByPrefixSpy = recorder((...a: unknown[]) => listGraphsByPrefixOrig(...a));
+      (result.store as any).listGraphsByPrefix = listGraphsByPrefixSpy;
+      const queryOrig = (result.store as any).query.bind(result.store);
+      const querySpy = recorder((...a: unknown[]) => queryOrig(...a));
+      (result.store as any).query = querySpy;
+      const projectionRecordQueries = () => querySpy.calls.filter(([query]) => {
         const text = String(query);
         return text.includes('SELECT ?p ?o WHERE') ||
           text.includes('SELECT ?subGraph ?name ?createdBy ?createdAt ?description WHERE');
       }).length;
-      const unboundMetaDiscoveryScans = () => querySpy.mock.calls.filter(([query]) => {
+      const unboundMetaDiscoveryScans = () => querySpy.calls.filter(([query]) => {
         const text = String(query);
         return text.includes('GRAPH ?g') && !text.includes('VALUES ?g');
       }).length;
 
       await agent.listContextGraphs({ callerAgentAddress: owner });
-      const firstListGraphsCalls = listGraphsSpy.mock.calls.length;
-      const firstPrefixCalls = listGraphsByPrefixSpy.mock.calls.length;
+      const firstListGraphsCalls = listGraphsSpy.calls.length;
+      const firstPrefixCalls = listGraphsByPrefixSpy.calls.length;
       const firstProjectionRecordQueries = projectionRecordQueries();
 
       await agent.listContextGraphs({ callerAgentAddress: owner });
 
       expect(firstPrefixCalls).toBeGreaterThan(0);
-      expect(listGraphsByPrefixSpy.mock.calls.length).toBeGreaterThan(firstPrefixCalls);
-      expect(listGraphsSpy.mock.calls.length).toBe(firstListGraphsCalls);
+      expect(listGraphsByPrefixSpy.calls.length).toBeGreaterThan(firstPrefixCalls);
+      expect(listGraphsSpy.calls.length).toBe(firstListGraphsCalls);
       expect(projectionRecordQueries()).toBe(firstProjectionRecordQueries);
       expect(unboundMetaDiscoveryScans()).toBe(0);
     } finally {

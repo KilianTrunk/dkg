@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { StorageACKHandler, type StorageACKHandlerConfig } from '../src/storage-ack-handler.js';
 import {
   computeFlatKCRootV10 as computeFlatKCRoot,
@@ -12,12 +12,6 @@ import { TypedEventBus } from '@origintrail-official/dkg-core';
 import { OxigraphStore } from '@origintrail-official/dkg-storage';
 import { ethers } from 'ethers';
 import type { Quad } from '@origintrail-official/dkg-storage';
-
-function recorder<A extends unknown[], R>(impl: (...args: A) => R) {
-  const calls: A[] = [];
-  const fn = (...args: A): R => { calls.push(args); return impl(...args); };
-  return Object.assign(fn, { calls });
-}
 
 // Test H5 prefix inputs — must match whatever `StorageACKHandlerConfig`
 // carries so that the ACK digest the test computes equals the one the
@@ -155,8 +149,8 @@ describe('StorageACKHandler', () => {
   });
 
   it('refuses to sign when signer registration lookup fails', async () => {
-    const lookupFailed = recorder(() => undefined);
-    const unregistered = recorder(() => undefined);
+    const lookupFailed = vi.fn();
+    const unregistered = vi.fn();
     const handler = await createHandler(swmQuads, {
       isSignerRegistered: async () => { throw new Error('rpc unavailable'); },
       onSignerRegistrationLookupFailed: lookupFailed,
@@ -178,8 +172,8 @@ describe('StorageACKHandler', () => {
     await expect(handler.handler(intent, fakePeerId)).rejects.toThrow(
       'StorageACK signer registration lookup failed; refusing to sign',
     );
-    expect(lookupFailed.calls).toHaveLength(1);
-    expect(unregistered.calls).toEqual([]);
+    expect(lookupFailed).toHaveBeenCalledOnce();
+    expect(unregistered).not.toHaveBeenCalled();
   });
 
   it('declines (NO_DATA_IN_SWM) when SWM has no data', async () => {

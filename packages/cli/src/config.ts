@@ -131,8 +131,6 @@ export interface NetworkConfig {
     hubAddress: string;
     tokenAddress?: string;
     chainId: string;
-    /** Network-level default for operator-facing V10 TRAC approval sizing. */
-    approvalPolicy?: ApprovalPolicyConfig;
   };
   faucet?: {
     url: string;
@@ -966,11 +964,7 @@ export function resolveChainConfig(
   if (tokenAddress !== undefined) merged.tokenAddress = tokenAddress;
   const chainId = cfg?.chainId ?? net?.chainId;
   if (chainId !== undefined) merged.chainId = chainId;
-  const cfgApprovalPolicy = requireApprovalPolicyConfig(cfg?.approvalPolicy);
-  const netApprovalPolicy = requireApprovalPolicyConfig(net?.approvalPolicy);
-  const approvalPolicy = cfgApprovalPolicy !== undefined || netApprovalPolicy !== undefined
-    ? { ...netApprovalPolicy, ...cfgApprovalPolicy }
-    : undefined;
+  const approvalPolicy = requireApprovalPolicyConfig(cfg?.approvalPolicy);
   if (approvalPolicy !== undefined) merged.approvalPolicy = approvalPolicy;
   if (cfg?.mockIdentityId !== undefined) merged.mockIdentityId = cfg.mockIdentityId;
   return merged;

@@ -558,10 +558,7 @@ describe('resolveChainConfig (field-level merge)', () => {
     )?.tokenAddress).toBe(operatorTokenAddress);
   });
 
-  it('merges approvalPolicy with operator override precedence', () => {
-    const networkApprovalPolicy = {
-      mode: 'unlimited' as const,
-    };
+  it('preserves operator approvalPolicy', () => {
     const operatorApprovalPolicy = {
       mode: 'replenishing' as const,
       targetAllowance: '1000000000000000000',
@@ -569,51 +566,45 @@ describe('resolveChainConfig (field-level merge)', () => {
     };
 
     expect(resolveChainConfig(
-      {},
-      { chain: { ...fullNetworkChain, approvalPolicy: networkApprovalPolicy } },
-    )?.approvalPolicy).toEqual(networkApprovalPolicy);
-
-    expect(resolveChainConfig(
       { chain: { approvalPolicy: operatorApprovalPolicy } },
-      { chain: { ...fullNetworkChain, approvalPolicy: networkApprovalPolicy } },
+      { chain: fullNetworkChain },
     )?.approvalPolicy).toEqual(operatorApprovalPolicy);
   });
 
-  it('merges partial approvalPolicy operator overrides over network defaults', () => {
+  it('keeps approvalPolicy local-only even when network config supplies one', () => {
     const networkApprovalPolicy = {
+      mode: 'unlimited' as const,
+    };
+    const operatorApprovalPolicy = {
       mode: 'replenishing' as const,
       targetAllowance: '1000000000000000000',
-      refillBelowFraction: 0.1,
     };
 
     expect(resolveChainConfig(
-      { chain: { approvalPolicy: { refillBelowFraction: 0.5 } } },
-      { chain: { ...fullNetworkChain, approvalPolicy: networkApprovalPolicy } },
-    )?.approvalPolicy).toEqual({
-      ...networkApprovalPolicy,
-      refillBelowFraction: 0.5,
-    });
+      {},
+      { chain: { ...fullNetworkChain, approvalPolicy: networkApprovalPolicy } as any },
+    )?.approvalPolicy).toBeUndefined();
+
+    expect(resolveChainConfig(
+      {},
+      { chain: { ...fullNetworkChain, approvalPolicy: [] } as any },
+    )?.approvalPolicy).toBeUndefined();
+
+    expect(resolveChainConfig(
+      { chain: { approvalPolicy: operatorApprovalPolicy } },
+      { chain: { ...fullNetworkChain, approvalPolicy: networkApprovalPolicy } as any },
+    )?.approvalPolicy).toEqual(operatorApprovalPolicy);
   });
 
-  it('rejects non-object approvalPolicy values before merging', () => {
-    const networkApprovalPolicy = {
-      mode: 'replenishing' as const,
-      targetAllowance: '1000000000000000000',
-    };
-
+  it('rejects non-object operator approvalPolicy values', () => {
     expect(() => resolveChainConfig(
       { chain: { approvalPolicy: 'unlimited' as any } },
-      { chain: { ...fullNetworkChain, approvalPolicy: networkApprovalPolicy } },
+      { chain: fullNetworkChain },
     )).toThrow(/chain\.approvalPolicy must be an object/);
 
     expect(() => resolveChainConfig(
       { chain: { approvalPolicy: [] as any } },
       { chain: fullNetworkChain },
-    )).toThrow(/chain\.approvalPolicy must be an object/);
-
-    expect(() => resolveChainConfig(
-      {},
-      { chain: { ...fullNetworkChain, approvalPolicy: [] as any } },
     )).toThrow(/chain\.approvalPolicy must be an object/);
   });
 

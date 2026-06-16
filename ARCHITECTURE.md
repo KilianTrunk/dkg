@@ -363,20 +363,20 @@ contracts. The chain-adapter SDK targets the V10 contract family
 
 Daemon startup resolves chain configuration through a small CLI boundary before
 constructing the agent. `packages/cli/src/config.ts#resolveChainConfig()` merges
-the operator config layer (`~/.dkg/config.json#chain`) over
-`network/<env>.json#chain` per field, so an operator can override one field such
-as `rpcUrl` while inheriting the network `hubAddress`, backup RPCs, token
-address, and `chainId`. The returned `chainBase` may still be partial, so daemon
-consumers guard for both `rpcUrl` and `hubAddress` before constructing EVM-backed
-runtime config.
+the persisted operator config layer (`~/.dkg/config.json#chain` or
+`~/.dkg/config.yaml#chain`) over `network/<env>.json#chain` per field, so an
+operator can override one field such as `rpcUrl` while inheriting the network
+`hubAddress`, backup RPCs, token address, and `chainId`. The returned
+`chainBase` may still be partial, so daemon consumers guard for both `rpcUrl`
+and `hubAddress` before constructing EVM-backed runtime config.
 
 Mock mode is the exception: an operator `chain.type = "mock"` short-circuits the
 merge and strips inherited EVM endpoint fields so no daemon consumer can
 accidentally open a real JSON-RPC provider while a `MockChainAdapter` is wired.
 
-`chain.approvalPolicy` belongs to the operator-facing chain config. The policy
-block is also field-merged, so an operator can override one policy field while
-inheriting the rest from network config. The resolved policy then flows to
+`chain.approvalPolicy` is the exception to network inheritance. It belongs only
+to operator-owned chain config because it changes TRAC allowance sizing and
+therefore wallet authorization blast radius. The resolved local policy flows to
 `packages/cli/src/daemon/lifecycle.ts`, which converts it with
 `resolveApprovalPolicy()` and passes the runtime `ApprovalPolicy` into
 `DKGAgent.chainConfig`; the agent then forwards it to `EVMChainAdapter`, where

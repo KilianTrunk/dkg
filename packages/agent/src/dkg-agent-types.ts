@@ -657,6 +657,24 @@ export interface ContextGraphSubscriptionStore {
   delete(contextGraphId: string): Promise<void>;
 }
 
+export interface ContextGraphSubscriptionRehydrationStatus {
+  /** Non-system persisted rows governed by the rehydration cap. */
+  persistedTotal: number;
+  /** Persisted system rows seen during rehydration; excluded from cap math. */
+  systemExcluded: number;
+  hostedActivated: number;
+  hostedActivatedIds: string[];
+  activated: number;
+  dormant: number;
+  activationCap: number;
+  capDisabled: boolean;
+  dormantIds: string[];
+  /** Startup rehydration completion timestamp; remains stable after boot. */
+  completedAt: number;
+  /** Most recent timestamp for post-boot diagnostic count/id updates. */
+  updatedAt: number;
+}
+
 export interface ContextGraphWritePreflightProbe {
   exists: boolean;
   hasLocalContent: boolean;
@@ -1005,12 +1023,13 @@ export interface DKGAgentConfig {
   /** Durable local store for paged sync checkpoints. Defaults to in-memory. */
   syncCheckpointStore?: SyncCheckpointStore;
   /**
-   * Cap on how many persisted context-graph subscriptions are *activated*
-   * (gossip-subscribed + sync-tracked) when rehydrating at startup. A large
-   * backlog of stale subscriptions otherwise fans out store-touching gossip
-   * /sync work that starves authenticated store-backed routes (issue #997).
-   * Subscriptions beyond the cap stay persisted but inactive and can be
-   * pruned via `DELETE /api/context-graph/subscriptions`. Default
+   * Intentional cap on how many persisted context-graph subscriptions are
+   * *activated* (gossip-subscribed + sync-tracked) when rehydrating at startup.
+   * A large backlog of stale subscriptions otherwise fans out store-touching
+   * gossip/sync work that starves authenticated store-backed routes (issue
+   * #997). Rows beyond the cap stay persisted but inactive, are reported via
+   * subscription diagnostics, and can be pruned via
+   * `DELETE /api/context-graph/subscriptions`. Default
    * `DEFAULT_MAX_REHYDRATED_SUBSCRIPTIONS`. `0` disables the cap.
    */
   maxRehydratedContextGraphSubscriptions?: number;

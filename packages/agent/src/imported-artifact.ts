@@ -6,6 +6,7 @@ import {
   contextGraphSharedMemoryUri,
   isSafeIri,
   PROTOCOL_GET_ASSERTION_ARTIFACT,
+  sharedMemoryReadBothFilter,
   validateContextGraphId,
   validateSubGraphName,
 } from '@origintrail-official/dkg-core';
@@ -386,13 +387,15 @@ async function resolveLinkedArtifact(agent: DKGAgent, args: {
     contentType = normalizeContentType(literal(durableBinding.contentType));
     mdIntermediateHash = literal(durableBinding.mdIntermediateHash) || undefined;
   } else {
+    const swmGraph = contextGraphSharedMemoryUri(args.contextGraphId, args.subGraphName);
     const swm = await agent.store.query(`
       SELECT ?sourceFile ?contentType ?markdownForm WHERE {
-        GRAPH <${contextGraphSharedMemoryUri(args.contextGraphId, args.subGraphName)}> {
+        GRAPH ?g {
           <${args.assertionUri}> <${DKG_ONTOLOGY}sourceFile> ?sourceFile .
           OPTIONAL { <${args.assertionUri}> <${DKG_ONTOLOGY}sourceContentType> ?contentType }
           OPTIONAL { <${args.assertionUri}> <${DKG_ONTOLOGY}markdownForm> ?markdownForm }
         }
+        ${sharedMemoryReadBothFilter(swmGraph)}
       }
       LIMIT 1
     `) as { type?: string; bindings?: Array<Record<string, unknown>> };

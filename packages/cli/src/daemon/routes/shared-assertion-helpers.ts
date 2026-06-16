@@ -15,6 +15,7 @@ import {
   assertSafeRdfTerm,
   escapeDkgRdfLiteral,
   contextGraphSharedMemoryUri,
+  sharedMemoryReadBothFilter,
   contextGraphAssertionUri,
   contextGraphMetaUri,
 } from '@origintrail-official/dkg-core';
@@ -578,12 +579,13 @@ export async function resolveImportedArtifactFromSharedMemory(
   const swmGraph = contextGraphSharedMemoryUri(args.contextGraphId, args.subGraphName);
   const result = await ctx.agent.store.query(`
     SELECT ?sourceFile ?contentType ?rootEntity ?markdownForm WHERE {
-      GRAPH <${swmGraph}> {
+      GRAPH ?g {
         <${args.assertionUri}> <${DKG_ONTOLOGY}sourceFile> ?sourceFile .
         OPTIONAL { <${args.assertionUri}> <${DKG_ONTOLOGY}sourceContentType> ?contentType }
         OPTIONAL { <${args.assertionUri}> <${DKG_ONTOLOGY}rootEntity> ?rootEntity }
         OPTIONAL { <${args.assertionUri}> <${DKG_ONTOLOGY}markdownForm> ?markdownForm }
       }
+      ${sharedMemoryReadBothFilter(swmGraph)}
     }
   `) as { type?: string; bindings?: Array<Record<string, unknown>> };
   const bindings = result.bindings ?? [];

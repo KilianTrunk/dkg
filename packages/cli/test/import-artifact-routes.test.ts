@@ -8,6 +8,7 @@ import {
   contextGraphAssertionUri,
   contextGraphMetaUri,
   contextGraphSharedMemoryUri,
+  sharedMemoryReadBothFilter,
 } from '@origintrail-official/dkg-core';
 import { FileStore } from '../src/file-store.js';
 import type { ExtractionStatusRecord } from '../src/extraction-status.js';
@@ -269,7 +270,8 @@ describe('import artifact daemon routes', () => {
             };
           }
           if (sparql.includes('SELECT ?sourceFile')) {
-            expect(sparql).toContain(`<${contextGraphSharedMemoryUri(args.contextGraphId)}>`);
+            expect(sparql).toContain('GRAPH ?g');
+            expect(sparql).toContain(sharedMemoryReadBothFilter(contextGraphSharedMemoryUri(args.contextGraphId)));
             expect(sparql).toContain(`<${args.assertionUri}> <${DKG}sourceFile>`);
             return {
               type: 'bindings',

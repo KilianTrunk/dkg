@@ -69,6 +69,19 @@ export interface RecoverContextGraphSwmDeps {
     excludedSubGraphNames?: readonly string[],
   ) => Promise<ProcessedSwmBatch>;
   readonly store: SwmRecoveryStore;
+  /**
+   * REPLACE (not append) the SWM meta for each recovered root, BEFORE the fresh
+   * `verifiedMeta` is inserted. `applySwmRecovery` REPLACEs the root DATA, but
+   * without also replacing the meta an older `WorkspaceOperation`/`rootEntity`
+   * row for the same root lingers in `_shared_memory_meta`; the TTL sweep then
+   * deletes data for that expired op and can wipe the freshly-recovered root
+   * (Codex high). Mirrors the share/gossip apply path's per-root meta
+   * replacement (`deleteMetaForRoot`). Production callers MUST pass it.
+   */
+  readonly replaceMetaForRoots?: (
+    roots: readonly { readonly entity: string }[],
+    metaGraphs: readonly string[],
+  ) => Promise<void>;
   readonly ensureContextGraph: (contextGraphId: string) => Promise<void>;
   readonly setCheckpoint: (key: string, offset: number) => void;
   readonly deleteCheckpoint: (key: string) => void;
@@ -180,6 +193,15 @@ export async function recoverContextGraphSwm(
     verifiedData: processed.verifiedData,
     roots: processed.entityCreators,
   });
+  // Codex high: REPLACE the SWM meta for each recovered root (the data was
+  // REPLACEd above; the meta must be too). Otherwise a stale WorkspaceOperation
+  // pointing at the root survives and the TTL sweep later deletes the
+  // freshly-recovered root. Scope to the meta graphs the curator's fresh meta
+  // populates (+ the caller's base fallback when empty). Runs BEFORE the insert.
+  if (processed.entityCreators.length > 0) {
+    const metaGraphs = [...new Set(processed.verifiedMeta.map((q) => q.graph))];
+    await deps.replaceMetaForRoots?.(processed.entityCreators, metaGraphs);
+  }
   if (processed.verifiedMeta.length > 0) {
     await deps.store.insert([...processed.verifiedMeta]);
   }

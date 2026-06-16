@@ -1099,7 +1099,11 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         // is safe. Everything else (on-chain reverts, storage, "Invalid"/
         // "Unsafe" publisher text) keeps the generic 500 — the #988 parity
         // contract that publish must NOT down-classify on-chain errors.
-        if (/is not finalized/.test(msg) || /No quads in shared memory/.test(msg)) {
+        // `has no private payload` is the curated-CG analogue of `No quads in
+        // shared memory`: a curated publish with nothing private shared (only
+        // the public catalog entry) — a caller precondition, thrown before any
+        // chain interaction, so 409 is safe + consistent with the public path.
+        if (/is not finalized/.test(msg) || /No quads in shared memory/.test(msg) || /has no private payload/.test(msg)) {
           return jsonResponse(res, 409, { code: "VM_PUBLISH_PRECONDITION", error: msg });
         }
         return jsonResponse(res, 500, { error: msg });

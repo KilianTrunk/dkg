@@ -16,6 +16,7 @@ import {
   PROTOCOL_SWM_SENDER_KEY, PROTOCOL_SWM_UPDATE, PROTOCOL_SWM_SHARE_ACK, PROTOCOL_SWM_HOST_CATCHUP, PROTOCOL_MESSAGE,
   contextGraphPublishTopic, contextGraphWorkspaceTopic, contextGraphAppTopic, contextGraphUpdateTopic, contextGraphFinalizationTopic,
   contextGraphDataGraphUri, contextGraphMetaGraphUri, contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
+  ENTITY_PRED_ALT, DKG_ENTITY, DKG_ROOT_ENTITY_LEGACY,
   contextGraphSharedMemoryUri,
   contextGraphVerifiableMemoryUri, contextGraphVerifiableMemoryMetaUri,
   contextGraphDataUri, contextGraphMetaUri, assertionLifecycleUri, contextGraphAssertionUri,
@@ -3211,6 +3212,42 @@ export class LifecycleSyncMethods extends DKGAgentBase {
         },
         deleteByPattern: (pattern) => this.store.deleteByPattern(pattern),
         deleteBySubjectPrefix: (graph, prefix) => this.store.deleteBySubjectPrefix(graph, prefix),
+      },
+      // Codex high: REPLACE per-root SWM meta (mirror the publisher's
+      // deleteMetaForRoot). For each recovered root, drop the op→root-entity
+      // links in the curator's fresh-meta graphs, then delete any op left with
+      // no remaining roots — so a stale WorkspaceOperation can't survive to
+      // TTL-delete the just-recovered root. Runs before swm-recovery inserts the
+      // fresh verifiedMeta. Falls back to the base meta graph if none provided.
+      replaceMetaForRoots: async (roots, metaGraphs) => {
+        const graphs = metaGraphs.length > 0
+          ? metaGraphs
+          : [contextGraphWorkspaceMetaGraphUri(contextGraphId)];
+        const entities = [...new Set(roots.map((r) => r.entity))];
+        for (const metaGraph of graphs) {
+          for (const entity of entities) {
+            const ops = await this.store.query(
+              `SELECT DISTINCT ?op WHERE { GRAPH <${metaGraph}> { ?op ${ENTITY_PRED_ALT} <${entity}> } }`,
+            );
+            if (ops.type !== 'bindings') continue;
+            for (const row of ops.bindings) {
+              const op = row['op'];
+              if (!op) continue;
+              await this.store.delete([
+                { subject: op, predicate: DKG_ROOT_ENTITY_LEGACY, object: entity, graph: metaGraph },
+                { subject: op, predicate: DKG_ENTITY, object: entity, graph: metaGraph },
+              ]);
+              const remaining = await this.store.query(
+                `SELECT (COUNT(DISTINCT ?r) AS ?c) WHERE { GRAPH <${metaGraph}> { <${op}> ${ENTITY_PRED_ALT} ?r } }`,
+              );
+              const raw = remaining.type === 'bindings' ? remaining.bindings[0]?.['c'] : undefined;
+              const countVal = raw ? parseInt(String(raw).match(/\d+/)?.[0] ?? '0', 10) : 0;
+              if (countVal === 0) {
+                await this.store.deleteByPattern({ graph: metaGraph, subject: op });
+              }
+            }
+          }
+        }
       },
       ensureContextGraph: async (cgId) => {
         const graphManager = new GraphManager(this.store);

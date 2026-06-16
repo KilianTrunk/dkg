@@ -282,7 +282,10 @@ describe('/api/knowledge-assets routes (real daemon, real chain)', () => {
       const res = await postJson(daemon, '/api/knowledge-assets/pub-noshare/vm/publish', { contextGraphId: REG });
       expect(res.status).toBe(409);
       expect(res.body.code).toBe('VM_PUBLISH_PRECONDITION');
-      expect(String(res.body.error)).toMatch(/shared memory/);
+      // REG is curated (accessPolicy:1): with nothing private shared, the catalog
+      // model surfaces the curated "no private payload" precondition rather than
+      // the public "No quads in shared memory" — both are VM_PUBLISH_PRECONDITION.
+      expect(String(res.body.error)).toMatch(/private payload|shared memory/);
     });
 
     it('rejects a non-integer epochs option (400, no publish)', async () => {

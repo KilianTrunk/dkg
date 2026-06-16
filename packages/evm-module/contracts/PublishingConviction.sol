@@ -403,7 +403,13 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
         }
 
         emit AccountCreated(accountId, publisher, committedTRAC, discountBps, currentEpoch, expiresAtEpoch);
-        emit PrimaryNodeChanged(accountId, 0, primaryNode, currentEpoch);
+        // Only emit a designation event when a node is actually designated at
+        // creation. createAccount(_, 0) is an inert PCA (no seeding), so a
+        // PrimaryNodeChanged(_, 0, 0, _) would be a spurious no-op that
+        // indexers would otherwise record as a real assignment.
+        if (primaryNode != 0) {
+            emit PrimaryNodeChanged(accountId, 0, primaryNode, currentEpoch);
+        }
     }
 
     // ============================================================

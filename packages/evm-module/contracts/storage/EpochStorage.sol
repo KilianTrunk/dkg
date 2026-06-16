@@ -87,9 +87,15 @@ contract EpochStorage is INamed, IVersioned, HubDependent {
     ///         re-designates its primary node — the epoch total
     ///         (`epochPublishingAllocation`, i.e. K_total) is intentionally
     ///         NOT touched, so the move is net-zero on the denominator of
-    ///         every node's publishing factor. The per-epoch node max is
-    ///         deliberately left stale (the RFC does not require recomputing
-    ///         it on a move; it is only ever raised, never lowered).
+    ///         every node's publishing factor.
+    /// @dev    `epochNodeMaxPublishingAllocation` is a per-epoch HIGH-WATER
+    ///         MARK, maintained identically on the add and move paths: it is
+    ///         only ever RAISED (when the destination's new value exceeds it),
+    ///         never lowered by the `fromId` decrement — computing the true
+    ///         current max after a decrement would need an O(nodes) scan.
+    ///         Nothing on-chain reads it (scoring reads only
+    ///         get(Node)EpochPublishingAllocation); it exists for off-chain
+    ///         observability, for which the high-water-mark semantic is correct.
     function moveEpochPublishingAllocation(
         uint72 fromId,
         uint72 toId,
@@ -98,6 +104,10 @@ contract EpochStorage is INamed, IVersioned, HubDependent {
     ) external onlyContracts {
         nodesEpochPublishingAllocation[fromId][epoch] -= amount;
         nodesEpochPublishingAllocation[toId][epoch] += amount; // epoch total unchanged -> K_total net-zero
+
+        if (nodesEpochPublishingAllocation[toId][epoch] > epochNodeMaxPublishingAllocation[epoch]) {
+            epochNodeMaxPublishingAllocation[epoch] = nodesEpochPublishingAllocation[toId][epoch];
+        }
     }
 
     function getEpochPublishingAllocation(uint256 epoch) external view returns (uint96) {

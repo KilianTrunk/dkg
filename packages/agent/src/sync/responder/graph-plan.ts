@@ -414,6 +414,15 @@ export async function readDurableDataPage(params: {
   const candidateGraphs = params.graphList.filter((graph) => {
     if (graph !== cgPrefix && !graph.startsWith(`${cgPrefix}/`)) return false;
     if (graph === topMetaGraph) return false;
+    // Shared-memory graphs (`/_shared_memory`, `/_shared_memory_meta`, including
+    // per-sub-graph buckets) are the EXCLUSIVE domain of the dedicated SWM phase
+    // (readSwmDataPage), which applies per-(graph,subject) REPLACE + the
+    // curator-skip. Serving them in the durable DATA phase makes the requester
+    // blind-UNION them, which (a) corrupts single-valued SWM into {v1,v2}, and
+    // (b) lets a curator reverse-sync its OWN CG's SWM from a member, polluting
+    // itself (devnet curator-converge Gate A) — and it leaks gated SWM to durable
+    // requesters. SWM is never served through the durable data phase.
+    if (graph.includes('/_shared_memory')) return false;
     return !graph.includes('/_private');
   }).sort(compareCodePoint);
 

@@ -131,6 +131,11 @@ export interface NetworkConfig {
     hubAddress: string;
     tokenAddress?: string;
     chainId: string;
+    /**
+     * ContextGraphNameRegistry discovery scan `eth_getLogs` block-window.
+     * Defaults to the EVM adapter's 2,000-block common provider cap.
+     */
+    cgRegistryScanPageSize?: number;
   };
   faucet?: {
     url: string;
@@ -220,6 +225,11 @@ export interface ChainConfig {
    * `packages/cli/skills/dkg-node/SKILL.md` §8 for the operator guide.
    */
   approvalPolicy?: ApprovalPolicyConfig;
+  /**
+   * ContextGraphNameRegistry discovery scan `eth_getLogs` block-window.
+   * Defaults to the EVM adapter's 2,000-block common provider cap.
+   */
+  cgRegistryScanPageSize?: number;
 }
 
 export interface LargeLiteralStorageConfig {
@@ -347,6 +357,12 @@ export interface QueryAccessConfig {
   rateLimitPerMinute?: number;
 }
 
+export interface GraphSetIndexConfig {
+  enabled?: boolean;
+  /** Revalidate the named-graph index after this many milliseconds. 0 means every read. */
+  revalidateMs?: number;
+}
+
 export interface DkgConfig {
   name: string;
   relay?: string;
@@ -445,13 +461,15 @@ export interface DkgConfig {
   /** Block explorer URL for TX links (default: derived from chainId). */
   blockExplorerUrl?: string;
   /** Triple store backend override (default: oxigraph-worker with file persistence). */
-  store?: { backend: string; options?: Record<string, unknown> };
+  store?: { backend: string; options?: Record<string, unknown>; graphSetIndex?: boolean | GraphSetIndexConfig };
   /**
-   * Cap on how many persisted context-graph subscriptions a node ACTIVATES on
-   * boot (gossip + sync). A large stale backlog otherwise fans out store work
-   * and starves authenticated routes (#997). coreHosted graphs are always
-   * restored regardless of this cap. Non-negative integer; 0 = no cap. Raise it
-   * on nodes that legitimately subscribe to more than the default (64).
+   * Intentional cap on how many persisted context-graph subscriptions a node
+   * ACTIVATES on boot (gossip + sync). A large stale backlog otherwise fans out
+   * store work and starves authenticated routes (#997). coreHosted graphs are
+   * always restored regardless of this cap. Rows beyond the cap stay persisted
+   * and are reported by GET /api/context-graph/subscriptions. Non-negative
+   * integer; 0 = no cap. Raise it on nodes that legitimately subscribe to more
+   * than the default (64).
    */
   maxRehydratedContextGraphSubscriptions?: number;
   /** Out-of-line storage for large public SWM RDF literal object terms. */
@@ -460,6 +478,13 @@ export interface DkgConfig {
   sharedMemoryPublicSnapshotStorage?: SharedMemoryPublicSnapshotStorageConfig;
   /** Disable expensive peer-connect SWM catch-up for bulk benchmark/devnet runs. */
   syncSharedMemoryOnConnect?: boolean;
+  /**
+   * Keep durable sync of `did:dkg:context-graph:agents/_meta` enabled by
+   * default. Edge-node operators can set this to false to sync the `agents`
+   * phonebook data without pulling the large system KA/KC lifecycle metadata.
+   * Ignored on core nodes, which always sync system graph metadata.
+   */
+  syncAgentsMeta?: boolean;
   /**
    * Generic local agent integration registry used by node-owned connect/install
    * flows. Framework-specific bridges (OpenClaw now, Hermes next) should store
@@ -480,6 +505,20 @@ export interface DkgConfig {
   workspaceTtlMs?: number;
   /** EPCIS plugin config. When set, POST /api/epcis/capture is enabled. */
   epcis?: { contextGraphId?: string };
+  /**
+   * Per-KA metadata writer tuning (RFC ka-metadata-trim Phase 3).
+   */
+  metadata?: {
+    /**
+     * P3.3 — write per-transition PROV event nodes (`dkg:AssertionCreated` /
+     * `dkg:AssertionPromoted` activities) into `_meta`. Default `true`.
+     * Set `false` ("lite mode") on high-throughput publishers / core nodes
+     * to skip the event rows: the seal, state and identity rows on the
+     * lifecycle subject are ALWAYS written regardless, and the history API
+     * simply returns `events: []` for ranges published while disabled.
+     */
+    provenanceEvents?: boolean;
+  };
   /** Async publisher runtime options. */
   publisher?: {
     enabled?: boolean;
@@ -966,6 +1005,8 @@ export function resolveChainConfig(
   if (chainId !== undefined) merged.chainId = chainId;
   const approvalPolicy = requireApprovalPolicyConfig(cfg?.approvalPolicy);
   if (approvalPolicy !== undefined) merged.approvalPolicy = approvalPolicy;
+  const cgRegistryScanPageSize = cfg?.cgRegistryScanPageSize ?? net?.cgRegistryScanPageSize;
+  if (cgRegistryScanPageSize !== undefined) merged.cgRegistryScanPageSize = cgRegistryScanPageSize;
   if (cfg?.mockIdentityId !== undefined) merged.mockIdentityId = cfg.mockIdentityId;
   return merged;
 }

@@ -350,6 +350,20 @@ describe('localAgentIntegrations config round-trip', () => {
     expect(loaded.relayReservationCount).toBe(5);
   });
 
+  it('round-trips syncAgentsMeta=false through saveConfig/loadConfig (edge store-load optimization)', async () => {
+    await saveConfig({
+      name: 'test-node',
+      apiPort: 9200,
+      listenPort: 0,
+      nodeRole: 'edge',
+      syncAgentsMeta: false,
+    });
+
+    const loaded = await loadConfig();
+    expect(loaded.nodeRole).toBe('edge');
+    expect(loaded.syncAgentsMeta).toBe(false);
+  });
+
   it('omits relayReservationCount when not set (so DKGNode.start() applies the default)', async () => {
     await saveConfig({
       name: 'test-node',
@@ -484,6 +498,20 @@ describe('resolveChainConfig (field-level merge)', () => {
     expect(merged?.rpcUrl).toBe(fullNetworkChain.rpcUrl);
     expect(merged?.rpcUrls).toEqual(fullNetworkChain.rpcUrls);
     expect(merged?.chainId).toBe(fullNetworkChain.chainId);
+  });
+
+  it('merges cgRegistryScanPageSize with operator precedence', () => {
+    const inherited = resolveChainConfig(
+      {},
+      { chain: { ...fullNetworkChain, cgRegistryScanPageSize: 10_000 } },
+    );
+    expect(inherited?.cgRegistryScanPageSize).toBe(10_000);
+
+    const overridden = resolveChainConfig(
+      { chain: { cgRegistryScanPageSize: 4_000 } },
+      { chain: { ...fullNetworkChain, cgRegistryScanPageSize: 10_000 } },
+    );
+    expect(overridden?.cgRegistryScanPageSize).toBe(4_000);
   });
 
   it('dedupes primary + backups while preserving operator priority', () => {

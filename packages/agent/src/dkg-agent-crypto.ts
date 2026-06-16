@@ -424,14 +424,21 @@ export class WorkspaceCryptoMethods extends DKGAgentBase {
     return null;
   }
 
-  async getContextGraphAgentGateAddresses(this: DKGAgent, contextGraphId: string): Promise<string[] | null> {
+  async getContextGraphAgentGateAddresses(
+    this: DKGAgent,
+    contextGraphId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<string[] | null> {
     const seen = new Set<string>();
     const agents: string[] = [];
     let sawAgentGate = false;
+    const meta = await this.getCgMeta(contextGraphId, { signal: options.signal });
+    const revoked = new Set(meta.revokedAgents.map((addr) => addr.toLowerCase()));
     const add = (value: string | undefined) => {
       if (!value || !ethers.isAddress(value)) return;
       const checksum = ethers.getAddress(value);
       const key = checksum.toLowerCase();
+      if (revoked.has(key)) return;
       if (seen.has(key)) return;
       seen.add(key);
       agents.push(checksum);
@@ -443,26 +450,9 @@ export class WorkspaceCryptoMethods extends DKGAgentBase {
       add(agentAddress);
     }
 
-    const contextGraphUri = contextGraphDataGraphUri(contextGraphId);
-    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
-    const result = await this.store.query(
-      `SELECT ?agent WHERE {
-        GRAPH <${cgMetaGraph}> {
-          { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ALLOWED_AGENT}> ?agent }
-          UNION
-          { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT}> ?agent }
-        }
-      }`,
-    );
-    if (result.type === 'bindings') {
-      if (result.bindings.length > 0) sawAgentGate = true;
-      for (const row of result.bindings) {
-        const raw = row['agent'];
-        if (typeof raw === 'string') {
-          add(raw.replace(/^"/, '').replace(/"(@[a-zA-Z-]+|\^\^<[^>]+>)?$/, ''));
-        }
-      }
-    }
+    if (meta.allowedAgents.length > 0 || meta.participantAgents.length > 0) sawAgentGate = true;
+    for (const agent of meta.allowedAgents) add(agent);
+    for (const agent of meta.participantAgents) add(agent);
 
     return sawAgentGate ? agents : null;
   }
@@ -481,7 +471,11 @@ export class WorkspaceCryptoMethods extends DKGAgentBase {
    * granted to agent A's node doesn't accidentally let traffic
    * "on behalf of agent B" through that same node.
    */
-  async getContextGraphAllowedDelegateePeers(this: DKGAgent, contextGraphId: string): Promise<Map<string, string[]>> {
+  async getContextGraphAllowedDelegateePeers(
+    this: DKGAgent,
+    contextGraphId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<Map<string, string[]>> {
     const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
     // SELECT also returns `expiresAtMs` so we can filter expired rows in
     // JS — pushing the FILTER into SPARQL would force a string→long
@@ -499,6 +493,7 @@ export class WorkspaceCryptoMethods extends DKGAgentBase {
           OPTIONAL { ?d <${DKG_ONTOLOGY.DKG_DELEGATION_EXPIRES_AT}> ?expiresAt }
         }
       }`,
+      { signal: options.signal },
     );
     const out = new Map<string, string[]>();
     if (result.type !== 'bindings') return out;
@@ -531,7 +526,11 @@ export class WorkspaceCryptoMethods extends DKGAgentBase {
    * Expired rows are filtered out — see the peer-lookup helper for the
    * rationale (PR #448 review round 4).
    */
-  async getContextGraphAllowedDelegateeKeys(this: DKGAgent, contextGraphId: string): Promise<Map<string, string[]>> {
+  async getContextGraphAllowedDelegateeKeys(
+    this: DKGAgent,
+    contextGraphId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<Map<string, string[]>> {
     const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
     const result = await this.store.query(
       `SELECT ?agent ?key ?expiresAt WHERE {
@@ -541,6 +540,7 @@ export class WorkspaceCryptoMethods extends DKGAgentBase {
           OPTIONAL { ?d <${DKG_ONTOLOGY.DKG_DELEGATION_EXPIRES_AT}> ?expiresAt }
         }
       }`,
+      { signal: options.signal },
     );
     const out = new Map<string, string[]>();
     if (result.type !== 'bindings') return out;

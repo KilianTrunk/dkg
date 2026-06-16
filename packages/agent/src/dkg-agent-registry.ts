@@ -1111,7 +1111,7 @@ export class AgentRegistryMethods extends DKGAgentBase {
     let markedDefaultAddr: string | undefined;
     const needsMigration: AgentKeyRecord[] = [];
     try {
-      const result = await this.store.query(sparql);
+      const result = await this.store.query(sparql, { source: 'agent.agentKeyMigration' });
       if (result.type !== 'bindings') return;
       const strip = (v?: string) => v?.replace(/^"|"$/g, '').replace(/"?\^\^.*$/, '') ?? '';
       for (const row of result.bindings) {
@@ -1523,7 +1523,7 @@ export class AgentRegistryMethods extends DKGAgentBase {
     peerId: string,
     protocolId: string,
     data: Uint8Array,
-    opts?: { timeoutMs?: number },
+    opts?: { timeoutMs?: number; signal?: AbortSignal },
   ): Promise<Uint8Array> {
     return this.messenger.sendToPeer(peerId, protocolId, data, opts);
   }

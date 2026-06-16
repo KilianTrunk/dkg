@@ -14,7 +14,16 @@ import {
   type ServerResponse,
 } from "node:http";
 import { createHash, randomUUID } from "node:crypto";
-import { GET_TOTAL_TRIPLES_SPARQL, parseRdfInt } from "./metrics-queries.js";
+import {
+  buildContextGraphDeclarationsSparql,
+  contextGraphIdsFromDeclarationBindings,
+  contextGraphIdsFromLocalRootMetaGraphs,
+  contextGraphIdsFromMetricSubscriptionCandidates,
+  countContextGraphsFromGraphUris,
+  GET_TOTAL_TRIPLES_SPARQL,
+  parseRdfInt,
+  shadowContextGraphIdsFromMetricSubscriptionCandidates,
+} from "./metrics-queries.js";
 import {
   appendFile,
   chmod,
@@ -73,6 +82,7 @@ import {
   LlmClient,
   SqliteMessageIdempotencyStore,
   SqliteProtocolOutboxStore,
+  SqliteSyncCheckpointStore,
   SqliteKaNumberStore,
   type MetricsSource,
 } from "@origintrail-official/dkg-node-ui";
@@ -570,6 +580,26 @@ export function mergePreferredRelays(input: {
     configCount: configParsed.length,
     preferredCount: preferredInResult.length,
   };
+}
+
+export function shouldUseIncrementalChainDiscoveryScan(input: {
+  run: number;
+  watermarkSeeded: boolean;
+  fullScanEvery: number;
+}): boolean {
+  return (
+    input.watermarkSeeded &&
+    input.run !== 0 &&
+    input.run % input.fullScanEvery !== 0
+  );
+}
+
+export function chainDiscoveryScanOptions(incremental: boolean):
+  | { incremental: true }
+  | { seedIncrementalWatermark: true; throwOnChainScanFailure: true } {
+  return incremental
+    ? { incremental: true }
+    : { seedIncrementalWatermark: true, throwOnChainScanFailure: true };
 }
 
 export interface PromoteWorkerDaemonLifecycle {
@@ -1171,6 +1201,7 @@ export async function runDaemonInner(
       return DEFAULT_PROTOCOL_OUTBOX_BACKOFFS_MS[idx];
     },
   });
+  const syncCheckpointStore = new SqliteSyncCheckpointStore(dashDb);
 
   // OT-RFC-43 Option-1 deterministic KA identity (B2 allocator core).
   // Durable per-author KA-number sequence backing the off-chain
@@ -1212,10 +1243,12 @@ export async function runDaemonInner(
     storeConfig: runtimeStore ? {
       backend: runtimeStore.backend,
       options: runtimeStore.options,
+      graphSetIndex: runtimeStore.graphSetIndex,
     } : undefined,
     largeLiteralStorage: runtimeLargeLiteralStorage,
     sharedMemoryPublicSnapshotStorage: runtimeSnapshotStorage,
     syncSharedMemoryOnConnect: config.syncSharedMemoryOnConnect,
+    syncAgentsMeta: role === 'core' ? true : config.syncAgentsMeta,
     queryAccess: config.queryAccess,
     chainAdapter: mockChainAdapter,
     // Only forward chain to the agent when both required fields resolved.
@@ -1232,11 +1265,15 @@ export async function runDaemonInner(
       operationalKeys: opWallets.wallets.map((w) => w.privateKey),
       chainId: chainBase.chainId,
       approvalPolicy: resolveApprovalPolicy(chainBase.approvalPolicy) as ApprovalPolicy | undefined,
+      cgRegistryScanPageSize: chainBase.cgRegistryScanPageSize,
     } : undefined,
     sharedMemoryTtlMs: resolveSharedMemoryTtlMs(config),
+    // RFC ka-metadata-trim P3.3 — lifecycle PROV event writes (default true).
+    metadataProvenanceEvents: config.metadata?.provenanceEvents,
     randomSamplingWalPath: config.randomSampling?.walPath,
     randomSamplingTickIntervalMs: config.randomSampling?.tickIntervalMs,
     randomSamplingUseWorkerThread: config.randomSampling?.useWorkerThread,
+    syncCheckpointStore,
     contextGraphSubscriptionStore: {
       loadAll: async () => dashDb.listContextGraphSubscriptions().map((row) => ({
         id: row.context_graph_id,
@@ -1251,6 +1288,22 @@ export async function runDaemonInner(
         coreHosted: row.core_hosted == null ? undefined : row.core_hosted === 1,
         syncScoped: row.sync_scoped === 1,
       })),
+      load: async (contextGraphId) => {
+        const row = dashDb.getContextGraphSubscription(contextGraphId);
+        return row ? {
+          id: row.context_graph_id,
+          name: row.name ?? undefined,
+          subscribed: row.subscribed === 1,
+          synced: row.synced === 1,
+          sharedMemorySynced: row.shared_memory_synced == null ? undefined : row.shared_memory_synced === 1,
+          metaSynced: row.meta_synced == null ? undefined : row.meta_synced === 1,
+          onChainId: row.on_chain_id ?? undefined,
+          onChainHash: row.on_chain_hash ?? undefined,
+          lastReconciledOrdinal: row.last_reconciled_ordinal ?? undefined,
+          coreHosted: row.core_hosted == null ? undefined : row.core_hosted === 1,
+          syncScoped: row.sync_scoped === 1,
+        } : null;
+      },
       save: async (record) => {
         dashDb.upsertContextGraphSubscription({
           context_graph_id: record.id,
@@ -1621,6 +1674,24 @@ export async function runDaemonInner(
               },
               log,
             }),
+            publishEncryptionFactory: async (publishOptions) => {
+              const encryptInlinePayload = await agent._resolveEncryptInlinePayload(
+                publishOptions.contextGraphId,
+                publishOptions.subGraphName,
+                undefined,
+                publishOptions.publishContextGraphId,
+              );
+              const encryptInlineChunked = await agent._resolveEncryptInlineChunked(
+                publishOptions.contextGraphId,
+                publishOptions.subGraphName,
+                undefined,
+                publishOptions.publishContextGraphId,
+              );
+              return {
+                encryptInlinePayload,
+                encryptInlineChunked,
+              };
+            },
             log,
           });
           publisherRuntime = runtime;
@@ -1699,24 +1770,27 @@ export async function runDaemonInner(
   // Run an initial chain scan for context graphs we might not know about,
   // then repeat every 30 minutes as a fallback discovery mechanism.
   const CHAIN_SCAN_INTERVAL_MS = 30 * 60 * 1000;
-  setTimeout(async () => {
+  const CHAIN_FULL_SCAN_EVERY = 48; // about once per day at the 30-minute cadence
+  let chainScanRuns = 0;
+  const runChainDiscoveryScan = async () => {
     try {
-      const found = await agent.discoverContextGraphsFromChain();
+      const run = chainScanRuns++;
+      const incremental = shouldUseIncrementalChainDiscoveryScan({
+        run,
+        watermarkSeeded: await agent.hasContextGraphRegistryScanWatermark(),
+        fullScanEvery: CHAIN_FULL_SCAN_EVERY,
+      });
+      const found = await agent.discoverContextGraphsFromChain(
+        chainDiscoveryScanOptions(incremental),
+      );
       if (found > 0)
         log(`Chain scan: discovered ${found} new context graph(s)`);
     } catch {
       /* non-critical */
     }
-  }, 15_000);
-  const chainScanTimer = setInterval(async () => {
-    try {
-      const found = await agent.discoverContextGraphsFromChain();
-      if (found > 0)
-        log(`Chain scan: discovered ${found} new context graph(s)`);
-    } catch {
-      /* non-critical */
-    }
-  }, CHAIN_SCAN_INTERVAL_MS);
+  };
+  setTimeout(runChainDiscoveryScan, 15_000);
+  const chainScanTimer = setInterval(runChainDiscoveryScan, CHAIN_SCAN_INTERVAL_MS);
   if (chainScanTimer.unref) chainScanTimer.unref();
 
   // Periodic peer health ping (every 2 minutes)
@@ -1843,28 +1917,77 @@ export async function runDaemonInner(
         return 0;
       }
     },
-    getContextGraphCount: async () => (await agent.listContextGraphs()).length,
+    getContextGraphCount: async () => {
+      const graphUris = await agent.store.listGraphs();
+      const knownContextGraphIds = new Set<string>();
+      const subscribedContextGraphs = agent.getSubscribedContextGraphs();
+      const shadowContextGraphIds = new Set(
+        shadowContextGraphIdsFromMetricSubscriptionCandidates(subscribedContextGraphs.entries()),
+      );
+      for (const contextGraphId of contextGraphIdsFromMetricSubscriptionCandidates(
+        subscribedContextGraphs.entries(),
+      )) {
+        knownContextGraphIds.add(contextGraphId);
+      }
+      for (const contextGraphId of contextGraphIdsFromLocalRootMetaGraphs(
+        graphUris,
+        subscribedContextGraphs.keys(),
+      )) {
+        if (!shadowContextGraphIds.has(contextGraphId)) knownContextGraphIds.add(contextGraphId);
+      }
+      const declarationQuery = buildContextGraphDeclarationsSparql(graphUris, knownContextGraphIds);
+      const declarationResult = declarationQuery
+        ? await agent.store.query(declarationQuery)
+        : null;
+      if (declarationResult?.type === "bindings") {
+        for (const contextGraphId of contextGraphIdsFromDeclarationBindings(
+          declarationResult.bindings as Record<string, string>[],
+        )) {
+          if (!shadowContextGraphIds.has(contextGraphId)) knownContextGraphIds.add(contextGraphId);
+        }
+      }
+      return countContextGraphsFromGraphUris(graphUris, knownContextGraphIds, shadowContextGraphIds);
+    },
     // The count getters below each issue a data-proportional full-scan COUNT,
     // but the only caller is the 30 s metrics tick (metricsSource is consumed
     // solely by MetricsCollector — no on-demand /api/status path), so each tick
     // already re-reads the store fresh and there is nothing concurrent to
     // coalesce. They are intentionally left uncached so a snapshot never serves
-    // a stale count and can't mask a store outage. The one heavy metrics read,
-    // getContextGraphCount, is relieved at the chokepoint by R6-A's listGraphs
-    // cache; these COUNTs are cheap (~0.015 CPU-s/tick on a 75k-triple store).
+    // a stale count and can't mask a store outage. The context-graph count
+    // avoids the composite context-graph listing enrichment path. It uses the
+    // cached store graph inventory plus backed subscription/declaration evidence,
+    // then dedupes local layer graphs. It intentionally includes private CG graphs
+    // that are backed by local subscription/declaration state.
+    // These COUNTs are cheap (~0.015 CPU-s/tick on a 75k-triple store).
     getTotalTriples: async () => {
       const r = await agent.query(GET_TOTAL_TRIPLES_SPARQL);
       return parseRdfInt(r?.bindings?.[0]?.c);
     },
+    // RFC ka-metadata-trim (Phase 2 ⊕ / Phase 3 P3.1): the KC/KA counters are
+    // predicate-based, not rdf:type-based — `generateKCMetadata` no longer
+    // emits `rdf:type dkg:KnowledgeCollection` / `dkg:KnowledgeAsset` rows.
+    //   - KC ≙ a subject carrying `dkg:status` (every KC row, old shape or
+    //     new, has exactly one tentative/confirmed status quad).
+    //   - KA ≙ read-both: a legacy `<ual>/<n>` token row carrying
+    //     `dkg:partOf`, OR (collapsed shape, P3.1) a UAL subject carrying
+    //     `dkg:status` + the entity pair with NO token row pointing at it
+    //     (the NOT-EXISTS guard prevents double-counting old-shape rows,
+    //     whose aggregate UAL node also carries `dkg:rootEntity`).
     getTotalKCs: async () => {
       const r = await agent.query(
-        "SELECT (COUNT(DISTINCT ?kc) AS ?c) WHERE { GRAPH ?g { ?kc a <http://dkg.io/ontology/KnowledgeCollection> } }",
+        "SELECT (COUNT(DISTINCT ?kc) AS ?c) WHERE { GRAPH ?g { ?kc <http://dkg.io/ontology/status> ?s } }",
       );
       return parseRdfInt(r?.bindings?.[0]?.c);
     },
     getTotalKAs: async () => {
       const r = await agent.query(
-        "SELECT (COUNT(DISTINCT ?ka) AS ?c) WHERE { GRAPH ?g { ?ka a <http://dkg.io/ontology/KnowledgeAsset> } }",
+        `SELECT (COUNT(DISTINCT ?ka) AS ?c) WHERE { GRAPH ?g {
+          { ?ka <http://dkg.io/ontology/partOf> ?kc }
+          UNION
+          { ?ka <http://dkg.io/ontology/status> ?st .
+            ?ka <http://dkg.io/ontology/rootEntity> ?re .
+            FILTER NOT EXISTS { ?tok <http://dkg.io/ontology/partOf> ?ka } }
+        } }`,
       );
       return parseRdfInt(r?.bindings?.[0]?.c);
     },

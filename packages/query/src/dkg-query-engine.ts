@@ -564,7 +564,7 @@ export class DKGQueryEngine implements QueryEngine {
   }
 
   private async discoverGraphsByPrefix(prefix: string): Promise<string[]> {
-    const allGraphs = await this.store.listGraphs();
+    const allGraphs = await listGraphsByPrefix(this.store, prefix);
     return allGraphs.filter(
       (g) => g.startsWith(prefix) && !g.includes('/_meta') && !g.includes('/staging/'),
     );
@@ -646,7 +646,7 @@ export class DKGQueryEngine implements QueryEngine {
       : await this.discoverRegisteredSubGraphNames(contextGraphId);
     const registeredAssertionGraphs = await this.discoverRegisteredAssertionGraphs(contextGraphId);
     const knownChildContextGraphs = await this.discoverKnownChildContextGraphUris(contextGraphId);
-    const allGraphs = await this.store.listGraphs();
+    const allGraphs = await listGraphFamily(this.store, `did:dkg:context-graph:${contextGraphId}`);
 
     for (const graph of allGraphs) {
       if (
@@ -764,11 +764,22 @@ export class DKGQueryEngine implements QueryEngine {
     // Look up KA metadata across all meta graphs, including subGraphName if recorded.
     // Design B (OT-RFC-44): one KA can hold MULTIPLE rootEntities, so collect
     // every `?ka <rootEntity>` binding (not just bindings[0]) — PR #968 salvage.
+    // Read-both (RFC ka-metadata-trim P3.1): the collapsed shape carries
+    // `dkg:rootEntity` directly on the UAL subject (no `<ual>/<n>` token rows,
+    // no `dkg:partOf`); legacy-shape rows synced from older nodes still use
+    // the token-row + partOf form, so both branches are queried.
     const metaResult = await this.store.query(
       `SELECT ?ka ?rootEntity ?ctxGraph ?sgName WHERE {
         GRAPH ?g {
-          ?ka <http://dkg.io/ontology/rootEntity> ?rootEntity .
-          ?ka <http://dkg.io/ontology/partOf> <${assertSafeIri(ual)}> .
+          {
+            ?ka <http://dkg.io/ontology/rootEntity> ?rootEntity .
+            ?ka <http://dkg.io/ontology/partOf> <${assertSafeIri(ual)}> .
+          }
+          UNION
+          {
+            <${assertSafeIri(ual)}> <http://dkg.io/ontology/rootEntity> ?rootEntity .
+            BIND(<${assertSafeIri(ual)}> AS ?ka)
+          }
           <${assertSafeIri(ual)}> <http://dkg.io/ontology/contextGraph> ?ctxGraph .
           OPTIONAL { <${assertSafeIri(ual)}> <http://dkg.io/ontology/subGraphName> ?sgName }
         }
@@ -934,6 +945,20 @@ function assertNoCallerDatasetClauses(sparql: string): void {
       'FROM clauses are not allowed on scoped local queries',
     );
   }
+}
+
+async function listGraphsByPrefix(store: TripleStore, prefix: string): Promise<string[]> {
+  return store.listGraphsByPrefix
+    ? store.listGraphsByPrefix(prefix)
+    : (await store.listGraphs()).filter((graph) => graph.startsWith(prefix));
+}
+
+async function listGraphFamily(store: TripleStore, rootGraph: string): Promise<string[]> {
+  const graphs = await listGraphsByPrefix(store, `${rootGraph}/`);
+  if (await store.hasGraph(rootGraph)) {
+    graphs.unshift(rootGraph);
+  }
+  return graphs;
 }
 
 function hasCallerDatasetClause(sparql: string): boolean {

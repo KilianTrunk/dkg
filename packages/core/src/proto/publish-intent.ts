@@ -78,7 +78,13 @@ export const PublishIntentSchema = new Type('PublishIntent')
   // SWM gossip, verify the Merkle root, and ignore `stagingQuads`).
   // Sent over `PROTOCOL_STORAGE_ACK_V2` so pre-LU-11 receivers never
   // see this field and stay on v1 semantics.
-  .add(new Field('ackProtocolVersion', 17, 'uint32'));
+  .add(new Field('ackProtocolVersion', 17, 'uint32'))
+  // OT-RFC-38 LU-11: optional direct-ACK fallback carrying the already
+  // encrypted ciphertext chunks. This is additive and safe for old
+  // receivers: pre-field-18 decoders ignore it, while upgraded V2
+  // handlers still recompute and compare `ciphertextChunksRoot` before
+  // signing. Plaintext never travels here.
+  .add(new Field('ciphertextChunks', 18, 'bytes', 'repeated'));
 
 type Long = { low: number; high: number; unsigned: boolean };
 
@@ -165,6 +171,15 @@ export interface PublishIntentMsg {
    * on the LU-5 path.
    */
   ackProtocolVersion?: number;
+  /**
+   * OT-RFC-38 LU-11 direct-ACK fallback. Each entry is an encrypted
+   * ciphertext chunk in `swmMessageIndex` order. Cores may use these
+   * bytes only when local chunk-store lookup races SWM/gossip ingest;
+   * they MUST still recompute `ciphertextChunksRoot`, validate
+   * `ciphertextChunkCount` and `publicByteSize`, and decline on any
+   * mismatch before signing.
+   */
+  ciphertextChunks?: Uint8Array[];
 }
 
 /** Sent in `ackProtocolVersion` for LU-11 chunked ACKs. */

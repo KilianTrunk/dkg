@@ -38,6 +38,7 @@ import type { ApprovalPolicy, ChainAdapter } from '@origintrail-official/dkg-cha
 import type { QueryAccessConfig } from '@origintrail-official/dkg-query';
 import type { SkillHandler } from './messaging.js';
 import type { CclFactResolutionMode } from './ccl-fact-resolution.js';
+import type { SyncCheckpointStore } from './sync/checkpoint/state.js';
 import type { JsonLdContent } from './dkg-agent-utils.js';
 import type { SwmHostModeStoreLimits } from './swm/host-mode-store.js';
 import type { KaNumberAllocator } from './allocator.js';
@@ -148,6 +149,7 @@ export interface SyncRequestEnvelope {
   requesterPeerId?: string;
   requestId?: string;
   issuedAtMs?: number;
+  syncSessionId?: string;
   requesterIdentityId?: string;
   requesterAgentAddress?: string;
   requesterSignatureR?: string;
@@ -277,6 +279,10 @@ export interface PublishOpts {
   subGraphName?: string;
   /** Optional on-chain publish lifetime override in epochs. */
   publishEpochs?: number;
+  /** Optional known numeric on-chain context graph id for direct publish callers. */
+  onChainContextGraphId?: string;
+  /** RFC-001 §4 per-publish attribution override; `0n` = mode d. */
+  publisherNodeIdentityIdOverride?: bigint;
 }
 
 export interface PublishAsyncOpts extends PublishOpts {
@@ -288,8 +294,6 @@ export interface PublishAsyncOpts extends PublishOpts {
   priorVersion?: string;
   /** V10 selective-disclosure: per-entity kaRoot instead of flat-hash KC. */
   entityProofs?: boolean;
-  /** RFC-001 §4 per-publish attribution override; `0n` = mode d. */
-  publisherNodeIdentityIdOverride?: bigint;
   localOnly?: boolean;
   /** Registered local agent whose key signs the seal. Mirrors sync `assertionFinalize`. */
   authorAgentAddress?: string;
@@ -648,8 +652,38 @@ export interface ContextGraphSubscriptionRecord {
 
 export interface ContextGraphSubscriptionStore {
   loadAll(): Promise<ContextGraphSubscriptionRecord[]>;
+  load?(contextGraphId: string): Promise<ContextGraphSubscriptionRecord | null>;
   save(record: ContextGraphSubscriptionRecord): Promise<void>;
   delete(contextGraphId: string): Promise<void>;
+}
+
+export interface ContextGraphSubscriptionRehydrationStatus {
+  /** Non-system persisted rows governed by the rehydration cap. */
+  persistedTotal: number;
+  /** Persisted system rows seen during rehydration; excluded from cap math. */
+  systemExcluded: number;
+  hostedActivated: number;
+  hostedActivatedIds: string[];
+  activated: number;
+  dormant: number;
+  activationCap: number;
+  capDisabled: boolean;
+  dormantIds: string[];
+  /** Startup rehydration completion timestamp; remains stable after boot. */
+  completedAt: number;
+  /** Most recent timestamp for post-boot diagnostic count/id updates. */
+  updatedAt: number;
+}
+
+export interface ContextGraphWritePreflightProbe {
+  exists: boolean;
+  hasLocalContent: boolean;
+  inMemorySubscription?: Pick<ContextGraphSub, 'subscribed' | 'synced'>;
+  persistedSubscription?: Pick<ContextGraphSubscriptionRecord, 'subscribed' | 'synced'>;
+  declarationFound: boolean;
+  accessPolicy?: 'public' | 'private';
+  curator?: string;
+  callerAuthorized?: boolean;
 }
 
 export type ContextGraphMemberPrincipalType = 'node' | 'agent' | 'identity';
@@ -680,11 +714,15 @@ export interface DurableSyncDiagnostics {
   insertedDataTriples: number;
   bytesReceived: number;
   resumedPhases: number;
+  timedOutPhases: number;
+  completedPhases: number;
+  checkpointAdvances: number;
   emptyResponses: number;
   metaOnlyResponses: number;
   dataRejectedMissingMeta: number;
   rejectedKcs: number;
   failedPeers: number;
+  failedPhases: number;
 }
 
 export interface SharedMemorySyncDiagnostics {
@@ -694,9 +732,13 @@ export interface SharedMemorySyncDiagnostics {
   insertedDataTriples: number;
   bytesReceived: number;
   resumedPhases: number;
+  timedOutPhases: number;
+  completedPhases: number;
+  checkpointAdvances: number;
   emptyResponses: number;
   droppedDataTriples: number;
   failedPeers: number;
+  failedPhases: number;
 }
 
 export interface CatchupSyncDiagnostics {
@@ -785,6 +827,13 @@ export interface DKGAgentConfig {
   sharedMemoryPublicSnapshotStorage?: SharedMemoryPublicSnapshotStorageConfig;
   /** When false, peer-connect sync skips SWM catch-up and relies on gossip for new SWM writes. */
   syncSharedMemoryOnConnect?: boolean;
+  /**
+   * When false, durable sync skips the large system `agents/_meta` graph while
+   * still syncing `agents` data as the phonebook. Defaults to true for
+   * compatibility; only honored for edge nodes that do not need full KA/KC
+   * lifecycle metadata for the system agents graph. Core nodes always sync it.
+   */
+  syncAgentsMeta?: boolean;
   /** Node deployment tier: 'core' (cloud, relay) or 'edge' (personal, behind NAT). Default: 'edge'. */
   nodeRole?: 'core' | 'edge';
   /**
@@ -794,6 +843,14 @@ export interface DKGAgentConfig {
    * the shared dashboard DB; omit for in-process tests / pre-Option-1 flows.
    */
   kaNumberAllocator?: KaNumberAllocator;
+  /**
+   * RFC ka-metadata-trim Phase 3 (P3.3) — daemon `metadata.provenanceEvents`
+   * config, forwarded into `DKGPublisherConfig.provenanceEvents`. Default
+   * `true`. When `false` ("lite mode"), the assertion-lifecycle writers skip
+   * the per-transition PROV event nodes (NOT the seal/state rows); the
+   * history API returns `events: []` gracefully.
+   */
+  metadataProvenanceEvents?: boolean;
   /**
    * Core Node relay-server capacity tuning. Forwarded straight into
    * `DKGNodeConfig.relayServerCapacity` — sets the maximum number of
@@ -915,6 +972,8 @@ export interface DKGAgentConfig {
      * (`'per-publish'`, bounded-per-publish with on-chain 1n floor).
      */
     approvalPolicy?: ApprovalPolicy;
+    /** Optional ContextGraphNameRegistry `eth_getLogs` block-window tuning. */
+    cgRegistryScanPageSize?: number;
   };
   /** Cross-agent query access configuration. */
   queryAccess?: QueryAccessConfig;
@@ -933,6 +992,8 @@ export interface DKGAgentConfig {
    *  - `registered`: TTL/byte-cap for on-chain registered CGs (typically larger).
    *  - `pruneIntervalMs`: how often the TTL/cap sweep runs.
    *  - `reconcileIntervalMs`: how often the host-mode subscription reconciler ensures cores are subscribed to all known curated CGs.
+   *  - `reconcileBatchSize`: max known CGs reconciled per tick. Default 32.
+   *  - `reconcileJitterRatio`: startup interval jitter ratio in [0, 1]. Default 0.15.
    */
   swmHostMode?: {
     enabled?: boolean;
@@ -940,6 +1001,8 @@ export interface DKGAgentConfig {
     registered?: SwmHostModeStoreLimits;
     pruneIntervalMs?: number;
     reconcileIntervalMs?: number;
+    reconcileBatchSize?: number;
+    reconcileJitterRatio?: number;
     /**
      * OT-RFC-38 / LU-6 Phase B — discovery-beacon rate limits for
      * pre-registration (freemium-tier) ciphertext writes. All three
@@ -957,13 +1020,16 @@ export interface DKGAgentConfig {
   };
   /** Durable local store for subscribed context-graph runtime state. */
   contextGraphSubscriptionStore?: ContextGraphSubscriptionStore;
+  /** Durable local store for paged sync checkpoints. Defaults to in-memory. */
+  syncCheckpointStore?: SyncCheckpointStore;
   /**
-   * Cap on how many persisted context-graph subscriptions are *activated*
-   * (gossip-subscribed + sync-tracked) when rehydrating at startup. A large
-   * backlog of stale subscriptions otherwise fans out store-touching gossip
-   * /sync work that starves authenticated store-backed routes (issue #997).
-   * Subscriptions beyond the cap stay persisted but inactive and can be
-   * pruned via `DELETE /api/context-graph/subscriptions`. Default
+   * Intentional cap on how many persisted context-graph subscriptions are
+   * *activated* (gossip-subscribed + sync-tracked) when rehydrating at startup.
+   * A large backlog of stale subscriptions otherwise fans out store-touching
+   * gossip/sync work that starves authenticated store-backed routes (issue
+   * #997). Rows beyond the cap stay persisted but inactive, are reported via
+   * subscription diagnostics, and can be pruned via
+   * `DELETE /api/context-graph/subscriptions`. Default
    * `DEFAULT_MAX_REHYDRATED_SUBSCRIPTIONS`. `0` disables the cap.
    */
   maxRehydratedContextGraphSubscriptions?: number;

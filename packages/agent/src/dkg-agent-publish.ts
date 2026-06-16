@@ -1180,7 +1180,7 @@ export class PublishMethods extends DKGAgentBase {
     this.log.info(ctx, `Starting publish to context graph "${contextGraphId}" with ${quads.length} triples`);
 
     const isSystem = contextGraphId === SYSTEM_CONTEXT_GRAPHS.AGENTS || contextGraphId === SYSTEM_CONTEXT_GRAPHS.ONTOLOGY;
-    if (!isSystem) {
+    if (!isSystem && !this.subscribedContextGraphs.has(contextGraphId)) {
       const exists = await this.contextGraphExists(contextGraphId);
       if (!exists) {
         throw new Error(
@@ -1190,7 +1190,7 @@ export class PublishMethods extends DKGAgentBase {
     }
     const v10ACKProvider = this.createV10ACKProvider(contextGraphId);
 
-    const onChainId = await this.getContextGraphOnChainId(contextGraphId);
+    const onChainId = opts?.onChainContextGraphId ?? await this.getContextGraphOnChainId(contextGraphId);
 
     // RFC-001 §9.x — sign-at-creation. The publisher refuses on-chain
     // publishes without a `precomputedAttestation`, so the agent
@@ -1255,8 +1255,7 @@ export class PublishMethods extends DKGAgentBase {
     // OT-RFC-38 LU-11 — also resolve the chunked emitter for curated
     // CGs. When set, the publisher prefers this path: chunks fan out
     // via SWM gossip and the V2 ACK carries only the commitment.
-    // Public CGs short-circuit to `undefined` here just like the
-    // single-blob resolver above.
+    // Public CGs resolve to `undefined` inside the chain-confirmed resolver.
     const encryptInlineChunked = await this._resolveEncryptInlineChunked(
       contextGraphId,
       opts?.subGraphName,
@@ -1274,7 +1273,9 @@ export class PublishMethods extends DKGAgentBase {
       subGraphName: opts?.subGraphName,
       operationCtx: ctx,
       onPhase,
+      skipContextGraphEnsure: true,
       v10ACKProvider,
+      publisherNodeIdentityIdOverride: opts?.publisherNodeIdentityIdOverride,
       publishContextGraphId: onChainId ?? undefined,
       publishEpochs: opts?.publishEpochs,
       precomputedAttestation,
@@ -1517,6 +1518,7 @@ export class PublishMethods extends DKGAgentBase {
     ];
 
     await this.store.insert(quads);
+    this.contextGraphMetaProjection.markDirtyFromQuads(quads);
     await gm.ensureContextGraph(contextGraphId);
     await this.store.flush?.();
     this.subscribeToContextGraph(contextGraphId);
@@ -2064,7 +2066,9 @@ export class PublishMethods extends DKGAgentBase {
     const merkleHexBare = ethers.hexlify(merkleRoot).slice(2);
     // Re-stamp the WM pointer (idempotent: drop any prior value first so a
     // re-finalize / update advances WM without accumulating stale pointers).
-    await this._stampPointer(lifecycleUri, WM_CURRENT_ASSERTION_PRED, merkleHexBare, metaGraph);
+    // RFC ka-metadata-trim Phase 2: only materialised when it diverges from
+    // VM — readers COALESCE a missing wm pointer to vm.
+    await this._stampPointerIfDivergedFromVm(lifecycleUri, WM_CURRENT_ASSERTION_PRED, merkleHexBare, metaGraph);
 
     if (freshNumber !== undefined) {
       // chainId here is the EVM uint256 from getEvmChainId(); the reservedUal
@@ -2435,7 +2439,7 @@ export class PublishMethods extends DKGAgentBase {
   ): Promise<{ chainKey: Uint8Array; aeadCgId: string; senderAddress: string } | undefined> {
     const ctx = createOperationContext('publish');
     const targetCgId = publishContextGraphId ?? contextGraphId;
-    const probeIsCurated = async (cgId: string): Promise<boolean | null> => {
+    const probeIsCurated = async (cgId: string, opts?: { rawOnChainSlot?: boolean }): Promise<boolean | null> => {
       // Consume the SHARED tri-state resolver (the same one behind the
       // SWM-gossip gate) so the publish-inline path can never DIVERGE from it,
       // and — critically (#884 review 🔴 GZh-c) — so a genuine UNKNOWN is
@@ -2445,7 +2449,12 @@ export class PublishMethods extends DKGAgentBase {
       // fails closed.
       let policyState: 0 | 1 | 'unregistered' | 'unknown';
       try {
-        policyState = await this.resolveOnChainAccessPolicyState(cgId, ctx);
+        if (opts?.rawOnChainSlot && /^\d+$/.test(cgId.trim())) {
+          const policy = await this.readLiveOnChainAccessPolicy(cgId.trim(), ctx);
+          policyState = policy === 0 || policy === 1 ? policy : 'unknown';
+        } else {
+          policyState = await this.resolveOnChainAccessPolicyState(cgId, ctx);
+        }
       } catch (err) {
         this.log.warn(ctx, `${logPrefix}: chain access-policy probe for ${cgId} failed — treating as UNKNOWN (fail-closed): ${err instanceof Error ? err.message : String(err)}`);
         return null;
@@ -2478,11 +2487,19 @@ export class PublishMethods extends DKGAgentBase {
       } catch { /* fall through to the plaintext-inline default */ }
       return false;
     };
-    const sourceIsCurated = await probeIsCurated(contextGraphId);
-    const targetIsCurated = targetCgId === contextGraphId
-      ? sourceIsCurated
-      : await probeIsCurated(targetCgId);
-    if (targetIsCurated == null || (targetCgId !== contextGraphId && sourceIsCurated == null)) {
+    const explicitRawTarget = publishContextGraphId !== undefined && /^\d+$/.test(targetCgId.trim());
+    let sourceIsCurated: boolean | null;
+    let targetIsCurated: boolean | null;
+    if (targetCgId !== contextGraphId && explicitRawTarget) {
+      targetIsCurated = await probeIsCurated(targetCgId, { rawOnChainSlot: true });
+      sourceIsCurated = targetIsCurated ? null : await probeIsCurated(contextGraphId);
+    } else {
+      sourceIsCurated = await probeIsCurated(contextGraphId);
+      targetIsCurated = targetCgId === contextGraphId
+        ? sourceIsCurated
+        : await probeIsCurated(targetCgId);
+    }
+    if (targetIsCurated == null || (targetCgId !== contextGraphId && sourceIsCurated == null && !targetIsCurated)) {
       throw new Error(
         `${logPrefix}: publish access-policy is unknown — ` +
         `source CG "${contextGraphId}" curated=${sourceIsCurated ?? 'unknown'}, ` +
@@ -2490,7 +2507,14 @@ export class PublishMethods extends DKGAgentBase {
         `Refusing to choose plaintext vs encrypted inline payload without chain-confirmed policy.`,
       );
     }
-    if (targetCgId !== contextGraphId && sourceIsCurated !== targetIsCurated) {
+    if (targetCgId !== contextGraphId && sourceIsCurated == null && targetIsCurated) {
+      this.log.warn(
+        ctx,
+        `${logPrefix}: source CG "${contextGraphId}" access-policy is unknown, but explicit target ` +
+        `on-chain CG "${targetCgId}" is chain-confirmed curated; selecting encrypted direct publish payload.`,
+      );
+    }
+    if (targetCgId !== contextGraphId && sourceIsCurated != null && sourceIsCurated !== targetIsCurated) {
       throw new Error(
         `${logPrefix}: remap publish source/target access-policy mismatch — ` +
         `source CG "${contextGraphId}" curated=${sourceIsCurated}, ` +
@@ -2653,6 +2677,7 @@ export class PublishMethods extends DKGAgentBase {
         ciphertextChunksRoot: Uint8Array;
         ciphertextChunkCount: number;
         totalCiphertextBytes: number;
+        ciphertextChunks: Uint8Array[];
       }>)
     | undefined
   > {
@@ -2681,6 +2706,7 @@ export class PublishMethods extends DKGAgentBase {
       ciphertextChunksRoot: Uint8Array;
       ciphertextChunkCount: number;
       totalCiphertextBytes: number;
+      ciphertextChunks: Uint8Array[];
     }> => {
       if (input.batchId.length !== 32) {
         throw new Error(
@@ -2706,6 +2732,27 @@ export class PublishMethods extends DKGAgentBase {
         const payload = new Uint8Array(input.batchId.length + ct.length);
         payload.set(input.batchId, 0);
         payload.set(ct, input.batchId.length);
+        const persistCanonical = this.canonicalChunkStoreCgIdOrNull(contextGraphId);
+        const chunksGraph = ciphertextChunkStoreGraph(persistCanonical ?? contextGraphId);
+        const subject = ciphertextChunkStoreSubject(input.batchId, i);
+        const literal = `"${Buffer.from(ct).toString('base64')}"`;
+        try {
+          await this.store.insert([{
+            subject,
+            predicate: CIPHERTEXT_CHUNK_PREDICATE,
+            object: literal,
+            graph: chunksGraph,
+          }]);
+        } catch (err) {
+          log.warn(
+            ctx,
+            `LU-11: failed to persist local ciphertext chunk cgId=${contextGraphId} ` +
+            `batchId=${batchIdHex.slice(0, 18)}... op=${input.publishOperationId} chunkIndex=${i}: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          throw err;
+        }
         const timestamp = new Date().toISOString();
         const signingPayload = computeGossipSigningPayloadV2(
           GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED,
@@ -2748,6 +2795,7 @@ export class PublishMethods extends DKGAgentBase {
         ciphertextChunksRoot: root,
         ciphertextChunkCount: leafCount,
         totalCiphertextBytes,
+        ciphertextChunks,
       };
     };
   }
@@ -2800,7 +2848,7 @@ export class PublishMethods extends DKGAgentBase {
         ${sharedMemoryReadBothFilter(swmGraph)}
       }`;
     }
-    const result = await this.store.query(sparql);
+    const result = await this.store.query(sparql, { source: 'agent.resolveLiftWorkspaceSlice' });
     return result.type === 'quads' ? result.quads : [];
   }
 
@@ -2957,10 +3005,13 @@ export class PublishMethods extends DKGAgentBase {
         try {
           const priorBare = vmCurrent.startsWith('0x') ? vmCurrent.slice(2) : vmCurrent;
           const priorUri = `${lifecycleUri}#assertion-${priorBare}`;
-          // Re-point VM + WM to the new merkle (drop-then-set), then record the
-          // revision chain via prov:wasRevisionOf <prior>.
+          // Re-point VM to the new merkle (drop-then-set), then record the
+          // revision chain via prov:wasRevisionOf <prior>. RFC ka-metadata-trim
+          // Phase 2: WM converges back to VM after the update mint, so the
+          // divergence-only stamp DELETES any stale WM row instead of
+          // duplicating the new merkle (readers COALESCE missing wm → vm).
           await this._stampPointer(lifecycleUri, VM_CURRENT_ASSERTION_PRED, newMerkleHexBare, metaGraph);
-          await this._stampPointer(lifecycleUri, WM_CURRENT_ASSERTION_PRED, newMerkleHexBare, metaGraph);
+          await this._stampPointerIfDivergedFromVm(lifecycleUri, WM_CURRENT_ASSERTION_PRED, newMerkleHexBare, metaGraph);
           await this.store.insert([
             { subject: lifecycleUri, predicate: 'http://www.w3.org/ns/prov#wasRevisionOf', object: priorUri, graph: metaGraph },
             { subject: priorUri, predicate: VM_CURRENT_ASSERTION_PRED, object: `"${priorBare}"`, graph: metaGraph },
@@ -3125,6 +3176,26 @@ export class PublishMethods extends DKGAgentBase {
             await this.store.insert([
               { subject: lifecycleUri, predicate: ASSERTION_GRAPH_PRED, object: vmGraph, graph: metaGraph },
             ]);
+            // RFC ka-metadata-trim Phase 2 (corrected by adversarial review
+            // F4) — WM-graph marker flip at the VM transition.
+            // `assertionCreate` stamps `<wmGraph> dkg:memoryLayer "WM"` on the
+            // per-KA number-keyed WM graph URI (assertionPromote flips it in
+            // place to "SWM"). The flip above only covers the lifecycle URN
+            // and the legacy name-keyed assertion URI; the data-graph-URI
+            // marker would otherwise read "SWM" forever — misleading, since
+            // the data now lives at VM. We UPDATE it to "VM" rather than
+            // DELETE it: `assertAssertionDataPersisted` (dkg-publisher.ts)
+            // reads this exact row as its "already promoted → harmless no-op"
+            // witness, so deleting it would make a stale re-promote after a
+            // successful publish misfire AssertionNotPersistedError when the
+            // preserved extraction markers are present (Codex #898 case).
+            // Any non-"WM" value short-circuits that guard, so "VM" keeps the
+            // no-op witness AND tells the truth about the layer.
+            const wmGraph = contextGraphLayerUri(contextGraphId, MemoryLayer.WorkingMemory, vmAuthor, vmNumber, opts?.subGraphName);
+            await this.store.deleteByPattern({ subject: wmGraph, predicate: MEMORY_LAYER_PRED, graph: metaGraph });
+            await this.store.insert([
+              { subject: wmGraph, predicate: MEMORY_LAYER_PRED, object: `"${MemoryLayer.VerifiableMemory}"`, graph: metaGraph },
+            ]);
           }
         }
       } catch (err) {
@@ -3213,6 +3284,43 @@ export class PublishMethods extends DKGAgentBase {
   }
 
   /**
+   * RFC ka-metadata-trim Phase 2 — divergence-only wm/swm pointer stamp.
+   * `dkg:vmCurrentAssertion` is always materialised; the wm/swm pointers are
+   * only written when they DIVERGE from the current VM value (the common
+   * "all three equal" steady state is implicit). When the new value equals
+   * VM, any prior row for `pred` is deleted instead (drop-then-skip), so a
+   * stale divergent pointer never lingers. Readers COALESCE a missing wm/swm
+   * to the vm value (see `agent.assertion.history()`), which also keeps
+   * old-store rows (always materialised) readable unchanged.
+   */
+  async _stampPointerIfDivergedFromVm(
+    this: DKGAgent,
+    lifecycleUri: string,
+    pred: string,
+    merkleHex: string,
+    metaGraph: string,
+  ): Promise<void> {
+    const bare = merkleHex.startsWith('0x') ? merkleHex.slice(2) : merkleHex;
+    let vmBare: string | undefined;
+    try {
+      const res = await this.store.query(
+        `SELECT ?vm WHERE { GRAPH <${metaGraph}> { <${lifecycleUri}> <${VM_CURRENT_ASSERTION_PRED}> ?vm } } LIMIT 1`,
+      );
+      const raw = res.type === 'bindings' ? res.bindings[0]?.['vm'] : undefined;
+      vmBare = raw?.replace(/^"/, '').replace(/"(\^\^<[^>]+>)?$/, '');
+    } catch {
+      // On a failed VM read fall back to the always-write behaviour below —
+      // an extra convergent row is harmless (readers COALESCE), a missing
+      // divergent row is not.
+    }
+    if (vmBare !== undefined && vmBare === bare) {
+      await this.store.deleteByPattern({ subject: lifecycleUri, predicate: pred, graph: metaGraph });
+      return;
+    }
+    await this._stampPointer(lifecycleUri, pred, bare, metaGraph);
+  }
+
+  /**
    * OT-RFC-43 A2 (decision 2) — stamp `dkg:swmCurrentAssertion` on the
    * lifecycle URN when an assertion is promoted/shared into SWM. The pointer
    * value is the assertion's sealed merkle root hex (read from the seal on the
@@ -3239,7 +3347,10 @@ export class PublishMethods extends DKGAgentBase {
       const seal = parseAssertionSealQuads(metaQuads, assertionUri);
       if (!seal) return; // not finalized — nothing to point at
       const merkleHexBare = ethers.hexlify(seal.merkleRoot).slice(2);
-      await this._stampPointer(lifecycleUri, SWM_CURRENT_ASSERTION_PRED, merkleHexBare, metaGraph);
+      // RFC ka-metadata-trim Phase 2: divergence-only — a re-promote of
+      // already-published content (swm == vm) materialises no row; readers
+      // COALESCE a missing swm pointer to vm.
+      await this._stampPointerIfDivergedFromVm(lifecycleUri, SWM_CURRENT_ASSERTION_PRED, merkleHexBare, metaGraph);
     } catch (err) {
       this.log.warn(
         createOperationContext('share'),

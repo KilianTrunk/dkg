@@ -216,6 +216,9 @@ describe('DKGAgent._publish inline encryption routing', () => {
         publish: publisherPublish,
       },
       broadcastPublish: recorder(async () => undefined),
+      // OT-RFC-49: _publish now refreshes the public catalog projection after a
+      // confirmed publish (no-op unless configured). Stub it on the mock.
+      emitPublicProjectionAfterPublish: recorder(async () => undefined),
       _resolveEncryptInlinePayload: recorder(async () => encryptInlinePayload),
       _resolveEncryptInlineChunked: recorder(async () => encryptInlineChunked),
     } as any;

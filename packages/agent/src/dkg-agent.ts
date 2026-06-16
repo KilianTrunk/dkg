@@ -952,8 +952,13 @@ export class DKGAgent extends DKGAgentBase {
         // CGs so this same connect cycle's `newlyDiscovered` set picks it up
         // (refreshing its meta-synced flag) and the shared-memory pass recovers it.
         // `trackSyncContextGraph` is idempotent, so public/already-scoped CGs are
-        // unaffected.
-        if (await this.isPrivateContextGraph(id)) {
+        // unaffected. Gate on `existing.subscribed`: `unsubscribeFromContextGraph`
+        // keeps the record but flips `subscribed` to false and drops the CG from
+        // `syncContextGraphs`, so re-tracking an explicitly-unsubscribed (or
+        // host-only) private CG here would silently undo that operator choice on
+        // every discovery scan. Only re-track CGs the node is still a live
+        // subscriber of.
+        if (existing.subscribed && await this.isPrivateContextGraph(id)) {
           this.trackSyncContextGraph(id);
           this.log.info(ctx, `Re-tracked already-subscribed private CG "${id.slice(0, 28)}" into the SWM-sync scope on discovery`);
         }

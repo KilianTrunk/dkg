@@ -2933,7 +2933,14 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     // dkg:curator/dkg:creator `_meta` triples — a member that pre-created the CG
     // self-stamps both, which would otherwise resolve the member AS the curator.
     let cachedAgents: Array<{ agentAddress?: string; peerId: string }> | undefined;
-    const resolveAgentPeer = async (agentAddrLower: string): Promise<string | undefined> => {
+    // Resolve EVERY libp2p peer the AGENTS registry advertises for a curator
+    // wallet, not the first match: `findAgents()` is not a unique wallet->peer
+    // map (agent registration is consent-free, so several URIs can share a
+    // wallet, and a restarted curator can linger under a stale peerId). The
+    // caller only needs to know whether the CONNECTING peer is among them, so a
+    // first-match pick could resolve a stale/wrong peer and wrongly defer (or,
+    // for a same-wallet Byzantine advertiser, mis-gate) recovery.
+    const resolveAgentPeers = async (agentAddrLower: string): Promise<string[]> => {
       if (!cachedAgents) {
         try {
           cachedAgents = await this.discovery.findAgents();
@@ -2941,7 +2948,9 @@ export class LifecycleSyncMethods extends DKGAgentBase {
           cachedAgents = [];
         }
       }
-      return cachedAgents.find((a) => a.agentAddress?.toLowerCase() === agentAddrLower)?.peerId;
+      return cachedAgents
+        .filter((a) => a.agentAddress?.toLowerCase() === agentAddrLower)
+        .map((a) => a.peerId);
     };
     for (const contextGraphId of contextGraphIds) {
       if (!(await this.canUseSharedMemoryForContextGraph(contextGraphId))) {
@@ -2968,18 +2977,18 @@ export class LifecycleSyncMethods extends DKGAgentBase {
           }
           // Resolve the structural curator's peer via the agent registry. On a
           // reconnect the registry may not be populated yet, so refresh meta once.
-          let curatorPeerId = await resolveAgentPeer(structuralAgent);
-          if (!curatorPeerId) {
+          let curatorPeers = await resolveAgentPeers(structuralAgent);
+          if (curatorPeers.length === 0) {
             await this.refreshMetaFromCurator(contextGraphId).catch(() => undefined);
             cachedAgents = undefined; // force a fresh registry read after the refresh
-            curatorPeerId = await resolveAgentPeer(structuralAgent);
+            curatorPeers = await resolveAgentPeers(structuralAgent);
           }
-          if (!curatorPeerId) {
+          if (curatorPeers.length === 0) {
             this.log.info(ctx, `SWM recovery skipped for private CG "${contextGraphId.slice(0, 28)}": curator (${structuralAgent.slice(0, 10)}) peer not resolved yet`);
-          } else if (curatorPeerId !== remotePeerId) {
-            this.log.info(ctx, `SWM recovery deferred for private CG "${contextGraphId.slice(0, 28)}": connecting peer ${remotePeerId.slice(0, 12)} is not the curator (${curatorPeerId.slice(0, 12)})`);
+          } else if (!curatorPeers.includes(remotePeerId)) {
+            this.log.info(ctx, `SWM recovery deferred for private CG "${contextGraphId.slice(0, 28)}": connecting peer ${remotePeerId.slice(0, 12)} is not among the curator's ${curatorPeers.length} registered peer(s)`);
           } else {
-            this.log.info(ctx, `SWM recovery ENQUEUED for private CG "${contextGraphId.slice(0, 28)}" from curator ${curatorPeerId.slice(0, 12)}`);
+            this.log.info(ctx, `SWM recovery ENQUEUED for private CG "${contextGraphId.slice(0, 28)}" from curator peer ${remotePeerId.slice(0, 12)}`);
             privateRecoverFromCurator.push(contextGraphId);
           }
           continue;
@@ -3074,6 +3083,21 @@ export class LifecycleSyncMethods extends DKGAgentBase {
         summary.insertedMetaTriples += r.insertedMetaQuads;
         summary.insertedTriples += r.insertedDataQuads + r.insertedMetaQuads;
         summary.droppedDataTriples += r.droppedDataTriples;
+        // `recoverContextGraphSwmFromPeer` signals a partial / deadline-bounded
+        // fetch with `completed === false` WITHOUT throwing (all-or-nothing
+        // REPLACE mutates nothing on a partial). The on-connect accounting and
+        // the catch-up runner key success off the phase counters, so an
+        // incomplete recovery that left `failedPhases`/`completedPhases` at 0
+        // would be reported clean — stamping `lastSuccessfulSyncAt` and
+        // suppressing the next retry while the member stays stale. Count an
+        // incomplete recovery as a failed phase (forces a prompt retry); count a
+        // complete one as a completed phase so an idempotent 0-insert REPLACE
+        // still registers as progress.
+        if (r.completed) {
+          summary.completedPhases += 1;
+        } else {
+          summary.failedPhases += 1;
+        }
       } catch (err) {
         this.log.warn(ctx, `Curator-recovery for private CG "${contextGraphId}" from ${remotePeerId} failed: ${err instanceof Error ? err.message : String(err)}`);
         summary.failedPeers += 1;

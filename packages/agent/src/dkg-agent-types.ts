@@ -794,13 +794,15 @@ export type ReplicationEventSink = (event: ReplicationEvent) => void;
 export interface DKGAgentConfig {
   name: string;
   /**
-   * public-projection target. When set, a private CG's
-   * confirmed VM publishes emit/refresh a verifiable public projection (the
-   * floor: existence, UAL, access class, committed root) into this PUBLIC
-   * context graph, binding the private CG into the public graph as a
-   * discoverable, verifiable node without disclosing its contents. The target
-   * MUST be a public CG (a curated target would encrypt the projection and
-   * also self-recurse). Unset → projections are off.
+   * public-projection enable flag. When set, a private CG's confirmed VM
+   * publishes emit/refresh a verifiable public projection (the floor: existence,
+   * UAL, access class, committed root) into the SOURCE CG's OWN `_catalog` graph
+   * (`<source-cg>/_catalog`) — the exact named graph open-serve reads — binding
+   * the private CG into the public discovery surface without disclosing its
+   * contents. NB despite the name the projection is NOT written into the named
+   * target CG: the configured value acts only as (a) an on/off switch and (b) a
+   * self-projection guard (a publish whose own CG id equals this value is
+   * skipped). See `emitPublicProjectionAfterPublish` (B7/B8). Unset → off.
    */
   publicProjectionContextGraphId?: string;
   framework?: string;

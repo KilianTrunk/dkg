@@ -135,6 +135,19 @@ describe('planManagedOxigraph', () => {
       directory: '/custom/snaps',
     });
   });
+
+  it('preserves graphSetIndex options through the managed store rewrite plan', () => {
+    const plan = planManagedOxigraph(
+      {
+        store: {
+          backend: MANAGED_OXIGRAPH_BACKEND,
+          graphSetIndex: { enabled: true, revalidateMs: 5_000 },
+        },
+      },
+      '/data',
+    );
+    expect(plan!.storeConfigTemplate.graphSetIndex).toEqual({ enabled: true, revalidateMs: 5_000 });
+  });
 });
 
 // A real free port from the OS (probe listener closed before reuse).

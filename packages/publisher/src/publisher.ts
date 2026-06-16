@@ -102,6 +102,7 @@ export type V10ACKProvider = (
   chunkedCommitment?: {
     ciphertextChunksRoot: Uint8Array;
     ciphertextChunkCount: number;
+    ciphertextChunks?: Uint8Array[];
   },
 ) => Promise<V10CoreNodeACK[]>;
 
@@ -252,6 +253,7 @@ export interface PublishOptions {
   }) => Promise<{
     ciphertextChunksRoot: Uint8Array;
     ciphertextChunkCount: number;
+    ciphertextChunks?: Uint8Array[];
     /**
      * Ciphertext byte size the publisher signed into the V10 ACK
      * digest. Concatenation of every per-chunk ciphertext length —

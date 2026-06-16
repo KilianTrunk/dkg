@@ -98,6 +98,7 @@ interface BuildIntentOpts {
    * ACK handler validates at lines 431-436 of `storage-ack-handler.ts`.
    */
   chunks: Uint8Array[];
+  ciphertextChunksOnWire?: Uint8Array[];
   /**
    * Optional overrides for fields the test wants to *lie* about
    * (e.g. flip the root to provoke `CIPHERTEXT_ROOT_MISMATCH`, or
@@ -138,6 +139,7 @@ function buildV2IntentBytes(opts: BuildIntentOpts): Uint8Array {
     ackProtocolVersion: ACK_PROTOCOL_VERSION_V2_LU11,
     ciphertextChunksRoot: opts.override?.ciphertextChunksRoot ?? trueRoot,
     ciphertextChunkCount: opts.override?.ciphertextChunkCount ?? opts.chunks.length,
+    ciphertextChunks: opts.ciphertextChunksOnWire,
     ...(opts.swmGraphId ? { swmGraphId: opts.swmGraphId } : {}),
   });
 }
@@ -263,6 +265,81 @@ describe('StorageACKHandler V2 chunked ACK — canonical CG keying (#729 Bug 4 r
       ? ack.merkleRoot
       : new Uint8Array(ack.merkleRoot);
     expect(Buffer.from(ackRoot).equals(Buffer.from(kcMerkleRoot))).toBe(true);
+  });
+
+  it('signs the V2 ACK when local chunk store is empty but PublishIntent carries valid ciphertextChunks fallback', async () => {
+    coreWallet = ethers.Wallet.createRandom();
+    const store = new OxigraphStore();
+
+    const chunks = [
+      new Uint8Array([0xA1, 0xA2]),
+      new Uint8Array([0xB1, 0xB2, 0xB3]),
+    ];
+    const kcMerkleRoot = ethers.getBytes(ethers.id('v2-direct-wire-chunks'));
+
+    const handler = new StorageACKHandler(
+      store,
+      createV2Config(coreWallet, {
+        normalizeContextGraphIdForChunkStore: () => CANONICAL_WIRE_FOR_CLEARTEXT,
+        _v2ChunkLookupRetryPolicyForTests: { maxRetries: 0, delayMs: 0 },
+      }),
+      makeEventBus() as any,
+    );
+
+    const intent = buildV2IntentBytes({
+      cgId: NUMERIC_CG_ID,
+      swmGraphId: CLEARTEXT_CG_ID,
+      merkleRoot: kcMerkleRoot,
+      chunks,
+      ciphertextChunksOnWire: chunks,
+    });
+
+    const response = await handler.handler(intent, fakePeerId);
+    const ack = decodeStorageACK(response);
+
+    expect(isStorageACKDecline(ack)).toBe(false);
+    const persisted = await store.query(
+      `SELECT ?o WHERE { GRAPH <${ciphertextChunkStoreGraph(CANONICAL_WIRE_FOR_CLEARTEXT)}> { <${ciphertextChunkStoreSubject(kcMerkleRoot, 1)}> <${CIPHERTEXT_CHUNK_PREDICATE}> ?o } } LIMIT 1`,
+    );
+    expect(persisted.type).toBe('bindings');
+    expect(persisted.bindings).toHaveLength(1);
+  });
+
+  it('declines with MERKLE_MISMATCH_IN_SWM when direct-wire ciphertextChunks do not match ciphertextChunksRoot', async () => {
+    coreWallet = ethers.Wallet.createRandom();
+    const store = new OxigraphStore();
+
+    const claimedChunks = [
+      new Uint8Array([0xC1, 0xC2]),
+      new Uint8Array([0xD1, 0xD2]),
+    ];
+    const suppliedChunks = [
+      new Uint8Array([0xC1, 0xC2]),
+      new Uint8Array([0xEE, 0xEE]),
+    ];
+    const kcMerkleRoot = ethers.getBytes(ethers.id('v2-direct-wire-bad-root'));
+
+    const handler = new StorageACKHandler(
+      store,
+      createV2Config(coreWallet, {
+        normalizeContextGraphIdForChunkStore: () => CANONICAL_WIRE_FOR_CLEARTEXT,
+        _v2ChunkLookupRetryPolicyForTests: { maxRetries: 0, delayMs: 0 },
+      }),
+      makeEventBus() as any,
+    );
+
+    const intent = buildV2IntentBytes({
+      cgId: NUMERIC_CG_ID,
+      swmGraphId: CLEARTEXT_CG_ID,
+      merkleRoot: kcMerkleRoot,
+      chunks: claimedChunks,
+      ciphertextChunksOnWire: suppliedChunks,
+    });
+
+    const ack = decodeStorageACK(await handler.handler(intent, fakePeerId));
+
+    expect(isStorageACKDecline(ack)).toBe(true);
+    expect(ack.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM);
   });
 
   it('#729 Bug 4 regression: signs the V2 ACK even when swmGraphId is omitted and the normalizer returns null (widens to GRAPH ?g)', async () => {

@@ -1243,6 +1243,7 @@ export async function runDaemonInner(
     storeConfig: runtimeStore ? {
       backend: runtimeStore.backend,
       options: runtimeStore.options,
+      graphSetIndex: runtimeStore.graphSetIndex,
     } : undefined,
     largeLiteralStorage: runtimeLargeLiteralStorage,
     sharedMemoryPublicSnapshotStorage: runtimeSnapshotStorage,
@@ -1673,6 +1674,24 @@ export async function runDaemonInner(
               },
               log,
             }),
+            publishEncryptionFactory: async (publishOptions) => {
+              const encryptInlinePayload = await agent._resolveEncryptInlinePayload(
+                publishOptions.contextGraphId,
+                publishOptions.subGraphName,
+                undefined,
+                publishOptions.publishContextGraphId,
+              );
+              const encryptInlineChunked = await agent._resolveEncryptInlineChunked(
+                publishOptions.contextGraphId,
+                publishOptions.subGraphName,
+                undefined,
+                publishOptions.publishContextGraphId,
+              );
+              return {
+                encryptInlinePayload,
+                encryptInlineChunked,
+              };
+            },
             log,
           });
           publisherRuntime = runtime;

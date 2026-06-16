@@ -4,6 +4,7 @@ import {
   PROTOCOL_STORAGE_UPDATE_ACK,
   ACK_PROTOCOL_VERSION_V1_LU5,
   ACK_PROTOCOL_VERSION_V2_LU11,
+  DEFAULT_MAX_READ_BYTES,
   encodePublishIntent,
   encodeUpdateIntent,
   decodeStorageACK,
@@ -91,6 +92,11 @@ export interface ACKCollectionResult {
 const DEFAULT_REQUIRED_ACKS = 3;
 const ACK_TIMEOUT_MS = 120_000;
 const MAX_RETRIES = 3;
+// V2 chunked ACK fallback is intentionally bounded. The storage-ack
+// protocol reader buffers at most DEFAULT_MAX_READ_BYTES (10 MiB), so
+// keep direct-wire ciphertext comfortably below that and let large
+// publishes use the normal SWM/chunk-store path instead.
+const MAX_DIRECT_ACK_CIPHERTEXT_CHUNKS_BYTES = Math.floor(DEFAULT_MAX_READ_BYTES / 2);
 // #887: transient declines (the core's SWM replica is still catching up
 // via gossip — NO_DATA_IN_SWM / MERKLE_MISMATCH_IN_SWM /
 // MISSING_CIPHERTEXT_CHUNKS) get their own, larger retry budget than
@@ -203,6 +209,7 @@ export class ACKCollector {
     chunkedCommitment?: {
       ciphertextChunksRoot: Uint8Array;
       ciphertextChunkCount: number;
+      ciphertextChunks?: Uint8Array[];
     };
   }): Promise<ACKCollectionResult> {
     const {
@@ -260,6 +267,15 @@ export class ACKCollector {
           `ACKCollector: chunkedCommitment.ciphertextChunksRoot must be 32 bytes; got ${params.chunkedCommitment.ciphertextChunksRoot.length}`,
         );
       }
+      if (
+        params.chunkedCommitment.ciphertextChunks
+        && params.chunkedCommitment.ciphertextChunks.length !== params.chunkedCommitment.ciphertextChunkCount
+      ) {
+        throw new Error(
+          `ACKCollector: chunkedCommitment.ciphertextChunks length must equal ciphertextChunkCount; ` +
+          `got ${params.chunkedCommitment.ciphertextChunks.length}/${params.chunkedCommitment.ciphertextChunkCount}`,
+        );
+      }
     }
     const ackProtocolVersion = params.chunkedCommitment
       ? ACK_PROTOCOL_VERSION_V2_LU11
@@ -273,6 +289,19 @@ export class ACKCollector {
     const ackProtocolId = params.chunkedCommitment
       ? PROTOCOL_STORAGE_ACK_V2
       : PROTOCOL_STORAGE_ACK;
+    let directFallbackCiphertextChunks: Uint8Array[] | undefined;
+    if (params.chunkedCommitment?.ciphertextChunks) {
+      const directFallbackBytes = params.chunkedCommitment.ciphertextChunks
+        .reduce((acc, chunk) => acc + chunk.length, 0);
+      if (directFallbackBytes <= MAX_DIRECT_ACK_CIPHERTEXT_CHUNKS_BYTES) {
+        directFallbackCiphertextChunks = params.chunkedCommitment.ciphertextChunks;
+      } else {
+        log(
+          `[ACKCollector] Omitting ${directFallbackBytes} ciphertext chunk bytes from V2 PublishIntent ` +
+          `(direct fallback cap=${MAX_DIRECT_ACK_CIPHERTEXT_CHUNKS_BYTES}); peers will use local chunk-store/SWM lookup`,
+        );
+      }
+    }
     const p2pMsg: PublishIntentMsg = {
       merkleRoot,
       contextGraphId: contextGraphIdStr,
@@ -293,6 +322,7 @@ export class ACKCollector {
       ciphertextChunksRoot: params.chunkedCommitment?.ciphertextChunksRoot,
       ciphertextChunkCount: params.chunkedCommitment?.ciphertextChunkCount,
       ackProtocolVersion: params.chunkedCommitment ? ackProtocolVersion : undefined,
+      ciphertextChunks: directFallbackCiphertextChunks,
     };
     const intentBytes = encodePublishIntent(p2pMsg);
 

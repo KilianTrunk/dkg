@@ -460,20 +460,27 @@ describe('PublishIntent — LU-11 fields (ciphertextChunksRoot, ciphertextChunkC
     expect(decoded.ciphertextChunksRoot?.length ?? 0).toBe(0);
     expect(decoded.ciphertextChunkCount ?? 0).toBe(0);
     expect(decoded.ackProtocolVersion ?? 0).toBe(0);
+    expect(decoded.ciphertextChunks ?? []).toHaveLength(0);
   });
 
-  it('encode → decode round-trips the three LU-11 fields together', () => {
+  it('encode → decode round-trips the LU-11 fields together', () => {
     const root = new Uint8Array(32).fill(0xcd);
+    const chunks = [
+      new Uint8Array([0x01, 0x02, 0x03]),
+      new Uint8Array([0x04, 0x05]),
+    ];
     const intent: PublishIntentMsg = {
       ...baseIntent(),
       isEncryptedPayload: true,
       ciphertextChunksRoot: root,
-      ciphertextChunkCount: 5,
+      ciphertextChunkCount: chunks.length,
+      ciphertextChunks: chunks,
       ackProtocolVersion: ACK_PROTOCOL_VERSION_V2_LU11,
     };
     const decoded = decodePublishIntent(encodePublishIntent(intent));
     expect(new Uint8Array(decoded.ciphertextChunksRoot!)).toEqual(root);
-    expect(decoded.ciphertextChunkCount).toBe(5);
+    expect(decoded.ciphertextChunkCount).toBe(chunks.length);
+    expect(decoded.ciphertextChunks?.map((chunk) => new Uint8Array(chunk))).toEqual(chunks);
     expect(decoded.ackProtocolVersion).toBe(ACK_PROTOCOL_VERSION_V2_LU11);
     // Legacy fields still round-trip verbatim.
     expect(decoded.contextGraphId).toBe('42');

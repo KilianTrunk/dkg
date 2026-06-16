@@ -357,6 +357,12 @@ export interface QueryAccessConfig {
   rateLimitPerMinute?: number;
 }
 
+export interface GraphSetIndexConfig {
+  enabled?: boolean;
+  /** Revalidate the named-graph index after this many milliseconds. 0 means every read. */
+  revalidateMs?: number;
+}
+
 export interface DkgConfig {
   name: string;
   relay?: string;
@@ -455,13 +461,15 @@ export interface DkgConfig {
   /** Block explorer URL for TX links (default: derived from chainId). */
   blockExplorerUrl?: string;
   /** Triple store backend override (default: oxigraph-worker with file persistence). */
-  store?: { backend: string; options?: Record<string, unknown> };
+  store?: { backend: string; options?: Record<string, unknown>; graphSetIndex?: boolean | GraphSetIndexConfig };
   /**
-   * Cap on how many persisted context-graph subscriptions a node ACTIVATES on
-   * boot (gossip + sync). A large stale backlog otherwise fans out store work
-   * and starves authenticated routes (#997). coreHosted graphs are always
-   * restored regardless of this cap. Non-negative integer; 0 = no cap. Raise it
-   * on nodes that legitimately subscribe to more than the default (64).
+   * Intentional cap on how many persisted context-graph subscriptions a node
+   * ACTIVATES on boot (gossip + sync). A large stale backlog otherwise fans out
+   * store work and starves authenticated routes (#997). coreHosted graphs are
+   * always restored regardless of this cap. Rows beyond the cap stay persisted
+   * and are reported by GET /api/context-graph/subscriptions. Non-negative
+   * integer; 0 = no cap. Raise it on nodes that legitimately subscribe to more
+   * than the default (64).
    */
   maxRehydratedContextGraphSubscriptions?: number;
   /** Out-of-line storage for large public SWM RDF literal object terms. */

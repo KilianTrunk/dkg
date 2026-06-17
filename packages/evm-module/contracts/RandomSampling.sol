@@ -26,7 +26,12 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
     string private constant _NAME = "RandomSampling";
-    string private constant _VERSION = "10.0.4";
+    // OT-RFC-49 WS-B: bumped 10.0.4 -> 10.1.0 alongside the proof-race rewrite of
+    // submitProof (reads the snapshotted challengeRoot/challengeLeafCount) and the
+    // coupled RandomSamplingStorage 10.0.2 -> 10.1.0 / RandomSamplingLib.Challenge
+    // struct growth. The on-chain version string must change when behavior does,
+    // so a redeploy is not mistaken for a no-op (live base_sepolia is 10.0.4).
+    string private constant _VERSION = "10.1.0";
     uint256 public constant SCALE18 = 1e18;
 
     /// @notice Maximum number of in-CG resamples when the picker hits an

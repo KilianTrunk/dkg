@@ -75,10 +75,26 @@ type AssertionArtifactResolution = ImportedArtifactResolution & {
   contentType: string;
 };
 
-type AssertionArtifactRemoteResult = {
-  remote: Awaited<ReturnType<NonNullable<RequestContext['agent']['fetchAndVerifyAssertionArtifact']>>>;
-  sourcePeerId: string;
-};
+type AssertionArtifactFetchResult = Awaited<
+  ReturnType<NonNullable<RequestContext['agent']['fetchAndVerifyAssertionArtifact']>>
+>;
+
+type AssertionArtifactRemoteResult =
+  | {
+      availability: 'verified';
+      remote: AssertionArtifactFetchResult;
+      sourcePeerId: string;
+    }
+  | {
+      availability: 'unverified_page';
+      remote: AssertionArtifactFetchResult;
+      sourcePeerId: string;
+    }
+  | {
+      availability: 'unavailable';
+      remote: AssertionArtifactFetchResult;
+      sourcePeerId: string;
+    };
 
 function normalizeAssertionArtifactKind(raw: unknown): AssertionArtifactKind {
   if (raw === 'source' || raw === 'markdown' || raw === 'original') return raw;
@@ -124,7 +140,7 @@ async function discoverArtifactCandidatePeers(
   });
 }
 
-async function fetchFirstVerifiedAssertionArtifact(
+async function fetchFirstAvailableAssertionArtifact(
   agent: RequestContext['agent'],
   resolved: AssertionArtifactResolution,
   opts: {
@@ -149,11 +165,12 @@ async function fetchFirstVerifiedAssertionArtifact(
       sourcePeerId,
       cache: opts.cache,
     });
-    const result = { remote, sourcePeerId };
-    if (remote.verifiedBytes) return result;
+    if (remote.verifiedBytes) return { availability: 'verified', remote, sourcePeerId };
     const page = remote.response;
-    if (!page.denied && !page.unavailable && !page.hashMismatch && page.bytesB64 != null) return result;
-    fallback ??= result;
+    if (!page.denied && !page.unavailable && !page.hashMismatch && page.bytesB64 != null) {
+      return { availability: 'unverified_page', remote, sourcePeerId };
+    }
+    fallback ??= { availability: 'unavailable', remote, sourcePeerId };
   }
   return fallback;
 }
@@ -306,7 +323,7 @@ export async function handleKaImportArtifactRead(ctx: RequestContext): Promise<v
     }
 
     const cache = raw.cache !== false && offset === 0;
-    const fetched = await fetchFirstVerifiedAssertionArtifact(agent, resolved, {
+    const fetched = await fetchFirstAvailableAssertionArtifact(agent, resolved, {
       sourcePeerIds,
       offset,
       maxBytes,
@@ -326,6 +343,7 @@ export async function handleKaImportArtifactRead(ctx: RequestContext): Promise<v
       });
     }
     const { remote, sourcePeerId: fetchedSourcePeerId } = fetched;
+    const verified = fetched.availability === 'verified';
     const page = remote.response;
     if (page.denied) {
       return jsonResponse(res, 200, {
@@ -359,7 +377,7 @@ export async function handleKaImportArtifactRead(ctx: RequestContext): Promise<v
       });
     }
 
-    if (remote.verifiedBytes && cache) {
+    if (verified && cache && remote.verifiedBytes) {
       if (!verifyDkgContentHash(resolved.hash, remote.verifiedBytes)) {
         return jsonResponse(res, 200, {
           status: 'hash_mismatch',
@@ -374,7 +392,7 @@ export async function handleKaImportArtifactRead(ctx: RequestContext): Promise<v
     }
 
     return jsonResponse(res, 200, {
-      status: page.bytesB64 != null ? 'fetched' : 'fetchable',
+      status: verified ? 'fetched' : 'unverified',
       contextGraphId: resolved.contextGraphId,
       assertionUri: resolved.assertionUri,
       kind: resolved.kind,
@@ -386,7 +404,7 @@ export async function handleKaImportArtifactRead(ctx: RequestContext): Promise<v
       truncated: page.truncated,
       bytesB64: page.bytesB64,
       source: { peerId: fetchedSourcePeerId, agentAddress: resolved.assertionAgentAddress },
-      ...(remote.verifiedBytes ? {} : { reason: 'Remote page fetched but full artifact was not cache-promoted' }),
+      ...(verified ? {} : { reason: 'Remote page fetched without full-artifact hash verification' }),
     });
   } catch (err) {
     if (handleImportArtifactRouteError(res, err)) return;

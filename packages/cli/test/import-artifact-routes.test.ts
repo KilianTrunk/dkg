@@ -8,6 +8,7 @@ import {
   contextGraphAssertionUri,
   contextGraphMetaUri,
   contextGraphSharedMemoryUri,
+  keccak256ContentHash,
   sharedMemoryReadBothFilter,
 } from '@origintrail-official/dkg-core';
 import { FileStore } from '../src/file-store.js';
@@ -849,6 +850,77 @@ describe('import artifact daemon routes', () => {
     expect(fetchAndVerifyAssertionArtifact).toHaveBeenCalledTimes(1);
   });
 
+  it('cache-promotes a discovered peer artifact under its keccak256 graph hash', async () => {
+    const bytes = Buffer.from('# Discovered Public Keccak\n');
+    const artifactHash = keccak256ContentHash(bytes);
+    const contextGraphId = 'cg-public-open-discovered-keccak-byte-read';
+    const assertionName = 'imported-md-keccak';
+    const assertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:source', assertionName);
+    const discoverAssertionArtifactCandidates = vi.fn(async () => ['peer-with-keccak-blob']);
+    const fetchAndVerifyAssertionArtifact = vi.fn(async () => ({
+      response: {
+        version: 1,
+        contextGraphId,
+        assertionUri,
+        kind: 'markdown',
+        hash: artifactHash,
+        offset: 0,
+        totalBytes: bytes.length,
+        truncated: false,
+        contentType: 'application/x-spoofed',
+        bytesB64: bytes.toString('base64'),
+      },
+      verifiedBytes: bytes,
+    }));
+    const { agent } = makeAgent({
+      contextGraphId,
+      assertionName,
+      assertionUri,
+      fileHash: artifactHash,
+      markdownHash: artifactHash,
+      markdownForm: `urn:dkg:file:${artifactHash}`,
+      onChainPolicy: { accessPolicy: 0, publishPolicy: 1 },
+      discoverAssertionArtifactCandidates,
+      fetchAndVerifyAssertionArtifact,
+    });
+    await startRoutes({ agent });
+
+    const fetched = await post('/api/knowledge-assets/import-artifact/read', {
+      contextGraphId,
+      assertionUri,
+      kind: 'markdown',
+      hash: artifactHash,
+      maxBytes: 1024,
+    });
+    expect(fetched.status).toBe(200);
+    expect(fetched.body).toMatchObject({
+      status: 'fetched',
+      contextGraphId,
+      assertionUri,
+      kind: 'markdown',
+      hash: artifactHash,
+      contentType: 'text/markdown',
+      bytesB64: bytes.toString('base64'),
+      source: { peerId: 'peer-with-keccak-blob', agentAddress: 'did:dkg:agent:source' },
+    });
+    await expect(fileStore.get(artifactHash)).resolves.toEqual(bytes);
+
+    const local = await post('/api/knowledge-assets/import-artifact/read', {
+      contextGraphId,
+      assertionUri,
+      kind: 'markdown',
+      hash: artifactHash,
+      maxBytes: 1024,
+    });
+    expect(local.status).toBe(200);
+    expect(local.body).toMatchObject({
+      status: 'local',
+      hash: artifactHash,
+      bytesB64: bytes.toString('base64'),
+    });
+    expect(fetchAndVerifyAssertionArtifact).toHaveBeenCalledTimes(1);
+  });
+
   it('serves a remote artifact page even when the full artifact is not cache-promoted', async () => {
     const bytes = Buffer.from('remote page bytes');
     const artifactHash = sha256Hash(bytes);
@@ -896,7 +968,7 @@ describe('import artifact daemon routes', () => {
 
     expect(fetched.status).toBe(200);
     expect(fetched.body).toMatchObject({
-      status: 'fetched',
+      status: 'unverified',
       contextGraphId,
       assertionUri,
       kind: 'markdown',
@@ -904,7 +976,7 @@ describe('import artifact daemon routes', () => {
       offset: 1024,
       bytesB64: bytes.toString('base64'),
       source: { peerId: 'peer-with-large-blob', agentAddress: 'did:dkg:agent:source' },
-      reason: 'Remote page fetched but full artifact was not cache-promoted',
+      reason: 'Remote page fetched without full-artifact hash verification',
     });
     expect(fetchAndVerifyAssertionArtifact).toHaveBeenCalledWith(expect.objectContaining({
       sourcePeerId: 'peer-with-large-blob',

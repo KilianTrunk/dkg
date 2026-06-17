@@ -125,6 +125,37 @@ describe('DashboardDB — replication rollup memo', () => {
     promote(db, now - 250, 'cg', 3);
     expect(timelineTotal(db.getReplicationTimeline(coarseBuckets))).toBe(2); // cached
   });
+
+  it('returns a defensive copy — mutating the result does not poison the cache', () => {
+    db = open(60_000);
+    const now = Date.now();
+    promote(db, now - 1000, 'cgA', 1);
+    promote(db, now - 900, 'cgB', 2);
+
+    const rows = db.getReplicationPerCg(3_600_000);
+    expect(rows.length).toBe(2);
+    rows.pop(); // mutate the returned array...
+    (rows as unknown[]).push({ tampered: true });
+    const rows2 = db.getReplicationPerCg(3_600_000); // cache hit within TTL
+    expect(rows2.length).toBe(2); // cached instance untouched
+    expect(rows2.some((r) => (r as { tampered?: boolean }).tampered === true)).toBe(false);
+
+    const summary = db.getReplicationSummary(3_600_000);
+    summary.totalEvents = 999; // mutate the returned object...
+    expect(db.getReplicationSummary(3_600_000).totalEvents).toBe(2); // cached instance untouched
+  });
+
+  it('caches at exactly MEMO_WINDOW_SAFETY_FACTOR x TTL (boundary is inclusive)', () => {
+    db = open(1000); // TTL 1s → 10x boundary = 10_000ms
+    const now = Date.now();
+    promote(db, now - 500, 'cg', 1);
+    // window EXACTLY 10x TTL → cached (matches the ">= 10x cacheable" contract)
+    expect(db.getReplicationSummary(10_000).totalEvents).toBe(1);
+    promote(db, now - 250, 'cg', 2);
+    expect(db.getReplicationSummary(10_000).totalEvents).toBe(1); // cached, still 1
+    // window just under the boundary → bypass → fresh
+    expect(db.getReplicationSummary(9_999).totalEvents).toBe(2);
+  });
 });
 
 describe('DashboardDB — cache TTL resolution', () => {
@@ -156,5 +187,17 @@ describe('DashboardDB — cache TTL resolution', () => {
     expect(db.getReplicationSummary(3_600_000).totalEvents).toBe(1);
     promote(db, now - 500, 'cg', 2);
     expect(db.getReplicationSummary(3_600_000).totalEvents).toBe(2); // option won → no cache
+  });
+
+  it('honors a VALID env value — DKG_DASHBOARD_CACHE_TTL_MS=0 disables (proves env is read, not ignored)', () => {
+    // A resolver that ignored the env and always returned 2000 would pass the
+    // empty/malformed cases above; this proves a real env value takes effect.
+    process.env[ENV_KEY] = '0';
+    db = new DashboardDB({ dataDir: dir });
+    const now = Date.now();
+    promote(db, now - 1000, 'cg', 1);
+    expect(db.getReplicationSummary(3_600_000).totalEvents).toBe(1);
+    promote(db, now - 500, 'cg', 2);
+    expect(db.getReplicationSummary(3_600_000).totalEvents).toBe(2); // env '0' disabled the cache → fresh
   });
 });

@@ -912,30 +912,36 @@ export class DashboardDB {
 
   /**
    * Memoize a rollup for up to `_memoTtlMs`. `minWindowMs` is the smallest time
-   * window the result depends on; caching is bypassed unless that window is
-   * COMFORTABLY larger than the TTL (>= MEMO_WINDOW_SAFETY_FACTOR x). These
-   * rollups are computed over a moving `Date.now()` window, so a cached value
-   * can represent a slightly older window than the live request; requiring a
-   * 10x margin keeps that drift a negligible fraction of the window. A 1x guard
-   * is technically sufficient for `periodMs` (only the window cutoff drives
-   * staleness, not `bucketMs`), but per review (zsculac) we apply the
-   * conservative 10x margin to the smallest relevant window so the cache is used
-   * only where staleness is unambiguously acceptable. Default dashboard windows
-   * (1h/24h) are far above the 2s TTL, so they always cache.
+   * window the result depends on; caching is bypassed unless that window is at
+   * least MEMO_WINDOW_SAFETY_FACTOR x the TTL. These rollups are computed over a
+   * moving `Date.now()` window, so a cached value can represent a slightly older
+   * window than the live request; requiring a 10x margin keeps that drift a
+   * negligible fraction of the window. A 1x guard is technically sufficient for
+   * `periodMs` (only the window cutoff drives staleness, not `bucketMs`), but per
+   * review (zsculac) we apply the conservative 10x margin to the smallest
+   * relevant window so the cache is used only where staleness is unambiguously
+   * acceptable. Default dashboard windows (1h/24h) are far above the 2s TTL, so
+   * they always cache.
+   *
+   * Returned values are structuredClone'd so a caller that sorts/pushes/annotates
+   * the summary or rows cannot mutate the cached instance and poison later reads
+   * (these methods previously returned a fresh result object on every call).
    */
   private memoized<T>(key: string, minWindowMs: number, fn: () => T): T {
-    if (!(this._memoTtlMs > 0) || minWindowMs <= this._memoTtlMs * MEMO_WINDOW_SAFETY_FACTOR) {
+    // `< F*ttl` bypasses, so a window of exactly F*ttl IS cached — matching the
+    // ">= 10x cacheable" contract documented above.
+    if (!(this._memoTtlMs > 0) || minWindowMs < this._memoTtlMs * MEMO_WINDOW_SAFETY_FACTOR) {
       return fn();
     }
     const now = Date.now();
     const hit = this._memo.get(key);
-    if (hit && now - hit.at < this._memoTtlMs) return hit.value as T;
+    if (hit && now - hit.at < this._memoTtlMs) return structuredClone(hit.value) as T;
     const value = fn();
     // Bound the map: keys are few in practice, but per-CG timeline variants can
     // accumulate. Entries are short-lived, so a rare full clear is safe.
     if (this._memo.size > 256) this._memo.clear();
     this._memo.set(key, { at: now, value });
-    return value;
+    return structuredClone(value) as T;
   }
 
   // --- Metric snapshots ---

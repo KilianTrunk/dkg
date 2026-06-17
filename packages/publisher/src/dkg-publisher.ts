@@ -3372,12 +3372,28 @@ export class DKGPublisher implements Publisher {
     let effectiveUpdateByteSize = updateByteSize;
     if (useEncryptedInlineUpdate) {
       // MEMBER-SIDE ENCRYPTION STAYS. AEAD-encrypt the private (non-catalog)
-      // data for CG members via the single-blob hook; OT-RFC-49 stripped the
-      // ciphertext from the on-chain commitment, the core ACK, and pricing, so
-      // the returned ciphertext root/bytes are intentionally DISCARDED here.
-      // (Chunked curated UPDATEs are out of v1 scope — single-blob only.)
+      // data and DISTRIBUTE it to CG members — via the chunked SWM fan-out when
+      // wired (PREFERRED; the single-blob hook is pure and does NOT distribute),
+      // mirroring curated publish (:2134-2155). OT-RFC-49 stripped the ciphertext
+      // from the on-chain commitment, the core ACK, and pricing, so the returned
+      // ciphertext root/bytes are intentionally DISCARDED — the gossip side
+      // effect (members receive the updated payload) is the point.
       const plaintextBytes = new TextEncoder().encode(encryptableUpdateNquadsStr);
-      await options.encryptInlinePayload!(plaintextBytes);
+      if (typeof options.encryptInlineChunked === 'function') {
+        // batchId = V10 KC merkleRoot (member-side per-chunk persistence key);
+        // the op id is the per-operation AEAD nonce domain — the update path has
+        // none of its own, so derive a session-scoped, content-unique one.
+        const updateOperationId = `${this.sessionId}-upd-${ethers.hexlify(kcMerkleRoot).slice(2, 18)}`;
+        await options.encryptInlineChunked({
+          plaintextNquads: plaintextBytes,
+          batchId: kcMerkleRoot,
+          publishOperationId: updateOperationId,
+        });
+      } else {
+        // No chunked emitter (single-blob fallback): the hook is pure and does
+        // NOT distribute, so members rely on SWM convergence in this case.
+        await options.encryptInlinePayload!(plaintextBytes);
+      }
       if (useCuratedUpdate) {
         // The ACK wire payload is the PUBLIC catalog N-quads (plaintext —
         // public by design). Cores rebuild the catalog root from these bytes,

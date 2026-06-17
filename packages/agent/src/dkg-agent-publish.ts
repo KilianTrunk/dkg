@@ -1432,13 +1432,9 @@ export class PublishMethods extends DKGAgentBase {
     // resolver returns a function for a curated CG (accessPolicy=curated) and
     // `undefined` for a public CG, so the function's truthiness IS the curated
     // gate — exactly what the producer keys `useEncryptedInlineUpdate` off of.
-    // No separate accessPolicy read is needed. The chunked emitter is
-    // deliberately NOT resolved: the producer's update() never invokes it
-    // (single-blob v1 only — no publishOperationId in the update path), and
-    // `_resolveEncryptInlineChunked` THROWS for a curated CG with no workspace-
-    // gossip signer, which would tank an otherwise-valid single-blob update.
-    // The 4th arg mirrors publish: the target on-chain cgId so the AEAD key
-    // derives from the canonical id consumers verify against.
+    // No separate accessPolicy read is needed. The 4th arg mirrors publish: the
+    // target on-chain cgId so the AEAD key derives from the canonical id
+    // consumers verify against.
     const updateEncryptInlinePayload = await this._resolveEncryptInlinePayload(
       contextGraphId,
       undefined,
@@ -1446,6 +1442,24 @@ export class PublishMethods extends DKGAgentBase {
       updateOnChainId ?? undefined,
     );
     const isCuratedUpdate = typeof updateEncryptInlinePayload === 'function';
+
+    // ALSO resolve the chunked SWM emitter — the MEMBER-DISTRIBUTION path. A
+    // curated update must actively fan the updated private payload out to CG
+    // members (OT-RFC-49: cores hold zero ciphertext, members hold it), exactly
+    // as curated publish does — otherwise members silently fall behind a
+    // committed update. The producer prefers this side-effecting chunked emitter
+    // over the pure single-blob hook. Like publish, it THROWS for a curated CG
+    // with no workspace-gossip signer (cores reject unsigned chunked envelopes):
+    // fail-closed — you cannot update a curated CG you cannot distribute to
+    // members. Public CGs → `undefined` (no-op), unchanged.
+    const updateEncryptInlineChunked = isCuratedUpdate
+      ? await this._resolveEncryptInlineChunked(
+          contextGraphId,
+          undefined,
+          undefined,
+          updateOnChainId ?? undefined,
+        )
+      : undefined;
 
     // A2: USER DECISION (a) — deterministic floor RE-PROJECTION (not read-and-
     // merge). For a curated update, the public `_catalog` floor MUST be in the
@@ -1491,9 +1505,12 @@ export class PublishMethods extends DKGAgentBase {
       precomputedUpdateAttestation: opts?.precomputedUpdateAttestation,
       v10UpdateACKProvider,
       // Curated → wire the single-blob AEAD hook so the producer's
-      // `useEncryptedInlineUpdate` gate fires (catalog commit + member
-      // encryption). Public → `undefined` (no catalog); unchanged on a healthy chain.
+      // `useEncryptedInlineUpdate` gate fires (catalog commit). Public →
+      // `undefined` (no catalog); unchanged on a healthy chain.
       encryptInlinePayload: updateEncryptInlinePayload,
+      // Curated → the chunked emitter the producer prefers to fan the updated
+      // private payload out to CG members (member distribution). Public → undefined.
+      encryptInlineChunked: updateEncryptInlineChunked,
     });
     this.log.info(ctx, `Update complete — status=${result.status}`);
 

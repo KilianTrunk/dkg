@@ -67,6 +67,13 @@ export interface ReadAssertionArtifactParams {
   subGraphName?: string;
   sourcePeerId: string;
   cache?: boolean;
+  /**
+   * Local agent that owns the imported assertion being read. Private artifact
+   * reads must be signed by this assertion owner, not by the generic CG sync
+   * signer, because the responder authorizes the recovered signer against the
+   * assertion owner embedded in the assertion URI.
+   */
+  requestingAgentAddress?: string;
 }
 
 export interface AssertionArtifactAvailabilityParams {
@@ -129,8 +136,94 @@ function encodeResponse(response: ImportedArtifactResponse): Uint8Array {
   return new TextEncoder().encode(JSON.stringify(response));
 }
 
-function decodeResponse(data: Uint8Array): ImportedArtifactResponse {
-  return JSON.parse(new TextDecoder().decode(data)) as ImportedArtifactResponse;
+function unavailableResponse(fallback: Omit<ImportedArtifactResponse, 'version'>): ImportedArtifactResponse {
+  return {
+    version: 1,
+    contextGraphId: fallback.contextGraphId,
+    assertionUri: fallback.assertionUri,
+    kind: fallback.kind,
+    hash: fallback.hash,
+    offset: fallback.offset,
+    unavailable: true,
+  };
+}
+
+function isSafeIntegerField(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isValidBase64(value: string): boolean {
+  return value.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(value);
+}
+
+function decodeResponse(
+  data: Uint8Array,
+  fallback: Omit<ImportedArtifactResponse, 'version'>,
+): ImportedArtifactResponse {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(data)) as Record<string, unknown>;
+  } catch {
+    return unavailableResponse(fallback);
+  }
+  const kind = normalizeKind(parsed.kind);
+  const contextGraphId = typeof parsed.contextGraphId === 'string' ? parsed.contextGraphId.trim() : '';
+  const assertionUri = typeof parsed.assertionUri === 'string' ? parsed.assertionUri.trim() : '';
+  const hash = typeof parsed.hash === 'string' ? parsed.hash.trim() : '';
+  if (
+    parsed.version !== 1 ||
+    !kind ||
+    !contextGraphId ||
+    !assertionUri ||
+    !hash ||
+    !isDkgContentHash(hash) ||
+    !isSafeIntegerField(parsed.offset)
+  ) {
+    return unavailableResponse(fallback);
+  }
+  const response: ImportedArtifactResponse = {
+    version: 1,
+    contextGraphId,
+    assertionUri,
+    kind,
+    hash,
+    offset: parsed.offset,
+  };
+  if (parsed.totalBytes !== undefined) {
+    if (!isSafeIntegerField(parsed.totalBytes)) return unavailableResponse(fallback);
+    response.totalBytes = parsed.totalBytes;
+  }
+  if (parsed.nextOffset !== undefined) {
+    if (!isSafeIntegerField(parsed.nextOffset)) return unavailableResponse(fallback);
+    response.nextOffset = parsed.nextOffset;
+  }
+  if (parsed.truncated !== undefined) {
+    if (typeof parsed.truncated !== 'boolean') return unavailableResponse(fallback);
+    response.truncated = parsed.truncated;
+  }
+  if (parsed.contentType !== undefined) {
+    if (typeof parsed.contentType !== 'string') return unavailableResponse(fallback);
+    response.contentType = parsed.contentType;
+  }
+  if (parsed.denied !== undefined) {
+    if (typeof parsed.denied !== 'string') return unavailableResponse(fallback);
+    response.denied = parsed.denied;
+  }
+  if (parsed.unavailable !== undefined) {
+    if (typeof parsed.unavailable !== 'boolean') return unavailableResponse(fallback);
+    response.unavailable = parsed.unavailable;
+  }
+  if (parsed.hashMismatch !== undefined) {
+    if (typeof parsed.hashMismatch !== 'boolean') return unavailableResponse(fallback);
+    response.hashMismatch = parsed.hashMismatch;
+  }
+  if (parsed.bytesB64 !== undefined) {
+    if (typeof parsed.bytesB64 !== 'string' || !isValidBase64(parsed.bytesB64)) {
+      return unavailableResponse(fallback);
+    }
+    response.bytesB64 = parsed.bytesB64;
+  }
+  return response;
 }
 
 function decodeRequest(data: Uint8Array): ImportedArtifactRequest | null {
@@ -186,6 +279,18 @@ function comparableAgentAddress(value: string): string {
 
 function isSameAgentAddress(left: string, right: string): boolean {
   return left === right || comparableAgentAddress(left) === comparableAgentAddress(right);
+}
+
+function findLocalAgentSigningAddress(
+  localAgents: ReadonlyMap<string, unknown>,
+  requestedAddress: string | undefined,
+): string | undefined {
+  if (!requestedAddress) return undefined;
+  const requested = comparableAgentAddress(requestedAddress);
+  for (const [localAddress] of localAgents) {
+    if (comparableAgentAddress(localAddress) === requested) return localAddress;
+  }
+  return undefined;
 }
 
 type ParsedImportedAssertionUri = {
@@ -443,8 +548,12 @@ export class ImportedArtifactMethods extends DKGAgentBase {
     if (!store) return encodeResponse({ ...responseBase(req), unavailable: true });
     const stat = await store.stat(linked.hash);
     if (!stat) return encodeResponse({ ...responseBase(req), unavailable: true });
-    const bytes = await store.readRange(linked.hash, req.offset, req.maxBytes);
-    if (!bytes) return encodeResponse({ ...responseBase(req), unavailable: true });
+    const rawBytes = await store.readRange(linked.hash, req.offset, req.maxBytes);
+    if (!rawBytes) return encodeResponse({ ...responseBase(req), unavailable: true });
+    const expectedLength = Math.min(req.maxBytes, Math.max(0, stat.size - req.offset));
+    const bytes = rawBytes.byteLength > expectedLength
+      ? rawBytes.subarray(0, expectedLength)
+      : rawBytes;
     const nextOffset = req.offset + bytes.byteLength;
     const truncated = nextOffset < stat.size;
     return encodeResponse({
@@ -465,6 +574,11 @@ export class ImportedArtifactMethods extends DKGAgentBase {
   async readAssertionArtifact(this: DKGAgent, params: ReadAssertionArtifactParams): Promise<ImportedArtifactResponse> {
     const range = normalizeRange(params.offset, params.maxBytes);
     if (!range) throw new Error('Invalid artifact byte range');
+    const parsedAssertion = parseImportedAssertionUri(
+      params.assertionUri,
+      params.contextGraphId,
+      params.requestingAgentAddress,
+    );
     const selector = computeImportedArtifactSelector({
       version: 1,
       contextGraphId: params.contextGraphId,
@@ -476,8 +590,9 @@ export class ImportedArtifactMethods extends DKGAgentBase {
       subGraphName: params.subGraphName,
     });
     const needsAuth = !await isPublicOpenContextGraph(this, params.contextGraphId);
+    const assertionOwnerAddress = params.requestingAgentAddress ?? parsedAssertion?.assertionAgentAddress;
     const claimedAgentAddress = needsAuth
-      ? await this.findLocalAgentForContextGraph(params.contextGraphId)
+      ? findLocalAgentSigningAddress(this.localAgents, assertionOwnerAddress)
       : undefined;
     const claimedAgent = claimedAgentAddress ? this.localAgents.get(claimedAgentAddress) : undefined;
     const auth = needsAuth
@@ -525,7 +640,13 @@ export class ImportedArtifactMethods extends DKGAgentBase {
       new TextEncoder().encode(JSON.stringify(req)),
       { timeoutMs: Math.max(SYNC_PAGE_TIMEOUT_MS, SYNC_AUTH_MAX_AGE_MS) },
     );
-    return decodeResponse(responseBytes);
+    return decodeResponse(responseBytes, {
+      contextGraphId: params.contextGraphId,
+      assertionUri: params.assertionUri,
+      kind: params.kind,
+      hash: params.hash,
+      offset: range.offset,
+    });
   }
 
   async fetchAndVerifyAssertionArtifact(this: DKGAgent, params: ReadAssertionArtifactParams): Promise<{
@@ -534,6 +655,30 @@ export class ImportedArtifactMethods extends DKGAgentBase {
   }> {
     const requestedRange = normalizeRange(params.offset, params.maxBytes);
     if (!requestedRange) throw new Error('Invalid artifact byte range');
+
+    const readRequestedPage = async (): Promise<{ response: ImportedArtifactResponse }> => {
+      const page = await this.readAssertionArtifact({
+        ...params,
+        offset: requestedRange.offset,
+        maxBytes: requestedRange.maxBytes,
+      });
+      if (page.denied || page.unavailable || page.hashMismatch || page.bytesB64 == null) {
+        return { response: page };
+      }
+      if (
+        page.offset !== requestedRange.offset ||
+        page.hash !== params.hash ||
+        (page.totalBytes != null && page.offset + Buffer.byteLength(page.bytesB64, 'base64') > page.totalBytes) ||
+        (page.truncated && (page.nextOffset == null || page.nextOffset <= page.offset))
+      ) {
+        return { response: { ...page, bytesB64: undefined, hashMismatch: true } };
+      }
+      return { response: page };
+    };
+
+    if (!params.cache) {
+      return readRequestedPage();
+    }
 
     const first = await this.readAssertionArtifact({
       ...params,
@@ -544,10 +689,8 @@ export class ImportedArtifactMethods extends DKGAgentBase {
       return { response: first };
     }
     const total = first.totalBytes;
-    if (!params.cache || total == null || total > IMPORTED_ARTIFACT_MAX_CACHE_BYTES) {
-      if (total == null || total > IMPORTED_ARTIFACT_MAX_CACHE_BYTES) {
-        return { response: { ...first, bytesB64: undefined, unavailable: true } };
-      }
+    if (total == null || total > IMPORTED_ARTIFACT_MAX_CACHE_BYTES) {
+      return readRequestedPage();
     }
     if (first.offset !== 0 || first.hash !== params.hash) {
       return { response: { ...first, bytesB64: undefined, hashMismatch: true } };

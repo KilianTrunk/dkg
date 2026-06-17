@@ -849,6 +849,72 @@ describe('import artifact daemon routes', () => {
     expect(fetchAndVerifyAssertionArtifact).toHaveBeenCalledTimes(1);
   });
 
+  it('serves a remote artifact page even when the full artifact is not cache-promoted', async () => {
+    const bytes = Buffer.from('remote page bytes');
+    const artifactHash = sha256Hash(bytes);
+    const contextGraphId = 'cg-public-open-large-page-read';
+    const assertionName = 'large-imported-md';
+    const assertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:source', assertionName);
+    const discoverAssertionArtifactCandidates = vi.fn(async () => ['peer-with-large-blob']);
+    const fetchAndVerifyAssertionArtifact = vi.fn(async () => ({
+      response: {
+        version: 1,
+        contextGraphId,
+        assertionUri,
+        kind: 'markdown',
+        hash: artifactHash,
+        offset: 1024,
+        totalBytes: 64 * 1024 * 1024 + 1,
+        nextOffset: 1024 + bytes.length,
+        truncated: true,
+        contentType: 'text/markdown',
+        bytesB64: bytes.toString('base64'),
+      },
+    }));
+    const { agent } = makeAgent({
+      contextGraphId,
+      assertionName,
+      assertionUri,
+      fileHash: artifactHash,
+      markdownHash: artifactHash,
+      markdownForm: `urn:dkg:file:${artifactHash}`,
+      onChainPolicy: { accessPolicy: 0, publishPolicy: 1 },
+      discoverAssertionArtifactCandidates,
+      fetchAndVerifyAssertionArtifact,
+    });
+    await startRoutes({ agent });
+
+    const fetched = await post('/api/knowledge-assets/import-artifact/read', {
+      contextGraphId,
+      assertionUri,
+      kind: 'markdown',
+      hash: artifactHash,
+      offset: 1024,
+      maxBytes: 4096,
+      cache: false,
+    });
+
+    expect(fetched.status).toBe(200);
+    expect(fetched.body).toMatchObject({
+      status: 'fetched',
+      contextGraphId,
+      assertionUri,
+      kind: 'markdown',
+      hash: artifactHash,
+      offset: 1024,
+      bytesB64: bytes.toString('base64'),
+      source: { peerId: 'peer-with-large-blob', agentAddress: 'did:dkg:agent:source' },
+      reason: 'Remote page fetched but full artifact was not cache-promoted',
+    });
+    expect(fetchAndVerifyAssertionArtifact).toHaveBeenCalledWith(expect.objectContaining({
+      sourcePeerId: 'peer-with-large-blob',
+      offset: 1024,
+      maxBytes: 4096,
+      cache: false,
+      requestingAgentAddress: 'did:dkg:agent:source',
+    }));
+  });
+
   it('rejects a poisoned discovered candidate and falls back to another peer before cache promotion', async () => {
     const bytes = Buffer.from('# Good Candidate\n');
     const artifactHash = sha256Hash(bytes);

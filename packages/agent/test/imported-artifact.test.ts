@@ -241,6 +241,21 @@ describe('generic imported artifact peer handler', () => {
     });
   });
 
+  it('clamps oversized byte-store reads to the requested protocol page', async () => {
+    const agent = fakeAgent({ bytes: Buffer.from('abcdef') });
+    agent.config.importedArtifactByteStore.readRange = vi.fn(async () => Buffer.from('abcdef'));
+    const res = await invoke(agent, await request({ maxBytes: 4 }, { signer: ownerWallet }));
+
+    expect(agent.config.importedArtifactByteStore.readRange).toHaveBeenCalledWith(hash, 0, 4);
+    expect(res).toMatchObject({
+      totalBytes: 6,
+      nextOffset: 4,
+      truncated: true,
+      bytesB64: Buffer.from('abcd').toString('base64'),
+    });
+    expect(Buffer.from(res.bytesB64, 'base64').byteLength).toBe(4);
+  });
+
   it('denies requesterPeerId/fromPeerId mismatches before artifact resolution', async () => {
     const agent = fakeAgent({ bytes: Buffer.from('abcdef') });
     const res = await invoke(agent, await request({}, { signer: ownerWallet }), 'peer-other');
@@ -428,11 +443,70 @@ describe('generic imported artifact peer handler', () => {
     }));
   });
 
+  it('treats malformed peer artifact responses as unavailable instead of throwing', async () => {
+    const agent = fakeAgent({
+      onChainPolicy: { accessPolicy: 0, publishPolicy: 1 },
+    });
+    agent.sendToPeer = vi.fn(async () => new TextEncoder().encode(JSON.stringify({
+      version: 1,
+      contextGraphId,
+      assertionUri,
+      kind: 'source',
+      hash,
+      offset: 0,
+      bytesB64: 123,
+      nextOffset: 'x',
+    })));
+
+    const response = await ImportedArtifactMethods.prototype.readAssertionArtifact.call(agent, {
+      contextGraphId,
+      assertionUri,
+      kind: 'source',
+      hash,
+      sourcePeerId: 'peer-local',
+    });
+
+    expect(response).toMatchObject({
+      version: 1,
+      contextGraphId,
+      assertionUri,
+      kind: 'source',
+      hash,
+      offset: 0,
+      unavailable: true,
+    });
+  });
+
+  it('keeps malformed peer artifact responses in the handled fetch path', async () => {
+    const agent = fakeAgent({
+      onChainPolicy: { accessPolicy: 0, publishPolicy: 1 },
+    });
+    agent.readAssertionArtifact = ImportedArtifactMethods.prototype.readAssertionArtifact;
+    agent.sendToPeer = vi.fn(async () => new TextEncoder().encode('{not json'));
+
+    const result = await ImportedArtifactMethods.prototype.fetchAndVerifyAssertionArtifact.call(agent, {
+      contextGraphId,
+      assertionUri,
+      kind: 'source',
+      hash,
+      sourcePeerId: 'peer-local',
+      cache: true,
+    });
+
+    expect(result.verifiedBytes).toBeUndefined();
+    expect(result.response).toMatchObject({
+      unavailable: true,
+      contextGraphId,
+      assertionUri,
+      hash,
+    });
+  });
+
   it('signs private artifact requests with the claimed agent key even when an identity signer exists', async () => {
     const agent = fakeAgent({
       onChainPolicy: { accessPolicy: 1, publishPolicy: 0 },
     });
-    agent.findLocalAgentForContextGraph = vi.fn(async () => ownerAgentAddress);
+    agent.findLocalAgentForContextGraph = vi.fn(async () => otherAgentAddress);
     agent.localAgents = new Map([[ownerAgentAddress, { privateKey: ownerWallet.privateKey }]]);
     agent.chain.getIdentityId = vi.fn(async () => 123n);
     agent.chain.signMessage = vi.fn(async (digest: Uint8Array) => {
@@ -468,8 +542,53 @@ describe('generic imported artifact peer handler', () => {
       yParityAndS: auth.requesterSignatureVS!,
     });
 
+    expect(agent.findLocalAgentForContextGraph).not.toHaveBeenCalled();
     expect(agent.chain.signMessage).not.toHaveBeenCalled();
     expect(auth.requesterIdentityId).toBe('0');
+    expect(auth.requesterAgentAddress).toBe(ownerAgentAddress);
+    expect(recovered).toBe(ownerAgentAddress);
+  });
+
+  it('signs private artifact requests as the assertion owner on multi-agent nodes', async () => {
+    const agent = fakeAgent({
+      onChainPolicy: { accessPolicy: 1, publishPolicy: 0 },
+    });
+    agent.findLocalAgentForContextGraph = vi.fn(async () => otherAgentAddress);
+    agent.localAgents = new Map([
+      [otherAgentAddress, { privateKey: otherWallet.privateKey }],
+      [ownerAgentAddress, { privateKey: ownerWallet.privateKey }],
+    ]);
+
+    await ImportedArtifactMethods.prototype.readAssertionArtifact.call(agent, {
+      contextGraphId,
+      assertionUri,
+      kind: 'source',
+      hash,
+      sourcePeerId: 'peer-local',
+      requestingAgentAddress: `did:dkg:agent:${ownerAgentAddress.toLowerCase()}`,
+    });
+
+    const sent = JSON.parse(new TextDecoder().decode(agent.sendToPeer.mock.calls[0][2]));
+    const auth = JSON.parse(Buffer.from(sent.authB64, 'base64').toString('utf8')) as SyncRequestEnvelope;
+    const digest = computeSyncDigest(
+      auth.contextGraphId,
+      auth.offset,
+      auth.limit,
+      auth.includeSharedMemory,
+      auth.targetPeerId!,
+      auth.requesterPeerId!,
+      auth.requestId!,
+      auth.issuedAtMs!,
+      auth.requesterAgentAddress,
+      auth.authPurpose,
+      auth.authSelector,
+    );
+    const recovered = ethers.recoverAddress(ethers.hashMessage(digest), {
+      r: auth.requesterSignatureR!,
+      yParityAndS: auth.requesterSignatureVS!,
+    });
+
+    expect(agent.findLocalAgentForContextGraph).not.toHaveBeenCalled();
     expect(auth.requesterAgentAddress).toBe(ownerAgentAddress);
     expect(recovered).toBe(ownerAgentAddress);
   });
@@ -519,20 +638,21 @@ describe('generic imported artifact peer handler', () => {
     expect(agent.readAssertionArtifact).toHaveBeenCalledTimes(2);
   });
 
-  it('verifies the full remote artifact before returning bytes even when cache is false', async () => {
+  it('returns the requested remote page without full-artifact verification when cache is false', async () => {
     const bytes = Buffer.from('abcdef');
     const artifactHash = keccakHash(bytes);
     const agent = {
-      readAssertionArtifact: vi.fn(async () => ({
+      readAssertionArtifact: vi.fn(async ({ offset = 0, maxBytes = IMPORTED_ARTIFACT_MAX_PAGE_BYTES }) => ({
         version: 1,
         contextGraphId,
         assertionUri,
         kind: 'source',
         hash: artifactHash,
-        offset: 0,
+        offset,
         totalBytes: bytes.length,
-        truncated: false,
-        bytesB64: bytes.toString('base64'),
+        nextOffset: offset + Math.min(maxBytes, bytes.length - offset),
+        truncated: offset + maxBytes < bytes.length,
+        bytesB64: bytes.subarray(offset, offset + maxBytes).toString('base64'),
       })),
     };
 
@@ -550,10 +670,66 @@ describe('generic imported artifact peer handler', () => {
     expect(res.response.hashMismatch).toBeUndefined();
     expect(res.response.offset).toBe(1);
     expect(res.response.bytesB64).toBe(Buffer.from('bcd').toString('base64'));
-    expect(res.verifiedBytes?.equals(bytes)).toBe(true);
+    expect(res.verifiedBytes).toBeUndefined();
+    expect(agent.readAssertionArtifact).toHaveBeenCalledTimes(1);
     expect(agent.readAssertionArtifact).toHaveBeenCalledWith(expect.objectContaining({
-      offset: 0,
-      maxBytes: IMPORTED_ARTIFACT_MAX_PAGE_BYTES,
+      offset: 1,
+      maxBytes: 3,
+    }));
+  });
+
+  it('serves requested pages for artifacts larger than the cache promotion cap', async () => {
+    const firstPage = Buffer.from('first page');
+    const requestedPage = Buffer.from('requested page');
+    const largeTotal = 64 * 1024 * 1024 + 1;
+    const artifactHash = `keccak256:${'d'.repeat(64)}`;
+    const agent = {
+      readAssertionArtifact: vi.fn()
+        .mockResolvedValueOnce({
+          version: 1,
+          contextGraphId,
+          assertionUri,
+          kind: 'source',
+          hash: artifactHash,
+          offset: 0,
+          totalBytes: largeTotal,
+          nextOffset: firstPage.length,
+          truncated: true,
+          bytesB64: firstPage.toString('base64'),
+        })
+        .mockResolvedValueOnce({
+          version: 1,
+          contextGraphId,
+          assertionUri,
+          kind: 'source',
+          hash: artifactHash,
+          offset: 1024,
+          totalBytes: largeTotal,
+          nextOffset: 1024 + requestedPage.length,
+          truncated: true,
+          bytesB64: requestedPage.toString('base64'),
+        }),
+    };
+
+    const res = await ImportedArtifactMethods.prototype.fetchAndVerifyAssertionArtifact.call(agent, {
+      contextGraphId,
+      assertionUri,
+      kind: 'source',
+      hash: artifactHash,
+      offset: 1024,
+      maxBytes: 4096,
+      sourcePeerId: 'peer-local',
+      cache: true,
+    });
+
+    expect(res.response.unavailable).toBeUndefined();
+    expect(res.response.offset).toBe(1024);
+    expect(res.response.bytesB64).toBe(requestedPage.toString('base64'));
+    expect(res.verifiedBytes).toBeUndefined();
+    expect(agent.readAssertionArtifact).toHaveBeenCalledTimes(2);
+    expect(agent.readAssertionArtifact).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      offset: 1024,
+      maxBytes: 4096,
     }));
   });
 

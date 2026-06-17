@@ -142,6 +142,7 @@ async function fetchFirstVerifiedAssertionArtifact(
       assertionUri: resolved.assertionUri,
       kind: resolved.kind,
       hash: resolved.hash,
+      requestingAgentAddress: resolved.assertionAgentAddress,
       offset: opts.offset,
       maxBytes: opts.maxBytes,
       ...(resolved.subGraphName ? { subGraphName: resolved.subGraphName } : {}),
@@ -150,6 +151,8 @@ async function fetchFirstVerifiedAssertionArtifact(
     });
     const result = { remote, sourcePeerId };
     if (remote.verifiedBytes) return result;
+    const page = remote.response;
+    if (!page.denied && !page.unavailable && !page.hashMismatch && page.bytesB64 != null) return result;
     fallback ??= result;
   }
   return fallback;
@@ -371,7 +374,7 @@ export async function handleKaImportArtifactRead(ctx: RequestContext): Promise<v
     }
 
     return jsonResponse(res, 200, {
-      status: remote.verifiedBytes ? 'fetched' : 'fetchable',
+      status: page.bytesB64 != null ? 'fetched' : 'fetchable',
       contextGraphId: resolved.contextGraphId,
       assertionUri: resolved.assertionUri,
       kind: resolved.kind,

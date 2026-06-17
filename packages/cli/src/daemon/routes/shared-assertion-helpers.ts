@@ -18,6 +18,7 @@ import {
   sharedMemoryReadBothFilter,
   contextGraphAssertionUri,
   contextGraphMetaUri,
+  isDkgContentHash,
 } from '@origintrail-official/dkg-core';
 import { type PromoteJob, type PromoteJobState } from '@origintrail-official/dkg-publisher';
 import { daemonState } from '../state.js';
@@ -131,11 +132,7 @@ export function hashFromFileUrn(value: string | undefined): string | undefined {
   const prefix = 'urn:dkg:file:';
   if (!value?.startsWith(prefix)) return undefined;
   const hash = value.slice(prefix.length);
-  return /^[a-z0-9]+:[0-9a-f]{64}$/i.test(hash) ? hash : undefined;
-}
-
-export function validateContentHash(hash: string): boolean {
-  return /^(?:sha256:|keccak256:)?[0-9a-f]{64}$/i.test(hash);
+  return isDkgContentHash(hash) ? hash : undefined;
 }
 
 export function validatePromoteJobId(jobId: string): { valid: true } | { valid: false; reason: string } {
@@ -593,7 +590,7 @@ export async function resolveImportedArtifactFromSharedMemory(
 
   const sourceFile = singletonMetadataBinding(bindings, 'sourceFile', normalizeIriBinding, 'source file');
   const sourceFileHash = hashFromFileUrn(sourceFile);
-  if (!sourceFileHash || !validateContentHash(sourceFileHash)) {
+  if (!sourceFileHash || !isDkgContentHash(sourceFileHash)) {
     throw new ImportArtifactRouteError(409, 'Shared-memory import metadata is missing a valid source file hash');
   }
   if (args.requestedFileHash && args.requestedFileHash !== sourceFileHash) {
@@ -610,7 +607,7 @@ export async function resolveImportedArtifactFromSharedMemory(
   const rootEntity = singletonMetadataBinding(bindings, 'rootEntity', normalizeIriBinding, 'root entity') || undefined;
   const markdownFormValue = singletonMetadataBinding(bindings, 'markdownForm', normalizeIriBinding, 'Markdown form') || undefined;
   const markdownFormHash = hashFromFileUrn(markdownFormValue);
-  if (markdownFormValue && (!markdownFormHash || !validateContentHash(markdownFormHash))) {
+  if (markdownFormValue && (!markdownFormHash || !isDkgContentHash(markdownFormHash))) {
     throw new ImportArtifactRouteError(409, 'Import metadata is missing a valid Markdown intermediate hash');
   }
   const markdownHash = markdownFormHash
@@ -784,7 +781,7 @@ export async function resolveImportedArtifact(
   const requestedFileHash = typeof raw.fileHash === 'string' && raw.fileHash.trim()
     ? raw.fileHash.trim()
     : undefined;
-  if (requestedFileHash && !validateContentHash(requestedFileHash)) {
+  if (requestedFileHash && !isDkgContentHash(requestedFileHash)) {
     throw new ImportArtifactRouteError(400, 'Invalid fileHash');
   }
 
@@ -844,7 +841,7 @@ export async function resolveImportedArtifact(
   }
 
   const sourceFileHash = normalizeLiteralBinding(metaBinding.fileHash);
-  if (!sourceFileHash || !validateContentHash(sourceFileHash)) {
+  if (!sourceFileHash || !isDkgContentHash(sourceFileHash)) {
     throw new ImportArtifactRouteError(409, 'Import metadata is missing a valid source file hash');
   }
   if (requestedFileHash && requestedFileHash !== sourceFileHash) {
@@ -856,7 +853,7 @@ export async function resolveImportedArtifact(
     durableSourceContentType || extractionRecord?.detectedContentType,
   );
   const mdIntermediateHash = normalizeLiteralBinding(metaBinding.mdIntermediateHash) || undefined;
-  if (mdIntermediateHash && !validateContentHash(mdIntermediateHash)) {
+  if (mdIntermediateHash && !isDkgContentHash(mdIntermediateHash)) {
     throw new ImportArtifactRouteError(409, 'Import metadata is missing a valid Markdown intermediate hash');
   }
   const markdownFormResult = await ctx.agent.store.query(`

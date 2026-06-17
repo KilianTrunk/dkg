@@ -428,6 +428,52 @@ describe('generic imported artifact peer handler', () => {
     }));
   });
 
+  it('signs private artifact requests with the claimed agent key even when an identity signer exists', async () => {
+    const agent = fakeAgent({
+      onChainPolicy: { accessPolicy: 1, publishPolicy: 0 },
+    });
+    agent.findLocalAgentForContextGraph = vi.fn(async () => ownerAgentAddress);
+    agent.localAgents = new Map([[ownerAgentAddress, { privateKey: ownerWallet.privateKey }]]);
+    agent.chain.getIdentityId = vi.fn(async () => 123n);
+    agent.chain.signMessage = vi.fn(async (digest: Uint8Array) => {
+      const sig = ethers.Signature.from(await otherWallet.signMessage(digest));
+      return { r: ethers.getBytes(sig.r), vs: ethers.getBytes(sig.yParityAndS) };
+    });
+
+    await ImportedArtifactMethods.prototype.readAssertionArtifact.call(agent, {
+      contextGraphId,
+      assertionUri,
+      kind: 'source',
+      hash,
+      sourcePeerId: 'peer-local',
+    });
+
+    const sent = JSON.parse(new TextDecoder().decode(agent.sendToPeer.mock.calls[0][2]));
+    const auth = JSON.parse(Buffer.from(sent.authB64, 'base64').toString('utf8')) as SyncRequestEnvelope;
+    const digest = computeSyncDigest(
+      auth.contextGraphId,
+      auth.offset,
+      auth.limit,
+      auth.includeSharedMemory,
+      auth.targetPeerId!,
+      auth.requesterPeerId!,
+      auth.requestId!,
+      auth.issuedAtMs!,
+      auth.requesterAgentAddress,
+      auth.authPurpose,
+      auth.authSelector,
+    );
+    const recovered = ethers.recoverAddress(ethers.hashMessage(digest), {
+      r: auth.requesterSignatureR!,
+      yParityAndS: auth.requesterSignatureVS!,
+    });
+
+    expect(agent.chain.signMessage).not.toHaveBeenCalled();
+    expect(auth.requesterIdentityId).toBe('0');
+    expect(auth.requesterAgentAddress).toBe(ownerAgentAddress);
+    expect(recovered).toBe(ownerAgentAddress);
+  });
+
   it('rejects remote pagination that does not advance nextOffset', async () => {
     const bytes = Buffer.from('abcdef');
     const artifactHash = keccakHash(bytes);

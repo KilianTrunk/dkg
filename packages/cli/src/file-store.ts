@@ -13,13 +13,15 @@
  * Spec: 05_PROTOCOL_EXTENSIONS.md §6.5
  */
 
-import { createHash } from 'node:crypto';
 import { mkdir, open, readFile, rename, stat as fsStat, unlink, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { ethers } from 'ethers';
-
-const MAX_READ_RANGE_BYTES = 1024 * 1024;
+import {
+  IMPORTED_ARTIFACT_MAX_PAGE_BYTES,
+  keccak256ContentHash,
+  parseDkgContentHash,
+  sha256ContentHash,
+} from '@origintrail-official/dkg-core';
 
 export interface FileStoreEntry {
   /**
@@ -61,10 +63,10 @@ export class FileStore {
    * by keccak256, which is the hash used on the wire and in graph triples.
    */
   async put(bytes: Buffer, contentType: string): Promise<FileStoreEntry> {
-    const sha256Hex = createHash('sha256').update(bytes).digest('hex');
-    const keccakHex = ethers.keccak256(bytes).replace(/^0x/, '');
-    const hash = `sha256:${sha256Hex}`;
-    const keccak256 = `keccak256:${keccakHex}`;
+    const hash = sha256ContentHash(bytes);
+    const keccak256 = keccak256ContentHash(bytes);
+    const sha256Hex = hash.slice('sha256:'.length);
+    const keccakHex = keccak256.slice('keccak256:'.length);
     const path = this.resolvePath(sha256Hex);
     await mkdir(join(this.rootDir, sha256Hex.slice(0, 2)), { recursive: true });
     if (!existsSync(path)) {
@@ -140,10 +142,9 @@ export class FileStore {
     try {
       const info = await handle.stat();
       if (offset >= info.size) return Buffer.alloc(0);
-      const requestedLength = Math.min(length, MAX_READ_RANGE_BYTES);
-      const cappedLength = Math.min(requestedLength, info.size - offset);
-      const buffer = Buffer.alloc(cappedLength);
-      const { bytesRead } = await handle.read(buffer, 0, cappedLength, offset);
+      const bytesToRead = Math.min(length, IMPORTED_ARTIFACT_MAX_PAGE_BYTES, info.size - offset);
+      const buffer = Buffer.alloc(IMPORTED_ARTIFACT_MAX_PAGE_BYTES);
+      const { bytesRead } = await handle.read(buffer, 0, bytesToRead, offset);
       return buffer.subarray(0, bytesRead);
     } finally {
       await handle.close().catch(() => {});
@@ -227,15 +228,5 @@ export class FileStore {
  * 64-char hex under a supported algorithm.
  */
 function parseHash(hash: string): { algo: 'sha256' | 'keccak256'; hex: string } | null {
-  if (typeof hash !== 'string') return null;
-  let algo: 'sha256' | 'keccak256' = 'sha256';
-  let hex = hash;
-  if (hash.startsWith('sha256:')) {
-    hex = hash.slice('sha256:'.length);
-  } else if (hash.startsWith('keccak256:')) {
-    algo = 'keccak256';
-    hex = hash.slice('keccak256:'.length);
-  }
-  if (!/^[0-9a-f]{64}$/i.test(hex)) return null;
-  return { algo, hex: hex.toLowerCase() };
+  return parseDkgContentHash(hash);
 }

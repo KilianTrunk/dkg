@@ -1,14 +1,16 @@
-import { createHash } from 'node:crypto';
 import { ethers } from 'ethers';
 import {
   createOperationContext,
   contextGraphMetaUri,
   contextGraphSharedMemoryUri,
+  IMPORTED_ARTIFACT_MAX_PAGE_BYTES,
   isSafeIri,
+  isDkgContentHash,
   PROTOCOL_GET_ASSERTION_ARTIFACT,
   sharedMemoryReadBothFilter,
   validateContextGraphId,
   validateSubGraphName,
+  verifyDkgContentHash,
 } from '@origintrail-official/dkg-core';
 import type { DKGAgent } from './dkg-agent.js';
 import { DKGAgentBase } from './dkg-agent-base.js';
@@ -26,9 +28,8 @@ import { stripLiteral } from './dkg-agent-utils.js';
 
 const DKG_ONTOLOGY = 'http://dkg.io/ontology/';
 export const IMPORTED_ARTIFACT_AUTH_PURPOSE = 'imported-artifact:v1';
-export const IMPORTED_ARTIFACT_MAX_PAGE_BYTES = 1024 * 1024;
 const IMPORTED_ARTIFACT_MAX_CACHE_BYTES = 64 * 1024 * 1024;
-export { PROTOCOL_GET_ASSERTION_ARTIFACT };
+export { IMPORTED_ARTIFACT_MAX_PAGE_BYTES, PROTOCOL_GET_ASSERTION_ARTIFACT };
 
 export interface ImportedArtifactRequest {
   version: 1;
@@ -77,10 +78,6 @@ export interface AssertionArtifactAvailabilityParams {
   kind: AssertionArtifactKind;
   hash: string;
   subGraphName?: string;
-}
-
-function validateContentHash(hash: string): boolean {
-  return /^(?:sha256:|keccak256:)?[0-9a-f]{64}$/i.test(hash);
 }
 
 function normalizeKind(kind: unknown): AssertionArtifactKind | null {
@@ -153,7 +150,7 @@ function decodeRequest(data: Uint8Array): ImportedArtifactRequest | null {
   const hash = typeof parsed.hash === 'string' ? parsed.hash.trim() : '';
   const authB64 = typeof parsed.authB64 === 'string' ? parsed.authB64.trim() : '';
   if (parsed.version !== 1 || !kind || !range || !contextGraphId || !assertionUri || !hash || !authB64) return null;
-  if (!validateContextGraphId(contextGraphId).valid || !isSafeIri(assertionUri) || !validateContentHash(hash)) return null;
+  if (!validateContextGraphId(contextGraphId).valid || !isSafeIri(assertionUri) || !isDkgContentHash(hash)) return null;
   const subGraphName = typeof parsed.subGraphName === 'string' && parsed.subGraphName.trim()
     ? parsed.subGraphName.trim()
     : undefined;
@@ -186,7 +183,7 @@ function parseHashUrn(value: string | undefined): string | undefined {
   const prefix = 'urn:dkg:file:';
   if (!value?.startsWith(prefix)) return undefined;
   const hash = value.slice(prefix.length);
-  return validateContentHash(hash) ? hash : undefined;
+  return isDkgContentHash(hash) ? hash : undefined;
 }
 
 function binding(cell: unknown): string {
@@ -405,8 +402,8 @@ async function resolveLinkedArtifact(agent: DKGAgent, args: {
     contentType = normalizeContentType(literal(row.contentType));
     mdIntermediateHash = parseHashUrn(binding(row.markdownForm));
   }
-  if (!fileHash || !validateContentHash(fileHash)) return null;
-  if (mdIntermediateHash && !validateContentHash(mdIntermediateHash)) return null;
+  if (!fileHash || !isDkgContentHash(fileHash)) return null;
+  if (mdIntermediateHash && !isDkgContentHash(mdIntermediateHash)) return null;
 
   const linkedHash = args.kind === 'markdown'
     ? mdIntermediateHash ?? (contentType === 'text/markdown' ? fileHash : undefined)
@@ -417,15 +414,6 @@ async function resolveLinkedArtifact(agent: DKGAgent, args: {
     hash: linkedHash,
     contentType: args.kind === 'markdown' ? 'text/markdown' : contentType,
   };
-}
-
-function verifyBytesHash(hash: string, bytes: Uint8Array): boolean {
-  const buffer = Buffer.from(bytes);
-  if (hash.startsWith('keccak256:')) {
-    return `keccak256:${ethers.keccak256(buffer).replace(/^0x/, '')}` === hash;
-  }
-  const sha = createHash('sha256').update(buffer).digest('hex');
-  return hash === sha || hash === `sha256:${sha}`;
 }
 
 export class ImportedArtifactMethods extends DKGAgentBase {
@@ -562,6 +550,7 @@ export class ImportedArtifactMethods extends DKGAgentBase {
           needsAuth,
           authPurpose: IMPORTED_ARTIFACT_AUTH_PURPOSE,
           authSelector: selector,
+          forceClaimedAgentSignature: true,
           computeSyncDigest: this.computeSyncDigest.bind(this),
           getIdentityId: () => this.chain.getIdentityId(),
           signMessage: typeof this.chain.signMessage === 'function' ? this.chain.signMessage.bind(this.chain) : undefined,
@@ -647,7 +636,7 @@ export class ImportedArtifactMethods extends DKGAgentBase {
       if (!page.truncated) break;
     }
     const assembled = Buffer.concat(chunks);
-    if (assembled.length !== total || !verifyBytesHash(params.hash, assembled)) {
+    if (assembled.length !== total || !verifyDkgContentHash(params.hash, assembled)) {
       return { response: { ...first, bytesB64: undefined, hashMismatch: true } };
     }
     const pageBytes = assembled.subarray(

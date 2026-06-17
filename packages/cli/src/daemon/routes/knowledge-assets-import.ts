@@ -17,14 +17,16 @@
 // error mapping, response shape, and side-effects. Each reads + parses
 // its own body. The shared logic lives in `./shared-assertion-helpers.js`.
 
-import { createHash, randomUUID } from "node:crypto";
-import { ethers } from "ethers";
+import { randomUUID } from "node:crypto";
 import {
   contextGraphAssertionUri,
   contextGraphMetaUri,
   assertionLifecycleUri,
   validateAssertionName,
   PayloadTooLargeError,
+  IMPORTED_ARTIFACT_MAX_PAGE_BYTES,
+  isDkgContentHash,
+  verifyDkgContentHash,
 } from "@origintrail-official/dkg-core";
 import { findReservedSubjectPrefix, isSkolemizedUri } from "@origintrail-official/dkg-publisher";
 import type { RequestContext } from "./context.js";
@@ -53,7 +55,6 @@ import {
   normalizeGeneratedAt,
   normalizeGeneratedBy,
   normalizeMarkdownReadLimit,
-  validateContentHash,
   type ImportedArtifactResolution,
 } from "./shared-assertion-helpers.js";
 import { parseBoundary, parseMultipart, MultipartParseError } from "../../http/multipart.js";
@@ -65,8 +66,6 @@ import {
   setExtractionStatusRecord,
 } from "../../extraction-status.js";
 import { SignedRequestRejectedError } from "../../auth.js";
-
-const MAX_ASSERTION_ARTIFACT_READ_BYTES = 1024 * 1024;
 
 type AssertionArtifactKind = 'source' | 'markdown' | 'original';
 
@@ -95,19 +94,11 @@ function normalizeArtifactOffset(raw: unknown): number {
 }
 
 function normalizeArtifactReadLimit(raw: unknown): number {
-  if (raw == null) return MAX_ASSERTION_ARTIFACT_READ_BYTES;
+  if (raw == null) return IMPORTED_ARTIFACT_MAX_PAGE_BYTES;
   if (typeof raw !== 'number' || !Number.isSafeInteger(raw) || raw <= 0) {
     throw new ImportArtifactRouteError(400, '"maxBytes" must be a positive integer');
   }
-  return Math.min(raw, MAX_ASSERTION_ARTIFACT_READ_BYTES);
-}
-
-function verifyArtifactBytesHash(hash: string, bytes: Buffer): boolean {
-  if (hash.startsWith('keccak256:')) {
-    return `keccak256:${ethers.keccak256(bytes).replace(/^0x/, '')}` === hash;
-  }
-  const sha = createHash('sha256').update(bytes).digest('hex');
-  return hash === sha || hash === `sha256:${sha}`;
+  return Math.min(raw, IMPORTED_ARTIFACT_MAX_PAGE_BYTES);
 }
 
 function orderedArtifactCandidatePeers(sourcePeerId: string | undefined, discovered: string[]): string[] {
@@ -172,7 +163,7 @@ async function resolveAssertionArtifact(
   const requestedHash = typeof raw.hash === 'string' && raw.hash.trim()
     ? raw.hash.trim()
     : undefined;
-  if (requestedHash && !validateContentHash(requestedHash)) {
+  if (requestedHash && !isDkgContentHash(requestedHash)) {
     throw new ImportArtifactRouteError(400, 'Invalid hash');
   }
 
@@ -366,7 +357,7 @@ export async function handleKaImportArtifactRead(ctx: RequestContext): Promise<v
     }
 
     if (remote.verifiedBytes && cache) {
-      if (!verifyArtifactBytesHash(resolved.hash, remote.verifiedBytes)) {
+      if (!verifyDkgContentHash(resolved.hash, remote.verifiedBytes)) {
         return jsonResponse(res, 200, {
           status: 'hash_mismatch',
           contextGraphId: resolved.contextGraphId,

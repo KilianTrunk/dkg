@@ -127,6 +127,13 @@ export type V10UpdateACKProvider = (params: {
   newMerkleLeafCount: number;
   newCatalogRoot?: Uint8Array;
   newCatalogLeafCount?: number;
+  /**
+   * OT-RFC-49 / WS-D — set `true` for a curated update so the agent closure
+   * forwards it into `collectUpdate`, stamping `UpdateIntent.isEncryptedPayload`.
+   * Cores gate the inline-catalog rebuild/verify/persist path on this flag.
+   * Omitted (undefined) for public updates — no catalog; unchanged on a healthy chain.
+   */
+  isEncryptedPayload?: boolean;
   /** Updated KC quads (N-Quads) so peers can recompute newMerkleRoot. */
   stagingQuads?: Uint8Array;
   /** Source SWM graph id (defaults to contextGraphId). */

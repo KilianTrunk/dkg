@@ -26,6 +26,8 @@ export interface SyncRequestEnvelope {
   requesterSignatureVS?: string;
   phase?: SyncPhase;
   snapshotRef?: string;
+  authPurpose?: string;
+  authSelector?: string;
   /**
    * Phase C — optional, UNSIGNED delta-sync hint. When set, the responder
    * returns only Knowledge Assets whose KC `dkg:batchId` is strictly greater
@@ -68,6 +70,8 @@ interface BuildSyncRequestParams {
   requesterPeerId: string;
   phase?: SyncPhase;
   snapshotRef?: string;
+  authPurpose?: string;
+  authSelector?: string;
   sinceBatchId?: string;
   syncSessionId?: string;
   needsAuth: boolean;
@@ -81,6 +85,13 @@ interface BuildSyncRequestParams {
    * delegation is consulted on the recovery path.
    */
   recovery?: boolean;
+  /**
+   * Force the authenticated envelope to be signed by `claimedAgentPrivateKey`
+   * even when the node also has an on-chain identity signer. Use this for
+   * protocols whose responder authorizes the recovered signer as the claimed
+   * agent itself, not as the node identity/op-key.
+   */
+  forceClaimedAgentSignature?: boolean;
   computeSyncDigest: (
     contextGraphId: string,
     offset: number,
@@ -91,6 +102,8 @@ interface BuildSyncRequestParams {
     requestId: string,
     issuedAtMs: number,
     requesterAgentAddress: string | undefined,
+    authPurpose?: string,
+    authSelector?: string,
   ) => Uint8Array;
   getIdentityId: () => Promise<bigint>;
   signMessage?: (digest: Uint8Array) => Promise<{ r: Uint8Array; vs: Uint8Array }>;
@@ -116,10 +129,13 @@ export async function buildSyncRequestEnvelope(params: BuildSyncRequestParams): 
     requesterPeerId,
     phase,
     snapshotRef,
+    authPurpose,
+    authSelector,
     sinceBatchId,
     syncSessionId,
     needsAuth,
     recovery,
+    forceClaimedAgentSignature,
     computeSyncDigest,
     getIdentityId,
     signMessage,
@@ -133,6 +149,9 @@ export async function buildSyncRequestEnvelope(params: BuildSyncRequestParams): 
   // silently downgrade to an envelope no responder will gate as recovery.
   if (recovery && !needsAuth) {
     throw new Error(`Cannot build member-recovery sync request for "${contextGraphId}": recovery requires an authenticated envelope`);
+  }
+  if (forceClaimedAgentSignature && !needsAuth) {
+    throw new Error(`Cannot build agent-signed sync request for "${contextGraphId}": forced agent signing requires an authenticated envelope`);
   }
 
   if (!needsAuth) {
@@ -167,6 +186,8 @@ export async function buildSyncRequestEnvelope(params: BuildSyncRequestParams): 
   };
   if (phase) request.phase = phase;
   if (snapshotRef) request.snapshotRef = snapshotRef;
+  if (authPurpose) request.authPurpose = authPurpose;
+  if (authSelector) request.authSelector = authSelector;
   // Phase C: set AFTER digest computation below — it is intentionally outside
   // the signature (narrowing-only, see field docs).
 
@@ -188,6 +209,8 @@ export async function buildSyncRequestEnvelope(params: BuildSyncRequestParams): 
     request.requestId!,
     request.issuedAtMs!,
     request.requesterAgentAddress,
+    request.authPurpose,
+    request.authSelector,
   );
 
   // Phase C: ride the envelope unsigned, after the digest (cannot influence
@@ -204,10 +227,12 @@ export async function buildSyncRequestEnvelope(params: BuildSyncRequestParams): 
   // identity op-key would recover to a non-member and be hard-denied. Force the
   // edge path and require the agent key locally (the recovering node IS the
   // member, so it holds the key).
-  const identityId = recovery ? 0n : await getIdentityId();
-  if (recovery) {
+  const mustSignWithClaimedAgent = Boolean(recovery || forceClaimedAgentSignature);
+  const identityId = mustSignWithClaimedAgent ? 0n : await getIdentityId();
+  if (mustSignWithClaimedAgent) {
     if (!claimedAgentAddress || !claimedAgentPrivateKey) {
-      throw new Error(`Cannot build member-recovery sync request for "${contextGraphId}": missing member agent signing key`);
+      const requestType = recovery ? 'member-recovery' : 'agent-signed';
+      throw new Error(`Cannot build ${requestType} sync request for "${contextGraphId}": missing claimed agent signing key`);
     }
     const wallet = new ethers.Wallet(claimedAgentPrivateKey);
     const sig = ethers.Signature.from(await wallet.signMessage(digest));

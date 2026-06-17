@@ -24,6 +24,8 @@ interface AuthorizeSyncRequestParams {
     requestId: string,
     issuedAtMs: number,
     requesterAgentAddress: string | undefined,
+    authPurpose?: string,
+    authSelector?: string,
   ) => Uint8Array;
   verifyIdentity?: (recoveredAddress: string, claimedIdentityId: bigint, options?: AuthLookupOptions) => Promise<boolean>;
   getParticipants: (contextGraphId: string, options?: AuthLookupOptions) => Promise<string[] | null>;
@@ -77,6 +79,14 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) throw asAbortError(signal.reason);
 }
 
+export function isSyncRequestEnvelopeBoundToPeer(
+  request: SyncRequestEnvelope,
+  remotePeerId: string,
+  localPeerId: string,
+): request is SyncRequestEnvelope & { targetPeerId: string; requesterPeerId: string } {
+  return request.targetPeerId === localPeerId && request.requesterPeerId === remotePeerId;
+}
+
 export async function authorizePrivateSyncRequest(params: AuthorizeSyncRequestParams): Promise<boolean> {
   const {
     ctx,
@@ -113,8 +123,7 @@ export async function authorizePrivateSyncRequest(params: AuthorizeSyncRequestPa
   try { requesterIdentityId = request.requesterIdentityId ? BigInt(request.requesterIdentityId) : 0n; } catch {}
 
   if (
-    request.targetPeerId !== localPeerId ||
-    request.requesterPeerId !== remotePeerId ||
+    !isSyncRequestEnvelopeBoundToPeer(request, remotePeerId, localPeerId) ||
     !request.requestId ||
     request.issuedAtMs == null ||
     now - request.issuedAtMs > syncAuthMaxAgeMs ||
@@ -144,6 +153,8 @@ export async function authorizePrivateSyncRequest(params: AuthorizeSyncRequestPa
     request.requestId,
     request.issuedAtMs,
     request.requesterAgentAddress,
+    request.authPurpose,
+    request.authSelector,
   );
 
   let recoveredAddress: string;

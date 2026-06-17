@@ -1220,6 +1220,47 @@ export class HttpRateLimiter {
   }
 }
 
+/**
+ * Bounds the number of HTTP requests being processed concurrently by the
+ * daemon, independent of client IP. This is admission control, not rate
+ * limiting: the single-process daemon funnels every request onto one event
+ * loop (and, on the embedded store backend, one Oxigraph worker thread), so a
+ * burst of concurrent in-flight requests — including local/loopback traffic
+ * that bypasses {@link HttpRateLimiter} — can pile pending work onto the heap
+ * and stall the node. When the cap is reached, callers should shed load with a
+ * 503 + Retry-After rather than queue unboundedly.
+ *
+ * `tryAcquire()` must be paired with exactly one `release()` in a `finally`.
+ */
+export class InFlightLimiter {
+  private _inFlight = 0;
+  private readonly _max: number;
+
+  constructor(max: number) {
+    // A non-positive cap disables the limiter (always admits).
+    this._max = Number.isFinite(max) && max > 0 ? Math.floor(max) : 0;
+  }
+
+  get inFlight(): number {
+    return this._inFlight;
+  }
+
+  get max(): number {
+    return this._max;
+  }
+
+  /** Returns true and reserves a slot, or false if at capacity (shed load). */
+  tryAcquire(): boolean {
+    if (this._max > 0 && this._inFlight >= this._max) return false;
+    this._inFlight += 1;
+    return true;
+  }
+
+  release(): void {
+    if (this._inFlight > 0) this._inFlight -= 1;
+  }
+}
+
 export function isLoopbackClientIp(ip: string): boolean {
   const normalized = ip.trim().toLowerCase();
   if (normalized === '::1') return true;

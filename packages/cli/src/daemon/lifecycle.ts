@@ -238,6 +238,7 @@ import {
   resolveCorsOrigin,
   corsHeaders,
   HttpRateLimiter,
+  InFlightLimiter,
   isLoopbackClientIp,
   isLoopbackRateLimitExemptPath,
   shouldBypassRateLimitForLoopbackTraffic,
@@ -2672,10 +2673,21 @@ export async function runDaemonInner(
       "/.well-known/skill.md",
     ],
   );
+
+  // Admission control: cap concurrent in-flight requests so a burst (including
+  // loopback traffic, which bypasses the per-IP rate limiter) can't pile
+  // unbounded pending work onto the single event loop / store worker thread.
+  // IP-agnostic on purpose — local agents legitimately burst, so we shed by
+  // concurrency (503 + Retry-After) rather than by per-minute rate. Tunable via
+  // DKG_MAX_INFLIGHT (<=0 disables); default 64.
+  const maxInFlight = Number(process.env.DKG_MAX_INFLIGHT ?? config.maxInFlightRequests ?? 64);
+  const inFlightLimiter = new InFlightLimiter(maxInFlight);
+
   let corsAllowed: CorsAllowlist = "*";
   daemonState.catchupRunner = createCatchupRunner(agent);
 
   const server = createServer(async (req, res) => {
+    let admitted = false;
     try {
       const reqUrl = new URL(req.url ?? "/", `http://${req.headers.host}`);
 
@@ -2691,6 +2703,16 @@ export async function runDaemonInner(
         res.end(JSON.stringify({ error: 'Too many requests' }));
         return;
       }
+
+      // Admission control — shed load when too many requests are already in
+      // flight. Applied to ALL traffic (not bypassed for loopback), so it also
+      // bounds local agents that the per-IP rate limiter intentionally exempts.
+      if (!inFlightLimiter.tryAcquire()) {
+        res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '1', ...corsHeaders(reqCorsOrigin) });
+        res.end(JSON.stringify({ error: 'Server busy, retry shortly' }));
+        return;
+      }
+      admitted = true;
 
       // CORS preflight
       if (req.method === "OPTIONS") {
@@ -2877,8 +2899,20 @@ export async function runDaemonInner(
         enrichEvmError(err);
         jsonResponse(res, 500, { error: err.message });
       }
+    } finally {
+      if (admitted) inFlightLimiter.release();
     }
   });
+
+  // Bound simultaneous sockets and slow-header connections so a flood of
+  // clients can't exhaust file descriptors or park half-open connections.
+  // requestTimeout is left at the Node default so legitimately long publishes /
+  // SPARQL queries aren't truncated. Tunable via DKG_MAX_CONNECTIONS.
+  server.maxConnections = Math.max(
+    1,
+    Number(process.env.DKG_MAX_CONNECTIONS ?? config.maxConnections ?? 256),
+  );
+  server.headersTimeout = Number(process.env.DKG_HEADERS_TIMEOUT_MS ?? 60_000);
 
   const apiPort = config.apiPort || 0;
   const apiHost = config.apiHost || "127.0.0.1";

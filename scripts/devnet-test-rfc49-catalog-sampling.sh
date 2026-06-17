@@ -438,6 +438,29 @@ for round in $(seq 1 12); do
 done
 [ "$RSU_OK" -eq 1 ] || fail "no core submitted a random-sampling proof against the updated catalog within the window"
 
+# ── MEMBER converges to the UPDATED private payload (OT-RFC-49 member distribution). ──
+# The curated update now DISTRIBUTES the updated payload: the producer emits the
+# LU-11 ciphertext chunk and the curator persists it (vs the OLD encrypt-then-
+# discard, which delivered NOTHING and left members permanently stale). This is
+# the NON-VACUOUS proof: unlike the catalog re-host (the floor is stable, so cores
+# already held it from publish), the member must end up holding the UPDATED value.
+# NOTE: a live gossip-push to an ALREADY-CONNECTED member is the known M2-a
+# converge race (issue #1205 — affects ALL SWM updates, not curated-update-
+# specific); the SUPPORTED catch-up is converge-on-reconnect. So restart the
+# member to exercise the converge path, then assert it holds the UPDATED value.
+log "restarting member edge$EDGE_MEMBER to exercise SWM converge to the UPDATED payload…"
+"$REPO_ROOT/scripts/devnet.sh" restart-node "$EDGE_MEMBER" >/dev/null 2>&1 || true
+for _ in $(seq 1 90); do curl -sf --max-time 1 -o /dev/null "http://127.0.0.1:$(node_port "$EDGE_MEMBER")/api/status" 2>/dev/null && break; sleep 1; done
+MEMBER_GOT_UPDATE=0
+for i in $(seq 1 40); do
+  got=$(api_call "$EDGE_MEMBER" POST /api/query "$(S="$PRIV_SUBJ" node -e 'console.log(JSON.stringify({sparql:`SELECT (COUNT(*) AS ?c) WHERE { GRAPH ?g { <${process.env.S}> ?p ?o . FILTER(CONTAINS(STR(?o), "UPDATED")) } }`}))')" | _count_from_query)
+  [ "${got:-0}" -ge 1 ] 2>/dev/null && { MEMBER_GOT_UPDATE=1; break; }
+  { [ "$i" -eq 1 ] || [ $((i % 10)) -eq 0 ]; } && log "  …member converging — still on pre-update value after $((i*3))s"
+  sleep 3
+done
+[ "$MEMBER_GOT_UPDATE" -ge 1 ] || fail "member edge$EDGE_MEMBER did NOT converge to the UPDATED private payload after reconnect — the curated update did not DISTRIBUTE to members (Option B regression)"
+pass "member edge$EDGE_MEMBER converged to the UPDATED private payload — the curated update DISTRIBUTES to members (producer emit + curator-held + converge-on-reconnect)"
+
 # ---------------------------------------------------------------------------
 # 10. FROM-SWM SHORTCUT (OT-RFC-49 catalog auto-injection): a curated publish via
 #     the RAW /api/shared-memory/write + /api/shared-memory/publish path (NO

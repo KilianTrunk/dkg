@@ -118,6 +118,13 @@ function resolveCacheTtlMs(optValue: number | undefined): number {
   return Number.isFinite(n) ? n : 2000;
 }
 
+/**
+ * A rollup is only memoized when its smallest relevant time window is at least
+ * this many multiples of the TTL — so a cached moving-window result can never
+ * represent a meaningfully different window than the live request.
+ */
+const MEMO_WINDOW_SAFETY_FACTOR = 10;
+
 export class DashboardDB {
   readonly db: Database.Database;
   readonly dataDir: string;
@@ -904,16 +911,22 @@ export class DashboardDB {
   private readonly _memoTtlMs: number;
 
   /**
-   * Memoize a rollup for up to `_memoTtlMs`. `minWindowMs` is the smallest
-   * time window the result depends on; caching is bypassed when it is <= the
-   * TTL, because these rollups are computed over a moving `Date.now()` window —
-   * for a short window, a cached value could otherwise surface events that have
-   * already aged out of the requested window (up to one TTL of staleness) even
-   * with no new writes. Default dashboard windows (1h/24h) are far above the
-   * 2s TTL, so they always cache.
+   * Memoize a rollup for up to `_memoTtlMs`. `minWindowMs` is the smallest time
+   * window the result depends on; caching is bypassed unless that window is
+   * COMFORTABLY larger than the TTL (>= MEMO_WINDOW_SAFETY_FACTOR x). These
+   * rollups are computed over a moving `Date.now()` window, so a cached value
+   * can represent a slightly older window than the live request; requiring a
+   * 10x margin keeps that drift a negligible fraction of the window. A 1x guard
+   * is technically sufficient for `periodMs` (only the window cutoff drives
+   * staleness, not `bucketMs`), but per review (zsculac) we apply the
+   * conservative 10x margin to the smallest relevant window so the cache is used
+   * only where staleness is unambiguously acceptable. Default dashboard windows
+   * (1h/24h) are far above the 2s TTL, so they always cache.
    */
   private memoized<T>(key: string, minWindowMs: number, fn: () => T): T {
-    if (!(this._memoTtlMs > 0) || minWindowMs <= this._memoTtlMs) return fn();
+    if (!(this._memoTtlMs > 0) || minWindowMs <= this._memoTtlMs * MEMO_WINDOW_SAFETY_FACTOR) {
+      return fn();
+    }
     const now = Date.now();
     const hit = this._memo.get(key);
     if (hit && now - hit.at < this._memoTtlMs) return hit.value as T;
@@ -1152,10 +1165,12 @@ export class DashboardDB {
    */
   getReplicationTimeline(opts: { periodMs: number; bucketMs: number; contextGraphId?: string }): ReplicationTimelineBucket[] {
     return this.memoized(
-      // Staleness is driven by the rolling `periodMs` cutoff only; `bucketMs`
-      // controls grouping, not which events fall in/out of the window.
       `replicationTimeline:${opts.periodMs}:${opts.bucketMs}:${opts.contextGraphId ?? ''}`,
-      opts.periodMs,
+      // Staleness is driven by the rolling `periodMs` cutoff; `bucketMs` only
+      // controls grouping. We still pass the smaller of the two so timeline
+      // caching also requires a comfortably-large bucket (conservative, per
+      // review) — fine-grained buckets fall back to a fresh compute.
+      Math.min(opts.periodMs, opts.bucketMs),
       () => this._computeReplicationTimeline(opts),
     );
   }

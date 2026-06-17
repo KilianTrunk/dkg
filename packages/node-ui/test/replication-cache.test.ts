@@ -81,13 +81,20 @@ describe('DashboardDB — replication rollup memo', () => {
     expect(db.getReplicationSummary(2 * 60 * 60_000).totalEvents).toBe(2); // distinct key
   });
 
-  it('bypasses the cache when the requested window is <= the TTL (avoids stale-by-window)', () => {
-    db = open(60_000); // TTL 60s, window 10s (<= TTL) → must not cache
+  it('only caches when the window is comfortably (>=10x) larger than the TTL', () => {
+    db = open(60_000); // TTL 60s → caches only when window > 600s (10x)
     const now = Date.now();
     promote(db, now - 1000, 'cg', 1);
-    expect(db.getReplicationSummary(10_000).totalEvents).toBe(1);
+
+    // window 500s (< 10x TTL) → bypass → always fresh
+    expect(db.getReplicationSummary(500_000).totalEvents).toBe(1);
     promote(db, now - 500, 'cg', 2);
-    expect(db.getReplicationSummary(10_000).totalEvents).toBe(2); // not cached → fresh
+    expect(db.getReplicationSummary(500_000).totalEvents).toBe(2);
+
+    // window 700s (> 10x TTL) → cache
+    expect(db.getReplicationSummary(700_000).totalEvents).toBe(2);
+    promote(db, now - 250, 'cg', 3);
+    expect(db.getReplicationSummary(700_000).totalEvents).toBe(2); // cached → 3rd not yet visible
   });
 
   it('memoizes getReplicationPerCg independently and keys it by window', () => {
@@ -101,19 +108,22 @@ describe('DashboardDB — replication rollup memo', () => {
     expect(db.getReplicationPerCg(2 * 3_600_000).length).toBe(2); // different window key → recomputed
   });
 
-  it('timeline cache bypass is driven by periodMs, not bucketMs', () => {
-    db = open(60_000); // 60s TTL
+  it('timeline caching also requires a comfortably-large bucketMs (conservative guard)', () => {
+    db = open(60_000); // 60s TTL → 10x = 600s
     const now = Date.now();
     promote(db, now - 1000, 'cg', 1);
-    // periodMs 1h (> TTL) but bucketMs 10s (<= TTL): with the periodMs-only rule
-    // this CACHES (bucketMs no longer forces a bypass).
-    const big = { periodMs: 3_600_000, bucketMs: 10_000 };
-    expect(timelineTotal(db.getReplicationTimeline(big))).toBe(1);
-    promote(db, now - 500, 'cg', 2);
-    expect(timelineTotal(db.getReplicationTimeline(big))).toBe(1); // cached (periodMs > TTL)
 
-    // A small periodMs (<= TTL) is bypassed → fresh.
-    expect(timelineTotal(db.getReplicationTimeline({ periodMs: 10_000, bucketMs: 1000 }))).toBe(2);
+    // periodMs 24h (>> 10x TTL) but bucketMs 10s (< 10x TTL) → bypass → fresh
+    const fineBuckets = { periodMs: 86_400_000, bucketMs: 10_000 };
+    expect(timelineTotal(db.getReplicationTimeline(fineBuckets))).toBe(1);
+    promote(db, now - 500, 'cg', 2);
+    expect(timelineTotal(db.getReplicationTimeline(fineBuckets))).toBe(2); // small bucket → not cached
+
+    // periodMs 24h AND bucketMs 1h (both >> 10x TTL) → cache
+    const coarseBuckets = { periodMs: 86_400_000, bucketMs: 3_600_000 };
+    expect(timelineTotal(db.getReplicationTimeline(coarseBuckets))).toBe(2);
+    promote(db, now - 250, 'cg', 3);
+    expect(timelineTotal(db.getReplicationTimeline(coarseBuckets))).toBe(2); // cached
   });
 });
 

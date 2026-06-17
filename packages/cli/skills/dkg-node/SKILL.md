@@ -825,6 +825,8 @@ chain:
 
 `targetAllowance` is a string because YAML/JSON can't carry bigints natively — the daemon parses it into a bigint at startup, fails fast on garbage input. `refillBelowFraction` clamps to `[0, 1]`; a value of `1` means "refill on every publish" (defeats the policy) and `0` means "never refill until the publish floor (1 wei-TRAC) is breached" (which on a zero-cost CG would mean approve once then never again).
 
+Mode-only shorthand is accepted for compatibility (`approvalPolicy: unlimited` is normalized to `approvalPolicy: { mode: unlimited }`). Use the object form when setting `targetAllowance` or `refillBelowFraction`.
+
 The policy never approves *less* than the immediate publish needs — a too-low `targetAllowance` gets quietly raised to the publish's on-chain floor so misconfiguration can't brick a publish.
 
 This entire surface was empirically driven by [PR #720](https://github.com/OriginTrail/dkg/pull/720)'s `TooLowAllowance(token, 0, 1)` finding on the May 2026 Base Sepolia publish-stress run; see also `packages/chain/test/evm-adapter.unit.test.ts` for the policy's invariants and edge cases.

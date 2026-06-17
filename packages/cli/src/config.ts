@@ -171,6 +171,8 @@ export interface NetworkConfig {
  * preparing for high-volume publishing should consider `replenishing`.
  * See `packages/cli/skills/dkg-node/SKILL.md` §8 for the operator guide.
  */
+export type ApprovalPolicyMode = 'per-publish' | 'replenishing' | 'unlimited';
+
 export interface ApprovalPolicyConfig {
   /**
    * Allowance sizing strategy. Defaults to `'per-publish'`:
@@ -186,7 +188,7 @@ export interface ApprovalPolicyConfig {
    *     Lowest gas, widest blast radius. Use only if you trust the V10 KA
    *     contract absolutely.
    */
-  mode?: 'per-publish' | 'replenishing' | 'unlimited';
+  mode?: ApprovalPolicyMode;
   /**
    * `replenishing` only. TRAC amount (decimal wei-TRAC string — `1000 *
    * 10^18 = '1000000000000000000000'` for 1000 TRAC) to approve up to.
@@ -200,6 +202,8 @@ export interface ApprovalPolicyConfig {
    */
   refillBelowFraction?: number;
 }
+
+export type ApprovalPolicyConfigInput = ApprovalPolicyConfig | ApprovalPolicyMode;
 
 export interface ChainConfig {
   /** 'evm' for real blockchain, omit or 'mock' for in-memory (testing only) */
@@ -222,16 +226,21 @@ export interface ChainConfig {
   /**
    * V10 TRAC auto-approve policy. Controls how the adapter sizes the
    * allowance it requests from each operational signer before a publish or
-   * update. See {@link ApprovalPolicyConfig} for the modes and
+   * update. The object form is preferred; a mode string shorthand is accepted
+   * for compatibility. See {@link ApprovalPolicyConfig} for the modes and
    * `packages/cli/skills/dkg-node/SKILL.md` §8 for the operator guide.
    */
-  approvalPolicy?: ApprovalPolicyConfig;
+  approvalPolicy?: ApprovalPolicyConfigInput;
   /**
    * ContextGraphNameRegistry discovery scan `eth_getLogs` block-window.
    * Defaults to the EVM adapter's 2,000-block common provider cap.
    */
   cgRegistryScanPageSize?: number;
 }
+
+export type ResolvedChainConfig = Partial<Omit<ChainConfig, 'approvalPolicy'>> & {
+  approvalPolicy?: ApprovalPolicyConfig;
+};
 
 export interface LargeLiteralStorageConfig {
   enabled?: boolean;
@@ -730,7 +739,7 @@ export function resolveSharedMemoryTtlMs(config: DkgConfig): number | undefined 
  */
 export function resolveApprovalPolicy(
   policy: ApprovalPolicyConfig | undefined,
-): { mode: 'per-publish' | 'replenishing' | 'unlimited'; targetAllowance?: bigint; refillBelowFraction?: number } | undefined {
+): { mode: ApprovalPolicyMode; targetAllowance?: bigint; refillBelowFraction?: number } | undefined {
   if (!policy) return undefined;
   const mode = policy.mode ?? 'per-publish';
   if (mode !== 'per-publish' && mode !== 'replenishing' && mode !== 'unlimited') {
@@ -877,6 +886,30 @@ export function _resetProjectConfigCache(): void {
   _projectConfig = null;
 }
 
+function isPlainConfigObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+function isApprovalPolicyMode(value: unknown): value is ApprovalPolicyMode {
+  return value === 'per-publish' || value === 'replenishing' || value === 'unlimited';
+}
+
+function requireApprovalPolicyConfig(policy: unknown): ApprovalPolicyConfig | undefined {
+  if (policy === undefined || policy === null) return undefined;
+  if (typeof policy === 'string') {
+    if (isApprovalPolicyMode(policy)) return { mode: policy };
+    throw new Error(
+      `chain.approvalPolicy must be an object or a valid mode string (got: ${JSON.stringify(policy)})`,
+    );
+  }
+  if (!isPlainConfigObject(policy)) {
+    throw new Error(`chain.approvalPolicy must be an object (got: ${JSON.stringify(policy)})`);
+  }
+  return policy as ApprovalPolicyConfig;
+}
+
 /**
  * Field-level merge of the effective auto-update configuration.
  *
@@ -962,7 +995,7 @@ export function resolveAutoUpdateSource(
 export function resolveChainConfig(
   config: Pick<DkgConfig, 'chain'> | null | undefined,
   network: Pick<NetworkConfig, 'chain'> | null | undefined,
-): Partial<ChainConfig> | undefined {
+): ResolvedChainConfig | undefined {
   const cfg = config?.chain;
   const net = network?.chain;
   if (!cfg && !net) return undefined;
@@ -978,13 +1011,13 @@ export function resolveChainConfig(
   // / EVMChainAdapter against the live network in parallel. MockChainAdapter
   // only needs chainId; rpcUrl/hubAddress are meaningless in mock mode.
   if (cfg?.type === 'mock') {
-    const mockMerged: Partial<ChainConfig> = { type: 'mock' };
+    const mockMerged: ResolvedChainConfig = { type: 'mock' };
     if (cfg.chainId !== undefined) mockMerged.chainId = cfg.chainId;
     if (cfg.mockIdentityId !== undefined) mockMerged.mockIdentityId = cfg.mockIdentityId;
     return mockMerged;
   }
 
-  const merged: Partial<ChainConfig> = {
+  const merged: ResolvedChainConfig = {
     type: cfg?.type ?? net?.type ?? 'evm',
   };
   const primaryRpcUrl = cfg?.rpcUrl ?? net?.rpcUrl;
@@ -1006,6 +1039,8 @@ export function resolveChainConfig(
   if (tokenAddress !== undefined) merged.tokenAddress = tokenAddress;
   const chainId = cfg?.chainId ?? net?.chainId;
   if (chainId !== undefined) merged.chainId = chainId;
+  const approvalPolicy = requireApprovalPolicyConfig(cfg?.approvalPolicy);
+  if (approvalPolicy !== undefined) merged.approvalPolicy = approvalPolicy;
   const cgRegistryScanPageSize = cfg?.cgRegistryScanPageSize ?? net?.cgRegistryScanPageSize;
   if (cgRegistryScanPageSize !== undefined) merged.cgRegistryScanPageSize = cgRegistryScanPageSize;
   if (cfg?.mockIdentityId !== undefined) merged.mockIdentityId = cfg.mockIdentityId;

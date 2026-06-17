@@ -44,9 +44,14 @@ describe('daemon /api/replication/* (real node, seeded telemetry)', () => {
   }, 90_000);
 
   afterAll(async () => {
-    await stopLiveDaemon(daemon);
-    if (prevTtlEnv === undefined) delete process.env.DKG_DASHBOARD_CACHE_TTL_MS;
-    else process.env.DKG_DASHBOARD_CACHE_TTL_MS = prevTtlEnv;
+    // Restore the env var even if daemon shutdown throws/times out, so a leaked
+    // TTL=0 can't change caching behaviour for later tests in this worker.
+    try {
+      await stopLiveDaemon(daemon);
+    } finally {
+      if (prevTtlEnv === undefined) delete process.env.DKG_DASHBOARD_CACHE_TTL_MS;
+      else process.env.DKG_DASHBOARD_CACHE_TTL_MS = prevTtlEnv;
+    }
   }, 30_000);
 
   async function getJson(d: LiveDaemon, path: string): Promise<{ status: number; body: any }> {

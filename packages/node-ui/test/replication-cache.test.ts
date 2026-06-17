@@ -169,14 +169,22 @@ describe('DashboardDB — cache TTL resolution', () => {
     expect(db.getReplicationSummary(3_600_000).totalEvents).toBe(1); // still cached → default TTL active, not disabled
   });
 
-  it('malformed DKG_DASHBOARD_CACHE_TTL_MS falls back to the default', () => {
+  it('malformed DKG_DASHBOARD_CACHE_TTL_MS falls back to the 2000ms default (not a lax parseInt)', () => {
+    // A lax resolver like `parseInt('64x')` would yield a 64ms TTL, and two
+    // immediate reads can't tell that from 2000ms. Use fake time: advance past a
+    // hypothetical 64ms TTL but well before 2000ms and assert the value is STILL
+    // cached → the TTL really is the default, not a leniently-parsed 64.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const t0 = 1_700_000_000_000;
+    vi.setSystemTime(t0);
     process.env[ENV_KEY] = '64x';
     db = new DashboardDB({ dataDir: dir });
-    const now = Date.now();
-    promote(db, now - 1000, 'cg', 1);
-    expect(db.getReplicationSummary(3_600_000).totalEvents).toBe(1);
-    promote(db, now - 500, 'cg', 2);
-    expect(db.getReplicationSummary(3_600_000).totalEvents).toBe(1); // cached at default → not disabled
+    promote(db, t0 - 1000, 'cg', 1);
+    expect(db.getReplicationSummary(3_600_000).totalEvents).toBe(1); // computed + cached at t0
+
+    promote(db, t0 - 500, 'cg', 2);
+    vi.setSystemTime(t0 + 100); // past a hypothetical 64ms TTL, far below 2000ms
+    expect(db.getReplicationSummary(3_600_000).totalEvents).toBe(1); // still cached → TTL is 2000, not 64
   });
 
   it('the cacheTtlMs option overrides the env var', () => {

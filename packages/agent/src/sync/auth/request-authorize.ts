@@ -143,31 +143,19 @@ export async function authorizePrivateSyncRequest(params: AuthorizeSyncRequestPa
     return false;
   }
 
-  const digest = request.authPurpose || request.authSelector
-    ? computeSyncDigest(
-        request.contextGraphId,
-        request.offset,
-        request.limit,
-        request.includeSharedMemory,
-        request.targetPeerId,
-        request.requesterPeerId,
-        request.requestId,
-        request.issuedAtMs,
-        request.requesterAgentAddress,
-        request.authPurpose,
-        request.authSelector,
-      )
-    : computeSyncDigest(
-        request.contextGraphId,
-        request.offset,
-        request.limit,
-        request.includeSharedMemory,
-        request.targetPeerId,
-        request.requesterPeerId,
-        request.requestId,
-        request.issuedAtMs,
-        request.requesterAgentAddress,
-      );
+  const digest = computeSyncDigest(
+    request.contextGraphId,
+    request.offset,
+    request.limit,
+    request.includeSharedMemory,
+    request.targetPeerId,
+    request.requesterPeerId,
+    request.requestId,
+    request.issuedAtMs,
+    request.requesterAgentAddress,
+    request.authPurpose,
+    request.authSelector,
+  );
 
   let recoveredAddress: string;
   try {

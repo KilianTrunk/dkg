@@ -199,31 +199,19 @@ export async function buildSyncRequestEnvelope(params: BuildSyncRequestParams): 
   if (claimedAgentAddress) {
     request.requesterAgentAddress = claimedAgentAddress;
   }
-  const digest = request.authPurpose || request.authSelector
-    ? computeSyncDigest(
-        request.contextGraphId,
-        request.offset,
-        request.limit,
-        request.includeSharedMemory,
-        request.targetPeerId!,
-        request.requesterPeerId!,
-        request.requestId!,
-        request.issuedAtMs!,
-        request.requesterAgentAddress,
-        request.authPurpose,
-        request.authSelector,
-      )
-    : computeSyncDigest(
-        request.contextGraphId,
-        request.offset,
-        request.limit,
-        request.includeSharedMemory,
-        request.targetPeerId!,
-        request.requesterPeerId!,
-        request.requestId!,
-        request.issuedAtMs!,
-        request.requesterAgentAddress,
-      );
+  const digest = computeSyncDigest(
+    request.contextGraphId,
+    request.offset,
+    request.limit,
+    request.includeSharedMemory,
+    request.targetPeerId!,
+    request.requesterPeerId!,
+    request.requestId!,
+    request.issuedAtMs!,
+    request.requesterAgentAddress,
+    request.authPurpose,
+    request.authSelector,
+  );
 
   // Phase C: ride the envelope unsigned, after the digest (cannot influence
   // authorization; only narrows the responder's result set).

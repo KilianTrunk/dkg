@@ -1642,6 +1642,13 @@ export class DKGAgent extends DKGAgentBase {
       newMerkleLeafCount: number;
       newCatalogRoot?: Uint8Array;
       newCatalogLeafCount?: number;
+      // OT-RFC-49 / WS-D — `true` for a curated update (the producer sets it
+      // from `useEncryptedInlineUpdate`). Forwarded into `collectUpdate` so it
+      // stamps `UpdateIntent.isEncryptedPayload`, gating the cores' inline-
+      // catalog rebuild/verify/persist path. Undefined for public updates,
+      // which stay byte-for-byte as today. Mirrors the publish closure passing
+      // `isEncryptedPayload` into `collect`.
+      isEncryptedPayload?: boolean;
       stagingQuads?: Uint8Array;
       swmGraphId?: string;
       subGraphName?: string;
@@ -1710,6 +1717,9 @@ export class DKGAgent extends DKGAgentBase {
         swmGraphId: params.swmGraphId,
         subGraphName: params.subGraphName,
         stagingQuads: params.stagingQuads,
+        // OT-RFC-49 / WS-D — stamp `UpdateIntent.isEncryptedPayload` for a
+        // curated update so cores rebuild/verify/persist the inline catalog.
+        isEncryptedPayload: params.isEncryptedPayload,
       });
       return result.acks;
     };

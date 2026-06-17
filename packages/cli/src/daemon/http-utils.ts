@@ -1290,23 +1290,49 @@ function parseIntOrNull(value: string | undefined): number | null {
  * `DKG_MAX_INFLIGHT=abc` or an empty string yields the documented default, not
  * `NaN`/`0`.
  *
- * Pass `allowZero` when non-positive is a meaningful value (e.g. "disable the
- * cap"): then ANY integer is accepted, so `<= 0` (incl. `-1`) flows through to
+ * Pass `allowNonPositive` when `<= 0` is a meaningful value (e.g. "disable the
+ * cap"): then ANY integer is accepted, so `0` or a negative flows through to
  * disable rather than falling back to the default. Without it the minimum
- * accepted value is 1.
+ * accepted value is 1. (Named for what it does — it admits negatives too, not
+ * just zero.)
  */
 export function resolveIntSetting(
   envValue: string | undefined,
   configValue: number | undefined,
   fallback: number,
-  opts: { allowZero?: boolean } = {},
+  opts: { allowNonPositive?: boolean } = {},
 ): number {
   const accepts = (n: number | null | undefined): n is number =>
-    typeof n === 'number' && Number.isInteger(n) && (opts.allowZero === true || n >= 1);
+    typeof n === 'number' && Number.isInteger(n) && (opts.allowNonPositive === true || n >= 1);
   const fromEnv = parseIntOrNull(envValue);
   if (accepts(fromEnv)) return fromEnv;
   if (accepts(configValue)) return configValue;
   return fallback;
+}
+
+/** Minimal shape of the bits of `http.Server` that {@link applyServerLimits} sets. */
+export interface ServerLimitsTarget {
+  maxConnections: number;
+  headersTimeout: number;
+}
+
+/**
+ * Resolve and APPLY the socket-level limits to an HTTP server: `maxConnections`
+ * (cap simultaneous sockets) and `headersTimeout` (kill slow-header
+ * connections). `requestTimeout` is intentionally left at the Node default so
+ * legitimately long publishes / SPARQL queries aren't truncated. Extracted from
+ * the daemon so the resolution precedence AND the assignment are unit-testable.
+ */
+export function applyServerLimits(
+  server: ServerLimitsTarget,
+  opts: {
+    maxConnectionsEnv?: string;
+    maxConnectionsConfig?: number;
+    headersTimeoutEnv?: string;
+  },
+): void {
+  server.maxConnections = resolveIntSetting(opts.maxConnectionsEnv, opts.maxConnectionsConfig, 256);
+  server.headersTimeout = resolveIntSetting(opts.headersTimeoutEnv, undefined, 60_000);
 }
 
 /**

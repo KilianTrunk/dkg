@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ServerResponse } from 'node:http';
-import { InFlightLimiter, admitRequest, resolveIntSetting } from '../src/daemon/http-utils.js';
+import { InFlightLimiter, admitRequest, resolveIntSetting, applyServerLimits } from '../src/daemon/http-utils.js';
 
 /** Minimal ServerResponse stand-in capturing writeHead/end for assertions. */
 function mockRes() {
@@ -78,22 +78,40 @@ describe('resolveIntSetting — env/config/fallback parsing', () => {
     expect(resolveIntSetting('abc', 200, 64)).toBe(200); // invalid env -> config
   });
 
-  it('without allowZero, rejects non-positive (min 1) and fractions', () => {
+  it('without allowNonPositive, rejects non-positive (min 1) and fractions', () => {
     expect(resolveIntSetting('0', undefined, 64)).toBe(64); // 0 rejected (min 1)
     expect(resolveIntSetting('-5', undefined, 64)).toBe(64); // negative rejected
     expect(resolveIntSetting(undefined, 2.5, 64)).toBe(64); // fractional config ignored
     expect(resolveIntSetting(undefined, 0, 64)).toBe(64); // config 0 rejected
   });
 
-  it('with allowZero, any <=0 flows through to disable (does NOT fall back to default)', () => {
+  it('with allowNonPositive, any <=0 flows through to disable (does NOT fall back to default)', () => {
     // Contract: "<= 0 disables". A typo must still fall back, but an explicit
     // 0 or negative is an intentional disable, not garbage.
-    expect(resolveIntSetting('0', undefined, 64, { allowZero: true })).toBe(0);
-    expect(resolveIntSetting('-1', undefined, 64, { allowZero: true })).toBe(-1);
-    expect(resolveIntSetting(undefined, -3, 64, { allowZero: true })).toBe(-3); // via config
-    expect(resolveIntSetting('abc', undefined, 64, { allowZero: true })).toBe(64); // still falls back
+    expect(resolveIntSetting('0', undefined, 64, { allowNonPositive: true })).toBe(0);
+    expect(resolveIntSetting('-1', undefined, 64, { allowNonPositive: true })).toBe(-1);
+    expect(resolveIntSetting(undefined, -3, 64, { allowNonPositive: true })).toBe(-3); // via config
+    expect(resolveIntSetting('abc', undefined, 64, { allowNonPositive: true })).toBe(64); // still falls back
     // And the resolved value disables the limiter end-to-end:
-    expect(new InFlightLimiter(resolveIntSetting('-1', undefined, 64, { allowZero: true })).max).toBe(0);
+    expect(new InFlightLimiter(resolveIntSetting('-1', undefined, 64, { allowNonPositive: true })).max).toBe(0);
+  });
+});
+
+describe('applyServerLimits — socket-level controls applied to the server', () => {
+  it('resolves env > config > default and assigns to the server object', () => {
+    const s = { maxConnections: 0, headersTimeout: 0 };
+
+    applyServerLimits(s, { maxConnectionsEnv: '500', maxConnectionsConfig: 256, headersTimeoutEnv: undefined });
+    expect(s.maxConnections).toBe(500); // env wins
+    expect(s.headersTimeout).toBe(60_000); // default
+
+    applyServerLimits(s, { maxConnectionsEnv: 'abc', maxConnectionsConfig: 300, headersTimeoutEnv: '5000' });
+    expect(s.maxConnections).toBe(300); // malformed env → config
+    expect(s.headersTimeout).toBe(5000); // env honored
+
+    applyServerLimits(s, {});
+    expect(s.maxConnections).toBe(256); // all defaults
+    expect(s.headersTimeout).toBe(60_000);
   });
 });
 

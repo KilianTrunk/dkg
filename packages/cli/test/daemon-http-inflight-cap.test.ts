@@ -15,7 +15,13 @@ describe('daemon admission control (real node, maxInFlightRequests=1)', () => {
   let daemon: LiveDaemon | undefined;
 
   beforeAll(async () => {
-    daemon = await startLiveDaemon({ authEnabled: true, extraConfig: { maxInFlightRequests: 1 } });
+    // Pin the cap via ENV (which takes precedence over config) so the test is
+    // hermetic — an ambient DKG_MAX_INFLIGHT in CI/dev can't override it.
+    daemon = await startLiveDaemon({
+      authEnabled: true,
+      extraConfig: { maxInFlightRequests: 1 },
+      env: { DKG_MAX_INFLIGHT: '1' },
+    });
   }, 90_000);
 
   afterAll(async () => {

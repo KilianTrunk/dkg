@@ -241,6 +241,7 @@ import {
   InFlightLimiter,
   admitRequest,
   resolveIntSetting,
+  applyServerLimits,
   isLoopbackClientIp,
   isLoopbackRateLimitExemptPath,
   shouldBypassRateLimitForLoopbackTraffic,
@@ -2687,7 +2688,7 @@ export async function runDaemonInner(
     process.env.DKG_MAX_INFLIGHT,
     config.maxInFlightRequests,
     64,
-    { allowZero: true },
+    { allowNonPositive: true },
   );
   const inFlightLimiter = new InFlightLimiter(maxInFlight);
   // Throttle the "shedding" warning so a sustained burst can't spam the log,
@@ -2699,7 +2700,6 @@ export async function runDaemonInner(
   daemonState.catchupRunner = createCatchupRunner(agent);
 
   const server = createServer(async (req, res) => {
-    let releaseSlot: (() => void) | undefined;
     try {
       const reqUrl = new URL(req.url ?? "/", `http://${req.headers.host}`);
 
@@ -2732,7 +2732,13 @@ export async function runDaemonInner(
         }
         return;
       }
-      releaseSlot = gate.release;
+      // Release the slot when the RESPONSE actually completes, not when this
+      // handler returns. Route plugins (and SSE) can send headers and return
+      // with the response still open while they keep streaming; releasing on
+      // handler return would free the slot mid-stream and let streaming work
+      // run outside the cap. `close` fires once per response (on finish or
+      // abort), so the slot is held for the response's true lifetime.
+      res.once('close', gate.release);
 
       // CORS preflight
       if (req.method === "OPTIONS") {
@@ -2919,27 +2925,21 @@ export async function runDaemonInner(
         enrichEvmError(err);
         jsonResponse(res, 500, { error: err.message });
       }
-    } finally {
-      releaseSlot?.();
     }
+    // Note: the admission slot is released on the response's `close` event
+    // (registered above), not in a finally here — see the comment at acquire.
   });
 
   // Bound simultaneous sockets and slow-header connections so a flood of
   // clients can't exhaust file descriptors or park half-open connections.
-  // requestTimeout is left at the Node default so legitimately long publishes /
-  // SPARQL queries aren't truncated. Malformed/empty env or config values fall
-  // back to the defaults rather than becoming NaN. Tunable via
-  // DKG_MAX_CONNECTIONS / DKG_HEADERS_TIMEOUT_MS.
-  server.maxConnections = resolveIntSetting(
-    process.env.DKG_MAX_CONNECTIONS,
-    config.maxConnections,
-    256,
-  );
-  server.headersTimeout = resolveIntSetting(
-    process.env.DKG_HEADERS_TIMEOUT_MS,
-    undefined,
-    60_000,
-  );
+  // Resolution + assignment live in applyServerLimits (unit-tested); tunable via
+  // DKG_MAX_CONNECTIONS / DKG_HEADERS_TIMEOUT_MS, with malformed/empty values
+  // falling back to defaults rather than becoming NaN.
+  applyServerLimits(server, {
+    maxConnectionsEnv: process.env.DKG_MAX_CONNECTIONS,
+    maxConnectionsConfig: config.maxConnections,
+    headersTimeoutEnv: process.env.DKG_HEADERS_TIMEOUT_MS,
+  });
 
   const apiPort = config.apiPort || 0;
   const apiHost = config.apiHost || "127.0.0.1";

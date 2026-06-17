@@ -26,6 +26,7 @@ import {
 } from '@origintrail-official/dkg-chain';
 import {
   V10MerkleTree,
+  contextGraphCatalogUri,
   contextGraphDataUri,
   contextGraphMetaUri,
   hashTripleV10,
@@ -112,6 +113,26 @@ async function seedKC(store: OxigraphStore, fixture: KCFixture): Promise<{ root:
   return { root: tree.root, leafCount: tree.leafCount };
 }
 
+/**
+ * Seed the PUBLIC `_catalog` named graph for a curated CG (OT-RFC-49 WS-C).
+ * The graph URI is keyed by the NUMERIC on-chain id (no name mapping), exactly
+ * what `extractCatalogLeavesFromStore` reads back. Returns the committed
+ * (root, leafCount) the prover must rebuild to satisfy the builder guard.
+ */
+async function seedCatalog(
+  store: OxigraphStore,
+  cgId: bigint,
+  triples: { subject: string; predicate: string; object: string }[],
+): Promise<{ root: Uint8Array; leafCount: number }> {
+  const catalogGraph = contextGraphCatalogUri(String(cgId));
+  await store.insert(triples.map((t) => ({ ...t, graph: catalogGraph })));
+  const leaves = triples.map((t) =>
+    hashTripleV10(t.subject, t.predicate, t.object),
+  );
+  const tree = new V10MerkleTree(leaves);
+  return { root: tree.root, leafCount: tree.leafCount };
+}
+
 const IDENTITY_ID = 42n;
 
 function makeChallenge(overrides: Partial<NodeChallenge> = {}): NodeChallenge {
@@ -183,6 +204,126 @@ describe('RandomSamplingProver — happy path', () => {
 
     const trail = (await wal.readAll()).map((e) => e.status);
     expect(trail).toEqual(['challenge', 'extracted', 'built', 'submitted']);
+    await prover.close();
+  });
+});
+
+describe('RandomSamplingProver — curated catalog (OT-RFC-49 WS-C)', () => {
+  let store: OxigraphStore;
+  beforeEach(() => {
+    store = new OxigraphStore();
+  });
+
+  it('tick: a curated CG proves the PUBLIC _catalog (extracts catalog, builds flat-kc, submits)', async () => {
+    const cgId = 11n;
+    const kaId = 7n;
+    // Plaintext public catalog floor triples; none use DKG_COMMITTED_ROOT, so
+    // all survive the catalogCommittedLeaves filter and form the committed set.
+    const catalogTriples = [
+      { subject: 'did:dkg:context-graph:11', predicate: 'urn:p:floor', object: '"catalog-a"' },
+      { subject: 'did:dkg:context-graph:11', predicate: 'urn:p:floor', object: '"catalog-b"' },
+      { subject: 'did:dkg:context-graph:11', predicate: 'urn:p:floor', object: '"catalog-c"' },
+    ];
+    const { root, leafCount } = await seedCatalog(store, cgId, catalogTriples);
+
+    const submitProof = vi.fn(async () => ({
+      hash: '0xcat123',
+      blockNumber: 1001,
+      success: true,
+    }));
+    // isCurated + the PINNED (challengeRoot, challengeLeafCount) snapshot the
+    // curated branch proves against (WS-B Trap 1), set to the catalog commitment.
+    const challenge = makeChallenge({
+      knowledgeAssetId: kaId,
+      chunkId: 1n,
+      isCurated: true,
+      challengeRoot: root,
+      challengeLeafCount: BigInt(leafCount),
+    });
+    const chain = makeChain({
+      status: { activeProofPeriodStartBlock: 1000n, isValid: true },
+      challengeForNode: null,
+      createChallenge: async () => ({
+        challenge,
+        contextGraphId: cgId,
+        hash: '0xchallenge',
+        blockNumber: 1000,
+        success: true,
+      }),
+      expectedRoot: root,
+      expectedLeafCount: leafCount,
+      cgIdForKc: cgId,
+      submitProof,
+    });
+
+    const wal = new InMemoryProverWal();
+    const prover = new RandomSamplingProver({
+      chain,
+      store,
+      identityId: IDENTITY_ID,
+      wal,
+    });
+    const outcome = await prover.tick();
+
+    expect(outcome).toEqual({
+      kind: 'submitted',
+      txHash: '0xcat123',
+      kaId,
+      cgId,
+      chunkId: 1n,
+    });
+    expect(submitProof).toHaveBeenCalledTimes(1);
+    // Same transition trail as the public flat-kc path — confirms the curated
+    // dispatch reaches build + submit, not a short-circuit.
+    const trail = (await wal.readAll()).map((e) => e.status);
+    expect(trail).toEqual(['challenge', 'extracted', 'built', 'submitted']);
+    await prover.close();
+  });
+
+  it('tick: a curated CG whose _catalog has not synced returns kc-not-synced (no submit)', async () => {
+    const cgId = 12n;
+    const kaId = 8n;
+    // No catalog seeded → extractCatalogLeavesFromStore throws
+    // CatalogLeavesMissingError → mapped to the kc-not-synced skip.
+    const submitProof = vi.fn(async () => ({
+      hash: '0xno',
+      blockNumber: 1,
+      success: true,
+    }));
+    const challenge = makeChallenge({
+      knowledgeAssetId: kaId,
+      chunkId: 1n,
+      isCurated: true,
+      challengeRoot: new Uint8Array(32),
+      challengeLeafCount: 0n,
+    });
+    const chain = makeChain({
+      status: { activeProofPeriodStartBlock: 1000n, isValid: true },
+      challengeForNode: null,
+      createChallenge: async () => ({
+        challenge,
+        contextGraphId: cgId,
+        hash: '0xc',
+        blockNumber: 1000,
+        success: true,
+      }),
+      expectedRoot: new Uint8Array(32),
+      expectedLeafCount: 0,
+      cgIdForKc: cgId,
+      submitProof,
+    });
+
+    const wal = new InMemoryProverWal();
+    const prover = new RandomSamplingProver({
+      chain,
+      store,
+      identityId: IDENTITY_ID,
+      wal,
+    });
+    const outcome = await prover.tick();
+
+    expect(outcome).toEqual({ kind: 'kc-not-synced', kaId, cgId });
+    expect(submitProof).not.toHaveBeenCalled();
     await prover.close();
   });
 });

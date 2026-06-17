@@ -871,6 +871,28 @@ export class DashboardDB {
     return this._stmts[key];
   }
 
+  // --- Short-TTL memo for polled, scan-heavy read rollups ---
+  // The replication summary/per-cg/timeline endpoints scan `replication_events`
+  // synchronously on the daemon's event loop and are polled by the dashboard on
+  // a few-second cadence. A short memo collapses repeated identical scans (extra
+  // browser tabs, a runaway poller) into one, with no visible staleness on
+  // window-based analytics. Tunable via DKG_DASHBOARD_CACHE_TTL_MS (<=0 disables).
+  private _memo = new Map<string, { at: number; value: unknown }>();
+  private readonly _memoTtlMs = Number(process.env.DKG_DASHBOARD_CACHE_TTL_MS ?? 2000);
+
+  private memoized<T>(key: string, fn: () => T): T {
+    if (!(this._memoTtlMs > 0)) return fn();
+    const now = Date.now();
+    const hit = this._memo.get(key);
+    if (hit && now - hit.at < this._memoTtlMs) return hit.value as T;
+    const value = fn();
+    // Bound the map: keys are few in practice, but per-CG timeline variants can
+    // accumulate. Entries are short-lived, so a rare full clear is safe.
+    if (this._memo.size > 256) this._memo.clear();
+    this._memo.set(key, { at: now, value });
+    return value;
+  }
+
   // --- Metric snapshots ---
 
   insertSnapshot(snap: MetricSnapshotRow): void {
@@ -1008,6 +1030,10 @@ export class DashboardDB {
    *  - raw action counts.
    */
   getReplicationSummary(periodMs = 86_400_000): ReplicationSummary {
+    return this.memoized(`replicationSummary:${periodMs}`, () => this._computeReplicationSummary(periodMs));
+  }
+
+  private _computeReplicationSummary(periodMs: number): ReplicationSummary {
     const cutoff = Date.now() - periodMs;
     const rows = this.db.prepare(
       `SELECT action, COUNT(*) AS n FROM replication_events WHERE ts >= ? GROUP BY action`,
@@ -1066,6 +1092,10 @@ export class DashboardDB {
 
   /** Per-CG rollup of replication activity over the window, newest-active first. */
   getReplicationPerCg(periodMs = 86_400_000): ReplicationPerCgRow[] {
+    return this.memoized(`replicationPerCg:${periodMs}`, () => this._computeReplicationPerCg(periodMs));
+  }
+
+  private _computeReplicationPerCg(periodMs: number): ReplicationPerCgRow[] {
     const cutoff = Date.now() - periodMs;
     return this.db.prepare(`
       SELECT context_graph_id,
@@ -1089,6 +1119,13 @@ export class DashboardDB {
    * is given, the series is scoped to that CG.
    */
   getReplicationTimeline(opts: { periodMs: number; bucketMs: number; contextGraphId?: string }): ReplicationTimelineBucket[] {
+    return this.memoized(
+      `replicationTimeline:${opts.periodMs}:${opts.bucketMs}:${opts.contextGraphId ?? ''}`,
+      () => this._computeReplicationTimeline(opts),
+    );
+  }
+
+  private _computeReplicationTimeline(opts: { periodMs: number; bucketMs: number; contextGraphId?: string }): ReplicationTimelineBucket[] {
     const cutoff = Date.now() - opts.periodMs;
     const bucket = Math.max(1, Math.floor(opts.bucketMs));
     const where = opts.contextGraphId ? 'AND context_graph_id = @cg' : '';

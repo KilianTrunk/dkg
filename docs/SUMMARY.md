@@ -12,6 +12,11 @@
 * [DKG V10 Bounty Program](active-now/dkg-v10-bounty.md)
 * [General Bug Bounty](active-now/general-bug-bounty.md)
 
+## OriginTrail V9/V10
+
+* [Roadmap](origintrail-v9-v10/roadmap.md)
+* [V10 Mainnet Release Timeline](origintrail-v9-v10/v10-mainnet-release-timeline.md)
+
 ## How DKG Works
 
 * [Key Concepts](how-dkg-works/key-concepts.md)

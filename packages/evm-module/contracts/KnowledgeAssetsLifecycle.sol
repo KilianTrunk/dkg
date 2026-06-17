@@ -130,7 +130,16 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     // out of the staker-bound net). Patch-level on purpose — the EIP-712
     // author-attestation domain version (`_EIP712_VERSION_HASH`) MUST stay
     // pinned at "2.0.0" so previously signed attestations keep verifying.
-    string private constant _VERSION = "10.1.0";
+    // 10.1.0 — OT-RFC-49 catalog model + ACK domain separation (see
+    //          `ACK_DIGEST_VERSION` below).
+    // 10.1.1 — OT-RFC-51 "Publishing Allocation": realized publishing no
+    //          longer credits per-node publishing allocation (K_n). The two
+    //          guarded `addEpochProducedKnowledgeValue` writes (publish core
+    //          + increase/extend delta) are removed; the publishing factor is
+    //          now fed exclusively by committed PCA allocation. The
+    //          `publisherNodeIdentityId` struct field is retained as a
+    //          self-claimed attribution (no longer scoring).
+    string private constant _VERSION = "10.1.1";
 
     /// @notice OT-RFC-49 / WS-B Trap 3: domain-separation version prepended to the
     ///         RAW publish/update ACK preimage (`abi.encodePacked`, later wrapped by
@@ -526,7 +535,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         uint256 convictionAccountId = publishingConvictionNFT.agentToAccountId(msg.sender);
         bool useConviction;
         if (convictionAccountId != 0) {
-            (,,,, uint40 expiresAtTimestamp, uint16 lockDurationEpochs,,,) =
+            (,,,, uint40 expiresAtTimestamp, uint16 lockDurationEpochs,,,,,) =
                 publishingConvictionNFT.accounts(convictionAccountId);
             useConviction =
                 block.timestamp < uint256(expiresAtTimestamp) &&
@@ -548,10 +557,16 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
 
         if (!useConviction) {
             // Direct-spend branch. `transferFrom(msg.sender, CSS, fullCost)`
-            // + epoch-range distribution. The named core (if non-zero) still
-            // earns publishing-factor credit through `_executePublishCore`'s
-            // `addEpochProducedKnowledgeValue` write — attribution and TRAC
-            // source are decoupled (RFC-001 §3.6).
+            // + epoch-range distribution.
+            //
+            // OT-RFC-51 "Publishing Allocation": realized publishing no
+            // longer feeds the RandomSampling publishing factor. The
+            // publishing factor is now driven exclusively by COMMITTED PCA
+            // publishing allocation (seeded in `PublishingConviction`), so
+            // this branch no longer credits `addEpochPublishingAllocation`.
+            // `publisherNodeIdentityId` is still recorded on the publish
+            // struct as a self-claimed attribution field, but it is no
+            // longer crediting any node's K_n.
             uint96 netTokenAmount = _addTokens(p.tokenAmount);
             _distributeTokens(netTokenAmount, p.epochs, currentEpoch);
         }
@@ -815,25 +830,14 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
             uint256(p.tokenAmount)
         );
 
-        // Per-node produced value for scoring. Shared by both public entry
-        // points — uses BASE `tokenAmount`, NOT any discounted effective
-        // spend, so a node's produced-value score reflects the data value
-        // the publisher declared.
-        //
-        // Validation gate: `publisherNodeIdentityId` is a self-claim under
-        // RFC-001 §3.6, but we MUST refuse to credit nonexistent nodes.
-        // Without this check any publisher with a valid ACK quorum could
-        // pump publishing-factor credit into arbitrary identity ids that
-        // the sharding table never minted, distorting RandomSampling node
-        // scores. `0` is the explicit "no attribution" sentinel and is
-        // accepted (skips the EpochStorage write entirely).
-        if (p.publisherNodeIdentityId != 0) {
-            require(
-                shardingTableStorage.nodeExists(p.publisherNodeIdentityId),
-                "publisherNodeIdentityId not in sharding table"
-            );
-            epochStorage.addEpochProducedKnowledgeValue(p.publisherNodeIdentityId, currentEpoch, p.tokenAmount);
-        }
+        // OT-RFC-51 "Publishing Allocation": realized publishing no longer
+        // credits per-node publishing allocation (K_n). The RandomSampling
+        // publishing factor is now fed exclusively by COMMITTED PCA
+        // allocation, seeded/moved in `PublishingConviction`. The former
+        // `addEpochProducedKnowledgeValue(publisherNodeIdentityId, ...)`
+        // write has been removed here. `publisherNodeIdentityId` remains a
+        // self-claimed attribution field on the publish struct but no longer
+        // drives scoring, so there is no longer a `nodeExists` gate to apply.
     }
 
     // ========================================================================
@@ -1289,7 +1293,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         uint256 convictionAccountId = publishingConvictionNFT.agentToAccountId(msg.sender);
         bool useConviction;
         if (convictionAccountId != 0) {
-            (,,,, uint40 expiresAtTimestamp, uint16 lockDurationEpochs,,,) =
+            (,,,, uint40 expiresAtTimestamp, uint16 lockDurationEpochs,,,,,) =
                 publishingConvictionNFT.accounts(convictionAccountId);
             useConviction =
                 block.timestamp < uint256(expiresAtTimestamp) &&
@@ -1612,23 +1616,12 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
                 uint256(deltaTokenAmount)
             );
 
-            // Track per-node produced value for the delta. Uses BASE delta
-            // (not discounted effective spend) so the scoring reflects data
-            // value added, not publisher economics — identical to publish.
-            //
-            // Same validation gate as `_executePublishCore`: refuse to
-            // credit nonexistent identity ids, accept `0` as no-attribution.
-            if (p.publisherNodeIdentityId != 0) {
-                require(
-                    shardingTableStorage.nodeExists(p.publisherNodeIdentityId),
-                    "publisherNodeIdentityId not in sharding table"
-                );
-                epochStorage.addEpochProducedKnowledgeValue(
-                    p.publisherNodeIdentityId,
-                    currentEpoch,
-                    deltaTokenAmount
-                );
-            }
+            // OT-RFC-51 "Publishing Allocation": realized publishing (here,
+            // the increase/extend delta) no longer credits per-node
+            // publishing allocation (K_n). The former
+            // `addEpochProducedKnowledgeValue(publisherNodeIdentityId, ...)`
+            // delta write has been removed — scoring is now driven solely by
+            // committed PCA allocation seeded/moved in `PublishingConviction`.
         }
     }
 

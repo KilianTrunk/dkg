@@ -230,13 +230,34 @@ const PINNED_DIGESTS: Record<string, string> = {
   // `ERROR_ABI_CONTRACTS` list update in the same file. This
   // intentional break is documented as the v2.x → v3.0.0 wrapper
   // bump in the wrapper NatSpec.
-  DKGPublishingConvictionNFT:   '80a2d5c1962624fc3f7b7e475daaf86a41542a1641d84783c8d4f969d4d86188',
+  //
+  // Updated OT-RFC-51 (publishing allocation): INTENTIONAL drift across the
+  // three conviction pins below — the conviction account now designates a
+  // primary node that receives the PCA's per-epoch publishing allocation.
+  // ABI surface changes synced into packages/chain/abi/ and re-pinned here:
+  //   - createAccount gained a `uint72 primaryNode` arg (new arity) — wrapper
+  //     forwarder + logic entrypoint.
+  //   - new `setPrimaryNode(accountId, primaryNode)` to (re)designate the node,
+  //     with a `ZeroPrimaryNode` revert guard; `moveEpochPublishingAllocation`
+  //     shifts the seeded allocation when the designation changes.
+  //   - the PCA Account tuple widened to carry the designated primaryNode.
+  //   - the old per-publish "realized-publish credit" path (which credited a
+  //     node's allocation per publish) was removed; allocation is now seeded
+  //     prorated at account creation. The legacy "publishingAllocation" naming
+  //     was renamed accordingly. The KAL/KCS pins did NOT drift (verified) —
+  //     this RFC touched only the conviction contracts.
+  DKGPublishingConvictionNFT:   '5bf5638221eb973bf4ba084378cfdaf6211decb6b68dd0b9bce2f93842bd7fca',
   // Updated (protocol treasury fee): added the public
   // `convictionStakingStorage()` getter (the TRAC vault the fee is paid out
   // of via `transferStake`). No event/error surface change — `settle()`,
   // `coverPublishingCost`, and the PCA business events/errors are unchanged.
-  PublishingConviction:         '55ceb341b2c8df35cd7cbebe5950b7673766c935ad7954b80187bef9f414a5a7',
-  PublishingConvictionStorage:  '42d2aae17b575a8e024b7c4503d4b44109ba6eb8a9c2e26bea36192c969a4508',
+  // Updated OT-RFC-51: see the conviction-pin note above — createAccount arity,
+  // setPrimaryNode/ZeroPrimaryNode/PrimaryNodeUnchanged/moveEpochPublishingAllocation,
+  // widened Account tuple, realized-publish credit removed / publishingAllocation rename.
+  PublishingConviction:         '6ad9aa97f4c049c126f302658257363a097ae4fdcc1a12f7d084082f81b44b07',
+  // Updated OT-RFC-51: storage surface for the above — primaryNode field on the
+  // widened Account tuple + the seeded per-epoch publishing allocation getters.
+  PublishingConvictionStorage:  '7eeae71f0efd9183fce232ccc669227dfd70fe4f93b4663392a0a52c1ccba859',
 };
 
 describe('ABI pin digest — detects silent contract surface drift [CH-5]', () => {

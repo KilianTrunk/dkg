@@ -1,13 +1,12 @@
 import { ethers } from 'ethers';
 import {
   createOperationContext,
-  contextGraphMetaUri,
-  contextGraphSharedMemoryUri,
   IMPORTED_ARTIFACT_MAX_PAGE_BYTES,
+  ImportedArtifactMetadataError,
   isSafeIri,
   isDkgContentHash,
   PROTOCOL_GET_ASSERTION_ARTIFACT,
-  sharedMemoryReadBothFilter,
+  resolveImportedArtifactMetadata,
   validateContextGraphId,
   validateSubGraphName,
   verifyDkgContentHash,
@@ -24,9 +23,7 @@ import type {
   AssertionArtifactKind,
   ImportedArtifactByteStore,
 } from './dkg-agent-types.js';
-import { stripLiteral } from './dkg-agent-utils.js';
 
-const DKG_ONTOLOGY = 'http://dkg.io/ontology/';
 export const IMPORTED_ARTIFACT_AUTH_PURPOSE = 'imported-artifact:v1';
 const IMPORTED_ARTIFACT_MAX_CACHE_BYTES = 64 * 1024 * 1024;
 export { IMPORTED_ARTIFACT_MAX_PAGE_BYTES, PROTOCOL_GET_ASSERTION_ARTIFACT };
@@ -177,30 +174,6 @@ function responseBase(req: ImportedArtifactRequest): ImportedArtifactResponse {
     hash: req.hash,
     offset: req.offset,
   };
-}
-
-function parseHashUrn(value: string | undefined): string | undefined {
-  const prefix = 'urn:dkg:file:';
-  if (!value?.startsWith(prefix)) return undefined;
-  const hash = value.slice(prefix.length);
-  return isDkgContentHash(hash) ? hash : undefined;
-}
-
-function binding(cell: unknown): string {
-  if (typeof cell === 'string') return cell.replace(/^<|>$/g, '');
-  if (cell && typeof cell === 'object' && 'value' in cell) {
-    const value = (cell as { value?: unknown }).value;
-    return typeof value === 'string' ? value : '';
-  }
-  return '';
-}
-
-function literal(cell: unknown): string {
-  return stripLiteral(binding(cell)).trim();
-}
-
-function normalizeContentType(raw: string | undefined): string {
-  return raw?.trim().toLowerCase() || 'application/octet-stream';
 }
 
 function comparableAgentAddress(value: string): string {
@@ -359,60 +332,28 @@ async function resolveLinkedArtifact(agent: DKGAgent, args: {
   hash?: string;
   subGraphName?: string;
 }): Promise<{ hash: string; contentType?: string } | null | 'hash_mismatch'> {
-  const durable = await agent.store.query(`
-    SELECT ?fileHash ?contentType ?extractionStatus ?structuralTripleCount ?mdIntermediateHash WHERE {
-      GRAPH <${contextGraphMetaUri(args.contextGraphId)}> {
-        <${args.assertionUri}> <${DKG_ONTOLOGY}sourceFileHash> ?fileHash .
-        OPTIONAL { <${args.assertionUri}> <${DKG_ONTOLOGY}sourceContentType> ?contentType }
-        OPTIONAL { <${args.assertionUri}> <${DKG_ONTOLOGY}extractionStatus> ?extractionStatus }
-        OPTIONAL { <${args.assertionUri}> <${DKG_ONTOLOGY}structuralTripleCount> ?structuralTripleCount }
-        OPTIONAL { <${args.assertionUri}> <${DKG_ONTOLOGY}mdIntermediateHash> ?mdIntermediateHash }
-      }
-    }
-    LIMIT 1
-  `) as { type?: string; bindings?: Array<Record<string, unknown>> };
-  let fileHash: string | undefined;
-  let contentType = 'application/octet-stream';
-  let mdIntermediateHash: string | undefined;
-  const durableBinding = durable.bindings?.[0];
-  if (durableBinding) {
-    const status = literal(durableBinding.extractionStatus);
-    const legacyCount = Number(literal(durableBinding.structuralTripleCount));
-    if (status && status !== 'completed') return null;
-    if (!status && (!Number.isSafeInteger(legacyCount) || legacyCount <= 0)) return null;
-    fileHash = literal(durableBinding.fileHash);
-    contentType = normalizeContentType(literal(durableBinding.contentType));
-    mdIntermediateHash = literal(durableBinding.mdIntermediateHash) || undefined;
-  } else {
-    const swmGraph = contextGraphSharedMemoryUri(args.contextGraphId, args.subGraphName);
-    const swm = await agent.store.query(`
-      SELECT ?sourceFile ?contentType ?markdownForm WHERE {
-        GRAPH ?g {
-          <${args.assertionUri}> <${DKG_ONTOLOGY}sourceFile> ?sourceFile .
-          OPTIONAL { <${args.assertionUri}> <${DKG_ONTOLOGY}sourceContentType> ?contentType }
-          OPTIONAL { <${args.assertionUri}> <${DKG_ONTOLOGY}markdownForm> ?markdownForm }
-        }
-        ${sharedMemoryReadBothFilter(swmGraph)}
-      }
-      LIMIT 1
-    `) as { type?: string; bindings?: Array<Record<string, unknown>> };
-    const row = swm.bindings?.[0];
-    if (!row) return null;
-    fileHash = parseHashUrn(binding(row.sourceFile));
-    contentType = normalizeContentType(literal(row.contentType));
-    mdIntermediateHash = parseHashUrn(binding(row.markdownForm));
+  let metadata: Awaited<ReturnType<typeof resolveImportedArtifactMetadata>>;
+  try {
+    metadata = await resolveImportedArtifactMetadata({
+      contextGraphId: args.contextGraphId,
+      assertionUri: args.assertionUri,
+      ...(args.subGraphName ? { subGraphName: args.subGraphName } : {}),
+      allowSharedMemoryFallback: true,
+      query: (sparql: string) => agent.store.query(sparql) as Promise<{ type?: string; bindings?: Array<Record<string, unknown>> }>,
+    });
+  } catch (err) {
+    if (err instanceof ImportedArtifactMetadataError) return null;
+    throw err;
   }
-  if (!fileHash || !isDkgContentHash(fileHash)) return null;
-  if (mdIntermediateHash && !isDkgContentHash(mdIntermediateHash)) return null;
 
   const linkedHash = args.kind === 'markdown'
-    ? mdIntermediateHash ?? (contentType === 'text/markdown' ? fileHash : undefined)
-    : fileHash;
+    ? metadata.markdownHash
+    : metadata.sourceFileHash;
   if (!linkedHash) return null;
   if (args.hash && args.hash !== linkedHash) return 'hash_mismatch';
   return {
     hash: linkedHash,
-    contentType: args.kind === 'markdown' ? 'text/markdown' : contentType,
+    contentType: args.kind === 'markdown' ? 'text/markdown' : metadata.sourceContentType,
   };
 }
 

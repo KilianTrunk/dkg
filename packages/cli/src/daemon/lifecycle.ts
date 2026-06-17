@@ -239,6 +239,8 @@ import {
   corsHeaders,
   HttpRateLimiter,
   InFlightLimiter,
+  admitRequest,
+  resolveIntSetting,
   isLoopbackClientIp,
   isLoopbackRateLimitExemptPath,
   shouldBypassRateLimitForLoopbackTraffic,
@@ -2679,15 +2681,21 @@ export async function runDaemonInner(
   // unbounded pending work onto the single event loop / store worker thread.
   // IP-agnostic on purpose — local agents legitimately burst, so we shed by
   // concurrency (503 + Retry-After) rather than by per-minute rate. Tunable via
-  // DKG_MAX_INFLIGHT (<=0 disables); default 64.
-  const maxInFlight = Number(process.env.DKG_MAX_INFLIGHT ?? config.maxInFlightRequests ?? 64);
+  // DKG_MAX_INFLIGHT (explicit 0 disables); default 64. Malformed/empty values
+  // fall back to the default instead of silently disabling the cap.
+  const maxInFlight = resolveIntSetting(
+    process.env.DKG_MAX_INFLIGHT,
+    config.maxInFlightRequests,
+    64,
+    { allowZero: true },
+  );
   const inFlightLimiter = new InFlightLimiter(maxInFlight);
 
   let corsAllowed: CorsAllowlist = "*";
   daemonState.catchupRunner = createCatchupRunner(agent);
 
   const server = createServer(async (req, res) => {
-    let admitted = false;
+    let releaseSlot: (() => void) | undefined;
     try {
       const reqUrl = new URL(req.url ?? "/", `http://${req.headers.host}`);
 
@@ -2704,15 +2712,14 @@ export async function runDaemonInner(
         return;
       }
 
-      // Admission control — shed load when too many requests are already in
-      // flight. Applied to ALL traffic (not bypassed for loopback), so it also
-      // bounds local agents that the per-IP rate limiter intentionally exempts.
-      if (!inFlightLimiter.tryAcquire()) {
-        res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '1', ...corsHeaders(reqCorsOrigin) });
-        res.end(JSON.stringify({ error: 'Server busy, retry shortly' }));
-        return;
-      }
-      admitted = true;
+      // Admission control — shed load (503 + Retry-After) when too many
+      // requests are already in flight. Applied to ALL traffic (not bypassed
+      // for loopback) so it also bounds local agents the per-IP rate limiter
+      // exempts; OPTIONS preflight and cheap health/liveness paths are exempt
+      // inside admitRequest so monitoring stays answerable under saturation.
+      const gate = admitRequest(inFlightLimiter, req.method, reqUrl.pathname, res, reqCorsOrigin);
+      if (!gate.admitted) return;
+      releaseSlot = gate.release;
 
       // CORS preflight
       if (req.method === "OPTIONS") {
@@ -2900,19 +2907,26 @@ export async function runDaemonInner(
         jsonResponse(res, 500, { error: err.message });
       }
     } finally {
-      if (admitted) inFlightLimiter.release();
+      releaseSlot?.();
     }
   });
 
   // Bound simultaneous sockets and slow-header connections so a flood of
   // clients can't exhaust file descriptors or park half-open connections.
   // requestTimeout is left at the Node default so legitimately long publishes /
-  // SPARQL queries aren't truncated. Tunable via DKG_MAX_CONNECTIONS.
-  server.maxConnections = Math.max(
-    1,
-    Number(process.env.DKG_MAX_CONNECTIONS ?? config.maxConnections ?? 256),
+  // SPARQL queries aren't truncated. Malformed/empty env or config values fall
+  // back to the defaults rather than becoming NaN. Tunable via
+  // DKG_MAX_CONNECTIONS / DKG_HEADERS_TIMEOUT_MS.
+  server.maxConnections = resolveIntSetting(
+    process.env.DKG_MAX_CONNECTIONS,
+    config.maxConnections,
+    256,
   );
-  server.headersTimeout = Number(process.env.DKG_HEADERS_TIMEOUT_MS ?? 60_000);
+  server.headersTimeout = resolveIntSetting(
+    process.env.DKG_HEADERS_TIMEOUT_MS,
+    undefined,
+    60_000,
+  );
 
   const apiPort = config.apiPort || 0;
   const apiHost = config.apiHost || "127.0.0.1";

@@ -1261,6 +1261,94 @@ export class InFlightLimiter {
   }
 }
 
+/**
+ * Parse a base-10 integer from an env-style string. Returns null for
+ * `undefined`, empty/whitespace, or any non-integer text — so malformed input
+ * falls through to the next source instead of becoming `NaN`/`0`.
+ */
+function parseIntOrNull(value: string | undefined): number | null {
+  if (value === undefined) return null;
+  const t = value.trim();
+  if (t === '' || !/^-?\d+$/.test(t)) return null;
+  const n = Number(t);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Resolve an integer setting from an env var (highest precedence), then a
+ * config value, then a fallback. Malformed / empty / out-of-range inputs are
+ * IGNORED (fall through) rather than silently disabling the setting — a typo
+ * like `DKG_MAX_INFLIGHT=abc` or an empty string yields the documented default,
+ * not `NaN`/`0`. Pass `allowZero` when 0 is a meaningful value (e.g. "disable
+ * the cap"); otherwise the minimum accepted value is 1.
+ */
+export function resolveIntSetting(
+  envValue: string | undefined,
+  configValue: number | undefined,
+  fallback: number,
+  opts: { allowZero?: boolean } = {},
+): number {
+  const min = opts.allowZero ? 0 : 1;
+  const fromEnv = parseIntOrNull(envValue);
+  if (fromEnv !== null && fromEnv >= min) return fromEnv;
+  if (
+    typeof configValue === 'number' &&
+    Number.isInteger(configValue) &&
+    configValue >= min
+  ) {
+    return configValue;
+  }
+  return fallback;
+}
+
+/** Cheap liveness/health paths kept answerable even under admission saturation. */
+const ADMISSION_EXEMPT_PATHS: ReadonlySet<string> = new Set([
+  '/api/status',
+  '/api/chain/rpc-health',
+  '/.well-known/skill.md',
+]);
+
+/**
+ * Apply concurrency admission control to one request. CORS preflight (OPTIONS)
+ * and a small set of cheap health/liveness paths are exempt so monitoring,
+ * `dkg status`, doctor, and MCP setup probes keep working even when the daemon
+ * is shedding load. On rejection it writes a `503` + `Retry-After` (with CORS
+ * headers so browsers surface it). Returns whether the request is admitted plus
+ * a `release` disposer the caller MUST call exactly once in a `finally` — it is
+ * idempotent and a no-op for exempt or rejected requests, so a slot is only ever
+ * released by its own owner.
+ */
+export function admitRequest(
+  limiter: InFlightLimiter,
+  method: string | undefined,
+  pathname: string,
+  res: ServerResponse,
+  corsOrigin: string | null,
+): { admitted: boolean; release: () => void } {
+  const noop = () => {};
+  if (method === 'OPTIONS' || ADMISSION_EXEMPT_PATHS.has(pathname)) {
+    return { admitted: true, release: noop };
+  }
+  if (!limiter.tryAcquire()) {
+    res.writeHead(503, {
+      'Content-Type': 'application/json',
+      'Retry-After': '1',
+      ...corsHeaders(corsOrigin),
+    });
+    res.end(JSON.stringify({ error: 'Server busy, retry shortly' }));
+    return { admitted: false, release: noop };
+  }
+  let released = false;
+  return {
+    admitted: true,
+    release: () => {
+      if (released) return;
+      released = true;
+      limiter.release();
+    },
+  };
+}
+
 export function isLoopbackClientIp(ip: string): boolean {
   const normalized = ip.trim().toLowerCase();
   if (normalized === '::1') return true;

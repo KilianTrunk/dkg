@@ -48,6 +48,19 @@ describe('InFlightLimiter — concurrency admission control', () => {
       for (let i = 0; i < 1000; i++) expect(limiter.tryAcquire()).toBe(true);
     }
   });
+
+  it('counts rejectedTotal on shed only (for metrics/logging)', () => {
+    const limiter = new InFlightLimiter(1);
+    expect(limiter.rejectedTotal).toBe(0);
+    expect(limiter.tryAcquire()).toBe(true); // admitted — not counted
+    expect(limiter.rejectedTotal).toBe(0);
+    expect(limiter.tryAcquire()).toBe(false); // shed
+    expect(limiter.tryAcquire()).toBe(false); // shed
+    expect(limiter.rejectedTotal).toBe(2);
+    limiter.release();
+    expect(limiter.tryAcquire()).toBe(true); // admitted again — still 2
+    expect(limiter.rejectedTotal).toBe(2);
+  });
 });
 
 describe('resolveIntSetting — env/config/fallback parsing', () => {
@@ -118,7 +131,7 @@ describe('admitRequest — wiring (503/Retry-After/CORS/exempt/release)', () => 
     expect(g3.admitted).toBe(true); // recovered
   });
 
-  it('exempts OPTIONS preflight and cheap health paths even at capacity', () => {
+  it('exempts OPTIONS, cheap health paths, and the long-lived SSE stream even at capacity', () => {
     const limiter = new InFlightLimiter(1);
     expect(limiter.tryAcquire()).toBe(true); // saturate
 
@@ -126,6 +139,7 @@ describe('admitRequest — wiring (503/Retry-After/CORS/exempt/release)', () => 
       ['OPTIONS', '/api/context-graphs'],
       ['GET', '/api/status'],
       ['GET', '/api/chain/rpc-health'],
+      ['GET', '/api/events'], // SSE — must not hold a slot for the connection lifetime
       ['GET', '/.well-known/skill.md'],
       ['GET', '/.well-known/skill-importer.md'],
     ] as const) {
@@ -136,5 +150,6 @@ describe('admitRequest — wiring (503/Retry-After/CORS/exempt/release)', () => 
       gate.release(); // no-op for exempt requests
     }
     expect(limiter.inFlight).toBe(1); // untouched by exempt traffic
+    expect(limiter.rejectedTotal).toBe(0); // exempt traffic is never counted as shed
   });
 });

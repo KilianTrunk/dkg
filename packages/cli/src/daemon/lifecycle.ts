@@ -2690,6 +2690,10 @@ export async function runDaemonInner(
     { allowZero: true },
   );
   const inFlightLimiter = new InFlightLimiter(maxInFlight);
+  // Throttle the "shedding" warning so a sustained burst can't spam the log,
+  // while still letting operators see the limiter is active (per review).
+  let lastShedLogAt = 0;
+  const SHED_LOG_THROTTLE_MS = 10_000;
 
   let corsAllowed: CorsAllowlist = "*";
   daemonState.catchupRunner = createCatchupRunner(agent);
@@ -2718,7 +2722,16 @@ export async function runDaemonInner(
       // exempts; OPTIONS preflight and cheap health/liveness paths are exempt
       // inside admitRequest so monitoring stays answerable under saturation.
       const gate = admitRequest(inFlightLimiter, req.method, reqUrl.pathname, res, reqCorsOrigin);
-      if (!gate.admitted) return;
+      if (!gate.admitted) {
+        const nowMs = Date.now();
+        if (nowMs - lastShedLogAt >= SHED_LOG_THROTTLE_MS) {
+          lastShedLogAt = nowMs;
+          log(
+            `admission-control: shedding requests (503) — inFlight=${inFlightLimiter.inFlight}/${inFlightLimiter.max} rejectedTotal=${inFlightLimiter.rejectedTotal}`,
+          );
+        }
+        return;
+      }
       releaseSlot = gate.release;
 
       // CORS preflight

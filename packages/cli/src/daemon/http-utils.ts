@@ -1234,6 +1234,7 @@ export class HttpRateLimiter {
  */
 export class InFlightLimiter {
   private _inFlight = 0;
+  private _rejectedTotal = 0;
   private readonly _max: number;
 
   constructor(max: number) {
@@ -1249,9 +1250,17 @@ export class InFlightLimiter {
     return this._max;
   }
 
+  /** Monotonic count of requests shed (tryAcquire returned false) — for metrics/logging. */
+  get rejectedTotal(): number {
+    return this._rejectedTotal;
+  }
+
   /** Returns true and reserves a slot, or false if at capacity (shed load). */
   tryAcquire(): boolean {
-    if (this._max > 0 && this._inFlight >= this._max) return false;
+    if (this._max > 0 && this._inFlight >= this._max) {
+      this._rejectedTotal += 1;
+      return false;
+    }
     this._inFlight += 1;
     return true;
   }
@@ -1300,10 +1309,18 @@ export function resolveIntSetting(
   return fallback;
 }
 
-/** Cheap liveness/health paths kept answerable even under admission saturation. */
+/**
+ * Paths exempt from concurrency admission control. Two reasons to exempt:
+ *  - cheap liveness/health paths that must stay answerable under load
+ *    (monitoring, `dkg status`, doctor, MCP setup probes);
+ *  - long-lived streaming connections (`/api/events` SSE) that would otherwise
+ *    hold an in-flight slot for the connection's entire lifetime, so a few open
+ *    dashboard tabs could exhaust the pool and shed all real work.
+ */
 const ADMISSION_EXEMPT_PATHS: ReadonlySet<string> = new Set([
   '/api/status',
   '/api/chain/rpc-health',
+  '/api/events',
   '/.well-known/skill.md',
   '/.well-known/skill-importer.md',
 ]);

@@ -7,6 +7,10 @@ doc_type: reference
 
 # Contract addresses
 
+{% hint style="info" %}
+DKG V10 is currently live on **Base Sepolia (testnet)** only. Mainnet (Base, Gnosis, NeuroWeb) has not launched yet — see the [V10 Mainnet Release Timeline](../origintrail-v9-v10/v10-mainnet-release-timeline.md). The mainnet TRAC addresses below are the existing token contracts on those chains (for reference and bridging); the V10 mainnet protocol contracts (Hub, etc.) will be published at mainnet launch.
+{% endhint %}
+
 ## TRAC token
 
 TRAC is the ERC-20 utility token used across the DKG. The token contract address is different on each chain — use the one for the network your node operates on.

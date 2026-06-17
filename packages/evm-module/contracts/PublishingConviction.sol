@@ -125,7 +125,7 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
     //           instead of recomputing `prorateActiveSink` + chronos reads on
     //           every loop iteration. Behavior-preserving: per-epoch amounts
     //           are byte-identical, so seed and move stay net-zero on K_total.
-    string private constant _VERSION = "10.0.3";
+    string private constant _VERSION = "10.0.4";
 
     uint256 public constant BPS_DENOMINATOR = 10_000;
     /// @notice EpochStorage shard ID for the staker reward pool. Mirrors
@@ -256,6 +256,12 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
     ///         the still-seeded future buckets and let a later re-designation
     ///         double-credit `K_n`/`K_total` (which has no decrement path).
     error ZeroPrimaryNode();
+    /// @notice OT-RFC-51: `setPrimaryNode` called with `newNode` equal to the
+    ///         current `primaryNode`. A no-op re-designation would still burn
+    ///         the once-per-epoch change slot, emit a spurious
+    ///         `PrimaryNodeChanged`, and run a pointless self-move loop — so it
+    ///         is rejected.
+    error PrimaryNodeUnchanged(uint256 accountId, uint72 node);
 
     // solhint-disable-next-line no-empty-blocks
     constructor(address hubAddress) ContractStatus(hubAddress) {}
@@ -455,6 +461,10 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
         }
 
         uint72 oldNode = acct.primaryNode;
+        // A no-op re-designation to the same node would burn the once-per-epoch
+        // change slot, emit a spurious PrimaryNodeChanged, and run a pointless
+        // self-move loop — reject it.
+        if (newNode == oldNode) revert PrimaryNodeUnchanged(accountId, newNode);
 
         // Move only FUTURE epochs within the lock. The schedule's last
         // credited epoch is `createdAtEpoch + lockDurationEpochs`. The

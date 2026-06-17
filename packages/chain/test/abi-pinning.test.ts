@@ -252,9 +252,9 @@ const PINNED_DIGESTS: Record<string, string> = {
   // of via `transferStake`). No event/error surface change — `settle()`,
   // `coverPublishingCost`, and the PCA business events/errors are unchanged.
   // Updated OT-RFC-51: see the conviction-pin note above — createAccount arity,
-  // setPrimaryNode/ZeroPrimaryNode/moveEpochPublishingAllocation, widened
-  // Account tuple, realized-publish credit removed / publishingAllocation rename.
-  PublishingConviction:         '33fb0ff6ee71d38a35a0b9de39736ab233a3247c5ffdefee763ad4750ef5b49f',
+  // setPrimaryNode/ZeroPrimaryNode/PrimaryNodeUnchanged/moveEpochPublishingAllocation,
+  // widened Account tuple, realized-publish credit removed / publishingAllocation rename.
+  PublishingConviction:         '6ad9aa97f4c049c126f302658257363a097ae4fdcc1a12f7d084082f81b44b07',
   // Updated OT-RFC-51: storage surface for the above — primaryNode field on the
   // widened Account tuple + the seeded per-epoch publishing allocation getters.
   PublishingConvictionStorage:  '7eeae71f0efd9183fce232ccc669227dfd70fe4f93b4663392a0a52c1ccba859',

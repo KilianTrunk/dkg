@@ -1133,6 +1133,13 @@ describe('@integration OT-RFC-51 Publishing Allocation', function () {
       'PrimaryNodeNotInShardingTable',
     );
 
+    // --- PrimaryNodeUnchanged: a no-op re-designation to the CURRENT node
+    //     (primaryNode is nodeBId here; still this epoch — the prior reverts
+    //     consumed no change slot). ---
+    await expect(
+      NFT.connect(creator).setPrimaryNode(accountId, nodeBId),
+    ).to.be.revertedWithCustomError(LogicContract, 'PrimaryNodeUnchanged');
+
     // --- PrimaryNodeNotInShardingTable: createAccount with a non-existent
     //     primary node. ---
     const creator2 = accounts[10];

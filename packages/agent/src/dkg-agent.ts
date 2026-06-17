@@ -1646,8 +1646,8 @@ export class DKGAgent extends DKGAgentBase {
       // from `useEncryptedInlineUpdate`). Forwarded into `collectUpdate` so it
       // stamps `UpdateIntent.isEncryptedPayload`, gating the cores' inline-
       // catalog rebuild/verify/persist path. Undefined for public updates,
-      // which stay byte-for-byte as today. Mirrors the publish closure passing
-      // `isEncryptedPayload` into `collect`.
+      // which carry no catalog (unchanged on a healthy chain). Mirrors the publish
+      // closure passing `isEncryptedPayload` into `collect`.
       isEncryptedPayload?: boolean;
       stagingQuads?: Uint8Array;
       swmGraphId?: string;

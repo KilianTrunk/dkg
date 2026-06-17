@@ -1462,8 +1462,12 @@ export class PublishMethods extends DKGAgentBase {
     // never duplicated, then append exactly the fresh projection. The graph
     // is cosmetic — `partitionCatalogQuads` matches on subject (the CG DID)
     // and the catalog root excludes the graph term — so we stamp the canonical
-    // CG-DID data graph for clarity. Public updates skip this entirely and stay
-    // byte-for-byte identical to today (no floor, no hook).
+    // CG-DID data graph for clarity. Public updates skip this block entirely (no
+    // floor, no hook) and are unchanged on a HEALTHY chain. NB: update() now
+    // resolves the access policy unconditionally (~:1442), exactly as the publish
+    // path always has — so under a DEGRADED / stale policy probe a public update
+    // fails closed (throws) consistently with publish, where the OLD update path
+    // would have proceeded. Fail-closed, never a leak; see PR #1208 notes.
     let updateQuads = quads;
     if (isCuratedUpdate) {
       const cgDid = contextGraphDataUri(contextGraphId);
@@ -1488,7 +1492,7 @@ export class PublishMethods extends DKGAgentBase {
       v10UpdateACKProvider,
       // Curated → wire the single-blob AEAD hook so the producer's
       // `useEncryptedInlineUpdate` gate fires (catalog commit + member
-      // encryption). Public → `undefined`, byte-identical to today.
+      // encryption). Public → `undefined` (no catalog); unchanged on a healthy chain.
       encryptInlinePayload: updateEncryptInlinePayload,
     });
     this.log.info(ctx, `Update complete — status=${result.status}`);

@@ -376,7 +376,7 @@ export async function handleKaImportArtifactRead(ctx: RequestContext): Promise<v
       assertionUri: resolved.assertionUri,
       kind: resolved.kind,
       hash: resolved.hash,
-      contentType: page.contentType ?? resolved.contentType,
+      contentType: resolved.contentType,
       size: page.totalBytes,
       offset: page.offset,
       nextOffset: page.nextOffset,

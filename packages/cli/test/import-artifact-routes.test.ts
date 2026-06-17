@@ -786,7 +786,7 @@ describe('import artifact daemon routes', () => {
         offset: 0,
         totalBytes: bytes.length,
         truncated: false,
-        contentType: 'text/markdown',
+        contentType: 'application/x-spoofed',
         bytesB64: bytes.toString('base64'),
       },
       verifiedBytes: bytes,
@@ -818,6 +818,7 @@ describe('import artifact daemon routes', () => {
       assertionUri,
       kind: 'markdown',
       hash: artifactHash,
+      contentType: 'text/markdown',
       bytesB64: bytes.toString('base64'),
       source: { peerId: 'peer-with-blob', agentAddress: 'did:dkg:agent:source' },
     });

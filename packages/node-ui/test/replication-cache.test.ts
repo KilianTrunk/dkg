@@ -64,4 +64,15 @@ describe('DashboardDB — replication rollup memo', () => {
     expect(db.getReplicationSummary(60 * 60_000).totalEvents).toBe(1); // 1h window
     expect(db.getReplicationSummary(2 * 60 * 60_000).totalEvents).toBe(2); // 2h window — distinct key
   });
+
+  it('bypasses the cache when the requested window is <= the TTL (avoids stale-by-window)', () => {
+    // TTL 60s, window 10s (<= TTL): a cached value could surface events that
+    // have aged out of the 10s window, so caching must be skipped here.
+    db = open(60_000);
+    const now = Date.now();
+    db.insertReplicationEvent({ ts: now - 1000, context_graph_id: 'cg', action: 'promote', ual: 'urn:ka:1', ordinal: 1 });
+    expect(db.getReplicationSummary(10_000).totalEvents).toBe(1);
+    db.insertReplicationEvent({ ts: now - 500, context_graph_id: 'cg', action: 'promote', ual: 'urn:ka:2', ordinal: 2 });
+    expect(db.getReplicationSummary(10_000).totalEvents).toBe(2); // not cached → fresh
+  });
 });

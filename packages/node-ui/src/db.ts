@@ -876,12 +876,25 @@ export class DashboardDB {
   // synchronously on the daemon's event loop and are polled by the dashboard on
   // a few-second cadence. A short memo collapses repeated identical scans (extra
   // browser tabs, a runaway poller) into one, with no visible staleness on
-  // window-based analytics. Tunable via DKG_DASHBOARD_CACHE_TTL_MS (<=0 disables).
+  // window-based analytics. Tunable via DKG_DASHBOARD_CACHE_TTL_MS (<=0 disables;
+  // malformed/empty falls back to 2000).
   private _memo = new Map<string, { at: number; value: unknown }>();
-  private readonly _memoTtlMs = Number(process.env.DKG_DASHBOARD_CACHE_TTL_MS ?? 2000);
+  private readonly _memoTtlMs = (() => {
+    const raw = Number(process.env.DKG_DASHBOARD_CACHE_TTL_MS);
+    return Number.isFinite(raw) ? raw : 2000;
+  })();
 
-  private memoized<T>(key: string, fn: () => T): T {
-    if (!(this._memoTtlMs > 0)) return fn();
+  /**
+   * Memoize a rollup for up to `_memoTtlMs`. `minWindowMs` is the smallest
+   * time window the result depends on; caching is bypassed when it is <= the
+   * TTL, because these rollups are computed over a moving `Date.now()` window —
+   * for a short window, a cached value could otherwise surface events that have
+   * already aged out of the requested window (up to one TTL of staleness) even
+   * with no new writes. Default dashboard windows (1h/24h) are far above the
+   * 2s TTL, so they always cache.
+   */
+  private memoized<T>(key: string, minWindowMs: number, fn: () => T): T {
+    if (!(this._memoTtlMs > 0) || minWindowMs <= this._memoTtlMs) return fn();
     const now = Date.now();
     const hit = this._memo.get(key);
     if (hit && now - hit.at < this._memoTtlMs) return hit.value as T;
@@ -1030,7 +1043,7 @@ export class DashboardDB {
    *  - raw action counts.
    */
   getReplicationSummary(periodMs = 86_400_000): ReplicationSummary {
-    return this.memoized(`replicationSummary:${periodMs}`, () => this._computeReplicationSummary(periodMs));
+    return this.memoized(`replicationSummary:${periodMs}`, periodMs, () => this._computeReplicationSummary(periodMs));
   }
 
   private _computeReplicationSummary(periodMs: number): ReplicationSummary {
@@ -1092,7 +1105,7 @@ export class DashboardDB {
 
   /** Per-CG rollup of replication activity over the window, newest-active first. */
   getReplicationPerCg(periodMs = 86_400_000): ReplicationPerCgRow[] {
-    return this.memoized(`replicationPerCg:${periodMs}`, () => this._computeReplicationPerCg(periodMs));
+    return this.memoized(`replicationPerCg:${periodMs}`, periodMs, () => this._computeReplicationPerCg(periodMs));
   }
 
   private _computeReplicationPerCg(periodMs: number): ReplicationPerCgRow[] {
@@ -1121,6 +1134,7 @@ export class DashboardDB {
   getReplicationTimeline(opts: { periodMs: number; bucketMs: number; contextGraphId?: string }): ReplicationTimelineBucket[] {
     return this.memoized(
       `replicationTimeline:${opts.periodMs}:${opts.bucketMs}:${opts.contextGraphId ?? ''}`,
+      Math.min(opts.periodMs, opts.bucketMs),
       () => this._computeReplicationTimeline(opts),
     );
   }

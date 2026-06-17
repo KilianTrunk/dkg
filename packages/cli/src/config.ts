@@ -3,6 +3,7 @@ import { join, dirname, basename } from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import yaml from 'js-yaml';
+import type { DKGAgentConfig } from '@origintrail-official/dkg-agent';
 import {
   blueGreenSlotEntryPoint,
   blueGreenSlotReady,
@@ -463,11 +464,13 @@ export interface DkgConfig {
   /** Triple store backend override (default: oxigraph-worker with file persistence). */
   store?: { backend: string; options?: Record<string, unknown>; graphSetIndex?: boolean | GraphSetIndexConfig };
   /**
-   * Cap on how many persisted context-graph subscriptions a node ACTIVATES on
-   * boot (gossip + sync). A large stale backlog otherwise fans out store work
-   * and starves authenticated routes (#997). coreHosted graphs are always
-   * restored regardless of this cap. Non-negative integer; 0 = no cap. Raise it
-   * on nodes that legitimately subscribe to more than the default (64).
+   * Intentional cap on how many persisted context-graph subscriptions a node
+   * ACTIVATES on boot (gossip + sync). A large stale backlog otherwise fans out
+   * store work and starves authenticated routes (#997). coreHosted graphs are
+   * always restored regardless of this cap. Rows beyond the cap stay persisted
+   * and are reported by GET /api/context-graph/subscriptions. Non-negative
+   * integer; 0 = no cap. Raise it on nodes that legitimately subscribe to more
+   * than the default (64).
    */
   maxRehydratedContextGraphSubscriptions?: number;
   /** Out-of-line storage for large public SWM RDF literal object terms. */
@@ -476,6 +479,14 @@ export interface DkgConfig {
   sharedMemoryPublicSnapshotStorage?: SharedMemoryPublicSnapshotStorageConfig;
   /** Disable expensive peer-connect SWM catch-up for bulk benchmark/devnet runs. */
   syncSharedMemoryOnConnect?: boolean;
+  /**
+   * STRICT curator-ack gate (OT-RFC-49 curator-leader), default OFF. When true,
+   * a non-`localOnly` write to a PRIVATE context graph must be applied+ack'd by
+   * the CG's curator before it commits locally; an unconfirmed write is rejected
+   * (HTTP 503) and not persisted, closing the silent same-root-update loss.
+   * Public CGs / `localOnly` / a node that IS the curator are unaffected.
+   */
+  swmAwaitCuratorAck?: boolean;
   /**
    * Keep durable sync of `did:dkg:context-graph:agents/_meta` enabled by
    * default. Edge-node operators can set this to false to sync the `agents`
@@ -654,6 +665,16 @@ export interface DkgConfig {
      */
     agentProfileHeartbeatMs?: number;
   };
+  /**
+   * OT-RFC-38 LU-6 host-mode custody config — eviction tiers, discovery-beacon
+   * rate limits, and the OT-RFC-49 WS-A `stripCiphertext` kill-switch.
+   * Forwarded through to `DKGAgentConfig.swmHostMode` by the daemon lifecycle;
+   * WITHOUT this field (and the matching forward in `lifecycle.ts`) the whole
+   * block is INERT — only the in-agent defaults apply, so an operator could not
+   * toggle `swmHostMode.stripCiphertext` (or any host-mode tunable) from
+   * config.json. (This is exactly the inert-flag bug the rung-1 strip hit.)
+   */
+  swmHostMode?: DKGAgentConfig['swmHostMode'];
 }
 
 /**

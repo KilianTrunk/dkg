@@ -1702,6 +1702,8 @@ export class ContextGraphMethods extends DKGAgentBase {
 
     this.contextGraphMetaProjection.markDirtyFromQuads(quadsToInsert);
 
+    this.contextGraphMetaProjection.markDirtyFromQuads(quadsToInsert);
+
     // Issue #865 — companion warning to the peer-invite path above.
     // Allowlist writes on explicit-public CGs are allowed (the
     // publishPolicy=curated + accessPolicy=public combination is a

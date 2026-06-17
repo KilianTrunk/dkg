@@ -161,6 +161,18 @@ export interface SyncRequestEnvelope {
    * like `phase`/`snapshotRef`), so it's additive and backward-compatible.
    */
   sinceBatchId?: string;
+  /**
+   * R9 (SECURITY) — UNSIGNED member-recovery marker. When set, the responder
+   * authorizes via the strict members-only `isMemberRecoveryAuthorized`
+   * hard-deny gate (a FRESH `_meta` agent-gate read) and MUST NOT fall through
+   * to the weaker participant/peer fallback. Unsigned because it only ever
+   * ESCALATES strictness (an attacker setting it faces the harder gate;
+   * stripping it reverts to the normal path the member already passes), and the
+   * responder decides on the cryptographically RECOVERED signer — never on this
+   * flag or the (forgeable) `requesterAgentAddress` claim. Kept in lockstep with
+   * the duplicate `SyncRequestEnvelope` in `sync/auth/request-build.ts`.
+   */
+  recovery?: boolean;
 }
 
 // ── Public error classes ────────────────────────────────────────────
@@ -657,6 +669,24 @@ export interface ContextGraphSubscriptionStore {
   delete(contextGraphId: string): Promise<void>;
 }
 
+export interface ContextGraphSubscriptionRehydrationStatus {
+  /** Non-system persisted rows governed by the rehydration cap. */
+  persistedTotal: number;
+  /** Persisted system rows seen during rehydration; excluded from cap math. */
+  systemExcluded: number;
+  hostedActivated: number;
+  hostedActivatedIds: string[];
+  activated: number;
+  dormant: number;
+  activationCap: number;
+  capDisabled: boolean;
+  dormantIds: string[];
+  /** Startup rehydration completion timestamp; remains stable after boot. */
+  completedAt: number;
+  /** Most recent timestamp for post-boot diagnostic count/id updates. */
+  updatedAt: number;
+}
+
 export interface ContextGraphWritePreflightProbe {
   exists: boolean;
   hasLocalContent: boolean;
@@ -783,6 +813,30 @@ export type ReplicationEventSink = (event: ReplicationEvent) => void;
 
 export interface DKGAgentConfig {
   name: string;
+  /**
+   * public-projection enable flag. When set, a private CG's confirmed VM
+   * publishes emit/refresh a verifiable public projection (the floor: existence,
+   * UAL, access class, committed root) into the SOURCE CG's OWN `_catalog` graph
+   * (`<source-cg>/_catalog`) — the exact named graph open-serve reads — binding
+   * the private CG into the public discovery surface without disclosing its
+   * contents. NB despite the name the projection is NOT written into the named
+   * target CG: the configured value acts only as (a) an on/off switch and (b) a
+   * self-projection guard (a publish whose own CG id equals this value is
+   * skipped). See `emitPublicProjectionAfterPublish` (B7/B8). Unset → off.
+   */
+  publicProjectionContextGraphId?: string;
+  /**
+   * STRICT curator-ack gate (OT-RFC-49 curator-leader), default OFF. When true,
+   * a non-`localOnly` write to a PRIVATE context graph must be applied+ack'd by
+   * the CG's curator (the authoritative replica) BEFORE it is committed locally;
+   * if the curator does not confirm, the write is rejected (`CuratorUnconfirmedError`
+   * → HTTP 503) and nothing is persisted — closing the silent same-root-update
+   * loss that otherwise hides until the next reconnect REPLACE. Public CGs,
+   * `localOnly` writes, and a node that IS the curator are unaffected. Phase-1
+   * default-off lets the gate soak before it becomes the default. Per-call
+   * `share({ awaitCuratorAck })` overrides this.
+   */
+  swmAwaitCuratorAck?: boolean;
   framework?: string;
   description?: string;
   listenPort?: number;
@@ -999,18 +1053,43 @@ export interface DKGAgentConfig {
       perCuratorBytesPerHour?: number;
       coreAggregateBytes?: number;
     };
+    /**
+     * OT-RFC-49 WS-A — the irreversible private-ciphertext strip. When `true`
+     * (DEFAULT — `undefined` is treated as on), a core declines ALL
+     * private-ciphertext host-mode custody for CURATED context graphs:
+     * "hosting follows access". Concretely, for a curated CG the core
+     *
+     *   - DECLINES the auto-host subscribe (reconcile/beacon/chain-event +
+     *     the restart-restore path), starving both the `.meta` ingest and
+     *     the LU-11 chunk ingest at the single subscribe choke point;
+     *   - REFUSES the operator override (`enableSwmHostModeFor`) — unlike the
+     *     narrower rung-1 `stripNonParticipants`, WS-A CLOSES the operator
+     *     hatch, so there is no manual path back into private custody;
+     *   - RETIRES the private serve responders (`handleSwmHostCatchup`,
+     *     `handleGetCiphertextChunk`) so a stripped core serves nothing
+     *     private back over the wire.
+     *
+     * Random sampling now proves the PUBLIC `_catalog` subgraph, so cores no
+     * longer need the ciphertext; private data lives member-side and members
+     * backfill from the curator (REPLACE-recovery), not from cores. PUBLIC CGs
+     * are NEVER affected — the gate sits after the curated check on every path.
+     * Set `false` to restore legacy host-mode custody (the rolling-upgrade
+     * kill-switch / A/B baseline; backcompat is waived for V10 testnet).
+     */
+    stripCiphertext?: boolean;
   };
   /** Durable local store for subscribed context-graph runtime state. */
   contextGraphSubscriptionStore?: ContextGraphSubscriptionStore;
   /** Durable local store for paged sync checkpoints. Defaults to in-memory. */
   syncCheckpointStore?: SyncCheckpointStore;
   /**
-   * Cap on how many persisted context-graph subscriptions are *activated*
-   * (gossip-subscribed + sync-tracked) when rehydrating at startup. A large
-   * backlog of stale subscriptions otherwise fans out store-touching gossip
-   * /sync work that starves authenticated store-backed routes (issue #997).
-   * Subscriptions beyond the cap stay persisted but inactive and can be
-   * pruned via `DELETE /api/context-graph/subscriptions`. Default
+   * Intentional cap on how many persisted context-graph subscriptions are
+   * *activated* (gossip-subscribed + sync-tracked) when rehydrating at startup.
+   * A large backlog of stale subscriptions otherwise fans out store-touching
+   * gossip/sync work that starves authenticated store-backed routes (issue
+   * #997). Rows beyond the cap stay persisted but inactive, are reported via
+   * subscription diagnostics, and can be pruned via
+   * `DELETE /api/context-graph/subscriptions`. Default
    * `DEFAULT_MAX_REHYDRATED_SUBSCRIPTIONS`. `0` disables the cap.
    */
   maxRehydratedContextGraphSubscriptions?: number;

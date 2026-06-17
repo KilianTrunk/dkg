@@ -952,9 +952,33 @@ export class DKGAgent extends DKGAgentBase {
       collectEntries(metaResult.bindings as Record<string, string>[], 'meta');
     }
 
+    this.log.debug(ctx, `Discovery scan found ${discoveredEntries.size} CG(s) in store`);
+
     for (const { id, name, source } of discoveredEntries.values()) {
       const existing = this.subscribedContextGraphs.get(id);
-      if (existing) continue;
+      if (existing) {
+        // A restart re-seeds `subscribedContextGraphs` from persisted state but
+        // does NOT re-add the CG to the SWM-sync scope (`config.syncContextGraphs`,
+        // what `getSyncContextGraphs()` and sync-on-connect's shared-memory pass
+        // iterate). For a PRIVATE CG the member is a participant in, that means a
+        // reconnecting member would data-sync the CG but its on-connect SWM pass
+        // would never cover it — the curator-leader REPLACE gate never sees it, so
+        // the member stays stale forever. Re-track the sync scope here for curated
+        // CGs so this same connect cycle's `newlyDiscovered` set picks it up
+        // (refreshing its meta-synced flag) and the shared-memory pass recovers it.
+        // `trackSyncContextGraph` is idempotent, so public/already-scoped CGs are
+        // unaffected. Gate on `existing.subscribed`: `unsubscribeFromContextGraph`
+        // keeps the record but flips `subscribed` to false and drops the CG from
+        // `syncContextGraphs`, so re-tracking an explicitly-unsubscribed (or
+        // host-only) private CG here would silently undo that operator choice on
+        // every discovery scan. Only re-track CGs the node is still a live
+        // subscriber of.
+        if (existing.subscribed && await this.isPrivateContextGraph(id)) {
+          this.trackSyncContextGraph(id);
+          this.log.info(ctx, `Re-tracked already-subscribed private CG "${id.slice(0, 28)}" into the SWM-sync scope on discovery`);
+        }
+        continue;
+      }
 
       // Two kinds of discovered CG, two different opt-in semantics:
       //
@@ -1443,14 +1467,12 @@ export class DKGAgent extends DKGAgentBase {
       subGraphName: string | undefined,
       merkleLeafCount: number,
       isEncryptedPayload?: boolean,
-      // OT-RFC-38 LU-11 — when present, the publisher's chunked
-      // emitter has already AEAD-encrypted + SWM-gossiped per-chunk
-      // ciphertexts. The collector routes through V2 ACK with empty
-      // stagingQuads and these fields populating PublishIntent.
-      chunkedCommitment?: {
-        ciphertextChunksRoot: Uint8Array;
-        ciphertextChunkCount: number;
-        ciphertextChunks?: Uint8Array[];
+      // OT-RFC-49 / WS-D — when present, this is a curated publish: the
+      // committed PUBLIC `_catalog` commitment the core rebuilds + verifies
+      // over the inline catalog `stagingQuads` and that lands on-chain.
+      catalogCommitment?: {
+        catalogRoot: Uint8Array;
+        catalogLeafCount: number;
       },
     ) => {
       // Fail loud on non-numeric or non-positive CG ids: V10 publish requires
@@ -1539,7 +1561,7 @@ export class DKGAgent extends DKGAgentBase {
         subGraphName,
         merkleLeafCount,
         isEncryptedPayload,
-        chunkedCommitment,
+        catalogCommitment,
       });
       return result.acks;
     };
@@ -1618,8 +1640,8 @@ export class DKGAgent extends DKGAgentBase {
       mintAmount: bigint;
       burnTokenIds: bigint[];
       newMerkleLeafCount: number;
-      newCiphertextChunksRoot?: Uint8Array;
-      newCiphertextChunkCount?: number;
+      newCatalogRoot?: Uint8Array;
+      newCatalogLeafCount?: number;
       stagingQuads?: Uint8Array;
       swmGraphId?: string;
       subGraphName?: string;
@@ -1679,8 +1701,8 @@ export class DKGAgent extends DKGAgentBase {
         mintAmount: params.mintAmount,
         burnTokenIds: params.burnTokenIds,
         newMerkleLeafCount: params.newMerkleLeafCount,
-        newCiphertextChunksRoot: params.newCiphertextChunksRoot,
-        newCiphertextChunkCount: params.newCiphertextChunkCount,
+        newCatalogRoot: params.newCatalogRoot,
+        newCatalogLeafCount: params.newCatalogLeafCount,
         chainId: chainIdBig,
         kav10Address,
         publisherPeerId: this.peerId,
@@ -1801,7 +1823,7 @@ export class DKGAgent extends DKGAgentBase {
       ): Promise<{ seeded: number; fromLayer: 'swm' | 'vm'; entities: number }> {
         return agent.publisher.assertionPullFrom(contextGraphId, name, agentAddress, sourceLayer, opts);
       },
-      async promote(contextGraphId: string, name: string, opts?: { entities?: string[] | 'all'; subGraphName?: string; authorAgentAddress?: string; preSignedAuthorAttestation?: PreSignedAuthorAttestation }): Promise<{ promotedCount: number }> {
+      async promote(contextGraphId: string, name: string, opts?: { entities?: string[] | 'all'; subGraphName?: string; authorAgentAddress?: string; preSignedAuthorAttestation?: PreSignedAuthorAttestation; awaitCuratorAck?: boolean; curatorAckTimeoutMs?: number }): Promise<{ promotedCount: number }> {
         // Seal-before-share: the on-chain publish path
         // (`publishFromFinalizedAssertion`) requires a FINALIZED assertion, and
         // the seal must be computed over the Working-Memory content BEFORE
@@ -1861,12 +1883,25 @@ export class DKGAgent extends DKGAgentBase {
         // Without this, private/agent-gated CGs receive plaintext
         // gossip and the new `SharedMemoryHandler` check rejects it.
         const gossipSigner = await agent.resolveWorkspaceGossipSigningAgent(contextGraphId);
+        // Strict curator-ack gate (OT-RFC-49 curator-leader) for the WM→SWM
+        // promote path — the same confirmer as share()/conditionalShare(). When
+        // armed (private CG, gate enabled, curator remote), assertionPromote
+        // requires the curator's applied-ack BEFORE it moves WM→SWM, so an
+        // unconfirmed promote aborts (CuratorUnconfirmedError → 503) leaving WM
+        // intact instead of silently committing a write the curator never got.
+        const confirmBeforeCommit = await agent.buildCuratorAckConfirmer(
+          contextGraphId,
+          gossipSigner,
+          { awaitCuratorAck: opts?.awaitCuratorAck, curatorAckTimeoutMs: opts?.curatorAckTimeoutMs },
+          createOperationContext('share'),
+        );
         const { promotedCount, gossipMessage } = await agent.publisher.assertionPromote(
           contextGraphId, name, agentAddress,
           {
             ...opts,
             publisherPeerId: agent.node.peerId.toString(),
             senderAgentAddress: gossipSigner?.agentAddress,
+            confirmBeforeCommit,
           },
         );
         if (gossipMessage) {

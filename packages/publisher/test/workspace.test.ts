@@ -209,6 +209,65 @@ describe('Workspace: share', () => {
     }
   });
 
+  // ── Strict curator-ack gate (OT-RFC-49 curator-leader) ──
+  // The publisher-side hook: `confirmBeforeCommit` runs after the wire message
+  // is built and BEFORE any store mutation. A non-confirmation MUST abort with
+  // zero local persistence — the load-bearing "don't accept state" property.
+  it('curator-ack gate: aborts (CuratorUnconfirmedError) and does NOT persist when the confirmer returns applied:false', async () => {
+    const quads = [q(ENTITY, 'http://schema.org/name', '"GatedV2"')];
+    let received: Uint8Array | undefined;
+    const opts: ShareOptions = {
+      publisherPeerId: 'peer1',
+      confirmBeforeCommit: async (message) => {
+        received = message;
+        return { applied: false };
+      },
+    };
+    await expect(publisher.share(CONTEXT_GRAPH, quads, opts)).rejects.toThrow(
+      /not confirmed by its curator/,
+    );
+    // the confirmer received the real, fully-built wire message
+    expect(received).toBeInstanceOf(Uint8Array);
+    expect(received!.length).toBeGreaterThan(0);
+    // CRITICAL: nothing was persisted — the workspace graph is empty for ENTITY
+    const r = await store.query(
+      `SELECT ?o WHERE { GRAPH <${WORKSPACE_GRAPH}> { <${ENTITY}> <http://schema.org/name> ?o } }`,
+    );
+    expect(r.type).toBe('bindings');
+    if (r.type === 'bindings') expect(r.bindings.length).toBe(0);
+  });
+
+  it('curator-ack gate: aborts (CuratorRejectedError) and does NOT persist on a permanent rejection', async () => {
+    const quads = [q(ENTITY, 'http://schema.org/name', '"GatedRej"')];
+    await expect(
+      publisher.share(CONTEXT_GRAPH, quads, {
+        publisherPeerId: 'peer1',
+        confirmBeforeCommit: async () => ({ applied: false, rejected: true }),
+      }),
+    ).rejects.toThrow(/permanently rejected by its curator/);
+    const r = await store.query(
+      `SELECT ?o WHERE { GRAPH <${WORKSPACE_GRAPH}> { <${ENTITY}> <http://schema.org/name> ?o } }`,
+    );
+    if (r.type === 'bindings') expect(r.bindings.length).toBe(0);
+  });
+
+  it('curator-ack gate: commits normally when the confirmer returns applied:true', async () => {
+    const quads = [q(ENTITY, 'http://schema.org/name', '"GatedOK"')];
+    const result = await publisher.share(CONTEXT_GRAPH, quads, {
+      publisherPeerId: 'peer1',
+      confirmBeforeCommit: async () => ({ applied: true }),
+    });
+    expect(result.shareOperationId).toMatch(/^swm-/);
+    const r = await store.query(
+      `SELECT ?o WHERE { GRAPH <${WORKSPACE_GRAPH}> { <${ENTITY}> <http://schema.org/name> ?o } }`,
+    );
+    expect(r.type).toBe('bindings');
+    if (r.type === 'bindings') {
+      expect(r.bindings.length).toBe(1);
+      expect(r.bindings[0]['o']).toBe('"GatedOK"');
+    }
+  });
+
   it('allows same creator to upsert an existing workspace entity', async () => {
     const quads1 = [q(ENTITY, 'http://schema.org/name', '"First"')];
     await publisher.share(CONTEXT_GRAPH, quads1, { publisherPeerId: 'peer1' });

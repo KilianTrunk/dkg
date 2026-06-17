@@ -331,6 +331,7 @@ import {
   type ChatSendResult,
   type ContextGraphSub,
   type ContextGraphSubscriptionRecord,
+  type ContextGraphSubscriptionRehydrationStatus,
   type ContextGraphSubscriptionStore,
   type ContextGraphMemberPrincipalType,
   type ContextGraphMemberStatus,
@@ -745,6 +746,16 @@ export class DKGAgentBase {
   static readonly SWM_SUBSTRATE_FANOUT_TIMEOUT_MS = 15_000;
 
   /**
+   * Per-curator-peer timeout for the STRICT curator-ack gate on a private-CG
+   * write (OT-RFC-49 curator-leader). Shorter than the 15s fan-out budget
+   * because it sits synchronously on the HTTP write path: too long makes a
+   * write hang when the curator is slow/unreachable; too short produces false
+   * `unconfirmed` errors for a curator that would have applied it. 5s is the
+   * default; callers may override via `share({ curatorAckTimeoutMs })`.
+   */
+  static readonly SWM_CURATOR_ACK_TIMEOUT_MS = 5_000;
+
+  /**
    * Lazy CGMemberEnumerator — single instance per agent. Holds the
    * 60s membership cache shared across every share to the same
    * cgId within a window. See {@link getOrCreateCGMemberEnumerator}.
@@ -884,6 +895,13 @@ export class DKGAgentBase {
   protected readonly config: DKGAgentConfig;
   protected started = false;
   protected readonly subscribedContextGraphs = new Map<string, ContextGraphSub>();
+  protected contextGraphSubscriptionRehydrationStatus: ContextGraphSubscriptionRehydrationStatus | null = null;
+  protected readonly contextGraphSubscriptionRehydrationAccountedIds = new Set<string>();
+  protected readonly contextGraphSubscriptionPersistRevisions = new Map<string, number>();
+  protected readonly contextGraphSubscriptionPersistAppliedRevisions = new Map<string, number>();
+  protected readonly contextGraphSubscriptionPersistCanceledRevisions = new Map<string, number>();
+  protected readonly contextGraphSubscriptionPersistPendingRevisions = new Map<string, Set<number>>();
+  protected readonly contextGraphSubscriptionPersistChains = new Map<string, Promise<void>>();
   protected readonly listContextGraphsCache = new Map<string, {
     expiresAt: number;
     rows: Array<Record<string, unknown>>;

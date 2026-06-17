@@ -1957,7 +1957,7 @@ export class DKGPublisher implements Publisher {
     if (kcMerkleLeafCount > 0xffffffff) {
       throw new Error(`V10 merkleLeafCount exceeds uint32: ${kcMerkleLeafCount}`);
     }
-    this.log.info(ctx, `Computed kcMerkleRoot (flat) over ${allSkolemizedQuads.length} triple hashes + ${privateRoots.length} private root(s), leafCount=${kcMerkleLeafCount}`);
+    this.log.info(ctx, `Computed kcMerkleRoot (structured: hashPair(publicRoot, privateDataHash)) over ${allSkolemizedQuads.length} public triple hashes + ${privateRoots.length} private root(s), public leafCount=${kcMerkleLeafCount}`);
     // Design B: a publish mints exactly ONE KA regardless of entity count.
     // `entityCount` is informational; `kaCount` is what goes on chain as
     // `knowledgeAssetsAmount` (the contract requires == 1) and into the ACK

@@ -95,6 +95,27 @@ export interface DashboardDBOptions {
   dataDir: string;
   /** Days to retain data before pruning. Default: 14 */
   retentionDays?: number;
+  /**
+   * TTL (ms) for the in-process memo over polled replication rollups. `<= 0`
+   * disables caching. When omitted, falls back to the
+   * `DKG_DASHBOARD_CACHE_TTL_MS` env var, then a 2000ms default.
+   */
+  cacheTtlMs?: number;
+}
+
+/**
+ * Resolve the replication-rollup memo TTL: an explicit option (any finite
+ * number, incl. `<= 0` to disable) wins; otherwise a STRICT parse of
+ * `DKG_DASHBOARD_CACHE_TTL_MS` — empty / malformed falls back to the default so
+ * an empty env var in a deploy file doesn't silently disable the memo; otherwise
+ * 2000ms.
+ */
+function resolveCacheTtlMs(optValue: number | undefined): number {
+  if (typeof optValue === 'number' && Number.isFinite(optValue)) return optValue;
+  const raw = process.env.DKG_DASHBOARD_CACHE_TTL_MS;
+  if (raw === undefined || !/^-?\d+$/.test(raw.trim())) return 2000;
+  const n = Number(raw.trim());
+  return Number.isFinite(n) ? n : 2000;
 }
 
 export class DashboardDB {
@@ -107,6 +128,7 @@ export class DashboardDB {
     this.dataDir = opts.dataDir;
     this.explicitRetentionDays = opts.retentionDays !== undefined;
     this.retentionDays = opts.retentionDays ?? DEFAULT_RETENTION_DAYS;
+    this._memoTtlMs = resolveCacheTtlMs(opts.cacheTtlMs);
     const dbPath = join(opts.dataDir, 'node-ui.db');
     this.db = new Database(dbPath);
     this.db.pragma('journal_mode = WAL');
@@ -876,13 +898,10 @@ export class DashboardDB {
   // synchronously on the daemon's event loop and are polled by the dashboard on
   // a few-second cadence. A short memo collapses repeated identical scans (extra
   // browser tabs, a runaway poller) into one, with no visible staleness on
-  // window-based analytics. Tunable via DKG_DASHBOARD_CACHE_TTL_MS (<=0 disables;
-  // malformed/empty falls back to 2000).
+  // window-based analytics. TTL resolved in the constructor from
+  // `cacheTtlMs` / DKG_DASHBOARD_CACHE_TTL_MS (<=0 disables; default 2000).
   private _memo = new Map<string, { at: number; value: unknown }>();
-  private readonly _memoTtlMs = (() => {
-    const raw = Number(process.env.DKG_DASHBOARD_CACHE_TTL_MS);
-    return Number.isFinite(raw) ? raw : 2000;
-  })();
+  private readonly _memoTtlMs: number;
 
   /**
    * Memoize a rollup for up to `_memoTtlMs`. `minWindowMs` is the smallest
@@ -1133,8 +1152,10 @@ export class DashboardDB {
    */
   getReplicationTimeline(opts: { periodMs: number; bucketMs: number; contextGraphId?: string }): ReplicationTimelineBucket[] {
     return this.memoized(
+      // Staleness is driven by the rolling `periodMs` cutoff only; `bucketMs`
+      // controls grouping, not which events fall in/out of the window.
       `replicationTimeline:${opts.periodMs}:${opts.bucketMs}:${opts.contextGraphId ?? ''}`,
-      Math.min(opts.periodMs, opts.bucketMs),
+      opts.periodMs,
       () => this._computeReplicationTimeline(opts),
     );
   }

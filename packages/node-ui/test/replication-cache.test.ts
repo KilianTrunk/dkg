@@ -1,11 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DashboardDB } from '../src/db.js';
+import { DashboardDB, type ReplicationTimelineBucket } from '../src/db.js';
 
-// The memo TTL is read from the env at construction time, so each test sets it
-// before opening its own DashboardDB.
 const ENV_KEY = 'DKG_DASHBOARD_CACHE_TTL_MS';
 
 let dir: string;
@@ -18,6 +16,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   db?.close();
   db = undefined;
   if (prevEnv === undefined) delete process.env[ENV_KEY];
@@ -25,54 +24,127 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+// TTL is injected via the constructor option (no global env mutation needed).
 function open(ttlMs: number): DashboardDB {
-  process.env[ENV_KEY] = String(ttlMs);
-  return new DashboardDB({ dataDir: dir });
+  return new DashboardDB({ dataDir: dir, cacheTtlMs: ttlMs });
 }
+
+function promote(d: DashboardDB, ts: number, cg: string, ord: number): void {
+  d.insertReplicationEvent({ ts, context_graph_id: cg, action: 'promote', ual: `urn:ka:${ord}`, ordinal: ord });
+}
+
+const timelineTotal = (buckets: ReplicationTimelineBucket[]): number =>
+  buckets.reduce((s, b) => s + (b.total ?? 0), 0);
 
 describe('DashboardDB — replication rollup memo', () => {
   it('serves a cached summary within the TTL (does not re-scan on every poll)', () => {
-    db = open(60_000); // long TTL so the second call is a guaranteed cache hit
+    db = open(60_000);
     const now = Date.now();
-    db.insertReplicationEvent({ ts: now - 1000, context_graph_id: 'cg', action: 'promote', ual: 'urn:ka:1', ordinal: 1 });
+    promote(db, now - 1000, 'cg', 1);
+    expect(db.getReplicationSummary(3_600_000).totalEvents).toBe(1);
 
-    const first = db.getReplicationSummary(3_600_000);
-    expect(first.totalEvents).toBe(1);
+    promote(db, now - 500, 'cg', 2); // new event, but within TTL the poll stays cached
+    expect(db.getReplicationSummary(3_600_000).totalEvents).toBe(1);
+  });
 
-    // A new event arrives, but within the TTL the polled value stays cached.
-    db.insertReplicationEvent({ ts: now - 500, context_graph_id: 'cg', action: 'promote', ual: 'urn:ka:2', ordinal: 2 });
-    const second = db.getReplicationSummary(3_600_000);
-    expect(second.totalEvents).toBe(1); // cache hit — not yet 2
+  it('expires the cache after the TTL — a permanent cache would FAIL this', () => {
+    // Deterministic via faked Date only (leaves real timers/native sqlite alone).
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const t0 = 1_700_000_000_000;
+    vi.setSystemTime(t0);
+    db = open(1000); // 1s TTL, 1h window (> TTL) so caching is active
+    promote(db, t0 - 1000, 'cg', 1);
+    expect(db.getReplicationSummary(3_600_000).totalEvents).toBe(1); // computed + cached at t0
+
+    promote(db, t0 - 500, 'cg', 2);
+    expect(db.getReplicationSummary(3_600_000).totalEvents).toBe(1); // still within TTL → cached
+
+    vi.setSystemTime(t0 + 1500); // advance past the 1s TTL
+    expect(db.getReplicationSummary(3_600_000).totalEvents).toBe(2); // expired → recomputed
   });
 
   it('reflects fresh data immediately when caching is disabled (TTL <= 0)', () => {
     db = open(0);
     const now = Date.now();
-    db.insertReplicationEvent({ ts: now - 1000, context_graph_id: 'cg', action: 'promote', ual: 'urn:ka:1', ordinal: 1 });
+    promote(db, now - 1000, 'cg', 1);
     expect(db.getReplicationSummary(3_600_000).totalEvents).toBe(1);
-    db.insertReplicationEvent({ ts: now - 500, context_graph_id: 'cg', action: 'promote', ual: 'urn:ka:2', ordinal: 2 });
+    promote(db, now - 500, 'cg', 2);
     expect(db.getReplicationSummary(3_600_000).totalEvents).toBe(2); // no cache
   });
 
-  it('keys the cache by arguments (a different window is not served a stale value)', () => {
+  it('keys the cache by window (a different periodMs is not served a stale value)', () => {
     db = open(60_000);
     const now = Date.now();
-    // one event inside the 1h window, one only inside the 2h window
-    db.insertReplicationEvent({ ts: now - 30 * 60_000, context_graph_id: 'cg', action: 'promote', ual: 'urn:ka:1', ordinal: 1 });
-    db.insertReplicationEvent({ ts: now - 90 * 60_000, context_graph_id: 'cg', action: 'promote', ual: 'urn:ka:2', ordinal: 2 });
-
-    expect(db.getReplicationSummary(60 * 60_000).totalEvents).toBe(1); // 1h window
-    expect(db.getReplicationSummary(2 * 60 * 60_000).totalEvents).toBe(2); // 2h window — distinct key
+    promote(db, now - 30 * 60_000, 'cg', 1); // inside 1h
+    promote(db, now - 90 * 60_000, 'cg', 2); // only inside 2h
+    expect(db.getReplicationSummary(60 * 60_000).totalEvents).toBe(1);
+    expect(db.getReplicationSummary(2 * 60 * 60_000).totalEvents).toBe(2); // distinct key
   });
 
   it('bypasses the cache when the requested window is <= the TTL (avoids stale-by-window)', () => {
-    // TTL 60s, window 10s (<= TTL): a cached value could surface events that
-    // have aged out of the 10s window, so caching must be skipped here.
+    db = open(60_000); // TTL 60s, window 10s (<= TTL) → must not cache
+    const now = Date.now();
+    promote(db, now - 1000, 'cg', 1);
+    expect(db.getReplicationSummary(10_000).totalEvents).toBe(1);
+    promote(db, now - 500, 'cg', 2);
+    expect(db.getReplicationSummary(10_000).totalEvents).toBe(2); // not cached → fresh
+  });
+
+  it('memoizes getReplicationPerCg independently and keys it by window', () => {
     db = open(60_000);
     const now = Date.now();
-    db.insertReplicationEvent({ ts: now - 1000, context_graph_id: 'cg', action: 'promote', ual: 'urn:ka:1', ordinal: 1 });
-    expect(db.getReplicationSummary(10_000).totalEvents).toBe(1);
-    db.insertReplicationEvent({ ts: now - 500, context_graph_id: 'cg', action: 'promote', ual: 'urn:ka:2', ordinal: 2 });
-    expect(db.getReplicationSummary(10_000).totalEvents).toBe(2); // not cached → fresh
+    promote(db, now - 1000, 'cgA', 1);
+    expect(db.getReplicationPerCg(3_600_000).length).toBe(1);
+
+    promote(db, now - 500, 'cgB', 2); // a second CG appears
+    expect(db.getReplicationPerCg(3_600_000).length).toBe(1); // cached within TTL — cgB not yet visible
+    expect(db.getReplicationPerCg(2 * 3_600_000).length).toBe(2); // different window key → recomputed
+  });
+
+  it('timeline cache bypass is driven by periodMs, not bucketMs', () => {
+    db = open(60_000); // 60s TTL
+    const now = Date.now();
+    promote(db, now - 1000, 'cg', 1);
+    // periodMs 1h (> TTL) but bucketMs 10s (<= TTL): with the periodMs-only rule
+    // this CACHES (bucketMs no longer forces a bypass).
+    const big = { periodMs: 3_600_000, bucketMs: 10_000 };
+    expect(timelineTotal(db.getReplicationTimeline(big))).toBe(1);
+    promote(db, now - 500, 'cg', 2);
+    expect(timelineTotal(db.getReplicationTimeline(big))).toBe(1); // cached (periodMs > TTL)
+
+    // A small periodMs (<= TTL) is bypassed → fresh.
+    expect(timelineTotal(db.getReplicationTimeline({ periodMs: 10_000, bucketMs: 1000 }))).toBe(2);
+  });
+});
+
+describe('DashboardDB — cache TTL resolution', () => {
+  it('empty DKG_DASHBOARD_CACHE_TTL_MS falls back to the default (does NOT disable) — the reported bug', () => {
+    process.env[ENV_KEY] = '';
+    db = new DashboardDB({ dataDir: dir }); // no option → resolves via env
+    const now = Date.now();
+    promote(db, now - 1000, 'cg', 1);
+    expect(db.getReplicationSummary(3_600_000).totalEvents).toBe(1);
+    promote(db, now - 500, 'cg', 2);
+    expect(db.getReplicationSummary(3_600_000).totalEvents).toBe(1); // still cached → default TTL active, not disabled
+  });
+
+  it('malformed DKG_DASHBOARD_CACHE_TTL_MS falls back to the default', () => {
+    process.env[ENV_KEY] = '64x';
+    db = new DashboardDB({ dataDir: dir });
+    const now = Date.now();
+    promote(db, now - 1000, 'cg', 1);
+    expect(db.getReplicationSummary(3_600_000).totalEvents).toBe(1);
+    promote(db, now - 500, 'cg', 2);
+    expect(db.getReplicationSummary(3_600_000).totalEvents).toBe(1); // cached at default → not disabled
+  });
+
+  it('the cacheTtlMs option overrides the env var', () => {
+    process.env[ENV_KEY] = '60000';
+    db = new DashboardDB({ dataDir: dir, cacheTtlMs: 0 }); // option disables, beating env
+    const now = Date.now();
+    promote(db, now - 1000, 'cg', 1);
+    expect(db.getReplicationSummary(3_600_000).totalEvents).toBe(1);
+    promote(db, now - 500, 'cg', 2);
+    expect(db.getReplicationSummary(3_600_000).totalEvents).toBe(2); // option won → no cache
   });
 });

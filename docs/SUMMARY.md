@@ -10,7 +10,6 @@
 
 * [OriginTrail DKG V10 Pre-Mainnet Bug Bounty](active-now/dkg-v10-premainnet-bounty.md)
 * [DKG V10 Bounty Program](active-now/dkg-v10-bounty.md)
-* [General Bug Bounty](active-now/general-bug-bounty.md)
 
 ## OriginTrail V9/V10
 
@@ -61,6 +60,15 @@
 * [Packages](references/packages.md)
 * [Glossary](references/glossary.md)
 * [Node Skill](references/node-skill.md)
+
+## General
+
+* [Networks & RPCs](general/networks.md)
+* [Contract addresses](general/contract-addresses.md)
+* [NeuroWeb & bridging TRAC](general/neuroweb.md)
+* [Whitepaper & RFCs](general/whitepaper-and-rfcs.md)
+* [Random Sampling](general/random-sampling.md)
+* [General Bug Bounty](general/general-bug-bounty.md)
 
 ## Archive
 

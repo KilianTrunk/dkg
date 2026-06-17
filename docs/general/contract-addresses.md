@@ -8,7 +8,7 @@ doc_type: reference
 # Contract addresses
 
 {% hint style="info" %}
-DKG V10 is currently live on **Base Sepolia (testnet)** only. Mainnet (Base, Gnosis, NeuroWeb) has not launched yet — see the [V10 Mainnet Release Timeline](../origintrail-v9-v10/v10-mainnet-release-timeline.md). The mainnet TRAC addresses below are the existing token contracts on those chains (for reference and bridging); the V10 mainnet protocol contracts (Hub, etc.) will be published at mainnet launch.
+DKG V10 runs on **Base Sepolia (testnet)**, and the final release-candidate contracts are also deployed on **Base mainnet** as a pre-mainnet deployment. The full mainnet launch across Base, Gnosis, and NeuroWeb is still upcoming — see the [V10 Mainnet Release Timeline](../origintrail-v9-v10/v10-mainnet-release-timeline.md). The mainnet TRAC addresses below are the existing token contracts on those chains (for reference and bridging); the Gnosis and NeuroWeb mainnet protocol contracts will be published at mainnet launch.
 {% endhint %}
 
 ## TRAC token
@@ -44,8 +44,9 @@ The **Hub** is the entry point — it resolves the addresses of every other V10 
 
 | Network | V10 Hub address |
 | --- | --- |
+| Base (mainnet) | `0x26146f51e31a95c075228a34cfc696f09e4c36c3` |
 | Base Sepolia (testnet) | `0xC056e67Da4F51377Ad1B01f50F655fFdcCD809F6` |
 
 {% hint style="info" %}
-Mainnet V10 Hub addresses (Base, Gnosis, NeuroWeb) are published in the [deployments folder](https://github.com/OriginTrail/dkg/tree/main/packages/evm-module/deployments) as each network's V10 contracts go live — use that folder as the source of truth.
+The Base mainnet Hub above is the pre-mainnet release-candidate deployment. Gnosis and NeuroWeb mainnet Hub addresses are published in the [deployments folder](https://github.com/OriginTrail/dkg/tree/main/packages/evm-module/deployments) as those networks' V10 contracts go live — use that folder as the source of truth.
 {% endhint %}

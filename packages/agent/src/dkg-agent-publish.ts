@@ -2021,9 +2021,10 @@ export class PublishMethods extends DKGAgentBase {
         throw new Error(
           `assertionFinalize: assertion <${assertionUri}> is already finalized with a ` +
             `different merkleRoot (existing=${ethers.hexlify(existingSeal.merkleRoot)}, ` +
-            `current=${ethers.hexlify(merkleRoot)}). Discard and re-create the assertion if ` +
-            `you intended to change its content; in-place mutation of a finalized assertion ` +
-            `breaks the author signature and is rejected.`,
+            `current=${ethers.hexlify(merkleRoot)}). In-place mutation of a finalized assertion ` +
+            `breaks the author signature and is rejected. To edit already-shared/published ` +
+            `content, start a sanctioned edit loop with POST /api/knowledge-assets/{name}/wm/pull-from ` +
+            `(which re-opens a fresh draft and clears the stale seal), or discard and re-create the assertion.`,
         );
       }
       // Seal exists and matches — return the existing record. The rebuilt digest
@@ -3228,6 +3229,17 @@ export class PublishMethods extends DKGAgentBase {
       }
     }
 
+    // Merge note (PR #1107 ← main): #1097's "auto-promote a sealed-but-unstaged
+    // assertion before publish" was dropped here. main reworked the memory
+    // model so that publishing a finalized-but-unshared assertion is an
+    // explicit caller precondition — `publishFromFinalizedAssertion` surfaces
+    // the actionable "No quads in shared memory" error and the vm/publish route
+    // maps it to a clean 409 VM_PUBLISH_PRECONDITION (see
+    // packages/cli/test/knowledge-assets-route.test.ts). Auto-promoting here
+    // defeats that precondition (it stages the data, so the publish proceeds
+    // instead of returning 409), so main's explicit share→publish contract
+    // supersedes the PR's auto-promote approach to the same issue.
+
     // ── OT-RFC-43 A2 (decision 3) — CREATE-VS-UPDATE ROUTING ──
     //
     // BEFORE minting, read the per-layer VM pointer + the stamped kaId off the
@@ -3298,6 +3310,28 @@ export class PublishMethods extends DKGAgentBase {
           precomputedUpdateAttestation: updateAttestation,
         },
       );
+
+      // #1099: the update primitive (`publisher.update`) has no SWM-drain of
+      // its own — only the mint path's `publishFromSharedMemory` cleans SWM
+      // after chain confirmation. Without this, every edit-loop update left
+      // the re-shared SWM copy in place forever (locally AND on every replica
+      // that mirrored the share), so SWM and VM permanently disagreed.
+      if (result.status === 'confirmed') {
+        try {
+          await this.publisher.clearPublishedSwmRoots(
+            contextGraphId,
+            seal.rootEntities,
+            opts?.subGraphName,
+            opts?.operationCtx ?? createOperationContext('publishFromSWM'),
+          );
+        } catch (err) {
+          this.log.warn(
+            opts?.operationCtx ?? createOperationContext('publishFromSWM'),
+            `Failed to clear SWM after confirmed update of <${lifecycleUri}>: ` +
+              (err instanceof Error ? err.message : String(err)),
+          );
+        }
+      }
 
       // Stamp UPDATE provenance + re-stamp VM/WM pointers to the new merkle.
       if (result.status === 'confirmed' || result.status === 'tentative') {
@@ -3439,6 +3473,33 @@ export class PublishMethods extends DKGAgentBase {
         await this.store.insert([
           { subject: lifecycleUri, predicate: STATE_PRED, object: '"published"', graph: metaGraph },
         ]);
+        // #1104: reconcile the KA's dual identity. `dkg:reservedUal`
+        // (chain/author/kaNumber, stamped at finalize) and the published
+        // UAL (chain/contract/tokenId, returned by vm/publish) are both
+        // permanent — record the published UAL on the lifecycle URN
+        // (drop-then-set, so updates re-point to the latest published UAL).
+        //
+        // Merge note (PR #1107 ← main): #1095's separate `published`
+        // prov:Activity EVENT minting was dropped here — main's RFC
+        // ka-metadata-trim deliberately removed `generateAssertionPublishedMetadata`,
+        // and main already stamps `dkg:state="published"` above (which
+        // `deriveStatus` maps to `vm-confirmed`), so the lifecycle STATE fix
+        // #1095 targeted is satisfied without the trimmed event entity.
+        if (result.ual) {
+          try {
+            const PUBLISHED_UAL_PRED = 'http://dkg.io/ontology/publishedUal';
+            await this.store.deleteByPattern({ subject: lifecycleUri, predicate: PUBLISHED_UAL_PRED, graph: metaGraph });
+            await this.store.insert([
+              { subject: lifecycleUri, predicate: PUBLISHED_UAL_PRED, object: `"${result.ual}"`, graph: metaGraph },
+            ]);
+          } catch (err) {
+            this.log.warn(
+              opts?.operationCtx ?? createOperationContext('publishFromSWM'),
+              `Failed to record publishedUal for <${lifecycleUri}>: ` +
+                (err instanceof Error ? err.message : String(err)),
+            );
+          }
+        }
         // SUBSTRATE-2 — re-point dkg:assertionGraph to the per-KA verifiable-
         // memory graph this publish actually wrote
         // (…/_verifiable_memory/{author}/{number}). promote() left the pointer on

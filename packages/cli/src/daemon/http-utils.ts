@@ -956,6 +956,10 @@ export interface ImportFileExtractionPayload {
   pipelineUsed: string | null;
   mdIntermediateHash?: string;
   error?: string;
+  // #1101: when status === "skipped", explain WHY extraction was skipped so
+  // callers don't have to guess (the dominant cause is an unrecognized
+  // content type with no registered converter).
+  skipReason?: string;
 }
 
 export function buildImportFileResponse(args: {
@@ -978,6 +982,7 @@ export function buildImportFileResponse(args: {
         ? { mdIntermediateHash: args.extraction.mdIntermediateHash }
         : {}),
       ...(args.extraction.error ? { error: args.extraction.error } : {}),
+      ...(args.extraction.skipReason ? { skipReason: args.extraction.skipReason } : {}),
     },
   };
 }

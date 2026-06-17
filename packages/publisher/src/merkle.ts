@@ -76,31 +76,42 @@ export function computePrivateRootV10(privateQuads: Quad[]): Uint8Array | undefi
 export { SENTINEL_NO_PRIVATE_V10, SENTINEL_NO_PUBLIC_V10 } from '@origintrail-official/dkg-core';
 
 /**
- * V10 per-KA commitment root — **STRUCTURED** `hashPair(publicRoot, privateDataHash)`
- * (replaces the former flat-mixed `publicHashes ++ privateRoots` tree). Public
- * triples form the challengeable subtree; private data is collapsed to one
- * sibling, bound into the root for integrity but NEVER a challengeable leaf.
- *
- * NOTE: name kept (`...FlatKC...`) so every recompute callsite inherits the new
- * root with no edit; the tree is no longer flat-mixed. TODO: rename in cleanup.
+ * V10 per-KA **STRUCTURED** commitment — `root = hashPair(publicRoot, privateDataHash)`
+ * with the public-only `leafCount` (the challenge index space). Public triples form
+ * the challengeable subtree; private data is collapsed to one sibling, bound into the
+ * root for integrity but NEVER a challengeable leaf. Returns both **atomically** so the
+ * on-chain `merkleRoot` and `merkleLeafCount` can't be paired inconsistently — prefer
+ * this over the deprecated `computeFlatKC*` names below.
+ */
+export function computeStructuredKCRootV10(
+  publicQuads: Quad[],
+  privateRoots: Uint8Array[],
+): { root: Uint8Array; leafCount: number } {
+  const r = structuredKARootV10(publicQuads.map(computeTripleHashV10), privateRoots);
+  return { root: r.root, leafCount: r.leafCount };
+}
+
+/**
+ * @deprecated Misleading name — this now returns the STRUCTURED root, not a
+ * flat-mixed one. Kept as a thin wrapper so existing recompute call sites inherit
+ * the new root with no edit; migrate to {@link computeStructuredKCRootV10}.
  */
 export function computeFlatKCRootV10(
   publicQuads: Quad[],
   privateRoots: Uint8Array[],
 ): Uint8Array {
-  return structuredKARootV10(publicQuads.map(computeTripleHashV10), privateRoots).root;
+  return computeStructuredKCRootV10(publicQuads, privateRoots).root;
 }
 
 /**
- * Challenge index space = PUBLIC leaves only (post sort+dedupe). Private data is
- * never sampled, so it no longer affects the count (kept in the signature for
- * callsite compatibility).
+ * @deprecated Use {@link computeStructuredKCRootV10}().leafCount. Public-only leaf
+ * count (the challenge index space); `privateRoots` no longer affects it.
  */
 export function computeFlatKCMerkleLeafCountV10(
   publicQuads: Quad[],
   privateRoots: Uint8Array[],
 ): number {
-  return structuredKARootV10(publicQuads.map(computeTripleHashV10), privateRoots).leafCount;
+  return computeStructuredKCRootV10(publicQuads, privateRoots).leafCount;
 }
 
 export function computeKARootV10(

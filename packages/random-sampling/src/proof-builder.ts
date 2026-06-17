@@ -24,7 +24,7 @@ import {
   type V10ProofMaterial,
 } from '@origintrail-official/dkg-core';
 
-export interface ProofBuilderRequest {
+interface ProofBuilderRequestBase {
   /**
    * Canonical N-Triple CONTENT bytes — the `content` the prover submits to
    * `submitProof(bytes content, ...)`; the chain derives `leaf = keccak256(content)`.
@@ -32,22 +32,27 @@ export interface ProofBuilderRequest {
    * Order does not matter — `V10MerkleTree` sorts + dedupes.
    */
   contents: Uint8Array[];
-  /**
-   * Per-entity private sub-roots — `kind: 'public'` ONLY (collapsed N->1 into the
-   * committed `privateDataHash` sibling). Empty/ignored for `kind: 'catalog'`.
-   */
-  privateRoots: Uint8Array[];
   /** On-chain `chunkId` from the challenge. */
   chunkId: number;
   /** Commitment we're trying to satisfy (chain-sourced root + leafCount). */
   expected: V10MerkleCommitment;
-  /**
-   * Tree shape (content-binding applies to both):
-   *   - `'public'` : structured `hashPair(publicRoot, privateDataHash)` (private as sibling).
-   *   - `'catalog'`: plain `V10MerkleTree` over the curated public `_catalog` (no sibling).
-   */
-  kind: 'public' | 'catalog';
 }
+
+/**
+ * Discriminated union on tree shape — the variant carries the invariant, so
+ * `privateRoots` only exists on the `public` path (no invalid states / cross-field
+ * rules to remember). Content-binding applies to both.
+ */
+export type ProofBuilderRequest =
+  | (ProofBuilderRequestBase & {
+      /** Structured `hashPair(publicRoot, privateDataHash)` — private sub-roots collapsed N->1 into the sibling. */
+      kind: 'public';
+      privateRoots: Uint8Array[];
+    })
+  | (ProofBuilderRequestBase & {
+      /** Plain `V10MerkleTree` over the curated public `_catalog` (no private sibling). */
+      kind: 'catalog';
+    });
 
 export interface ProofBuilder {
   /**

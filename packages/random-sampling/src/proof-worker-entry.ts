@@ -14,21 +14,12 @@ import {
   V10ProofRootMismatchError,
   V10ProofLeafCountMismatchError,
   V10ProofChunkOutOfRangeError,
-  type V10MerkleCommitment,
 } from '@origintrail-official/dkg-core';
+import type { ProofBuilderRequest } from './proof-builder.js';
 
-interface BuildRequest {
-  /** Monotonic id; echoed in the response so the host can correlate. */
-  taskId: number;
-  /** N-Triple CONTENT bytes transferred as ArrayBuffer-backed Uint8Array[]. */
-  contents: Uint8Array[];
-  /** Private sub-roots (public path only; collapsed into the committed sibling). */
-  privateRoots: Uint8Array[];
-  chunkId: number;
-  expected: V10MerkleCommitment;
-  /** Tree shape: structured public path vs plain curated `_catalog`. */
-  kind: 'public' | 'catalog';
-}
+// The host posts a ProofBuilderRequest plus a correlation id. Discriminated on
+// `kind`, so `privateRoots` is present iff `kind === 'public'`.
+type BuildRequest = { taskId: number } & ProofBuilderRequest;
 
 interface BuildResponse {
   taskId: number;

@@ -176,11 +176,7 @@ export class WorkerThreadProofBuilder implements ProofBuilder {
       worker.postMessage(
         {
           taskId,
-          contents: req.contents,
-          privateRoots: req.privateRoots,
-          chunkId: req.chunkId,
-          expected: req.expected,
-          kind: req.kind,
+          ...req, // discriminated union — `privateRoots` only on the 'public' variant
         },
         // We don't transfer ArrayBuffers (cheaper structuredClone is
         // fine for v1; transfer adds complexity around lifetime

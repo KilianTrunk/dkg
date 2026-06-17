@@ -38,7 +38,7 @@ import {
   extractCatalogLeavesFromStore,
   CatalogLeavesMissingError,
 } from './catalog-extractor.js';
-import type { ProofBuilder } from './proof-builder.js';
+import type { ProofBuilder, ProofBuilderRequest } from './proof-builder.js';
 import { InProcessProofBuilder } from './proof-builder.js';
 import {
   makeWalEntry,
@@ -442,15 +442,15 @@ export class RandomSamplingProver {
       }),
     );
 
+    const expected = { merkleRoot: expectedRoot, merkleLeafCount: expectedLeafCount };
+    const req: ProofBuilderRequest =
+      proofKind === 'public'
+        ? { kind: 'public', contents, privateRoots, chunkId: Number(chunkId), expected }
+        : { kind: 'catalog', contents, chunkId: Number(chunkId), expected };
+
     let material;
     try {
-      material = await this.builder.build({
-        contents,
-        privateRoots,
-        chunkId: Number(chunkId),
-        expected: { merkleRoot: expectedRoot, merkleLeafCount: expectedLeafCount },
-        kind: proofKind,
-      });
+      material = await this.builder.build(req);
     } catch (err) {
       const reason = mapBuilderError(err);
       if (reason) {

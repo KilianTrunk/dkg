@@ -570,6 +570,17 @@ export interface DkgConfig {
   /** HTTP rate limiting settings. */
   rateLimit?: { requestsPerMinute?: number; exempt?: string[] };
   /**
+   * Max concurrent in-flight HTTP requests before the daemon sheds load with
+   * 503 (admission control, IP-agnostic). `<= 0` disables. Overridden by the
+   * `DKG_MAX_INFLIGHT` env var. Defaults to 64.
+   */
+  maxInFlightRequests?: number;
+  /**
+   * Max simultaneous TCP connections the HTTP server will accept. Overridden by
+   * the `DKG_MAX_CONNECTIONS` env var. Defaults to 256.
+   */
+  maxConnections?: number;
+  /**
    * V10 Random Sampling prover (core-only). When the node is `core`
    * AND has an on-chain identity, the agent automatically schedules
    * `RandomSamplingProver.tick()` on `tickIntervalMs`. Edge nodes

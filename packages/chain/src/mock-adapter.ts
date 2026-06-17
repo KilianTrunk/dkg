@@ -87,12 +87,12 @@ export class MockChainAdapter implements ChainAdapter {
     /** Token amount paid for the KC lifetime. Used to model per-epoch CG value. */
     tokenAmount: bigint;
     /**
-     * OT-RFC-38 LU-11 / OT-RFC-39 — ciphertext-chunks commitment for
-     * curated KCs. `bytes32(0)` + 0 when omitted (default for legacy
-     * and public-CG entries; matches Solidity default-zero mapping).
+     * OT-RFC-49 — curated `_catalog` commitment (REPLACED the ciphertext-chunks
+     * pair). `bytes32(0)` + 0 when omitted (default for legacy and public-CG
+     * entries; matches the Solidity default-zero mapping).
      */
-    ciphertextChunksRoot: Uint8Array;
-    ciphertextChunkCount: number;
+    catalogRoot: Uint8Array;
+    catalogLeafCount: number;
   }>();
   private contextGraphRegistry = new Map<string, Record<string, string>>();
   private events: ChainEvent[] = [];
@@ -388,8 +388,8 @@ export class MockChainAdapter implements ChainAdapter {
       startEpoch: this.rsEpoch,
       endEpoch: this.rsEpoch + 1n,
       tokenAmount: 0n,
-      ciphertextChunksRoot: new Uint8Array(32),
-      ciphertextChunkCount: 0,
+      catalogRoot: new Uint8Array(32),
+      catalogLeafCount: 0,
     });
 
     this.pushEvent('KCCreated', {
@@ -463,8 +463,15 @@ export class MockChainAdapter implements ChainAdapter {
     return this.txResult(true);
   }
 
-  async listContextGraphsFromChain(): Promise<import('./chain-adapter.js').ContextGraphOnChain[]> {
+  async listContextGraphsFromChain(
+    _fromBlock?: number,
+    _options?: import('./chain-adapter.js').ContextGraphChainScanOptions,
+  ): Promise<import('./chain-adapter.js').ContextGraphOnChain[]> {
     return [];
+  }
+
+  async hasContextGraphRegistryScanWatermark(): Promise<boolean> {
+    return false;
   }
 
   // --- V10 Publishing Conviction NFT (DKGPublishingConvictionNFT) ---
@@ -535,7 +542,9 @@ export class MockChainAdapter implements ChainAdapter {
     }
   }
 
-  async createPublishingConvictionAccount(committedTRAC: bigint): Promise<{ accountId: bigint } & TxResult> {
+  // `primaryNode` (RFC-51) is accepted for interface parity but not modeled:
+  // the mock tracks account budget only, not per-node publishing allocation.
+  async createPublishingConvictionAccount(committedTRAC: bigint, _primaryNode: bigint = 0n): Promise<{ accountId: bigint } & TxResult> {
     this.requireValidConvictionAmount(committedTRAC);
     const accountId = this.nextConvictionAccountId++;
     this.convictionAccounts.set(accountId, {
@@ -653,6 +662,27 @@ export class MockChainAdapter implements ChainAdapter {
 
   async getConvictionAccountLockDurationEpochs(accountId: bigint): Promise<number> {
     return this.convictionAccounts.get(accountId)?.lockDurationEpochs ?? 0;
+  }
+
+  /**
+   * Mock parity for the publisher SDK's fundability gate. Mirrors
+   * `PublishingConviction.coverPublishingCost`: discount the base cost by the
+   * account's tier (with the 1-wei post-discount floor), then compare against
+   * the per-epoch base allowance (`committedTRAC / lockDurationEpochs`,
+   * integer-divided so a few-wei squat floors to 0) plus the top-up buffer.
+   * The mock doesn't track per-window publish spend, so this is the account's
+   * nominal current capacity — enough to tell a genuinely-funding account
+   * from a squatted/underfunded one for THIS publish's cost.
+   */
+  async convictionAccountCanCover(accountId: bigint, baseCost: bigint): Promise<boolean> {
+    if (baseCost <= 0n) return true;
+    const acct = this.convictionAccounts.get(accountId);
+    if (!acct || acct.lockDurationEpochs <= 0) return false;
+    const BPS_DENOMINATOR = 10_000n;
+    let discountedCost = (baseCost * (BPS_DENOMINATOR - BigInt(acct.discountBps))) / BPS_DENOMINATOR;
+    if (discountedCost === 0n && baseCost > 0n) discountedCost = 1n;
+    const baseEpochAllowance = acct.committedTRAC / BigInt(acct.lockDurationEpochs);
+    return baseEpochAllowance + acct.topUpBuffer >= discountedCost;
   }
 
   /**
@@ -1252,10 +1282,10 @@ export class MockChainAdapter implements ChainAdapter {
       startEpoch: this.rsEpoch,
       endEpoch: this.rsEpoch + BigInt(params.epochs),
       tokenAmount: params.tokenAmount,
-      ciphertextChunksRoot: params.ciphertextChunksRoot && params.ciphertextChunksRoot.length === 32
-        ? params.ciphertextChunksRoot
+      catalogRoot: params.catalogRoot && params.catalogRoot.length === 32
+        ? params.catalogRoot
         : new Uint8Array(32),
-      ciphertextChunkCount: params.ciphertextChunkCount ?? 0,
+      catalogLeafCount: params.catalogLeafCount ?? 0,
     });
     this.rsKCs.set(kaId, {
       merkleRootHex: toHex(params.merkleRoot),
@@ -1466,8 +1496,8 @@ export class MockChainAdapter implements ChainAdapter {
       startEpoch: input.startEpoch ?? this.rsEpoch,
       endEpoch: input.endEpoch ?? ((input.startEpoch ?? this.rsEpoch) + 1n),
       tokenAmount: input.tokenAmount ?? 1n,
-      ciphertextChunksRoot: new Uint8Array(32),
-      ciphertextChunkCount: 0,
+      catalogRoot: new Uint8Array(32),
+      catalogLeafCount: 0,
     });
   }
 
@@ -1551,6 +1581,12 @@ export class MockChainAdapter implements ChainAdapter {
     }
     const chunkId = chunkIds[0];
 
+    // OT-RFC-49 — pin (isCurated, challengeLeafCount, challengeRoot) on the
+    // challenge, mirroring the contract's `_generateChallenge` snapshot. The
+    // mock's RS bridge is the public flat-KC path (curated catalog-path tests
+    // set their own pinned root via `__registerKC`-style setup), so default
+    // isCurated=false and pin the public merkle (root, leafCount).
+    const challengeCollection = this.collections.get(kaId);
     const challenge: NodeChallenge = {
       knowledgeAssetId: kaId,
       chunkId,
@@ -1559,6 +1595,9 @@ export class MockChainAdapter implements ChainAdapter {
       activeProofPeriodStartBlock: this.rsPeriodCursor,
       proofingPeriodDurationInBlocks: MockChainAdapter.RS_MOCK_PERIOD_DURATION_IN_BLOCKS,
       solved: false,
+      isCurated: false,
+      challengeLeafCount: BigInt(challengeCollection?.merkleLeafCount ?? chunkIds.length),
+      challengeRoot: fromHex(kcEntry.merkleRootHex),
     };
     this.rsChallenges.set(identityId, challenge);
 
@@ -1667,16 +1706,16 @@ export class MockChainAdapter implements ChainAdapter {
     return entry.merkleLeafCount;
   }
 
-  async getLatestCiphertextChunksRoot(kaId: bigint): Promise<Uint8Array> {
+  async getCatalogRoot(kaId: bigint): Promise<Uint8Array> {
     const entry = this.collections.get(kaId);
     if (!entry) throw new Error(`Mock: unknown kaId ${kaId}`);
-    return entry.ciphertextChunksRoot;
+    return entry.catalogRoot;
   }
 
-  async getCiphertextChunkCount(kaId: bigint): Promise<number> {
+  async getCatalogLeafCount(kaId: bigint): Promise<number> {
     const entry = this.collections.get(kaId);
     if (!entry) throw new Error(`Mock: unknown kaId ${kaId}`);
-    return entry.ciphertextChunkCount;
+    return entry.catalogLeafCount;
   }
 
   async getLatestMerkleRootPublisher(kaId: bigint): Promise<string> {

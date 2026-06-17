@@ -21,7 +21,7 @@ contract ParametersStorage is INamed, IVersioned, HubDependent {
     // protocol treasury fee (`protocolTreasuryFee`, `protocolTreasury`,
     // `MAX_PROTOCOL_TREASURY_FEE`) skimmed from the staker-bound TRAC on
     // every paid publish / update / lifetime-extension.
-    string private constant _VERSION = "10.0.2";
+    string private constant _VERSION = "10.0.3";
 
     uint96 public minimumStake;
     uint96 public maximumStake;

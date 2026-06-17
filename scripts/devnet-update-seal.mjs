@@ -38,16 +38,14 @@ const {
   partitionCatalogQuads,
   contextGraphDataUri,
 } = req('@origintrail-official/dkg-core');
-// OT-RFC-49 WS-D — the curated public `_catalog` floor builder. Not on the
-// agent package's public surface, so deep-import the compiled module. A curated
-// UPDATE re-injects this deterministic floor into the payload BEFORE the
-// on-chain merkle is computed (mirrors dkg-agent-publish.ts update()'s
-// isCuratedUpdate branch), and the producer hard-checks
-// precomputedUpdateAttestation.expectedNewMerkleRoot against the floor-injected
-// recompute — so a curated update seal MUST commit to the SAME injection.
-const { buildPublicProjection } = req(
-  path.join(REPO_ROOT, 'packages/agent/dist/context-graph-public-projection.js'),
-);
+// OT-RFC-49 WS-D — the curated public `_catalog` floor builder, imported from
+// the agent package's public surface. A curated UPDATE re-injects this
+// deterministic floor into the payload BEFORE the on-chain merkle is computed
+// (mirrors dkg-agent-publish.ts update()'s isCuratedUpdate branch), and the
+// producer hard-checks precomputedUpdateAttestation.expectedNewMerkleRoot
+// against the floor-injected recompute — so a curated update seal MUST commit
+// to the SAME injection.
+const { buildPublicProjection } = req('@origintrail-official/dkg-agent');
 
 function out(o) {
   process.stdout.write(JSON.stringify(o, (_k, v) => (typeof v === 'bigint' ? v.toString() : v)) + '\n');

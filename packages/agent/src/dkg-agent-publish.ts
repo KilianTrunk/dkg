@@ -96,6 +96,7 @@ import {
   SUBSCRIPTION_SOURCES,
   pickNetworkTunables,
   sharedMemoryReadBothFilter,
+  partitionCatalogQuads,
 } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad, type LargeLiteralStorageConfig } from '@origintrail-official/dkg-storage';
 import { EVMChainAdapter, NoChainAdapter, enrichEvmError, buildKnowledgeAssetUal, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
@@ -1424,9 +1425,78 @@ export class PublishMethods extends DKGAgentBase {
     // could not be resolved (the provider re-resolves the digest cgId from
     // the adapter regardless, so the digest TARGET stays chain-truth).
     const v10UpdateACKProvider = this.createV10UpdateACKProvider(updateOnChainId ?? contextGraphId);
+
+    // OT-RFC-49 / WS-D — curated-UPDATE discrimination + floor re-projection.
+    // A1: resolve the single-blob curated AEAD hook the SAME way the publish
+    // path does (dkg-agent-publish.ts:1257 _resolveEncryptInlinePayload). The
+    // resolver returns a function for a curated CG (accessPolicy=curated) and
+    // `undefined` for a public CG, so the function's truthiness IS the curated
+    // gate — exactly what the producer keys `useEncryptedInlineUpdate` off of.
+    // No separate accessPolicy read is needed. The 4th arg mirrors publish: the
+    // target on-chain cgId so the AEAD key derives from the canonical id
+    // consumers verify against.
+    const updateEncryptInlinePayload = await this._resolveEncryptInlinePayload(
+      contextGraphId,
+      undefined,
+      undefined,
+      updateOnChainId ?? undefined,
+    );
+    const isCuratedUpdate = typeof updateEncryptInlinePayload === 'function';
+
+    // ALSO resolve the chunked SWM emitter — the MEMBER-DISTRIBUTION path. A
+    // curated update must actively fan the updated private payload out to CG
+    // members (OT-RFC-49: cores hold zero ciphertext, members hold it), exactly
+    // as curated publish does — otherwise members silently fall behind a
+    // committed update. The producer prefers this side-effecting chunked emitter
+    // over the pure single-blob hook. Like publish, it THROWS for a curated CG
+    // with no workspace-gossip signer (cores reject unsigned chunked envelopes):
+    // fail-closed — you cannot update a curated CG you cannot distribute to
+    // members. Public CGs → `undefined` (no-op), unchanged.
+    const updateEncryptInlineChunked = isCuratedUpdate
+      ? await this._resolveEncryptInlineChunked(
+          contextGraphId,
+          undefined,
+          undefined,
+          updateOnChainId ?? undefined,
+        )
+      : undefined;
+
+    // A2: USER DECISION (a) — deterministic floor RE-PROJECTION (not read-and-
+    // merge). For a curated update, the public `_catalog` floor MUST be in the
+    // quads handed to the publisher so `partitionCatalogQuads` can lift it back
+    // out, commit a non-zero `newCatalogRoot`, and satisfy the on-chain
+    // `CuratedCGRequiresCatalogCommitment` gate — even for a metadata-only
+    // update (Open Decision #2: every curated update re-commits the floor).
+    // The update analogue of `_ensureCuratedCatalogInSwm` (3606): build the
+    // floor via the SAME `buildPublicProjection({ ual: cgDid, accessPolicy:
+    // 'private' })` so the committed catalog is byte-identical across publish
+    // and update. STRIP-THEN-APPEND: drop any catalog quads the caller's
+    // payload already carries (the from-SWM `publishFromFinalizedAssertion`
+    // path at 3213 can re-load a previously-injected floor) so the floor is
+    // never duplicated, then append exactly the fresh projection. The graph
+    // is cosmetic — `partitionCatalogQuads` matches on subject (the CG DID)
+    // and the catalog root excludes the graph term — so we stamp the canonical
+    // CG-DID data graph for clarity. Public updates skip this block entirely (no
+    // floor, no hook) and are unchanged on a HEALTHY chain. NB: update() now
+    // resolves the access policy unconditionally (~:1442), exactly as the publish
+    // path always has — so under a DEGRADED / stale policy probe a public update
+    // fails closed (throws) consistently with publish, where the OLD update path
+    // would have proceeded. Fail-closed, never a leak; see PR #1208 notes.
+    let updateQuads = quads;
+    if (isCuratedUpdate) {
+      const cgDid = contextGraphDataUri(contextGraphId);
+      const { otherQuads: nonCatalogQuads } = partitionCatalogQuads(quads, cgDid);
+      const catalogFloor = buildPublicProjection({
+        ual: cgDid,
+        accessPolicy: 'private',
+        graph: cgDid,
+      });
+      updateQuads = [...nonCatalogQuads, ...catalogFloor];
+    }
+
     const result = await this.publisher.update(kaId, {
       contextGraphId,
-      quads,
+      quads: updateQuads,
       privateQuads,
       publisherPeerId: this.node.peerId.toString(),
       publishContextGraphId: updateOnChainId ?? undefined,
@@ -1434,6 +1504,13 @@ export class PublishMethods extends DKGAgentBase {
       onPhase,
       precomputedUpdateAttestation: opts?.precomputedUpdateAttestation,
       v10UpdateACKProvider,
+      // Curated → wire the single-blob AEAD hook so the producer's
+      // `useEncryptedInlineUpdate` gate fires (catalog commit). Public →
+      // `undefined` (no catalog); unchanged on a healthy chain.
+      encryptInlinePayload: updateEncryptInlinePayload,
+      // Curated → the chunked emitter the producer prefers to fan the updated
+      // private payload out to CG members (member distribution). Public → undefined.
+      encryptInlineChunked: updateEncryptInlineChunked,
     });
     this.log.info(ctx, `Update complete — status=${result.status}`);
 

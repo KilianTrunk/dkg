@@ -18,6 +18,7 @@ export {
   computeTripleHashV10,
   computePublicRootV10,
   computePrivateRootV10,
+  computeStructuredKCRootV10,
   computeFlatKCRootV10,
   computeFlatKCMerkleLeafCountV10,
   computeKARootV10,

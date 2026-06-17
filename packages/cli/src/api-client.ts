@@ -879,6 +879,9 @@ export class ApiClient {
 
   async createPca(request: {
     tokens: string;
+    // OT-RFC-51: the node identityId this PCA's committed TRAC funds. Required
+    // — a PCA created with no node seeds publishing allocation to nobody.
+    primaryNode: string;
   }): Promise<{
     accountId: string;
     txHash: string;

@@ -48,6 +48,11 @@ import {
 const LOCAL = `ka-loc-${Date.now().toString(36)}`;
 // On-chain-registered CG — required for finalize/share/publish preconditions.
 const REG = `ka-reg-${Date.now().toString(36)}`;
+// On-chain-registered PUBLIC CG — for preconditions that only hold on the public
+// path. Post OT-RFC-49 a CURATED CG can publish catalog-only (the catalog IS the
+// commitment), so "nothing shared" is no longer a precondition there; the public
+// "No quads in shared memory" precondition still holds and is checked via this CG.
+const PUBREG = `ka-pubreg-${Date.now().toString(36)}`;
 
 let daemon: LiveDaemon;
 let ownerAddress = '';
@@ -71,6 +76,10 @@ describe('/api/knowledge-assets routes (real daemon, real chain)', () => {
     expect(reg.status, `reg CG create: ${JSON.stringify(reg.body)}`).toBeLessThan(300);
     const onchain = await postJson(daemon, '/api/context-graph/register', { id: REG, accessPolicy: 1 });
     expect(onchain.status, `on-chain register: ${JSON.stringify(onchain.body)}`).toBe(200);
+    const pubCreate = await postJson(daemon, '/api/context-graph/create', { id: PUBREG, name: 'PubReg', accessPolicy: 0 });
+    expect(pubCreate.status, `pub CG create: ${JSON.stringify(pubCreate.body)}`).toBeLessThan(300);
+    const pubReg = await postJson(daemon, '/api/context-graph/register', { id: PUBREG, accessPolicy: 0 });
+    expect(pubReg.status, `pub on-chain register: ${JSON.stringify(pubReg.body)}`).toBe(200);
 
     // Capture the daemon's REAL custodial owner agent address from a create
     // response's assertionUri (…/_working_memory/<ADDR>/<n>) — used to build
@@ -272,14 +281,18 @@ describe('/api/knowledge-assets routes (real daemon, real chain)', () => {
     });
 
     it('409 VM_PUBLISH_PRECONDITION when finalized but nothing shared into SWM', async () => {
-      await createKa(REG, 'pub-noshare');
+      // PUBLIC CG: post OT-RFC-49 a CURATED CG can publish catalog-only (the
+      // catalog is the on-chain commitment), so "nothing shared" is no longer a
+      // precondition there — it proceeds to ACK. The "No quads in shared memory"
+      // precondition still holds on the public path, which is what this checks.
+      await createKa(PUBREG, 'pub-noshare');
       // A UNIQUE subject so the seal's selection can't cross-match another KA's
       // already-shared entity (real fact: SWM selection is by entity subject
       // within the CG — a reused subject would let publish find someone else's
       // shared quad and proceed to ACK instead of returning the 409).
-      await write(REG, 'pub-noshare', [{ subject: 'ex:noshare-only', predicate: 'ex:p', object: '"x"' }]);
-      await postJson(daemon, '/api/knowledge-assets/pub-noshare/wm/finalize', { contextGraphId: REG });
-      const res = await postJson(daemon, '/api/knowledge-assets/pub-noshare/vm/publish', { contextGraphId: REG });
+      await write(PUBREG, 'pub-noshare', [{ subject: 'ex:noshare-only', predicate: 'ex:p', object: '"x"' }]);
+      await postJson(daemon, '/api/knowledge-assets/pub-noshare/wm/finalize', { contextGraphId: PUBREG });
+      const res = await postJson(daemon, '/api/knowledge-assets/pub-noshare/vm/publish', { contextGraphId: PUBREG });
       expect(res.status).toBe(409);
       expect(res.body.code).toBe('VM_PUBLISH_PRECONDITION');
       expect(String(res.body.error)).toMatch(/shared memory/);

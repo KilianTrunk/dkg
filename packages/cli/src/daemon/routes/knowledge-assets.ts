@@ -132,6 +132,28 @@ function respondAssertionError(res: RequestContext["res"], e: any): void {
     });
     return;
   }
+  // Strict curator-ack gate (OT-RFC-49 curator-leader) on the WM→SWM promote
+  // (swm/share). The curator (authoritative replica) did not confirm, so the
+  // promote was aborted with WM left intact — surface a distinct, actionable
+  // status instead of a 500. The client is TOLD, never silently led to success.
+  if (e?.code === "CURATOR_UNCONFIRMED") {
+    jsonResponse(res, 503, {
+      error: e.message,
+      code: "CURATOR_UNCONFIRMED",
+      curatorDelivery: "unconfirmed",
+      contextGraphId: e.contextGraphId,
+    });
+    return;
+  }
+  if (e?.code === "CURATOR_REJECTED") {
+    jsonResponse(res, 409, {
+      error: e.message,
+      code: "CURATOR_REJECTED",
+      curatorDelivery: "rejected",
+      contextGraphId: e.contextGraphId,
+    });
+    return;
+  }
   const msg = e?.message ?? String(e);
   if (
     e?.name === "ReservedNamespaceError" ||
@@ -981,7 +1003,11 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
 
     // ── SWM verb: share (WM → SWM; OT-RFC-43 §10.6 renames promote → share) ──
     if (layer === "swm" && verb === "share") {
-      const share = await agent.assertion.promote(contextGraphId, name, { entities: parsed.entities, subGraphName });
+      // Per-request opt-in to the strict curator-ack gate (OT-RFC-49). Omitted →
+      // agent config default (`swmAwaitCuratorAck`). The promote aborts with 503
+      // (mapped in respondAssertionError) if the curator doesn't confirm.
+      const awaitCuratorAck = typeof parsed?.awaitCuratorAck === "boolean" ? parsed.awaitCuratorAck : undefined;
+      const share = await agent.assertion.promote(contextGraphId, name, { entities: parsed.entities, subGraphName, awaitCuratorAck });
       if (share.promotedCount !== 0) {
         emitMemoryGraphChanged?.({ contextGraphId, layers: ["wm", "swm"], subGraphName, operation: "assertion_promoted", source: "api", counts: { triples: share.promotedCount } });
         recordActivityAndNotify(ctx, { contextGraphId, kind: "promoted", actorAgentAddress: requestAgentAddress, subGraphName, tripleCount: share.promotedCount });
@@ -1073,7 +1099,11 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         // is safe. Everything else (on-chain reverts, storage, "Invalid"/
         // "Unsafe" publisher text) keeps the generic 500 — the #988 parity
         // contract that publish must NOT down-classify on-chain errors.
-        if (/is not finalized/.test(msg) || /No quads in shared memory/.test(msg)) {
+        // `has no private payload` is the curated-CG analogue of `No quads in
+        // shared memory`: a curated publish with nothing private shared (only
+        // the public catalog entry) — a caller precondition, thrown before any
+        // chain interaction, so 409 is safe + consistent with the public path.
+        if (/is not finalized/.test(msg) || /No quads in shared memory/.test(msg) || /has no private payload/.test(msg)) {
           return jsonResponse(res, 409, { code: "VM_PUBLISH_PRECONDITION", error: msg });
         }
         return jsonResponse(res, 500, { error: msg });

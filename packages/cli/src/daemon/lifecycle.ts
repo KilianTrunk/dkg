@@ -1240,6 +1240,12 @@ export async function runDaemonInner(
     agentProfileHeartbeatMs: config.network?.agentProfileHeartbeatMs,
     syncContextGraphs: syncContextGraphs,
     maxRehydratedContextGraphSubscriptions: config.maxRehydratedContextGraphSubscriptions,
+    // OT-RFC-38 LU-6 / OT-RFC-49 WS-A — plumb the host-mode block (eviction
+    // tiers, discovery rate limits, and the `stripCiphertext` private-ciphertext
+    // strip kill-switch) from config.json. Without this forward the whole
+    // `swmHostMode` config is inert and only in-agent defaults apply, so an
+    // operator could not toggle the strip via config (the rung-1 inert-flag bug).
+    swmHostMode: config.swmHostMode,
     storeConfig: runtimeStore ? {
       backend: runtimeStore.backend,
       options: runtimeStore.options,
@@ -1248,6 +1254,7 @@ export async function runDaemonInner(
     largeLiteralStorage: runtimeLargeLiteralStorage,
     sharedMemoryPublicSnapshotStorage: runtimeSnapshotStorage,
     syncSharedMemoryOnConnect: config.syncSharedMemoryOnConnect,
+    swmAwaitCuratorAck: config.swmAwaitCuratorAck,
     syncAgentsMeta: role === 'core' ? true : config.syncAgentsMeta,
     queryAccess: config.queryAccess,
     chainAdapter: mockChainAdapter,

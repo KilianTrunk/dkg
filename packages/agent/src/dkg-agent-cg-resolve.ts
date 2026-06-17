@@ -19,7 +19,7 @@ import {
   contextGraphDataGraphUri, contextGraphMetaGraphUri, contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
   contextGraphSharedMemoryUri,
   contextGraphVerifiableMemoryUri, contextGraphVerifiableMemoryMetaUri,
-  contextGraphDataUri, contextGraphMetaUri, assertionLifecycleUri, contextGraphAssertionUri,
+  contextGraphDataUri, contextGraphMetaUri, assertionLifecycleUri, contextGraphAssertionUri, contextGraphCatalogUri,
   deriveCuratorDidFromCgId,
   MemoryLayer,
   computeACKDigest,
@@ -770,6 +770,13 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
         syncSessionId: typeof parsed.syncSessionId === 'string' ? parsed.syncSessionId : undefined,
         // Phase C: unsigned delta hint. Validated/normalised in the responder.
         sinceBatchId: typeof parsed.sinceBatchId === 'string' ? parsed.sinceBatchId : undefined,
+        // R9 (SECURITY): the unsigned member-recovery marker. This is a STRICT
+        // FIELD ALLOWLIST — anything not copied here is dropped. If `recovery`
+        // were omitted, the responder would never see it, silently fall through
+        // to the fail-open participant/peer path, and the members-only gate
+        // would be dead code. Coerce to a real boolean so a truthy non-bool
+        // can't smuggle through.
+        recovery: parsed.recovery === true ? true : undefined,
       };
     }
 
@@ -889,6 +896,7 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
     snapshotRef?: string,
     sinceBatchId?: string,
     syncSessionId?: string,
+    recovery?: boolean,
   ): Promise<Uint8Array> {
     const isPrivate = await this.isPrivateContextGraph(contextGraphId);
 
@@ -897,7 +905,11 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
     // authenticated request so the remote peer can verify our identity
     // against its allowlist.
     const hasLocalData = this.subscribedContextGraphs.get(contextGraphId)?.synced === true;
-    const needsAuth = isPrivate || !hasLocalData;
+    // the catalog facet is public and served without the
+    // allowlist gate, so an outsider (no CG identity) requests it unauthenticated.
+    // R9: recovery serves plaintext member-to-member and is gated by the strict
+    // members-only authorizer — it MUST be an authenticated (signed) envelope.
+    const needsAuth = recovery || (phase !== 'catalog' && (isPrivate || !hasLocalData));
     const claimedAgentAddress = await this.findLocalAgentForContextGraph(contextGraphId);
     const claimedAgent = claimedAgentAddress ? this.localAgents.get(claimedAgentAddress) : undefined;
     return buildSyncRequestEnvelope({
@@ -916,12 +928,64 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
       sinceBatchId: phase === 'data' && !includeSharedMemory ? sinceBatchId : undefined,
       syncSessionId: phase === 'snapshot' ? undefined : syncSessionId,
       needsAuth,
+      // R9: forces the EDGE (member-agent-key) signing path so the responder
+      // recovers the member agent address and matches it against the gate.
+      recovery,
       computeSyncDigest: this.computeSyncDigest.bind(this),
       getIdentityId: () => this.chain.getIdentityId(),
       signMessage: typeof this.chain.signMessage === 'function' ? this.chain.signMessage.bind(this.chain) : undefined,
       claimedAgentAddress: claimedAgentAddress,
       claimedAgentPrivateKey: claimedAgent?.privateKey,
     });
+  }
+
+  /**
+   * fetch a (private) CG's PUBLIC catalog entry from a peer
+   * WITHOUT membership. The responder serves the bounded `_catalog` facet
+   * openly (no allowlist gate); the fetched DCAT dataset record is written to
+   * the local store's `_catalog` graph. Returns the catalog quads received.
+   * The peer serves ONLY `_catalog` — gated content is never returned.
+   */
+  public async fetchPublicCatalog(this: DKGAgent,
+    contextGraphId: string,
+    responderPeerId: string,
+    deadlineMs = 30_000,
+  ): Promise<Quad[]> {
+    const ctx = createOperationContext('sync');
+    const catalogGraph = contextGraphCatalogUri(contextGraphId);
+    const result = await this.fetchSyncPages(
+      ctx, responderPeerId, contextGraphId, false, 'catalog', catalogGraph, Date.now() + deadlineMs,
+    );
+    // SECURITY: this is the UNAUTHENTICATED catalog path — there is no
+    // membership/allowlist gate on what we persist. The generic requester
+    // filter (parseAndFilterNQuads) admits ANY graph under
+    // `did:dkg:context-graph:<cg>/…`, not just `_catalog`, so a malicious
+    // peer could ride the open catalog fetch to inject `_meta`/`_private`/VM
+    // quads into the local store. Re-filter to ONLY the `<cg>/_catalog` graph
+    // before insert and drop everything else.
+    const catalogQuads = result.quads.filter((q) => q.graph === catalogGraph);
+    // Treat partial fetches as NOT done: fetchSyncPages returns
+    // `completed: false` (timed out) with a possibly-truncated page. Inserting
+    // that would corrupt the local `_catalog`, and deleting the checkpoint
+    // would lose the resume cursor. Only persist + delete-checkpoint when the
+    // fetch ran to completion; on partial, keep the checkpoint and persist
+    // nothing.
+    if (result.completed) {
+      // Persist the fetched DCAT dataset record into the local `<cg>/_catalog`
+      // graph and invalidate the meta projection so getCgMeta() /
+      // listContextGraphs() can see the remotely discovered private CG after
+      // this call. The projection read side is disclosure-floor only (rdf:type
+      // / dct:accessRights — CATALOG_META_PREDICATES), so persisting
+      // peer-fetched catalog quads cannot poison the authz-bearing
+      // creator/curator/allowlist fields. Mirrors refreshMetaFromCurator's
+      // persist+invalidate path.
+      if (catalogQuads.length > 0) {
+        await this.store.insert(catalogQuads);
+        this.contextGraphMetaProjection.markDirtyFromQuads(catalogQuads);
+      }
+      this.syncCheckpoints.delete(result.checkpointKey);
+    }
+    return catalogQuads;
   }
 
   computeSyncDigest(this: DKGAgent,
@@ -996,6 +1060,9 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
       getAgentGateAddresses: (contextGraphId, lookupOptions) => this.getContextGraphAgentGateAddresses(contextGraphId, lookupOptions),
       getAllowedDelegateePeers: (contextGraphId, lookupOptions) => this.getContextGraphAllowedDelegateePeers(contextGraphId, lookupOptions),
       getAllowedDelegateeKeys: (contextGraphId, lookupOptions) => this.getContextGraphAllowedDelegateeKeys(contextGraphId, lookupOptions),
+      // R9: FRESH `_meta`-only members-only gate for the recovery branch (no
+      // subscription cache). Consulted only when `request.recovery` is set.
+      getMemberRecoveryGate: (contextGraphId, lookupOptions) => this.getMemberRecoveryGate(contextGraphId, lookupOptions),
       refreshMetaFromCurator: (contextGraphId, lookupOptions) => this.refreshMetaFromCurator(contextGraphId, lookupOptions),
       signal: options.signal,
       logWarn: (ctx, message) => this.log.warn(ctx, message),
@@ -1460,6 +1527,13 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
     contextGraphId: string,
     options: { signal?: AbortSignal } = {},
   ): Promise<string[] | null> {
+    // the participant set is read from the in-memory meta projection
+    // (getCgMeta), NOT a direct store query — the projection is the only place
+    // that applies revokedAgents filtering, so a store-only read (main's A2
+    // form) would silently re-authorize revoked agents. `options.signal` is
+    // accepted for caller parity with the abort-hardened siblings but the
+    // projection read is in-memory and has no I/O to cancel.
+    void options;
     const merged: string[] = [];
     const seen = new Set<string>();
     const add = (value: string | undefined) => {

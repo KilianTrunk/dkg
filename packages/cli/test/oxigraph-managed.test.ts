@@ -36,12 +36,12 @@ describe('planManagedOxigraph', () => {
     const plan = planManagedOxigraph({ store: { backend: MANAGED_OXIGRAPH_BACKEND } }, '/data');
     expect(plan).not.toBeNull();
     expect(plan!.port).toBe(DEFAULT_OXIGRAPH_PORT);
-    expect(plan!.location).toBe('/data/oxigraph-data');
-    expect(plan!.cacheDir).toBe('/data/oxigraph');
+    expect(plan!.location).toBe(join('/data', 'oxigraph-data'));
+    expect(plan!.cacheDir).toBe(join('/data', 'oxigraph'));
     expect(plan!.largeLiteralStorage).toEqual({
       enabled: true,
       thresholdBytes: undefined,
-      directory: '/data/literal-blobs',
+      directory: join('/data', 'literal-blobs'),
     });
     expect(plan!.storeConfigTemplate).toEqual({
       backend: 'sparql-http',
@@ -92,6 +92,19 @@ describe('planManagedOxigraph', () => {
     });
   });
 
+  it('preserves graphSetIndex options through the managed store rewrite plan', () => {
+    const plan = planManagedOxigraph(
+      {
+        store: {
+          backend: MANAGED_OXIGRAPH_BACKEND,
+          graphSetIndex: { enabled: true, revalidateMs: 5_000 },
+        },
+      },
+      '/data',
+    );
+    expect(plan!.storeConfigTemplate.graphSetIndex).toEqual({ enabled: true, revalidateMs: 5_000 });
+  });
+
   it('leaves sharedMemoryPublicSnapshotStorage undefined when disabled/absent', () => {
     expect(
       planManagedOxigraph({ store: { backend: MANAGED_OXIGRAPH_BACKEND } }, '/data')!
@@ -118,7 +131,7 @@ describe('planManagedOxigraph', () => {
     );
     expect(plan!.sharedMemoryPublicSnapshotStorage).toEqual({
       enabled: true,
-      directory: '/data/swm-public-snapshots',
+      directory: join('/data', 'swm-public-snapshots'),
     });
   });
 

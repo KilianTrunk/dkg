@@ -542,7 +542,9 @@ export class MockChainAdapter implements ChainAdapter {
     }
   }
 
-  async createPublishingConvictionAccount(committedTRAC: bigint): Promise<{ accountId: bigint } & TxResult> {
+  // `primaryNode` (RFC-51) is accepted for interface parity but not modeled:
+  // the mock tracks account budget only, not per-node publishing allocation.
+  async createPublishingConvictionAccount(committedTRAC: bigint, _primaryNode: bigint = 0n): Promise<{ accountId: bigint } & TxResult> {
     this.requireValidConvictionAmount(committedTRAC);
     const accountId = this.nextConvictionAccountId++;
     this.convictionAccounts.set(accountId, {

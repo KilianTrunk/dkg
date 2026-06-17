@@ -167,7 +167,10 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
   ): Promise<bigint> => {
     await Token.mint(owner.address, COMMITTED_TRAC);
     await Token.connect(owner).approve(await NFT.getAddress(), COMMITTED_TRAC);
-    await NFT.connect(owner).createAccount(COMMITTED_TRAC);
+    // RFC-51: createAccount(committedTRAC, primaryNode). These lifecycle
+    // assertions don't exercise publishing-allocation seeding, so pass an
+    // inert primaryNode = 0 (no designated node, no allocation seeded).
+    await NFT.connect(owner).createAccount(COMMITTED_TRAC, 0);
     return NFT.totalSupply();
   };
 

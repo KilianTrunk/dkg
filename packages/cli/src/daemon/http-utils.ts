@@ -1336,14 +1336,18 @@ export function applyServerLimits(
 }
 
 /**
- * Paths exempt from concurrency admission control. Two reasons to exempt:
- *  - cheap liveness/health paths that must stay answerable under load
- *    (monitoring, `dkg status`, doctor, MCP setup probes);
- *  - long-lived streaming connections (`/api/events` SSE) that would otherwise
- *    hold an in-flight slot for the connection's entire lifetime, so a few open
- *    dashboard tabs could exhaust the pool and shed all real work.
+ * Cheap GET/HEAD paths exempt from concurrency admission control — liveness /
+ * health / manifest handlers that must stay answerable under load (monitoring,
+ * `dkg status`, doctor, MCP setup probes), plus the long-lived `/api/events`
+ * SSE stream (which must NOT hold an in-flight slot for the connection's whole
+ * lifetime, or a few open dashboard tabs would exhaust the pool).
+ *
+ * NOTE: this is one of several HTTP path-category tables in the daemon (see
+ * `auth.ts` public paths, `isLoopbackRateLimitExemptPath`, and the default
+ * rate-limit exempt list in `lifecycle.ts`). Centralizing them behind one
+ * source of truth is a worthwhile follow-up; kept local here for now.
  */
-const ADMISSION_EXEMPT_PATHS: ReadonlySet<string> = new Set([
+const ADMISSION_EXEMPT_GET_PATHS: ReadonlySet<string> = new Set([
   '/api/status',
   '/api/chain/rpc-health',
   '/api/events',
@@ -1352,14 +1356,31 @@ const ADMISSION_EXEMPT_PATHS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Apply concurrency admission control to one request. CORS preflight (OPTIONS)
- * and a small set of cheap health/liveness paths are exempt so monitoring,
- * `dkg status`, doctor, and MCP setup probes keep working even when the daemon
- * is shedding load. On rejection it writes a `503` + `Retry-After` (with CORS
- * headers so browsers surface it). Returns whether the request is admitted plus
- * a `release` disposer the caller MUST call exactly once in a `finally` — it is
- * idempotent and a no-op for exempt or rejected requests, so a slot is only ever
- * released by its own owner.
+ * Whether a request bypasses admission control. METHOD-AWARE on purpose: only
+ * `OPTIONS` (CORS preflight, any path) and safe `GET`/`HEAD` reads of the cheap
+ * liveness/doc/SSE paths bypass. A `POST`/`PUT`/etc. to those same paths is NOT
+ * exempt — it falls through to the router/route-plugins and so must still take
+ * a slot, otherwise a buggy/authenticated local client could run real work
+ * outside the cap via e.g. `POST /api/status`.
+ */
+export function isAdmissionExempt(method: string | undefined, pathname: string): boolean {
+  if (method === 'OPTIONS') return true;
+  if ((method === 'GET' || method === 'HEAD') && ADMISSION_EXEMPT_GET_PATHS.has(pathname)) return true;
+  return false;
+}
+
+/**
+ * Apply concurrency admission control to one request. Exempt requests (see
+ * {@link isAdmissionExempt}) always pass and take no slot. Otherwise a slot is
+ * reserved; on capacity it writes `503` + `Retry-After` (with CORS headers so
+ * browsers surface it) and returns `{ admitted: false }`.
+ *
+ * Ownership model: the slot is released automatically when the RESPONSE
+ * completes (`res` `close`), NOT when the request handler returns — route
+ * plugins and SSE can return with the response still streaming, and releasing
+ * on handler return would free the slot mid-stream and let that work run
+ * outside the cap. The release is registered here so callers cannot get it
+ * wrong; they only need to honor `admitted`.
  */
 export function admitRequest(
   limiter: InFlightLimiter,
@@ -1367,10 +1388,9 @@ export function admitRequest(
   pathname: string,
   res: ServerResponse,
   corsOrigin: string | null,
-): { admitted: boolean; release: () => void } {
-  const noop = () => {};
-  if (method === 'OPTIONS' || ADMISSION_EXEMPT_PATHS.has(pathname)) {
-    return { admitted: true, release: noop };
+): { admitted: boolean } {
+  if (isAdmissionExempt(method, pathname)) {
+    return { admitted: true };
   }
   if (!limiter.tryAcquire()) {
     res.writeHead(503, {
@@ -1379,17 +1399,16 @@ export function admitRequest(
       ...corsHeaders(corsOrigin),
     });
     res.end(JSON.stringify({ error: 'Server busy, retry shortly' }));
-    return { admitted: false, release: noop };
+    return { admitted: false };
   }
+  // Release exactly once, when the response completes (finish or abort).
   let released = false;
-  return {
-    admitted: true,
-    release: () => {
-      if (released) return;
-      released = true;
-      limiter.release();
-    },
-  };
+  res.once('close', () => {
+    if (released) return;
+    released = true;
+    limiter.release();
+  });
+  return { admitted: true };
 }
 
 export function isLoopbackClientIp(ip: string): boolean {

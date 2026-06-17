@@ -2,8 +2,19 @@ import { describe, expect, it } from 'vitest';
 import type { ServerResponse } from 'node:http';
 import { InFlightLimiter, admitRequest, resolveIntSetting, applyServerLimits } from '../src/daemon/http-utils.js';
 
-/** Minimal ServerResponse stand-in capturing writeHead/end for assertions. */
-function mockRes() {
+/**
+ * Minimal ServerResponse stand-in capturing writeHead/end and supporting the
+ * single `once('close', ...)` listener admitRequest registers for slot release.
+ * `emitClose()` simulates the response completing.
+ */
+type MockRes = ServerResponse & {
+  statusCode: number;
+  headers: Record<string, string>;
+  body: string;
+  emitClose(): void;
+};
+function mockRes(): MockRes {
+  let closeCb: (() => void) | undefined;
   const r = {
     statusCode: 0,
     headers: {} as Record<string, string>,
@@ -17,8 +28,15 @@ function mockRes() {
       if (chunk) r.body += chunk;
       return r;
     },
+    once(event: string, cb: () => void) {
+      if (event === 'close') closeCb = cb;
+      return r;
+    },
+    emitClose() {
+      closeCb?.();
+    },
   };
-  return r as unknown as ServerResponse & { statusCode: number; headers: Record<string, string>; body: string };
+  return r as unknown as MockRes;
 }
 
 describe('InFlightLimiter — concurrency admission control', () => {
@@ -115,47 +133,49 @@ describe('applyServerLimits — socket-level controls applied to the server', ()
   });
 });
 
-describe('admitRequest — wiring (503/Retry-After/CORS/exempt/release)', () => {
-  it('admits, consumes a slot, and the disposer frees exactly that slot (idempotent)', () => {
+describe('admitRequest — wiring (503/Retry-After/CORS/exempt) + release on response close', () => {
+  it('admits, consumes a slot, and releases it exactly once when the response closes', () => {
     const limiter = new InFlightLimiter(1);
-    const g1 = admitRequest(limiter, 'GET', '/api/context-graphs', mockRes(), null);
-    expect(g1.admitted).toBe(true);
+    const res = mockRes();
+    const gate = admitRequest(limiter, 'POST', '/api/query', res, null);
+    expect(gate.admitted).toBe(true);
     expect(limiter.inFlight).toBe(1);
-    g1.release();
+    res.emitClose(); // response completes → slot released
     expect(limiter.inFlight).toBe(0);
-    g1.release(); // idempotent — does not double-free
+    res.emitClose(); // idempotent — does not double-free
     expect(limiter.inFlight).toBe(0);
   });
 
   it('sheds an over-capacity request with 503 + Retry-After and preserves CORS', () => {
     const limiter = new InFlightLimiter(1);
-    const g1 = admitRequest(limiter, 'GET', '/api/context-graphs', mockRes(), null);
-    expect(g1.admitted).toBe(true);
+    const held = mockRes();
+    expect(admitRequest(limiter, 'POST', '/api/query', held, null).admitted).toBe(true);
 
     const res = mockRes();
-    const g2 = admitRequest(limiter, 'GET', '/api/context-graphs', res, 'https://app.example');
+    const g2 = admitRequest(limiter, 'POST', '/api/query', res, 'https://app.example');
     expect(g2.admitted).toBe(false);
     expect(res.statusCode).toBe(503);
     expect(res.headers['Retry-After']).toBe('1');
     expect(res.headers['Access-Control-Allow-Origin']).toBe('https://app.example');
     expect(res.body).toContain('busy');
 
-    // A rejected request's disposer must not touch the slot held by g1.
-    g2.release();
+    // The rejected request took no slot and registered no close listener, so
+    // closing its (already-sent) response must not touch the held slot.
+    res.emitClose();
     expect(limiter.inFlight).toBe(1);
 
-    g1.release();
-    const g3 = admitRequest(limiter, 'GET', '/api/context-graphs', mockRes(), null);
-    expect(g3.admitted).toBe(true); // recovered
+    held.emitClose(); // held response completes → slot freed
+    expect(admitRequest(limiter, 'POST', '/api/query', mockRes(), null).admitted).toBe(true); // recovered
   });
 
-  it('exempts OPTIONS, cheap health paths, and the long-lived SSE stream even at capacity', () => {
+  it('exempts OPTIONS (any path) and GET/HEAD liveness/doc/SSE paths even at capacity', () => {
     const limiter = new InFlightLimiter(1);
     expect(limiter.tryAcquire()).toBe(true); // saturate
 
     for (const [method, path] of [
-      ['OPTIONS', '/api/context-graphs'],
+      ['OPTIONS', '/api/query'], // preflight, any path
       ['GET', '/api/status'],
+      ['HEAD', '/api/status'],
       ['GET', '/api/chain/rpc-health'],
       ['GET', '/api/events'], // SSE — must not hold a slot for the connection lifetime
       ['GET', '/.well-known/skill.md'],
@@ -165,9 +185,24 @@ describe('admitRequest — wiring (503/Retry-After/CORS/exempt/release)', () => 
       const gate = admitRequest(limiter, method, path, res, null);
       expect(gate.admitted).toBe(true); // never shed
       expect(res.statusCode).toBe(0); // nothing written
-      gate.release(); // no-op for exempt requests
     }
     expect(limiter.inFlight).toBe(1); // untouched by exempt traffic
     expect(limiter.rejectedTotal).toBe(0); // exempt traffic is never counted as shed
+  });
+
+  it('is method-aware: a non-GET/HEAD to an exempt path is NOT exempt (would run work outside the cap)', () => {
+    const limiter = new InFlightLimiter(1);
+    const held = mockRes();
+    expect(admitRequest(limiter, 'GET', '/api/status', held, null).admitted).toBe(true); // exempt → no slot
+    expect(limiter.inFlight).toBe(0); // GET /api/status took no slot
+
+    // POST to the same liveness path is subject to the cap. With the slot free
+    // it's admitted (and takes a slot); once saturated it is shed.
+    const post1 = mockRes();
+    expect(admitRequest(limiter, 'POST', '/api/status', post1, null).admitted).toBe(true);
+    expect(limiter.inFlight).toBe(1);
+    const post2 = mockRes();
+    expect(admitRequest(limiter, 'POST', '/api/status', post2, null).admitted).toBe(false);
+    expect(post2.statusCode).toBe(503);
   });
 });

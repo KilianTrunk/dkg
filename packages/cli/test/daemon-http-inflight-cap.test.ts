@@ -10,6 +10,14 @@ import { startLiveDaemon, stopLiveDaemon, authHeaders, type LiveDaemon } from '.
  * This is the end-to-end counterpart to the unit tests in
  * http-admission-control.test.ts: it would fail if the limiter were never wired
  * into createServer, wired after an early return, or never released.
+ *
+ * Saturation is created with a 50-request burst against cap=1 rather than a
+ * single held-open request. That is statistically deterministic — 50 concurrent
+ * requests cannot all serialize through one slot without overlap — and avoids a
+ * brittle blocking fixture (the daemon admits before the route reads the body,
+ * so an unfinished-body "hold" does not reliably pin the slot). The precise
+ * one-in/one-shed/release semantics are covered deterministically by the unit
+ * tests; here we prove the wiring end-to-end.
  */
 describe('daemon admission control (real node, maxInFlightRequests=1)', () => {
   let daemon: LiveDaemon | undefined;

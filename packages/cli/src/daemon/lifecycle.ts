@@ -2732,13 +2732,8 @@ export async function runDaemonInner(
         }
         return;
       }
-      // Release the slot when the RESPONSE actually completes, not when this
-      // handler returns. Route plugins (and SSE) can send headers and return
-      // with the response still open while they keep streaming; releasing on
-      // handler return would free the slot mid-stream and let streaming work
-      // run outside the cap. `close` fires once per response (on finish or
-      // abort), so the slot is held for the response's true lifetime.
-      res.once('close', gate.release);
+      // (admitRequest registers slot release on the response's `close` event —
+      // covers streaming/plugin responses; nothing to release here.)
 
       // CORS preflight
       if (req.method === "OPTIONS") {

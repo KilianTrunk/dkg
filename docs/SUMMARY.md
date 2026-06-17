@@ -65,7 +65,7 @@
 
 * [Networks & RPCs](general/networks.md)
 * [Contract addresses](general/contract-addresses.md)
-* [NeuroWeb & bridging TRAC](general/neuroweb.md)
+* [Bridging TRAC](general/bridging-trac.md)
 * [Whitepaper & RFCs](general/whitepaper-and-rfcs.md)
 * [Random Sampling](general/random-sampling.md)
 * [General Bug Bounty](general/general-bug-bounty.md)

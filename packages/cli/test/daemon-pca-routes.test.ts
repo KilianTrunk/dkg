@@ -79,6 +79,35 @@ describe('daemon /api/pca V10 caller contract', () => {
     expect(called).toBe(false);
   });
 
+  it('POST /api/pca with a numeric primaryNode beyond JSON safe-integer → 400, facade not called', async () => {
+    // A uint72 id can exceed 2^53-1; as a JSON *number* it is already rounded by
+    // JSON.parse, so it must be rejected (caller should pass it as a string).
+    let called = false;
+    const agent = { createPublishingConvictionAccount: async () => { called = true; return { accountId: 9n, hash: '0x', blockNumber: 1, success: true }; } };
+    // 2**53 is the first non-safe integer (MAX_SAFE_INTEGER is 2**53 - 1).
+    const { res, done } = runCtx('POST', '/api/pca', agent, { tokens: '100', primaryNode: 2 ** 53 });
+    await done;
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/safe-integer/);
+    expect(called).toBe(false);
+  });
+
+  it('POST /api/pca with a large string primaryNode (beyond safe-integer) is accepted losslessly', async () => {
+    // The string path must preserve a uint72 id exactly (no rounding).
+    const big = '4722366482869645213695'; // 2**72 - 1 (max uint72)
+    const calls: Array<[bigint, bigint]> = [];
+    const agent = {
+      createPublishingConvictionAccount: async (committedTRAC: bigint, primaryNode: bigint) => {
+        calls.push([committedTRAC, primaryNode]);
+        return { accountId: 5n, hash: '0xabc', blockNumber: 1, success: true };
+      },
+    };
+    const { res, done } = runCtx('POST', '/api/pca', agent, { tokens: '100', primaryNode: big });
+    await done;
+    expect(res.statusCode).toBe(200);
+    expect(calls).toEqual([[ethers.parseEther('100'), BigInt(big)]]);
+  });
+
   it('POST /api/pca/:id/agent registers an agent → 200 with txHash', async () => {
     let registered: { id: bigint; agent: string } | null = null;
     const addr = '0x' + '1'.repeat(40);

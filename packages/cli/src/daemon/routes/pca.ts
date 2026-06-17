@@ -89,7 +89,16 @@ function parseAccountId(idStr: string): bigint | null {
 const MAX_UINT72 = (1n << 72n) - 1n;
 
 function parsePrimaryNode(raw: unknown): bigint | { error: string } {
-  if (typeof raw !== 'string' && typeof raw !== 'number') {
+  if (typeof raw === 'number') {
+    // A uint72 identityId can exceed Number.MAX_SAFE_INTEGER. By the time we
+    // see a JSON number, JSON.parse has ALREADY rounded it to the nearest
+    // double — so String(raw)/BigInt() below would silently read a different
+    // node. Only safe-integer numbers survive losslessly; larger ids must come
+    // as strings.
+    if (!Number.isSafeInteger(raw)) {
+      return { error: 'primaryNode exceeds JSON safe-integer range — pass the node identityId as a string' };
+    }
+  } else if (typeof raw !== 'string') {
     return { error: 'primaryNode is required: the node identityId (uint72) this PCA allocates publishing to' };
   }
   const s = String(raw).trim();

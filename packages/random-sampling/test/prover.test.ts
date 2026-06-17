@@ -52,13 +52,32 @@ interface FakeChainState {
 }
 
 function makeChain(state: FakeChainState): ChainAdapter {
+  // OT-RFC-49 WS-B proof-race snapshot: the on-chain `createChallenge` PINS the
+  // current (root, leafCount) onto the Challenge struct, and `submitProof` (and
+  // the prover) verify against THOSE pinned values, not a live re-read. Mirror
+  // that here — pin the snapshot from the chain's reported (root, leafCount)
+  // onto any surfaced challenge that doesn't already carry it. Without this the
+  // prover reads `challenge.challengeRoot`/`challengeLeafCount` as undefined and
+  // every build fails `leaf-count-mismatch`.
+  const pin = (ch: NodeChallenge | null): NodeChallenge | null =>
+    ch === null
+      ? null
+      : {
+          ...ch,
+          challengeRoot: ch.challengeRoot ?? state.expectedRoot,
+          challengeLeafCount:
+            ch.challengeLeafCount ?? BigInt(state.expectedLeafCount),
+        };
   // Only the methods the prover touches need to be implemented.
   const partial: Partial<ChainAdapter> = {
     chainType: 'evm',
     chainId: '31337',
     getActiveProofPeriodStatus: vi.fn(async () => state.status),
-    getNodeChallenge: vi.fn(async () => state.challengeForNode),
-    createChallenge: vi.fn(state.createChallenge),
+    getNodeChallenge: vi.fn(async () => pin(state.challengeForNode)),
+    createChallenge: vi.fn(async () => {
+      const r = await state.createChallenge();
+      return { ...r, challenge: pin(r.challenge)! };
+    }),
     getLatestMerkleRoot: vi.fn(async () => state.expectedRoot),
     getMerkleLeafCount: vi.fn(async () => state.expectedLeafCount),
     getKAContextGraphId: vi.fn(async () => state.cgIdForKc),
@@ -144,6 +163,7 @@ function makeChallenge(overrides: Partial<NodeChallenge> = {}): NodeChallenge {
     activeProofPeriodStartBlock: 1000n,
     proofingPeriodDurationInBlocks: 50n,
     solved: false,
+    isCurated: false,
     ...overrides,
   };
 }

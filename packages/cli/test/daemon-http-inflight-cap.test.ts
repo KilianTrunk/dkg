@@ -44,6 +44,9 @@ describe('daemon admission control (real node, maxInFlightRequests=1)', () => {
     const shed = results.filter((r) => r.status === 503);
     const ok = results.filter((r) => r.status === 200);
 
+    // Every result must be an EXPECTED status — never a network error (0) or an
+    // unexpected 4xx/5xx that would otherwise hide behind the >=1/>=1 counts.
+    expect(results.every((r) => r.status === 200 || r.status === 503)).toBe(true);
     expect(ok.length).toBeGreaterThan(0); // at least one admitted
     expect(shed.length).toBeGreaterThan(0); // cap enforced under concurrent load
     expect(shed.every((r) => r.retryAfter === '1')).toBe(true); // Retry-After present on every 503
@@ -53,10 +56,16 @@ describe('daemon admission control (real node, maxInFlightRequests=1)', () => {
     expect(recovered.status).toBe(200);
   }, 60_000);
 
-  it('never sheds the exempt liveness path (/api/status) under saturation', async () => {
+  it('keeps the exempt liveness path (/api/status) answerable even while saturated', async () => {
     const d = daemon!;
-    // Saturate with non-exempt query work (not awaited yet)...
-    const burst = Promise.all(Array.from({ length: 40 }, () => selectQuery(d).catch(() => null)));
+    // Saturate with non-exempt query work; capture the burst results so we can
+    // PROVE the daemon was actually over capacity (>=1 shed) while the status
+    // probes ran — otherwise "status stayed 200" would be vacuous.
+    const burst = Promise.all(
+      Array.from({ length: 40 }, () =>
+        selectQuery(d).then((r) => r.status).catch(() => 0),
+      ),
+    );
     // ...while hammering the exempt status endpoint, which must always answer 200.
     const statuses = await Promise.all(
       Array.from({ length: 12 }, () =>
@@ -65,7 +74,10 @@ describe('daemon admission control (real node, maxInFlightRequests=1)', () => {
           .catch(() => 0),
       ),
     );
-    await burst;
-    expect(statuses.every((s) => s === 200)).toBe(true);
+    const burstStatuses = await burst;
+
+    expect(statuses.every((s) => s === 200)).toBe(true); // exempt path never shed
+    expect(burstStatuses.filter((s) => s === 503).length).toBeGreaterThan(0); // saturation really happened
+    expect(burstStatuses.every((s) => s === 200 || s === 503)).toBe(true); // no unexpected failures
   }, 60_000);
 });

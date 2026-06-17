@@ -1276,11 +1276,15 @@ function parseIntOrNull(value: string | undefined): number | null {
 
 /**
  * Resolve an integer setting from an env var (highest precedence), then a
- * config value, then a fallback. Malformed / empty / out-of-range inputs are
- * IGNORED (fall through) rather than silently disabling the setting — a typo
- * like `DKG_MAX_INFLIGHT=abc` or an empty string yields the documented default,
- * not `NaN`/`0`. Pass `allowZero` when 0 is a meaningful value (e.g. "disable
- * the cap"); otherwise the minimum accepted value is 1.
+ * config value, then a fallback. Malformed / empty / NaN inputs are IGNORED
+ * (fall through) rather than silently disabling the setting — a typo like
+ * `DKG_MAX_INFLIGHT=abc` or an empty string yields the documented default, not
+ * `NaN`/`0`.
+ *
+ * Pass `allowZero` when non-positive is a meaningful value (e.g. "disable the
+ * cap"): then ANY integer is accepted, so `<= 0` (incl. `-1`) flows through to
+ * disable rather than falling back to the default. Without it the minimum
+ * accepted value is 1.
  */
 export function resolveIntSetting(
   envValue: string | undefined,
@@ -1288,16 +1292,11 @@ export function resolveIntSetting(
   fallback: number,
   opts: { allowZero?: boolean } = {},
 ): number {
-  const min = opts.allowZero ? 0 : 1;
+  const accepts = (n: number | null | undefined): n is number =>
+    typeof n === 'number' && Number.isInteger(n) && (opts.allowZero === true || n >= 1);
   const fromEnv = parseIntOrNull(envValue);
-  if (fromEnv !== null && fromEnv >= min) return fromEnv;
-  if (
-    typeof configValue === 'number' &&
-    Number.isInteger(configValue) &&
-    configValue >= min
-  ) {
-    return configValue;
-  }
+  if (accepts(fromEnv)) return fromEnv;
+  if (accepts(configValue)) return configValue;
   return fallback;
 }
 
@@ -1306,6 +1305,7 @@ const ADMISSION_EXEMPT_PATHS: ReadonlySet<string> = new Set([
   '/api/status',
   '/api/chain/rpc-health',
   '/.well-known/skill.md',
+  '/.well-known/skill-importer.md',
 ]);
 
 /**

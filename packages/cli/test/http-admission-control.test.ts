@@ -65,11 +65,22 @@ describe('resolveIntSetting — env/config/fallback parsing', () => {
     expect(resolveIntSetting('abc', 200, 64)).toBe(200); // invalid env -> config
   });
 
-  it('honors allowZero only when set, and rejects negatives/fractions', () => {
+  it('without allowZero, rejects non-positive (min 1) and fractions', () => {
     expect(resolveIntSetting('0', undefined, 64)).toBe(64); // 0 rejected (min 1)
-    expect(resolveIntSetting('0', undefined, 64, { allowZero: true })).toBe(0); // explicit disable
-    expect(resolveIntSetting('-5', undefined, 64, { allowZero: true })).toBe(64); // negative -> default
+    expect(resolveIntSetting('-5', undefined, 64)).toBe(64); // negative rejected
     expect(resolveIntSetting(undefined, 2.5, 64)).toBe(64); // fractional config ignored
+    expect(resolveIntSetting(undefined, 0, 64)).toBe(64); // config 0 rejected
+  });
+
+  it('with allowZero, any <=0 flows through to disable (does NOT fall back to default)', () => {
+    // Contract: "<= 0 disables". A typo must still fall back, but an explicit
+    // 0 or negative is an intentional disable, not garbage.
+    expect(resolveIntSetting('0', undefined, 64, { allowZero: true })).toBe(0);
+    expect(resolveIntSetting('-1', undefined, 64, { allowZero: true })).toBe(-1);
+    expect(resolveIntSetting(undefined, -3, 64, { allowZero: true })).toBe(-3); // via config
+    expect(resolveIntSetting('abc', undefined, 64, { allowZero: true })).toBe(64); // still falls back
+    // And the resolved value disables the limiter end-to-end:
+    expect(new InFlightLimiter(resolveIntSetting('-1', undefined, 64, { allowZero: true })).max).toBe(0);
   });
 });
 
@@ -115,6 +126,8 @@ describe('admitRequest — wiring (503/Retry-After/CORS/exempt/release)', () => 
       ['OPTIONS', '/api/context-graphs'],
       ['GET', '/api/status'],
       ['GET', '/api/chain/rpc-health'],
+      ['GET', '/.well-known/skill.md'],
+      ['GET', '/.well-known/skill-importer.md'],
     ] as const) {
       const res = mockRes();
       const gate = admitRequest(limiter, method, path, res, null);

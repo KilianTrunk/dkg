@@ -52,6 +52,15 @@ function classifyPcaRevert(msg: string): { status: number; error: string } | nul
   if (/\bAgentCapReached\b/.test(msg)) return { status: 409, error: 'AgentCapReached' };
   if (/\bAccountExpired\b/.test(msg)) return { status: 409, error: 'AccountExpired' };
   if (/\bAccountAlreadyFullySettled\b/.test(msg)) return { status: 409, error: 'AccountAlreadyFullySettled' };
+  // OT-RFC-51 primary-node reverts. `PrimaryNodeNotInShardingTable` is reachable
+  // from POST /api/pca (createAccount validates a non-zero node against the
+  // sharding table) → a bad-but-well-formed node id is a 400, not a 500. The
+  // rest are setPrimaryNode-only (re-designation, not yet wired via the daemon)
+  // but classified here so they map cleanly the moment that route lands.
+  if (/\bPrimaryNodeNotInShardingTable\b/.test(msg)) return { status: 400, error: 'PrimaryNodeNotInShardingTable' };
+  if (/\bZeroPrimaryNode\b/.test(msg)) return { status: 400, error: 'ZeroPrimaryNode' };
+  if (/\bPrimaryNodeUnchanged\b/.test(msg)) return { status: 409, error: 'PrimaryNodeUnchanged' };
+  if (/\bPrimaryNodeChangeRateLimited\b/.test(msg)) return { status: 409, error: 'PrimaryNodeChangeRateLimited' };
   // OZ v5 _requireOwned on an unminted NFT id → caller mistake, 404.
   // Legacy string-revert fallback for older OZ ERC721 builds.
   if (/\bERC721NonexistentToken\b/.test(msg) ||

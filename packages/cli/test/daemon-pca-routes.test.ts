@@ -426,6 +426,17 @@ describe('daemon /api/pca V10 caller contract', () => {
     expect(JSON.parse(res.body).error).toBe('TokenTransferFailed');
   });
 
+  it('maps an OT-RFC-51 PrimaryNodeNotInShardingTable revert on POST /api/pca → 400, not 500', async () => {
+    // A syntactically valid but nonexistent node id passes parsePrimaryNode but
+    // reverts in createAccount — must be a caller-actionable 400, not a 500.
+    const { res, done } = runCtx('POST', '/api/pca', {
+      createPublishingConvictionAccount: async () => { throw new Error('execution reverted: PrimaryNodeNotInShardingTable(999999)'); },
+    }, { tokens: '100', primaryNode: '999999' });
+    await done;
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe('PrimaryNodeNotInShardingTable');
+  });
+
   it('maps an AccountAlreadyFullySettled revert on POST /api/pca/:id/settle → 409', async () => {
     const { res, done } = runCtx('POST', '/api/pca/2/settle', {
       settlePublishingConvictionAccount: async () => { throw new Error('execution reverted: AccountAlreadyFullySettled(2)'); },

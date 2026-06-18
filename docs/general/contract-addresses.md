@@ -15,7 +15,7 @@ DKG V10 runs on **Base Sepolia (testnet)**, and the final release-candidate cont
 
 TRAC is the ERC-20 utility token used across the DKG. The token contract address is different on each chain — use the one for the network your node operates on.
 
-On **mainnet**, TRAC is the original token contract (unchanged from V8). On **testnet**, V10 uses freshly redeployed test-TRAC contracts (different from the V8 ones). NeuroWeb uses the same native TRAC address on both mainnet and testnet.
+On **mainnet**, TRAC is the original token contract (unchanged from V8). On the active V10 testnet (**Base Sepolia**), V10 uses a freshly redeployed test-TRAC contract (different from the V8 one). NeuroWeb uses the same native TRAC address on both mainnet and testnet.
 
 ### Mainnet
 
@@ -30,10 +30,11 @@ On **mainnet**, TRAC is the original token contract (unchanged from V8). On **te
 | Network | TRAC token address |
 | --- | --- |
 | Base Sepolia | `0x2A58BdD13176D85906D804cdbFFA0D9119282DC8` |
+| Gnosis Chiado | `0x9cFa71394906fa38399aD305E7Ca97b00e3b4449` |
 | NeuroWeb Testnet | `0xFfFFFFff00000000000000000000000000000001` |
 
 {% hint style="info" %}
-NeuroWeb uses the same TRAC address on mainnet and testnet. For other testnets and the exact current test-token addresses, get test TRAC from the [faucet](../use-dkg/funding.md) and check the [deployments folder](https://github.com/OriginTrail/dkg/tree/main/packages/evm-module/deployments) — V10 redeploys its test contracts, so the deployments folder is the source of truth for testnet addresses.
+The test-TRAC faucet currently serves **Base Sepolia** only — that is the active V10 testnet. The Gnosis Chiado and NeuroWeb testnet addresses above are the existing test-token contracts (NeuroWeb uses the same address on mainnet and testnet). See the [deployments folder](https://github.com/OriginTrail/dkg/tree/main/packages/evm-module/deployments) for the canonical addresses.
 {% endhint %}
 
 ## DKG smart contracts

@@ -838,6 +838,56 @@ describe('sync responder pagination interleaving', () => {
     expect(loads).toBe(2);
   });
 
+  it('does not retain a durable row snapshot when the serving request aborts before build completion', async () => {
+    const memo = createResponderSyncRowListMemo(10_000, 1);
+    const snapshot = deferred<readonly {
+      s: string;
+      p: string;
+      o: string;
+      g: string;
+    }[]>();
+    const controller = new AbortController();
+
+    const first = memo.get('durable:aborted', () => snapshot.promise, { signal: controller.signal });
+    controller.abort(new Error('request aborted'));
+    snapshot.resolve([{
+      s: 'urn:memo:row',
+      p: `${DKG_NS}label`,
+      o: '"aborted"',
+      g: 'urn:memo:graph',
+    }]);
+
+    await expect(first).rejects.toThrow('request aborted');
+    await expect(memo.get('durable:fresh', async () => [{
+      s: 'urn:memo:row',
+      p: `${DKG_NS}label`,
+      o: '"fresh"',
+      g: 'urn:memo:graph',
+    }])).resolves.toHaveLength(1);
+  });
+
+  it('releases completed durable row snapshots after the completion grace window', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const memo = createResponderSyncRowListMemo(10_000, 1);
+    const row = {
+      s: 'urn:memo:row',
+      p: `${DKG_NS}label`,
+      o: '"snapshot"',
+      g: 'urn:memo:graph',
+    };
+
+    await expect(memo.get('durable:complete', async () => [row])).resolves.toHaveLength(1);
+    memo.release('durable:complete', { graceMs: 10 });
+
+    await expect(memo.get('durable:blocked', async () => [row])).rejects.toThrow(
+      'Too many active durable data sync session snapshots',
+    );
+
+    vi.advanceTimersByTime(11);
+    await expect(memo.get('durable:blocked', async () => [row])).resolves.toHaveLength(1);
+  });
+
   it('coalesces concurrent durable row snapshot refreshes', async () => {
     const memo = createResponderSyncRowListMemo();
     const snapshot = deferred<readonly {

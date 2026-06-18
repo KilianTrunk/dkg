@@ -133,6 +133,32 @@ describe('sync-on-connect churn gates', () => {
     expect(syncSharedMemoryFromPeer.calls).toEqual([]);
   });
 
+  it('passes the connecting peer into the SWM sync-scope selector', async () => {
+    const syncSharedMemoryFromPeer = recorder(async () => 0);
+    let selectedForPeer: string | undefined;
+
+    const outcome = await runSyncOnConnect({
+      remotePeer: PEER_A,
+      syncingPeers: new Set(),
+      getPeerProtocols: async () => [PROTOCOL_SYNC],
+      knownCorePeerIds: new Set(),
+      getSyncContextGraphs: () => ['eligible-cg'],
+      getSharedMemorySyncContextGraphs: (peerId) => {
+        selectedForPeer = peerId;
+        return ['eligible-cg'];
+      },
+      syncFromPeer: async () => 0,
+      refreshMetaSyncedFlags: async () => undefined,
+      discoverContextGraphsFromStore: async () => 0,
+      syncSharedMemoryFromPeer,
+      logInfo: noopLog,
+    });
+
+    expect(outcome).toBe('synced');
+    expect(selectedForPeer).toBe(PEER_A);
+    expect(syncSharedMemoryFromPeer.calls).toEqual([[PEER_A, ['eligible-cg']]]);
+  });
+
   it('preserves successful SWM sync-on-connect for eligible CGs', async () => {
     const syncSharedMemoryFromPeer = recorder(async () => 0);
 
@@ -152,5 +178,47 @@ describe('sync-on-connect churn gates', () => {
 
     expect(outcome).toBe('synced');
     expect(syncSharedMemoryFromPeer.calls).toEqual([[PEER_A, ['eligible-cg']]]);
+  });
+
+  it('filters private SWM sync-on-connect scope to the matching curator peer', async () => {
+    const agent = await createUnstartedAgent('SwmPeerScopedRecovery');
+    const privateCg = 'private-cg';
+    const otherPrivateCg = 'other-private-cg';
+    const localPrivateCg = 'local-private-cg';
+    const unconfirmedCg = 'unconfirmed-cg';
+    (agent as any).config.syncContextGraphs = [
+      'public-cg',
+      privateCg,
+      otherPrivateCg,
+      localPrivateCg,
+      unconfirmedCg,
+    ];
+    (agent as any).canUseSharedMemoryForContextGraph = async (contextGraphId: string) =>
+      contextGraphId !== unconfirmedCg;
+    (agent as any).isPrivateContextGraph = async (contextGraphId: string) =>
+      contextGraphId.includes('private');
+    (agent as any).resolveCuratorPeerIdsForCg = async (contextGraphId: string) => {
+      if (contextGraphId === privateCg) {
+        return { peerIds: [PEER_A], curatorIsLocal: false, legacyTripleResolved: false };
+      }
+      if (contextGraphId === otherPrivateCg) {
+        return { peerIds: ['other-peer'], curatorIsLocal: false, legacyTripleResolved: false };
+      }
+      if (contextGraphId === localPrivateCg) {
+        return { peerIds: [], curatorIsLocal: true, legacyTripleResolved: false };
+      }
+      return { peerIds: [], curatorIsLocal: false, legacyTripleResolved: false };
+    };
+
+    expect(await (agent as any).getSharedMemorySyncContextGraphs(PEER_A)).toEqual([
+      'public-cg',
+      privateCg,
+    ]);
+    expect(await (agent as any).getSharedMemorySyncContextGraphs()).toEqual([
+      'public-cg',
+      privateCg,
+      otherPrivateCg,
+      localPrivateCg,
+    ]);
   });
 });

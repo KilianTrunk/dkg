@@ -793,14 +793,15 @@ export class SwmSubstrateMethods extends DKGAgentBase {
    * Add a context graph to runtime sync scope so sync-on-connect includes it.
    * System context graphs are already included by default and are skipped here.
    */
-  public trackSyncContextGraph(this: DKGAgent, contextGraphId: string): void {
+  public trackSyncContextGraph(this: DKGAgent, contextGraphId: string): boolean {
     const systemContextGraphs = new Set<string>(Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]);
-    if (systemContextGraphs.has(contextGraphId)) return;
+    if (systemContextGraphs.has(contextGraphId)) return false;
 
     const syncSet = new Set<string>(this.config.syncContextGraphs ?? []);
-    if (syncSet.has(contextGraphId)) return;
+    if (syncSet.has(contextGraphId)) return false;
     syncSet.add(contextGraphId);
     this.config.syncContextGraphs = [...syncSet];
+    return true;
   }
 
   getOrCreateGossipPublishHandler(this: DKGAgent): GossipPublishHandler {

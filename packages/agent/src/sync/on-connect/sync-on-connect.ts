@@ -26,7 +26,7 @@ interface SyncOnConnectContext {
   getPeerProtocols: (peerId: string) => Promise<string[]>;
   knownCorePeerIds: Set<string>;
   getSyncContextGraphs: () => string[];
-  getSharedMemorySyncContextGraphs?: () => string[] | Promise<string[]>;
+  getSharedMemorySyncContextGraphs?: (remotePeerId: string) => string[] | Promise<string[]>;
   syncFromPeer: (peerId: string, contextGraphIds?: string[]) => Promise<SyncFromPeerResult>;
   refreshMetaSyncedFlags: (contextGraphIds: Iterable<string>) => Promise<void>;
   discoverContextGraphsFromStore: () => Promise<number>;
@@ -219,7 +219,7 @@ export async function runSyncOnConnect(context: SyncOnConnectContext): Promise<S
 
     durableSyncCompleted = true;
     const wsContextGraphIds = getSharedMemorySyncContextGraphs
-      ? await runNonTransportStep(() => Promise.resolve(getSharedMemorySyncContextGraphs()))
+      ? await runNonTransportStep(() => Promise.resolve(getSharedMemorySyncContextGraphs(remotePeer)))
       : getSyncContextGraphs() ?? [];
     if (syncSharedMemoryOnConnect && wsContextGraphIds.length > 0) {
       const wsSynced = await syncSharedMemoryFromPeer(remotePeer, wsContextGraphIds);

@@ -2475,7 +2475,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       getPeerProtocols: (peerId) => this.getPeerProtocols(peerId),
       knownCorePeerIds: this.knownCorePeerIds,
       getSyncContextGraphs: () => this.config.syncContextGraphs ?? [],
-      getSharedMemorySyncContextGraphs: () => this.getSharedMemorySyncContextGraphs(),
+      getSharedMemorySyncContextGraphs: (peerId) => this.getSharedMemorySyncContextGraphs(peerId),
       syncFromPeer: (peerId, contextGraphIds) => this.syncFromPeerDetailed(
         peerId,
         contextGraphIds ?? [SYSTEM_CONTEXT_GRAPHS.AGENTS, SYSTEM_CONTEXT_GRAPHS.ONTOLOGY, ...(this.config.syncContextGraphs ?? [])],
@@ -2505,10 +2505,16 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     });
   }
 
-  async getSharedMemorySyncContextGraphs(this: DKGAgent): Promise<string[]> {
+  async getSharedMemorySyncContextGraphs(this: DKGAgent, remotePeerId?: string): Promise<string[]> {
     const eligible: string[] = [];
     for (const contextGraphId of this.config.syncContextGraphs ?? []) {
       if (await this.canUseSharedMemoryForContextGraph(contextGraphId)) {
+        if (remotePeerId && await this.isPrivateContextGraph(contextGraphId)) {
+          const { peerIds, curatorIsLocal } = await this.resolveCuratorPeerIdsForCg(contextGraphId);
+          if (curatorIsLocal || !peerIds.includes(remotePeerId)) {
+            continue;
+          }
+        }
         eligible.push(contextGraphId);
       }
     }

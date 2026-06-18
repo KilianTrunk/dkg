@@ -41,7 +41,9 @@ import {ERC721Enumerable} from "@openzeppelin/contracts/token/ERC721/extensions/
  */
 contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
     string private constant _NAME = "ContextGraphStorage";
-    string private constant _VERSION = "10.0.2";
+    // 10.0.3 — KC→KA terminology: public getters renamed getContextGraphKCCount/At/List →
+    //          getContextGraphKaCount/At/List (ABI selector change; no behavior change).
+    string private constant _VERSION = "10.0.3";
 
     // -----------------------------------------------------------------------
     // Bounds on participant list — anti-griefing cap.

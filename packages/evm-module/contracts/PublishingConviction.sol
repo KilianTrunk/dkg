@@ -125,7 +125,9 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
     //           instead of recomputing `prorateActiveSink` + chronos reads on
     //           every loop iteration. Behavior-preserving: per-epoch amounts
     //           are byte-identical, so seed and move stay net-zero on K_total.
-    string private constant _VERSION = "10.0.4";
+    // 10.0.5 — KC→KA terminology: error InvalidConvictionKcEpochs → InvalidConvictionKaEpochs
+    //          (error selector change; no behavior change).
+    string private constant _VERSION = "10.0.5";
 
     uint256 public constant BPS_DENOMINATOR = 10_000;
     /// @notice EpochStorage shard ID for the staker reward pool. Mirrors

@@ -13,6 +13,7 @@ import {
   ShardingTable,
   ContextGraphStorage,
   ContextGraphValueStorage,
+  CGWeightTreeStorage,
 } from '../../typechain';
 import { createProfile } from '../helpers/profile-helpers';
 
@@ -98,6 +99,7 @@ describe('@integration RandomSampling submitProof + multi-store seam (R3)', () =
   let ShardingTable: ShardingTable;
   let ContextGraphStorage: ContextGraphStorage;
   let ContextGraphValueStorage: ContextGraphValueStorage;
+  let CGWeightTreeStorage: CGWeightTreeStorage;
   let kaNumber = 0n;
 
   async function deployFixture() {
@@ -148,6 +150,11 @@ describe('@integration RandomSampling submitProof + multi-store seam (R3)', () =
       await hre.ethers.getContract<ContextGraphValueStorage>(
         'ContextGraphValueStorage',
       );
+    CGWeightTreeStorage =
+      await hre.ethers.getContract<CGWeightTreeStorage>('CGWeightTreeStorage');
+    // Phase 10.x — unlock the BIT index (fresh chain) so createChallenge can draw;
+    // accounts[19] is a registered Hub contract so it passes onlyContracts.
+    await CGWeightTreeStorage.connect(accounts[19]).finishBackfill();
     opSigner = accounts[19];
     kaNumber = 0n;
   }
@@ -216,6 +223,8 @@ describe('@integration RandomSampling submitProof + multi-store seam (R3)', () =
         1_000n, // per-epoch value
       )
     ).wait();
+    // settle-on-spend: reconcile the BIT leaf so createChallenge can draw this CG.
+    await (await CGWeightTreeStorage.connect(opSigner).settle(cgId)).wait();
     return kaId;
   }
 
@@ -292,6 +301,8 @@ describe('@integration RandomSampling submitProof + multi-store seam (R3)', () =
         1_000n,
       )
     ).wait();
+    // settle-on-spend: reconcile the BIT leaf so createChallenge can draw this CG.
+    await (await CGWeightTreeStorage.connect(opSigner).settle(cgId)).wait();
     return kaId;
   }
 
@@ -319,6 +330,32 @@ describe('@integration RandomSampling submitProof + multi-store seam (R3)', () =
   beforeEach(async () => {
     hre.helpers.resetDeploymentsJson();
     await loadFixture(deployFixture);
+  });
+
+  it('Test E — createChallenge reverts ChallengeDrawPaused while the BIT index is backfill-locked', async () => {
+    const node = await setupChallengingNode();
+    await RandomSampling.updateAndGetActiveProofPeriodStartBlock();
+
+    // Swap in a fresh, still-LOCKED CGWeightTreeStorage and re-point RandomSampling at it
+    // (the migration window). accounts[0] is the Hub owner: setContractAddress is
+    // onlyHubOwner and initialize() is onlyHub (owner allowed).
+    const Factory = await hre.ethers.getContractFactory('CGWeightTreeStorage');
+    const lockedTree = await Factory.connect(accounts[0]).deploy(
+      await Hub.getAddress(),
+      2n ** 21n,
+    );
+    await lockedTree.waitForDeployment();
+    await Hub.connect(accounts[0]).setContractAddress(
+      'CGWeightTreeStorage',
+      await lockedTree.getAddress(),
+    );
+    await RandomSampling.connect(accounts[0]).initialize(); // re-resolve to the locked tree
+    expect(await lockedTree.backfillLocked()).to.equal(true);
+
+    // The gate fires before the draw, so no seeded CG is needed.
+    await expect(
+      RandomSampling.connect(node.operational).createChallenge(),
+    ).to.be.revertedWithCustomError(RandomSampling, 'ChallengeDrawPaused');
   });
 
   it('Test A — submits a valid proof against the single store (solved=true)', async () => {

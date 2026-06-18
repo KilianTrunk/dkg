@@ -25,6 +25,7 @@ import {
   Profile,
   ContextGraphStorage,
   ContextGraphValueStorage,
+  CGWeightTreeStorage,
 } from '../../typechain';
 
 type RandomSamplingFixture = {
@@ -44,6 +45,7 @@ type RandomSamplingFixture = {
   DKGKnowledgeAssets: DKGKnowledgeAssets;
   ContextGraphStorage: ContextGraphStorage;
   ContextGraphValueStorage: ContextGraphValueStorage;
+  CGWeightTreeStorage: CGWeightTreeStorage;
   Profile: Profile;
 };
 
@@ -66,6 +68,7 @@ describe('@unit RandomSampling', () => {
   let DKGKnowledgeAssets: DKGKnowledgeAssets;
   let ContextGraphStorage: ContextGraphStorage;
   let ContextGraphValueStorage: ContextGraphValueStorage;
+  let CGWeightTreeStorage: CGWeightTreeStorage;
   let Profile: Profile;
 
   async function deployRandomSamplingFixture(): Promise<RandomSamplingFixture> {
@@ -133,6 +136,8 @@ describe('@unit RandomSampling', () => {
       await hre.ethers.getContract<ContextGraphValueStorage>(
         'ContextGraphValueStorage',
       );
+    CGWeightTreeStorage =
+      await hre.ethers.getContract<CGWeightTreeStorage>('CGWeightTreeStorage');
 
     // Register a sentinel signer as a Hub contract so Phase 10 weighted-
     // selection tests can call `onlyContracts` methods on ContextGraphStorage /
@@ -141,6 +146,11 @@ describe('@unit RandomSampling', () => {
     // Must run after HubOwner is set so `setContractAddress` passes the auth
     // check. Safe for existing tests because accounts[19] is never used elsewhere.
     await Hub.setContractAddress('TestStorageOperator', accounts[19].address);
+
+    // Phase 10.x — a fresh chain has no CGs to migrate, so unlock the BIT index
+    // immediately (mirrors the operator's post-deploy finishBackfill). accounts[19]
+    // is now a registered Hub contract, so it passes onlyContracts.
+    await CGWeightTreeStorage.connect(accounts[19]).finishBackfill();
 
     return {
       accounts,
@@ -159,6 +169,7 @@ describe('@unit RandomSampling', () => {
       DKGKnowledgeAssets,
       ContextGraphStorage,
       ContextGraphValueStorage,
+      CGWeightTreeStorage,
       Profile,
     };
   }
@@ -188,6 +199,7 @@ describe('@unit RandomSampling', () => {
       DKGKnowledgeAssets,
       ContextGraphStorage,
       ContextGraphValueStorage,
+      CGWeightTreeStorage,
       Profile,
     } = await loadFixture(deployRandomSamplingFixture));
   });
@@ -889,7 +901,11 @@ describe('@unit RandomSampling', () => {
      * given CG. Returns the new KC id. `endEpoch` controls the expiry — pass
      * `currentEpoch - 1` to create an already-expired KC.
      */
-    async function createKC(cgId: bigint, endEpoch: bigint): Promise<bigint> {
+    async function createKC(
+      cgId: bigint,
+      endEpoch: bigint,
+      merkleLeafCount: bigint = 1n,
+    ): Promise<bigint> {
       const currentEpoch = await Chronos.getCurrentEpoch();
       const startEpoch = currentEpoch;
       const createTx = await DKGKnowledgeAssets.connect(
@@ -910,7 +926,7 @@ describe('@unit RandomSampling', () => {
         endEpoch,
         0, // tokenAmount
         false, // isImmutable
-        1, // merkleLeafCount (v10 — pin-the-leaf-count guard, not exercised by Phase 10)
+        merkleLeafCount, // merkleLeafCount (v10 — pin-the-leaf-count guard)
       );
       const receipt = await createTx.wait();
       // Parse kc id from the KnowledgeAssetCreated event.
@@ -948,6 +964,10 @@ describe('@unit RandomSampling', () => {
         lifetime,
         value,
       );
+      // Mirror production settle-on-spend: reconcile the BIT leaf to the new
+      // ledger truth (settle reads getCGValueAtEpoch — the same getter the
+      // legacy scan read, so the BIT draw matches the old draw bit-for-bit).
+      await CGWeightTreeStorage.connect(opSigner).settle(cgId);
     }
 
     /**
@@ -1209,6 +1229,10 @@ describe('@unit RandomSampling', () => {
         await ContextGraphValueStorage.getCGValueAtEpoch(cgId, newEpoch),
       ).to.equal(0n);
 
+      // BIT leaf is a snapshot from seed time; reconcile it to the decayed ledger
+      // truth (models settle-on-miss / the keeper). After settle the leaf is 0.
+      await CGWeightTreeStorage.connect(opSigner).settle(cgId);
+
       // Picker-level invariant: adjustedTotal == 0 → revert.
       await expect(
         RandomSampling.previewChallengeForSeed(testSeed(0), newEpoch),
@@ -1246,6 +1270,11 @@ describe('@unit RandomSampling', () => {
       await time.increase(Number(epochLength) * Number(shortLifetime + 1n));
       const newEpoch = await Chronos.getCurrentEpoch();
 
+      // Reconcile both BIT leaves to the decayed ledger (models settle-on-miss /
+      // keeper): the expired CG settles to 0, the live neighbor keeps its weight.
+      await CGWeightTreeStorage.connect(opSigner).settle(expiredCg);
+      await CGWeightTreeStorage.connect(opSigner).settle(activeCg);
+
       // Storage invariant: expired decayed to zero, active still > 0.
       expect(
         await ContextGraphValueStorage.getCGValueAtEpoch(expiredCg, newEpoch),
@@ -1264,5 +1293,131 @@ describe('@unit RandomSampling', () => {
         expect(preview.kaId).to.equal(activeKc);
       }
     });
+
+    // -----------------------------------------------------------------------
+    // Test 9 — Draw-level parity (BIT refactor discriminator): the full
+    // (cgId, kaId, chunkId) tuple from previewChallengeForSeed must match a JS
+    // oracle replicating the EXACT on-chain seed threading — r = seed % total
+    // straddle for the CG; kcSeed = keccak256(seed, uint8(0)) for the KC index
+    // and the leaf. If this fails, the draw diverged (seed threading or the
+    // tree weight broke) — do NOT just adjust the expectation.
+    // -----------------------------------------------------------------------
+    it('draw-level parity: (cgId,kaId,chunkId) matches the seed-threading oracle', async () => {
+      const endEpoch = (await Chronos.getCurrentEpoch()) + 100n;
+      // Multiple KCs per CG (exercise the kcSeed→idx pick) and leafCount > 1
+      // (exercise the chunk draw). leafCount is uniform within each CG below.
+      const cgA = await createCG(OPEN_POLICY);
+      await createKC(cgA, endEpoch, 4n);
+      await createKC(cgA, endEpoch, 4n);
+      const cgB = await createCG(OPEN_POLICY);
+      await createKC(cgB, endEpoch, 7n);
+      const cgC = await createCG(OPEN_POLICY);
+      await createKC(cgC, endEpoch, 3n);
+      await createKC(cgC, endEpoch, 3n);
+      await createKC(cgC, endEpoch, 3n);
+
+      await seedCGValue(cgA, 5_000n);
+      await seedCGValue(cgB, 3_000n);
+      await seedCGValue(cgC, 2_000n);
+
+      const currentEpoch = await Chronos.getCurrentEpoch();
+      const cgs = [cgA, cgB, cgC];
+      const leafCountByCg: Record<string, bigint> = {
+        [cgA.toString()]: 4n,
+        [cgB.toString()]: 7n,
+        [cgC.toString()]: 3n,
+      };
+      // Prefetch weights + KC ordering so the oracle is a pure function.
+      const weight: Record<string, bigint> = {};
+      const kcList: Record<string, bigint[]> = {};
+      for (const cg of cgs) {
+        weight[cg.toString()] = await ContextGraphValueStorage.getCGValueAtEpoch(
+          cg,
+          currentEpoch,
+        );
+        const n = Number(await ContextGraphStorage.getContextGraphKCCount(cg));
+        const list: bigint[] = [];
+        for (let i = 0; i < n; i++) {
+          list.push(await ContextGraphStorage.getContextGraphKCAt(cg, BigInt(i)));
+        }
+        kcList[cg.toString()] = list;
+      }
+      const total = cgs.reduce((s, cg) => s + weight[cg.toString()], 0n);
+
+      function oracle(seed: string): { cg: bigint; ka: bigint; chunk: bigint } {
+        const r = BigInt(seed) % total;
+        let running = 0n;
+        let cg = 0n;
+        for (const c of cgs) {
+          running += weight[c.toString()];
+          if (running > r) {
+            cg = c;
+            break;
+          }
+        }
+        // attempt 0 (all KCs live & public): kcSeed = keccak256(seed, uint8(0)).
+        const kcSeed = ethers.keccak256(
+          ethers.solidityPacked(['bytes32', 'uint8'], [seed, 0]),
+        );
+        const list = kcList[cg.toString()];
+        const idx = Number(BigInt(kcSeed) % BigInt(list.length));
+        const ka = list[idx];
+        const chunk = BigInt(kcSeed) % leafCountByCg[cg.toString()];
+        return { cg, ka, chunk };
+      }
+
+      for (let i = 0; i < 60; i++) {
+        const seed = testSeed(i);
+        const got = await RandomSampling.previewChallengeForSeed(
+          seed,
+          currentEpoch,
+        );
+        const exp = oracle(seed);
+        expect(got.cgId, `cgId i=${i}`).to.equal(exp.cg);
+        expect(got.kaId, `kaId i=${i}`).to.equal(exp.ka);
+        expect(got.chunkId, `chunkId i=${i}`).to.equal(exp.chunk);
+      }
+    });
+
+    // -----------------------------------------------------------------------
+    // Test 10 — Fairness bar (RFC acceptance criterion): in the settled state,
+    // per-CG draw frequency stays within ±2 percentage points of its true
+    // active-weight share. Deterministic seed sequence, so this is a fixed
+    // pass/fail check, not a flaky statistical one.
+    // -----------------------------------------------------------------------
+    it('fairness: draw frequency within ±2pp of weight share (settled state)', async () => {
+      const endEpoch = (await Chronos.getCurrentEpoch()) + 100n;
+      const sharePct = [50n, 25n, 15n, 7n, 3n]; // sums to 100
+      const cgIds: bigint[] = [];
+      for (const w of sharePct) {
+        const cg = await createCG(OPEN_POLICY);
+        await createKC(cg, endEpoch);
+        await seedCGValue(cg, w * 1_000n);
+        cgIds.push(cg);
+      }
+      const totalShare = Number(sharePct.reduce((a, b) => a + b, 0n)); // 100
+      const currentEpoch = await Chronos.getCurrentEpoch();
+
+      const DRAWS = 5_000;
+      const counts = new Map<string, number>();
+      for (let i = 0; i < DRAWS; i++) {
+        const p = await RandomSampling.previewChallengeForSeed(
+          testSeed(1_000_000 + i),
+          currentEpoch,
+        );
+        counts.set(
+          p.cgId.toString(),
+          (counts.get(p.cgId.toString()) ?? 0) + 1,
+        );
+      }
+      cgIds.forEach((cg, k) => {
+        const observed = (counts.get(cg.toString()) ?? 0) / DRAWS;
+        const expected = Number(sharePct[k]) / totalShare;
+        expect(
+          Math.abs(observed - expected),
+          `cg share ${expected} observed ${observed}`,
+        ).to.be.lessThan(0.02);
+      });
+    }).timeout(600_000);
   });
 });

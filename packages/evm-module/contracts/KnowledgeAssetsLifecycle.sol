@@ -13,6 +13,7 @@ import {ShardingTableStorage} from "./storage/ShardingTableStorage.sol";
 import {ContextGraphs} from "./ContextGraphs.sol";
 import {ContextGraphStorage} from "./storage/ContextGraphStorage.sol";
 import {ContextGraphValueStorage} from "./storage/ContextGraphValueStorage.sol";
+import {CGWeightTreeStorage} from "./storage/CGWeightTreeStorage.sol";
 import {KnowledgeAssetsLib} from "./libraries/KnowledgeAssetsLib.sol";
 import {KnowledgeAssetLib} from "./libraries/KnowledgeAssetLib.sol";
 import {TokenLib} from "./libraries/TokenLib.sol";
@@ -295,6 +296,9 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     ContextGraphs public contextGraphs;
     ContextGraphStorage public contextGraphStorage;
     ContextGraphValueStorage public contextGraphValueStorage;
+    /// @notice Phase 10.x BIT weight index — settled on every CG value spend so the
+    ///         value-weighted challenge draw sees fresh weights (settle-on-spend).
+    CGWeightTreeStorage public cgWeightTreeStorage;
     IDKGPublishingConvictionNFT public publishingConvictionNFT;
 
     // --- Errors ---
@@ -448,6 +452,10 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         address cgvAddr = hub.getContractAddress("ContextGraphValueStorage");
         if (cgvAddr == address(0)) revert ZeroAddressDependency("ContextGraphValueStorage");
         contextGraphValueStorage = ContextGraphValueStorage(cgvAddr);
+
+        address cgwtAddr = hub.getContractAddress("CGWeightTreeStorage");
+        if (cgwtAddr == address(0)) revert ZeroAddressDependency("CGWeightTreeStorage");
+        cgWeightTreeStorage = CGWeightTreeStorage(cgwtAddr);
 
         address nftAddr = hub.getContractAddress("DKGPublishingConvictionNFT");
         if (nftAddr == address(0)) revert ZeroAddressDependency("DKGPublishingConvictionNFT");
@@ -829,6 +837,8 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
             uint256(p.epochs),
             uint256(p.tokenAmount)
         );
+        // settle-on-spend: reconcile the BIT weight leaf to the new ledger truth.
+        cgWeightTreeStorage.settle(p.contextGraphId);
 
         // OT-RFC-51 "Publishing Allocation": realized publishing no longer
         // credits per-node publishing allocation (K_n). The RandomSampling
@@ -891,6 +901,8 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
                     uint256(epochs),
                     uint256(tokenAmount)
                 );
+                // settle-on-spend: reconcile the BIT weight leaf to the new ledger truth.
+                cgWeightTreeStorage.settle(cgId);
             }
         }
     }
@@ -1615,6 +1627,8 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
                 uint256(remainingEpochs),
                 uint256(deltaTokenAmount)
             );
+            // settle-on-spend: reconcile the BIT weight leaf to the new ledger truth.
+            cgWeightTreeStorage.settle(contextGraphId);
 
             // OT-RFC-51 "Publishing Allocation": realized publishing (here,
             // the increase/extend delta) no longer credits per-node

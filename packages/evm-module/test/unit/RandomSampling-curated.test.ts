@@ -8,6 +8,7 @@ import {
   Chronos,
   ContextGraphStorage,
   ContextGraphValueStorage,
+  CGWeightTreeStorage,
   Hub,
   DKGKnowledgeAssets,
   RandomSampling,
@@ -67,6 +68,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
   let KCSContract: DKGKnowledgeAssets;
   let CGStorageContract: ContextGraphStorage;
   let CGValueStorage: ContextGraphValueStorage;
+  let CGWeightTreeStorage: CGWeightTreeStorage;
 
   /** Hub sentinel — registered as a "contract" in the fixture so it can
    *  bypass the production facades and call `onlyContracts` setters on
@@ -103,6 +105,12 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
     // setCatalogCommitment, etc).
     await Hub.setContractAddress('TestStorageOperator', signers[19].address);
 
+    // Phase 10.x — unlock the BIT index (fresh chain, nothing to migrate); signers[19]
+    // is a registered Hub contract so it passes onlyContracts.
+    const CGWeightTree =
+      await hre.ethers.getContract<CGWeightTreeStorage>('CGWeightTreeStorage');
+    await CGWeightTree.connect(signers[19]).finishBackfill();
+
     return {
       accounts: signers,
       HubContract: Hub,
@@ -117,6 +125,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       CGValueStorage: await hre.ethers.getContract<ContextGraphValueStorage>(
         'ContextGraphValueStorage',
       ),
+      CGWeightTreeStorage: CGWeightTree,
     };
   }
 
@@ -130,6 +139,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
     KCSContract = f.KCSContract;
     CGStorageContract = f.CGStorageContract;
     CGValueStorage = f.CGValueStorage;
+    CGWeightTreeStorage = f.CGWeightTreeStorage;
     opSigner = accounts[19];
     _kaIdCounter = 0n;
   });
@@ -256,6 +266,8 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       lifetime,
       value,
     );
+    // Mirror production settle-on-spend so the BIT weight matches the ledger.
+    await CGWeightTreeStorage.connect(opSigner).settle(cgId);
   }
 
   function testSeed(i: number): string {
@@ -733,11 +745,16 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       );
     });
 
-    it('reverts NoEligibleContextGraph when the only CG is deactivated (`isContextGraphActive == false` excludes it)', async () => {
-      // `_isCGEligible` filters on `contextGraphStorage.isContextGraphActive`.
-      // A deactivated CG must drop out of step 1's adjusted total — so
-      // even though its value is non-zero, the adjusted total is zero and
-      // we hit the first-attempt revert path.
+    it('reverts (deactivated CG is never challenged) when the only CG is deactivated', async () => {
+      // Eligibility is now verified on the DRAWN CG in `_pickKc`
+      // (`isContextGraphActive`), not pre-filtered out of a full scan. A
+      // deactivated CG still has a non-zero BIT leaf (the leaf-zeroing
+      // deactivation hook is deferred — Invariant 2; deactivateContextGraph has
+      // no production callers), so the picker DRAWS it, finds it inactive, treats
+      // it as a miss, excludes it, and re-draws. With it as the only CG the retry
+      // budget exhausts → NoEligibleKnowledgeAsset (vs the legacy pre-filter's
+      // NoEligibleContextGraph). The safety property is unchanged: a deactivated
+      // CG is never challenged; only the revert reason refined.
       const cgId = await createCG(CURATED_POLICY);
       const endEpoch = (await ChronosContract.getCurrentEpoch()) + 5n;
       await createKC({
@@ -756,7 +773,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
         RandomSamplingContract.previewChallengeForSeed(testSeed(0), currentEpoch),
       ).to.be.revertedWithCustomError(
         RandomSamplingContract,
-        'NoEligibleContextGraph',
+        'NoEligibleKnowledgeAsset',
       );
     });
 

@@ -194,9 +194,15 @@ export function resolveViewGraphs(
       // `dkg:trustLevel` ConsensusVerified by
       // `DKGAgent.promoteToVerifiableMemory`).
       return {
-        // The root content graph carries no sub-graph segment; when scoped to a
-        // sub-graph, the per-KA `…/{sub}/_verifiable_memory/*` prefix is the source.
-        graphs: opts?.subGraphName ? [] : [`did:dkg:context-graph:${contextGraphId}`],
+        // Include the content ROOT graph: the bare CG data graph for an
+        // unscoped read, or the sub-graph root `…/{cg}/{sub}` when scoped.
+        // Codex #1132 review: the publisher's intentional-local / pre-verify
+        // sub-graph publishes land in `…/{cg}/{sub}` (not `…/_verifiable_memory/*`),
+        // so a sub-graph VM read previously returned `[]` and missed confirmed
+        // data — mirror the root-CG branch and include the sub-graph root.
+        graphs: [opts?.subGraphName
+          ? contextGraphSubGraphUri(contextGraphId, opts.subGraphName)
+          : `did:dkg:context-graph:${contextGraphId}`],
         graphPrefixes: [`did:dkg:context-graph:${contextGraphId}${sg}/_verifiable_memory/`],
       };
     }
@@ -475,7 +481,11 @@ export class DKGQueryEngine implements QueryEngine {
     // so they were silently excluded. Fan out across registered sub-graphs and
     // add each one's per-layer partitions. (A by-name WM read is already pinned
     // to a single graph, so skip the fan-out there.)
-    if (!options.subGraphName && !(view === 'working-memory' && options.assertionName)) {
+    // Codex #1132 review: also skip the fan-out for a single-graph
+    // `verifiedGraph` VM read — it is already pinned to one graph (like a
+    // by-name WM read); fanning out would broaden it across every sub-graph's
+    // VM partition and return unrelated rows.
+    if (!options.subGraphName && !options.verifiedGraph && !(view === 'working-memory' && options.assertionName)) {
       const subNames = await this.discoverRegisteredSubGraphNames(contextGraphId);
       for (const sub of subNames) {
         const subResolution = resolveViewGraphs(view, contextGraphId, {

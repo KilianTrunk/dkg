@@ -189,4 +189,42 @@ describe('sub-graph query scoping', () => {
       });
     });
   });
+
+  // Codex #1132 review — verifiable-memory sub-graph scoping fixes.
+  describe('Codex #1132 — verifiable-memory sub-graph scoping', () => {
+    const VADDR = '0x2222222222222222222222222222222222222222';
+    const VNAME = 'http://schema.org/name';
+    const VMETA = `did:dkg:context-graph:${CG_ID}/_meta`;
+    const VSUBGRAPH_URN = `urn:dkg:subgraph:${CG_ID}:code`;
+    const SUB_ROOT = `did:dkg:context-graph:${CG_ID}/code`; // sub-graph ROOT graph
+    const SUB_VM = contextGraphLayerUri(CG_ID, MemoryLayer.VerifiableMemory, VADDR, 1, 'code');
+
+    beforeEach(async () => {
+      await store.insert([
+        // Register `code` so the #675 fan-out would discover it when it runs.
+        { subject: VSUBGRAPH_URN, predicate: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', object: 'http://dkg.io/ontology/SubGraph', graph: VMETA },
+        { subject: VSUBGRAPH_URN, predicate: 'http://schema.org/name', object: '"code"', graph: VMETA },
+        // Confirmed / intentional-local sub-graph publishes land in the sub-graph ROOT graph.
+        { subject: 'urn:vm:sub-root', predicate: VNAME, object: '"SubRootVM"', graph: SUB_ROOT },
+        // A sub-graph VM partition — what the fan-out would union in.
+        { subject: 'urn:vm:sub-partition', predicate: VNAME, object: '"SubPartitionVM"', graph: SUB_VM },
+      ]);
+    });
+
+    it('A: VM view + subGraphName includes the sub-graph ROOT graph (previously graphs:[] → missed confirmed data)', async () => {
+      const result = await engine.query(
+        `SELECT ?s ?o WHERE { ?s <${VNAME}> ?o }`,
+        { contextGraphId: CG_ID, view: 'verifiable-memory', subGraphName: 'code' },
+      );
+      expect(result.bindings.map((b) => b['s'])).toContain('urn:vm:sub-root');
+    });
+
+    it('C: VM view + verifiedGraph does NOT fan out across sub-graph VM partitions', async () => {
+      const result = await engine.query(
+        `SELECT ?s ?o WHERE { ?s <${VNAME}> ?o }`,
+        { contextGraphId: CG_ID, view: 'verifiable-memory', verifiedGraph: 'team-a' },
+      );
+      expect(result.bindings.map((b) => b['s'])).not.toContain('urn:vm:sub-partition');
+    });
+  });
 });

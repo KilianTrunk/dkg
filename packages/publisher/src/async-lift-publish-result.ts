@@ -149,6 +149,15 @@ function classifyPublishFailureCode(
   lowerMessage: string,
   failedFromState: AsyncLiftPublishFailureInput['failedFromState'],
 ): LiftJobFailureMetadata['code'] {
+  // GH #1013/#1121 (Codex #1132 review): a private payload that could not reach
+  // Verifiable Memory (no collectable storage ACKs) is a DETERMINISTIC terminal
+  // failure — classifying it as the default retryable `rpc_unavailable` made the
+  // queue reset/retry forever a job that can never finalize until encrypted
+  // private async publish (#1121) lands. The message is emitted verbatim by
+  // mapPublishResultToLiftJobSuccess for this exact condition.
+  if (lowerMessage.includes('no collectable storage acks')) {
+    return 'private_unanchorable';
+  }
   if (lowerMessage.includes('timeout') || lowerMessage.includes('timed out')) {
     return failedFromState === 'included' ? 'finality_timeout' : 'tx_submit_timeout';
   }

@@ -22,6 +22,11 @@ import { DKGAgent } from '../src/index.js';
 
 interface AgentInternals {
   runVmReconcileSweep(): Promise<void>;
+  selfPrimeSubscriptionOnChainId(
+    localCgId: string,
+    sub: { subscribed: boolean; coreHosted?: boolean; onChainId?: string },
+    targetOnChainId?: bigint,
+  ): Promise<string | null>;
   subscribedContextGraphs: Map<string, { subscribed: boolean; coreHosted?: boolean; onChainId?: string }>;
   reconcileCoalescer: { trigger: (cg: string) => void } | null;
   store: TripleStore;
@@ -76,5 +81,38 @@ describe('GH #1098 — VM reconcile sweep self-primes onChainId for a pre-subscr
     // — no longer skipped by the `!onChainId` guard — triggered its reconcile.
     expect(internals.subscribedContextGraphs.get(LOCAL)?.onChainId).toBe(ONCHAIN);
     expect(triggered).toContain(LOCAL);
+  });
+
+  it('KACG nudge targeting: binds ONLY the unbound CG whose on-chain id matches the event, not an unrelated one', async () => {
+    // This exercises the SAME `selfPrimeSubscriptionOnChainId` helper the live
+    // onKARegisteredToContextGraph nudge delegates to, with a `targetOnChainId`
+    // (the event's CG id). The nudge loops subscribed-unbound CGs and binds the
+    // one whose resolved id matches the event — so an unrelated CG must NOT bind.
+    const chain = new MockChainAdapter();
+    agent = await DKGAgent.create({ name: 'SelfPrimeTargeted', chainAdapter: chain });
+    stubNode(agent);
+    const internals = agent as unknown as AgentInternals;
+
+    const CG_MATCH = 'gh1098-match';
+    const CG_OTHER = 'gh1098-other';
+    const ON_MATCH = '500';
+    const ON_OTHER = '600';
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+    await internals.store.insert([
+      { subject: `did:dkg:context-graph:${CG_MATCH}`, predicate: `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId`, object: `"${ON_MATCH}"`, graph: ontologyGraph },
+      { subject: `did:dkg:context-graph:${CG_OTHER}`, predicate: `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId`, object: `"${ON_OTHER}"`, graph: ontologyGraph },
+    ]);
+    internals.subscribedContextGraphs.set(CG_MATCH, { subscribed: true });
+    internals.subscribedContextGraphs.set(CG_OTHER, { subscribed: true });
+
+    // Event for ON_MATCH: the other CG (resolves to ON_OTHER) must NOT bind.
+    const other = await internals.selfPrimeSubscriptionOnChainId(CG_OTHER, internals.subscribedContextGraphs.get(CG_OTHER)!, BigInt(ON_MATCH));
+    expect(other).toBeNull();
+    expect(internals.subscribedContextGraphs.get(CG_OTHER)?.onChainId).toBeUndefined();
+
+    // The matching CG binds.
+    const matched = await internals.selfPrimeSubscriptionOnChainId(CG_MATCH, internals.subscribedContextGraphs.get(CG_MATCH)!, BigInt(ON_MATCH));
+    expect(matched).toBe(ON_MATCH);
+    expect(internals.subscribedContextGraphs.get(CG_MATCH)?.onChainId).toBe(ON_MATCH);
   });
 });

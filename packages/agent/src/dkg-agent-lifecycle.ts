@@ -295,6 +295,7 @@ import {
   GOSSIP_DIAL_COOLDOWN_MS,
   GOSSIP_DIAL_TIMEOUT_MS,
   CATCHUP_ON_CONNECT_COOLDOWN_MS,
+  SYNC_RECONNECT_FLAP_GRACE_MS,
   SYNC_RECONCILER_INTERVAL_MS,
   SYNC_STALENESS_THRESHOLD_MS,
   SYNC_BACKOFF_BASE_MS,
@@ -2057,24 +2058,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
         }
       })();
 
-      const now = Date.now();
-      const lastSuccessfulSync = this.lastSuccessfulSyncAt.get(remotePeer);
-      const lastDisconnected = this.lastSyncDisconnectedAt.get(remotePeer) ?? 0;
-      if (
-        lastSuccessfulSync != null &&
-        lastSuccessfulSync > lastDisconnected &&
-        now - lastSuccessfulSync < SYNC_STALENESS_THRESHOLD_MS
-      ) {
-        return;
-      }
-      const last = this.catchupOnConnectAt.get(remotePeer) ?? 0;
-      if (last > lastDisconnected && now - last < CATCHUP_ON_CONNECT_COOLDOWN_MS) return;
-      this.catchupOnConnectAt.set(remotePeer, now);
-      setTimeout(() => {
-        this.trySyncFromPeer(remotePeer).catch((err: unknown) => {
-          handleSyncError(remotePeer, err);
-        });
-      }, 3000);
+      this.queueSyncFromPeerOnConnect(remotePeer, handleSyncError);
     });
 
     // Remember when the last live connection to a peer is gone. A3 keeps
@@ -2131,11 +2115,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     const alreadyConnected = this.node.libp2p.getPeers();
     for (const pid of alreadyConnected) {
       const remotePeer = pid.toString();
-      setTimeout(() => {
-        this.trySyncFromPeer(remotePeer).catch((err: unknown) => {
-          handleSyncError(remotePeer, err);
-        });
-      }, 3000);
+      this.queueSyncFromPeerOnConnect(remotePeer, handleSyncError);
     }
 
     // Start periodic shared memory cleanup
@@ -2397,6 +2377,85 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     this.storageACKRegistrationRetryTimer = null;
   }
 
+  syncOnConnectDisconnectBoundary(this: DKGAgent, remotePeer: string, now = Date.now()): number {
+    const lastDisconnected = this.lastSyncDisconnectedAt.get(remotePeer) ?? 0;
+    if (lastDisconnected === 0) return 0;
+    return now - lastDisconnected >= SYNC_RECONNECT_FLAP_GRACE_MS ? lastDisconnected : 0;
+  }
+
+  queueSyncFromPeerOnConnect(
+    this: DKGAgent,
+    remotePeer: string,
+    handleSyncError: (remotePeer: string, err: unknown) => void,
+    delayMs = 3000,
+  ): boolean {
+    const now = Date.now();
+    const disconnectBoundary = this.syncOnConnectDisconnectBoundary(remotePeer, now);
+    const lastSuccessfulSync = this.lastSuccessfulSyncAt.get(remotePeer);
+    if (
+      lastSuccessfulSync != null &&
+      lastSuccessfulSync > disconnectBoundary &&
+      now - lastSuccessfulSync < SYNC_STALENESS_THRESHOLD_MS
+    ) {
+      return false;
+    }
+
+    const lastQueued = this.catchupOnConnectAt.get(remotePeer) ?? 0;
+    if (lastQueued > disconnectBoundary && now - lastQueued < CATCHUP_ON_CONNECT_COOLDOWN_MS) {
+      return false;
+    }
+
+    const backoff = this.syncReconcilerBackoff.get(remotePeer);
+    if (backoff && now < backoff.nextRetryAt) {
+      return false;
+    }
+
+    this.catchupOnConnectAt.set(remotePeer, now);
+    setTimeout(() => {
+      this.runSyncFromPeerOnConnect(remotePeer, handleSyncError).catch((err: unknown) => {
+        handleSyncError(remotePeer, err);
+      });
+    }, delayMs);
+    return true;
+  }
+
+  async runSyncFromPeerOnConnect(
+    this: DKGAgent,
+    remotePeer: string,
+    handleSyncError: (remotePeer: string, err: unknown) => void,
+  ): Promise<void> {
+    const now = Date.now();
+    const backoff = this.syncReconcilerBackoff.get(remotePeer);
+    if (backoff && now < backoff.nextRetryAt) return;
+
+    const lastOk = this.lastSuccessfulSyncAt.get(remotePeer);
+    const lastProgress = this.lastSyncProgressAt.get(remotePeer);
+    const probe = await this.getSyncReconcilerProbe(remotePeer);
+    let syncAccountingClearedBackoff = false;
+    try {
+      const outcome = await this.trySyncFromPeer(remotePeer, () => {
+        syncAccountingClearedBackoff = true;
+      });
+      if (
+        outcome === 'synced' &&
+        !syncAccountingClearedBackoff &&
+        this.lastSuccessfulSyncAt.get(remotePeer) === lastOk &&
+        this.lastSyncProgressAt.get(remotePeer) === lastProgress
+      ) {
+        this.recordSyncReconcilerFailure(remotePeer, probe);
+      }
+    } catch (err: unknown) {
+      if (err instanceof SyncOnConnectPostSyncError) {
+        if (err.backoffEligible) {
+          this.recordSyncReconcilerFailure(remotePeer, probe);
+        }
+      } else {
+        this.recordSyncReconcilerFailure(remotePeer, probe);
+      }
+      handleSyncError(remotePeer, err);
+    }
+  }
+
   /**
    * Pull all triples for the given context graphs from a remote peer and merge
    * them into our local store. Used on peer:connect for initial catch-up,
@@ -2416,6 +2475,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       getPeerProtocols: (peerId) => this.getPeerProtocols(peerId),
       knownCorePeerIds: this.knownCorePeerIds,
       getSyncContextGraphs: () => this.config.syncContextGraphs ?? [],
+      getSharedMemorySyncContextGraphs: () => this.getSharedMemorySyncContextGraphs(),
       syncFromPeer: (peerId, contextGraphIds) => this.syncFromPeerDetailed(
         peerId,
         contextGraphIds ?? [SYSTEM_CONTEXT_GRAPHS.AGENTS, SYSTEM_CONTEXT_GRAPHS.ONTOLOGY, ...(this.config.syncContextGraphs ?? [])],
@@ -2443,6 +2503,16 @@ export class LifecycleSyncMethods extends DKGAgentBase {
         }
       },
     });
+  }
+
+  async getSharedMemorySyncContextGraphs(this: DKGAgent): Promise<string[]> {
+    const eligible: string[] = [];
+    for (const contextGraphId of this.config.syncContextGraphs ?? []) {
+      if (await this.canUseSharedMemoryForContextGraph(contextGraphId)) {
+        eligible.push(contextGraphId);
+      }
+    }
+    return eligible;
   }
 
   /**
@@ -2510,7 +2580,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       const peerId = pid.toString();
       if (this.syncingPeers.has(peerId)) continue;
       const lastOk = this.lastSuccessfulSyncAt.get(peerId);
-      const lastDisconnected = this.lastSyncDisconnectedAt.get(peerId) ?? 0;
+      const lastDisconnected = this.syncOnConnectDisconnectBoundary(peerId, now);
       const lastProgress = this.lastSyncProgressAt.get(peerId);
       const lastSyncCooldown = Math.max(lastOk ?? 0, lastProgress ?? 0);
       const stale = lastSyncCooldown === 0

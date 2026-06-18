@@ -153,6 +153,24 @@ export const SYSTEM_CONTEXT_GRAPHS = {
   ONTOLOGY: 'ontology',
 } as const;
 
+/**
+ * The agent registry (`agents`) system context graph is genesis-seeded and never
+ * registered on-chain, so its profile publishes are always tentative and the
+ * per-publish KC/KA `_meta` tracking record has no consumer — agent facts are
+ * served from the DATA graph. Persisting that `_meta` on every heartbeat
+ * (locally, and once per gossiped peer heartbeat) grows `agents/_meta` without
+ * bound (#1233). The two highest-volume write paths gate on this single
+ * predicate: the local publish terminal and the gossip publish receiver (the
+ * dominant per-peer-heartbeat source). The remaining publisher paths — the
+ * update restatement and the direct-protocol receive handler — are intentionally
+ * deferred to a follow-up that prunes/bounds the record rather than skipping it,
+ * because there the `_meta` is load-bearing (prior-root cleanup + the tentative
+ * lifecycle). See #1233.
+ */
+export function isAgentRegistryContextGraph(contextGraphId: string): boolean {
+  return contextGraphId === SYSTEM_CONTEXT_GRAPHS.AGENTS;
+}
+
 export const DKG_ONTOLOGY = {
   RDF_TYPE: `${RDF}type`,
   SCHEMA_NAME: `${SCHEMA}name`,

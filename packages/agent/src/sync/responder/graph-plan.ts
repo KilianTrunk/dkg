@@ -216,8 +216,15 @@ export function createResponderSyncRowListMemo(
 
       const load = loadRows()
         .then((rows) => {
+          // The owner's snapshot load (`readRowsAcrossGraphs` et al.) is NOT
+          // abort-aware — it carries no signal, so a settled `rows` here is the
+          // COMPLETE snapshot regardless of whether the owner's stream aborted
+          // mid-wait. Cache it unconditionally so a later same-session request
+          // (which coalesces on this `key`) reuses it instead of re-querying the
+          // store. The owner's own abort still surfaces at the `throwIfAborted`
+          // below, after `await load`, so the aborted request still rejects; it
+          // just no longer discards the snapshot it already paid to build.
           const value = [...rows];
-          throwIfAborted(options?.signal);
           storeCached(key, value);
           return value;
         })

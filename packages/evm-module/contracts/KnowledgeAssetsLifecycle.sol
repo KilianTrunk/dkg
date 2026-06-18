@@ -139,7 +139,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     //          now fed exclusively by committed PCA allocation. The
     //          `publisherNodeIdentityId` struct field is retained as a
     //          self-claimed attribution (no longer scoring).
-    string private constant _VERSION = "10.1.1";
+    string private constant _VERSION = "10.1.2";
 
     /// @notice OT-RFC-49 / WS-B Trap 3: domain-separation version prepended to the
     ///         RAW publish/update ACK preimage (`abi.encodePacked`, later wrapped by
@@ -521,7 +521,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
 
         // OT-RFC-53: spend the CG owner's prepaid registration escrow first
         // (no-op for third-party publishers into an open CG, or when the CG has
-        // no escrow). The escrow-funded portion is already net in the CSS vault,
+        // no escrow). The escrow-funded portion is already gross in the CSS vault,
         // so distribute it directly; charge only the remainder below.
         uint96 fromEscrow = _useCgEscrow(p.contextGraphId, p.tokenAmount);
         if (fromEscrow > 0) {
@@ -884,7 +884,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         uint256 cgId = contextGraphStorage.kaToContextGraph(id);
 
         // OT-RFC-53: spend the CG owner's prepaid registration escrow first.
-        // The escrow-funded portion is already net in the CSS vault, so
+        // The escrow-funded portion is already gross in the CSS vault, so
         // distribute it over the extension window directly; charge only the
         // remainder. The CG-value write below stays on the GROSS `tokenAmount`
         // regardless of payment source, so random-sampling weight tracks the
@@ -1302,7 +1302,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         if (deltaTokenAmount == 0) return;
 
         // OT-RFC-53: spend the CG owner's prepaid registration escrow first.
-        // The escrow-funded portion is already net in the CSS vault, so
+        // The escrow-funded portion is already gross in the CSS vault, so
         // distribute it directly; charge only the remainder below.
         uint96 fromEscrow = _useCgEscrow(contextGraphStorage.kaToContextGraph(p.id), deltaTokenAmount);
         if (fromEscrow > 0) {
@@ -1661,7 +1661,8 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
 
     /// @dev OT-RFC-53: draw down the CG owner's prepaid registration escrow to
     ///      cover up to `cost`. Returns the escrow-funded `used` amount (already
-    ///      decremented; the underlying TRAC sits in the CSS vault, net of fee).
+    ///      decremented; the underlying TRAC sits in the CSS vault, gross —
+    ///      no fee is skimmed at deposit, so escrow draws are gross-for-gross).
     ///      The caller distributes `used` over the relevant epoch window and
     ///      charges only `cost - used` to the wallet. Owner-scoped: a third
     ///      party publishing into an open CG gets `used == 0` (the escrow is the

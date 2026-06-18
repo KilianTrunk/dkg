@@ -248,6 +248,24 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
         'Pass both explicitly — e.g. { accessPolicy: 1, publishPolicy: 0 } for invite-only + curators-only.',
       );
     }
+
+    // OT-RFC-53: when the on-chain CG registration deposit is active, approve
+    // it to the ContextGraphs facade, which pulls it into the CSS vault as the
+    // CG's prepaid publishing escrow. No-op when the deposit is 0 (dormant) or
+    // ParametersStorage is unresolved.
+    const ps = this.contracts.parametersStorage as Contract | undefined;
+    if (ps) {
+      const deposit: bigint = await ps.contextGraphRegistrationDeposit();
+      if (deposit > 0n) {
+        await this.ensureV10ApproveTrac(
+          this.signer,
+          await this.contracts.contextGraphs.getAddress(),
+          deposit,
+          'cg registration deposit',
+        );
+      }
+    }
+
     const receipt = await this.sendContractTransaction(
       this.contracts.contextGraphs,
       'createContextGraph',

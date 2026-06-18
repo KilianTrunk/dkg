@@ -78,8 +78,7 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable, Re
     event ContextGraphRegistrationDeposited(
         uint256 indexed contextGraphId,
         address indexed payer,
-        uint96 gross,
-        uint96 net
+        uint96 amount
     );
 
     /// @notice Emitted when an admin sweeps a CG's residual escrow to the pool.
@@ -103,7 +102,11 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable, Re
             epochStorage = EpochStorage(hub.getContractAddress("EpochStorageV8"));
             chronos = Chronos(hub.getContractAddress("Chronos"));
         } catch {
-            // ParametersStorage not registered — registration deposit stays off.
+            // Any deposit-stack lookup missing ⇒ feature stays off. Reset
+            // parametersStorage so the createContextGraph guard
+            // (address(parametersStorage) != 0) treats a partial resolution
+            // (e.g. ParametersStorage present but Token absent) as fully off.
+            parametersStorage = ParametersStorage(address(0));
         }
     }
 
@@ -201,32 +204,19 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable, Re
         if (token.balanceOf(msg.sender) < deposit) {
             revert TokenLib.TooLowBalance(address(token), token.balanceOf(msg.sender), deposit);
         }
-        (uint96 fee, address treasury) = _treasuryFee(deposit);
-        uint96 net = deposit - fee;
-        if (!token.transferFrom(msg.sender, address(convictionStakingStorage), net)) {
+        // The deposit is escrowed GROSS in the CSS vault and tracked gross, so
+        // the consume path subtracts it directly from the gross publish cost
+        // (no net-vs-gross mismatch). The protocol treasury fee is intentionally
+        // NOT skimmed here: escrow-funded publishing routes the full amount to
+        // the staker pool, and only the wallet-funded remainder pays the fee via
+        // `KnowledgeAssetsLifecycle._addTokens`. (A treasury cut on escrow, if
+        // ever wanted, would be skimmed at consume/sweep — out of scope while
+        // the treasury fee is dormant.)
+        if (!token.transferFrom(msg.sender, address(convictionStakingStorage), deposit)) {
             revert TokenLib.TransferFailed();
         }
-        if (fee > 0 && treasury != address(0)) {
-            if (!token.transferFrom(msg.sender, treasury, fee)) {
-                revert TokenLib.TransferFailed();
-            }
-        }
-        contextGraphStorage.setRegistrationEscrow(contextGraphId, net);
-        emit ContextGraphRegistrationDeposited(contextGraphId, msg.sender, deposit, net);
-    }
-
-    /// @dev Mirrors KnowledgeAssetsLifecycle._treasuryFee. Dormant (returns 0)
-    ///      while `protocolTreasury` is unset — the current configuration.
-    function _treasuryFee(uint96 amount) internal view returns (uint96 fee, address treasury) {
-        treasury = parametersStorage.protocolTreasury();
-        if (treasury == address(0)) {
-            return (0, address(0));
-        }
-        uint16 bps = parametersStorage.protocolTreasuryFee();
-        if (bps == 0) {
-            return (0, treasury);
-        }
-        fee = uint96((uint256(amount) * uint256(bps)) / 10_000);
+        contextGraphStorage.setRegistrationEscrow(contextGraphId, deposit);
+        emit ContextGraphRegistrationDeposited(contextGraphId, msg.sender, deposit);
     }
 
     /// @notice Admin: sweep a CG's residual registration escrow into the staker

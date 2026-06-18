@@ -19,7 +19,12 @@ import {
 //
 // The tree is left BACKFILL-LOCKED so we can `seed` fake leaves cheaply to grow N;
 // previewChallengeForSeed (the draw) is not gated by the lock, so it still runs.
-describe('@gas RandomSampling BIT draw', () => {
+//
+// Pure gas benchmark — slow under coverage instrumentation and adds no unique
+// contract-line coverage, so skip the whole suite under coverage (same convention
+// as ContextGraphStorage.test.ts's heavy-test skip).
+const skipGasUnderCoverage = process.argv.some((a) => a.includes('coverage'));
+(skipGasUnderCoverage ? describe.skip : describe)('@gas RandomSampling BIT draw', () => {
   const OPEN_POLICY = 1;
   const TEST_KA_BYTE_SIZE = 128n;
   const DOMINANT = 10n ** 18n; // real CG weight dwarfs the fake unit leaves, so the draw lands on it

@@ -1367,7 +1367,12 @@ describe('@unit RandomSampling', () => {
     // active-weight share. Deterministic seed sequence, so this is a fixed
     // pass/fail check, not a flaky statistical one.
     // -----------------------------------------------------------------------
-    it('fairness: draw frequency within ±2pp of weight share (settled state)', async () => {
+    // 5000-draw statistical check: too slow under coverage instrumentation (each
+    // instrumented draw is far slower, so it exceeds the 600s mocha timeout on CI).
+    // It adds no unique contract-line coverage, so skip it under coverage — same
+    // convention as ContextGraphStorage.test.ts's heavy-test skip.
+    const skipFairnessUnderCoverage = process.argv.some((a) => a.includes('coverage'));
+    (skipFairnessUnderCoverage ? it.skip : it)('fairness: draw frequency within ±2pp of weight share (settled state)', async () => {
       const endEpoch = (await Chronos.getCurrentEpoch()) + 100n;
       const sharePct = [50n, 25n, 15n, 7n, 3n]; // sums to 100
       const cgIds: bigint[] = [];

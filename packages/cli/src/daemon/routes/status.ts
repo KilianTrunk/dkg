@@ -518,6 +518,7 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
     validTokens,
     apiHost,
     apiPortRef,
+    inFlightLimiter,
     url,
     path,
     requestToken,
@@ -694,6 +695,15 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
           ? await getCachedExternalStoreQuads(agent, Date.now())
           : null,
       uptimeMs: Date.now() - startedAt,
+      // Concurrency admission control (PR #1209): inFlight = requests currently
+      // holding a slot, max = the configured cap (0 = disabled), rejectedTotal =
+      // monotonic count of 503-shed requests since boot. Surfaced so operators
+      // can see whether the daemon is shedding load (and read the effective cap).
+      admission: {
+        inFlight: inFlightLimiter.inFlight,
+        max: inFlightLimiter.max,
+        rejectedTotal: inFlightLimiter.rejectedTotal,
+      },
       connectedPeers: uniquePeers.size,
       connections: {
         total: allConns.length,

@@ -94,4 +94,21 @@ describe('daemon admission control (real node, maxInFlightRequests=1)', () => {
     expect(burstStatuses.filter((s) => s === 503).length).toBeGreaterThan(0); // saturation really happened
     expect(burstStatuses.every((s) => s === 200 || s === 503)).toBe(true); // no unexpected failures
   }, 60_000);
+
+  it('surfaces admission stats on /api/status (effective cap + cumulative sheds)', async () => {
+    const d = daemon!;
+    // Force some shedding so rejectedTotal is provably non-zero regardless of
+    // test order, then read the stats off the exempt status endpoint.
+    await Promise.all(
+      Array.from({ length: 50 }, () => selectQuery(d).then((r) => r.status).catch(() => 0)),
+    );
+    const res = await fetch(`${d.base}/api/status`, { headers: authHeaders(d) });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { admission?: { inFlight: number; max: number; rejectedTotal: number } };
+
+    expect(body.admission).toBeDefined();
+    expect(body.admission!.max).toBe(1); // the pinned effective cap is surfaced
+    expect(typeof body.admission!.inFlight).toBe('number');
+    expect(body.admission!.rejectedTotal).toBeGreaterThan(0); // cumulative sheds are observable
+  }, 60_000);
 });

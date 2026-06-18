@@ -2917,6 +2917,7 @@ export async function runDaemonInner(
         apiHost,
         apiPortRef,
         routePlugins,
+        inFlightLimiter,
         emitMemoryGraphChanged,
         emitNotification,
       );

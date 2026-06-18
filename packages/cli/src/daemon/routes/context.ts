@@ -22,6 +22,7 @@ import type { FileStore } from '../../file-store.js';
 import type { VectorStore, EmbeddingProvider } from '../../vector-store.js';
 import type { CatchupTracker } from '../types.js';
 import type { RoutePlugin } from '../plugin-api.js';
+import type { InFlightLimiter } from '../http-utils.js';
 
 export type MemoryGraphLayer = 'wm' | 'swm' | 'vm';
 
@@ -83,6 +84,9 @@ export interface RequestContext {
   apiPortRef: { value: number };
   // Route plugins; dispatched by `handlePluginRoutes` before the trailing 404.
   routePlugins: RoutePlugin[];
+  // Concurrency admission limiter; `/api/status` surfaces its inFlight/max/
+  // rejectedTotal so operators can see whether the daemon is shedding load.
+  inFlightLimiter: InFlightLimiter;
   // Derived per-request (from req.url + headers + token). Routes read
   // `path`, `url`, `requestAgentAddress` extensively; pre-computing
   // here keeps every group on the same fast path.

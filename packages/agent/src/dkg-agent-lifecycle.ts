@@ -400,13 +400,21 @@ import { DKGAgentBase } from './dkg-agent-base.js';
 import type { DKGAgent } from './dkg-agent.js';
 
 const DEFAULT_HOST_MODE_RECONCILE_JITTER_RATIO = 0.15;
-const inFlightSyncPageFetchesByAgent = new WeakMap<DKGAgent, Map<string, Promise<SyncPageResult>>>();
+type InFlightSyncPageFetch = {
+  promise: Promise<SyncPageResult>;
+  controller: AbortController;
+  waiters: number;
+};
+
+const inFlightSyncPageFetchesByAgent = new WeakMap<DKGAgent, Map<string, InFlightSyncPageFetch>>();
 
 function syncPageFetchCoalescingKey(params: {
   remotePeerId: string;
   contextGraphId: string;
   includeSharedMemory: boolean;
   phase: SyncPhase;
+  graphUri: string;
+  deadline: number;
   snapshotRef?: string;
   sinceBatchId?: string;
   recovery?: boolean;
@@ -416,13 +424,15 @@ function syncPageFetchCoalescingKey(params: {
     params.contextGraphId,
     params.includeSharedMemory,
     params.phase,
+    params.graphUri,
+    params.deadline,
     params.snapshotRef ?? null,
     params.sinceBatchId ?? null,
     params.recovery === true,
   ]);
 }
 
-function inFlightSyncPageFetchesFor(agent: DKGAgent): Map<string, Promise<SyncPageResult>> {
+function inFlightSyncPageFetchesFor(agent: DKGAgent): Map<string, InFlightSyncPageFetch> {
   let inFlight = inFlightSyncPageFetchesByAgent.get(agent);
   if (!inFlight) {
     inFlight = new Map();
@@ -445,17 +455,39 @@ function asSyncFetchAbortError(reason: unknown): Error {
 }
 
 function waitForSyncPageFetch(
-  promise: Promise<SyncPageResult>,
+  entry: InFlightSyncPageFetch,
   signal: AbortSignal | undefined,
 ): Promise<SyncPageResult> {
-  if (!signal) return promise;
-  if (signal.aborted) return Promise.reject(asSyncFetchAbortError(signal.reason));
+  if (signal?.aborted) return Promise.reject(asSyncFetchAbortError(signal.reason));
+  entry.waiters += 1;
+
   return new Promise<SyncPageResult>((resolve, reject) => {
-    const onAbort = () => reject(asSyncFetchAbortError(signal.reason));
-    signal.addEventListener('abort', onAbort, { once: true });
-    promise.then(resolve, reject).finally(() => {
-      signal.removeEventListener('abort', onAbort);
-    });
+    let settled = false;
+    const release = (options?: { abortSharedIfLast?: boolean; reason?: unknown }) => {
+      if (settled) return;
+      settled = true;
+      if (signal) signal.removeEventListener('abort', onAbort);
+      entry.waiters -= 1;
+      if (entry.waiters === 0 && options?.abortSharedIfLast === true && !entry.controller.signal.aborted) {
+        entry.controller.abort(options.reason);
+      }
+    };
+    const onAbort = () => {
+      release({ abortSharedIfLast: true, reason: signal?.reason });
+      reject(asSyncFetchAbortError(signal?.reason));
+    };
+
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    entry.promise.then(
+      (value) => {
+        release();
+        resolve(value);
+      },
+      (error) => {
+        release();
+        reject(error);
+      },
+    );
   });
 }
 
@@ -2904,6 +2936,8 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       contextGraphId,
       includeSharedMemory,
       phase,
+      graphUri,
+      deadline,
       snapshotRef,
       sinceBatchId,
       recovery,
@@ -2911,12 +2945,28 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     const inFlight = inFlightSyncPageFetchesFor(this);
     const existing = inFlight.get(coalescingKey);
     if (existing) {
-      return waitForSyncPageFetch(existing, signal);
+      if (!existing.controller.signal.aborted) {
+        return waitForSyncPageFetch(existing, signal);
+      }
+      inFlight.delete(coalescingKey);
     }
     if (signal?.aborted) {
       return Promise.reject(asSyncFetchAbortError(signal.reason));
     }
 
+    const controller = new AbortController();
+    const abortSharedFetch = (reason: unknown) => {
+      if (!controller.signal.aborted) controller.abort(reason);
+    };
+    const nodeStopSignal = this.node.stopSignal;
+    const onNodeStop = () => abortSharedFetch(nodeStopSignal?.reason);
+    if (nodeStopSignal?.aborted) {
+      abortSharedFetch(nodeStopSignal.reason);
+    } else if (nodeStopSignal) {
+      nodeStopSignal.addEventListener('abort', onNodeStop, { once: true });
+    }
+
+    let entry!: InFlightSyncPageFetch;
     const sharedFetch = fetchSyncPages({
       ctx,
       remotePeerId,
@@ -2934,9 +2984,10 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       syncPageSize: SYNC_PAGE_SIZE,
       syncDeniedResponse: SYNC_DENIED_RESPONSE,
       // Caller AbortSignals are waiter-scoped below: one duplicate trigger
-      // timing out must not abort the shared fetch for the other waiters. Node
-      // shutdown still aborts the underlying transport through stopSignal.
-      signal: this.node.stopSignal,
+      // timing out must not abort the shared fetch for the other waiters. The
+      // shared fetch itself is cancelled on node shutdown or when every waiter
+      // has detached.
+      signal: controller.signal,
       // Legacy sentinel that older (pre-v10-rc) responders still emit on ACL
       // denial. Recognising it in the requester is what keeps mixed-version
       // catch-up correct: without the second sentinel, a curated-CG denial
@@ -2974,17 +3025,19 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       logInfo: (opCtx, message) => this.log.info(opCtx, message),
       logDebug: (opCtx, message) => this.log.debug(opCtx, message),
     }).finally(() => {
-      if (inFlight.get(coalescingKey) === sharedFetch) {
+      nodeStopSignal?.removeEventListener('abort', onNodeStop);
+      if (inFlight.get(coalescingKey) === entry) {
         inFlight.delete(coalescingKey);
       }
     });
     sharedFetch.catch(() => {
-      // The underlying fetch can outlive all waiter-scoped aborts. Keep late
-      // failures from becoming unhandled while still propagating them to active
-      // waiters through the original promise.
+      // The shared fetch can reject after every waiter has already detached.
+      // Keep that from becoming unhandled while still propagating failures to
+      // active waiters through the original promise.
     });
-    inFlight.set(coalescingKey, sharedFetch);
-    return waitForSyncPageFetch(sharedFetch, signal);
+    entry = { promise: sharedFetch, controller, waiters: 0 };
+    inFlight.set(coalescingKey, entry);
+    return waitForSyncPageFetch(entry, signal);
   }
 
   /**

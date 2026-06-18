@@ -7,6 +7,7 @@ import type { SyncPageResult } from '../src/sync/requester/page-fetch.js';
 
 const PEER_A = '12D3KooWSmU3owJvB9sFw8uApDgKrv2VBMecsGGvgAc4Gq6hB57M';
 const PEER_B = '12D3KooWAbLiM6Xy2TfXtFpUrXqttnTSuctW8Lo1mkauaijsNrWw';
+const DEFAULT_DEADLINE = Date.UTC(2100, 0, 1);
 
 type FetchArgs = {
   remotePeerId?: string;
@@ -58,7 +59,7 @@ function fetchPages(agent: DKGAgent, args: FetchArgs = {}): Promise<SyncPageResu
     args.includeSharedMemory ?? false,
     args.phase ?? 'data',
     args.graphUri ?? 'did:dkg:context-graph:coalesced-cg',
-    args.deadline ?? Date.now() + 60_000,
+    args.deadline ?? DEFAULT_DEADLINE,
     args.snapshotRef,
     args.sinceBatchId,
     args.signal,
@@ -97,6 +98,8 @@ describe('DKGAgent sync fetch coalescing', () => {
       { name: 'contextGraphId', base: {}, variant: { contextGraphId: 'other-cg', graphUri: 'did:dkg:context-graph:other-cg' } },
       { name: 'includeSharedMemory', base: {}, variant: { includeSharedMemory: true, graphUri: 'did:dkg:context-graph:coalesced-cg/_shared_memory' } },
       { name: 'phase', base: {}, variant: { phase: 'meta', graphUri: 'did:dkg:context-graph:coalesced-cg/_meta' } },
+      { name: 'graphUri', base: {}, variant: { graphUri: 'did:dkg:context-graph:coalesced-cg/_alternate' } },
+      { name: 'deadline', base: {}, variant: { deadline: DEFAULT_DEADLINE + 1 } },
       {
         name: 'snapshotRef',
         base: { includeSharedMemory: true, phase: 'snapshot', graphUri: '', snapshotRef: 'snapshot-a' },
@@ -180,6 +183,45 @@ describe('DKGAgent sync fetch coalescing', () => {
       response.resolve(new Uint8Array(0));
       await expect(first).resolves.toMatchObject({ quads: [] });
       expect(sends).toBe(1);
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  });
+
+  it('aborts the shared fetch when the last waiter aborts', async () => {
+    let sends = 0;
+    let sendSignal: AbortSignal | undefined;
+    const abortObserved = deferred<void>();
+    const agent = await createAgentWithSend(async (...args: unknown[]) => {
+      sends++;
+      const options = args[3] as { signal?: AbortSignal };
+      sendSignal = options.signal;
+      return new Promise<Uint8Array>((_resolve, reject) => {
+        const rejectAbort = () => {
+          abortObserved.resolve();
+          const err = new Error('shared fetch aborted');
+          err.name = 'AbortError';
+          reject(err);
+        };
+        if (options.signal?.aborted) {
+          rejectAbort();
+          return;
+        }
+        options.signal?.addEventListener('abort', rejectAbort, { once: true });
+      });
+    });
+    const abort = new AbortController();
+
+    try {
+      const waiter = fetchPages(agent, { signal: abort.signal });
+      await flushMicrotasks();
+      expect(sends).toBe(1);
+      expect(sendSignal?.aborted).toBe(false);
+
+      abort.abort(new Error('only waiter aborted'));
+      await expect(waiter).rejects.toMatchObject({ name: 'AbortError', message: 'only waiter aborted' });
+      await abortObserved.promise;
+      expect(sendSignal?.aborted).toBe(true);
     } finally {
       await agent.stop().catch(() => {});
     }

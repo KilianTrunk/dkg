@@ -34,8 +34,7 @@ export function isRecoverableSendError(err: unknown): boolean {
     msg.includes('no valid addresses') ||
     (msg.includes('sync responder') &&
       (msg.includes('queue full') ||
-        msg.includes('queue wait exceeded') ||
-        msg.includes('snapshot limit exceeded'))) ||
+        msg.includes('queue wait exceeded'))) ||
     // libp2p dial exhaustion — every known multiaddr for the peer
     // failed in one attempt. Surfaced by `transportManager.dial` and
     // by `dialProtocol` after iterating every relay/transport

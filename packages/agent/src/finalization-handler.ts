@@ -16,7 +16,7 @@ import { GraphManager, type TripleStore, type Quad } from '@origintrail-official
 import { type ChainAdapter, type EventFilter } from '@origintrail-official/dkg-chain';
 import {
   computeFlatKCRootV10 as computeFlatKCRoot, skolemizeByEntity,
-  generateConfirmedFullMetadata, buildDeterministicTokenRows, getTentativeStatusQuad,
+  generateConfirmedFullMetadata, buildDeterministicTokenRows, compareRootIris, getTentativeStatusQuad,
   generateSubGraphRegistration,
   shouldApplyMaterialization, writeMaterializedVersion, withMaterializationLock,
   type MaterializedVersion,
@@ -1074,7 +1074,7 @@ export class FinalizationHandler {
     // dependency — see dkg-publisher.ts), so a content-derived sort makes the
     // map a pure function of the root SET: identical on every replica and on
     // both the gossip and chain-reconcile promotion paths.
-    const orderedRoots = [...rootEntities].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    const orderedRoots = [...rootEntities].sort(compareRootIris);
 
     for (let tokenIdx = 0; tokenIdx < orderedRoots.length; tokenIdx++) {
       const rootEntity = orderedRoots[tokenIdx];

@@ -311,6 +311,17 @@ export function generateConfirmedFullMetadata(
  * (lexicographically-sorted-by-rootEntity) tokenId order — both call sites sort
  * before minting.
  */
+/**
+ * GH #936 — the canonical root ordering used for deterministic compatibility
+ * tokenId assignment. The publisher (originator), the gossip path, and the
+ * chain-reconcile path MUST all assign `<ual>/<tokenId>` over roots sorted by
+ * THIS comparator, so every node derives the identical rootEntity→tokenId map.
+ * Shared here so the invariant is API-enforced rather than comment-enforced.
+ */
+export function compareRootIris(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 export function buildDeterministicTokenRows(
   ual: string,
   kaEntries: ReadonlyArray<{ tokenId: bigint; rootEntity: string }>,

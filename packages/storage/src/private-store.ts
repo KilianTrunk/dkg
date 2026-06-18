@@ -213,7 +213,7 @@ export class PrivateContentStore {
           // write) so the new commitment fully replaces it, then stamp the new
           // commitment marker. Repeated stores under the SAME commitment fall
           // through to the append+dedup path below (chunked/retry-safe).
-          await this.store.deleteBySubjectPrefix(graphUri, rootEntity);
+          await this.deleteRootPrivateSlice(graphUri, rootEntity);
           await this.store.deleteByPattern({ graph: graphUri, subject: markerSubject });
           await this.store.insert([{
             subject: markerSubject,
@@ -366,10 +366,25 @@ export class PrivateContentStore {
   ): Promise<void> {
     assertSafeIri(rootEntity);
     const graphUri = this.privateGraph(contextGraphId, subGraphName);
-    await this.store.deleteBySubjectPrefix(graphUri, rootEntity);
+    await this.deleteRootPrivateSlice(graphUri, rootEntity);
     const key = this.privateKey(contextGraphId, subGraphName);
     const entities = this.privateEntities.get(key);
     if (entities) entities.delete(rootEntity);
+  }
+
+  /**
+   * Delete exactly ONE root's private slice from `graphUri`: the exact root
+   * subject plus its skolem children (`<root>/.well-known/genid/…`), the SAME
+   * shape `getPrivateTriples` reads. We deliberately do NOT use a bare
+   * `deleteBySubjectPrefix(root)` — RDF root IRIs are not prefix-delimited, so a
+   * raw prefix would also delete sibling roots that share it (e.g. superseding
+   * `urn:device:1` would nuke `urn:device:10`'s private triples). The skolem
+   * prefix IS delimited (`…/.well-known/genid/`), so it is collision-safe.
+   */
+  private async deleteRootPrivateSlice(graphUri: string, rootEntity: string): Promise<void> {
+    assertSafeIri(rootEntity);
+    await this.store.deleteByPattern({ graph: graphUri, subject: rootEntity });
+    await this.store.deleteBySubjectPrefix(graphUri, `${rootEntity}/.well-known/genid/`);
   }
 
   /**

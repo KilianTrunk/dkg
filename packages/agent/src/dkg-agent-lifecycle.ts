@@ -1518,19 +1518,15 @@ export class LifecycleSyncMethods extends DKGAgentBase {
                 // hook). Find the subscribed-but-unbound CG whose locally-resolved
                 // on-chain id matches THIS event and bind + reconcile only it —
                 // targeted, not a global sweep, so an unrelated KA registration
-                // touches nothing. The periodic self-priming sweep remains the
-                // safety net for a CG whose OnChainId quad hasn't arrived yet.
+                // touches nothing. Uses the SAME self-prime helper as the
+                // periodic sweep (single bind/persist/cursor-reset path); the
+                // sweep remains the safety net for a CG whose quad hasn't arrived.
                 let targetOnChain: bigint | null = null;
                 try { targetOnChain = BigInt(onChainId); } catch { targetOnChain = null; }
                 if (targetOnChain !== null) {
                   for (const [lcg, sub] of this.subscribedContextGraphs) {
-                    if (!sub.subscribed || sub.onChainId) continue;
-                    const resolved = await this.getContextGraphOnChainId(lcg).catch(() => null);
-                    let resolvedNum: bigint | null = null;
-                    try { resolvedNum = resolved ? BigInt(resolved) : null; } catch { resolvedNum = null; }
-                    if (resolvedNum !== null && resolvedNum === targetOnChain) {
-                      this.bindSubscriptionOnChainId(lcg, sub, resolved!);
-                      this.persistContextGraphSubscription(lcg);
+                    const bound = await this.selfPrimeSubscriptionOnChainId(lcg, sub, targetOnChain);
+                    if (bound) {
                       this.log.info(ctx, `Phase B: KACG nudge cg=${onChainId} ka=${kaId} -> bound + reconcile pre-subscribed "${lcg}"`);
                       if (this.reconcileCoalescer) void this.reconcileCoalescer.trigger(lcg);
                       break;

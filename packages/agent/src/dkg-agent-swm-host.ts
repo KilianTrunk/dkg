@@ -2348,39 +2348,55 @@ export class SwmHostModeMethods extends DKGAgentBase {
   async runVmReconcileSweep(this: DKGAgent): Promise<void> {
     if (!this.vmReconcileEnabled() || !this.reconcileCoalescer) return;
     for (const [localCgId, sub] of this.subscribedContextGraphs) {
-      // GH #1098 — self-prime the on-chain id for a pre-subscribed PUBLIC member
-      // CG. A peer that subscribed BEFORE the CG's first publish has
-      // `sub.onChainId` unset: the chain `ContextGraphCreated` handler only binds
-      // it for CURATED CGs, and the ACK-signer path (`recordCoreHostedPublicCg`)
-      // only fires for cores in that publish's storage-ACK set. Left unbound, the
-      // sweep below skips the CG and the peer is stranded on the unreliable
-      // one-shot finalization gossip (the ~1/3 materialization + kc-not-synced
-      // spam in #1098). As soon as the CG's OnChainId quad is local (publisher
-      // ontology-topic broadcast or durable _meta sync), resolve + bind it so the
-      // reliable chain-driven reconcile/backfill runs for this peer — the same
-      // path the late-subscriber (#886) and ACK-signer cores already converge on.
-      // Best-effort + gated on `!sub.onChainId` so it binds at most once (a later
-      // id CHANGE would reset the cursor; binding from undefined never does).
+      // GH #1098 — self-prime onChainId for a pre-subscribed PUBLIC member CG
+      // (subscribed BEFORE its first publish, so unbound) before the skip-gate
+      // below would pass it over. Shared with the live KACG nudge.
       if (sub.subscribed && !sub.onChainId) {
-        try {
-          // Bind ANY non-null resolved on-chain id. getContextGraphOnChainId
-          // returns the persisted OnChainId quad (or null) — it never falls back
-          // to localCgId, so a `resolved === localCgId` match is legitimate for a
-          // direct CG whose local id IS its numeric on-chain id (e.g. "42"); a
-          // `!== localCgId` guard would wrongly leave such a sub unbound forever.
-          const resolved = await this.getContextGraphOnChainId(localCgId);
-          if (resolved) {
-            this.bindSubscriptionOnChainId(localCgId, sub, resolved);
-            this.persistContextGraphSubscription(localCgId);
-          }
-        } catch {
-          /* a store/RPC hiccup on one CG must not abort the whole sweep */
-        }
+        await this.selfPrimeSubscriptionOnChainId(localCgId, sub);
       }
       // Member subscriptions AND Phase D core-hosted public CGs get swept.
       if ((!sub.subscribed && !sub.coreHosted) || !sub.onChainId) continue;
       void this.reconcileCoalescer.trigger(localCgId);
     }
+  }
+
+  /**
+   * GH #1098 — bind `sub.onChainId` for a subscribed-but-unbound CG from the
+   * locally-resolvable OnChainId quad (publisher ontology broadcast / durable
+   * _meta sync), then persist. The chain `ContextGraphCreated` handler only
+   * binds CURATED CGs and the ACK-signer hook only fires for cores in a
+   * publish's storage-ACK set, so a pre-subscribed PUBLIC member would otherwise
+   * stay unbound — stranded on the unreliable one-shot finalization gossip.
+   * SHARED by the periodic sweep and the live KACG nudge so the bind / persist /
+   * cursor-reset semantics (in {@link bindSubscriptionOnChainId}) live in ONE
+   * place. `targetOnChainId`: when set (the nudge), bind only if the resolved id
+   * matches THIS event; when omitted (the sweep), bind any non-null id —
+   * `getContextGraphOnChainId` never falls back to `localCgId`, so a
+   * `resolved === localCgId` match is legitimate for a direct CG. Best-effort:
+   * a store/RPC hiccup yields null instead of throwing. Returns the bound id.
+   */
+  async selfPrimeSubscriptionOnChainId(
+    this: DKGAgent,
+    localCgId: string,
+    sub: ContextGraphSub,
+    targetOnChainId?: bigint,
+  ): Promise<string | null> {
+    if (!sub.subscribed || sub.onChainId) return null;
+    let resolved: string | null = null;
+    try {
+      resolved = await this.getContextGraphOnChainId(localCgId);
+    } catch {
+      return null;
+    }
+    if (!resolved) return null;
+    if (targetOnChainId !== undefined) {
+      let resolvedNum: bigint | null = null;
+      try { resolvedNum = BigInt(resolved); } catch { return null; }
+      if (resolvedNum !== targetOnChainId) return null;
+    }
+    this.bindSubscriptionOnChainId(localCgId, sub, resolved);
+    this.persistContextGraphSubscription(localCgId);
+    return resolved;
   }
 
   /**

@@ -21,6 +21,7 @@ import { isFailClosedInlineEncrypt } from './async-lift-publish-options.js';
 import {
   generateConfirmedFullMetadata,
   buildDeterministicTokenRows,
+  compareRootIris,
   generateOwnershipQuads,
   generateAssertionCreatedMetadata,
   generateAssertionPromotedMetadata,
@@ -1909,7 +1910,7 @@ export class DKGPublisher implements Publisher {
     // queries. These tokenIds are non-on-chain compatibility labels (the
     // on-chain KA count is 1), so a content-derived sort is safe.
     const orderedEntries = [...canonical.manifestEntries].sort((a, b) =>
-      a.rootEntity < b.rootEntity ? -1 : a.rootEntity > b.rootEntity ? 1 : 0,
+      compareRootIris(a.rootEntity, b.rootEntity),
     );
     let compatibilityTokenId = 1n;
     for (const entry of orderedEntries) {

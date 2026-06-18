@@ -502,6 +502,16 @@ function jitteredIntervalMs(intervalMs: number, ratio: number | undefined): numb
   return Math.max(1, Math.round(intervalMs - delta + Math.random() * delta * 2));
 }
 
+type SharedMemorySyncContextGraphPlan = {
+  publicContextGraphIds: string[];
+  privateRecoverFromCurator: string[];
+  eligibleContextGraphIds: string[];
+};
+
+function sameStringArray(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
 export class LifecycleSyncMethods extends DKGAgentBase {
   async start(this: DKGAgent): Promise<void> {
     if (this.started) return;
@@ -2428,22 +2438,37 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     const backoff = this.syncReconcilerBackoff.get(remotePeer);
     if (backoff && now < backoff.nextRetryAt) return;
 
+    const probe = await this.getSyncReconcilerProbe(remotePeer);
+    try {
+      await this.attemptSyncFromPeerWithReconcilerAccounting(remotePeer, probe);
+    } catch (err: unknown) {
+      handleSyncError(remotePeer, err);
+    }
+  }
+
+  async attemptSyncFromPeerWithReconcilerAccounting(
+    this: DKGAgent,
+    remotePeer: string,
+    probe: SyncReconcilerProbe,
+  ): Promise<SyncOnConnectOutcome | 'not-started'> {
     const lastOk = this.lastSuccessfulSyncAt.get(remotePeer);
     const lastProgress = this.lastSyncProgressAt.get(remotePeer);
-    const probe = await this.getSyncReconcilerProbe(remotePeer);
     let syncAccountingClearedBackoff = false;
     try {
       const outcome = await this.trySyncFromPeer(remotePeer, () => {
         syncAccountingClearedBackoff = true;
       });
       if (
-        outcome === 'synced' &&
+        outcome !== 'skipped-no-sync' &&
+        outcome !== 'already-syncing' &&
+        outcome !== 'not-started' &&
         !syncAccountingClearedBackoff &&
         this.lastSuccessfulSyncAt.get(remotePeer) === lastOk &&
         this.lastSyncProgressAt.get(remotePeer) === lastProgress
       ) {
         this.recordSyncReconcilerFailure(remotePeer, probe);
       }
+      return outcome;
     } catch (err: unknown) {
       if (err instanceof SyncOnConnectPostSyncError) {
         if (err.backoffEligible) {
@@ -2452,7 +2477,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       } else {
         this.recordSyncReconcilerFailure(remotePeer, probe);
       }
-      handleSyncError(remotePeer, err);
+      throw err;
     }
   }
 
@@ -2469,13 +2494,26 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     if (!this.started) {
       return 'not-started';
     }
+    const sharedMemorySyncPlans = new Map<string, Promise<SharedMemorySyncContextGraphPlan>>();
+    const getSharedMemorySyncPlan = (peerId: string): Promise<SharedMemorySyncContextGraphPlan> => {
+      let plan = sharedMemorySyncPlans.get(peerId);
+      if (!plan) {
+        plan = this.planSharedMemorySyncContextGraphs(
+          peerId,
+          this.config.syncContextGraphs ?? [],
+          createOperationContext('sync'),
+        );
+        sharedMemorySyncPlans.set(peerId, plan);
+      }
+      return plan;
+    };
     return runSyncOnConnect({
       remotePeer,
       syncingPeers: this.syncingPeers,
       getPeerProtocols: (peerId) => this.getPeerProtocols(peerId),
       knownCorePeerIds: this.knownCorePeerIds,
       getSyncContextGraphs: () => this.config.syncContextGraphs ?? [],
-      getSharedMemorySyncContextGraphs: (peerId) => this.getSharedMemorySyncContextGraphs(peerId),
+      getSharedMemorySyncContextGraphs: async (peerId) => (await getSharedMemorySyncPlan(peerId)).eligibleContextGraphIds,
       syncFromPeer: (peerId, contextGraphIds) => this.syncFromPeerDetailed(
         peerId,
         contextGraphIds ?? [SYSTEM_CONTEXT_GRAPHS.AGENTS, SYSTEM_CONTEXT_GRAPHS.ONTOLOGY, ...(this.config.syncContextGraphs ?? [])],
@@ -2486,7 +2524,10 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       ),
       refreshMetaSyncedFlags: (contextGraphIds) => this.refreshMetaSyncedFlags(contextGraphIds),
       discoverContextGraphsFromStore: () => this.discoverContextGraphsFromStore(),
-      syncSharedMemoryFromPeer: (peerId, contextGraphIds) => this.syncSharedMemoryFromPeerDetailed(peerId, contextGraphIds, { stopOnBackoffWorthyFailure: true }),
+      syncSharedMemoryFromPeer: async (peerId, contextGraphIds) => this.syncSharedMemoryFromPeerDetailed(peerId, contextGraphIds, {
+        stopOnBackoffWorthyFailure: true,
+        sharedMemorySyncPlan: await getSharedMemorySyncPlan(peerId),
+      }),
       syncSharedMemoryOnConnect: this.config.syncSharedMemoryOnConnect ?? true,
       logInfo: (ctx, message) => this.log.info(ctx, message),
       onPeerSkippedNoSync: (peerId) => {
@@ -2509,20 +2550,134 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     });
   }
 
-  async getSharedMemorySyncContextGraphs(this: DKGAgent, remotePeerId?: string): Promise<string[]> {
-    const eligible: string[] = [];
-    for (const contextGraphId of this.config.syncContextGraphs ?? []) {
-      if (await this.canUseSharedMemoryForContextGraph(contextGraphId)) {
-        if (remotePeerId && await this.isPrivateContextGraph(contextGraphId)) {
-          const { peerIds, curatorIsLocal } = await this.resolveCuratorPeerIdsForCg(contextGraphId);
-          if (curatorIsLocal || !peerIds.includes(remotePeerId)) {
+  async planSharedMemorySyncContextGraphs(
+    this: DKGAgent,
+    remotePeerId: string | undefined,
+    contextGraphIds: readonly string[],
+    ctx: OperationContext,
+  ): Promise<SharedMemorySyncContextGraphPlan> {
+    // M2 (curator-leader convergence): a PRIVATE CG converges by REPLACE-recovering the
+    // current state from its CURATOR (the authoritative SWM replica), never the
+    // bidirectional mesh union-sync — which corrupts a reconnecting member into {old,new}
+    // AND pollutes the curator back (proven on devnet). PUBLIC CGs keep the union path
+    // (correct for cold-start / empty target).
+    const publicContextGraphIds: string[] = [];
+    const privateRecoverFromCurator: string[] = [];
+    const eligibleContextGraphIds: string[] = [];
+    // Memoized agent-registry lookup: resolve a curator WALLET -> its libp2p peer
+    // via the AGENTS registry (the authoritative agent->peer map), bypassing the
+    // dkg:curator/dkg:creator `_meta` triples — a member that pre-created the CG
+    // self-stamps both, which would otherwise resolve the member AS the curator.
+    let cachedAgents: Array<{ agentAddress?: string; peerId: string }> | undefined;
+    // Resolve EVERY libp2p peer the AGENTS registry advertises for a curator
+    // wallet, not the first match: `findAgents()` is not a unique wallet->peer
+    // map (agent registration is consent-free, so several URIs can share a
+    // wallet, and a restarted curator can linger under a stale peerId). The
+    // caller only needs to know whether the CONNECTING peer is among them, so a
+    // first-match pick could resolve a stale/wrong peer and wrongly defer (or,
+    // for a same-wallet Byzantine advertiser, mis-gate) recovery.
+    const resolveAgentPeers = async (agentAddrLower: string): Promise<string[]> => {
+      if (!cachedAgents) {
+        try {
+          cachedAgents = await this.discovery.findAgents();
+        } catch {
+          cachedAgents = [];
+        }
+      }
+      return cachedAgents
+        .filter((a) => a.agentAddress?.toLowerCase() === agentAddrLower)
+        .map((a) => a.peerId);
+    };
+    let localPeerId: string | undefined;
+    try {
+      localPeerId = this.peerId;
+    } catch {
+      localPeerId = undefined;
+    }
+
+    for (const contextGraphId of contextGraphIds) {
+      if (!(await this.canUseSharedMemoryForContextGraph(contextGraphId))) {
+        this.log.warn(ctx, `Skipping SWM sync for unauthorized or unconfirmed context graph "${contextGraphId}"`);
+        continue;
+      }
+      if (await this.isPrivateContextGraph(contextGraphId)) {
+        if (!remotePeerId) {
+          eligibleContextGraphIds.push(contextGraphId);
+          continue;
+        }
+        // The curator (curator-leader) is the authoritative SWM replica; it never
+        // reverse-syncs a CG it owns. Decide curatorship AND resolve the curator's
+        // peer by the STRUCTURAL curator — the wallet-scoped id prefix `0x<addr>` —
+        // NOT the dkg:curator/dkg:creator triples. A member that locally pre-created
+        // the CG (the rfc38 multi-member onboarding pattern) self-stamps its OWN
+        // wallet as a dkg:curator triple and its OWN peer as dkg:creator, which makes
+        // BOTH isCuratorOf() and resolveCuratorPeerId() resolve the member AS the
+        // curator — so the gate would skip the member's own recovery and it would
+        // silently never converge (a zero-byte-core durability failure). The id
+        // prefix is authoritative; only the node owning that agent is the curator.
+        const structuralCuratorDid = deriveCuratorDidFromCgId(contextGraphId);
+        if (structuralCuratorDid) {
+          const structuralAgent = structuralCuratorDid.slice('did:dkg:agent:'.length).toLowerCase();
+          if ([...this.localAgents.keys()].some((addr) => addr.toLowerCase() === structuralAgent)) {
+            this.log.debug(ctx, `SWM sync: skipping "${contextGraphId}" — local node is the curator (never reverse-syncs a CG it owns)`);
             continue;
           }
+          // Resolve the structural curator's peer via the agent registry. On a
+          // reconnect the registry may not be populated yet, so refresh meta once.
+          let curatorPeers = await resolveAgentPeers(structuralAgent);
+          if (curatorPeers.length === 0) {
+            await this.refreshMetaFromCurator(contextGraphId).catch(() => undefined);
+            cachedAgents = undefined; // force a fresh registry read after the refresh
+            curatorPeers = await resolveAgentPeers(structuralAgent);
+          }
+          if (curatorPeers.length === 0) {
+            this.log.info(ctx, `SWM recovery skipped for private CG "${contextGraphId.slice(0, 28)}": curator (${structuralAgent.slice(0, 10)}) peer not resolved yet`);
+          } else if (!curatorPeers.includes(remotePeerId)) {
+            this.log.info(ctx, `SWM recovery deferred for private CG "${contextGraphId.slice(0, 28)}": connecting peer ${remotePeerId.slice(0, 12)} is not among the curator's ${curatorPeers.length} registered peer(s)`);
+          } else {
+            this.log.info(ctx, `SWM recovery ENQUEUED for private CG "${contextGraphId.slice(0, 28)}" from curator peer ${remotePeerId.slice(0, 12)}`);
+            privateRecoverFromCurator.push(contextGraphId);
+            eligibleContextGraphIds.push(contextGraphId);
+          }
+          continue;
         }
-        eligible.push(contextGraphId);
+        // Legacy non-wallet-scoped CG (no structural curator): fall back to the
+        // triple-based curator resolution.
+        if (await this.isCuratorOf(contextGraphId)) {
+          this.log.debug(ctx, `SWM sync: skipping "${contextGraphId}" — local node is the curator (never reverse-syncs a CG it owns)`);
+          continue;
+        }
+        let curatorPeerId = await this.resolveCuratorPeerId(contextGraphId);
+        if (!curatorPeerId) {
+          await this.refreshMetaFromCurator(contextGraphId).catch(() => undefined);
+          curatorPeerId = await this.resolveCuratorPeerId(contextGraphId);
+        }
+        if (!curatorPeerId) {
+          this.log.info(ctx, `SWM recovery skipped for private CG "${contextGraphId.slice(0, 28)}": curator peerId not resolved`);
+        } else if (localPeerId && curatorPeerId === localPeerId) {
+          this.log.info(ctx, `SWM recovery skipped for private CG "${contextGraphId.slice(0, 28)}": local node resolves AS the curator`);
+        } else if (curatorPeerId !== remotePeerId) {
+          this.log.info(ctx, `SWM recovery deferred for private CG "${contextGraphId.slice(0, 28)}": connecting peer is not the curator`);
+        } else {
+          this.log.info(ctx, `SWM recovery ENQUEUED for private CG "${contextGraphId.slice(0, 28)}" from curator ${curatorPeerId.slice(0, 12)}`);
+          privateRecoverFromCurator.push(contextGraphId);
+          eligibleContextGraphIds.push(contextGraphId);
+        }
+        continue;
       }
+      publicContextGraphIds.push(contextGraphId);
+      eligibleContextGraphIds.push(contextGraphId);
     }
-    return eligible;
+    return { publicContextGraphIds, privateRecoverFromCurator, eligibleContextGraphIds };
+  }
+
+  async getSharedMemorySyncContextGraphs(this: DKGAgent, remotePeerId?: string): Promise<string[]> {
+    const plan = await this.planSharedMemorySyncContextGraphs(
+      remotePeerId,
+      this.config.syncContextGraphs ?? [],
+      createOperationContext('sync'),
+    );
+    return plan.eligibleContextGraphIds;
   }
 
   /**
@@ -2614,43 +2769,15 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       }
       const shortPeer = peerId.slice(-8);
       this.log.info(ctx, `Sync reconciler retrying ${shortPeer} (last success: ${lastOk == null ? 'never' : `${Math.round((now - lastOk) / 1000)}s ago`}${backoff ? `, prior failures: ${backoff.failures}` : ''})`);
-      let syncAccountingClearedBackoff = false;
-      this.trySyncFromPeer(peerId, () => {
-        syncAccountingClearedBackoff = true;
-      })
-        .then((outcome) => {
-          if (outcome === 'skipped-no-sync' || outcome === 'already-syncing' || outcome === 'not-started') {
-            return;
-          }
-          // `onPeerSynced` clears the backoff when a round makes progress or
-          // gets a clean denial. Only useful progress writes the cooldown
-          // marker; denial-only rounds must remain eligible next tick because
-          // a later ACL approval does not emit peer:update/connection:open.
-          // If the attempt resolved without advancing either marker, treat it
-          // as a genuine sync failure so peer backoff grows unless sync
-          // accounting explicitly cleared backoff for this attempt. A peer
-          // that still does not advertise PROTOCOL_SYNC is handled above and
-          // remains eligible on every reconciler tick, so a missed identify
-          // update cannot stretch into a 5/10/20/60-minute delay.
-          if (
-            !syncAccountingClearedBackoff &&
-            this.lastSuccessfulSyncAt.get(peerId) === lastOk &&
-            this.lastSyncProgressAt.get(peerId) === lastProgress
-          ) {
-            this.recordSyncReconcilerFailure(peerId, probe);
-          }
-        })
+      this.attemptSyncFromPeerWithReconcilerAccounting(peerId, probe)
+        .then(() => undefined)
         .catch((err: unknown) => {
           const message = err instanceof Error ? err.message : String(err);
           if (err instanceof SyncOnConnectPostSyncError) {
-            if (err.backoffEligible) {
-              this.recordSyncReconcilerFailure(peerId, probe);
-            }
             const backoffNote = err.backoffEligible ? 'growing peer backoff' : 'retrying without growing peer backoff';
             this.log.warn(ctx, `Sync reconciler post-sync step failed for ${shortPeer}; ${backoffNote}: ${message}`);
             return;
           }
-          this.recordSyncReconcilerFailure(peerId, probe);
           this.log.warn(ctx, `Sync reconciler retry failed for ${shortPeer}: ${message}`);
         });
     }
@@ -3200,106 +3327,17 @@ export class LifecycleSyncMethods extends DKGAgentBase {
   async syncSharedMemoryFromPeerDetailed(this: DKGAgent,
     remotePeerId: string,
     contextGraphIds: string[],
-    options?: { stopOnBackoffWorthyFailure?: boolean },
+    options?: {
+      stopOnBackoffWorthyFailure?: boolean;
+      sharedMemorySyncPlan?: SharedMemorySyncContextGraphPlan;
+    },
   ): Promise<SharedMemorySyncResult> {
     const ctx = createOperationContext('sync');
-    // M2 (curator-leader convergence): a PRIVATE CG converges by REPLACE-recovering the
-    // current state from its CURATOR (the authoritative SWM replica), never the
-    // bidirectional mesh union-sync — which corrupts a reconnecting member into {old,new}
-    // AND pollutes the curator back (proven on devnet). PUBLIC CGs keep the union path
-    // (correct for cold-start / empty target).
-    const publicContextGraphIds: string[] = [];
-    const privateRecoverFromCurator: string[] = [];
-    // Memoized agent-registry lookup: resolve a curator WALLET -> its libp2p peer
-    // via the AGENTS registry (the authoritative agent->peer map), bypassing the
-    // dkg:curator/dkg:creator `_meta` triples — a member that pre-created the CG
-    // self-stamps both, which would otherwise resolve the member AS the curator.
-    let cachedAgents: Array<{ agentAddress?: string; peerId: string }> | undefined;
-    // Resolve EVERY libp2p peer the AGENTS registry advertises for a curator
-    // wallet, not the first match: `findAgents()` is not a unique wallet->peer
-    // map (agent registration is consent-free, so several URIs can share a
-    // wallet, and a restarted curator can linger under a stale peerId). The
-    // caller only needs to know whether the CONNECTING peer is among them, so a
-    // first-match pick could resolve a stale/wrong peer and wrongly defer (or,
-    // for a same-wallet Byzantine advertiser, mis-gate) recovery.
-    const resolveAgentPeers = async (agentAddrLower: string): Promise<string[]> => {
-      if (!cachedAgents) {
-        try {
-          cachedAgents = await this.discovery.findAgents();
-        } catch {
-          cachedAgents = [];
-        }
-      }
-      return cachedAgents
-        .filter((a) => a.agentAddress?.toLowerCase() === agentAddrLower)
-        .map((a) => a.peerId);
-    };
-    for (const contextGraphId of contextGraphIds) {
-      if (!(await this.canUseSharedMemoryForContextGraph(contextGraphId))) {
-        this.log.warn(ctx, `Skipping SWM sync for unauthorized or unconfirmed context graph "${contextGraphId}"`);
-        continue;
-      }
-      if (await this.isPrivateContextGraph(contextGraphId)) {
-        // The curator (curator-leader) is the authoritative SWM replica; it never
-        // reverse-syncs a CG it owns. Decide curatorship AND resolve the curator's
-        // peer by the STRUCTURAL curator — the wallet-scoped id prefix `0x<addr>` —
-        // NOT the dkg:curator/dkg:creator triples. A member that locally pre-created
-        // the CG (the rfc38 multi-member onboarding pattern) self-stamps its OWN
-        // wallet as a dkg:curator triple and its OWN peer as dkg:creator, which makes
-        // BOTH isCuratorOf() and resolveCuratorPeerId() resolve the member AS the
-        // curator — so the gate would skip the member's own recovery and it would
-        // silently never converge (a zero-byte-core durability failure). The id
-        // prefix is authoritative; only the node owning that agent is the curator.
-        const structuralCuratorDid = deriveCuratorDidFromCgId(contextGraphId);
-        if (structuralCuratorDid) {
-          const structuralAgent = structuralCuratorDid.slice('did:dkg:agent:'.length).toLowerCase();
-          if ([...this.localAgents.keys()].some((addr) => addr.toLowerCase() === structuralAgent)) {
-            this.log.debug(ctx, `SWM sync: skipping "${contextGraphId}" — local node is the curator (never reverse-syncs a CG it owns)`);
-            continue;
-          }
-          // Resolve the structural curator's peer via the agent registry. On a
-          // reconnect the registry may not be populated yet, so refresh meta once.
-          let curatorPeers = await resolveAgentPeers(structuralAgent);
-          if (curatorPeers.length === 0) {
-            await this.refreshMetaFromCurator(contextGraphId).catch(() => undefined);
-            cachedAgents = undefined; // force a fresh registry read after the refresh
-            curatorPeers = await resolveAgentPeers(structuralAgent);
-          }
-          if (curatorPeers.length === 0) {
-            this.log.info(ctx, `SWM recovery skipped for private CG "${contextGraphId.slice(0, 28)}": curator (${structuralAgent.slice(0, 10)}) peer not resolved yet`);
-          } else if (!curatorPeers.includes(remotePeerId)) {
-            this.log.info(ctx, `SWM recovery deferred for private CG "${contextGraphId.slice(0, 28)}": connecting peer ${remotePeerId.slice(0, 12)} is not among the curator's ${curatorPeers.length} registered peer(s)`);
-          } else {
-            this.log.info(ctx, `SWM recovery ENQUEUED for private CG "${contextGraphId.slice(0, 28)}" from curator peer ${remotePeerId.slice(0, 12)}`);
-            privateRecoverFromCurator.push(contextGraphId);
-          }
-          continue;
-        }
-        // Legacy non-wallet-scoped CG (no structural curator): fall back to the
-        // triple-based curator resolution.
-        if (await this.isCuratorOf(contextGraphId)) {
-          this.log.debug(ctx, `SWM sync: skipping "${contextGraphId}" — local node is the curator (never reverse-syncs a CG it owns)`);
-          continue;
-        }
-        let curatorPeerId = await this.resolveCuratorPeerId(contextGraphId);
-        if (!curatorPeerId) {
-          await this.refreshMetaFromCurator(contextGraphId).catch(() => undefined);
-          curatorPeerId = await this.resolveCuratorPeerId(contextGraphId);
-        }
-        if (!curatorPeerId) {
-          this.log.info(ctx, `SWM recovery skipped for private CG "${contextGraphId.slice(0, 28)}": curator peerId not resolved`);
-        } else if (curatorPeerId === this.peerId) {
-          this.log.info(ctx, `SWM recovery skipped for private CG "${contextGraphId.slice(0, 28)}": local node resolves AS the curator`);
-        } else if (curatorPeerId !== remotePeerId) {
-          this.log.info(ctx, `SWM recovery deferred for private CG "${contextGraphId.slice(0, 28)}": connecting peer is not the curator`);
-        } else {
-          this.log.info(ctx, `SWM recovery ENQUEUED for private CG "${contextGraphId.slice(0, 28)}" from curator ${curatorPeerId.slice(0, 12)}`);
-          privateRecoverFromCurator.push(contextGraphId);
-        }
-        continue;
-      }
-      publicContextGraphIds.push(contextGraphId);
-    }
+    const planned = options?.sharedMemorySyncPlan;
+    const plan = planned && sameStringArray(planned.eligibleContextGraphIds, contextGraphIds)
+      ? planned
+      : await this.planSharedMemorySyncContextGraphs(remotePeerId, contextGraphIds, ctx);
+    const { publicContextGraphIds, privateRecoverFromCurator } = plan;
 
     const subGraphAdmissionByContextGraph = new Map<string, Promise<{ registered: string[]; excluded: string[] }>>();
     const getSubGraphAdmission = (contextGraphId: string) => {

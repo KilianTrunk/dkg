@@ -35,6 +35,7 @@ export default defineConfig({
           'test/async-promote-worker.test.ts',
           'test/async-promote-queue-e2e.test.ts',
           'test/import-artifact-routes.test.ts',
+          'test/shared-memory-catchup-durable.test.ts',
           'test/skill-endpoint.test.ts',
           // R6-B — metric COUNT getter TTL memo. Pure logic, no hardhat.
           'test/metrics-queries.test.ts',

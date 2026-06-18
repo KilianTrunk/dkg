@@ -898,7 +898,8 @@ WHERE {
     };
     const perCgLegs: PerCgLeg[] = [];
     for (const cgId of cgIds) {
-      if (!(await canUseSharedMemoryForContextGraph(cgId))) {
+      const canUseSharedMemory = await canUseSharedMemoryForContextGraph(cgId);
+      if (!canUseSharedMemory && !includeDurable) {
         perCgLegs.push({
           contextGraphId: cgId,
           perPeer: [],
@@ -922,27 +923,29 @@ WHERE {
           let durable = 0;
           let swmError: string | undefined;
           let durableError: string | undefined;
-          try {
-            const syncResult = await withTimeout(
-              typeof (agent as any).syncSharedMemoryFromPeerDetailed === 'function'
-                ? (agent as any).syncSharedMemoryFromPeerDetailed(candidate, [cgId])
-                : agent.syncSharedMemoryFromPeer(candidate, [cgId]).then(swmCatchupResultFromInserted),
-              PER_PEER_SWM_BUDGET_MS,
-              `SWM catchup from ${candidate} for ${cgId}`,
-            ) as SwmCatchupDetailedResult;
-            swm = Number(syncResult.insertedTriples ?? 0);
-            swmCatchupPeerSelector.record(
-              cgId,
-              candidate,
-              classifySwmCatchupPeerOutcome(swmCatchupOutcomeInput({ ...syncResult, insertedTriples: swm })),
-            );
-          } catch (err: any) {
-            swmError = err?.message ?? String(err);
-            swmCatchupPeerSelector.record(
-              cgId,
-              candidate,
-              classifySwmCatchupPeerOutcome(swmCatchupOutcomeInput({ insertedTriples: 0 }, swmError)),
-            );
+          if (canUseSharedMemory) {
+            try {
+              const syncResult = await withTimeout(
+                typeof (agent as any).syncSharedMemoryFromPeerDetailed === 'function'
+                  ? (agent as any).syncSharedMemoryFromPeerDetailed(candidate, [cgId])
+                  : agent.syncSharedMemoryFromPeer(candidate, [cgId]).then(swmCatchupResultFromInserted),
+                PER_PEER_SWM_BUDGET_MS,
+                `SWM catchup from ${candidate} for ${cgId}`,
+              ) as SwmCatchupDetailedResult;
+              swm = Number(syncResult.insertedTriples ?? 0);
+              swmCatchupPeerSelector.record(
+                cgId,
+                candidate,
+                classifySwmCatchupPeerOutcome(swmCatchupOutcomeInput({ ...syncResult, insertedTriples: swm })),
+              );
+            } catch (err: any) {
+              swmError = err?.message ?? String(err);
+              swmCatchupPeerSelector.record(
+                cgId,
+                candidate,
+                classifySwmCatchupPeerOutcome(swmCatchupOutcomeInput({ insertedTriples: 0 }, swmError)),
+              );
+            }
           }
           if (includeDurable) {
             try {

@@ -278,18 +278,14 @@ describe('sync-on-connect churn gates', () => {
       contextGraphId !== unconfirmedCg;
     (agent as any).isPrivateContextGraph = async (contextGraphId: string) =>
       contextGraphId.includes('private');
-    (agent as any).resolveCuratorPeerIdsForCg = async (contextGraphId: string) => {
-      if (contextGraphId === privateCg) {
-        return { peerIds: [PEER_A], curatorIsLocal: false, legacyTripleResolved: false };
-      }
-      if (contextGraphId === otherPrivateCg) {
-        return { peerIds: ['other-peer'], curatorIsLocal: false, legacyTripleResolved: false };
-      }
-      if (contextGraphId === localPrivateCg) {
-        return { peerIds: [], curatorIsLocal: true, legacyTripleResolved: false };
-      }
-      return { peerIds: [], curatorIsLocal: false, legacyTripleResolved: false };
+    (agent as any).isCuratorOf = async (contextGraphId: string) =>
+      contextGraphId === localPrivateCg;
+    (agent as any).resolveCuratorPeerId = async (contextGraphId: string) => {
+      if (contextGraphId === privateCg) return PEER_A;
+      if (contextGraphId === otherPrivateCg) return 'other-peer';
+      return undefined;
     };
+    (agent as any).refreshMetaFromCurator = async () => undefined;
 
     expect(await (agent as any).getSharedMemorySyncContextGraphs(PEER_A)).toEqual([
       'public-cg',

@@ -2108,7 +2108,19 @@ export class DKGPublisher implements Publisher {
     // with NO_DATA_IN_SWM — the exact bug §1.1 surfaces. Public CGs keep
     // the existing behaviour: `fromSharedMemory` → cores look up SWM
     // locally; otherwise plaintext inline.
-    const useEncryptedInline = typeof options.encryptInlinePayload === 'function';
+    // GH #1121 — take the encrypted-inline path ONLY when this publish actually
+    // goes on-chain (collects core StorageACKs / distributes to CG members). A
+    // chainless / local-only publish (e.g. an ownerOnly KA on an unregistered
+    // CG, or a chain-not-ready node) ships nothing to other nodes, so there is
+    // no plaintext-to-cores leak to guard against — and forcing the encryption
+    // hook there would break a legitimate local publish (the curated chain-key
+    // the real hook needs cannot be resolved off-chain, so the async-lift
+    // mapper's fail-closed default would throw). When the publish IS on-chain
+    // the requirement stands: a defined hook (the agent-resolved real callback,
+    // or the fail-closed default) is used, so private data is never shipped to
+    // cores in the clear.
+    const useEncryptedInline =
+      canAttemptOnChainPublish && typeof options.encryptInlinePayload === 'function';
     // OT-RFC-49 / WS-D — a curated publish is now identified by a non-zero
     // catalog commitment. The on-chain commitment + the core ACK verify the
     // PUBLIC `_catalog`; the PRIVATE data stays encrypted for MEMBERS only.

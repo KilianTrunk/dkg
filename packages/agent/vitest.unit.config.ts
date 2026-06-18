@@ -30,6 +30,7 @@ export default defineConfig({
       "test/sync-fetch-coalescing.test.ts",
       "test/sync-on-connect-churn.test.ts",
       "test/sync-requester-bailout.test.ts",
+      "test/swm-catchup-peer-selection.test.ts",
     ],
     testTimeout: 60_000,
     maxWorkers: 1,

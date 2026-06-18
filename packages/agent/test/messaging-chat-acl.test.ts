@@ -19,7 +19,7 @@
 // each peer's Ed25519 public key so we don't need real libp2p PeerId
 // strings.
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   generateEd25519Keypair,
   InMemoryMessageIdempotencyStore,

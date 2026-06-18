@@ -23,8 +23,8 @@ import {IInitializable} from "../interfaces/IInitializable.sol";
  *
  *         `ContextGraphValueStorage` is the source of truth; this tree is an
  *         eventually-consistent fast index reconciled by `settle`. Challenge
- *         correctness never depends on weight freshness (RandomSampling's KC
- *         filter drops expired KCs after the draw), so leaves may be approximate.
+ *         correctness never depends on weight freshness (RandomSampling's KA
+ *         filter drops expired KAs after the draw), so leaves may be approximate.
  *
  * @dev CAPACITY IS FIXED AT DEPLOY — never grow it. A mapping-backed Fenwick whose
  *      logical size grows is silently wrong: when the live id count crosses a 2^k

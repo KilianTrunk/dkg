@@ -1,6 +1,7 @@
 import { ethers } from 'ethers';
 import { chmod, readFile, writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
+import { randomBytes, scryptSync, createCipheriv, createDecipheriv } from 'node:crypto';
 
 export interface WalletEntry {
   address: string;
@@ -15,6 +16,31 @@ export interface OpWalletsConfig {
 }
 
 const DEFAULT_WALLET_COUNT = 3;
+
+// GH #11 — operational wallet private keys are encrypted at rest (AES-256-GCM)
+// so `wallets.json` never carries a plaintext key. The key is derived from a
+// machine-local 32-byte secret in `wallets.key` (zero operator interaction);
+// when `DKG_WALLETS_PASSPHRASE` is set it is mixed in via scrypt for an extra
+// factor against host-FS compromise. `address` stays plaintext so every
+// address-only reader (faucet, openclaw setup, status) keeps working, and
+// `loadOpWallets` still returns decrypted keys in memory for the chain config.
+const WALLET_SECRET_FILE = 'wallets.key';
+const PASSPHRASE_ENV = 'DKG_WALLETS_PASSPHRASE';
+
+interface EncryptedKeystore {
+  v: number;
+  alg: 'aes-256-gcm';
+  kdf: 'raw' | 'scrypt';
+  iv: string;
+  ct: string;
+  tag: string;
+}
+
+interface StoredWalletEntry {
+  address: string;
+  privateKey?: string;
+  keystore?: EncryptedKeystore;
+}
 
 /**
  * Load admin + operational wallets from `wallets.json` in the data directory.
@@ -34,7 +60,7 @@ export async function loadOpWallets(
 
   try {
     const raw = await readFile(filePath, 'utf-8');
-    const parsed = JSON.parse(raw) as Partial<OpWalletsConfig> | WalletEntry[];
+    const parsed = JSON.parse(raw) as { adminWallet?: StoredWalletEntry; wallets?: StoredWalletEntry[] } | StoredWalletEntry[];
     const existingWallets = Array.isArray(parsed) ? parsed : parsed.wallets;
     if (!Array.isArray(existingWallets)) {
       throw new Error('wallets.json must contain a wallets array');
@@ -44,12 +70,37 @@ export async function loadOpWallets(
     }
 
     {
-      const wallets = existingWallets.map((w, index) =>
-        validateWalletEntry(w, `wallets[${index}]`),
-      );
-      const adminWallet = !Array.isArray(parsed) && parsed.adminWallet
-        ? validateWalletEntry(parsed.adminWallet, 'adminWallet')
-        : undefined;
+      const adminStored = !Array.isArray(parsed) ? parsed.adminWallet : undefined;
+      // Decrypt any keystore entries before validating addresses. The secret is
+      // only required when at least one entry is encrypted; legacy plaintext
+      // files load with no secret and are opportunistically re-encrypted below.
+      const hasEncrypted = existingWallets.some(isEncryptedEntry)
+        || (adminStored ? isEncryptedEntry(adminStored) : false);
+      const secret = hasEncrypted ? await loadWalletSecret(dataDir) : undefined;
+      if (hasEncrypted && !secret) {
+        throw new Error(
+          `wallets.json holds encrypted wallet keystores but ${WALLET_SECRET_FILE} is missing — cannot decrypt. ` +
+            `Restore ${WALLET_SECRET_FILE} (or set ${PASSPHRASE_ENV} if it was passphrase-protected) from backup.`,
+        );
+      }
+
+      const resolve = (stored: StoredWalletEntry, path: string): WalletEntry => {
+        if (isEncryptedEntry(stored)) {
+          const privateKey = decryptKey(stored.keystore!, secret!);
+          return validateWalletEntry({ address: stored.address, privateKey }, path);
+        }
+        // Legacy plaintext entry — load as-is. We deliberately do NOT rewrite
+        // the file: a hand-provisioned / tooling-written plaintext wallets.json
+        // (devnet provisioning, the live-daemon test fixture, operators who
+        // manage the file directly) must stay byte-compatible with external
+        // readers. New nodes generate encrypted wallets (see saveOpWallets), so
+        // a fresh install is encrypted at rest; existing plaintext files are
+        // honoured unchanged.
+        return validateWalletEntry({ address: stored.address, privateKey: stored.privateKey as string }, path);
+      };
+
+      const wallets = existingWallets.map((w, index) => resolve(w, `wallets[${index}]`));
+      const adminWallet = adminStored ? resolve(adminStored, 'adminWallet') : undefined;
 
       if (adminWallet) {
         const adminKey = adminWallet.address.toLowerCase();
@@ -85,8 +136,18 @@ export function generateWallets(count: number): OpWalletsConfig {
 
 async function saveOpWallets(dataDir: string, config: OpWalletsConfig): Promise<void> {
   await mkdir(dataDir, { recursive: true });
+  const secret = await loadOrCreateWalletSecret(dataDir);
+  const passphrase = process.env[PASSPHRASE_ENV];
+  const encEntry = (w: WalletEntry): StoredWalletEntry => ({
+    address: w.address,
+    keystore: encryptKey(w.privateKey, secret, passphrase),
+  });
+  const stored: { adminWallet?: StoredWalletEntry; wallets: StoredWalletEntry[] } = {
+    ...(config.adminWallet ? { adminWallet: encEntry(config.adminWallet) } : {}),
+    wallets: config.wallets.map(encEntry),
+  };
   const filePath = join(dataDir, 'wallets.json');
-  await writeFile(filePath, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+  await writeFile(filePath, JSON.stringify(stored, null, 2) + '\n', { mode: 0o600 });
   await chmod(filePath, 0o600);
 }
 
@@ -103,4 +164,81 @@ function validateWalletEntry(entry: WalletEntry, path: string): WalletEntry {
     );
   }
   return { address: derived.address, privateKey: derived.privateKey };
+}
+
+// ── GH #11 — at-rest encryption helpers ────────────────────────────────────
+
+function isEncryptedEntry(entry: StoredWalletEntry): boolean {
+  return !!entry && typeof entry === 'object' && !!entry.keystore;
+}
+
+/** Derive the 32-byte AES key: the raw machine-local secret, optionally
+ *  strengthened with a scrypt pass over an operator passphrase. */
+function deriveAtRestKey(secret: Buffer, kdf: 'raw' | 'scrypt', passphrase?: string): Buffer {
+  if (kdf === 'scrypt') {
+    if (!passphrase) {
+      throw new Error(`${PASSPHRASE_ENV} is required to derive the wallet key for a passphrase-protected keystore`);
+    }
+    return scryptSync(passphrase, secret, 32, { N: 16384, r: 8, p: 1 });
+  }
+  return secret;
+}
+
+function encryptKey(privateKey: string, secret: Buffer, passphrase?: string): EncryptedKeystore {
+  const kdf: 'raw' | 'scrypt' = passphrase ? 'scrypt' : 'raw';
+  const key = deriveAtRestKey(secret, kdf, passphrase);
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const ct = Buffer.concat([cipher.update(privateKey, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return {
+    v: 1,
+    alg: 'aes-256-gcm',
+    kdf,
+    iv: iv.toString('base64'),
+    ct: ct.toString('base64'),
+    tag: tag.toString('base64'),
+  };
+}
+
+function decryptKey(keystore: EncryptedKeystore, secret: Buffer): string {
+  const passphrase = process.env[PASSPHRASE_ENV];
+  if (keystore.kdf === 'scrypt' && !passphrase) {
+    throw new Error(
+      `wallet keystore was encrypted with ${PASSPHRASE_ENV} which is not currently set — refusing to decrypt`,
+    );
+  }
+  const key = deriveAtRestKey(secret, keystore.kdf, passphrase);
+  const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(keystore.iv, 'base64'));
+  decipher.setAuthTag(Buffer.from(keystore.tag, 'base64'));
+  const pt = Buffer.concat([decipher.update(Buffer.from(keystore.ct, 'base64')), decipher.final()]);
+  return pt.toString('utf8');
+}
+
+/** Read the machine-local wallet secret, or undefined if it doesn't exist. */
+async function loadWalletSecret(dataDir: string): Promise<Buffer | undefined> {
+  try {
+    const raw = await readFile(join(dataDir, WALLET_SECRET_FILE), 'utf-8');
+    const buf = Buffer.from(raw.trim(), 'base64');
+    if (buf.length !== 32) {
+      throw new Error(`${WALLET_SECRET_FILE} is malformed (expected a 32-byte base64 secret)`);
+    }
+    return buf;
+  } catch (err: any) {
+    if (err.code === 'ENOENT') return undefined;
+    throw err;
+  }
+}
+
+/** Read or create the machine-local wallet secret (32 random bytes, mode 0600).
+ *  The secret is independent of any wallet key, so it never leaks a private key. */
+async function loadOrCreateWalletSecret(dataDir: string): Promise<Buffer> {
+  const existing = await loadWalletSecret(dataDir);
+  if (existing) return existing;
+  await mkdir(dataDir, { recursive: true });
+  const secret = randomBytes(32);
+  const secretPath = join(dataDir, WALLET_SECRET_FILE);
+  await writeFile(secretPath, secret.toString('base64') + '\n', { mode: 0o600 });
+  await chmod(secretPath, 0o600);
+  return secret;
 }

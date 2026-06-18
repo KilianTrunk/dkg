@@ -57,13 +57,29 @@ export interface LiftResolvedPublishSlice {
  * with NO inline-encryption callback, this default makes the publish FAIL LOUD
  * instead of leaking plaintext.
  */
-const failClosedInlineEncrypt: NonNullable<PublishOptions['encryptInlinePayload']> = () => {
-  throw new Error(
-    'Async-lift private/curated CG publish requires an encryptInlinePayload factory threaded ' +
-      'through LiftResolvedPublishSlice (a non-public context graph must not ship plaintext to cores). ' +
-      'Wire publishEncryptionFactory in the async publisher runtime.',
-  );
-};
+const FAIL_CLOSED_MARKER = '__dkgFailClosedInlineEncrypt';
+const failClosedInlineEncrypt: NonNullable<PublishOptions['encryptInlinePayload']> = Object.assign(
+  (() => {
+    throw new Error(
+      'Async-lift private/curated CG publish requires an encryptInlinePayload factory threaded ' +
+        'through LiftResolvedPublishSlice (a non-public context graph must not ship plaintext to cores). ' +
+        'Wire publishEncryptionFactory in the async publisher runtime.',
+    );
+  }) as NonNullable<PublishOptions['encryptInlinePayload']>,
+  { [FAIL_CLOSED_MARKER]: true as const },
+);
+
+/**
+ * True iff `cb` is the mapper's fail-closed default (not a real agent-resolved
+ * encryption callback). The publisher uses this to skip the encrypted-inline
+ * path on a chainless/local publish that ships nothing to cores — there is no
+ * plaintext leak to guard, so the default must not throw — while still honouring
+ * any REAL callback the caller wired, and still firing the default (fail-closed)
+ * for an actual on-chain publish with no real encryption resolved.
+ */
+export function isFailClosedInlineEncrypt(cb: unknown): boolean {
+  return typeof cb === 'function' && (cb as unknown as Record<string, unknown>)[FAIL_CLOSED_MARKER] === true;
+}
 
 export interface LiftPublishMappingInput {
   readonly request: LiftRequest;

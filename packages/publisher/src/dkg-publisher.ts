@@ -17,6 +17,7 @@ import {
   computeFlatKCMerkleLeafCountV10,
 } from './merkle.js';
 import { validatePublishRequest } from './validation.js';
+import { isFailClosedInlineEncrypt } from './async-lift-publish-options.js';
 import {
   generateConfirmedFullMetadata,
   buildDeterministicTokenRows,
@@ -2131,19 +2132,19 @@ export class DKGPublisher implements Publisher {
     // with NO_DATA_IN_SWM — the exact bug §1.1 surfaces. Public CGs keep
     // the existing behaviour: `fromSharedMemory` → cores look up SWM
     // locally; otherwise plaintext inline.
-    // GH #1121 — take the encrypted-inline path ONLY when this publish actually
-    // goes on-chain (collects core StorageACKs / distributes to CG members). A
-    // chainless / local-only publish (e.g. an ownerOnly KA on an unregistered
-    // CG, or a chain-not-ready node) ships nothing to other nodes, so there is
-    // no plaintext-to-cores leak to guard against — and forcing the encryption
-    // hook there would break a legitimate local publish (the curated chain-key
-    // the real hook needs cannot be resolved off-chain, so the async-lift
-    // mapper's fail-closed default would throw). When the publish IS on-chain
-    // the requirement stands: a defined hook (the agent-resolved real callback,
-    // or the fail-closed default) is used, so private data is never shipped to
-    // cores in the clear.
+    // GH #1121 — take the encrypted-inline path whenever a REAL encryption
+    // callback is wired. The ONE exception: skip the async-lift mapper's
+    // fail-closed DEFAULT on a chainless / local-only publish (ownerOnly KA on
+    // an unregistered CG, chain-not-ready node, …). Such a publish ships nothing
+    // to other nodes, so there is no plaintext-to-cores leak to guard — and the
+    // default (which exists only to prevent that leak) cannot resolve a real
+    // chain-key off-chain, so invoking it would needlessly fail a legitimate
+    // local publish. For an actual on-chain publish the default still fires
+    // (fail-closed): a private payload is never shipped to cores in the clear.
+    const inlineEncryptCb = options.encryptInlinePayload;
     const useEncryptedInline =
-      canAttemptOnChainPublish && typeof options.encryptInlinePayload === 'function';
+      typeof inlineEncryptCb === 'function'
+      && (canAttemptOnChainPublish || !isFailClosedInlineEncrypt(inlineEncryptCb));
     // OT-RFC-49 / WS-D — a curated publish is now identified by a non-zero
     // catalog commitment. The on-chain commitment + the core ACK verify the
     // PUBLIC `_catalog`; the PRIVATE data stays encrypted for MEMBERS only.

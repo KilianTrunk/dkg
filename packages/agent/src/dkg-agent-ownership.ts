@@ -716,9 +716,11 @@ export class OwnershipMethods extends DKGAgentBase {
     return deriveCuratorDidFromCgId(contextGraphId);
   }
 
-  async getContextGraphCurator(this: DKGAgent, contextGraphId: string): Promise<string | null> {
-    const cgMetaGraph = contextGraphMetaUri(contextGraphId);
-    const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
+  async getContextGraphCurator(
+    this: DKGAgent,
+    contextGraphId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<string | null> {
     // Multi-curator scenario: peer-to-peer sync of CG `_meta` triples
     // can replicate FOREIGN `dkg:curator` triples onto a node's local
     // store. The original behaviour (`LIMIT 1`) made ownership lookup
@@ -736,21 +738,7 @@ export class OwnershipMethods extends DKGAgentBase {
     // the first curator triple when no local match exists, preserving
     // the legacy "subscriber sees foreign owner" semantics for
     // membership/UI queries against CGs this node did not curate.
-    const curatorResult = await this.store.query(`
-      SELECT ?owner WHERE {
-        GRAPH <${cgMetaGraph}> {
-          <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_CURATOR}> ?owner .
-        }
-      }
-    `);
-    if (curatorResult.type !== 'bindings' || curatorResult.bindings.length === 0) {
-      return null;
-    }
-    const owners: string[] = [];
-    for (const b of curatorResult.bindings) {
-      const o = (b as Record<string, string>)['owner'];
-      if (o) owners.push(o);
-    }
+    const owners = (await this.getCgMeta(contextGraphId, { signal: options.signal })).curators;
     if (owners.length === 0) return null;
     if (owners.length === 1) return owners[0];
     const selfDid = `did:dkg:agent:${this.peerId}`;
@@ -796,8 +784,13 @@ export class OwnershipMethods extends DKGAgentBase {
    * Whether the wallet is on the CG allowlist (participant / allowed-agent) or tied to a
    * listed on-chain identity ID. Does not consult curator — compose with curator checks separately.
    */
-  public async callerIsAllowlistedAgentParticipant(this: DKGAgent, contextGraphId: string, checksumAddress: string): Promise<boolean> {
-    const participants = await this.getPrivateContextGraphParticipants(contextGraphId);
+  public async callerIsAllowlistedAgentParticipant(
+    this: DKGAgent,
+    contextGraphId: string,
+    checksumAddress: string,
+    options: { onChainLookup?: () => void; signal?: AbortSignal } = {},
+  ): Promise<boolean> {
+    const participants = await this.getPrivateContextGraphParticipants(contextGraphId, { signal: options.signal });
     if (!participants?.length) return false;
 
     for (const raw of participants) {
@@ -808,6 +801,7 @@ export class OwnershipMethods extends DKGAgentBase {
       }
       if (/^\d+$/.test(p) && this.chain.isOperationalWalletRegistered) {
         try {
+          options.onChainLookup?.();
           if (await this.chain.isOperationalWalletRegistered(BigInt(p), checksumAddress)) return true;
         } catch {
           // ignore chain read errors — treat as non-participant
@@ -834,8 +828,6 @@ export class OwnershipMethods extends DKGAgentBase {
       merged.push(checksumAddress);
     };
 
-    const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
-    const cgMetaGraph = contextGraphMetaUri(contextGraphId);
     // OT-RFC-38 / LU-6 Phase B — the on-chain participant-agent list
     // is now the authoritative source for the host-mode envelope
     // authority check on cores (see `resolveOnChainParticipantAgents`
@@ -858,19 +850,13 @@ export class OwnershipMethods extends DKGAgentBase {
     // (those are persisted as PARTICIPANT triples). The merge below
     // is a UNION so any per-CG explicit list survives and just gets
     // augmented with whatever local allowlist exists.
-    const agentResult = await this.store.query(
-      `SELECT ?agent WHERE {
-        GRAPH <${cgMetaGraph}> {
-          { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT}> ?agent }
-          UNION
-          { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ALLOWED_AGENT}> ?agent }
-        }
-      }`,
-    );
-    if (agentResult.type === 'bindings') {
-      for (const row of agentResult.bindings) {
-        add(row['agent']);
-      }
+    const meta = await this.getCgMeta(contextGraphId);
+    const revoked = new Set(meta.revokedAgents.map((agent) => agent.toLowerCase()));
+    for (const agent of meta.participantAgents) {
+      if (!revoked.has(agent.toLowerCase())) add(agent);
+    }
+    for (const agent of meta.allowedAgents) {
+      if (!revoked.has(agent.toLowerCase())) add(agent);
     }
     return merged;
   }
@@ -883,25 +869,7 @@ export class OwnershipMethods extends DKGAgentBase {
    * peers validating via `gossip-publish-handler` see a matching owner.
    */
   async getContextGraphCreator(this: DKGAgent, contextGraphId: string): Promise<string | null> {
-    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
-    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
-    const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
-    const result = await this.store.query(`
-      SELECT ?owner WHERE {
-        {
-          GRAPH <${ontologyGraph}> {
-            <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_CREATOR}> ?owner .
-          }
-        } UNION {
-          GRAPH <${cgMetaGraph}> {
-            <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_CREATOR}> ?owner .
-          }
-        }
-      }
-      LIMIT 1
-    `);
-    if (result.type !== 'bindings' || result.bindings.length === 0) return null;
-    return (result.bindings[0] as Record<string, string>)['owner'] ?? null;
+    return (await this.getCgMeta(contextGraphId)).creator ?? null;
   }
 
   public async listCclPolicyBindings(this: DKGAgent, opts: {

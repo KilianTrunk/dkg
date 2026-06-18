@@ -1515,17 +1515,27 @@ export class LifecycleSyncMethods extends DKGAgentBase {
                 // GH #1098 — a pre-subscribed PUBLIC member peer may not have
                 // bound this CG's on-chain id yet (only curated CGs bind on the
                 // ContextGraphCreated event; ACK-signers bind via the storage-ACK
-                // hook). Rather than wait up to a full sweep interval, run a
-                // self-priming sweep NOW so any subscribed-but-unbound CG resolves
-                // + binds its on-chain id from the local ontology/_meta and
-                // reconciles immediately. Gated on there actually being an unbound
-                // subscription so a KA registration for an unrelated CG is a no-op.
-                const hasUnbound = [...this.subscribedContextGraphs.values()].some(
-                  (s) => s.subscribed && !s.onChainId,
-                );
-                if (hasUnbound) {
-                  this.log.info(ctx, `Phase B: KACG nudge cg=${onChainId} ka=${kaId} -> self-priming reconcile sweep (unbound pre-subscription)`);
-                  await this.runVmReconcileSweep();
+                // hook). Find the subscribed-but-unbound CG whose locally-resolved
+                // on-chain id matches THIS event and bind + reconcile only it —
+                // targeted, not a global sweep, so an unrelated KA registration
+                // touches nothing. The periodic self-priming sweep remains the
+                // safety net for a CG whose OnChainId quad hasn't arrived yet.
+                let targetOnChain: bigint | null = null;
+                try { targetOnChain = BigInt(onChainId); } catch { targetOnChain = null; }
+                if (targetOnChain !== null) {
+                  for (const [lcg, sub] of this.subscribedContextGraphs) {
+                    if (!sub.subscribed || sub.onChainId) continue;
+                    const resolved = await this.getContextGraphOnChainId(lcg).catch(() => null);
+                    let resolvedNum: bigint | null = null;
+                    try { resolvedNum = resolved ? BigInt(resolved) : null; } catch { resolvedNum = null; }
+                    if (resolvedNum !== null && resolvedNum === targetOnChain) {
+                      this.bindSubscriptionOnChainId(lcg, sub, resolved!);
+                      this.persistContextGraphSubscription(lcg);
+                      this.log.info(ctx, `Phase B: KACG nudge cg=${onChainId} ka=${kaId} -> bound + reconcile pre-subscribed "${lcg}"`);
+                      if (this.reconcileCoalescer) void this.reconcileCoalescer.trigger(lcg);
+                      break;
+                    }
+                  }
                 }
                 return; // chain replay hasn't resolved the cleartext CG yet; periodic sweep is the safety net
               }

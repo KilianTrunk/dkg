@@ -1898,8 +1898,19 @@ export class DKGPublisher implements Publisher {
     // many entities it contains. The on-chain KA count and ACK digest stay at
     // one below, while these token IDs remain compatibility labels for
     // per-root response/meta subjects (`<ual>/1`, `<ual>/2`, ...).
+    // GH #936 — mint the compatibility tokenIds over a CANONICAL (lexicographic
+    // by rootEntity) order, the SAME order the replica reconcile/gossip path
+    // uses in `FinalizationHandler.promoteSharedMemoryToCanonical`. Without this,
+    // the ORIGINATOR would label `<ual>/<tokenId>` by input-quad order while
+    // replicas label by sorted order, so a multi-root KC could resolve a
+    // different root for the same token label depending on which node a client
+    // queries. These tokenIds are non-on-chain compatibility labels (the
+    // on-chain KA count is 1), so a content-derived sort is safe.
+    const orderedEntries = [...canonical.manifestEntries].sort((a, b) =>
+      a.rootEntity < b.rootEntity ? -1 : a.rootEntity > b.rootEntity ? 1 : 0,
+    );
     let compatibilityTokenId = 1n;
-    for (const entry of canonical.manifestEntries) {
+    for (const entry of orderedEntries) {
       const tokenId = compatibilityTokenId++;
       manifestEntries.push({
         tokenId,

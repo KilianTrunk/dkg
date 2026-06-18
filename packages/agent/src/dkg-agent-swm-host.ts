@@ -2363,8 +2363,13 @@ export class SwmHostModeMethods extends DKGAgentBase {
       // id CHANGE would reset the cursor; binding from undefined never does).
       if (sub.subscribed && !sub.onChainId) {
         try {
+          // Bind ANY non-null resolved on-chain id. getContextGraphOnChainId
+          // returns the persisted OnChainId quad (or null) — it never falls back
+          // to localCgId, so a `resolved === localCgId` match is legitimate for a
+          // direct CG whose local id IS its numeric on-chain id (e.g. "42"); a
+          // `!== localCgId` guard would wrongly leave such a sub unbound forever.
           const resolved = await this.getContextGraphOnChainId(localCgId);
-          if (resolved && resolved !== localCgId) {
+          if (resolved) {
             this.bindSubscriptionOnChainId(localCgId, sub, resolved);
             this.persistContextGraphSubscription(localCgId);
           }

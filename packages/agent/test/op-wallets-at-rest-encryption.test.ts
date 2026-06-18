@@ -49,17 +49,32 @@ describe('GH #11 — operational wallet private keys at rest', () => {
     // Control: the in-memory config really does carry private keys (so the
     // negative assertion below is meaningful, not vacuously true).
     expect(config.wallets[0].privateKey).toMatch(/^0x[0-9a-fA-F]{64}$/);
+    expect(config.adminWallet?.privateKey).toMatch(/^0x[0-9a-fA-F]{64}$/);
 
     // Scan EVERY persisted file (and the bare-hex form, in case a future writer
-    // strips the 0x prefix). No file may contain a wallet's raw private key.
+    // strips the 0x prefix). No file may contain a wallet's raw private key —
+    // including the ADMIN wallet (a regression that encrypts operational wallets
+    // but leaves the admin key plaintext must fail here too).
+    const allKeys = [
+      ...config.wallets.map((w) => w.privateKey),
+      ...(config.adminWallet ? [config.adminWallet.privateKey] : []),
+    ];
     const files = await walkFiles(dir);
     const blobs = await Promise.all(files.map((f) => readFile(f, 'utf-8').catch(() => '')));
     const combined = blobs.join('\n');
-    for (const w of config.wallets) {
-      const hex = w.privateKey;
+    for (const hex of allKeys) {
       const bare = hex.replace(/^0x/, '');
       expect(combined, `a persisted file under ${dir} contains a raw private key`).not.toContain(hex);
       expect(combined).not.toContain(bare);
     }
+
+    // Reload from the now-encrypted files (simulates a daemon restart): the
+    // keystore must decrypt back to the SAME admin + operational keys. Guards
+    // against writing an unreadable keystore or rotating keys on reload.
+    const reloaded = await loadOpWallets(dir, 2);
+    expect(reloaded.adminWallet?.privateKey).toBe(config.adminWallet?.privateKey);
+    expect(reloaded.adminWallet?.address).toBe(config.adminWallet?.address);
+    expect(reloaded.wallets.map((w) => w.privateKey)).toEqual(config.wallets.map((w) => w.privateKey));
+    expect(reloaded.wallets.map((w) => w.address)).toEqual(config.wallets.map((w) => w.address));
   });
 });

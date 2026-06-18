@@ -17,9 +17,10 @@
  * metadata still turns it green (Codex review on PR #1129). Hermetic — tmpdir.
  */
 import { describe, expect, it, afterEach } from 'vitest';
-import { mkdtemp, readFile, rm, readdir } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { ethers } from 'ethers';
 import { loadOpWallets } from '../src/op-wallets.js';
 
 /** Every regular file under `dir`, recursively. */
@@ -76,5 +77,41 @@ describe('GH #11 — operational wallet private keys at rest', () => {
     expect(reloaded.adminWallet?.address).toBe(config.adminWallet?.address);
     expect(reloaded.wallets.map((w) => w.privateKey)).toEqual(config.wallets.map((w) => w.privateKey));
     expect(reloaded.wallets.map((w) => w.address)).toEqual(config.wallets.map((w) => w.address));
+  });
+
+  it('migrates an existing LEGACY plaintext wallets.json to an encrypted keystore on load', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'gh11-migrate-'));
+    dirs.push(dir);
+
+    // Simulate an upgraded node carrying a pre-encryption plaintext wallets.json
+    // (the deployed wallets most likely to hold real funds).
+    const admin = ethers.Wallet.createRandom();
+    const op = ethers.Wallet.createRandom();
+    await writeFile(
+      join(dir, 'wallets.json'),
+      JSON.stringify({
+        adminWallet: { address: admin.address, privateKey: admin.privateKey },
+        wallets: [{ address: op.address, privateKey: op.privateKey }],
+      }),
+    );
+
+    // Load: accepts the legacy keys AND transparently re-encrypts the file.
+    const loaded = await loadOpWallets(dir);
+    expect(loaded.adminWallet?.privateKey).toBe(admin.privateKey);
+    expect(loaded.wallets[0].privateKey).toBe(op.privateKey);
+
+    // The on-disk file no longer contains either raw private key.
+    const files = await walkFiles(dir);
+    const combined = (await Promise.all(files.map((f) => readFile(f, 'utf-8').catch(() => '')))).join('\n');
+    for (const hex of [admin.privateKey, op.privateKey]) {
+      expect(combined, 'legacy plaintext key still on disk after migration').not.toContain(hex);
+      expect(combined).not.toContain(hex.replace(/^0x/, ''));
+    }
+
+    // Reload (simulated restart): decrypts back to the SAME keys — no rotation,
+    // no lockout.
+    const reloaded = await loadOpWallets(dir);
+    expect(reloaded.adminWallet?.privateKey).toBe(admin.privateKey);
+    expect(reloaded.wallets[0].privateKey).toBe(op.privateKey);
   });
 });

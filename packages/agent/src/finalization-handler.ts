@@ -16,7 +16,7 @@ import { GraphManager, type TripleStore, type Quad } from '@origintrail-official
 import { type ChainAdapter, type EventFilter } from '@origintrail-official/dkg-chain';
 import {
   computeFlatKCRootV10 as computeFlatKCRoot, skolemizeByEntity,
-  generateConfirmedFullMetadata, getTentativeStatusQuad,
+  generateConfirmedFullMetadata, buildDeterministicTokenRows, getTentativeStatusQuad,
   generateSubGraphRegistration,
   shouldApplyMaterialization, writeMaterializedVersion, withMaterializationLock,
   type MaterializedVersion,
@@ -1170,34 +1170,15 @@ export class FinalizationHandler {
 
     let metaQuads = generateConfirmedFullMetadata(kcMeta, kaMetadata, provenance);
 
-    // GH #936 — emit an EXPLICIT, deterministic per-root token map
-    // (`<ual>/<tokenId>` dkg:tokenId / dkg:entity) for multi-root KCs so two
-    // replicas reconciling the same KC expose an IDENTICAL, queryable
-    // rootEntity→tokenId mapping (the tokenId now derives from the canonical
-    // root sort above). Emitted here rather than in generateKCMetadata, which
-    // metadata.test.ts pins to forbid these predicates. graph = the default
+    // GH #936 — append the SHARED deterministic per-root token rows (no-op for
+    // single-root). This is the SAME helper the publisher uses on the originator
+    // path, so a locally-published and a chain-reconciled multi-root KC expose
+    // an identical, queryable rootEntity→tokenId map. graph = the default
     // `<cg>/_meta` so the ctxGraphId remap below routes them to the per-cgId
     // `_meta` (and dual-writes a root copy when keepRootCopyOnLabel).
-    if (kaMetadata.length > 1) {
-      const defaultMetaGraph = `did:dkg:context-graph:${contextGraphId}/_meta`;
-      for (const ka of kaMetadata) {
-        const labelSubject = `${ual}/${ka.tokenId}`;
-        metaQuads.push(
-          {
-            subject: labelSubject,
-            predicate: `${DKG_NS}tokenId`,
-            object: `"${ka.tokenId}"^^<http://www.w3.org/2001/XMLSchema#integer>`,
-            graph: defaultMetaGraph,
-          },
-          {
-            subject: labelSubject,
-            predicate: DKG_ENTITY,
-            object: ka.rootEntity,
-            graph: defaultMetaGraph,
-          },
-        );
-      }
-    }
+    metaQuads.push(
+      ...buildDeterministicTokenRows(ual, kaMetadata, `did:dkg:context-graph:${contextGraphId}/_meta`),
+    );
     if (ctxGraphId) {
       const defaultMeta = `did:dkg:context-graph:${contextGraphId}/_meta`;
       const targetMeta = contextGraphMetaUri(contextGraphId, ctxGraphId);

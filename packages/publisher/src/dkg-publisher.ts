@@ -19,6 +19,7 @@ import {
 import { validatePublishRequest } from './validation.js';
 import {
   generateConfirmedFullMetadata,
+  buildDeterministicTokenRows,
   generateOwnershipQuads,
   generateAssertionCreatedMetadata,
   generateAssertionPromotedMetadata,
@@ -1989,20 +1990,31 @@ export class DKGPublisher implements Publisher {
     // to ACK / chain digests — moving it past the chain-success branch
     // would risk a race where the publisher returns 'confirmed' before
     // its own private store has the data.
-    for (const entry of canonical.manifestEntries) {
-      const entityPrivateQuads = privateQuads.filter(
-        (q) => q.subject === entry.rootEntity || q.subject.startsWith(entry.rootEntity + '/.well-known/genid/'),
-      );
-      if (entityPrivateQuads.length > 0) {
-        // GH #1078 — tag the stored slice with the commitment this root just
-        // committed (its privateMerkleRoot) so a re-publish for the same root
-        // supersedes the stale slice instead of commingling it.
-        const commitmentId = entry.privateMerkleRoot
-          ? Buffer.from(entry.privateMerkleRoot).toString('hex')
-          : undefined;
-        await this.privateStore.storePrivateTriples(contextGraphId, entry.rootEntity, entityPrivateQuads, options.subGraphName, commitmentId);
+    // GH #1078 — persist the finalized private slices. DEFERRED to the terminal
+    // branches (post-chain-confirmation, or the intentional-local finalize) and
+    // NEVER run on the chain-failure path. Because `storePrivateTriples(…,
+    // commitmentId)` now SUPERSEDES a root's prior private slice when the
+    // commitment differs, running it pre-chain would let a failed/rejected
+    // re-publish delete the private data of the still-current KA while the chain
+    // still points at the old version. Gating it on confirmation keeps the
+    // private store consistent with the committed `privateMerkleRoot`, and
+    // invoking it BEFORE the publish returns 'confirmed' preserves the
+    // no-"confirmed-before-data" guarantee the pre-chain insert used to give.
+    const persistFinalizedPrivateSlices = async (): Promise<void> => {
+      for (const entry of canonical.manifestEntries) {
+        const entityPrivateQuads = privateQuads.filter(
+          (q) => q.subject === entry.rootEntity || q.subject.startsWith(entry.rootEntity + '/.well-known/genid/'),
+        );
+        if (entityPrivateQuads.length > 0) {
+          // Tag the stored slice with the commitment this root committed (its
+          // privateMerkleRoot) so a later re-publish supersedes the stale slice.
+          const commitmentId = entry.privateMerkleRoot
+            ? Buffer.from(entry.privateMerkleRoot).toString('hex')
+            : undefined;
+          await this.privateStore.storePrivateTriples(contextGraphId, entry.rootEntity, entityPrivateQuads, options.subGraphName, commitmentId);
+        }
       }
-    }
+    };
 
     onPhase?.('store', 'end');
 
@@ -2571,6 +2583,9 @@ export class DKGPublisher implements Publisher {
       }
       this.log.info(ctx, `Storing ${normalizedQuads.length} triples in local store (${reasonLog})`);
       await this.store.insert(normalizedQuads);
+      // GH #1078 — persist private slices on this intentional-local terminal
+      // branch too (a chainless / ownerOnly publish still finalizes here).
+      await persistFinalizedPrivateSlices();
       await this.store.insert(tentativeMeta);
       // B3: only now that the local publish has persisted do we refresh the
       // public catalog entry (CLEAR/REPLACE — see persistCatalogEntry).
@@ -2958,6 +2973,15 @@ export class DKGPublisher implements Publisher {
             chainId: this.chain.chainId,
           },
         );
+        // GH #936 — append the SHARED deterministic per-root token rows (the
+        // same helper the gossip / chain-reconcile path uses) so the originator
+        // exposes the IDENTICAL `<ual>/<tokenId>` → root map as replicas. kaMetadata
+        // is already in canonical (sorted) tokenId order. graph = default
+        // `<cg>/_meta` so the remap below routes them to the per-cgId `_meta`.
+        confirmedQuads = [
+          ...confirmedQuads,
+          ...buildDeterministicTokenRows(ual, kaMetadata, `did:dkg:context-graph:${contextGraphId}/_meta`),
+        ];
         if (options.targetMetaGraphUri) {
           const defaultMeta = `did:dkg:context-graph:${contextGraphId}/_meta`;
           confirmedQuads = confirmedQuads.map((q) =>
@@ -2983,6 +3007,10 @@ export class DKGPublisher implements Publisher {
         this.log.info(ctx, `Storing ${vmQuads.length} triples in ${vmGraph} (post-confirmation)`);
         await this.store.insert(vmQuads);
         await this.store.insert(confirmedQuads);
+        // GH #1078 — supersede/persist private slices only now that the chain
+        // has confirmed (before returning 'confirmed', so no read sees the KA
+        // confirmed without its private data).
+        await persistFinalizedPrivateSlices();
         await stampTrustLevel(
           this.store,
           vmGraph,

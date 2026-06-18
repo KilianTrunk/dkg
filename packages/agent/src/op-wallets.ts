@@ -26,6 +26,10 @@ const DEFAULT_WALLET_COUNT = 3;
 // `loadOpWallets` still returns decrypted keys in memory for the chain config.
 const WALLET_SECRET_FILE = 'wallets.key';
 const PASSPHRASE_ENV = 'DKG_WALLETS_PASSPHRASE';
+// Test-only escape hatch: skip the legacy-plaintext→encrypted migration on load.
+// Set by harnesses/tooling that read the raw `privateKey` field out of
+// wallets.json directly and cannot decrypt (e.g. the devnet staking script).
+const NO_MIGRATE_ENV = 'DKG_WALLETS_NO_MIGRATE';
 
 interface EncryptedKeystore {
   v: number;
@@ -84,18 +88,15 @@ export async function loadOpWallets(
         );
       }
 
+      let sawLegacyPlaintext = false;
       const resolve = (stored: StoredWalletEntry, path: string): WalletEntry => {
         if (isEncryptedEntry(stored)) {
           const privateKey = decryptKey(stored.keystore!, secret!);
           return validateWalletEntry({ address: stored.address, privateKey }, path);
         }
-        // Legacy plaintext entry — load as-is. We deliberately do NOT rewrite
-        // the file: a hand-provisioned / tooling-written plaintext wallets.json
-        // (devnet provisioning, the live-daemon test fixture, operators who
-        // manage the file directly) must stay byte-compatible with external
-        // readers. New nodes generate encrypted wallets (see saveOpWallets), so
-        // a fresh install is encrypted at rest; existing plaintext files are
-        // honoured unchanged.
+        // Legacy plaintext entry — accepted (back-compat), and flagged for
+        // opportunistic migration to an encrypted keystore below.
+        sawLegacyPlaintext = true;
         return validateWalletEntry({ address: stored.address, privateKey: stored.privateKey as string }, path);
       };
 
@@ -111,7 +112,24 @@ export async function loadOpWallets(
         }
       }
 
-      return { adminWallet, wallets };
+      const config = { adminWallet, wallets };
+      // GH #11 migration — an upgraded node that still has a LEGACY plaintext
+      // wallets.json (the deployed wallets most likely to hold real funds) gets
+      // its keys transparently re-saved as encrypted keystores after a
+      // successful load (same keys, same addresses — no rotation, no lockout).
+      // This closes the plaintext-at-rest exposure for existing operators, not
+      // just fresh installs. Opt OUT via `DKG_WALLETS_NO_MIGRATE=1` for test
+      // harnesses / provisioning tooling that reads the raw `privateKey` field
+      // directly (e.g. the devnet staking script) and cannot decrypt. The
+      // re-save is best-effort: a write failure must not block loading.
+      if (sawLegacyPlaintext && process.env[NO_MIGRATE_ENV] !== '1') {
+        try {
+          await saveOpWallets(dataDir, config);
+        } catch {
+          /* keep serving the loaded keys even if the migration re-save fails */
+        }
+      }
+      return config;
     }
   } catch (err: any) {
     if (err.code !== 'ENOENT') throw err;

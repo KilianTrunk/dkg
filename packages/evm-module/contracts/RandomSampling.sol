@@ -541,26 +541,22 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
      * @param seed       The 32-byte seed to draw against. Production callers
      *                   should pass a high-entropy hash; tests pass deterministic
      *                   per-iteration seeds for distribution analysis.
-     * @param targetEpoch Epoch used ONLY for per-KC expiry filtering (`getEndEpoch < targetEpoch`).
-     *                   The CG weight draw reads the CURRENT BIT snapshot (`bitTotal` /
-     *                   `findStrictGtExcluding`), which the index cannot reconstruct for a past or
-     *                   future epoch — so the CG distribution is always "as of now". Pass
-     *                   `chronos.getCurrentEpoch()` for a faithful preview; other epochs select the
-     *                   CG from the current weights and only shift KC eligibility.
      * @return cgId      Selected Context Graph id.
      * @return kaId      Selected Knowledge Collection id within that CG.
      * @return chunkId   Selected **V10 Merkle leaf index** within the KC (same field
      *                   name as V8 byte-chunk index for struct compatibility).
+     *
+     *      Always previews the CURRENT epoch: the CG draw reads the live BIT snapshot
+     *      (`bitTotal`/`findStrictGtExcluding`), which the index cannot reconstruct for a past or
+     *      future epoch, so a `targetEpoch` parameter would be misleading and was dropped. Uses the
+     *      view selection core (no settle-on-miss), so under stale (over-stated) leaves this may
+     *      diverge from the state-changing `_generateChallenge` draw, which self-heals — best-effort
+     *      prediction only, not guaranteed between settle cycles (RFC §Security).
      */
     function previewChallengeForSeed(
-        bytes32 seed,
-        uint256 targetEpoch
+        bytes32 seed
     ) external view returns (uint256 cgId, uint256 kaId, uint256 chunkId) {
-        // Uses the view selection core (no settle-on-miss). Under stale (over-stated)
-        // leaves this may diverge from the state-changing `_generateChallenge` draw,
-        // which self-heals via settle-on-miss. Best-effort prediction only; exactness
-        // is not guaranteed between settle cycles (RFC §Security).
-        return _pickWeightedChallengeView(seed, targetEpoch);
+        return _pickWeightedChallengeView(seed, chronos.getCurrentEpoch());
     }
 
     /**

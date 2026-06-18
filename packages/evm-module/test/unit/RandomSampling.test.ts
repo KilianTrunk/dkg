@@ -998,10 +998,7 @@ describe('@unit RandomSampling', () => {
       const expectedMaxChunk = TEST_KC_BYTE_SIZE / BigInt(chunkByteSize); // 4
 
       for (let i = 0; i < 10; i++) {
-        const preview = await RandomSampling.previewChallengeForSeed(
-          testSeed(i),
-          currentEpoch,
-        );
+        const preview = await RandomSampling.previewChallengeForSeed(testSeed(i));
         expect(preview.cgId).to.equal(cgId);
         expect(preview.kaId).to.equal(kaId);
         // KC byte size (128) > chunk byte size (32), so chunkId is drawn from
@@ -1032,7 +1029,7 @@ describe('@unit RandomSampling', () => {
 
       const currentEpoch = await Chronos.getCurrentEpoch();
       await expect(
-        RandomSampling.previewChallengeForSeed(testSeed(0), currentEpoch),
+        RandomSampling.previewChallengeForSeed(testSeed(0)),
       ).to.be.revertedWithCustomError(
         RandomSampling,
         'NoEligibleKnowledgeAsset',
@@ -1077,10 +1074,7 @@ describe('@unit RandomSampling', () => {
 
       const currentEpoch = await Chronos.getCurrentEpoch();
       for (let i = 0; i < 25; i++) {
-        const preview = await RandomSampling.previewChallengeForSeed(
-          testSeed(i),
-          currentEpoch,
-        );
+        const preview = await RandomSampling.previewChallengeForSeed(testSeed(i));
         // Every successful draw MUST be the public CG / public KC. A
         // success on the curated branch would mean the per-KC commitment
         // filter is leaking.
@@ -1115,7 +1109,7 @@ describe('@unit RandomSampling', () => {
       expect(newEpoch).to.be.greaterThan(endEpoch);
 
       await expect(
-        RandomSampling.previewChallengeForSeed(testSeed(0), newEpoch),
+        RandomSampling.previewChallengeForSeed(testSeed(0)),
       ).to.be.revertedWithCustomError(
         RandomSampling,
         'NoEligibleKnowledgeAsset',
@@ -1151,10 +1145,7 @@ describe('@unit RandomSampling', () => {
       const counts: Record<string, number> = { A: 0, B: 0, C: 0 };
       const currentEpoch = await Chronos.getCurrentEpoch();
       for (let i = 0; i < DRAWS; i++) {
-        const preview = await RandomSampling.previewChallengeForSeed(
-          testSeed(i),
-          currentEpoch,
-        );
+        const preview = await RandomSampling.previewChallengeForSeed(testSeed(i));
         if (preview.cgId === cgA) counts.A++;
         else if (preview.cgId === cgB) counts.B++;
         else if (preview.cgId === cgC) counts.C++;
@@ -1190,10 +1181,7 @@ describe('@unit RandomSampling', () => {
 
       const currentEpoch = await Chronos.getCurrentEpoch();
       for (let i = 0; i < 15; i++) {
-        const preview = await RandomSampling.previewChallengeForSeed(
-          testSeed(i),
-          currentEpoch,
-        );
+        const preview = await RandomSampling.previewChallengeForSeed(testSeed(i));
         expect(preview.cgId).to.equal(activeCg);
         expect(preview.kaId).to.equal(activeKc);
       }
@@ -1235,7 +1223,7 @@ describe('@unit RandomSampling', () => {
 
       // Picker-level invariant: adjustedTotal == 0 → revert.
       await expect(
-        RandomSampling.previewChallengeForSeed(testSeed(0), newEpoch),
+        RandomSampling.previewChallengeForSeed(testSeed(0)),
       ).to.be.revertedWithCustomError(
         RandomSampling,
         'NoEligibleContextGraph',
@@ -1285,10 +1273,7 @@ describe('@unit RandomSampling', () => {
 
       // Picker invariant: every draw lands on the active CG.
       for (let i = 0; i < 20; i++) {
-        const preview = await RandomSampling.previewChallengeForSeed(
-          testSeed(i),
-          newEpoch,
-        );
+        const preview = await RandomSampling.previewChallengeForSeed(testSeed(i));
         expect(preview.cgId).to.equal(activeCg);
         expect(preview.kaId).to.equal(activeKc);
       }
@@ -1368,10 +1353,7 @@ describe('@unit RandomSampling', () => {
 
       for (let i = 0; i < 60; i++) {
         const seed = testSeed(i);
-        const got = await RandomSampling.previewChallengeForSeed(
-          seed,
-          currentEpoch,
-        );
+        const got = await RandomSampling.previewChallengeForSeed(seed);
         const exp = oracle(seed);
         expect(got.cgId, `cgId i=${i}`).to.equal(exp.cg);
         expect(got.kaId, `kaId i=${i}`).to.equal(exp.ka);
@@ -1401,10 +1383,7 @@ describe('@unit RandomSampling', () => {
       const DRAWS = 5_000;
       const counts = new Map<string, number>();
       for (let i = 0; i < DRAWS; i++) {
-        const p = await RandomSampling.previewChallengeForSeed(
-          testSeed(1_000_000 + i),
-          currentEpoch,
-        );
+        const p = await RandomSampling.previewChallengeForSeed(testSeed(1_000_000 + i));
         counts.set(
           p.cgId.toString(),
           (counts.get(p.cgId.toString()) ?? 0) + 1,

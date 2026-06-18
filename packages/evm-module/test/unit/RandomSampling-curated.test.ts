@@ -289,10 +289,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
 
       const currentEpoch = await ChronosContract.getCurrentEpoch();
       for (let i = 0; i < 10; i++) {
-        const preview = await RandomSamplingContract.previewChallengeForSeed(
-          testSeed(i),
-          currentEpoch,
-        );
+        const preview = await RandomSamplingContract.previewChallengeForSeed(testSeed(i));
         expect(preview.cgId).to.equal(cgId);
         expect(preview.kaId).to.equal(kaId);
         // Step 3 uses catalogLeafCount for curated CGs.
@@ -319,10 +316,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       const currentEpoch = await ChronosContract.getCurrentEpoch();
       const seen = new Set<bigint>();
       for (let i = 0; i < 30; i++) {
-        const preview = await RandomSamplingContract.previewChallengeForSeed(
-          testSeed(i),
-          currentEpoch,
-        );
+        const preview = await RandomSamplingContract.previewChallengeForSeed(testSeed(i));
         expect(preview.chunkId).to.be.lessThan(BigInt(SAMPLE_CATALOG_COUNT_B));
         seen.add(preview.chunkId);
       }
@@ -357,10 +351,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       let successes = 0;
       for (let i = 0; i < 30; i++) {
         try {
-          const preview = await RandomSamplingContract.previewChallengeForSeed(
-            testSeed(i),
-            currentEpoch,
-          );
+          const preview = await RandomSamplingContract.previewChallengeForSeed(testSeed(i));
           expect(preview.kaId).to.equal(committedKcId);
           successes++;
         } catch {
@@ -382,7 +373,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
 
       const currentEpoch = await ChronosContract.getCurrentEpoch();
       await expect(
-        RandomSamplingContract.previewChallengeForSeed(testSeed(0), currentEpoch),
+        RandomSamplingContract.previewChallengeForSeed(testSeed(0)),
       ).to.be.revertedWithCustomError(
         RandomSamplingContract,
         'NoEligibleKnowledgeAsset',
@@ -598,10 +589,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       const currentEpoch = await ChronosContract.getCurrentEpoch();
       const seen = new Set<bigint>();
       for (let i = 0; i < 30; i++) {
-        const preview = await RandomSamplingContract.previewChallengeForSeed(
-          testSeed(i),
-          currentEpoch,
-        );
+        const preview = await RandomSamplingContract.previewChallengeForSeed(testSeed(i));
         expect(preview.cgId).to.equal(cgId);
         expect(preview.kaId).to.equal(kaId);
         seen.add(preview.chunkId);
@@ -629,10 +617,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       await seedCGValue(cgId, 1_000n);
 
       const currentEpoch = await ChronosContract.getCurrentEpoch();
-      const preview = await RandomSamplingContract.previewChallengeForSeed(
-        testSeed(0),
-        currentEpoch,
-      );
+      const preview = await RandomSamplingContract.previewChallengeForSeed(testSeed(0));
       expect(preview.cgId).to.equal(cgId);
       expect(preview.kaId).to.equal(kaId);
       expect(preview.chunkId).to.equal(0n); // merkleLeafCount == 1 → seed % 1 == 0
@@ -674,10 +659,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       // revert NoEligibleKnowledgeAsset on roughly all seeds.
       let successes = 0;
       for (let i = 0; i < 20; i++) {
-        const preview = await RandomSamplingContract.previewChallengeForSeed(
-          testSeed(i),
-          currentEpoch,
-        );
+        const preview = await RandomSamplingContract.previewChallengeForSeed(testSeed(i));
         expect(preview.cgId).to.equal(eligibleCg);
         expect(preview.kaId).to.equal(eligibleKcId);
         successes++;
@@ -699,7 +681,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
 
       const currentEpoch = await ChronosContract.getCurrentEpoch();
       await expect(
-        RandomSamplingContract.previewChallengeForSeed(testSeed(0), currentEpoch),
+        RandomSamplingContract.previewChallengeForSeed(testSeed(0)),
       ).to.be.revertedWithCustomError(
         RandomSamplingContract,
         'NoEligibleKnowledgeAsset',
@@ -716,7 +698,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       await seedCGValue(emptyCg, 1_000n);
       const currentEpoch = await ChronosContract.getCurrentEpoch();
       await expect(
-        RandomSamplingContract.previewChallengeForSeed(testSeed(0), currentEpoch),
+        RandomSamplingContract.previewChallengeForSeed(testSeed(0)),
       ).to.be.revertedWithCustomError(
         RandomSamplingContract,
         'NoEligibleKnowledgeAsset',
@@ -738,7 +720,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
 
       const currentEpoch = await ChronosContract.getCurrentEpoch();
       await expect(
-        RandomSamplingContract.previewChallengeForSeed(testSeed(0), currentEpoch),
+        RandomSamplingContract.previewChallengeForSeed(testSeed(0)),
       ).to.be.revertedWithCustomError(
         RandomSamplingContract,
         'NoEligibleContextGraph',
@@ -770,7 +752,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
 
       const currentEpoch = await ChronosContract.getCurrentEpoch();
       await expect(
-        RandomSamplingContract.previewChallengeForSeed(testSeed(0), currentEpoch),
+        RandomSamplingContract.previewChallengeForSeed(testSeed(0)),
       ).to.be.revertedWithCustomError(
         RandomSamplingContract,
         'NoEligibleKnowledgeAsset',
@@ -796,10 +778,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
 
       const seen = new Set<bigint>();
       for (let i = 0; i < 30; i++) {
-        const preview = await RandomSamplingContract.previewChallengeForSeed(
-          testSeed(i),
-          currentEpoch,
-        );
+        const preview = await RandomSamplingContract.previewChallengeForSeed(testSeed(i));
         seen.add(preview.kaId);
         expect([aliveKcId, aliveKcId2]).to.include(preview.kaId);
       }
@@ -829,12 +808,9 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
 
       const currentEpoch = await ChronosContract.getCurrentEpoch();
       const seed = testSeed(42);
-      const ref = await RandomSamplingContract.previewChallengeForSeed(seed, currentEpoch);
+      const ref = await RandomSamplingContract.previewChallengeForSeed(seed);
       for (let i = 0; i < 10; i++) {
-        const preview = await RandomSamplingContract.previewChallengeForSeed(
-          seed,
-          currentEpoch,
-        );
+        const preview = await RandomSamplingContract.previewChallengeForSeed(seed);
         expect(preview.cgId).to.equal(ref.cgId);
         expect(preview.kaId).to.equal(ref.kaId);
         expect(preview.chunkId).to.equal(ref.chunkId);
@@ -862,10 +838,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       // ~all 13 values; a regression collapsing the distribution to <6
       // values is the failure mode worth catching here.
       for (let i = 0; i < 60; i++) {
-        const preview = await RandomSamplingContract.previewChallengeForSeed(
-          testSeed(i),
-          currentEpoch,
-        );
+        const preview = await RandomSamplingContract.previewChallengeForSeed(testSeed(i));
         seenChunks.add(preview.chunkId);
       }
       expect(seenChunks.size).to.be.greaterThanOrEqual(7);
@@ -894,10 +867,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       const currentEpoch = await ChronosContract.getCurrentEpoch();
       const cgPicks = new Map<string, number>();
       for (let i = 0; i < 40; i++) {
-        const preview = await RandomSamplingContract.previewChallengeForSeed(
-          testSeed(i),
-          currentEpoch,
-        );
+        const preview = await RandomSamplingContract.previewChallengeForSeed(testSeed(i));
         const k = preview.cgId.toString();
         cgPicks.set(k, (cgPicks.get(k) ?? 0) + 1);
         if (preview.cgId === curatedCg) {

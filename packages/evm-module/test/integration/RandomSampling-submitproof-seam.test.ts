@@ -1,4 +1,4 @@
-import { loadFixture } from '@nomicfoundation/hardhat-network-helpers';
+import { loadFixture, time } from '@nomicfoundation/hardhat-network-helpers';
 import { expect } from 'chai';
 import { ethers } from 'ethers';
 import hre from 'hardhat';
@@ -228,6 +228,53 @@ describe('@integration RandomSampling submitProof + multi-store seam (R3)', () =
     return kaId;
   }
 
+  // Like seedKa but with explicit KC expiry / value lifetime / per-epoch weight — used by the
+  // settle-on-miss test to build a dominant CG that goes stale (KC expires + value decays) while
+  // its BIT leaf keeps the old (over-stated) weight until something settles it.
+  async function seedKaCustom(
+    cgId: bigint,
+    kcEndEpoch: bigint,
+    lifetime: bigint,
+    value: bigint,
+  ): Promise<bigint> {
+    const currentEpoch = await Chronos.getCurrentEpoch();
+    const receipt = await (
+      await DKGKnowledgeAssets.connect(opSigner).createKnowledgeAsset(
+        opSigner.address,
+        opSigner.address,
+        nextKaId(),
+        'seam-settle-miss',
+        merkleRoot,
+        1,
+        TEST_KC_BYTE_SIZE,
+        currentEpoch,
+        kcEndEpoch,
+        0,
+        false,
+        1,
+      )
+    ).wait();
+    const iface = DKGKnowledgeAssets.interface;
+    const topic = iface.getEvent('KnowledgeAssetCreated')!.topicHash;
+    const log = receipt!.logs.find((l) => l.topics[0] === topic)!;
+    const kaId = iface.parseLog(
+      log as unknown as { topics: string[]; data: string },
+    )!.args[0] as bigint;
+    await (
+      await ContextGraphStorage.connect(opSigner).registerKnowledgeAssetToContextGraph(cgId, kaId)
+    ).wait();
+    await (
+      await ContextGraphValueStorage.connect(opSigner).addCGValueForEpochRange(
+        cgId,
+        currentEpoch,
+        lifetime,
+        value,
+      )
+    ).wait();
+    await (await CGWeightTreeStorage.connect(opSigner).settle(cgId)).wait();
+    return kaId;
+  }
+
   // Curated variant of createPublicCG: accessPolicy=1 ⇒ getIsCurated()=true.
   // publishPolicy stays OPEN so no publishAuthority is required.
   async function createCuratedCG(): Promise<bigint> {
@@ -356,6 +403,45 @@ describe('@integration RandomSampling submitProof + multi-store seam (R3)', () =
     await expect(
       RandomSampling.connect(node.operational).createChallenge(),
     ).to.be.revertedWithCustomError(RandomSampling, 'ChallengeDrawPaused');
+  });
+
+  it('Test F — createChallenge settle-on-miss: a dominant STALE CG is reconciled (and the reconcile PERSISTS) before the draw lands on a live CG', async () => {
+    const node = await setupChallengingNode();
+    const epoch = await Chronos.getCurrentEpoch();
+
+    // Stale-dominant CG A: huge per-epoch weight (1e24/2 = 5e23), short lifetime, KC expires soon.
+    const cgA = await createPublicCG();
+    await seedKaCustom(cgA, epoch + 2n, 2n, 10n ** 24n);
+    // Live CG B: tiny weight (1), long lifetime, KC lives long.
+    const cgB = await createPublicCG();
+    const kaB = await seedKaCustom(cgB, epoch + 1000n, 1000n, 1000n);
+
+    const leafA0 = await CGWeightTreeStorage.cgWeight(cgA);
+    const leafB0 = await CGWeightTreeStorage.cgWeight(cgB);
+    // A's stale leaf dominates the weighted draw, so createChallenge deterministically lands on A first.
+    expect(leafA0).to.be.greaterThan(leafB0 * 10n ** 6n);
+
+    // Advance past A's lifetime + KC expiry, but well within B's. No re-settle, so A's BIT leaf
+    // stays at the old (over-stated) weight while its ledger value has decayed to 0.
+    const epochSeconds = Number(await Chronos.epochLength());
+    await time.increase(epochSeconds * 3);
+    const now = await Chronos.getCurrentEpoch();
+    expect(await ContextGraphValueStorage.getCGValueAtEpoch(cgA, now)).to.equal(0n); // A decayed
+    expect(await ContextGraphValueStorage.getCGValueAtEpoch(cgB, now)).to.be.greaterThan(0n); // B live
+    expect(await CGWeightTreeStorage.cgWeight(cgA)).to.equal(leafA0); // leaf still stale (over-stated)
+
+    // Production path: A dominates → drawn first → KC expired → settle-on-miss reconciles A's
+    // leaf to its true (0) value → A excluded → re-draw lands on the live CG B → SUCCESS (commits).
+    await RandomSampling.updateAndGetActiveProofPeriodStartBlock();
+    await RandomSampling.connect(node.operational).createChallenge();
+    const ch = await RandomSamplingStorage.getNodeChallenge(node.identityId);
+
+    // The challenge is for the live CG B...
+    expect(ch.knowledgeAssetId).to.equal(kaB);
+    // ...and settle-on-miss reconciled A's stale leaf to 0 AND it PERSISTED (the tx committed).
+    expect(await CGWeightTreeStorage.cgWeight(cgA)).to.equal(0n);
+    // B was the winning draw (not a miss), so its leaf is untouched.
+    expect(await CGWeightTreeStorage.cgWeight(cgB)).to.equal(leafB0);
   });
 
   it('Test A — submits a valid proof against the single store (solved=true)', async () => {

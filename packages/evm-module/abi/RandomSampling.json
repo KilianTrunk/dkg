@@ -420,11 +420,6 @@
         "internalType": "bytes32",
         "name": "seed",
         "type": "bytes32"
-      },
-      {
-        "internalType": "uint256",
-        "name": "targetEpoch",
-        "type": "uint256"
       }
     ],
     "name": "previewChallengeForSeed",

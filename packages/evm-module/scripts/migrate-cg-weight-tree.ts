@@ -61,11 +61,14 @@ async function main() {
   let expectedTotal = 0n;
   for (let cg = 1n; cg <= counter; cg++) {
     if (!(await cgStorage.isContextGraphActive(cg))) continue; // Invariant 2: inactive -> leaf 0
+    // FATAL on a read failure: getCGValueAtEpoch only reverts on ledger corruption
+    // (NegativeCumulative). Silently seeding 0 would drop that CG's weight; abort so the
+    // operator investigates rather than unlocking with a missing leaf.
     let w = 0n;
     try {
       w = await cgValue.getCGValueAtEpoch(cg, currentEpoch);
     } catch (e) {
-      console.warn(`  cg ${cg}: getCGValueAtEpoch reverted (${(e as Error).message.slice(0, 60)}) — seeding 0`);
+      throw new Error(`cg ${cg}: getCGValueAtEpoch reverted (${(e as Error).message.slice(0, 80)}) — aborting migration`);
     }
     if (w > 0n) {
       cgIds.push(cg);

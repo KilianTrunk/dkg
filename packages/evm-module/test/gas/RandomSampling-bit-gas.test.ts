@@ -104,11 +104,9 @@ describe('@gas RandomSampling BIT draw', () => {
     await createKC(cg, endEpoch, 4n);
     await Tree.connect(opSigner).seed(cg, DOMINANT);
 
-    const epoch = await ChronosCtr.getCurrentEpoch();
     const seed = ethers.keccak256(ethers.toUtf8Bytes('gas-seed'));
 
-    const measure = async () =>
-      RS.previewChallengeForSeed.estimateGas(seed, epoch);
+    const measure = async () => RS.previewChallengeForSeed.estimateGas(seed);
 
     const results: Record<string, bigint> = {};
     results['N=1'] = await measure();

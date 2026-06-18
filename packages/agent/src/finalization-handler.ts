@@ -1066,8 +1066,18 @@ export class FinalizationHandler {
     }
     const kaMetadata: KAMetadata[] = [];
 
-    for (let tokenIdx = 0; tokenIdx < rootEntities.length; tokenIdx++) {
-      const rootEntity = rootEntities[tokenIdx];
+    // GH #936 — assign per-root tokenIds over a CANONICAL (lexicographic) root
+    // order, NOT the SPARQL/gossip binding order. oxigraph binding order is
+    // store-history-dependent, so two replicas reconciling the same KC from
+    // chain would otherwise mint divergent root→tokenId maps. These tokenIds are
+    // local compatibility labels (the on-chain KA count is 1, no on-chain
+    // dependency — see dkg-publisher.ts), so a content-derived sort makes the
+    // map a pure function of the root SET: identical on every replica and on
+    // both the gossip and chain-reconcile promotion paths.
+    const orderedRoots = [...rootEntities].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+
+    for (let tokenIdx = 0; tokenIdx < orderedRoots.length; tokenIdx++) {
+      const rootEntity = orderedRoots[tokenIdx];
       const entityQuads = partitioned.get(rootEntity) ?? [];
       if (entityQuads.length === 0) continue;
       kaMetadata.push({
@@ -1159,6 +1169,35 @@ export class FinalizationHandler {
     } catch { /* tentative status may not exist */ }
 
     let metaQuads = generateConfirmedFullMetadata(kcMeta, kaMetadata, provenance);
+
+    // GH #936 — emit an EXPLICIT, deterministic per-root token map
+    // (`<ual>/<tokenId>` dkg:tokenId / dkg:entity) for multi-root KCs so two
+    // replicas reconciling the same KC expose an IDENTICAL, queryable
+    // rootEntity→tokenId mapping (the tokenId now derives from the canonical
+    // root sort above). Emitted here rather than in generateKCMetadata, which
+    // metadata.test.ts pins to forbid these predicates. graph = the default
+    // `<cg>/_meta` so the ctxGraphId remap below routes them to the per-cgId
+    // `_meta` (and dual-writes a root copy when keepRootCopyOnLabel).
+    if (kaMetadata.length > 1) {
+      const defaultMetaGraph = `did:dkg:context-graph:${contextGraphId}/_meta`;
+      for (const ka of kaMetadata) {
+        const labelSubject = `${ual}/${ka.tokenId}`;
+        metaQuads.push(
+          {
+            subject: labelSubject,
+            predicate: `${DKG_NS}tokenId`,
+            object: `"${ka.tokenId}"^^<http://www.w3.org/2001/XMLSchema#integer>`,
+            graph: defaultMetaGraph,
+          },
+          {
+            subject: labelSubject,
+            predicate: DKG_ENTITY,
+            object: ka.rootEntity,
+            graph: defaultMetaGraph,
+          },
+        );
+      }
+    }
     if (ctxGraphId) {
       const defaultMeta = `did:dkg:context-graph:${contextGraphId}/_meta`;
       const targetMeta = contextGraphMetaUri(contextGraphId, ctxGraphId);

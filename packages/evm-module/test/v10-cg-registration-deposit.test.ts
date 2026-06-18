@@ -149,12 +149,20 @@ describe('@unit OT-RFC-53 — CG registration deposit', () => {
     // Non-owner cannot sweep.
     await expect(Facade.connect(stranger).sweepContextGraphEscrow(cgId)).to.be.reverted;
 
+    // Read the staker reward pool (shard 1) at the sweep epoch before/after so
+    // the test fails if the sweep ever stops crediting EpochStorage.
+    const ChronosC = await hre.ethers.getContract('Chronos');
+    const epoch = await (ChronosC as unknown as { getCurrentEpoch(): Promise<bigint> }).getCurrentEpoch();
+    const poolBefore = await Epoch.getEpochPool(1n, epoch);
+
     // HubOwner sweep credits the current-epoch pool and clears the escrow.
     await expect(Facade.connect(owner).sweepContextGraphEscrow(cgId)).to.emit(
       Facade,
       'ContextGraphEscrowSwept',
     );
     expect(await CGS.getRegistrationEscrow(cgId)).to.equal(0n);
+    // The swept escrow actually landed in the reward pool.
+    expect(await Epoch.getEpochPool(1n, epoch)).to.equal(poolBefore + DEPOSIT);
 
     // Nothing left to sweep ⇒ revert.
     await expect(Facade.connect(owner).sweepContextGraphEscrow(cgId)).to.be.reverted;

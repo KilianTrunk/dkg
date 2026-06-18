@@ -11,6 +11,7 @@ interface SyncProgressSummary {
   failedPeers?: number;
   failedPhases?: number;
   deniedPhases?: number;
+  backoffWorthyFailures?: number;
 }
 
 type SyncFromPeerResult = number | SyncProgressSummary;
@@ -87,7 +88,11 @@ function madeSyncProgress(result: SyncFromPeerResult): boolean {
 
 function hadBackoffWorthyFailure(result: SyncFromPeerResult): boolean {
   if (typeof result === 'number') return false;
-  return (result.failedPeers ?? 0) > 0 || (result.timedOutPhases ?? 0) > 0;
+  return (
+    (result.backoffWorthyFailures ?? 0) > 0 ||
+    (result.failedPeers ?? 0) > 0 ||
+    (result.timedOutPhases ?? 0) > 0
+  );
 }
 
 function hadDeniedPhase(result: SyncFromPeerResult): boolean {
@@ -197,6 +202,10 @@ export async function runSyncOnConnect(context: SyncOnConnectContext): Promise<S
     const synced = await syncFromPeer(remotePeer);
     recordSyncAccounting(synced, 'durable');
     logInfo(ctx, `Synced ${insertedTriples(synced)} data triples from peer ${shortPeer}`);
+    if (hadBackoffWorthyFailure(synced)) {
+      logInfo(ctx, `Stopping sync-on-connect fanout for peer ${shortPeer} after durable sync hit backoff-worthy pressure`);
+      return 'synced';
+    }
 
     const syncScope = new Set<string>([
       SYSTEM_CONTEXT_GRAPHS.AGENTS,
@@ -214,6 +223,10 @@ export async function runSyncOnConnect(context: SyncOnConnectContext): Promise<S
       const discoverSynced = await syncFromPeer(remotePeer, newlyDiscovered);
       recordSyncAccounting(discoverSynced, 'durable');
       logInfo(ctx, `Synced ${insertedTriples(discoverSynced)} durable triples for newly discovered CG(s) from ${shortPeer}`);
+      if (hadBackoffWorthyFailure(discoverSynced)) {
+        logInfo(ctx, `Stopping sync-on-connect fanout for peer ${shortPeer} after discovered-CG durable sync hit backoff-worthy pressure`);
+        return 'synced';
+      }
       await runNonTransportStep(() => refreshMetaSyncedFlags(newlyDiscovered));
     }
 

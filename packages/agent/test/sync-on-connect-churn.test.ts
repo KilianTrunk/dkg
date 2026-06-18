@@ -7,6 +7,7 @@ import { runSyncOnConnect } from '../src/sync/on-connect/sync-on-connect.js';
 import type { OperationContext } from '@origintrail-official/dkg-core';
 
 const PEER_A = '12D3KooWSmU3owJvB9sFw8uApDgKrv2VBMecsGGvgAc4Gq6hB57M';
+const PEER_B = '12D3KooWRnKxyUg8W3ju7BpxN3e9NAsG1T4d6TuK53LZxD41f3RC';
 
 function recorder<A extends unknown[], R>(impl: (...args: A) => R) {
   const calls: A[] = [];
@@ -31,6 +32,23 @@ async function createUnstartedAgent(name: string): Promise<DKGAgent> {
 }
 
 const noopLog = (_ctx: OperationContext, _message: string) => {};
+
+function emptyDetailedSync(overrides: Record<string, number> = {}) {
+  return {
+    insertedTriples: 0,
+    insertedDataTriples: 0,
+    insertedMetaTriples: 0,
+    metaOnlyResponses: 0,
+    completedPhases: 0,
+    checkpointAdvances: 0,
+    timedOutPhases: 0,
+    failedPeers: 0,
+    failedPhases: 0,
+    deniedPhases: 0,
+    backoffWorthyFailures: 0,
+    ...overrides,
+  };
+}
 
 describe('sync-on-connect churn gates', () => {
   it('dedupes repeated reconnect scheduling across a short relay flap', async () => {
@@ -110,6 +128,69 @@ describe('sync-on-connect churn gates', () => {
     (agent as any).catchupOnConnectAt.set(PEER_A, staleQueuedAt);
     expect((agent as any).queueSyncFromPeerOnConnect(PEER_A, () => undefined, 0)).toBe(false);
     expect((agent as any).catchupOnConnectAt.get(PEER_A)).toBe(staleQueuedAt);
+  });
+
+  it('does not let one peer backoff suppress connection-open sync for another peer', async () => {
+    const agent = await createUnstartedAgent('SyncReconnectBackoffPeerScoped');
+    const calls: string[] = [];
+    (agent as any).syncReconcilerBackoff.set(PEER_A, {
+      failures: 1,
+      nextRetryAt: Date.now() + CATCHUP_ON_CONNECT_COOLDOWN_MS,
+      protocolsKey: null,
+      connectionKey: null,
+    });
+    (agent as any).runSyncFromPeerOnConnect = async (peerId: string) => {
+      calls.push(peerId);
+    };
+
+    expect((agent as any).queueSyncFromPeerOnConnect(PEER_A, () => undefined, 0)).toBe(false);
+    expect((agent as any).queueSyncFromPeerOnConnect(PEER_B, () => undefined, 0)).toBe(true);
+
+    await flushTimers();
+    expect(calls).toEqual([PEER_B]);
+  });
+
+  it('allows connection-open sync after peer backoff cooldown expires', async () => {
+    const agent = await createUnstartedAgent('SyncReconnectBackoffExpiry');
+    const calls: string[] = [];
+    (agent as any).syncReconcilerBackoff.set(PEER_A, {
+      failures: 1,
+      nextRetryAt: Date.now() - 1,
+      protocolsKey: null,
+      connectionKey: null,
+    });
+    (agent as any).runSyncFromPeerOnConnect = async (peerId: string) => {
+      calls.push(peerId);
+    };
+
+    expect((agent as any).queueSyncFromPeerOnConnect(PEER_A, () => undefined, 0)).toBe(true);
+
+    await flushTimers();
+    expect(calls).toEqual([PEER_A]);
+  });
+
+  it('stops post-durable sync-on-connect fanout after backoff-worthy durable pressure', async () => {
+    const refreshMetaSyncedFlags = recorder(async () => undefined);
+    const discoverContextGraphsFromStore = recorder(async () => 0);
+    const syncSharedMemoryFromPeer = recorder(async () => 0);
+
+    const outcome = await runSyncOnConnect({
+      remotePeer: PEER_A,
+      syncingPeers: new Set(),
+      getPeerProtocols: async () => [PROTOCOL_SYNC],
+      knownCorePeerIds: new Set(),
+      getSyncContextGraphs: () => ['cg-a'],
+      syncFromPeer: async () => emptyDetailedSync({ failedPeers: 1, backoffWorthyFailures: 1 }),
+      refreshMetaSyncedFlags,
+      discoverContextGraphsFromStore,
+      syncSharedMemoryFromPeer,
+      logInfo: noopLog,
+    });
+
+    expect(outcome).toBe('synced');
+    expect(refreshMetaSyncedFlags.calls).toEqual([]);
+    expect(discoverContextGraphsFromStore.calls).toEqual([]);
+    expect(syncSharedMemoryFromPeer.calls).toEqual([]);
   });
 
   it('skips SWM sync-on-connect fanout when no CG is locally eligible', async () => {

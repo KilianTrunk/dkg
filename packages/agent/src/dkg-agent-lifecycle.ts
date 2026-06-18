@@ -2479,10 +2479,14 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       syncFromPeer: (peerId, contextGraphIds) => this.syncFromPeerDetailed(
         peerId,
         contextGraphIds ?? [SYSTEM_CONTEXT_GRAPHS.AGENTS, SYSTEM_CONTEXT_GRAPHS.ONTOLOGY, ...(this.config.syncContextGraphs ?? [])],
+        undefined,
+        undefined,
+        undefined,
+        { stopOnBackoffWorthyFailure: true },
       ),
       refreshMetaSyncedFlags: (contextGraphIds) => this.refreshMetaSyncedFlags(contextGraphIds),
       discoverContextGraphsFromStore: () => this.discoverContextGraphsFromStore(),
-      syncSharedMemoryFromPeer: (peerId, contextGraphIds) => this.syncSharedMemoryFromPeerDetailed(peerId, contextGraphIds),
+      syncSharedMemoryFromPeer: (peerId, contextGraphIds) => this.syncSharedMemoryFromPeerDetailed(peerId, contextGraphIds, { stopOnBackoffWorthyFailure: true }),
       syncSharedMemoryOnConnect: this.config.syncSharedMemoryOnConnect ?? true,
       logInfo: (ctx, message) => this.log.info(ctx, message),
       onPeerSkippedNoSync: (peerId) => {
@@ -2967,6 +2971,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     // Phase C — optional gap-safe per-CG delta high-water mark resolver. Backed
     // by a CONTIGUOUS watermark when supplied; omitted ⇒ full scan (default).
     sinceBatchIdFor?: (contextGraphId: string) => string | undefined,
+    options?: { stopOnBackoffWorthyFailure?: boolean },
   ): Promise<DurableSyncResult> {
     const ctx = createOperationContext('sync');
     return runDurableSync({
@@ -2979,6 +2984,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       createContextGraphSyncDeadline: this.createContextGraphSyncDeadline.bind(this),
       fetchSyncPages: this.fetchSyncPages.bind(this),
       sinceBatchIdFor,
+      stopOnBackoffWorthyFailure: options?.stopOnBackoffWorthyFailure,
       processDurableBatchInWorker: this.processDurableBatchInWorker.bind(this),
       storeInsert: (quads) => this.insertSyncedQuadsAndInvalidateListCache(quads),
       deleteCheckpoint: (key) => this.syncCheckpoints.delete(key),
@@ -3194,6 +3200,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
   async syncSharedMemoryFromPeerDetailed(this: DKGAgent,
     remotePeerId: string,
     contextGraphIds: string[],
+    options?: { stopOnBackoffWorthyFailure?: boolean },
   ): Promise<SharedMemorySyncResult> {
     const ctx = createOperationContext('sync');
     // M2 (curator-leader convergence): a PRIVATE CG converges by REPLACE-recovering the
@@ -3327,6 +3334,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
             ),
           getRegisteredSubGraphNames: async (contextGraphId) => (await getSubGraphAdmission(contextGraphId)).registered,
           getExcludedSubGraphNames: async (contextGraphId) => (await getSubGraphAdmission(contextGraphId)).excluded,
+          stopOnBackoffWorthyFailure: options?.stopOnBackoffWorthyFailure,
           ensureContextGraph: async (contextGraphId) => {
             const graphManager = new GraphManager(this.store);
             await graphManager.ensureContextGraph(contextGraphId);
@@ -3372,10 +3380,20 @@ export class LifecycleSyncMethods extends DKGAgentBase {
           summary.completedPhases += 1;
         } else {
           summary.failedPhases += 1;
+          summary.backoffWorthyFailures = (summary.backoffWorthyFailures ?? 0) + 1;
+          if (options?.stopOnBackoffWorthyFailure) {
+            this.log.info(ctx, `Stopping SWM curator-recovery fanout for ${remotePeerId} after "${contextGraphId}" (incomplete recovery)`);
+            break;
+          }
         }
       } catch (err) {
         this.log.warn(ctx, `Curator-recovery for private CG "${contextGraphId}" from ${remotePeerId} failed: ${err instanceof Error ? err.message : String(err)}`);
         summary.failedPeers += 1;
+        summary.backoffWorthyFailures = (summary.backoffWorthyFailures ?? 0) + 1;
+        if (options?.stopOnBackoffWorthyFailure) {
+          this.log.info(ctx, `Stopping SWM curator-recovery fanout for ${remotePeerId} after "${contextGraphId}" (backoff-worthy failure)`);
+          break;
+        }
       }
     }
 

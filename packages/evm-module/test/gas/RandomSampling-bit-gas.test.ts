@@ -21,7 +21,7 @@ import {
 // previewChallengeForSeed (the draw) is not gated by the lock, so it still runs.
 describe('@gas RandomSampling BIT draw', () => {
   const OPEN_POLICY = 1;
-  const TEST_KC_BYTE_SIZE = 128n;
+  const TEST_KA_BYTE_SIZE = 128n;
   const DOMINANT = 10n ** 18n; // real CG weight dwarfs the fake unit leaves, so the draw lands on it
 
   let accounts: Awaited<ReturnType<typeof hre.ethers.getSigners>>;
@@ -70,14 +70,14 @@ describe('@gas RandomSampling BIT draw', () => {
     return CGStorage.getLatestContextGraphId();
   }
 
-  async function createKC(cgId: bigint, endEpoch: bigint, leafCount: bigint): Promise<bigint> {
+  async function createKa(cgId: bigint, endEpoch: bigint, leafCount: bigint): Promise<bigint> {
     kaCounter += 1n;
     const kaId = (BigInt(opSigner.address) << 96n) | kaCounter;
     const startEpoch = await ChronosCtr.getCurrentEpoch();
     await (await KAs.connect(opSigner).createKnowledgeAsset(
       opSigner.address, opSigner.address, kaId, 'gas-bench',
       ethers.keccak256(ethers.toUtf8Bytes(`gas-${cgId}-${kaCounter}`)),
-      1, TEST_KC_BYTE_SIZE, startEpoch, endEpoch, 0, false, leafCount,
+      1, TEST_KA_BYTE_SIZE, startEpoch, endEpoch, 0, false, leafCount,
     )).wait();
     await (await CGStorage.connect(opSigner).registerKnowledgeAssetToContextGraph(cgId, kaId)).wait();
     return kaId;
@@ -98,10 +98,10 @@ describe('@gas RandomSampling BIT draw', () => {
   }
 
   it('draw gas is ~constant in N (CG count) — O(log fixed capacity)', async () => {
-    // One real CG with a live KC and dominant weight, so the draw lands on it.
+    // One real CG with a live KA and dominant weight, so the draw lands on it.
     const cg = await createCG();
     const endEpoch = (await ChronosCtr.getCurrentEpoch()) + 1000n;
-    await createKC(cg, endEpoch, 4n);
+    await createKa(cg, endEpoch, 4n);
     await Tree.connect(opSigner).seed(cg, DOMINANT);
 
     const seed = ethers.keccak256(ethers.toUtf8Bytes('gas-seed'));
@@ -132,7 +132,7 @@ describe('@gas RandomSampling BIT draw', () => {
 
     for (const D of Ds) {
       const cg = await createCG();
-      await createKC(cg, endEpoch, 1n);
+      await createKa(cg, endEpoch, 1n);
       const e = await ChronosCtr.getCurrentEpoch();
       // addCGValueForEpochRange finalizes to e-1; advancing D epochs leaves D epochs to replay.
       await (await CGV.connect(opSigner).addCGValueForEpochRange(cg, e, 1000n, 1_000_000n)).wait();

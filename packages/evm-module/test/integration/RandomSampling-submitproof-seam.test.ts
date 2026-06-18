@@ -68,7 +68,7 @@ const rotatedCatalogRoot = ethers.keccak256(rotatedCatalogContent);
 
 const OPEN_POLICY = 1; // public CG (accessPolicy=0 ⇒ getIsCurated()=false ⇒ merkle path)
 const CURATED_ACCESS = 1; // accessPolicy=1 ⇒ getIsCurated()=true ⇒ catalog path
-const TEST_KC_BYTE_SIZE = 128n;
+const TEST_KA_BYTE_SIZE = 128n;
 
 /**
  * V10 `RandomSampling.submitProof` happy path — NOT exercised by any running
@@ -195,7 +195,7 @@ describe('@integration RandomSampling submitProof + multi-store seam (R3)', () =
         'seam-test-op',
         merkleRoot,
         1, // knowledgeAssetsAmount
-        TEST_KC_BYTE_SIZE,
+        TEST_KA_BYTE_SIZE,
         currentEpoch,
         endEpoch,
         0, // tokenAmount
@@ -233,7 +233,7 @@ describe('@integration RandomSampling submitProof + multi-store seam (R3)', () =
   // its BIT leaf keeps the old (over-stated) weight until something settles it.
   async function seedKaCustom(
     cgId: bigint,
-    kcEndEpoch: bigint,
+    kaEndEpoch: bigint,
     lifetime: bigint,
     value: bigint,
   ): Promise<bigint> {
@@ -246,9 +246,9 @@ describe('@integration RandomSampling submitProof + multi-store seam (R3)', () =
         'seam-settle-miss',
         merkleRoot,
         1,
-        TEST_KC_BYTE_SIZE,
+        TEST_KA_BYTE_SIZE,
         currentEpoch,
-        kcEndEpoch,
+        kaEndEpoch,
         0,
         false,
         1,
@@ -309,7 +309,7 @@ describe('@integration RandomSampling submitProof + multi-store seam (R3)', () =
         'seam-test-curated',
         decoyMerkleRoot, // plaintext root = decoy (public branch would use this)
         1,
-        TEST_KC_BYTE_SIZE,
+        TEST_KA_BYTE_SIZE,
         currentEpoch,
         endEpoch,
         0,

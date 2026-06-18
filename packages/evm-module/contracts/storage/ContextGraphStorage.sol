@@ -342,7 +342,7 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
     /**
      * @notice Return a single KA id at a given index within a CG's KA list.
      * @dev O(1) indexed accessor for on-chain consumers (Phase 10 random
-     *      sampling). Reverts with `InvalidContextGraphConfig("kcIndex oob")`
+     *      sampling). Reverts with `InvalidContextGraphConfig("kaIndex oob")`
      *      on out-of-bounds access — empty list rejects all indices.
      */
     function getContextGraphKaAt(
@@ -351,7 +351,7 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
     ) external view returns (uint256 kaId) {
         uint256[] storage list = _contextGraphKAList[contextGraphId];
         if (index >= list.length) {
-            revert KnowledgeAssetsLib.InvalidContextGraphConfig("kcIndex oob");
+            revert KnowledgeAssetsLib.InvalidContextGraphConfig("kaIndex oob");
         }
         return list[index];
     }

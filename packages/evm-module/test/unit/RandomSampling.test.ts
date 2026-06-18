@@ -844,7 +844,7 @@ describe('@unit RandomSampling', () => {
   describe('Phase 10 — value-weighted challenge generation', () => {
     const CURATED_POLICY = 0; // curated → counts as "private" for Phase 10
     const OPEN_POLICY = 1;
-    const TEST_KC_BYTE_SIZE = 128n;
+    const TEST_KA_BYTE_SIZE = 128n;
 
     /** Hub sentinel — registered as a "contract" in `deployRandomSamplingFixture`
      *  so it can bypass the production facades and call `onlyContracts`
@@ -917,11 +917,11 @@ describe('@unit RandomSampling', () => {
         'phase-10-test-op',
         ethers.keccak256(
           ethers.toUtf8Bytes(
-            `phase-10-kc-${cgId}-${Date.now()}-${Math.random()}`,
+            `phase-10-ka-${cgId}-${Date.now()}-${Math.random()}`,
           ),
         ),
         1, // knowledgeAssetsAmount (mintKnowledgeAssetsTokens requires >=1)
-        TEST_KC_BYTE_SIZE,
+        TEST_KA_BYTE_SIZE,
         startEpoch,
         endEpoch,
         0, // tokenAmount
@@ -929,7 +929,7 @@ describe('@unit RandomSampling', () => {
         merkleLeafCount, // merkleLeafCount (v10 — pin-the-leaf-count guard)
       );
       const receipt = await createTx.wait();
-      // Parse kc id from the KnowledgeAssetCreated event.
+      // Parse ka id from the KnowledgeAssetCreated event.
       const iface = DKGKnowledgeAssets.interface;
       const topic = iface.getEvent('KnowledgeAssetCreated')!.topicHash;
       const log = receipt!.logs.find((l) => l.topics[0] === topic);
@@ -995,7 +995,7 @@ describe('@unit RandomSampling', () => {
 
       const currentEpoch = await Chronos.getCurrentEpoch();
       const chunkByteSize = await RandomSamplingStorage.CHUNK_BYTE_SIZE();
-      const expectedMaxChunk = TEST_KC_BYTE_SIZE / BigInt(chunkByteSize); // 4
+      const expectedMaxChunk = TEST_KA_BYTE_SIZE / BigInt(chunkByteSize); // 4
 
       for (let i = 0; i < 10; i++) {
         const preview = await RandomSampling.previewChallengeForSeed(testSeed(i));
@@ -1062,7 +1062,7 @@ describe('@unit RandomSampling', () => {
 
       const endEpoch = (await Chronos.getCurrentEpoch()) + 5n;
       await createKa(curatedCg, endEpoch);
-      const openKc = await createKa(openCg, endEpoch);
+      const openKa = await createKa(openCg, endEpoch);
 
       // Curated CG holds 10x the value of the public CG. Pre-R1 the picker
       // would have reverted on every curated-weighted draw; post-R1 the
@@ -1079,7 +1079,7 @@ describe('@unit RandomSampling', () => {
         // success on the curated branch would mean the per-KA commitment
         // filter is leaking.
         expect(preview.cgId).to.equal(openCg);
-        expect(preview.kaId).to.equal(openKc);
+        expect(preview.kaId).to.equal(openKa);
       }
     });
 
@@ -1170,7 +1170,7 @@ describe('@unit RandomSampling', () => {
 
       const endEpoch = (await Chronos.getCurrentEpoch()) + 5n;
       await createKa(deactivated, endEpoch);
-      const activeKc = await createKa(activeCg, endEpoch);
+      const activeKa = await createKa(activeCg, endEpoch);
 
       await seedCGValue(deactivated, 10_000n);
       await seedCGValue(activeCg, 1_000n);
@@ -1183,7 +1183,7 @@ describe('@unit RandomSampling', () => {
       for (let i = 0; i < 15; i++) {
         const preview = await RandomSampling.previewChallengeForSeed(testSeed(i));
         expect(preview.cgId).to.equal(activeCg);
-        expect(preview.kaId).to.equal(activeKc);
+        expect(preview.kaId).to.equal(activeKa);
       }
     });
 
@@ -1247,7 +1247,7 @@ describe('@unit RandomSampling', () => {
       // Both KAs live past the advance so picker exclusion is driven only
       // by value decay, not KA expiry.
       await createKa(expiredCg, startEpoch + longLifetime);
-      const activeKc = await createKa(activeCg, startEpoch + longLifetime);
+      const activeKa = await createKa(activeCg, startEpoch + longLifetime);
 
       // Expired CG: 10× the nominal TRAC but a 5-epoch lifetime.
       // Active  CG: 1/10 the nominal TRAC but a 100-epoch lifetime.
@@ -1275,7 +1275,7 @@ describe('@unit RandomSampling', () => {
       for (let i = 0; i < 20; i++) {
         const preview = await RandomSampling.previewChallengeForSeed(testSeed(i));
         expect(preview.cgId).to.equal(activeCg);
-        expect(preview.kaId).to.equal(activeKc);
+        expect(preview.kaId).to.equal(activeKa);
       }
     });
 
@@ -1314,7 +1314,7 @@ describe('@unit RandomSampling', () => {
       };
       // Prefetch weights + KA ordering so the oracle is a pure function.
       const weight: Record<string, bigint> = {};
-      const kcList: Record<string, bigint[]> = {};
+      const kaList: Record<string, bigint[]> = {};
       for (const cg of cgs) {
         weight[cg.toString()] = await ContextGraphValueStorage.getCGValueAtEpoch(
           cg,
@@ -1325,7 +1325,7 @@ describe('@unit RandomSampling', () => {
         for (let i = 0; i < n; i++) {
           list.push(await ContextGraphStorage.getContextGraphKaAt(cg, BigInt(i)));
         }
-        kcList[cg.toString()] = list;
+        kaList[cg.toString()] = list;
       }
       const total = cgs.reduce((s, cg) => s + weight[cg.toString()], 0n);
 
@@ -1344,7 +1344,7 @@ describe('@unit RandomSampling', () => {
         const kaSeed = ethers.keccak256(
           ethers.solidityPacked(['bytes32', 'uint8'], [seed, 0]),
         );
-        const list = kcList[cg.toString()];
+        const list = kaList[cg.toString()];
         const idx = Number(BigInt(kaSeed) % BigInt(list.length));
         const ka = list[idx];
         const chunk = BigInt(kaSeed) % leafCountByCg[cg.toString()];

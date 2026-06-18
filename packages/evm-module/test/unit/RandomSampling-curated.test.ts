@@ -46,7 +46,7 @@ import {
 describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () => {
   const CURATED_POLICY = 0;
   const OPEN_POLICY = 1;
-  const TEST_KC_BYTE_SIZE = 128n;
+  const TEST_KA_BYTE_SIZE = 128n;
   // OT-RFC-49: catalog roots are arbitrary non-zero bytes32 sentinels here —
   // `DKGKnowledgeAssets.setCatalogCommitment` only enforces `root != 0 &&
   // count > 0`; it does not recompute the catalog tree at commit time, so the
@@ -65,7 +65,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
   let HubContract: Hub;
   let RandomSamplingContract: RandomSampling;
   let ChronosContract: Chronos;
-  let KCSContract: DKGKnowledgeAssets;
+  let KASContract: DKGKnowledgeAssets;
   let CGStorageContract: ContextGraphStorage;
   let CGValueStorage: ContextGraphValueStorage;
   let CGWeightTreeStorage: CGWeightTreeStorage;
@@ -116,7 +116,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       HubContract: Hub,
       RandomSamplingContract: await hre.ethers.getContract<RandomSampling>('RandomSampling'),
       ChronosContract: await hre.ethers.getContract<Chronos>('Chronos'),
-      KCSContract: await hre.ethers.getContract<DKGKnowledgeAssets>(
+      KASContract: await hre.ethers.getContract<DKGKnowledgeAssets>(
         'DKGKnowledgeAssets',
       ),
       CGStorageContract: await hre.ethers.getContract<ContextGraphStorage>(
@@ -136,7 +136,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
     HubContract = f.HubContract;
     RandomSamplingContract = f.RandomSamplingContract;
     ChronosContract = f.ChronosContract;
-    KCSContract = f.KCSContract;
+    KASContract = f.KASContract;
     CGStorageContract = f.CGStorageContract;
     CGValueStorage = f.CGValueStorage;
     CGWeightTreeStorage = f.CGWeightTreeStorage;
@@ -214,18 +214,18 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
     catalog?: { root: string; count: number };
   }): Promise<bigint> {
     const currentEpoch = await ChronosContract.getCurrentEpoch();
-    const createTx = await KCSContract.connect(opSigner).createKnowledgeAsset(
+    const createTx = await KASContract.connect(opSigner).createKnowledgeAsset(
       opSigner.address,
       opSigner.address,
       nextOpSignerKaId(), // OT-RFC-43 (1a): caller-supplied author-namespaced id
       'rfc39-curated-test-op',
       ethers.keccak256(
         ethers.toUtf8Bytes(
-          `rfc39-curated-kc-${args.cgId}-${Date.now()}-${Math.random()}`,
+          `rfc39-curated-ka-${args.cgId}-${Date.now()}-${Math.random()}`,
         ),
       ),
       1,
-      TEST_KC_BYTE_SIZE,
+      TEST_KA_BYTE_SIZE,
       currentEpoch,
       args.endEpoch,
       0,
@@ -233,7 +233,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       1,
     );
     const receipt = await createTx.wait();
-    const iface = KCSContract.interface;
+    const iface = KASContract.interface;
     const topic = iface.getEvent('KnowledgeAssetCreated')!.topicHash;
     const log = receipt!.logs.find((l) => l.topics[0] === topic);
     if (!log) {
@@ -249,7 +249,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       kaId,
     );
     if (args.catalog) {
-      await KCSContract.connect(opSigner).setCatalogCommitment(
+      await KASContract.connect(opSigner).setCatalogCommitment(
         kaId,
         args.catalog.root,
         args.catalog.count,
@@ -334,8 +334,8 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       // Two KAs in the same curated CG: one without commitment (legacy /
       // pre-LU-11), one with. The picker should skip the legacy KA every
       // time and consistently return the committed one.
-      await createKa({ cgId, endEpoch }); // legacyKcId — no commitment
-      const committedKcId = await createKa({
+      await createKa({ cgId, endEpoch }); // legacyKaId — no commitment
+      const committedKaId = await createKa({
         cgId,
         endEpoch,
         catalog: { root: SAMPLE_CATALOG_ROOT_A, count: SAMPLE_CATALOG_COUNT_A },
@@ -352,7 +352,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       for (let i = 0; i < 30; i++) {
         try {
           const preview = await RandomSamplingContract.previewChallengeForSeed(testSeed(i));
-          expect(preview.kaId).to.equal(committedKcId);
+          expect(preview.kaId).to.equal(committedKaId);
           successes++;
         } catch {
           // Tolerated — see note above.
@@ -390,10 +390,10 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
         endEpoch,
         catalog: { root: SAMPLE_CATALOG_ROOT_A, count: SAMPLE_CATALOG_COUNT_A },
       });
-      expect(await KCSContract.getCatalogRoot(kaId)).to.equal(
+      expect(await KASContract.getCatalogRoot(kaId)).to.equal(
         SAMPLE_CATALOG_ROOT_A,
       );
-      expect(await KCSContract.getCatalogLeafCount(kaId)).to.equal(
+      expect(await KASContract.getCatalogLeafCount(kaId)).to.equal(
         SAMPLE_CATALOG_COUNT_A,
       );
     });
@@ -402,10 +402,10 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       const cgId = await createCG(OPEN_POLICY);
       const endEpoch = (await ChronosContract.getCurrentEpoch()) + 5n;
       const kaId = await createKa({ cgId, endEpoch });
-      expect(await KCSContract.getCatalogRoot(kaId)).to.equal(
+      expect(await KASContract.getCatalogRoot(kaId)).to.equal(
         ethers.ZeroHash,
       );
-      expect(await KCSContract.getCatalogLeafCount(kaId)).to.equal(0);
+      expect(await KASContract.getCatalogLeafCount(kaId)).to.equal(0);
     });
 
     it('setCatalogCommitment rejects partial commitments (zero root)', async () => {
@@ -413,7 +413,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       const endEpoch = (await ChronosContract.getCurrentEpoch()) + 5n;
       const kaId = await createKa({ cgId, endEpoch });
       await expect(
-        KCSContract.connect(opSigner).setCatalogCommitment(
+        KASContract.connect(opSigner).setCatalogCommitment(
           kaId,
           ethers.ZeroHash,
           SAMPLE_CATALOG_COUNT_A,
@@ -426,7 +426,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       const endEpoch = (await ChronosContract.getCurrentEpoch()) + 5n;
       const kaId = await createKa({ cgId, endEpoch });
       await expect(
-        KCSContract.connect(opSigner).setCatalogCommitment(
+        KASContract.connect(opSigner).setCatalogCommitment(
           kaId,
           SAMPLE_CATALOG_ROOT_A,
           0,
@@ -442,7 +442,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       const endEpoch = (await ChronosContract.getCurrentEpoch()) + 5n;
       const kaId = await createKa({ cgId, endEpoch });
       await expect(
-        KCSContract.connect(opSigner).setCatalogCommitment(
+        KASContract.connect(opSigner).setCatalogCommitment(
           kaId,
           ethers.ZeroHash,
           0,
@@ -460,13 +460,13 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       const endEpoch = (await ChronosContract.getCurrentEpoch()) + 5n;
       const kaId = await createKa({ cgId, endEpoch });
       await expect(
-        KCSContract.connect(opSigner).setCatalogCommitment(
+        KASContract.connect(opSigner).setCatalogCommitment(
           kaId,
           SAMPLE_CATALOG_ROOT_A,
           SAMPLE_CATALOG_COUNT_A,
         ),
       )
-        .to.emit(KCSContract, 'KnowledgeAssetCatalogCommitmentSet')
+        .to.emit(KASContract, 'KnowledgeAssetCatalogCommitmentSet')
         .withArgs(kaId, SAMPLE_CATALOG_ROOT_A, SAMPLE_CATALOG_COUNT_A);
     });
 
@@ -480,7 +480,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       const kaId = await createKa({ cgId, endEpoch });
       const intruder = accounts[5];
       await expect(
-        KCSContract.connect(intruder).setCatalogCommitment(
+        KASContract.connect(intruder).setCatalogCommitment(
           kaId,
           SAMPLE_CATALOG_ROOT_A,
           SAMPLE_CATALOG_COUNT_A,
@@ -502,16 +502,16 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
         endEpoch,
         catalog: { root: SAMPLE_CATALOG_ROOT_A, count: SAMPLE_CATALOG_COUNT_A },
       });
-      expect(await KCSContract.getCatalogRoot(kaId)).to.equal(SAMPLE_CATALOG_ROOT_A);
-      expect(await KCSContract.getCatalogLeafCount(kaId)).to.equal(SAMPLE_CATALOG_COUNT_A);
+      expect(await KASContract.getCatalogRoot(kaId)).to.equal(SAMPLE_CATALOG_ROOT_A);
+      expect(await KASContract.getCatalogLeafCount(kaId)).to.equal(SAMPLE_CATALOG_COUNT_A);
 
-      await KCSContract.connect(opSigner).setCatalogCommitment(
+      await KASContract.connect(opSigner).setCatalogCommitment(
         kaId,
         SAMPLE_CATALOG_ROOT_B,
         SAMPLE_CATALOG_COUNT_B,
       );
-      expect(await KCSContract.getCatalogRoot(kaId)).to.equal(SAMPLE_CATALOG_ROOT_B);
-      expect(await KCSContract.getCatalogLeafCount(kaId)).to.equal(SAMPLE_CATALOG_COUNT_B);
+      expect(await KASContract.getCatalogRoot(kaId)).to.equal(SAMPLE_CATALOG_ROOT_B);
+      expect(await KASContract.getCatalogLeafCount(kaId)).to.equal(SAMPLE_CATALOG_COUNT_B);
     });
 
     it('emits a fresh event on every overwrite (no event suppression on identical values)', async () => {
@@ -524,22 +524,22 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       const kaId = await createKa({ cgId, endEpoch });
 
       await expect(
-        KCSContract.connect(opSigner).setCatalogCommitment(
+        KASContract.connect(opSigner).setCatalogCommitment(
           kaId,
           SAMPLE_CATALOG_ROOT_A,
           SAMPLE_CATALOG_COUNT_A,
         ),
       )
-        .to.emit(KCSContract, 'KnowledgeAssetCatalogCommitmentSet')
+        .to.emit(KASContract, 'KnowledgeAssetCatalogCommitmentSet')
         .withArgs(kaId, SAMPLE_CATALOG_ROOT_A, SAMPLE_CATALOG_COUNT_A);
       await expect(
-        KCSContract.connect(opSigner).setCatalogCommitment(
+        KASContract.connect(opSigner).setCatalogCommitment(
           kaId,
           SAMPLE_CATALOG_ROOT_A,
           SAMPLE_CATALOG_COUNT_A,
         ),
       )
-        .to.emit(KCSContract, 'KnowledgeAssetCatalogCommitmentSet')
+        .to.emit(KASContract, 'KnowledgeAssetCatalogCommitmentSet')
         .withArgs(kaId, SAMPLE_CATALOG_ROOT_A, SAMPLE_CATALOG_COUNT_A);
     });
 
@@ -550,10 +550,10 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       // overflow — otherwise the picker's commitment check would itself
       // revert and DoS the entire sampling tick.
       const farFutureKcId = 999_999_999n;
-      expect(await KCSContract.getCatalogRoot(farFutureKcId)).to.equal(
+      expect(await KASContract.getCatalogRoot(farFutureKcId)).to.equal(
         ethers.ZeroHash,
       );
-      expect(await KCSContract.getCatalogLeafCount(farFutureKcId)).to.equal(0);
+      expect(await KASContract.getCatalogLeafCount(farFutureKcId)).to.equal(0);
     });
   });
 
@@ -579,7 +579,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       const kaId = await createKa({ cgId, endEpoch });
       // Force a commitment onto the public KA to set up the regression
       // probe (storage allows it — the policy gate lives in KAV10).
-      await KCSContract.connect(opSigner).setCatalogCommitment(
+      await KASContract.connect(opSigner).setCatalogCommitment(
         kaId,
         SAMPLE_CATALOG_ROOT_B,
         SAMPLE_CATALOG_COUNT_B,
@@ -622,7 +622,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       expect(preview.kaId).to.equal(kaId);
       expect(preview.chunkId).to.equal(0n); // merkleLeafCount == 1 → seed % 1 == 0
       // Source-truth lock: storage public-branch leaf-count is 1.
-      expect(await KCSContract.getMerkleLeafCount(kaId)).to.equal(1);
+      expect(await KASContract.getMerkleLeafCount(kaId)).to.equal(1);
     });
   });
 
@@ -642,7 +642,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       await createKa({ cgId: exhaustedCg, endEpoch });
       await createKa({ cgId: exhaustedCg, endEpoch });
       // eligibleCg: 1 committed KA (always selectable on Step 2).
-      const eligibleKcId = await createKa({
+      const eligibleKaId = await createKa({
         cgId: eligibleCg,
         endEpoch,
         catalog: { root: SAMPLE_CATALOG_ROOT_A, count: SAMPLE_CATALOG_COUNT_A },
@@ -661,7 +661,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       for (let i = 0; i < 20; i++) {
         const preview = await RandomSamplingContract.previewChallengeForSeed(testSeed(i));
         expect(preview.cgId).to.equal(eligibleCg);
-        expect(preview.kaId).to.equal(eligibleKcId);
+        expect(preview.kaId).to.equal(eligibleKaId);
         successes++;
       }
       expect(successes).to.equal(20);
@@ -691,7 +691,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
     it('a CG with zero KAs is also exhausted on first attempt (kaCount == 0 branch)', async () => {
       // CG exists, is active, has positive value, but the KA list is empty.
       // `_pickWeightedChallenge` step 2: `if (kaCount > 0) { ... }` — when
-      // kaCount==0, pickedKcId stays 0, the inner block is skipped, and the
+      // kaCount==0, pickedKaId stays 0, the inner block is skipped, and the
       // CG is marked exhausted. On the *only* such CG, the outer loop runs
       // out of weighted total on the next attempt and reverts.
       const emptyCg = await createCG(CURATED_POLICY);
@@ -772,7 +772,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       // expiry-retry without a Chronos cheat-code helper.
       const cgId = await createCG(OPEN_POLICY);
       const currentEpoch = await ChronosContract.getCurrentEpoch();
-      const aliveKcId = await createKa({ cgId, endEpoch: currentEpoch + 5n });
+      const aliveKaId = await createKa({ cgId, endEpoch: currentEpoch + 5n });
       const aliveKcId2 = await createKa({ cgId, endEpoch: currentEpoch + 5n });
       await seedCGValue(cgId, 1_000n);
 
@@ -780,7 +780,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       for (let i = 0; i < 30; i++) {
         const preview = await RandomSamplingContract.previewChallengeForSeed(testSeed(i));
         seen.add(preview.kaId);
-        expect([aliveKcId, aliveKcId2]).to.include(preview.kaId);
+        expect([aliveKaId, aliveKcId2]).to.include(preview.kaId);
       }
       // Sanity that the random draw actually distributed across both KAs —
       // if it always picked one (e.g. due to a step-2 regression that
@@ -855,12 +855,12 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       const curatedCg = await createCG(CURATED_POLICY);
       const publicCg = await createCG(OPEN_POLICY);
       const endEpoch = (await ChronosContract.getCurrentEpoch()) + 5n;
-      const curatedKcId = await createKa({
+      const curatedKaId = await createKa({
         cgId: curatedCg,
         endEpoch,
         catalog: { root: SAMPLE_CATALOG_ROOT_A, count: SAMPLE_CATALOG_COUNT_A },
       });
-      const publicKcId = await createKa({ cgId: publicCg, endEpoch });
+      const publicKaId = await createKa({ cgId: publicCg, endEpoch });
       await seedCGValue(curatedCg, 1_000n);
       await seedCGValue(publicCg, 1_000n);
 
@@ -871,11 +871,11 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
         const k = preview.cgId.toString();
         cgPicks.set(k, (cgPicks.get(k) ?? 0) + 1);
         if (preview.cgId === curatedCg) {
-          expect(preview.kaId).to.equal(curatedKcId);
+          expect(preview.kaId).to.equal(curatedKaId);
           // Step 3 curated branch: bound by catalogLeafCount.
           expect(preview.chunkId).to.be.lessThan(BigInt(SAMPLE_CATALOG_COUNT_A));
         } else if (preview.cgId === publicCg) {
-          expect(preview.kaId).to.equal(publicKcId);
+          expect(preview.kaId).to.equal(publicKaId);
           // Step 3 public branch: merkleLeafCount=1 → chunkId=0.
           expect(preview.chunkId).to.equal(0n);
         }

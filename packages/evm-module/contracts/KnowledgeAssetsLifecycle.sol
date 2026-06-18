@@ -79,7 +79,7 @@ import {ECDSA} from "solady/src/utils/ECDSA.sol";
  *              may update a KA, transfer the NFT (an owner may be an EOA, a
  *              Safe via EIP-1271 for N-of-M, or an EIP-7702-delegated EOA).
  *              This supersedes the initial V10 ERC-1155
- *              `balanceOf(msg.sender, kcRange) > 0` gate (which was hijackable
+ *              `balanceOf(msg.sender, kaRange) > 0` gate (which was hijackable
  *              via ERC-1155Delta token transfers) and the V9
  *              `latestPublisher == msg.sender` gate (which gated on
  *              node-operator key). See OT-RFC-45 (owner-only update authority).
@@ -610,10 +610,10 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
      */
     function _coverViaConvictionOrFallThrough(
         uint96 baseCost,
-        uint40 kcStartEpoch,
-        uint40 kcEpochs
+        uint40 kaStartEpoch,
+        uint40 kaEpochs
     ) internal returns (bool covered) {
-        try publishingConvictionNFT.coverPublishingCost(msg.sender, baseCost, kcStartEpoch, kcEpochs) returns (
+        try publishingConvictionNFT.coverPublishingCost(msg.sender, baseCost, kaStartEpoch, kaEpochs) returns (
             uint96
         ) {
             return true;
@@ -784,7 +784,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
 
         // --- 3. Create KA in storage ---
 
-        DKGKnowledgeAssets kcs = knowledgeAssetsStorage;
+        DKGKnowledgeAssets kas = knowledgeAssetsStorage;
         currentEpoch = uint40(chronos.getCurrentEpoch());
 
         // Publisher of record + gas/TRAC payer = `msg.sender` (the paying
@@ -801,7 +801,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         // so off-chain readers (`/api/get`, indexers) can return the
         // canonical author without re-deriving from the EIP-712
         // signature embedded in calldata.
-        kaId = kcs.createKnowledgeAsset(
+        kaId = kas.createKnowledgeAsset(
             msg.sender,
             p.authorAddress,
             p.reservedKaId,
@@ -825,7 +825,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         // `setCatalogCommitment` re-asserts the non-zero invariants as a defensive
         // crosscheck against contract-pair drift.
         if (_hasCatalogCommitment) {
-            kcs.setCatalogCommitment(kaId, p.catalogRoot, p.catalogLeafCount);
+            kas.setCatalogCommitment(kaId, p.catalogRoot, p.catalogLeafCount);
         }
 
         // --- 4. N20: atomic CG↔KA binding + CG value diff ---
@@ -864,17 +864,17 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         uint40 epochs,
         uint96 tokenAmount
     ) external nonReentrant {
-        DKGKnowledgeAssets kcs = knowledgeAssetsStorage;
+        DKGKnowledgeAssets kas = knowledgeAssetsStorage;
 
-        (, , , uint88 byteSize, , uint40 endEpoch, uint96 oldTokenAmount, ) = kcs.getKnowledgeAssetMetadata(id);
+        (, , , uint88 byteSize, , uint40 endEpoch, uint96 oldTokenAmount, ) = kas.getKnowledgeAssetMetadata(id);
 
         uint256 currentEpoch = chronos.getCurrentEpoch();
         if (currentEpoch > endEpoch) {
             revert KnowledgeAssetLib.KnowledgeAssetExpired(id, currentEpoch, endEpoch);
         }
 
-        kcs.setEndEpoch(id, endEpoch + epochs);
-        kcs.setTokenAmount(id, oldTokenAmount + tokenAmount);
+        kas.setEndEpoch(id, endEpoch + epochs);
+        kas.setTokenAmount(id, oldTokenAmount + tokenAmount);
 
         _validateTokenAmount(byteSize, epochs, tokenAmount, false);
         // Pull gross from the publisher first, then distribute only the net
@@ -1360,7 +1360,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         internal
         returns (uint96 deltaTokenAmount, uint40 remainingEpochs, uint40 currentEpoch)
     {
-        DKGKnowledgeAssets kcs = knowledgeAssetsStorage;
+        DKGKnowledgeAssets kas = knowledgeAssetsStorage;
 
         // --- 1. Read current KA metadata (needed for validation + auth) ---
         //
@@ -1386,7 +1386,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
             uint96 currentTokenAmount,
             bool isImmutable,
             uint32 ignoredPreUpdateMerkleLeafCount
-        ) = kcs.getKnowledgeAssetUpdateContext(p.id);
+        ) = kas.getKnowledgeAssetUpdateContext(p.id);
         ignoredPreUpdateMerkleLeafCount;
 
         if (isImmutable) {
@@ -1436,7 +1436,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         //
         // ACK digest — covers EVERY mutable field the update can change so a
         // stale ACK can't be replayed with different byte size, different
-        // token amount, different mint/burn counts, or a different kc id. The
+        // token amount, different mint/burn counts, or a different ka id. The
         // burn id list is digested by its `keccak256` so an arbitrary-length
         // array folds into a fixed-size `bytes32` without blowing out the
         // packed digest. H5 prefix pins replay to (chain, contract).
@@ -1482,7 +1482,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
 
         _verifyUpdateAuthorAttestation(p);
 
-        address kaOwner = kcs.ownerOf(p.id);
+        address kaOwner = kas.ownerOf(p.id);
         if (kaOwner != p.authorAddress) {
             revert NotKnowledgeAssetOwner(p.id, kaOwner, p.authorAddress);
         }
@@ -1553,7 +1553,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
 
         // --- 6. Apply storage mutation (new merkle root, bytes, tokens) ---
 
-        kcs.updateKnowledgeAsset(
+        kas.updateKnowledgeAsset(
             msg.sender,
             p.authorAddress,
             p.id,
@@ -1601,8 +1601,8 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
                 if (p.newCatalogRoot == bytes32(0) || p.newCatalogLeafCount == 0) {
                     revert IncompleteCatalogCommitment();
                 }
-                kcs.setCatalogCommitment(p.id, p.newCatalogRoot, p.newCatalogLeafCount);
-            } else if (kcs.getCatalogRoot(p.id) != bytes32(0)) {
+                kas.setCatalogCommitment(p.id, p.newCatalogRoot, p.newCatalogLeafCount);
+            } else if (kas.getCatalogRoot(p.id) != bytes32(0)) {
                 // KA was previously committed; a zero-pair update would
                 // strand the stale commitment.
                 revert IncompleteCatalogCommitment();

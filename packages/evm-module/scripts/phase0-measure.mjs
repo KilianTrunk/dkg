@@ -15,8 +15,9 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const evmDir = path.resolve(__dirname, '..');
-// The worktree has no .env (gitignored); fall back to the main checkout's .env.
-for (const p of [path.join(evmDir, '.env'), '/Users/aleatoric/dev/dkg/packages/evm-module/.env']) {
+// .env resolution: explicit DOTENV_CONFIG_PATH wins, else the package-local .env. (A fresh
+// worktree may have no .env — it's gitignored — so point DOTENV_CONFIG_PATH at your env file.)
+for (const p of [process.env.DOTENV_CONFIG_PATH, path.join(evmDir, '.env')].filter(Boolean)) {
   if (fs.existsSync(p)) { dotenv.config({ path: p }); break; }
 }
 

@@ -10,11 +10,15 @@
 //
 // Why this is cheap: each leaf weight is read off-chain via getCGValueAtEpoch (a view; the
 // O(D) per-epoch replay runs on the RPC node for free), and seedMany only does O(k.log)
-// SSTOREs. So we batch by COUNT, not gas. The ledger is finalized lazily later (settle-on-
-// spend / settle-on-miss), so no O(D) on-chain work happens here.
+// SSTOREs. The ledger is finalized lazily later (settle-on-spend / settle-on-miss), so no
+// O(D) on-chain work happens here.
+//
+// Each seeded leaf is still ~log2(capacity) (~21) cold SSTOREs, so the batch is kept small
+// (default 25 ≈ a few hundred k gas/tx). Override with MIGRATE_BATCH for a specific chain's
+// gas limit. (Off the critical path for a clean redeploy, which seeds nothing.)
 import hre from 'hardhat';
 
-const BATCH = 200; // CGs per seedMany tx (each seed is O(log); tune down if a tx nears the gas cap)
+const BATCH = Number(process.env.MIGRATE_BATCH || 25); // CGs per seedMany tx (conservative)
 
 async function main() {
   const { ethers, deployments } = hre;
@@ -94,10 +98,19 @@ async function main() {
   }
   console.log(`bitTotal=${bitTotal} (== Σseeded ✓)  ledger getTotalValueAtEpoch=${globalTotal}`);
   if (globalTotal !== 0n && globalTotal !== bitTotal) {
-    console.warn(
-      `  NOTE: global total ${globalTotal} != bitTotal ${bitTotal}. Expected only if some CGs are ` +
-        `inactive-but-valued (excluded from the tree by Invariant 2). Verify before relying on it.`,
-    );
+    // FATAL by default: the RFC makes this cross-check part of unlock validation. A mismatch
+    // means missing/mis-seeded weight UNLESS there are inactive-but-valued CGs (legitimately
+    // excluded from the tree by Invariant 2) — in which case set MIGRATE_ALLOW_TOTAL_MISMATCH=1
+    // after confirming the delta equals the inactive-CG value. Do NOT unlock on an unexplained gap.
+    const msg = `global total ${globalTotal} != bitTotal ${bitTotal} (delta ${globalTotal - bitTotal})`;
+    if (process.env.MIGRATE_ALLOW_TOTAL_MISMATCH === '1') {
+      console.warn(`  OVERRIDE (MIGRATE_ALLOW_TOTAL_MISMATCH=1): ${msg} — unlocking anyway.`);
+    } else {
+      throw new Error(
+        `${msg} — NOT unlocking. If this equals the inactive-but-valued CG total (Invariant 2), ` +
+          're-run with MIGRATE_ALLOW_TOTAL_MISMATCH=1.',
+      );
+    }
   }
 
   // 4) Unlock the draw.

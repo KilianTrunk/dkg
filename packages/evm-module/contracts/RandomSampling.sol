@@ -541,8 +541,12 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
      * @param seed       The 32-byte seed to draw against. Production callers
      *                   should pass a high-entropy hash; tests pass deterministic
      *                   per-iteration seeds for distribution analysis.
-     * @param targetEpoch Epoch to read CG values at. Pass `chronos.getCurrentEpoch()`
-     *                   for the live picker semantics.
+     * @param targetEpoch Epoch used ONLY for per-KC expiry filtering (`getEndEpoch < targetEpoch`).
+     *                   The CG weight draw reads the CURRENT BIT snapshot (`bitTotal` /
+     *                   `findStrictGtExcluding`), which the index cannot reconstruct for a past or
+     *                   future epoch — so the CG distribution is always "as of now". Pass
+     *                   `chronos.getCurrentEpoch()` for a faithful preview; other epochs select the
+     *                   CG from the current weights and only shift KC eligibility.
      * @return cgId      Selected Context Graph id.
      * @return kaId      Selected Knowledge Collection id within that CG.
      * @return chunkId   Selected **V10 Merkle leaf index** within the KC (same field
@@ -631,9 +635,28 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
         return (0, 0, false);
     }
 
-    /// @dev View selection core: renormalizing weighted draw over the BIT, WITHOUT
-    ///      settle-on-miss. Backs `previewChallengeForSeed`. Mirrors the production
-    ///      `_pickWeightedChallengeFull` exactly except it cannot self-heal stale leaves.
+    /// @dev One selection attempt (view): O(1) working total → straddle draw → KC pick.
+    ///      `workingTotal == 0` signals no eligible CG left (caller maps to the attempt-
+    ///      dependent revert); `found == false` with a `chosenCg` signals a miss the caller
+    ///      excludes (and, on the production path, settles). Shared by both loops so the
+    ///      selection — the part that must match the draw-level parity oracle — has ONE
+    ///      implementation; the only difference between view and production is settle-on-miss.
+    function _drawAttempt(
+        bytes32 cgSeed,
+        uint256 currentEpoch,
+        uint256[] memory exhausted
+    ) internal view returns (uint256 workingTotal, uint256 chosenCg, uint256 kaId, uint256 chunkId, bool found) {
+        // working total = bitTotal − Σ excluded leaves (padded zero slots are no-ops).
+        workingTotal = cgWeightTreeStorage.workingTotal(exhausted);
+        if (workingTotal == 0) return (0, 0, 0, 0, false);
+        uint256 r = uint256(cgSeed) % workingTotal;
+        chosenCg = cgWeightTreeStorage.findStrictGtExcluding(r, exhausted);
+        (kaId, chunkId, found) = _pickKc(chosenCg, cgSeed, currentEpoch);
+    }
+
+    /// @dev View loop backing `previewChallengeForSeed`. Same selection as the production
+    ///      draw but cannot settle-on-miss (it's `view`); parity is enforced by the
+    ///      draw-level parity oracle test.
     function _pickWeightedChallengeView(
         bytes32 seed,
         uint256 currentEpoch
@@ -642,25 +665,32 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
         uint8 exhaustedCount = 0;
         bytes32 cgSeed = seed;
         for (uint8 cgAttempt = 0; cgAttempt < MAX_CG_RETRIES; cgAttempt++) {
-            // O(1) working total = bitTotal - sum of excluded leaves (padded zero slots are no-ops).
-            uint256 wt = cgWeightTreeStorage.workingTotal(exhausted);
+            (uint256 wt, uint256 cg, uint256 ka, uint256 chunk, bool found) = _drawAttempt(
+                cgSeed,
+                currentEpoch,
+                exhausted
+            );
             if (wt == 0) {
                 if (cgAttempt == 0) revert NoEligibleContextGraph();
                 revert NoEligibleKnowledgeAsset();
             }
-            uint256 r = uint256(cgSeed) % wt;
-            uint256 chosenCg = cgWeightTreeStorage.findStrictGtExcluding(r, exhausted);
-            (uint256 ka, uint256 chunk, bool found) = _pickKc(chosenCg, cgSeed, currentEpoch);
-            if (found) return (chosenCg, ka, chunk);
-            exhausted[exhaustedCount++] = chosenCg;
+            if (found) return (cg, ka, chunk);
+            exhausted[exhaustedCount++] = cg;
             cgSeed = keccak256(abi.encodePacked(cgSeed, "cgRetry", cgAttempt));
         }
         revert NoEligibleKnowledgeAsset();
     }
 
-    /// @dev Production weighted draw: identical to the view core but reconciles a missed
-    ///      CG's leaf to ledger truth (settle-on-miss) before excluding it, so an
-    ///      over-stated (expired) leaf self-heals to 0 and stops being over-drawn.
+    /// @dev Production weighted draw. Same selection as the view loop, plus settle-on-miss:
+    ///      a missed CG is reconciled to ledger truth before exclusion, so an over-stated
+    ///      (expired) leaf self-heals to 0 and stops being over-drawn.
+    ///
+    ///      Persistence: settle-on-miss commits ONLY when this call returns a challenge. If
+    ///      every attempt misses, `createChallenge` reverts and the settles roll back with it —
+    ///      but `_deriveChallengeSeed` mixes per-block entropy, so the node simply re-rolls with
+    ///      a fresh seed on its next attempt/period (self-recovering, correctness-preserving).
+    ///      settle-on-spend and the permissionless `settleMany` keeper are therefore opportunistic
+    ///      optimizations that trim wasted retries — NOT a liveness backstop.
     function _pickWeightedChallengeFull(
         bytes32 seed,
         uint256 currentEpoch
@@ -669,17 +699,18 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
         uint8 exhaustedCount = 0;
         bytes32 cgSeed = seed;
         for (uint8 cgAttempt = 0; cgAttempt < MAX_CG_RETRIES; cgAttempt++) {
-            uint256 wt = cgWeightTreeStorage.workingTotal(exhausted);
+            (uint256 wt, uint256 cg, uint256 ka, uint256 chunk, bool found) = _drawAttempt(
+                cgSeed,
+                currentEpoch,
+                exhausted
+            );
             if (wt == 0) {
                 if (cgAttempt == 0) revert NoEligibleContextGraph();
                 revert NoEligibleKnowledgeAsset();
             }
-            uint256 r = uint256(cgSeed) % wt;
-            uint256 chosenCg = cgWeightTreeStorage.findStrictGtExcluding(r, exhausted);
-            (uint256 ka, uint256 chunk, bool found) = _pickKc(chosenCg, cgSeed, currentEpoch);
-            if (found) return (chosenCg, ka, chunk);
-            cgWeightTreeStorage.settle(chosenCg); // settle-on-miss: heal over-stated (expired) leaf
-            exhausted[exhaustedCount++] = chosenCg;
+            if (found) return (cg, ka, chunk);
+            cgWeightTreeStorage.settle(cg); // settle-on-miss (persists only if this call commits)
+            exhausted[exhaustedCount++] = cg;
             cgSeed = keccak256(abi.encodePacked(cgSeed, "cgRetry", cgAttempt));
         }
         revert NoEligibleKnowledgeAsset();

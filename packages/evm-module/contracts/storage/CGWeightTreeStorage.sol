@@ -9,6 +9,7 @@ import {ContextGraphValueStorage} from "./ContextGraphValueStorage.sol";
 import {HubDependent} from "../abstract/HubDependent.sol";
 import {INamed} from "../interfaces/INamed.sol";
 import {IVersioned} from "../interfaces/IVersioned.sol";
+import {IInitializable} from "../interfaces/IInitializable.sol";
 
 /**
  * @title CGWeightTreeStorage
@@ -35,7 +36,7 @@ import {IVersioned} from "../interfaces/IVersioned.sol";
  *      the mapping is sparse so unused leaves cost nothing. Because RandomSampling is
  *      a fresh-deploy contract, capacity is (re)chosen per deploy via the constructor.
  */
-contract CGWeightTreeStorage is INamed, IVersioned, HubDependent {
+contract CGWeightTreeStorage is INamed, IVersioned, IInitializable, HubDependent {
     using SafeCast for uint256;
     using SafeCast for int256;
 
@@ -74,7 +75,7 @@ contract CGWeightTreeStorage is INamed, IVersioned, HubDependent {
         backfillLocked = true; // released by finishBackfill() once seeding completes
     }
 
-    function initialize() public onlyHub {
+    function initialize() public virtual override onlyHub {
         chronos = Chronos(hub.getContractAddress("Chronos"));
         contextGraphValueStorage = ContextGraphValueStorage(hub.getContractAddress("ContextGraphValueStorage"));
     }
@@ -100,6 +101,10 @@ contract CGWeightTreeStorage is INamed, IVersioned, HubDependent {
         for (uint256 x = i; x <= BIT_CAPACITY; x += (x & (~x + 1))) {
             bit[x] = (bit[x].toInt256() + delta).toUint256(); // never underflows: see invariants
         }
+        // Slither flags this cached-total SSTORE as "costly op in a loop" via the settleMany/
+        // seedMany batch call stacks; updating bitTotal once per leaf change is required and is
+        // the whole point of the cached total (O(1) reads).
+        // slither-disable-next-line costly-loop
         bitTotal = (bitTotal.toInt256() + delta).toUint256();
     }
 
@@ -201,6 +206,12 @@ contract CGWeightTreeStorage is INamed, IVersioned, HubDependent {
     ///         finalize the ledger so subsequent reads of this CG are O(1). Permissionless
     ///         by design (settle-on-spend, settle-on-miss, keeper): finalizeCGValueUpTo is
     ///         onlyContracts but the call originates from this Hub-registered contract.
+    // Slither: the "reentrancy" detectors flag the state writes after finalizeCGValueUpTo/
+    // getCGValueAtEpoch, but those callees are TRUSTED Hub-registered storage contracts that do
+    // pure storage math — no ETH/token transfer, no low-level call, no untrusted callback — so
+    // there is no reentrancy surface. State-after-call ordering is required (finalize must run
+    // before the value read).
+    // slither-disable-next-line reentrancy-no-eth,reentrancy-benign,reentrancy-events
     function settle(uint256 cg) public {
         uint256 currentEpoch = chronos.getCurrentEpoch();
         if (currentEpoch > 0) contextGraphValueStorage.finalizeCGValueUpTo(cg, currentEpoch - 1);
@@ -210,6 +221,9 @@ contract CGWeightTreeStorage is INamed, IVersioned, HubDependent {
     }
 
     /// @notice Permissionless batch settle (keeper backstop for dormant / under-stated CGs).
+    // Slither: external calls inside the loop are unavoidable for a batch settle; each callee is
+    // a trusted Hub storage contract (see settle). The batch is caller-bounded.
+    // slither-disable-next-line calls-loop
     function settleMany(uint256[] calldata cgs) external {
         uint256 n = cgs.length;
         for (uint256 k = 0; k < n; k++) settle(cgs[k]);

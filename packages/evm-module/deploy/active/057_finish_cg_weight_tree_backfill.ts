@@ -8,7 +8,8 @@ import { DeployFunction } from 'hardhat-deploy/types';
 // testnet redeploy) there is nothing to seed, so we go live immediately by calling
 // finishBackfill() — no manual migration step.
 //
-// - development + testnet: auto-unlock here (deployer is the Hub owner).
+// - development + testnet: auto-unlock here, but ONLY on a provably fresh ledger
+//   (ContextGraphStorage counter == 0) and only if the deployer is the Hub owner.
 // - mainnet: SKIP — going live is a deliberate operator step (seed existing CGs first,
 //   then finishBackfill, typically via the Hub-owner multisig + scripts/migrate-cg-weight-tree.ts).
 //
@@ -35,6 +36,24 @@ const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
   if (!(await tree.backfillLocked())) {
     console.log('[CGWeightTree] already unlocked — skipping.');
     return;
+  }
+
+  // Only auto-unlock on a PROVABLY FRESH ledger. If ContextGraphStorage already has CGs
+  // (an upgrade-in-place / redeploy that kept the value ledger), unlocking with an empty
+  // BIT would orphan all existing weight (draw reverts NoEligibleContextGraph until each CG
+  // is re-settled). In that case the operator must seed first (scripts/migrate-cg-weight-tree.ts)
+  // then finishBackfill. A clean redeploy of ContextGraphStorage has counter == 0 → safe.
+  const cgStorageDep = await deployments.getOrNull('ContextGraphStorage');
+  if (cgStorageDep) {
+    const cgStorage = await ethers.getContractAt('ContextGraphStorage', cgStorageDep.address, signer);
+    const cgCount: bigint = await cgStorage.getLatestContextGraphId();
+    if (cgCount > 0n) {
+      console.log(
+        `[CGWeightTree] ContextGraphStorage already has ${cgCount} CGs — NOT auto-unlocking. ` +
+          'Seed the BIT (scripts/migrate-cg-weight-tree.ts) then call finishBackfill().',
+      );
+      return;
+    }
   }
 
   // finishBackfill is onlyContracts (Hub owner bypasses). Only call if the deployer is the owner;

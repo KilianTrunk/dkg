@@ -23,6 +23,7 @@ export default defineConfig({
       'test/profile-fix-verify.test.ts',
       'test/sync-verify-collapsed.test.ts',
       'test/durable-sync-since-threading.test.ts',
+      'test/sync-responder-concurrent-interleaving.test.ts',
     ],
     testTimeout: 60_000,
     maxWorkers: 1,

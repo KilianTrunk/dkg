@@ -38,6 +38,7 @@ describe('ProtocolRouter', () => {
       expect(isRecoverableSendError(new Error('sync responder queue full'))).toBe(true);
       expect(isRecoverableSendError(new Error('sync responder peer queue full'))).toBe(true);
       expect(isRecoverableSendError(new Error('sync responder queue wait exceeded'))).toBe(true);
+      expect(isRecoverableSendError(new Error('sync responder snapshot limit exceeded (active=128/128)'))).toBe(true);
     });
 
     // Regression for the May 2026 multi-node soak: libp2p surfaces

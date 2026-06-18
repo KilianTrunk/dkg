@@ -3,7 +3,13 @@ import { OxigraphStore, type Quad } from '@origintrail-official/dkg-storage';
 import {
   createResponderGraphListMemo,
   createResponderSyncRowListMemo,
+  SyncRowSnapshotLimitError,
 } from '../src/sync/responder/graph-plan.js';
+import {
+  SYNC_RESPONDER_DURABLE_DATA_SNAPSHOT_LIMIT,
+  SYNC_RESPONDER_DURABLE_META_SNAPSHOT_LIMIT,
+  SYNC_RESPONDER_SHARED_MEMORY_SNAPSHOT_LIMIT,
+} from '../src/sync/responder/sync-handler.js';
 import {
   DKG_NS,
   lineGraphsFromNquads,
@@ -34,6 +40,12 @@ function deferred<T>() {
 
 afterEach(() => {
   vi.useRealTimers();
+});
+
+it('keeps responder snapshot defaults above the generic memo fallback', () => {
+  expect(SYNC_RESPONDER_DURABLE_DATA_SNAPSHOT_LIMIT).toBe(128);
+  expect(SYNC_RESPONDER_DURABLE_META_SNAPSHOT_LIMIT).toBe(64);
+  expect(SYNC_RESPONDER_SHARED_MEMORY_SNAPSHOT_LIMIT).toBe(64);
 });
 
 function watchBoundedPageQuery(
@@ -810,8 +822,15 @@ describe('sync responder pagination interleaving', () => {
     await expect(memo.get('durable:session-1', loadRows)).resolves.toHaveLength(1);
     await expect(memo.get('durable:session-2', loadRows)).resolves.toHaveLength(1);
     await expect(memo.get('durable:session-3', loadRows)).rejects.toThrow(
-      'Too many active durable data sync session snapshots',
+      SyncRowSnapshotLimitError,
     );
+    await expect(memo.get('durable:session-3', loadRows)).rejects.toMatchObject({
+      key: 'durable:session-3',
+      maxEntries: 2,
+      cachedEntries: 2,
+      inflightEntries: 0,
+      activeEntries: 2,
+    });
 
     await expect(
       memo.get('durable:session-1', loadRows, { requireExisting: true }),

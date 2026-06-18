@@ -3947,6 +3947,10 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     await this.refreshMetaSyncedFlags([contextGraphId]);
 
     if (dataSynced > 0 || sharedMemorySynced > 0) {
+      this.markContextGraphSubscriptionState(contextGraphId, {
+        synced: true,
+        ...(sharedMemorySynced > 0 ? { sharedMemorySynced: true } : {}),
+      });
       this.eventBus.emit(DKGEvent.PROJECT_SYNCED, {
         contextGraphId,
         dataSynced,

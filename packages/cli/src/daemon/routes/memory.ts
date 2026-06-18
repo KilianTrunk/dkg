@@ -549,6 +549,17 @@ function swmCatchupOutcomeInput(result: SwmCatchupDetailedResult, errorMessage?:
   };
 }
 
+function uniquePeerIds(peerIds: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const peerId of peerIds) {
+    if (!peerId || seen.has(peerId)) continue;
+    seen.add(peerId);
+    out.push(peerId);
+  }
+  return out;
+}
+
 export async function handleMemoryRoutes(ctx: RequestContext): Promise<void> {
   const {
     req,
@@ -911,19 +922,27 @@ WHERE {
       const baseCandidatePeers = await candidatePeersForContextGraph(cgId);
       const unsupportedPeers = await unsupportedPeersForContextGraph(cgId, baseCandidatePeers);
       const privateCuratorPeerIds = await privateCuratorPeersForContextGraph(cgId);
-      const selectedPeers = swmCatchupPeerSelector.select({
-        contextGraphId: cgId,
-        candidatePeers: baseCandidatePeers,
-        unsupportedPeers,
-        privateCuratorPeerIds,
-      }).selectedPeers;
+      const swmSelectedPeers = canUseSharedMemory
+        ? swmCatchupPeerSelector.select({
+            contextGraphId: cgId,
+            candidatePeers: baseCandidatePeers,
+            unsupportedPeers,
+            privateCuratorPeerIds,
+          }).selectedPeers
+        : [];
+      const durableSelectedPeers = includeDurable
+        ? uniquePeerIds(baseCandidatePeers).filter((peerId) => !unsupportedPeers.has(peerId))
+        : [];
+      const swmSelected = new Set(swmSelectedPeers);
+      const durableSelected = new Set(durableSelectedPeers);
+      const selectedPeers = uniquePeerIds([...swmSelectedPeers, ...durableSelectedPeers]);
       const settled = await Promise.allSettled(
         selectedPeers.map(async (candidate) => {
           let swm = 0;
           let durable = 0;
           let swmError: string | undefined;
           let durableError: string | undefined;
-          if (canUseSharedMemory) {
+          if (swmSelected.has(candidate)) {
             try {
               const syncResult = await withTimeout(
                 typeof (agent as any).syncSharedMemoryFromPeerDetailed === 'function'
@@ -947,7 +966,7 @@ WHERE {
               );
             }
           }
-          if (includeDurable) {
+          if (durableSelected.has(candidate)) {
             try {
               durable = await withTimeout(
                 (agent as any).syncFromPeer?.(candidate, [cgId]) ?? Promise.resolve(0),

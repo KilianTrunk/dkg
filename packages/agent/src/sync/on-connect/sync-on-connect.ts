@@ -168,6 +168,17 @@ export async function runSyncOnConnect(context: SyncOnConnectContext): Promise<S
       cleanDurableDetailedRound = cleanDurableDetailedRound || cleanDetailedSync(result);
     }
   };
+  const finishSyncAccounting = (): SyncOnConnectOutcome => {
+    const cleanDurableRound = cleanDurableDetailedRound && !sawDurableMetadataOnlyDetailedSync;
+    const clearsPeerBackoff = madeProgress || (!sawBackoffWorthyFailure && (cleanDurableRound || sawDeniedPhase));
+    if (clearsPeerBackoff) {
+      context.onPeerSynced?.(remotePeer, {
+        fresh: !sawBackoffWorthyFailure && !sawDeniedPhase && !sawFailedPhase && cleanDurableRound,
+        progress: madeProgress,
+      });
+    }
+    return 'synced';
+  };
   const runNonTransportStep = async <T>(step: () => Promise<T>): Promise<T> => {
     try {
       return await step();
@@ -204,7 +215,7 @@ export async function runSyncOnConnect(context: SyncOnConnectContext): Promise<S
     logInfo(ctx, `Synced ${insertedTriples(synced)} data triples from peer ${shortPeer}`);
     if (hadBackoffWorthyFailure(synced)) {
       logInfo(ctx, `Stopping sync-on-connect fanout for peer ${shortPeer} after durable sync hit backoff-worthy pressure`);
-      return 'synced';
+      return finishSyncAccounting();
     }
 
     const syncScope = new Set<string>([
@@ -225,7 +236,7 @@ export async function runSyncOnConnect(context: SyncOnConnectContext): Promise<S
       logInfo(ctx, `Synced ${insertedTriples(discoverSynced)} durable triples for newly discovered CG(s) from ${shortPeer}`);
       if (hadBackoffWorthyFailure(discoverSynced)) {
         logInfo(ctx, `Stopping sync-on-connect fanout for peer ${shortPeer} after discovered-CG durable sync hit backoff-worthy pressure`);
-        return 'synced';
+        return finishSyncAccounting();
       }
       await runNonTransportStep(() => refreshMetaSyncedFlags(newlyDiscovered));
     }
@@ -242,15 +253,7 @@ export async function runSyncOnConnect(context: SyncOnConnectContext): Promise<S
       logInfo(ctx, `Skipping shared memory sync from peer ${shortPeer} (syncSharedMemoryOnConnect=false)`);
     }
 
-    const cleanDurableRound = cleanDurableDetailedRound && !sawDurableMetadataOnlyDetailedSync;
-    const clearsPeerBackoff = madeProgress || (!sawBackoffWorthyFailure && (cleanDurableRound || sawDeniedPhase));
-    if (clearsPeerBackoff) {
-      context.onPeerSynced?.(remotePeer, {
-        fresh: !sawBackoffWorthyFailure && !sawDeniedPhase && !sawFailedPhase && cleanDurableRound,
-        progress: madeProgress,
-      });
-    }
-    return 'synced';
+    return finishSyncAccounting();
   } catch (err) {
     if (err instanceof SyncOnConnectPostSyncError) {
       throw err;

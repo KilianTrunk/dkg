@@ -41,6 +41,32 @@ export interface SyncRowListMemo {
   ): Promise<readonly SyncRow[] | null>;
 }
 
+export class SyncRowSnapshotLimitError extends Error {
+  readonly key: string;
+  readonly maxEntries: number;
+  readonly cachedEntries: number;
+  readonly inflightEntries: number;
+  readonly activeEntries: number;
+
+  constructor(params: {
+    key: string;
+    maxEntries: number;
+    cachedEntries: number;
+    inflightEntries: number;
+  }) {
+    const activeEntries = params.cachedEntries + params.inflightEntries;
+    super(
+      `Too many active sync responder session snapshots (key=${params.key}, active=${activeEntries}, max=${params.maxEntries})`,
+    );
+    this.name = 'SyncRowSnapshotLimitError';
+    this.key = params.key;
+    this.maxEntries = params.maxEntries;
+    this.cachedEntries = params.cachedEntries;
+    this.inflightEntries = params.inflightEntries;
+    this.activeEntries = activeEntries;
+  }
+}
+
 interface RowListCache {
   memo: SyncRowListMemo;
   key: string;
@@ -135,7 +161,12 @@ export function createResponderSyncRowListMemo(
     if (value.length === 0) return;
     const replacingExisting = cached.has(key);
     if (!replacingExisting && cached.size >= maxEntries) {
-      throw new Error('Too many active durable data sync session snapshots');
+      throw new SyncRowSnapshotLimitError({
+        key,
+        maxEntries,
+        cachedEntries: cached.size,
+        inflightEntries: inflight.size,
+      });
     }
     deleteCached(key);
     cached.set(key, {
@@ -173,7 +204,12 @@ export function createResponderSyncRowListMemo(
       }
       if (options?.requireExisting) return null;
       if (!cached.has(key) && cached.size + inflight.size >= maxEntries) {
-        throw new Error('Too many active durable data sync session snapshots');
+        throw new SyncRowSnapshotLimitError({
+          key,
+          maxEntries,
+          cachedEntries: cached.size,
+          inflightEntries: inflight.size,
+        });
       }
 
       const load = loadRows()

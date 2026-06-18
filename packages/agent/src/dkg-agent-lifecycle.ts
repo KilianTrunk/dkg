@@ -1510,14 +1510,9 @@ export class LifecycleSyncMethods extends DKGAgentBase {
         // is actually possible (chain + ordinal reads present).
         onKARegisteredToContextGraph: this.vmReconcileEnabled()
           ? async ({ contextGraphId: onChainId, kaId }) => {
-              const localCgId = this.resolveLocalCgIdByOnChainId(BigInt(onChainId));
-              if (!localCgId) return; // chain replay hasn't resolved the cleartext CG yet; sweep heals it
-              const sub = this.subscribedContextGraphs.get(localCgId);
-              // Populate VM for CGs we member-subscribe to OR (Phase D) public
-              // CGs this Core hosts — a hosted Core fills its own gaps too.
-              if (!sub?.subscribed && !sub?.coreHosted) return;
-              this.log.info(ctx, `Phase B: KACG nudge cg=${onChainId} ka=${kaId} -> reconcile "${localCgId}"`);
-              if (this.reconcileCoalescer) void this.reconcileCoalescer.trigger(localCgId);
+              // GH #1098 — body extracted to `handleKARegisteredNudge` so the
+              // bind-only-the-matching-CG branch is directly testable.
+              await this.handleKARegisteredNudge(onChainId, kaId, ctx);
             }
           : undefined,
       });

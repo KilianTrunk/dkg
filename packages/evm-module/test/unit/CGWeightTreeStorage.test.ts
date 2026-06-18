@@ -23,6 +23,7 @@ describe('@unit CGWeightTreeStorage', () => {
   let Tree: CGWeightTreeStorage;
   let CGV: ContextGraphValueStorage;
   let ChronosCtr: Chronos;
+  let HubCtr: Hub;
 
   async function deployFixture(): Promise<Fixture> {
     await hre.deployments.fixture(['CGWeightTreeStorage']);
@@ -49,6 +50,7 @@ describe('@unit CGWeightTreeStorage', () => {
       Tree,
       CGV,
       Chronos: ChronosCtr,
+      Hub: HubCtr,
     } = await loadFixture(deployFixture));
   });
 
@@ -250,5 +252,91 @@ describe('@unit CGWeightTreeStorage', () => {
     await Tree.settle(cg);
     expect(await Tree.cgWeight(cg)).to.equal(0n);
     expect(await Tree.bitTotal()).to.equal(0n);
+  });
+
+  it('seedMany seeds in batch and rejects length mismatch', async () => {
+    await Tree.seedMany([1, 2, 3], [10n, 20n, 30n]);
+    expect(await Tree.cgWeight(1)).to.equal(10n);
+    expect(await Tree.cgWeight(2)).to.equal(20n);
+    expect(await Tree.cgWeight(3)).to.equal(30n);
+    expect(await Tree.bitTotal()).to.equal(60n);
+    await expect(Tree.seedMany([1, 2], [1n])).to.be.revertedWith(
+      'len mismatch',
+    );
+  });
+
+  it('Constructor rejects a non-power-of-two (and zero) capacity', async () => {
+    const hubAddr = await HubCtr.getAddress();
+    const factory =
+      await hre.ethers.getContractFactory('CGWeightTreeStorage');
+    await expect(
+      factory.deploy(hubAddr, 3),
+    ).to.be.revertedWithCustomError(Tree, 'CapacityNotPowerOfTwo');
+    await expect(
+      factory.deploy(hubAddr, 0),
+    ).to.be.revertedWithCustomError(Tree, 'CapacityNotPowerOfTwo');
+  });
+
+  it('settleMany reconciles a batch to ledger truth', async () => {
+    await Tree.finishBackfill();
+    const epoch = await ChronosCtr.getCurrentEpoch();
+    await CGV.addCGValueForEpochRange(1, epoch, 1, 500);
+    await CGV.addCGValueForEpochRange(2, epoch, 1, 700);
+    await Tree.settleMany([1, 2]);
+    expect(await Tree.cgWeight(1)).to.equal(500n);
+    expect(await Tree.cgWeight(2)).to.equal(700n);
+    expect(await Tree.bitTotal()).to.equal(1200n);
+  });
+
+  it('settle advances cgSettledEpoch; no-op path leaves weight/total untouched', async () => {
+    await Tree.finishBackfill();
+    const epoch = await ChronosCtr.getCurrentEpoch();
+    await CGV.addCGValueForEpochRange(1, epoch, 1, 1000);
+    await Tree.settle(1);
+    expect(await Tree.cgSettledEpoch(1)).to.equal(epoch);
+    const totalBefore = await Tree.bitTotal();
+    // Same-epoch re-settle: truth unchanged -> no WeightSet, weight/total identical.
+    await expect(Tree.settle(1)).to.not.emit(Tree, 'WeightSet');
+    expect(await Tree.cgWeight(1)).to.equal(1000n);
+    expect(await Tree.bitTotal()).to.equal(totalBefore);
+    expect(await Tree.cgSettledEpoch(1)).to.equal(epoch);
+  });
+
+  it('seed emits WeightSet; finishBackfill emits BackfillFinalized and is not re-callable', async () => {
+    await expect(Tree.seed(5, 42n))
+      .to.emit(Tree, 'WeightSet')
+      .withArgs(5, 0, 42);
+    await expect(Tree.finishBackfill())
+      .to.emit(Tree, 'BackfillFinalized')
+      .withArgs(42);
+    await expect(Tree.finishBackfill()).to.be.revertedWithCustomError(
+      Tree,
+      'NotBackfilling',
+    );
+  });
+
+  it('Capacity-boundary index BIT_CAPACITY-1 is a valid leaf', async () => {
+    const cap = await Tree.BIT_CAPACITY();
+    await Tree.seed(cap - 1n, 9n);
+    expect(await Tree.cgWeight(cap - 1n)).to.equal(9n);
+    expect(await Tree.bitTotal()).to.equal(9n);
+    expect(await Tree.findStrictGt(0n)).to.equal(cap - 1n);
+  });
+
+  it('Empty tree: findStrictGt returns an out-of-range sentinel (caller must gate on bitTotal>0)', async () => {
+    // Unreachable in prod: createChallenge reverts NoEligibleContextGraph when total==0, so the
+    // draw is only ever called with r < bitTotal. On an all-zero tree the descent steps right off
+    // the top and returns BIT_CAPACITY+1 — an invalid id (defensive: a caller that forgot to gate
+    // gets an obviously-bad id that fails downstream existence/eligibility, not a silent CG #1).
+    const cap = await Tree.BIT_CAPACITY();
+    expect(await Tree.bitTotal()).to.equal(0n);
+    expect(await Tree.findStrictGt(0n)).to.equal(cap + 1n);
+  });
+
+  it('workingTotal reverts if excluded ids are duplicated/over-counted', async () => {
+    await Tree.seed(1, 10n);
+    await Tree.seed(2, 5n);
+    expect(await Tree.workingTotal([1])).to.equal(5n); // distinct excluded is fine
+    await expect(Tree.workingTotal([1, 1])).to.be.reverted; // 15 - 20 underflow (caller must pass distinct ids)
   });
 });

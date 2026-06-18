@@ -93,8 +93,10 @@ contract CGWeightTreeStorage is INamed, IVersioned, HubDependent {
 
     /// @dev Standard Fenwick point update by a signed delta; keeps bitTotal in sync.
     function _bitUpdate(uint256 i, int256 delta) internal {
-        if (delta == 0) return;
+        // Guard first (unconditional): an out-of-range/zero id must revert even on a no-op delta,
+        // matching the docstring's defense-in-depth intent against the monotonic CG counter.
         if (i == 0 || i >= BIT_CAPACITY) revert CgIdOutOfBitCapacity(i, BIT_CAPACITY);
+        if (delta == 0) return;
         for (uint256 x = i; x <= BIT_CAPACITY; x += (x & (~x + 1))) {
             bit[x] = (bit[x].toInt256() + delta).toUint256(); // never underflows: see invariants
         }
@@ -182,7 +184,11 @@ contract CGWeightTreeStorage is INamed, IVersioned, HubDependent {
     }
 
     /// @notice End the migration backfill; enables the prod draw/settle path in RandomSampling.
+    ///         One-way and not re-callable, so an accidental double-call reverts loudly rather than
+    ///         silently re-emitting. Recovery from a premature call is a fresh redeploy (capacity is
+    ///         immutable and chosen per deploy anyway).
     function finishBackfill() external onlyContracts {
+        if (!backfillLocked) revert NotBackfilling();
         backfillLocked = false;
         emit BackfillFinalized(bitTotal);
     }

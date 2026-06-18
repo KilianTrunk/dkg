@@ -1510,37 +1510,9 @@ export class LifecycleSyncMethods extends DKGAgentBase {
         // is actually possible (chain + ordinal reads present).
         onKARegisteredToContextGraph: this.vmReconcileEnabled()
           ? async ({ contextGraphId: onChainId, kaId }) => {
-              const localCgId = this.resolveLocalCgIdByOnChainId(BigInt(onChainId));
-              if (!localCgId) {
-                // GH #1098 — a pre-subscribed PUBLIC member peer may not have
-                // bound this CG's on-chain id yet (only curated CGs bind on the
-                // ContextGraphCreated event; ACK-signers bind via the storage-ACK
-                // hook). Find the subscribed-but-unbound CG whose locally-resolved
-                // on-chain id matches THIS event and bind + reconcile only it —
-                // targeted, not a global sweep, so an unrelated KA registration
-                // touches nothing. Uses the SAME self-prime helper as the
-                // periodic sweep (single bind/persist/cursor-reset path); the
-                // sweep remains the safety net for a CG whose quad hasn't arrived.
-                let targetOnChain: bigint | null = null;
-                try { targetOnChain = BigInt(onChainId); } catch { targetOnChain = null; }
-                if (targetOnChain !== null) {
-                  for (const [lcg, sub] of this.subscribedContextGraphs) {
-                    const bound = await this.selfPrimeSubscriptionOnChainId(lcg, sub, targetOnChain);
-                    if (bound) {
-                      this.log.info(ctx, `Phase B: KACG nudge cg=${onChainId} ka=${kaId} -> bound + reconcile pre-subscribed "${lcg}"`);
-                      if (this.reconcileCoalescer) void this.reconcileCoalescer.trigger(lcg);
-                      break;
-                    }
-                  }
-                }
-                return; // chain replay hasn't resolved the cleartext CG yet; periodic sweep is the safety net
-              }
-              const sub = this.subscribedContextGraphs.get(localCgId);
-              // Populate VM for CGs we member-subscribe to OR (Phase D) public
-              // CGs this Core hosts — a hosted Core fills its own gaps too.
-              if (!sub?.subscribed && !sub?.coreHosted) return;
-              this.log.info(ctx, `Phase B: KACG nudge cg=${onChainId} ka=${kaId} -> reconcile "${localCgId}"`);
-              if (this.reconcileCoalescer) void this.reconcileCoalescer.trigger(localCgId);
+              // GH #1098 — body extracted to `handleKARegisteredNudge` so the
+              // bind-only-the-matching-CG branch is directly testable.
+              await this.handleKARegisteredNudge(onChainId, kaId, ctx);
             }
           : undefined,
       });

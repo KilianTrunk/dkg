@@ -2400,6 +2400,62 @@ export class SwmHostModeMethods extends DKGAgentBase {
   }
 
   /**
+   * GH #1098 (Phase B) — body of the live `onKARegisteredToContextGraph` nudge,
+   * extracted so the branch is directly testable. A
+   * `KnowledgeAssetRegisteredToContextGraph` event carries only `{ kaId, cgId }`
+   * (no ordinal), so this just triggers a coalesced reconcile for the matching
+   * local CG. Two cases:
+   *
+   *  1. The on-chain id is already bound to a local CG → trigger its reconcile
+   *     (when subscribed or core-hosted).
+   *  2. The id is unbound but a pre-subscribed PUBLIC member CG resolves to it
+   *     (subscribed BEFORE its first publish; only curated CGs bind on the
+   *     ContextGraphCreated event and ACK-signers bind via the storage-ACK hook)
+   *     → self-prime + bind ONLY the CG whose resolved id matches THIS event,
+   *     then reconcile it. Unrelated subscribed-unbound CGs are left untouched.
+   *
+   * Best-effort and idempotent: a missed nudge heals on the periodic sweep.
+   * Returns the local CG id that was reconciled, or null if none matched.
+   */
+  async handleKARegisteredNudge(
+    this: DKGAgent,
+    onChainId: string,
+    kaId: bigint,
+    ctx: OperationContext,
+  ): Promise<string | null> {
+    let targetOnChain: bigint | null = null;
+    try { targetOnChain = BigInt(onChainId); } catch { targetOnChain = null; }
+
+    const localCgId = targetOnChain === null ? null : this.resolveLocalCgIdByOnChainId(targetOnChain);
+    if (!localCgId) {
+      // Find the subscribed-but-unbound CG whose locally-resolved on-chain id
+      // matches THIS event and bind + reconcile only it — targeted, not a global
+      // sweep, so an unrelated KA registration touches nothing. Uses the SAME
+      // self-prime helper as the periodic sweep (single bind/persist/cursor-reset
+      // path); the sweep remains the safety net for a CG whose quad hasn't arrived.
+      if (targetOnChain !== null) {
+        for (const [lcg, sub] of this.subscribedContextGraphs) {
+          const bound = await this.selfPrimeSubscriptionOnChainId(lcg, sub, targetOnChain);
+          if (bound) {
+            this.log.info(ctx, `Phase B: KACG nudge cg=${onChainId} ka=${kaId} -> bound + reconcile pre-subscribed "${lcg}"`);
+            if (this.reconcileCoalescer) void this.reconcileCoalescer.trigger(lcg);
+            return lcg;
+          }
+        }
+      }
+      return null; // chain replay hasn't resolved the cleartext CG yet; periodic sweep is the safety net
+    }
+
+    const sub = this.subscribedContextGraphs.get(localCgId);
+    // Populate VM for CGs we member-subscribe to OR (Phase D) public CGs this
+    // Core hosts — a hosted Core fills its own gaps too.
+    if (!sub?.subscribed && !sub?.coreHosted) return null;
+    this.log.info(ctx, `Phase B: KACG nudge cg=${onChainId} ka=${kaId} -> reconcile "${localCgId}"`);
+    if (this.reconcileCoalescer) void this.reconcileCoalescer.trigger(localCgId);
+    return localCgId;
+  }
+
+  /**
    * One reconcile pass for a single CG: build the injected deps and hand off to
    * the pure {@link reconcileContextGraph} orchestrator (which owns the cursor
    * math + watermark persistence gate). The cursor is created lazily from the

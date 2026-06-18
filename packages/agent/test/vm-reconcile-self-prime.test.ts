@@ -16,6 +16,7 @@ import {
   DKG_ONTOLOGY,
   SYSTEM_CONTEXT_GRAPHS,
   contextGraphDataGraphUri,
+  createOperationContext,
 } from '@origintrail-official/dkg-core';
 import type { TripleStore } from '@origintrail-official/dkg-storage';
 import { DKGAgent } from '../src/index.js';
@@ -27,6 +28,7 @@ interface AgentInternals {
     sub: { subscribed: boolean; coreHosted?: boolean; onChainId?: string },
     targetOnChainId?: bigint,
   ): Promise<string | null>;
+  handleKARegisteredNudge(onChainId: string, kaId: bigint, ctx: unknown): Promise<string | null>;
   subscribedContextGraphs: Map<string, { subscribed: boolean; coreHosted?: boolean; onChainId?: string }>;
   reconcileCoalescer: { trigger: (cg: string) => void } | null;
   store: TripleStore;
@@ -114,5 +116,68 @@ describe('GH #1098 — VM reconcile sweep self-primes onChainId for a pre-subscr
     const matched = await internals.selfPrimeSubscriptionOnChainId(CG_MATCH, internals.subscribedContextGraphs.get(CG_MATCH)!, BigInt(ON_MATCH));
     expect(matched).toBe(ON_MATCH);
     expect(internals.subscribedContextGraphs.get(CG_MATCH)?.onChainId).toBe(ON_MATCH);
+  });
+
+  it('live KACG nudge handler: with multiple subscribed-unbound CGs, binds + reconciles ONLY the one matching the event id', async () => {
+    // Exercises the EXACT branch the live `onKARegisteredToContextGraph` poller
+    // hook runs (extracted to `handleKARegisteredNudge`), not just the underlying
+    // self-prime helper — so the loop-and-target logic is covered end to end.
+    // Three pre-subscribed PUBLIC member CGs are unbound (the #1098 state); a KA
+    // registration arrives for ONE of their on-chain ids. Only that CG must bind
+    // and reconcile; the other two are left untouched.
+    const chain = new MockChainAdapter();
+    agent = await DKGAgent.create({ name: 'KacgNudgeLive', chainAdapter: chain });
+    stubNode(agent);
+    const internals = agent as unknown as AgentInternals;
+
+    const CG_HIT = 'gh1098-nudge-hit';
+    const CG_MISS_A = 'gh1098-nudge-miss-a';
+    const CG_MISS_B = 'gh1098-nudge-miss-b';
+    const ON_HIT = '7000';
+    const ON_MISS_A = '7001';
+    const ON_MISS_B = '7002';
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+    await internals.store.insert([
+      { subject: `did:dkg:context-graph:${CG_HIT}`, predicate: `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId`, object: `"${ON_HIT}"`, graph: ontologyGraph },
+      { subject: `did:dkg:context-graph:${CG_MISS_A}`, predicate: `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId`, object: `"${ON_MISS_A}"`, graph: ontologyGraph },
+      { subject: `did:dkg:context-graph:${CG_MISS_B}`, predicate: `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId`, object: `"${ON_MISS_B}"`, graph: ontologyGraph },
+    ]);
+    internals.subscribedContextGraphs.set(CG_HIT, { subscribed: true });
+    internals.subscribedContextGraphs.set(CG_MISS_A, { subscribed: true });
+    internals.subscribedContextGraphs.set(CG_MISS_B, { subscribed: true });
+
+    const triggered: string[] = [];
+    internals.reconcileCoalescer = { trigger: (cg: string) => { triggered.push(cg); } };
+
+    // The event names ON_HIT's on-chain id. None is bound yet.
+    const reconciled = await internals.handleKARegisteredNudge(ON_HIT, 99n, createOperationContext('system'));
+
+    expect(reconciled).toBe(CG_HIT);
+    expect(internals.subscribedContextGraphs.get(CG_HIT)?.onChainId).toBe(ON_HIT);
+    // The other two pre-subscribed CGs were NOT bound and NOT reconciled.
+    expect(internals.subscribedContextGraphs.get(CG_MISS_A)?.onChainId).toBeUndefined();
+    expect(internals.subscribedContextGraphs.get(CG_MISS_B)?.onChainId).toBeUndefined();
+    expect(triggered).toEqual([CG_HIT]);
+  });
+
+  it('live KACG nudge handler: an already-bound CG reconciles directly without a self-prime scan', async () => {
+    // The other live branch: the event id already resolves to a local CG. It must
+    // reconcile that CG straight away (subscribed or core-hosted), independent of
+    // the pre-subscribed self-prime loop.
+    const chain = new MockChainAdapter();
+    agent = await DKGAgent.create({ name: 'KacgNudgeBound', chainAdapter: chain });
+    stubNode(agent);
+    const internals = agent as unknown as AgentInternals;
+
+    const CG_BOUND = 'gh1098-nudge-bound';
+    const ON_BOUND = '8080';
+    internals.subscribedContextGraphs.set(CG_BOUND, { subscribed: true, onChainId: ON_BOUND });
+
+    const triggered: string[] = [];
+    internals.reconcileCoalescer = { trigger: (cg: string) => { triggered.push(cg); } };
+
+    const reconciled = await internals.handleKARegisteredNudge(ON_BOUND, 1n, createOperationContext('system'));
+    expect(reconciled).toBe(CG_BOUND);
+    expect(triggered).toEqual([CG_BOUND]);
   });
 });

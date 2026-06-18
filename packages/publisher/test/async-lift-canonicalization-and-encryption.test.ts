@@ -113,4 +113,30 @@ describe('GH #1121 — async lift carries an inline-encryption path for private 
     // publisher onto the encrypted-inline path and break public ACK verification.
     expect(opts.encryptInlinePayload).toBeUndefined();
   });
+
+  it('a PUBLIC async publish FORCES both inline callbacks to undefined even when the resolver supplies them', () => {
+    // Defence-in-depth for the public path: a resolver (or a per-process default
+    // encryption factory) might hand a non-public-looking callback through
+    // `resolved` even for a public CG. The mapper must NOT forward it — otherwise
+    // DKGPublisher's `useEncryptedInline` gate (`typeof inlineEncryptCb === 'function'`)
+    // would silently encrypt public content at rest, making it unreadable to
+    // public readers and breaking public ACK verification. Force BOTH to undefined.
+    const strayInline = async (b: Uint8Array): Promise<Uint8Array> => new Uint8Array([...b, 0xff]);
+    const strayChunked = async (): Promise<void> => { /* would fan out members */ };
+    const opts = mapLiftRequestToPublishOptions({
+      request: { ...baseRequest, accessPolicy: 'public' },
+      validation: { authorityProofRef: 'devnet-proof', transitionType: 'CREATE' },
+      resolved: {
+        quads: [
+          { subject: CALLER_ROOT, predicate: 'https://schema.org/name', object: '"Tenant A"', graph: 'g' },
+        ],
+        accessPolicy: 'public',
+        encryptInlinePayload: strayInline,
+        encryptInlineChunked: strayChunked,
+      },
+    });
+    expect(opts.accessPolicy).toBe('public');
+    expect(opts.encryptInlinePayload).toBeUndefined();
+    expect(opts.encryptInlineChunked).toBeUndefined();
+  });
 });

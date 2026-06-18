@@ -150,16 +150,21 @@ export function mapLiftRequestToPublishOptions(input: LiftPublishMappingInput): 
     throw new Error('Lift publish mapping only allows allowedPeers when accessPolicy is allowList');
   }
 
-  // GH #1121 — derive the inline-encryption path. Public CGs stay plaintext
-  // (undefined). Non-public CGs MUST carry an inline-encryption callback: use
-  // the agent-resolved one threaded through `resolved`, else the fail-closed
-  // default so a missing factory throws at publish time rather than leaking
-  // plaintext. The chunked callback is optional (the inline blob path is the
-  // floor) and only ever passes through the resolved value.
+  // GH #1121 — derive the inline-encryption path. Public CGs MUST stay
+  // plaintext: force BOTH inline callbacks to `undefined` so even a resolver
+  // that supplies a default encryption factory cannot push DKGPublisher onto
+  // the encrypted-inline path for a public CG (otherwise public content would
+  // be silently encrypted at rest and unreadable by readers). Non-public CGs
+  // MUST carry an inline-encryption callback: use the agent-resolved one
+  // threaded through `resolved`, else the fail-closed default so a missing
+  // factory throws at publish time rather than leaking plaintext. The chunked
+  // callback is optional (the inline blob path is the floor).
   const encryptInlinePayload = accessPolicy === 'public'
-    ? input.resolved.encryptInlinePayload
+    ? undefined
     : (input.resolved.encryptInlinePayload ?? failClosedInlineEncrypt);
-  const encryptInlineChunked = input.resolved.encryptInlineChunked;
+  const encryptInlineChunked = accessPolicy === 'public'
+    ? undefined
+    : input.resolved.encryptInlineChunked;
 
   // Request flags (enqueue-time caller intent) win over resolved hints (per-process defaults).
   const entityProofs = input.request.entityProofs ?? input.resolved.entityProofs;

@@ -191,6 +191,9 @@ export {
 } from './async-lift-runner.js';
 export {
   mapLiftRequestToPublishOptions,
+  prepareAsyncPublishPayload,
+  isFailClosedInlineEncrypt,
+  type AsyncPreparedPublishPayload,
   type LiftResolvedPublishSlice,
   type LiftPublishMappingInput,
 } from './async-lift-publish-options.js';

@@ -1425,6 +1425,25 @@ export async function runDaemonInner(
     }),
   );
 
+  // GH #462 — skill_request authorization. Default-deny remote skill invocation
+  // (any connected peer could otherwise invoke any registered skill). Operators
+  // restore open skills with `messaging.openSkills: true`, or allowlist specific
+  // peers via `messaging.skillAllowedPeers`.
+  {
+    const openSkills = config.messaging?.openSkills === true;
+    const allowedSkillPeers = new Set(config.messaging?.skillAllowedPeers ?? []);
+    agent.setSkillAcl((senderPeerId: string) => {
+      if (openSkills) return { accept: true };
+      if (allowedSkillPeers.has(senderPeerId)) return { accept: true };
+      return {
+        accept: false,
+        reason:
+          'unauthorized: skill invocation is default-deny for remote peers; ' +
+          'set messaging.openSkills or add this peer to messaging.skillAllowedPeers (GH #462)',
+      };
+    });
+  }
+
   let chatDb: DashboardDB | null = null;
   agent.onChat((text, senderPeerId, _convId, senderContextGraphId, verifiedContextGraphId, messageId) => {
     if (chatDb) {

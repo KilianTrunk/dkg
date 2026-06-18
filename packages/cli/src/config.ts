@@ -642,6 +642,17 @@ export interface DkgConfig {
    * See {@link ChatConfig} / {@link ChatAclConfig}.
    */
   chat?: ChatConfig;
+  /**
+   * GH #462 — agent-to-agent messaging authorization. `skill_request` over
+   * `/dkg/message/1.0.0` is default-deny for remote peers (the Ed25519 check
+   * authenticates the caller but does not authorize skill invocation). Set
+   * `openSkills: true` to restore the legacy open behaviour, or list specific
+   * peer ids in `skillAllowedPeers`.
+   */
+  messaging?: {
+    openSkills?: boolean;
+    skillAllowedPeers?: string[];
+  };
   /** Route-plugin specs (absolute paths / package names) loaded at daemon startup. ADR 0001. */
   routePlugins?: string[];
   /**

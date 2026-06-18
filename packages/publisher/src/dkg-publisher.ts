@@ -2571,11 +2571,17 @@ export class DKGPublisher implements Publisher {
     const noPathToOnChainACKs =
       hasPrivateData && (!v10ACKs || v10ACKs.length === 0);
 
+    // GH #1013 — record WHY a local-only publish skipped chain so the async
+    // lift can tell an honest local finalization (no chain) from a private
+    // publish that failed to reach the chain it should have.
+    let localChainSkipReason: 'no-chain' | 'private-no-acks' | undefined;
     if (publisherContextGraphId === undefined) {
       this.log.warn(ctx, `No positive on-chain context graph id resolved from "${v10CgDomain}" — skipping on-chain publish`);
+      localChainSkipReason = 'no-chain';
       await finalizeIntentionalLocalPublish('no on-chain CG id');
     } else if (!chainV10Ready) {
       this.log.warn(ctx, 'Chain adapter is not V10-ready — skipping on-chain publish');
+      localChainSkipReason = 'no-chain';
       await finalizeIntentionalLocalPublish('chain not V10-ready');
     } else if (noPathToOnChainACKs) {
       const reason = 'private data — no ACKs collectable (peers cannot see private payloads)';
@@ -2583,6 +2589,7 @@ export class DKGPublisher implements Publisher {
         ctx,
         `Skipping on-chain submission: ${reason}. Storing locally as tentative.`,
       );
+      localChainSkipReason = 'private-no-acks';
       await finalizeIntentionalLocalPublish(reason);
     } else {
       const tokenAmount = precomputedTokenAmount;
@@ -3023,6 +3030,7 @@ export class DKGPublisher implements Publisher {
       kaManifest: manifestEntries,
       status,
       onChainResult,
+      localChainSkipReason, // GH #1013
       publicQuads: allSkolemizedQuads,
       v10ACKs,
       v10Origin: usedV10Path,

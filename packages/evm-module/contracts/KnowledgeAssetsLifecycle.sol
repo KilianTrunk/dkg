@@ -140,7 +140,12 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     //          now fed exclusively by committed PCA allocation. The
     //          `publisherNodeIdentityId` struct field is retained as a
     //          self-claimed attribution (no longer scoring).
-    string private constant _VERSION = "10.1.1";
+    // 10.1.2 — Phase 10.x settle-on-spend: after each addCGValueForEpochRange
+    //          (publish / extend / update) the CG's BIT weight leaf is settled via
+    //          CGWeightTreeStorage so the value-weighted challenge draw sees fresh
+    //          weights. No ACK / attestation change — PATCH bump keeps the EIP-712
+    //          domain (major.minor "10.1") stable.
+    string private constant _VERSION = "10.1.2";
 
     /// @notice OT-RFC-49 / WS-B Trap 3: domain-separation version prepended to the
     ///         RAW publish/update ACK preimage (`abi.encodePacked`, later wrapped by

@@ -39,7 +39,12 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
     // 10.2.0 — PoS content-binding: submitProof(bytes content) derives
     //          leaf = keccak256(content); public-CG commitment is the structured
     //          hashPair(publicRoot, privateDataHash). Supersedes 10.1.1.
-    string private constant _VERSION = "10.2.0";
+    // 10.3.0 — Phase 10.x scaling: the value-weighted CG draw reads the O(log)
+    //          CGWeightTreeStorage Fenwick index instead of the O(N·D) twin scan,
+    //          with lazy settlement (settle-on-spend/-miss), a backfill-locked
+    //          gate (ChallengeDrawPaused), and a per-draw active-CG check. The
+    //          selection distribution is unchanged (seed parity preserved).
+    string private constant _VERSION = "10.3.0";
     uint256 public constant SCALE18 = 1e18;
 
     /// @notice Maximum number of in-CG resamples when the picker hits an
@@ -596,6 +601,10 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
         // caller excludes it and re-draws. Defense-in-depth for Invariant 2 — a deactivated
         // CG's leaf can stay nonzero until the (deferred) deactivation hook zeros it, and
         // `deactivateContextGraph` has no production callers today, so this is the gate.
+        // NB: if deactivation is ever wired up, leaf-zeroing becomes MANDATORY, not a backstop —
+        // >MAX_CG_RETRIES deactivated-but-weighted CGs would each consume a retry and could
+        // exhaust the budget, reverting the draw even while active CGs exist (the legacy
+        // pre-filter scan could not starve this way). See RFC Invariant 2.
         if (!contextGraphStorage.isContextGraphActive(chosenCg)) return (0, 0, false);
 
         // Step 2 — pick a challengeable KC inside `chosenCg` (bounded resampling), then a leaf.

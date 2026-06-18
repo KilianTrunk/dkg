@@ -1983,7 +1983,13 @@ export class DKGPublisher implements Publisher {
         (q) => q.subject === entry.rootEntity || q.subject.startsWith(entry.rootEntity + '/.well-known/genid/'),
       );
       if (entityPrivateQuads.length > 0) {
-        await this.privateStore.storePrivateTriples(contextGraphId, entry.rootEntity, entityPrivateQuads, options.subGraphName);
+        // GH #1078 — tag the stored slice with the commitment this root just
+        // committed (its privateMerkleRoot) so a re-publish for the same root
+        // supersedes the stale slice instead of commingling it.
+        const commitmentId = entry.privateMerkleRoot
+          ? Buffer.from(entry.privateMerkleRoot).toString('hex')
+          : undefined;
+        await this.privateStore.storePrivateTriples(contextGraphId, entry.rootEntity, entityPrivateQuads, options.subGraphName, commitmentId);
       }
     }
 

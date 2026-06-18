@@ -26,7 +26,7 @@ across multiple proof periods on real nodes.
 - `057` auto-`finishBackfill` brings the draw live on a clean deploy (no migration).
 - settle-on-spend fires on the real publish path (`KnowledgeAssetsLifecycle.publish`) → the
   BIT leaf is populated → `createChallenge` draws the CG.
-- The split picker (`_pickWeightedChallengeFull`) + KC pick + proof all succeed on real nodes.
+- The split picker (`_pickWeightedChallengeFull`) + KA pick + proof all succeed on real nodes.
 - `no-eligible-cg = 0` → no spurious empty-tree reverts once value is published.
 
 > An earlier 2-core run failed at PUBLISH with `QuorumUnmetError` (2 < 3 required ACK peers) —

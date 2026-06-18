@@ -48,15 +48,15 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
     uint256 public constant SCALE18 = 1e18;
 
     /// @notice Maximum number of in-CG resamples when the picker hits an
-    ///         expired KC during Phase 10 weighted challenge generation.
+    ///         expired KA during Phase 10 weighted challenge generation.
     ///         Exhausting this budget reverts with `NoEligibleKnowledgeAsset`
     ///         so the node skips the current proof period and retries on the
-    ///         next one (see {_pickKc}).
-    uint8 public constant MAX_KC_RETRIES = 10;
+    ///         next one (see {_pickKa}).
+    uint8 public constant MAX_KA_RETRIES = 10;
 
     /// @notice RFC-39 Phase A.5 — bounded retries at the CG selection layer
-    ///         when the picked CG has no challengeable KC (all legacy /
-    ///         uncommitted curated KCs, or every retry hit an expired KC).
+    ///         when the picked CG has no challengeable KA (all legacy /
+    ///         uncommitted curated KAs, or every retry hit an expired KA).
     ///         Falls through to a fresh weighted draw with the picked CG
     ///         excluded, instead of reverting the whole sampling tick and
     ///         letting one high-value legacy curated CG DoS the network.
@@ -85,13 +85,14 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
     ///         i.e. there is nothing eligible to challenge against. The caller's
     ///         transaction reverts and the node retries on the next proof period.
     error NoEligibleContextGraph();
-    /// @notice Thrown by `_generateChallenge` when the chosen CG's KC list is
-    ///         empty or all sampled KCs are expired after `MAX_KC_RETRIES`
+    /// @notice Thrown by `_generateChallenge` when the chosen CG's KA list is
+    ///         empty or all sampled KAs are expired after `MAX_KA_RETRIES`
     ///         attempts. Same retry-next-period semantics as above.
     error NoEligibleKnowledgeAsset();
-    /// @notice Thrown by `_generateChallenge` while the BIT weight index is still
-    ///         seeding (`CGWeightTreeStorage.backfillLocked()`). Draws are paused for
-    ///         the migration window; the node retries on a later proof period.
+    /// @notice Thrown by `_generateChallenge` while the BIT weight index is backfill-locked
+    ///         (`CGWeightTreeStorage.backfillLocked()`). Open on a clean deploy (deploy step `057`
+    ///         unlocks at deploy, fresh ledger); only held during an upgrade-in-place that seeds
+    ///         existing CGs into the tree. While locked, the node retries on a later proof period.
     error ChallengeDrawPaused();
 
     /// @notice Emitted when {createChallenge} produces a new challenge for a
@@ -211,7 +212,7 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
     /**
      * @dev Creates a new challenge for the calling node in the current proofing period
      * Caller must have a registered profile and cannot have an active unsolved challenge
-     * Generates a random knowledge collection and chunk to be proven
+     * Generates a random knowledge asset and chunk to be proven
      * Can only create one challenge per proofing period
      */
     // Slither: strict equality is the intended proof-period identity check;
@@ -248,7 +249,7 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
     /**
      * @dev Submits proof for an active challenge to earn score used for later reward calculation
      *
-     * Public CG path — verifies a V10 flat-KC Merkle inclusion proof
+     * Public CG path — verifies a V10 flat-KA Merkle inclusion proof
      * (dkg-core `V10MerkleTree` / spec §9.0.2): `leaf` is a `hashTripleV10`
      * public leaf or a private sub-root leaf; `challenge.chunkId` stores
      * the challenged leaf index in the sorted+deduped bottom layer;
@@ -258,7 +259,7 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
      * Curated CG path (OT-RFC-49) — same `_verifyV10MerkleProof` sibling-pair
      * composition over a different leaf/root pair: `leaf` is `hashTripleV10(s,p,o)`
      * of the challenged PUBLIC `_catalog` triple at index `challenge.chunkId`, and
-     * the root is the per-KC catalog root (`getCatalogRoot`) snapshotted at
+     * the root is the per-KA catalog root (`getCatalogRoot`) snapshotted at
      * issuance. Cores hold zero private bytes post-strip, so they prove the public
      * catalog, never the ciphertext. `_verifyV10MerkleProof` is unchanged — only
      * the (root, leaf, count) triple differs between the two paths.
@@ -274,7 +275,7 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
      * `isHostForCG(identityId, cgId)` once `ShardingTableStorage` ships
      * that view (and once per-CG sub-sharding lands in the v2 of RFC-38).
      * Under universal-hosting (Phase A.5), the universal check is
-     * functionally equivalent — every active core hosts every KC's
+     * functionally equivalent — every active core hosts every KA's
      * substrate.
      */
     function submitProof(bytes calldata content, bytes32[] calldata merkleProof)
@@ -405,19 +406,19 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
     /**
      * @dev Generates a new value-weighted challenge for a node.
      *
-     * Phase 10 — value-weighted CG selection (replaces V8 uniform-random KC pick).
+     * Phase 10 — value-weighted CG selection (replaces V8 uniform-random KA pick).
      * Uses blockchain properties (block hash, difficulty, timestamp, gas price)
      * for randomness, picks a Context Graph weighted by its per-epoch TRAC
-     * value at the current epoch, and then picks a KC uniformly at random
+     * value at the current epoch, and then picks a KA uniformly at random
      * within that CG.
      *
      * Read-time eligibility (NOT a write-time filter): deactivated CGs are
      * skipped during both the adjusted-total accumulation and the cumulative
      * walk (`_isCGEligible`). Curated ("private") CGs ARE eligible and ARE
-     * drawn — post-RFC-49 their cores prove the PUBLIC `_catalog` (a per-KC
+     * drawn — post-RFC-49 their cores prove the PUBLIC `_catalog` (a per-KA
      * `catalogRoot`/`catalogLeafCount`), not the private payload, so they earn
-     * the sampling reward like public CGs. A curated KC with no catalog
-     * commitment (`catalogLeafCount == 0`) is skipped at the KC level in step 2.
+     * the sampling reward like public CGs. A curated KA with no catalog
+     * commitment (`catalogLeafCount == 0`) is skipped at the KA level in step 2.
      * (Historical note: an earlier RFC-39 revision DID exclude curated CGs here;
      * RFC-39 Phase B re-enabled them and RFC-49 moved the proof target to the
      * catalog — this docstring previously lagged that change.)
@@ -426,12 +427,12 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
      *
      * - Weighting decay (cumulative drift): `cgValueCumulative` is per-epoch
      *   (not lifetime-cumulative) via the diff/cumulative pattern in
-     *   `ContextGraphValueStorage`, so expired KCs auto-decay after their
+     *   `ContextGraphValueStorage`, so expired KAs auto-decay after their
      *   active window. Correct by design — no Phase 10 action.
-     * - KC-level gaming: within a CG, KC selection is uniform — not
-     *   value-weighted. Skipping one high-value KC in a 100-KC CG costs only
-     *   1% of challenges, not proportional to that KC's TRAC share. Accepted
-     *   per `V10_CONTRACTS_REDESIGN_v2.md` §"Known limitation — KC-level
+     * - KA-level gaming: within a CG, KA selection is uniform — not
+     *   value-weighted. Skipping one high-value KA in a 100-KA CG costs only
+     *   1% of challenges, not proportional to that KA's TRAC share. Accepted
+     *   per `V10_CONTRACTS_REDESIGN_v2.md` §"Known limitation — KA-level
      *   gaming". CG-level weighting is the primary defense.
      * - Gas scaling: linear scan over all CGs is O(N) per challenge. Fine up
      *   to ~1K CGs (~2.1M gas). Fenwick tree (BIT) deferred to V10.x.
@@ -448,8 +449,10 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
         bytes32 baseSeed = _deriveChallengeSeed(originalSender);
         uint256 currentEpoch = chronos.getCurrentEpoch();
 
-        // Phase 10.x — draws are disabled while the BIT weight index is being seeded
-        // (migration). Nodes retry on a later proof period.
+        // Phase 10.x — the value-weighted draw is disabled until the BIT index is unlocked
+        // (`backfillLocked == false`). On a clean deploy `057` unlocks it at deploy time (fresh
+        // ledger, nothing to seed); only an upgrade-in-place that seeds existing CGs into the tree
+        // holds it locked during seeding. While locked, nodes retry on a later proof period.
         if (cgWeightTreeStorage.backfillLocked()) revert ChallengeDrawPaused();
 
         (uint256 cgId, uint256 kaId, uint256 chunkId) = _pickWeightedChallengeFull(baseSeed, currentEpoch);
@@ -474,7 +477,7 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
         // Read in the same `view` tx as the `chunkId = seed % leafCount` draw, so
         // the snapshotted count equals the count the draw used.
         //   curated → public `_catalog` commitment (cores prove the catalog);
-        //   public  → the full flat-KC merkle root over all leaves.
+        //   public  → the full flat-KA merkle root over all leaves.
         uint32 challengeLeafCount = isCurated
             ? knowledgeAssetStorage.getCatalogLeafCount(kaId)
             : knowledgeAssetStorage.getMerkleLeafCount(kaId);
@@ -542,8 +545,8 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
      *                   should pass a high-entropy hash; tests pass deterministic
      *                   per-iteration seeds for distribution analysis.
      * @return cgId      Selected Context Graph id.
-     * @return kaId      Selected Knowledge Collection id within that CG.
-     * @return chunkId   Selected **V10 Merkle leaf index** within the KC (same field
+     * @return kaId      Selected Knowledge Asset id within that CG.
+     * @return chunkId   Selected **V10 Merkle leaf index** within the KA (same field
      *                   name as V8 byte-chunk index for struct compatibility).
      *
      *      Always previews the CURRENT epoch: the CG draw reads the live BIT snapshot
@@ -562,13 +565,13 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
     /**
      * @dev Phase 10.x weighted draw, in three internal pieces:
      *
-     *      `_pickKc` — Step 2/3 inside a chosen CG: pick a KC at a random index
-     *      (via `getContextGraphKCAt`), resampling up to `MAX_KC_RETRIES` if the
-     *      KC has expired (`endEpoch < currentEpoch`) or — for curated CGs — has
+     *      `_pickKa` — Step 2/3 inside a chosen CG: pick a KA at a random index
+     *      (via `getContextGraphKaAt`), resampling up to `MAX_KA_RETRIES` if the
+     *      KA has expired (`endEpoch < currentEpoch`) or — for curated CGs — has
      *      no catalog commitment (`getCatalogLeafCount == 0`), then draw a V10
-     *      Merkle leaf `uint256(kcSeed) % leafCount` (curated → `_catalog` leaves,
-     *      public → flat-KC leaves). Returns found=false if the CG has no
-     *      challengeable KC; reverts `NoEligibleKnowledgeAsset` if a chosen KC
+     *      Merkle leaf `uint256(kaSeed) % leafCount` (curated → `_catalog` leaves,
+     *      public → flat-KA leaves). Returns found=false if the CG has no
+     *      challengeable KA; reverts `NoEligibleKnowledgeAsset` if a chosen KA
      *      records zero leaves.
      *
      *      `_pickWeightedChallengeView` / `_pickWeightedChallengeFull` — Step 1:
@@ -580,7 +583,7 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
      *      The Full variant additionally settles a missed CG to ledger truth
      *      (settle-on-miss self-healing); the View variant cannot (it backs the
      *      `view` `previewChallengeForSeed`). Zero-weight leaves are never drawn;
-     *      the drawn CG's `active` flag is verified in `_pickKc` (1 SLOAD on the
+     *      the drawn CG's `active` flag is verified in `_pickKa` (1 SLOAD on the
      *      chosen CG, not the legacy O(N) scan) so a deactivated-but-weighted CG is
      *      excluded even before its leaf is zeroed (RFC Invariant 2 backstop).
      *
@@ -589,9 +592,9 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
      */
     // Slither: protocol sampling intentionally derives bounded pseudo-random
     // indices from the period seed; the storage reads are bounded by
-    // MAX_CG_RETRIES/MAX_KC_RETRIES and strict equality checks are guards.
+    // MAX_CG_RETRIES/MAX_KA_RETRIES and strict equality checks are guards.
     // slither-disable-start weak-prng,uninitialized-local,cyclomatic-complexity,incorrect-equality,calls-loop,timestamp
-    function _pickKc(
+    function _pickKa(
         uint256 chosenCg,
         bytes32 cgSeed,
         uint256 currentEpoch
@@ -607,31 +610,31 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
         // pre-filter scan could not starve this way). See RFC Invariant 2.
         if (!contextGraphStorage.isContextGraphActive(chosenCg)) return (0, 0, false);
 
-        // Step 2 — pick a challengeable KC inside `chosenCg` (bounded resampling), then a leaf.
-        // OT-RFC-49: curated KCs gate on the PUBLIC `_catalog` commitment; a curated KC with
-        // `catalogLeafCount == 0` is skipped like an expired KC (cores prove the catalog).
-        uint256 kcCount = contextGraphStorage.getContextGraphKCCount(chosenCg);
+        // Step 2 — pick a challengeable KA inside `chosenCg` (bounded resampling), then a leaf.
+        // OT-RFC-49: curated KAs gate on the PUBLIC `_catalog` commitment; a curated KA with
+        // `catalogLeafCount == 0` is skipped like an expired KA (cores prove the catalog).
+        uint256 kaCount = contextGraphStorage.getContextGraphKaCount(chosenCg);
         bool cgIsCurated = contextGraphStorage.getIsCurated(chosenCg);
-        bytes32 kcSeed = cgSeed;
-        if (kcCount > 0) {
-            for (uint8 attempt = 0; attempt < MAX_KC_RETRIES; attempt++) {
-                kcSeed = keccak256(abi.encodePacked(kcSeed, attempt));
-                uint256 idx = uint256(kcSeed) % kcCount;
-                uint256 candidate = contextGraphStorage.getContextGraphKCAt(chosenCg, idx);
+        bytes32 kaSeed = cgSeed;
+        if (kaCount > 0) {
+            for (uint8 attempt = 0; attempt < MAX_KA_RETRIES; attempt++) {
+                kaSeed = keccak256(abi.encodePacked(kaSeed, attempt));
+                uint256 idx = uint256(kaSeed) % kaCount;
+                uint256 candidate = contextGraphStorage.getContextGraphKaAt(chosenCg, idx);
                 if (knowledgeAssetStorage.getEndEpoch(candidate) < currentEpoch) continue;
                 if (cgIsCurated && knowledgeAssetStorage.getCatalogLeafCount(candidate) == 0) continue;
-                // Step 3 — leaf draw (curated -> public `_catalog` leaves; public -> flat-KC leaves).
+                // Step 3 — leaf draw (curated -> public `_catalog` leaves; public -> flat-KA leaves).
                 uint32 leafCount = cgIsCurated
                     ? knowledgeAssetStorage.getCatalogLeafCount(candidate)
                     : knowledgeAssetStorage.getMerkleLeafCount(candidate);
                 if (leafCount == 0) revert NoEligibleKnowledgeAsset();
-                return (candidate, uint256(kcSeed) % uint256(leafCount), true);
+                return (candidate, uint256(kaSeed) % uint256(leafCount), true);
             }
         }
         return (0, 0, false);
     }
 
-    /// @dev One selection attempt (view): O(1) working total → straddle draw → KC pick.
+    /// @dev One selection attempt (view): O(1) working total → straddle draw → KA pick.
     ///      `workingTotal == 0` signals no eligible CG left (caller maps to the attempt-
     ///      dependent revert); `found == false` with a `chosenCg` signals a miss the caller
     ///      excludes (and, on the production path, settles). Shared by both loops so the
@@ -647,7 +650,7 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
         if (workingTotal == 0) return (0, 0, 0, 0, false);
         uint256 r = uint256(cgSeed) % workingTotal;
         chosenCg = cgWeightTreeStorage.findStrictGtExcluding(r, exhausted);
-        (kaId, chunkId, found) = _pickKc(chosenCg, cgSeed, currentEpoch);
+        (kaId, chunkId, found) = _pickKa(chosenCg, cgSeed, currentEpoch);
     }
 
     /// @dev View loop backing `previewChallengeForSeed`. Same selection as the production
@@ -715,9 +718,9 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
     // slither-disable-end weak-prng,uninitialized-local,cyclomatic-complexity,incorrect-equality,calls-loop,timestamp
 
     // NOTE: the legacy `_isInExhaustedList` / `_isCGEligible` helpers were removed with the
-    // BIT migration. Exhaustion is now the in-memory `exhausted` set passed to
+    // BIT integration. Exhaustion is now the in-memory `exhausted` set passed to
     // CGWeightTreeStorage.findStrictGtExcluding; eligibility is verified on the DRAWN CG in
-    // `_pickKc` (1 SLOAD, not the O(N) scan) — a deactivated CG is treated as a miss.
+    // `_pickKa` (1 SLOAD, not the O(N) scan) — a deactivated CG is treated as a miss.
 
     /**
      * @dev Calculates the node score based on stake, publishing activity, and ask alignment

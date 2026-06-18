@@ -28,7 +28,7 @@ RandomSampling picks which Context Graph to challenge by a **value-weighted rand
 **Proposal, in two moves:**
 
 1. **Replace the linear scan with a Fenwick/Binary-Indexed-Tree (BIT) index over CG ids** → the weighted draw becomes an `O(log)` prefix search (~21 reads against a fixed-capacity tree, instead of 100k+ reads — and constant in the live CG count).
-2. **Replace the exact, calendar-synchronized weight bookkeeping with lazy settlement.** We can do this safely because **the draw already filters expired knowledge collections after it picks a CG** — so a CG's weight only needs to be *approximately* right. We never run a per-epoch sweep; weights are reconciled opportunistically (on the next spend, on a wasted draw, or by a cheap keeper).
+2. **Replace the exact, calendar-synchronized weight bookkeeping with lazy settlement.** We can do this safely because **the draw already filters expired knowledge assets after it picks a CG** — so a CG's weight only needs to be *approximately* right. We never run a per-epoch sweep; weights are reconciled opportunistically (on the next spend, on a wasted draw, or by a cheap keeper).
 
 Result: `O(log N)` reads and writes, **no per-epoch roll, no draw-gating, no clustered-expiry gas cliff.** The only heavy step is a one-time, batched migration to seed the tree. The existing `cgValueDiff` ledger stays as the source of truth; the BIT is a fast index kept loosely in sync with it.
 
@@ -42,7 +42,7 @@ Result: `O(log N)` reads and writes, **no per-epoch roll, no draw-gating, no clu
 
 1. **Scan 1 — total:** loop `i = 1..cgCount` (`cgCount = getLatestContextGraphId()`), sum `getCGValueAtEpoch(i, currentEpoch)` for every eligible CG into `adjustedTotal`.
 2. **Scan 2 — straddle pick:** draw `r = seed % adjustedTotal`, loop `i = 1..cgCount` again accumulating the running weight, and pick the first CG where `running > r` (`RandomSampling.sol:618`, strict `>`).
-3. **KC + leaf pick:** inside the chosen CG, pick a KC (up to `MAX_KC_RETRIES = 10`) and a leaf; an outer loop (up to `MAX_CG_RETRIES = 5`) excludes a CG that has no challengeable KC and re-draws over the remaining set.
+3. **KA + leaf pick:** inside the chosen CG, pick a KA (up to `MAX_KA_RETRIES = 10`) and a leaf; an outer loop (up to `MAX_CG_RETRIES = 5`) excludes a CG that has no challengeable KA and re-draws over the remaining set.
 
 `createChallenge` (`RandomSampling.sol:205`) is **state-changing** (it calls `setNodeChallenge`, `:230`), which matters below.
 
@@ -55,7 +55,7 @@ Leading-order cost ≈ `R · 2 · N · (1 + (1+D))` SLOADs, `R ≤ 5`. The contr
 
 ### How a CG's weight is defined today
 
-When a KC is published to a CG with value `V` over `lifetime` epochs, `ContextGraphValueStorage.addCGValueForEpochRange` (`:110`) records a per-epoch rate `perEpoch = V / lifetime` as two ledger entries:
+When a KA is published to a CG with value `V` over `lifetime` epochs, `ContextGraphValueStorage.addCGValueForEpochRange` (`:110`) records a per-epoch rate `perEpoch = V / lifetime` as two ledger entries:
 
 ```
 cgValueDiff[cgId][startEpoch]            += perEpoch     // :131  weight starts
@@ -71,7 +71,7 @@ Challenge CGs in proportion to their **active TRAC spend** (more spend → more 
 ### Constraints / facts that shape the design
 
 - `deactivateContextGraph` (`ContextGraphStorage.sol:363`) exists but has **no callers anywhere** in the contracts/SDK — the CG set is effectively **append-only** today. There is no reactivation function.
-- After the draw picks a CG, the **KC pick filters expired KCs**: `getEndEpoch(candidate) < currentEpoch → skip` (`RandomSampling.sol:648`). A challenge therefore **cannot land on expired data regardless of whether the CG's weight is current.** This is the key correctness backstop the simplification relies on.
+- After the draw picks a CG, the **KA pick filters expired KAs**: `getEndEpoch(candidate) < currentEpoch → skip` (`RandomSampling.sol:648`). A challenge therefore **cannot land on expired data regardless of whether the CG's weight is current.** This is the key correctness backstop the simplification relies on.
 - `RandomSampling` / `RandomSamplingStorage` are **non-upgradeable, fresh-deploy** contracts; redeploys use `clearOutstandingChallenges()` to avoid challenge-struct mismatch.
 - Write:read ratio is heavily read-dominated (a handful of spends per epoch vs many challenges, each doing `2·N` weight reads) — so paying `O(log N)` on writes to make reads `O(log N)` is a clear win.
 
@@ -94,7 +94,7 @@ This eliminates **both** scans. `prefixSum`/search touch `log2(BIT_CAPACITY)` tr
 
 The painful machinery in a naive Fenwick port is keeping leaves exactly in sync with the calendar (a per-epoch "roll" that applies due weight changes, plus gating so a draw never reads a half-rolled tree). We avoid all of it by letting leaves be **approximately** right and reconciling lazily:
 
-- **Correctness is unconditional and does not depend on weight freshness.** An over-drawn CG cannot produce a bad challenge — the KC filter (`:648`) drops expired KCs and the retry loop moves on. So weight staleness only ever affects *sampling fairness*, never proof validity.
+- **Correctness is unconditional and does not depend on weight freshness.** An over-drawn CG cannot produce a bad challenge — the KA filter (`:648`) drops expired KAs and the retry loop moves on. So weight staleness only ever affects *sampling fairness*, never proof validity.
 - **Staleness is bounded and bidirectional.** Between settlements a leaf can drift two ways: *over*-stated when a paid window expires (an un-applied `−` diff), and *under*-stated when future-dated value activates (an un-applied `+` diff, e.g. from `extend` or a scheduled start). The common case — publish-now, `startEpoch == currentEpoch` — is applied immediately by settle-on-spend, so steady-state drift is small.
 - We reconcile a leaf to the ledger's true value **only when we already touch the CG**:
   - **on its next spend** (settle-on-spend) — applies immediate value at once;
@@ -229,16 +229,16 @@ We keep an explicit `mapping(uint256 => uint256) cgWeight` (declared in storage 
 
 ### Hooking the existing flows
 
-- **On spend** (every caller of `addCGValueForEpochRange` — publish, update, extend): after the ledger write, call `settle(cg)`. Note `addCGValueForEpochRange` **already** finalizes the CG to `currentEpoch-1` (`ContextGraphValueStorage.sol:138`), so settle's `finalizeCGValueUpTo` is a no-op on this path and the real work is the `_bitUpdate` to the new true value. Because the ledger nets additive deltas (extend adds positive diffs; the original expiry diff is untouched), `settle` picks up the new value with no per-KC tracking. `O(log)` on the rare write path.
-- **In `createChallenge`** (read path): replace the twin scan with the BIT draw; keep the existing KC/leaf pick and retry loop. On a miss, call `settle(cg)` before excluding it. **What settle-on-miss does and does *not* heal:**
+- **On spend** (every caller of `addCGValueForEpochRange` — publish, update, extend): after the ledger write, call `settle(cg)`. Note `addCGValueForEpochRange` **already** finalizes the CG to `currentEpoch-1` (`ContextGraphValueStorage.sol:138`), so settle's `finalizeCGValueUpTo` is a no-op on this path and the real work is the `_bitUpdate` to the new true value. Because the ledger nets additive deltas (extend adds positive diffs; the original expiry diff is untouched), `settle` picks up the new value with no per-KA tracking. `O(log)` on the rare write path.
+- **In `createChallenge`** (read path): replace the twin scan with the BIT draw; keep the existing KA/leaf pick and retry loop. On a miss, call `settle(cg)` before excluding it. **What settle-on-miss does and does *not* heal:**
   - ✅ **Expiry over-statement** — lapsed paid windows. `settle` reconciles the leaf to `getCGValueAtEpoch`, which is `0` once all windows expired, so the CG stops being over-drawn ("self-healing").
-  - ❌ **Positive value, no challengeable KC** — every KC expired, or curated KCs with `catalogLeafCount == 0` (`RandomSampling.sol:649`). Truth is still positive, so `settle` leaves the leaf positive; the CG can be drawn-and-wasted again on a later challenge. **This is not a regression** — today's twin-scan re-picks and re-excludes such a CG every challenge too — but the leaf does not zero out.
+  - ❌ **Positive value, no challengeable KA** — every KA expired, or curated KAs with `catalogLeafCount == 0` (`RandomSampling.sol:649`). Truth is still positive, so `settle` leaves the leaf positive; the CG can be drawn-and-wasted again on a later challenge. **This is not a regression** — today's twin-scan re-picks and re-excludes such a CG every challenge too — but the leaf does not zero out.
   - ❌ **Under-statement** — future-dated `+` (extend / scheduled start) not yet active. A CG that *gained* weight is not the one drawn-and-missed, so settle-on-miss never fires for it; it relies on settle-on-spend or the keeper.
 - **Keeper (optional):** `settleMany(uint256[] cgIds)` — permissionless batch `settle`, for dormant CGs and for the under-statement case the draw won't otherwise touch. Whether it's needed is the main open decision (below) and depends on Phase-0 measurement.
 
 ### Exact-exclusion fidelity (the retry renormalization)
 
-Today the outer retry loop excludes an exhausted CG and **renormalizes over the remaining set** (it defends against a high-weight CG with no challengeable KCs starving the draw). We must reproduce that renormalized distribution **exactly**.
+Today the outer retry loop excludes an exhausted CG and **renormalizes over the remaining set** (it defends against a high-weight CG with no challengeable KAs starving the draw). We must reproduce that renormalized distribution **exactly**.
 
 **Do not "advance to the next nonzero leaf" after landing on an excluded CG — that is not renormalization.** It dumps the excluded CG's probability mass onto its right-neighbor and can starve everything past the cut. Concretely: four equal-weight CGs (10 each), exclude CG2, draw `r ∈ [0,30)` over the full tree → `r∈[10,20)` lands CG2 → "advance" gives CG3, and `r∈[20,30)` also gives CG3, so the result is `CG1=⅓, CG3=⅔, CG4=0` instead of `⅓` each. Wrong distribution, and it fails Test #2.
 
@@ -295,7 +295,7 @@ for (uint8 cgAttempt = 0; cgAttempt < MAX_CG_RETRIES; cgAttempt++) {
     }
     uint256 r  = uint256(cgSeed) % workingTotal;
     uint256 cg = _bitFindStrictGtExcluding(r, excluded, excludedCount);
-    // ... pick KC inside cg (unchanged: :626-667); on success return ...
+    // ... pick KA inside cg (unchanged: :626-667); on success return ...
     // on miss:
     settle(cg);                                  // heals expiry over-statement (may drop cgWeight[cg] & bitTotal)
     excluded[excludedCount++] = cg;              // exclude for the rest of THIS challenge regardless
@@ -314,7 +314,7 @@ for (uint8 cgAttempt = 0; cgAttempt < MAX_CG_RETRIES; cgAttempt++) {
 1. **Non-negativity & total consistency:** every leaf ≥ 0 and `bitTotal == Σ leaves`. Held by: leaves seeded ≥ 0; spends add ≥ 0; `settle` sets leaf to `getCGValueAtEpoch ≥ 0`; `_bitUpdate` only moves a leaf toward its non-negative truth. **Cross-check (free oracle):** when all CGs are active, `bitTotal` should also equal the ledger's finalized **global** total (`totalValueCumulative`, fed by `totalValueDiff` at `ContextGraphValueStorage.sol:134-135`) up to lazy-settle drift — assert it at migration and optionally at runtime.
 2. **Eligibility ⇔ weight (must be enforced).** A CG contributes to the draw **iff** `cgWeight[cg] > 0`, but the real eligibility gate is `_isCGEligible == isContextGraphActive` (`RandomSampling.sol:711`). These must not drift apart. Today they can't — `deactivateContextGraph` (`ContextGraphStorage.sol:363`) has **no callers**, so every created CG is permanently active (`active = true` at `:247`) and a weight-only tree is sound. To keep it sound the contract MUST maintain **`cgWeight[cg] > 0 ⇒ CG active`**: if deactivation is ever wired up, its first action is `settle(cg); _bitUpdate(cg, -cgWeight[cg]); cgWeight[cg] = 0` (plus a ≥2-active-CG floor), so an inactive CG always has a zero leaf and is never drawn. Add a guard/test asserting the active flag never flips without zeroing the leaf. *(Promoted from Open Decision #3 because `isContextGraphActive` is already the live gate, not a future feature.)*
 3. **Bounded bidirectional drift (fairness only).** Between settlements a leaf may be over-stated (un-applied expiry `−`) or under-stated (un-applied future-dated `+`). Over-statement from expiry is corrected by settle-on-miss; under-statement (and the positive-value-but-unchallengeable case) relies on settle-on-spend or the keeper — see *Hooking* for exact scope. Drift bounds sampling skew, **not** correctness.
-4. **No bad challenge from staleness — unconditional:** guaranteed by the KC filter (`:648`) regardless of leaf freshness or drift direction.
+4. **No bad challenge from staleness — unconditional:** guaranteed by the KA filter (`:648`) regardless of leaf freshness or drift direction.
 
 > **Freshness vs simplicity.** Over-statement self-heals for free; under-statement is the case the keeper exists to bound. If low-latency fairness for scheduled/extended value matters more than minimal machinery, add an optional **epoch-due index** — `epochDueCgs[E]` populated whenever `addCGValueForEpochRange` writes a diff at epoch `E`, settled in bulk on the first challenge of epoch `E` (or by the keeper). This is a *churn-sized* settle (`O(diffs-due-this-epoch · log N)`), not the `O(N)` synchronized roll, and needs no draw-gating because correctness never depends on it. Recommended only if measurements show under-statement lag matters; otherwise the keeper suffices.
 
@@ -323,8 +323,8 @@ for (uint8 cgAttempt = 0; cgAttempt < MAX_CG_RETRIES; cgAttempt++) {
 - `workingTotal == 0` (no eligible/weighted CG): revert with today's semantics — `NoEligibleContextGraph` on attempt 0, `NoEligibleKnowledgeAsset` once all eligible CGs are excluded (`RandomSampling.sol:602-608`).
 - Single CG / single nonzero leaf: prefix search returns it; fine.
 - Zero-weight leaf: prefix sum is flat across it, so the search never lands on it — naturally skipped (no eligibility SLOAD needed).
-- **Expired** CG with stale nonzero leaf: drawn occasionally → KC pick finds nothing live → `settle` reconciles the leaf to truth, which is **0 once all paid windows have lapsed** → excluded; next time its leaf is 0 and it's skipped.
-- CG with **positive** ledger value but no challengeable KC (all KCs expired, or curated with `catalogLeafCount == 0`, `:649`): drawn → missed → `settle` leaves the leaf **positive** → excluded for this challenge but drawable again later. Same as today's twin-scan; bounded by `MAX_CG_RETRIES` per challenge. Not healed by settle (see *Hooking*).
+- **Expired** CG with stale nonzero leaf: drawn occasionally → KA pick finds nothing live → `settle` reconciles the leaf to truth, which is **0 once all paid windows have lapsed** → excluded; next time its leaf is 0 and it's skipped.
+- CG with **positive** ledger value but no challengeable KA (all KAs expired, or curated with `catalogLeafCount == 0`, `:649`): drawn → missed → `settle` leaves the leaf **positive** → excluded for this challenge but drawable again later. Same as today's twin-scan; bounded by `MAX_CG_RETRIES` per challenge. Not healed by settle (see *Hooking*).
 - New CG creation: **no tree growth needed.** Capacity is fixed at deploy and `bit`/`cgWeight` are sparse mappings, so a new id's weight is implicitly 0 until its first spend — no `createContextGraph → BIT` hook. Defensive guard: revert if a CG id ever reaches `BIT_CAPACITY` (size capacity to make this unreachable).
 
 ### Gas & storage
@@ -333,7 +333,7 @@ for (uint8 cgAttempt = 0; cgAttempt < MAX_CG_RETRIES; cgAttempt++) {
 
 | Operation | Cost | Frequency |
 |---|---|---|
-| Draw, no exclusions (`createChallenge`) | `O(log)` ≈ 21 node reads + KC/leaf pick | hot — every challenge |
+| Draw, no exclusions (`createChallenge`) | `O(log)` ≈ 21 node reads + KA/leaf pick | hot — every challenge |
 | Draw with `k` exclusions | `O(k · log)` (each descent step deducts ≤ `k` excluded leaves) | retry path only |
 | Settle-on-miss (per missed CG) | `O(log)` + `O(D_cg)` finalize the **first** time a dormant CG is touched, then `O(log)` | up to `MAX_CG_RETRIES`× per challenge |
 | Spend update (`settle` + `_bitUpdate`) | `O(log)` (`finalizeCGValueUpTo` already done by the spend, `:138`) | rare — per publish/extend |
@@ -348,7 +348,7 @@ Storage: `bit` + explicit `cgWeight` + `cgSettledEpoch` ≈ `3·N` *populated* s
 
 - **Seed grindability is unchanged.** The draw is still seeded from the same source; commit-reveal/VRF is explicitly out of V10 scope. This RFC neither improves nor worsens it.
 - **Staleness can't break proofs** (invariant 4).
-- **Clustered-expiry attack:** an adversary publishing many KCs with identical lifetimes makes a cohort expire together. Under lazy settlement this leaves many over-stated leaves; the draw may waste retries landing on them, each healed by settle-on-miss (or pre-empted by the keeper). Bounded by `MAX_CG_RETRIES` per challenge with **no synchronized roll and therefore no block-gas cliff** — strictly better than the "exact roll + draw-gating" alternative (see the worst-case gas note above).
+- **Clustered-expiry attack:** an adversary publishing many KAs with identical lifetimes makes a cohort expire together. Under lazy settlement this leaves many over-stated leaves; the draw may waste retries landing on them, each healed by settle-on-miss (or pre-empted by the keeper). Bounded by `MAX_CG_RETRIES` per challenge with **no synchronized roll and therefore no block-gas cliff** — strictly better than the "exact roll + draw-gating" alternative (see the worst-case gas note above).
 - **Preview vs. real draw can diverge.** `previewChallengeForSeed` is `view` and **cannot** settle-on-miss, so under stale (over-stated) leaves it may predict a different CG than the state-changing `createChallenge` (which self-heals and re-draws). Today the two agree (both `view`-sum the same source). Identify every consumer of preview before shipping and decide whether best-effort prediction is acceptable; if exactness is required, document that preview is approximate under drift.
 - **Migration safety / challenge pause:** draws are disabled (`backfillLocked`) until seeding completes and the `bitTotal == Σ leaves` check (plus the global-total cross-check) passes. **This pauses all challenges for the whole multi-tx seeding window** — bound the window (pre-compute leaves off-chain, batch aggressively) and communicate the outage; for a fresh redeploy it overlaps the unavoidable `clearOutstandingChallenges()` transition.
 
@@ -357,7 +357,7 @@ Storage: `bit` + explicit `cgWeight` + `cgSettledEpoch` ≈ `3·N` *populated* s
 1. **Distribution parity (settled state):** BIT draw vs current twin-scan over the same seeds and weights, with fully-settled leaves — attempt-1 must be bit-identical (validates the strict-`>` boundary). Under drift the distributions diverge by design; parity is asserted only when settled.
 2. **Renormalization equivalence (corrected exclusion path):** for randomized weight vectors and excluded sets of size `1..MAX_CG_RETRIES`, the subtract-during-descent draw must match the analytic renormalized distribution. **Include the regression the old "advance to next nonzero" wording failed:** N equal-weight CGs, exclude one, assert every survivor is equiprobable (no neighbor double-count, no starved tail).
 3. **Fixed-capacity Fenwick correctness:** property test that draws/prefix sums stay correct as ids are added **across multiple 2^k boundaries** (the growth-corruption regression) — seed leaves below a 2^k index, add ids above it, assert `bitTotal == Σ leaves` and prefix sums match a brute-force oracle.
-4. **Stale-leaf self-heal (expiry only):** seed an over-stated leaf from a lapsed window, draw, assert settle-on-miss reconciles it to 0 and excludes it. **Companion negative test:** a CG with positive value but no challengeable KC stays positive after settle (documents the non-healing case).
+4. **Stale-leaf self-heal (expiry only):** seed an over-stated leaf from a lapsed window, draw, assert settle-on-miss reconciles it to 0 and excludes it. **Companion negative test:** a CG with positive value but no challengeable KA stays positive after settle (documents the non-healing case).
 5. **Eligibility ⇔ weight invariant:** assert no path flips `active` without zeroing the leaf; if a deactivation hook exists, assert an inactive CG is never drawn.
 6. **Fairness tolerance (drift regime):** with a realistic publish/expire/extend workload and settle-on-miss only, assert observed draw frequencies stay within the agreed tolerance of true active weight (define the tolerance — see Open Decisions).
 7. **Preview vs. draw:** agree when settled; characterize divergence under stale leaves.
@@ -401,4 +401,4 @@ Storage: `bit` + explicit `cgWeight` + `cgSettledEpoch` ≈ `3·N` *populated* s
 - **Alias method.** `O(1)` draw, but **any weight change forces an `O(N)` table rebuild**; weights change every epoch via implicit decay → ~`O(N)` gas per epoch. Worse than status quo. Rejected.
 - **Segment tree.** Algorithmically equivalent to Fenwick but 2–4× the storage with no benefit here. Rejected in favor of Fenwick.
 - **Off-chain draw + on-chain verify.** Verifying the *weighted* (not merely eligible) property on-chain needs the same prefix structure (back to Fenwick) or a per-epoch weight-vector commitment (relocates the problem off-chain), and a grind-resistant seed needs commit-reveal/VRF — out of V10 scope. Rejected.
-- **Cumulative weight (no expiry at all).** Simplest possible, but over-samples CGs whose data has expired → wasted retries and (absent the KC filter) un-answerable challenges. Lazy settlement keeps expiry semantics at the same simplicity, so it is strictly preferable. Rejected.
+- **Cumulative weight (no expiry at all).** Simplest possible, but over-samples CGs whose data has expired → wasted retries and (absent the KA filter) un-answerable challenges. Lazy settlement keeps expiry semantics at the same simplicity, so it is strictly preferable. Rejected.

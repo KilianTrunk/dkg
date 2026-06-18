@@ -956,7 +956,7 @@ describe.skip('@integration RandomSampling (OBSOLETE: V8 stake pipeline)', () =>
 
       // Verification: with Phase 10 the bound CG still holds value (the
       // bridge seeds a 100-epoch lifetime), so the picker walks into it,
-      // finds the only KC has expired, exhausts MAX_KC_RETRIES, and reverts
+      // finds the only KC has expired, exhausts MAX_KA_RETRIES, and reverts
       // with `NoEligibleKnowledgeAsset`. The V8 string
       // `"Failed to find a knowledge collection that is active in the current epoch"`
       // came from the now-deleted BFS picker.

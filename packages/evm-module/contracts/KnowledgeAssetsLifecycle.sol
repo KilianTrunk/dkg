@@ -830,7 +830,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
 
         // --- 4. N20: atomic CG↔KC binding + CG value diff ---
 
-        // Facade write: kaToContextGraph[kaId] = cgId AND contextGraphKCList[cgId].push(kaId).
+        // Facade write: kaToContextGraph[kaId] = cgId AND contextGraphKaList[cgId].push(kaId).
         contextGraphs.registerKnowledgeAsset(p.contextGraphId, kaId);
 
         // Per-CG + global value ledger for value-weighted random challenges.

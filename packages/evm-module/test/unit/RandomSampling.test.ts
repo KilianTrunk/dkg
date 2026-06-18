@@ -832,8 +832,8 @@ describe('@unit RandomSampling', () => {
   // `_generateChallenge`:
   //   Step 1 — pick a CG weighted by its per-epoch TRAC value at the current
   //            epoch, excluding curated ("private") and inactive CGs.
-  //   Step 2 — pick a KC uniformly at random from the chosen CG's KC list and
-  //            retry up to MAX_KC_RETRIES on expired KCs.
+  //   Step 2 — pick a KA uniformly at random from the chosen CG's KA list and
+  //            retry up to MAX_KA_RETRIES on expired KAs.
   //
   // We deploy ContextGraphStorage + ContextGraphValueStorage in an extended
   // fixture, register a test signer as a Hub contract so it can seed state
@@ -852,8 +852,8 @@ describe('@unit RandomSampling', () => {
     let opSigner: SignerWithAddress;
 
     // OT-RFC-43 Option 1 (1a): KA ids are caller-supplied, author-namespaced
-    // packed values `(uint160(author) << 96) | uint96(number)`. `createKC`
-    // seeds with `author == opSigner`, so allocate a fresh number per KC in
+    // packed values `(uint160(author) << 96) | uint96(number)`. `createKa`
+    // seeds with `author == opSigner`, so allocate a fresh number per KA in
     // opSigner's namespace. Reset per test so snapshot-reverted runs realloc.
     let _kaIdCounter: bigint;
     beforeEach(() => {
@@ -872,7 +872,7 @@ describe('@unit RandomSampling', () => {
      * Codex PR #630 R1 #1325 (cherry-picked from C2): `getIsCurated()` was
      * re-anchored from `publishPolicy == 0` to `accessPolicy != 0`. The
      * Phase 10 picker (step 2 of `_pickWeightedChallenge`) calls
-     * `getIsCurated()` to decide whether to apply the per-KC ciphertext-
+     * `getIsCurated()` to decide whether to apply the per-KA ciphertext-
      * commitment filter. So the arg this helper takes — semantically
      * "should this CG be treated as curated?" — now drives `accessPolicy`
      * and we keep `publishPolicy` open in both branches (the picker
@@ -897,11 +897,11 @@ describe('@unit RandomSampling', () => {
     }
 
     /**
-     * Seed a KC directly on DKGKnowledgeAssets and register it to the
-     * given CG. Returns the new KC id. `endEpoch` controls the expiry — pass
-     * `currentEpoch - 1` to create an already-expired KC.
+     * Seed a KA directly on DKGKnowledgeAssets and register it to the
+     * given CG. Returns the new KA id. `endEpoch` controls the expiry — pass
+     * `currentEpoch - 1` to create an already-expired KA.
      */
-    async function createKC(
+    async function createKa(
       cgId: bigint,
       endEpoch: bigint,
       merkleLeafCount: bigint = 1n,
@@ -984,13 +984,13 @@ describe('@unit RandomSampling', () => {
     }
 
     // -----------------------------------------------------------------------
-    // Test 1 — Happy path: a single public CG with one active KC is always
+    // Test 1 — Happy path: a single public CG with one active KA is always
     // selected regardless of the draw seed.
     // -----------------------------------------------------------------------
     it('picks the only public CG when it is the only eligible graph', async () => {
       const cgId = await createCG(OPEN_POLICY);
       const endEpoch = (await Chronos.getCurrentEpoch()) + 5n;
-      const kaId = await createKC(cgId, endEpoch);
+      const kaId = await createKa(cgId, endEpoch);
       await seedCGValue(cgId, 1_000n);
 
       const currentEpoch = await Chronos.getCurrentEpoch();
@@ -1001,30 +1001,30 @@ describe('@unit RandomSampling', () => {
         const preview = await RandomSampling.previewChallengeForSeed(testSeed(i));
         expect(preview.cgId).to.equal(cgId);
         expect(preview.kaId).to.equal(kaId);
-        // KC byte size (128) > chunk byte size (32), so chunkId is drawn from
-        // the rotated KC seed in [0, byteSize/chunkSize) = [0, 4).
+        // KA byte size (128) > chunk byte size (32), so chunkId is drawn from
+        // the rotated KA seed in [0, byteSize/chunkSize) = [0, 4).
         expect(preview.chunkId).to.be.lessThan(expectedMaxChunk);
       }
     });
 
     // -----------------------------------------------------------------------
-    // Test 2 — Edge: only-curated-CG-holds-value scenario, KC uncommitted.
+    // Test 2 — Edge: only-curated-CG-holds-value scenario, KA uncommitted.
     //
     // RFC-39 Phase B (PR-B) / OT-RFC-49: curated CGs are now CG-level eligible,
-    // but the KC in this test has no `(catalogRoot, catalogLeafCount)`
-    // commitment. The picker's inner per-KC retry exhausts all MAX_KC_RETRIES
+    // but the KA in this test has no `(catalogRoot, catalogLeafCount)`
+    // commitment. The picker's inner per-KA retry exhausts all MAX_KA_RETRIES
     // (each candidate is skipped at `getCatalogLeafCount == 0`), then the
     // outer CG-retry marks the curated CG exhausted and re-draws; with no
     // other CGs holding value, the second outer pass hits zero adjustedTotal
     // and the picker reverts with `NoEligibleKnowledgeAsset` (NOT
     // `NoEligibleContextGraph` — the first pass had a positive adjusted
     // total). This is the spec-faithful behaviour: a curated CG with only
-    // pre-LU-11 KCs is functionally the same as a CG with only expired KCs.
+    // pre-LU-11 KAs is functionally the same as a CG with only expired KAs.
     // -----------------------------------------------------------------------
     it('reverts NoEligibleKnowledgeAsset when only an uncommitted curated CG holds value', async () => {
       const curatedCgId = await createCG(CURATED_POLICY);
       const endEpoch = (await Chronos.getCurrentEpoch()) + 5n;
-      await createKC(curatedCgId, endEpoch);
+      await createKa(curatedCgId, endEpoch);
       await seedCGValue(curatedCgId, 5_000n);
 
       const currentEpoch = await Chronos.getCurrentEpoch();
@@ -1041,42 +1041,42 @@ describe('@unit RandomSampling', () => {
     // with a public CG.
     //
     // RFC-39 Phase A.5 / OT-RFC-49 behaviour: curated CGs participate in the
-    // CG-level lottery; the per-KC catalog-commitment gate is what keeps legacy
-    // (pre-LU-11) curated KCs out of the curated draw.
+    // CG-level lottery; the per-KA catalog-commitment gate is what keeps legacy
+    // (pre-LU-11) curated KAs out of the curated draw.
     //
     // Codex PR #630 R1 #3 added a bounded outer CG-retry to
     // `_pickWeightedChallenge` so a single high-value legacy curated CG
     // can't DoS the entire sampling tick. With this retry, the picker
-    // self-heals when it lands on a curated CG whose KCs are all
+    // self-heals when it lands on a curated CG whose KAs are all
     // uncommitted: it marks that CG exhausted, re-draws against the
     // remaining eligible CGs, and falls through to the public CG. So
     // even though the curated CG carries 10× the weight, all 25 draws
-    // succeed and EVERY successful draw must land on the public CG/KC
-    // (a success on the curated branch would mean the per-KC commitment
+    // succeed and EVERY successful draw must land on the public CG/KA
+    // (a success on the curated branch would mean the per-KA commitment
     // filter is leaking and `setCatalogCommitment` is no longer
     // a prerequisite for inclusion in the curated lottery).
     // -----------------------------------------------------------------------
-    it('skips curated KCs without catalog commitment; CG-retry fallback routes every draw to the public CG', async () => {
+    it('skips curated KAs without catalog commitment; CG-retry fallback routes every draw to the public CG', async () => {
       const curatedCg = await createCG(CURATED_POLICY);
       const openCg = await createCG(OPEN_POLICY);
 
       const endEpoch = (await Chronos.getCurrentEpoch()) + 5n;
-      await createKC(curatedCg, endEpoch);
-      const openKc = await createKC(openCg, endEpoch);
+      await createKa(curatedCg, endEpoch);
+      const openKc = await createKa(openCg, endEpoch);
 
       // Curated CG holds 10x the value of the public CG. Pre-R1 the picker
       // would have reverted on every curated-weighted draw; post-R1 the
       // outer CG-retry exhausts the curated CG and falls back to the
-      // public one. The per-KC commitment filter is still what guarantees
-      // the curated KC never gets picked (only public KCs survive step 2).
+      // public one. The per-KA commitment filter is still what guarantees
+      // the curated KA never gets picked (only public KAs survive step 2).
       await seedCGValue(curatedCg, 10_000n);
       await seedCGValue(openCg, 1_000n);
 
       const currentEpoch = await Chronos.getCurrentEpoch();
       for (let i = 0; i < 25; i++) {
         const preview = await RandomSampling.previewChallengeForSeed(testSeed(i));
-        // Every successful draw MUST be the public CG / public KC. A
-        // success on the curated branch would mean the per-KC commitment
+        // Every successful draw MUST be the public CG / public KA. A
+        // success on the curated branch would mean the per-KA commitment
         // filter is leaking.
         expect(preview.cgId).to.equal(openCg);
         expect(preview.kaId).to.equal(openKc);
@@ -1084,25 +1084,25 @@ describe('@unit RandomSampling', () => {
     });
 
     // -----------------------------------------------------------------------
-    // Test 4 — CG with only expired KCs: MAX_KC_RETRIES are exhausted and the
+    // Test 4 — CG with only expired KAs: MAX_KA_RETRIES are exhausted and the
     // picker reverts with NoEligibleKnowledgeAsset (the whole challenge
     // is skipped — node retries next proof period).
     // -----------------------------------------------------------------------
-    it('reverts NoEligibleKnowledgeAsset when every KC in the CG has expired', async () => {
+    it('reverts NoEligibleKnowledgeAsset when every KA in the CG has expired', async () => {
       const cgId = await createCG(OPEN_POLICY);
       const currentEpoch = await Chronos.getCurrentEpoch();
-      // Create a KC that is still live, seed value, then advance Chronos far
-      // enough that the KC has expired by the time we generate the challenge.
+      // Create a KA that is still live, seed value, then advance Chronos far
+      // enough that the KA has expired by the time we generate the challenge.
       // The CG's value ledger is finalized only up to currentEpoch-1, so the
       // per-epoch view must still report non-zero at the new current epoch
-      // (so the picker reaches the KC draw step and fails there).
+      // (so the picker reaches the KA draw step and fails there).
       const endEpoch = currentEpoch + 1n;
-      await createKC(cgId, endEpoch);
+      await createKa(cgId, endEpoch);
       // Give the CG value for a long lifetime so it remains weighted after
       // the epoch advance.
       await seedCGValue(cgId, 10_000n, 20n);
 
-      // Advance Chronos past the KC's endEpoch.
+      // Advance Chronos past the KA's endEpoch.
       const epochLength = await Chronos.epochLength();
       await time.increase(Number(epochLength) * 5);
       const newEpoch = await Chronos.getCurrentEpoch();
@@ -1132,9 +1132,9 @@ describe('@unit RandomSampling', () => {
       const cgC = await createCG(OPEN_POLICY);
 
       const endEpoch = (await Chronos.getCurrentEpoch()) + 100n;
-      await createKC(cgA, endEpoch);
-      await createKC(cgB, endEpoch);
-      await createKC(cgC, endEpoch);
+      await createKa(cgA, endEpoch);
+      await createKa(cgB, endEpoch);
+      await createKa(cgC, endEpoch);
 
       // Raw value values become per-epoch contributions of 7000 / 2000 / 1000.
       await seedCGValue(cgA, 7_000n);
@@ -1169,8 +1169,8 @@ describe('@unit RandomSampling', () => {
       const activeCg = await createCG(OPEN_POLICY);
 
       const endEpoch = (await Chronos.getCurrentEpoch()) + 5n;
-      await createKC(deactivated, endEpoch);
-      const activeKc = await createKC(activeCg, endEpoch);
+      await createKa(deactivated, endEpoch);
+      const activeKc = await createKa(activeCg, endEpoch);
 
       await seedCGValue(deactivated, 10_000n);
       await seedCGValue(activeCg, 1_000n);
@@ -1190,17 +1190,17 @@ describe('@unit RandomSampling', () => {
     // -----------------------------------------------------------------------
     // Test 7 — Plan invariant (v10 plan lines 713–714): a CG's per-epoch
     // contribution must auto-decay to zero once its seeded lifetime expires,
-    // and the picker must then auto-exclude it. The KC is deliberately kept
+    // and the picker must then auto-exclude it. The KA is deliberately kept
     // live beyond the seed lifetime so the only driver of auto-exclusion is
-    // the value decay in ContextGraphValueStorage — not KC expiry.
+    // the value decay in ContextGraphValueStorage — not KA expiry.
     // -----------------------------------------------------------------------
     it('auto-excludes a CG whose seed lifetime has expired (per-epoch contribution decays to zero)', async () => {
       const cgId = await createCG(OPEN_POLICY);
       const startEpoch = await Chronos.getCurrentEpoch();
       const seedLifetime = 5n;
-      // KC outlives the seed so auto-exclusion can only be driven by
+      // KA outlives the seed so auto-exclusion can only be driven by
       // ContextGraphValueStorage's per-epoch decay.
-      await createKC(cgId, startEpoch + 100n);
+      await createKa(cgId, startEpoch + 100n);
       await seedCGValue(cgId, 10_000n, seedLifetime);
 
       expect(
@@ -1244,10 +1244,10 @@ describe('@unit RandomSampling', () => {
       const shortLifetime = 5n;
       const longLifetime = 100n;
 
-      // Both KCs live past the advance so picker exclusion is driven only
-      // by value decay, not KC expiry.
-      await createKC(expiredCg, startEpoch + longLifetime);
-      const activeKc = await createKC(activeCg, startEpoch + longLifetime);
+      // Both KAs live past the advance so picker exclusion is driven only
+      // by value decay, not KA expiry.
+      await createKa(expiredCg, startEpoch + longLifetime);
+      const activeKc = await createKa(activeCg, startEpoch + longLifetime);
 
       // Expired CG: 10× the nominal TRAC but a 5-epoch lifetime.
       // Active  CG: 1/10 the nominal TRAC but a 100-epoch lifetime.
@@ -1283,23 +1283,23 @@ describe('@unit RandomSampling', () => {
     // Test 9 — Draw-level parity (BIT refactor discriminator): the full
     // (cgId, kaId, chunkId) tuple from previewChallengeForSeed must match a JS
     // oracle replicating the EXACT on-chain seed threading — r = seed % total
-    // straddle for the CG; kcSeed = keccak256(seed, uint8(0)) for the KC index
+    // straddle for the CG; kaSeed = keccak256(seed, uint8(0)) for the KA index
     // and the leaf. If this fails, the draw diverged (seed threading or the
     // tree weight broke) — do NOT just adjust the expectation.
     // -----------------------------------------------------------------------
     it('draw-level parity: (cgId,kaId,chunkId) matches the seed-threading oracle', async () => {
       const endEpoch = (await Chronos.getCurrentEpoch()) + 100n;
-      // Multiple KCs per CG (exercise the kcSeed→idx pick) and leafCount > 1
+      // Multiple KAs per CG (exercise the kaSeed→idx pick) and leafCount > 1
       // (exercise the chunk draw). leafCount is uniform within each CG below.
       const cgA = await createCG(OPEN_POLICY);
-      await createKC(cgA, endEpoch, 4n);
-      await createKC(cgA, endEpoch, 4n);
+      await createKa(cgA, endEpoch, 4n);
+      await createKa(cgA, endEpoch, 4n);
       const cgB = await createCG(OPEN_POLICY);
-      await createKC(cgB, endEpoch, 7n);
+      await createKa(cgB, endEpoch, 7n);
       const cgC = await createCG(OPEN_POLICY);
-      await createKC(cgC, endEpoch, 3n);
-      await createKC(cgC, endEpoch, 3n);
-      await createKC(cgC, endEpoch, 3n);
+      await createKa(cgC, endEpoch, 3n);
+      await createKa(cgC, endEpoch, 3n);
+      await createKa(cgC, endEpoch, 3n);
 
       await seedCGValue(cgA, 5_000n);
       await seedCGValue(cgB, 3_000n);
@@ -1312,7 +1312,7 @@ describe('@unit RandomSampling', () => {
         [cgB.toString()]: 7n,
         [cgC.toString()]: 3n,
       };
-      // Prefetch weights + KC ordering so the oracle is a pure function.
+      // Prefetch weights + KA ordering so the oracle is a pure function.
       const weight: Record<string, bigint> = {};
       const kcList: Record<string, bigint[]> = {};
       for (const cg of cgs) {
@@ -1320,10 +1320,10 @@ describe('@unit RandomSampling', () => {
           cg,
           currentEpoch,
         );
-        const n = Number(await ContextGraphStorage.getContextGraphKCCount(cg));
+        const n = Number(await ContextGraphStorage.getContextGraphKaCount(cg));
         const list: bigint[] = [];
         for (let i = 0; i < n; i++) {
-          list.push(await ContextGraphStorage.getContextGraphKCAt(cg, BigInt(i)));
+          list.push(await ContextGraphStorage.getContextGraphKaAt(cg, BigInt(i)));
         }
         kcList[cg.toString()] = list;
       }
@@ -1340,14 +1340,14 @@ describe('@unit RandomSampling', () => {
             break;
           }
         }
-        // attempt 0 (all KCs live & public): kcSeed = keccak256(seed, uint8(0)).
-        const kcSeed = ethers.keccak256(
+        // attempt 0 (all KAs live & public): kaSeed = keccak256(seed, uint8(0)).
+        const kaSeed = ethers.keccak256(
           ethers.solidityPacked(['bytes32', 'uint8'], [seed, 0]),
         );
         const list = kcList[cg.toString()];
-        const idx = Number(BigInt(kcSeed) % BigInt(list.length));
+        const idx = Number(BigInt(kaSeed) % BigInt(list.length));
         const ka = list[idx];
-        const chunk = BigInt(kcSeed) % leafCountByCg[cg.toString()];
+        const chunk = BigInt(kaSeed) % leafCountByCg[cg.toString()];
         return { cg, ka, chunk };
       }
 
@@ -1373,7 +1373,7 @@ describe('@unit RandomSampling', () => {
       const cgIds: bigint[] = [];
       for (const w of sharePct) {
         const cg = await createCG(OPEN_POLICY);
-        await createKC(cg, endEpoch);
+        await createKa(cg, endEpoch);
         await seedCGValue(cg, w * 1_000n);
         cgIds.push(cg);
       }

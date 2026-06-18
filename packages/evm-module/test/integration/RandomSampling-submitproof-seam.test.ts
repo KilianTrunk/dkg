@@ -228,8 +228,8 @@ describe('@integration RandomSampling submitProof + multi-store seam (R3)', () =
     return kaId;
   }
 
-  // Like seedKa but with explicit KC expiry / value lifetime / per-epoch weight — used by the
-  // settle-on-miss test to build a dominant CG that goes stale (KC expires + value decays) while
+  // Like seedKa but with explicit KA expiry / value lifetime / per-epoch weight — used by the
+  // settle-on-miss test to build a dominant CG that goes stale (KA expires + value decays) while
   // its BIT leaf keeps the old (over-stated) weight until something settles it.
   async function seedKaCustom(
     cgId: bigint,
@@ -409,10 +409,10 @@ describe('@integration RandomSampling submitProof + multi-store seam (R3)', () =
     const node = await setupChallengingNode();
     const epoch = await Chronos.getCurrentEpoch();
 
-    // Stale-dominant CG A: huge per-epoch weight (1e24/2 = 5e23), short lifetime, KC expires soon.
+    // Stale-dominant CG A: huge per-epoch weight (1e24/2 = 5e23), short lifetime, KA expires soon.
     const cgA = await createPublicCG();
     await seedKaCustom(cgA, epoch + 2n, 2n, 10n ** 24n);
-    // Live CG B: tiny weight (1), long lifetime, KC lives long.
+    // Live CG B: tiny weight (1), long lifetime, KA lives long.
     const cgB = await createPublicCG();
     const kaB = await seedKaCustom(cgB, epoch + 1000n, 1000n, 1000n);
 
@@ -421,7 +421,7 @@ describe('@integration RandomSampling submitProof + multi-store seam (R3)', () =
     // A's stale leaf dominates the weighted draw, so createChallenge deterministically lands on A first.
     expect(leafA0).to.be.greaterThan(leafB0 * 10n ** 6n);
 
-    // Advance past A's lifetime + KC expiry, but well within B's. No re-settle, so A's BIT leaf
+    // Advance past A's lifetime + KA expiry, but well within B's. No re-settle, so A's BIT leaf
     // stays at the old (over-stated) weight while its ledger value has decayed to 0.
     const epochSeconds = Number(await Chronos.epochLength());
     await time.increase(epochSeconds * 3);
@@ -430,7 +430,7 @@ describe('@integration RandomSampling submitProof + multi-store seam (R3)', () =
     expect(await ContextGraphValueStorage.getCGValueAtEpoch(cgB, now)).to.be.greaterThan(0n); // B live
     expect(await CGWeightTreeStorage.cgWeight(cgA)).to.equal(leafA0); // leaf still stale (over-stated)
 
-    // Production path: A dominates → drawn first → KC expired → settle-on-miss reconciles A's
+    // Production path: A dominates → drawn first → KA expired → settle-on-miss reconciles A's
     // leaf to its true (0) value → A excluded → re-draw lands on the live CG B → SUCCESS (commits).
     await RandomSampling.updateAndGetActiveProofPeriodStartBlock();
     await RandomSampling.connect(node.operational).createChallenge();

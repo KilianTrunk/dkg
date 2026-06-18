@@ -170,7 +170,7 @@ describe('V10 E2E Conviction System', function () {
   //      (commit 41be7c71 — KA tokens minted to the paying agent, so the
   //      N16 ERC-1155 balanceOf gate works on follow-up updates)
   //   8. Atomic CG binding via ContextGraphs.registerKnowledgeAsset
-  //      (kaToContextGraph[kaId] == cgId, contextGraphKCList[cgId] includes
+  //      (kaToContextGraph[kaId] == cgId, contextGraphKaList[cgId] includes
   //      kaId) (N20)
   //   9. CG value ledger written via
   //      ContextGraphValueStorage.addCGValueForEpochRange (N20, Phase 1)

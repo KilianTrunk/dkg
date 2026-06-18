@@ -341,6 +341,58 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
   };
 
   // --------------------------------------------------------------------------
+  // OT-RFC-53 — publishing into a funded CG spends the registration escrow first
+  // --------------------------------------------------------------------------
+  it('OT-RFC-53: a publish into the owner-funded CG draws the registration escrow before the wallet/PCA', async () => {
+    const Params = await hre.ethers.getContract<ParametersStorage>(
+      'ParametersStorage',
+    );
+    const deposit = ethers.parseEther('100');
+    await Params.connect(accounts[0]).setContextGraphRegistrationDeposit(deposit);
+
+    // Fund the creator's deposit allowance to the CG facade BEFORE setup —
+    // `setupRegisteredAgentPublish` creates the CG as the creator, which now
+    // pulls the deposit.
+    const creator = getDefaultKCCreator(accounts);
+    await Token.mint(creator.address, deposit);
+    await Token.connect(creator).approve(await CGFacade.getAddress(), deposit);
+
+    const { cgId, epochs, receivingNodes, publisherIdentityId, receiverIdentityIds } =
+      await setupRegisteredAgentPublish();
+
+    // The deposit became the CG's prepaid escrow.
+    expect(await CGS.getRegistrationEscrow(cgId)).to.equal(deposit);
+
+    const tokenAmount = ethers.parseEther('1000');
+    const p = await buildPublishParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes,
+      publisherIdentityId,
+      receiverIdentityIds,
+      author: creator,
+      contextGraphId: cgId,
+      merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('rfc53-consume')),
+      knowledgeAssetsAmount: 1,
+      byteSize: 1000,
+      epochs,
+      tokenAmount,
+      isImmutable: false,
+      publishOperationId: 'rfc53-consume-op',
+      reservedKaId: packReservedKaId(creator.address, 1),
+    });
+
+    // Escrow (100) is drawn first; the 900 remainder flows through the PCA
+    // discount branch as usual. The consume event fires with the drawn amount.
+    await expect(KAV10.connect(creator).publish(p))
+      .to.emit(KAV10, 'RegistrationEscrowConsumed')
+      .withArgs(cgId, deposit);
+
+    // Fully consumed (1000 > 100).
+    expect(await CGS.getRegistrationEscrow(cgId)).to.equal(0n);
+  });
+
+  // --------------------------------------------------------------------------
   // 2. registered agent publishes via real KnowledgeAssetsLifecycle.publish()
   // --------------------------------------------------------------------------
   it('takes the discount branch when epochs == lockDurationEpochs and the discounted cost is asserted on chain', async () => {

@@ -9,6 +9,13 @@ import {INamed} from "./interfaces/INamed.sol";
 import {IVersioned} from "./interfaces/IVersioned.sol";
 import {ContextGraphStorage} from "./storage/ContextGraphStorage.sol";
 import {KnowledgeAssetsLib} from "./libraries/KnowledgeAssetsLib.sol";
+import {TokenLib} from "./libraries/TokenLib.sol";
+import {ParametersStorage} from "./storage/ParametersStorage.sol";
+import {ConvictionStakingStorage} from "./storage/ConvictionStakingStorage.sol";
+import {EpochStorage} from "./storage/EpochStorage.sol";
+import {Chronos} from "./storage/Chronos.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /**
  * @title ContextGraphs
@@ -52,11 +59,31 @@ import {KnowledgeAssetsLib} from "./libraries/KnowledgeAssetsLib.sol";
  *      the caller — this facade is responsible for the logic being correct
  *      when a correct principal is supplied.
  */
-contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable {
+contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable, ReentrancyGuard {
     string private constant _NAME = "ContextGraphs";
-    string private constant _VERSION = "10.0.2";
+    string private constant _VERSION = "10.0.3";
 
     ContextGraphStorage public contextGraphStorage;
+
+    // OT-RFC-53 — refs for the registration-deposit escrow. The deposit is
+    // pulled into the CSS vault at creation and credited to the staker reward
+    // pool (via EpochStorage) when consumed by publishing or swept by admin.
+    IERC20 public tokenContract;
+    ParametersStorage public parametersStorage;
+    ConvictionStakingStorage public convictionStakingStorage;
+    EpochStorage public epochStorage;
+    Chronos public chronos;
+
+    /// @notice Emitted when a CG registration deposit is pulled at creation.
+    event ContextGraphRegistrationDeposited(
+        uint256 indexed contextGraphId,
+        address indexed payer,
+        uint96 gross,
+        uint96 net
+    );
+
+    /// @notice Emitted when an admin sweeps a CG's residual escrow to the pool.
+    event ContextGraphEscrowSwept(uint256 indexed contextGraphId, uint96 amount);
 
     constructor(address hubAddress) ContractStatus(hubAddress) {}
 
@@ -64,6 +91,20 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable {
         contextGraphStorage = ContextGraphStorage(
             hub.getAssetStorageAddress("ContextGraphStorage")
         );
+        // OT-RFC-53 deposit refs — resolved tolerantly so ContextGraphs stays
+        // deployable without the full economic stack (e.g. isolated unit
+        // fixtures). `Hub.getContractAddress` reverts for unregistered names, so
+        // a missing ParametersStorage leaves these refs zero and the deposit is
+        // treated as disabled (createContextGraph guards on it below).
+        try hub.getContractAddress("ParametersStorage") returns (address p) {
+            parametersStorage = ParametersStorage(p);
+            tokenContract = IERC20(hub.getContractAddress("Token"));
+            convictionStakingStorage = ConvictionStakingStorage(hub.getContractAddress("ConvictionStakingStorage"));
+            epochStorage = EpochStorage(hub.getContractAddress("EpochStorageV8"));
+            chronos = Chronos(hub.getContractAddress("Chronos"));
+        } catch {
+            // ParametersStorage not registered — registration deposit stays off.
+        }
     }
 
     function name() public pure virtual returns (string memory) {
@@ -105,7 +146,7 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable {
         address publishAuthority,
         uint256 publishAuthorityAccountId,
         bytes32 nameHash
-    ) external returns (uint256 contextGraphId) {
+    ) external nonReentrant returns (uint256 contextGraphId) {
         // Storage validates sorting/dedup/zero-rejection, but a friendly
         // default for curated CGs: if caller passes zero authority and the
         // policy is curated, use msg.sender.
@@ -131,6 +172,76 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable {
             publishAuthorityAccountId,
             nameHash
         );
+
+        // OT-RFC-53: anti-spam registration deposit, held as the CG's prepaid
+        // publishing escrow. Skipped when ParametersStorage is unresolved
+        // (deposit feature off) or the param is 0 (dormant default).
+        if (address(parametersStorage) != address(0)) {
+            uint96 deposit = parametersStorage.contextGraphRegistrationDeposit();
+            if (deposit > 0) {
+                _pullRegistrationDeposit(contextGraphId, deposit);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // OT-RFC-53 — registration-deposit pull + admin sweep
+    // -----------------------------------------------------------------------
+
+    /// @dev Pulls `deposit` TRAC from the creator: net into the CSS vault
+    ///      (recorded as the CG's escrow), treasury fee to the treasury. The
+    ///      escrow is later spent on publishing (KnowledgeAssetsLifecycle) or
+    ///      swept by admin — never cash-refunded.
+    function _pullRegistrationDeposit(uint256 contextGraphId, uint96 deposit) internal {
+        IERC20 token = tokenContract;
+        uint256 allowance = token.allowance(msg.sender, address(this));
+        if (allowance < deposit) {
+            revert TokenLib.TooLowAllowance(address(token), allowance, deposit);
+        }
+        if (token.balanceOf(msg.sender) < deposit) {
+            revert TokenLib.TooLowBalance(address(token), token.balanceOf(msg.sender), deposit);
+        }
+        (uint96 fee, address treasury) = _treasuryFee(deposit);
+        uint96 net = deposit - fee;
+        if (!token.transferFrom(msg.sender, address(convictionStakingStorage), net)) {
+            revert TokenLib.TransferFailed();
+        }
+        if (fee > 0 && treasury != address(0)) {
+            if (!token.transferFrom(msg.sender, treasury, fee)) {
+                revert TokenLib.TransferFailed();
+            }
+        }
+        contextGraphStorage.setRegistrationEscrow(contextGraphId, net);
+        emit ContextGraphRegistrationDeposited(contextGraphId, msg.sender, deposit, net);
+    }
+
+    /// @dev Mirrors KnowledgeAssetsLifecycle._treasuryFee. Dormant (returns 0)
+    ///      while `protocolTreasury` is unset — the current configuration.
+    function _treasuryFee(uint96 amount) internal view returns (uint96 fee, address treasury) {
+        treasury = parametersStorage.protocolTreasury();
+        if (treasury == address(0)) {
+            return (0, address(0));
+        }
+        uint16 bps = parametersStorage.protocolTreasuryFee();
+        if (bps == 0) {
+            return (0, treasury);
+        }
+        fee = uint96((uint256(amount) * uint256(bps)) / 10_000);
+    }
+
+    /// @notice Admin: sweep a CG's residual registration escrow into the staker
+    ///         reward pool (current epoch). Reclaim path for abandoned / spam
+    ///         CGs whose deposit was never spent on publishing. The TRAC is
+    ///         already in the CSS vault, so this only credits the epoch pool and
+    ///         clears the per-CG accounting. Never refunds to the depositor.
+    function sweepContextGraphEscrow(uint256 contextGraphId) external onlyHubOwner {
+        uint96 swept = contextGraphStorage.clearRegistrationEscrow(contextGraphId);
+        if (swept == 0) {
+            revert KnowledgeAssetsLib.InvalidContextGraphConfig("no escrow");
+        }
+        uint256 currentEpoch = chronos.getCurrentEpoch();
+        epochStorage.addTokensToEpochRange(1, currentEpoch, currentEpoch, swept);
+        emit ContextGraphEscrowSwept(contextGraphId, swept);
     }
 
     // --- Governance (token-holder gated) ---

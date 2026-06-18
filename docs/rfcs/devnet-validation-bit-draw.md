@@ -14,7 +14,10 @@ across multiple proof periods on real nodes.
 - PREFLIGHT: 4/4 nodes up; 4/4 cores have an RS prover.
 - PUBLISH: owner seed-publish registered the CG; **30/30 KAs published**.
 - OBSERVE (per-period proof success): core1 100% (5/5), core2 100% (5/5), core3 75% (3/4),
-  core4 75% (3/4). **16 proofs submitted.**
+  core4 75% (3/4) — **16 in-window per-period successes** (the rs-validation metric, scoped to the
+  ~5-min observation window). The gas table below reports **32 `submitProof` txs**: that's *every*
+  successful submit across the chain's full lifetime (bootstrap + the whole run), a strict superset
+  of the 16 counted in the timed window — not a contradiction.
 - **0 data-corrupted, 0 no-eligible-cg, 0 errors** across all cores — the value-weighted
   draw always found the published CG (settle-on-spend populated the BIT; the Fenwick draw +
   proof verification all worked end-to-end).

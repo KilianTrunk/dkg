@@ -2348,6 +2348,30 @@ export class SwmHostModeMethods extends DKGAgentBase {
   async runVmReconcileSweep(this: DKGAgent): Promise<void> {
     if (!this.vmReconcileEnabled() || !this.reconcileCoalescer) return;
     for (const [localCgId, sub] of this.subscribedContextGraphs) {
+      // GH #1098 — self-prime the on-chain id for a pre-subscribed PUBLIC member
+      // CG. A peer that subscribed BEFORE the CG's first publish has
+      // `sub.onChainId` unset: the chain `ContextGraphCreated` handler only binds
+      // it for CURATED CGs, and the ACK-signer path (`recordCoreHostedPublicCg`)
+      // only fires for cores in that publish's storage-ACK set. Left unbound, the
+      // sweep below skips the CG and the peer is stranded on the unreliable
+      // one-shot finalization gossip (the ~1/3 materialization + kc-not-synced
+      // spam in #1098). As soon as the CG's OnChainId quad is local (publisher
+      // ontology-topic broadcast or durable _meta sync), resolve + bind it so the
+      // reliable chain-driven reconcile/backfill runs for this peer — the same
+      // path the late-subscriber (#886) and ACK-signer cores already converge on.
+      // Best-effort + gated on `!sub.onChainId` so it binds at most once (a later
+      // id CHANGE would reset the cursor; binding from undefined never does).
+      if (sub.subscribed && !sub.onChainId) {
+        try {
+          const resolved = await this.getContextGraphOnChainId(localCgId);
+          if (resolved && resolved !== localCgId) {
+            this.bindSubscriptionOnChainId(localCgId, sub, resolved);
+            this.persistContextGraphSubscription(localCgId);
+          }
+        } catch {
+          /* a store/RPC hiccup on one CG must not abort the whole sweep */
+        }
+      }
       // Member subscriptions AND Phase D core-hosted public CGs get swept.
       if ((!sub.subscribed && !sub.coreHosted) || !sub.onChainId) continue;
       void this.reconcileCoalescer.trigger(localCgId);

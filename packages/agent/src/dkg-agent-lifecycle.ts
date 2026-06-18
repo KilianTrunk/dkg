@@ -1421,7 +1421,24 @@ export class LifecycleSyncMethods extends DKGAgentBase {
         onKARegisteredToContextGraph: this.vmReconcileEnabled()
           ? async ({ contextGraphId: onChainId, kaId }) => {
               const localCgId = this.resolveLocalCgIdByOnChainId(BigInt(onChainId));
-              if (!localCgId) return; // chain replay hasn't resolved the cleartext CG yet; sweep heals it
+              if (!localCgId) {
+                // GH #1098 — a pre-subscribed PUBLIC member peer may not have
+                // bound this CG's on-chain id yet (only curated CGs bind on the
+                // ContextGraphCreated event; ACK-signers bind via the storage-ACK
+                // hook). Rather than wait up to a full sweep interval, run a
+                // self-priming sweep NOW so any subscribed-but-unbound CG resolves
+                // + binds its on-chain id from the local ontology/_meta and
+                // reconciles immediately. Gated on there actually being an unbound
+                // subscription so a KA registration for an unrelated CG is a no-op.
+                const hasUnbound = [...this.subscribedContextGraphs.values()].some(
+                  (s) => s.subscribed && !s.onChainId,
+                );
+                if (hasUnbound) {
+                  this.log.info(ctx, `Phase B: KACG nudge cg=${onChainId} ka=${kaId} -> self-priming reconcile sweep (unbound pre-subscription)`);
+                  await this.runVmReconcileSweep();
+                }
+                return; // chain replay hasn't resolved the cleartext CG yet; periodic sweep is the safety net
+              }
               const sub = this.subscribedContextGraphs.get(localCgId);
               // Populate VM for CGs we member-subscribe to OR (Phase D) public
               // CGs this Core hosts — a hosted Core fills its own gaps too.

@@ -255,7 +255,15 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
     // ParametersStorage is unresolved.
     const ps = this.contracts.parametersStorage as Contract | undefined;
     if (ps) {
-      const deposit: bigint = await ps.contextGraphRegistrationDeposit();
+      let deposit = 0n;
+      try {
+        deposit = await ps.contextGraphRegistrationDeposit();
+      } catch {
+        // Pre-OT-RFC-53 ParametersStorage (getter absent) or an ABI/bytecode
+        // mismatch — treat as no deposit. createContextGraph reverts loudly if
+        // a deposit is actually required on-chain, so this never underpays.
+        deposit = 0n;
+      }
       if (deposit > 0n) {
         await this.ensureV10ApproveTrac(
           this.signer,

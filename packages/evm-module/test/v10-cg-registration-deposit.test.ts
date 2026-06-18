@@ -46,7 +46,6 @@ describe('@unit OT-RFC-53 — CG registration deposit', () => {
       'ConvictionStakingStorage',
       'ContextGraphStorage',
       'ContextGraphs',
-      'SetContextGraphRegistrationDeposit', // OT-RFC-53 deploy script → sets 100 TRAC
     ]);
     const signers = await hre.ethers.getSigners();
     const hub = await hre.ethers.getContract<Hub>('Hub');
@@ -77,6 +76,9 @@ describe('@unit OT-RFC-53 — CG registration deposit', () => {
     owner = accounts[0];
     creator = accounts[1];
     stranger = accounts[2];
+    // 054 only activates the deposit on real networks; on hardhat we set it
+    // explicitly via governance so these tests exercise the active path.
+    await Params.connect(owner).setContextGraphRegistrationDeposit(DEPOSIT);
   });
 
   const fundAndApprove = async (who: SignerWithAddress, amount: bigint) => {
@@ -97,7 +99,7 @@ describe('@unit OT-RFC-53 — CG registration deposit', () => {
     return CGS.getLatestContextGraphId();
   };
 
-  it('deploy script activates the registration deposit at 100 TRAC', async () => {
+  it('is active at 100 TRAC once governance sets it', async () => {
     expect(await Params.contextGraphRegistrationDeposit()).to.equal(DEPOSIT);
   });
 

@@ -392,6 +392,25 @@
     "type": "error"
   },
   {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "contextGraphId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint96",
+        "name": "amount",
+        "type": "uint96"
+      }
+    ],
+    "name": "RegistrationEscrowConsumed",
+    "type": "event"
+  },
+  {
     "inputs": [],
     "name": "ACK_DIGEST_VERSION",
     "outputs": [

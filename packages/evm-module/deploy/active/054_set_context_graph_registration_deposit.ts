@@ -10,6 +10,15 @@ import { DeployFunction } from 'hardhat-deploy/types';
 const CONTEXT_GRAPH_REGISTRATION_DEPOSIT = 100n * 10n ** 18n; // 100 TRAC
 
 const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
+  // Activate the deposit on real networks only. Local hardhat (chainId 31337)
+  // stays at 0 so the integration suite (which does full deploys) isn't forced
+  // to fund every createContextGraph; tests that exercise the deposit set it
+  // explicitly via setContextGraphRegistrationDeposit.
+  if (hre.network.config.chainId === 31337) {
+    console.log('OT-RFC-53: skipping deposit activation on local hardhat (chainId 31337).');
+    return;
+  }
+
   const parametersStorageAddress =
     hre.helpers.contractDeployments.contracts['ParametersStorage'].evmAddress;
 

@@ -141,6 +141,7 @@ describe('loadNetworkConfig', () => {
       return;
     }
     expect(config.networkName).toMatch(/testnet/i);
+    expect((config as any).genesisId).toBe('base-testnet');
   });
 
   it('loads mainnet prep configs without activating testnet genesis or relays', async () => {

@@ -195,8 +195,37 @@ export async function computeNetworkId(genesisId: string = DEFAULT_GENESIS_ID): 
   return hex;
 }
 
-export function getGenesisRaw(): string {
-  return GENESIS_TRIG;
+function buildGenesisRaw(network: GenesisNetworkDefinition): string {
+  const systemContextGraphLines = network.systemContextGraphs
+    .map((graph, index) => {
+      const terminator = index === network.systemContextGraphs.length - 1 ? '.' : ';';
+      return `    dkg:systemContextGraphs <${graph}> ${terminator}`;
+    })
+    .join('\n');
+
+  return `\
+@prefix dkg:     <https://dkg.network/ontology#> .
+@prefix erc8004: <https://eips.ethereum.org/erc-8004#> .
+@prefix prov:    <http://www.w3.org/ns/prov#> .
+@prefix schema:  <https://schema.org/> .
+@prefix rdfs:    <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix rdf:     <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix xsd:     <http://www.w3.org/2001/XMLSchema#> .
+
+<${network.subject}>
+    a dkg:Network ;
+    schema:name "${network.name}" ;
+    dkg:genesisVersion "1"^^xsd:integer ;
+    dkg:createdAt "${network.createdAt}"^^xsd:dateTime ;
+${systemContextGraphLines}
+`;
+}
+
+export function getGenesisRaw(genesisId: string = DEFAULT_GENESIS_ID): string {
+  if (genesisId === DEFAULT_GENESIS_ID) {
+    return GENESIS_TRIG;
+  }
+  return buildGenesisRaw(getGenesisNetwork(genesisId));
 }
 
 export const SYSTEM_CONTEXT_GRAPHS = {

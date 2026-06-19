@@ -679,6 +679,33 @@ export class SwmHostModeMethods extends DKGAgentBase {
   }
 
   /**
+   * GH #1124 — DEFINITIVE public-CG check for the host-mode ingest gates. Unlike
+   * `!isCuratedForHostMode` (which treats UNKNOWN as public), this returns true
+   * ONLY for a CG we can positively confirm is public (open). Curated AND unknown
+   * both return false, so an in-flight chain-event race (policy not loaded yet)
+   * keeps the conservative ciphertext+allowlist gates and heals via member
+   * catchup — it can NEVER misclassify a curated CG as public and admit an
+   * unauthenticated plaintext envelope into curated storage.
+   */
+  async isConfirmedPublicForHostMode(this: DKGAgent, contextGraphId: string): Promise<boolean> {
+    const sub = this.subscribedContextGraphs.get(contextGraphId);
+    // Any curated marker is disqualifying.
+    if (sub?.onChainHash) return false;
+    if (sub?.onChainId) {
+      const cached = this.onChainAccessPolicyCache.get(sub.onChainId);
+      if (cached === 1) return false;
+      if (cached === 0) return true; // confirmed public on-chain
+    }
+    // Local `_meta` explicit accessPolicy is the authoritative tri-state:
+    // 'public' → yes, 'private' → no, null (unknown) → no (safe default).
+    try {
+      return (await this.getExplicitAccessPolicy(contextGraphId)) === 'public';
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Register the host-mode gossip handler for `contextGraphId` and
    * track its reference so {@link unwireSwmHostModeHandler} can
    * remove ONLY that handler later (without touching member-mode
@@ -1009,7 +1036,13 @@ export class SwmHostModeMethods extends DKGAgentBase {
         isCiphertext = skm.type === SWM_SENDER_KEY_MESSAGE_TYPE;
       } catch { /* fall through */ }
     }
-    if (!isCiphertext) return;
+    // GH #1124 — a curated CG MUST carry ciphertext, so a non-ciphertext
+    // envelope there is garbage → drop early (unchanged). A CONFIRMED-public
+    // (open) CG legitimately gossips PLAINTEXT SWM, so let it through to the
+    // authority + storage path below. Unknown CGs stay on the drop path (safe;
+    // member catchup heals once the policy resolves) — see
+    // isConfirmedPublicForHostMode for why UNKNOWN is treated as not-public.
+    if (!isCiphertext && !(await this.isConfirmedPublicForHostMode(storageCgId))) return;
 
     // Authority check: verify the envelope signature against the
     // curated CG's agent allowlist. Without this, a topic-reachable
@@ -1024,6 +1057,24 @@ export class SwmHostModeMethods extends DKGAgentBase {
     const handler = this.getOrCreateSharedMemoryHandler();
     const verdict = await handler.verifyHostModeEnvelopeAuthority(data, storageCgId, fromPeerId);
     if (!verdict.accepted) {
+      // GH #1124 — a CONFIRMED-public (open) CG has no curated agent allowlist,
+      // so the authority check returns 'no agent allowlist'. Accept it for such
+      // CGs: the envelope is already confirmed SIGNED (verifyHostModeEnvelopeAuthority
+      // rejects unsigned envelopes BEFORE the allowlist check), and public-CG
+      // host-mode storage is bounded by the per-CG byte cap + registration
+      // economics (the same safety net the pre-reg fail-open below relies on).
+      // Scoped to isConfirmedPublicForHostMode so a curated CG mid chain-event
+      // race (also 'no agent allowlist') is NEVER admitted — it stays a drop and
+      // heals via member catchup. Every OTHER rejection reason (decode failure,
+      // unsigned, sig mismatch, peer-not-in-allowlist) still drops for ALL CGs.
+      const noAllowlist = verdict.reason === 'no agent allowlist on context graph';
+      if (noAllowlist && (await this.isConfirmedPublicForHostMode(storageCgId))) {
+        this.log.debug(
+          ctx,
+          `Host-mode accepting public-CG plaintext SWM cg=${storageCgId} from=${fromPeerId} (#1124; open CG has no curated allowlist, envelope is signed, per-CG byte cap remains the safety net)`,
+        );
+        // fall through to the rate-limit + store path below
+      } else {
       // "no agent allowlist" is the expected outcome during the brief
       // chain-event race window (cores see the beacon, auto-engage
       // host-mode, then receive ciphertext BEFORE the
@@ -1048,6 +1099,7 @@ export class SwmHostModeMethods extends DKGAgentBase {
         );
       }
       return;
+      }
     }
 
     // OT-RFC-38 / LU-6 Phase B — pre-registration ciphertext rate-

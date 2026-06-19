@@ -1150,7 +1150,6 @@ export class PublishMethods extends DKGAgentBase {
     const typedData = buildAuthorAttestationTypedData({
       chainId,
       kav10Address,
-      contextGraphId: BigInt(onChainId),
       merkleRoot: canonical.kcMerkleRoot,
       authorAddress,
       reservedKaId,
@@ -2045,7 +2044,6 @@ export class PublishMethods extends DKGAgentBase {
       const typedData = buildAuthorAttestationTypedData({
         chainId: existingSeal.chainId,
         kav10Address: existingSeal.kav10Address,
-        contextGraphId: await this.requireOnChainContextGraphId(contextGraphId),
         merkleRoot: existingSeal.merkleRoot,
         authorAddress: existingSeal.authorAddress,
         reservedKaId: reReservedKaId,
@@ -2080,8 +2078,11 @@ export class PublishMethods extends DKGAgentBase {
     const chainId = await this.chain.getEvmChainId();
     const kav10Address = await this.chain.getKnowledgeAssetsLifecycleAddress();
 
-    // 6. Resolve the on-chain CG id — the EIP-712 digest binds to it.
-    const onChainCgId = await this.requireOnChainContextGraphId(contextGraphId);
+    // 6. (removed, #1116) The seal is now context-graph-independent: the
+    //    EIP-712 AuthorAttestation no longer binds the on-chain CG id, so
+    //    finalize works on an UNREGISTERED CG and performs no chain write /
+    //    registration. CG binding happens at publish time (the contract's
+    //    PublishParams.contextGraphId + the separate ACK digest).
 
     // 7. Resolve author. preSigned > custodial agent > publisher fallback.
     const schemeVersion = opts?.schemeVersion ?? AUTHOR_SCHEME_VERSION_V1;
@@ -2271,7 +2272,6 @@ export class PublishMethods extends DKGAgentBase {
     const typedData = buildAuthorAttestationTypedData({
       chainId,
       kav10Address,
-      contextGraphId: onChainCgId,
       merkleRoot,
       authorAddress,
       reservedKaId,
@@ -2403,30 +2403,6 @@ export class PublishMethods extends DKGAgentBase {
   }
 
   /**
-   * Helper: resolve the on-chain context graph id used by the EIP-712
-   * AuthorAttestation domain. Throws when the CG is not yet
-   * registered on-chain — finalize cannot bind a sig to a missing CG.
-   */
-  async requireOnChainContextGraphId(this: DKGAgent, contextGraphId: string): Promise<bigint> {
-    const onChainId = await this.getContextGraphOnChainId(contextGraphId);
-    if (onChainId == null) {
-      throw new Error(
-        `Context graph "${contextGraphId}" is not registered on-chain. ` +
-          `Run 'dkg context-graph register ${contextGraphId}' before finalizing an assertion ` +
-          `targeted at it; finalize binds the author signature to the on-chain CG id.`,
-      );
-    }
-    try {
-      return BigInt(onChainId);
-    } catch {
-      throw new Error(
-        `Context graph "${contextGraphId}" has a non-numeric on-chain id ("${onChainId}") — ` +
-          `the EIP-712 binding requires a uint256.`,
-      );
-    }
-  }
-
-  /**
    * RFC-001 §9.x — selection-based publish bridge.
    *
    * Mints a `precomputedAttestation` inline for a given quads bag,
@@ -2525,10 +2501,9 @@ export class PublishMethods extends DKGAgentBase {
 
     const chainId = await this.chain.getEvmChainId();
     const kav10Address = await this.chain.getKnowledgeAssetsLifecycleAddress();
-    const onChainCgId =
-      opts?.targetOnChainCgId !== undefined
-        ? BigInt(opts.targetOnChainCgId)
-        : await this.requireOnChainContextGraphId(contextGraphId);
+    // #1116: the AuthorAttestation no longer binds the on-chain CG id, so the
+    // selection-publish seal is also CG-independent. The CG the publisher mints
+    // into is resolved separately at publish time (targetOnChainCgId/v10CgId).
 
     const schemeVersion = opts?.schemeVersion ?? AUTHOR_SCHEME_VERSION_V1;
     let authorAddress: string;
@@ -2625,7 +2600,6 @@ export class PublishMethods extends DKGAgentBase {
     const typedData = buildAuthorAttestationTypedData({
       chainId,
       kav10Address,
-      contextGraphId: onChainCgId,
       merkleRoot,
       authorAddress,
       reservedKaId: selReservedKaId,
@@ -3150,6 +3124,39 @@ export class PublishMethods extends DKGAgentBase {
     }
     const result = await this.store.query(sparql, { source: 'agent.resolveLiftWorkspaceSlice' });
     return result.type === 'quads' ? result.quads : [];
+  }
+
+  /**
+   * #1116 — transparent register-then-publish (OT-RFC-38 LU-6).
+   *
+   * The seal is now context-graph-independent, so `finalize` no longer
+   * registers the CG on-chain. Registration is therefore deferred to publish
+   * time: the FIRST VM publish of a CG implicitly registers it (the moment the
+   * user accepts the chain cost). Idempotent — `registerContextGraph`
+   * short-circuits when an on-chain id already exists, so re-publishes don't
+   * double-mint. Preserves create-time `publishPolicy`/PCA via the stored
+   * registration options. Throws on registration failure (insufficient TRAC /
+   * no signer) so the route can surface a clear 4xx.
+   *
+   * Mirrors the legacy bridge's auto-register block
+   * (`daemon/routes/memory.ts`); the canonical `/vm/publish` route calls this
+   * before `publishFromFinalizedAssertion`.
+   */
+  async ensureRegisteredForPublish(
+    this: DKGAgent,
+    contextGraphId: string,
+    opts?: { callerAgentAddress?: string },
+  ): Promise<void> {
+    const existingOnChainId = await this.getContextGraphOnChainId(contextGraphId);
+    if (existingOnChainId) return;
+    const storedOpts = await this.getStoredContextGraphRegistrationOptions(contextGraphId);
+    await this.registerContextGraph(contextGraphId, {
+      ...(opts?.callerAgentAddress != null ? { callerAgentAddress: opts.callerAgentAddress } : {}),
+      ...(storedOpts.publishPolicy !== undefined ? { publishPolicy: storedOpts.publishPolicy } : {}),
+      ...(storedOpts.publishAuthorityAccountId !== undefined
+        ? { publishAuthorityAccountId: storedOpts.publishAuthorityAccountId }
+        : {}),
+    });
   }
 
   /**

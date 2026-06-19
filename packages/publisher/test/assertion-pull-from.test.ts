@@ -6,6 +6,7 @@ import {
   buildAssertionSealQuads,
   contextGraphMetaUri,
   contextGraphAssertionUri,
+  assertionLifecycleUri,
 } from '@origintrail-official/dkg-core';
 import { OxigraphStore, type Quad } from '@origintrail-official/dkg-storage';
 import { DKGPublisher } from '../src/index.js';
@@ -148,11 +149,32 @@ describe('assertionPullFrom (OT-RFC-43 §10.5.3 wm/pull-from)', () => {
     expect(draft.some((d) => d.subject === ENTITY_1 && d.object === '"precious local edit"')).toBe(true);
   });
 
-  it('throws when the file has no sealed entity list (never finalized)', async () => {
+  it('throws when the file has neither a seal nor a prior promote (no member entities)', async () => {
     const { publisher, store } = await makePublisher();
-    await store.insert([q(ENTITY_1, SCHEMA, '"Alice"', SWM_GRAPH)]); // no seal entities
+    await store.insert([q(ENTITY_1, SCHEMA, '"Alice"', SWM_GRAPH)]); // no seal, no promoted rows
     const err = await publisher.assertionPullFrom(CG, NAME, AGENT, 'swm').catch((e) => e);
     expect(err).toBeInstanceOf(Error);
-    expect((err as Error).message).toMatch(/no sealed entity list/i);
+    expect((err as Error).message).toMatch(/requires either a finalized assertion.*or a prior promote/i);
+  });
+
+  // #1116: seal-INDEPENDENT pull-from. An asset shared UNSEALED (a skipSeal
+  // share, or stuck unsealed under the old behavior) records its member
+  // entities on the lifecycle URN (dkg:rootEntity) even with no seal —
+  // pull-from falls back to those so seal-in-SWM / recovery can reconstruct the
+  // WM draft without first finalizing.
+  it('seeds a WM draft from SWM via the promoted member entities when there is NO seal', async () => {
+    const { publisher, store } = await makePublisher();
+    await store.insert([
+      q(ENTITY_1, SCHEMA, '"Alice"', SWM_GRAPH),
+      q(SKOLEM_1, SCHEMA, '"Alice detail"', SWM_GRAPH),
+      // NO seal — instead the promote-stamped member row on the lifecycle URN:
+      q(assertionLifecycleUri(CG, AGENT, NAME), `${DKG}rootEntity`, ENTITY_1, contextGraphMetaUri(CG)),
+    ]);
+    const result = await publisher.assertionPullFrom(CG, NAME, AGENT, 'swm');
+    expect(result.fromLayer).toBe('swm');
+    expect(result.entities).toBe(1);
+    const subjects = new Set((await wmQuads(store)).map((d) => d.subject));
+    expect(subjects.has(ENTITY_1)).toBe(true);
+    expect(subjects.has(SKOLEM_1)).toBe(true);
   });
 });

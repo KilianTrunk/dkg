@@ -1269,6 +1269,9 @@ export class DkgDaemonClient {
       authorAgentAddress?: string;
       preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
       schemeVersion?: number;
+      // #1116: "wm" (default) seals the open WM draft; "swm" seals an asset
+      // already shared to SWM (recover-without-recreate).
+      layer?: 'wm' | 'swm';
     },
   ): Promise<{ merkleRoot: string; eip712Digest: string }> {
     assertExclusiveAuthorFields(opts ?? {});
@@ -1308,8 +1311,8 @@ export class DkgDaemonClient {
   async knowledgeAssetShare(
     contextGraphId: string,
     name: string,
-    opts?: { subGraphName?: string; entities?: string[] | 'all' },
-  ): Promise<{ swmShared: boolean; promotedCount: number }> {
+    opts?: { subGraphName?: string; entities?: string[] | 'all'; skipSeal?: boolean },
+  ): Promise<{ swmShared: boolean; promotedCount: number; sealed: boolean; publishReady: boolean }> {
     // Only include the optional fields when actually set — don't spread the whole
     // opts object (which would carry `entities: undefined` / `subGraphName:
     // undefined` keys). Parity with MCP's knowledgeAssetShare body construction.
@@ -1318,6 +1321,8 @@ export class DkgDaemonClient {
     };
     if (opts?.subGraphName) body.subGraphName = opts.subGraphName;
     if (opts?.entities !== undefined) body.entities = opts.entities;
+    // #1116: a full share SEALS BY DEFAULT; `skipSeal:true` shares unsealed.
+    if (opts?.skipSeal !== undefined) body.skipSeal = opts.skipSeal;
     return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/swm/share`, body);
   }
 

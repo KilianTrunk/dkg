@@ -1219,6 +1219,10 @@ export class DkgClient {
     authorAgentAddress?: string;
     preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
     schemeVersion?: number;
+    // #1116: optional layer selects WHERE the content to seal lives. "wm"
+    // (default) seals the open WM draft; "swm" reconstructs a draft from an
+    // already-shared SWM asset and seals it (recover-without-recreate).
+    layer?: 'wm' | 'swm';
   }): Promise<{ merkleRoot: string; eip712Digest: string }> {
     assertExclusiveAuthorFields(args);
     const body: Record<string, unknown> = {
@@ -1230,6 +1234,7 @@ export class DkgClient {
       body.preSignedAuthorAttestation = args.preSignedAuthorAttestation;
     }
     if (args.schemeVersion !== undefined) body.schemeVersion = args.schemeVersion;
+    if (args.layer !== undefined) body.layer = args.layer;
     return this.request<{ merkleRoot: string; eip712Digest: string }>(
       'POST',
       `/api/knowledge-assets/${encodeURIComponent(args.name)}/wm/finalize`,
@@ -1281,13 +1286,18 @@ export class DkgClient {
     name: string;
     subGraphName?: string;
     entities?: string[] | 'all';
-  }): Promise<{ swmShared: boolean; promotedCount: number }> {
+    // #1116: a full share SEALS BY DEFAULT (publish-ready). `skipSeal:true`
+    // opts out into an unsealed SWM share. A subset share is SWM-only and is
+    // never sealed regardless of this flag.
+    skipSeal?: boolean;
+  }): Promise<{ swmShared: boolean; promotedCount: number; sealed: boolean; publishReady: boolean }> {
     const body: Record<string, unknown> = {
       contextGraphId: normalizeContextGraphId(args.contextGraphId),
     };
     if (args.subGraphName) body.subGraphName = args.subGraphName;
     if (args.entities !== undefined) body.entities = args.entities;
-    return this.request<{ swmShared: boolean; promotedCount: number }>(
+    if (args.skipSeal !== undefined) body.skipSeal = args.skipSeal;
+    return this.request<{ swmShared: boolean; promotedCount: number; sealed: boolean; publishReady: boolean }>(
       'POST',
       `/api/knowledge-assets/${encodeURIComponent(args.name)}/swm/share`,
       body,

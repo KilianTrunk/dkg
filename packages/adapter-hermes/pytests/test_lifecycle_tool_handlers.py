@@ -41,9 +41,11 @@ class _FakeClient:
         return self.register_response
 
     def finalize_assertion(self, name, cg, sub_graph_name=None,
-                           author_agent_address=None, scheme_version=None):
+                           author_agent_address=None, scheme_version=None,
+                           layer=None):
+        # #1116: accept the new `layer` kwarg ("wm"|"swm") the handler now forwards.
         self.calls.append(("finalize", name, cg, sub_graph_name,
-                           author_agent_address, scheme_version))
+                           author_agent_address, scheme_version, layer))
         return {"merkleRoot": "0xroot", "authorAddress": author_agent_address or "0xdefault"}
 
     def publish_finalized_assertion(self, name, cg, sub_graph_name=None, options=None):
@@ -56,8 +58,10 @@ class _FakeClient:
         self.calls.append(("pull", name, cg, layer, on_conflict, sub_graph_name))
         return {"wmDraft": "open", "seededFrom": {"layer": layer}}
 
-    def promote_assertion(self, name, cg, entities, sub_graph_name=None):
-        self.calls.append(("share", name, cg, entities, sub_graph_name))
+    def promote_assertion(self, name, cg, entities, sub_graph_name=None,
+                          skip_seal=None):
+        # #1116: accept the new `skip_seal` kwarg the handler now forwards.
+        self.calls.append(("share", name, cg, entities, sub_graph_name, skip_seal))
         return {"swmShared": True, "promotedCount": 1}
 
 
@@ -138,16 +142,20 @@ def test_share_description_carries_subset_language(provider):
 
 
 def test_share_description_softens_publish_ready_and_notes_finalize(provider):
-    # #1076:96 — "publish-ready" must be CONDITIONAL: full share auto-seals
-    # best-effort; on a signing/capability gap it shares UNSEALED and a later
-    # publish 409s, so finalize explicitly for predictable publishing.
+    # #1116 — a full share now SEALS BY DEFAULT (publish-ready). skip_seal=true
+    # opts out into an unsealed SWM share; a default share that cannot seal fails
+    # CLOSED (409, WM preserved) with a recovery hint. Finalize stays the explicit
+    # path for custom options and for sealing an already-shared asset (layer:swm).
     share = next(s for s in provider.get_tool_schemas()
                  if s["name"] == "dkg_knowledge_asset_share")
     desc = share["description"]
-    assert "BEST-EFFORT" in desc
-    assert "UNSEALED" in desc
-    assert "409" in desc
+    assert "SEALS BY DEFAULT" in desc
+    assert "skip_seal=true" in desc
+    assert "WITHOUT sealing" in desc
+    assert "fails CLOSED" in desc and "409" in desc
     assert "dkg_knowledge_asset_finalize EXPLICITLY first" in desc
+    # layer:swm note for sealing after sharing
+    assert "layer=\"swm\" works after" in desc
     # custom finalize options note is preserved
     assert "author_agent_address" in desc and "scheme_version" in desc
 

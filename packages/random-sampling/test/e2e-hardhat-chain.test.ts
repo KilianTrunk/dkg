@@ -189,7 +189,6 @@ describe('Random Sampling E2E (Hardhat)', () => {
     const authorTyped = buildAuthorAttestationTypedData({
       chainId: TEST_CHAIN_ID,
       kav10Address,
-      contextGraphId: cgId,
       merkleRoot,
       authorAddress: coreOpWallet.address,
       reservedKaId,

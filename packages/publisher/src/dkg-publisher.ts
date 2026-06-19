@@ -2670,10 +2670,12 @@ export class DKGPublisher implements Publisher {
       ) {
         const effectiveAuthorAddress = options.precomputedAttestation.authorAddress;
         const effectiveSchemeVersion = options.precomputedAttestation.schemeVersion;
+        // #1116: the seal is CG-independent — the AuthorAttestation no longer
+        // binds the on-chain CG id. v10CgId is still submitted to the contract
+        // (createKnowledgeAssets below) as the mint target / publisher-auth gate.
         const authorTypedData = buildAuthorAttestationTypedData({
           chainId: v10ChainId,
           kav10Address: v10KavAddress,
-          contextGraphId: v10CgId,
           merkleRoot: kcMerkleRoot,
           authorAddress: effectiveAuthorAddress,
           reservedKaId: options.precomputedAttestation.reservedKaId,
@@ -2773,10 +2775,12 @@ export class DKGPublisher implements Publisher {
         }
         const effectiveAuthorAddress = options.precomputedAttestation.authorAddress;
         const effectiveSchemeVersion = options.precomputedAttestation.schemeVersion;
+        // #1116: the seal is CG-independent — the AuthorAttestation no longer
+        // binds the on-chain CG id. v10CgId is still submitted to the contract
+        // (createKnowledgeAssets below) as the mint target / publisher-auth gate.
         const authorTypedData = buildAuthorAttestationTypedData({
           chainId: v10ChainId,
           kav10Address: v10KavAddress,
-          contextGraphId: v10CgId,
           merkleRoot: kcMerkleRoot,
           authorAddress: effectiveAuthorAddress,
           reservedKaId: options.precomputedAttestation.reservedKaId,
@@ -4532,6 +4536,33 @@ export class DKGPublisher implements Publisher {
     }
   }
 
+  /**
+   * #1116 — read an assertion's member root entities from the lifecycle URN,
+   * independent of any seal. `generateAssertionPromotedMetadata` stamps these
+   * (predicate dkg:rootEntity / dkg:entity) on EVERY promote — sealed or not —
+   * so this is the seal-independent source `pull-from swm` uses to reconstruct
+   * a WM draft for an asset that was shared unsealed (seal-in-SWM / recovery).
+   */
+  private async readPromotedRootEntities(
+    contextGraphId: string,
+    agentAddress: string,
+    name: string,
+    subGraphName?: string,
+  ): Promise<string[]> {
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    const lifecycleUri = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
+    const res = await this.store.query(
+      `SELECT DISTINCT ?root WHERE { GRAPH <${metaGraph}> { <${lifecycleUri}> ${ENTITY_PRED_ALT} ?root } }`,
+    );
+    if (res.type !== 'bindings') return [];
+    const roots: string[] = [];
+    for (const row of res.bindings) {
+      const root = row['root'];
+      if (typeof root === 'string' && root.length > 0) roots.push(root);
+    }
+    return roots;
+  }
+
   // ── Working Memory Assertion Operations (spec §6) ───────────────────
 
   private static validateOptionalSubGraph(subGraphName: string | undefined): void {
@@ -4921,16 +4952,24 @@ export class DKGPublisher implements Publisher {
       );
       seal = parseAssertionSealQuads(sealRes.type === 'quads' ? sealRes.quads : [], wmGraph);
     }
-    if (!seal) {
-      throw new Error(
-        `No sealed entity list for "${name}" in context graph "${contextGraphId}" — pull-from `
-        + `requires a finalized assertion (its seal records the member entities).`,
-      );
+    // #1116: a seal is no longer required to pull from SWM. When the asset was
+    // shared UNSEALED (a `skipSeal` share, or an asset stuck unsealed under the
+    // old auto-finalize-swallow behavior), fall back to the member entities
+    // stamped on the lifecycle URN by every promote
+    // (`generateAssertionPromotedMetadata`, predicate dkg:rootEntity) — recorded
+    // independent of any seal. This is what lets seal-in-SWM (finalize
+    // layer=swm) and recovery reconstruct the WM draft without first finalizing.
+    // VM pulls still require the seal (VM content is keyed by the published
+    // roots, which only the seal records).
+    let entities = seal?.rootEntities ?? [];
+    if (entities.length === 0 && sourceLayer === 'swm') {
+      entities = await this.readPromotedRootEntities(contextGraphId, agentAddress, name, subGraphName);
     }
-    const entities = seal.rootEntities;
     if (entities.length === 0) {
       throw new Error(
-        `Sealed assertion "${name}" in context graph "${contextGraphId}" records no member entities; nothing to pull.`,
+        `No member entities for "${name}" in context graph "${contextGraphId}" — pull-from `
+        + `requires either a finalized assertion (its seal records the members) or a prior `
+        + `promote to SWM (which stamps the members on the lifecycle record). Found neither.`,
       );
     }
 

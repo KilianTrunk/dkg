@@ -227,7 +227,6 @@ describe('EVM E2E: Full on-chain publishing lifecycle', () => {
     const authorTyped = buildAuthorAttestationTypedData({
       chainId: evmChainId,
       kav10Address,
-      contextGraphId,
       merkleRoot,
       authorAddress: coreOp.address,
     });

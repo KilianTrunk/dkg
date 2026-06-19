@@ -101,6 +101,36 @@ import { buildMessagingTools } from './tools/messaging-tools.js';
 import { buildAssertionTools } from './tools/assertion-tools.js';
 import { buildMemoryTools } from './tools/memory-tools.js';
 
+// #1116: the publishReady:false warning surfaced after a share that did NOT
+// seal (subset or skip_seal:true). Kept byte-identical across the MCP, OpenClaw,
+// and Hermes adapters (cross-adapter parity invariant).
+const SHARE_NOT_PUBLISH_READY_WARNING =
+  'Shared to SWM but NOT publish-ready (sealed:false). Seal it with ' +
+  'dkg_knowledge_asset_finalize (layer:swm works after sharing), then publish.';
+
+/**
+ * #1116: extract the daemon's recovery hint from a 409 UNSEALED_SHARE_BLOCKED
+ * share failure. The DkgDaemonClient throws a plain Error whose message embeds
+ * the response body JSON ("... responded 409: {json}"), so parse the trailing
+ * JSON object and return `recovery` only when the body's code matches. Returns
+ * undefined for any other error (caller falls back to the generic daemonError).
+ */
+function extractUnsealedShareRecovery(err: unknown): string | undefined {
+  const message = err instanceof Error ? err.message : String(err ?? '');
+  if (!message.includes('UNSEALED_SHARE_BLOCKED')) return undefined;
+  const start = message.indexOf('{');
+  if (start === -1) return undefined;
+  try {
+    const body = JSON.parse(message.slice(start)) as { code?: string; recovery?: string };
+    if (body?.code === 'UNSEALED_SHARE_BLOCKED' && typeof body.recovery === 'string' && body.recovery) {
+      return body.recovery;
+    }
+  } catch {
+    // Not parseable as JSON — fall through to the generic daemon error.
+  }
+  return undefined;
+}
+
 export class DkgNodePlugin {
   private config: DkgOpenClawConfig;
 
@@ -3543,6 +3573,17 @@ export class DkgNodePlugin {
         }
         schemeVersion = raw;
       }
+      // #1116: optional `layer` selects WHERE the content to seal lives. Default
+      // (omitted) seals the open WM draft; "swm" seals an asset already shared to
+      // SWM. Present-but-invalid is a tool error, never a silent default.
+      let layer: 'wm' | 'swm' | undefined;
+      if (args.layer !== undefined) {
+        const raw = String(args.layer).trim();
+        if (raw !== 'wm' && raw !== 'swm') {
+          return this.error('"layer" must be "wm" or "swm".');
+        }
+        layer = raw;
+      }
       // Seal the WHOLE WM draft (CONTRACT §1 Stage3 — there is no subset scope on
       // finalize). The author defaults to the request token's agent when
       // `author_agent_address` is omitted; pre-signed attestations are not surfaced
@@ -3551,6 +3592,7 @@ export class DkgNodePlugin {
         subGraphName,
         authorAgentAddress,
         schemeVersion,
+        layer,
       });
       return this.json(result);
     } catch (err: any) {
@@ -3585,14 +3627,36 @@ export class DkgNodePlugin {
       } else {
         return this.error('"entities" must be omitted, the string "all", or a non-empty array of root entity URIs.');
       }
+      // #1116: a full share SEALS BY DEFAULT; `skip_seal:true` shares unsealed.
+      // Present-but-invalid is a tool error, never a silent default.
+      let skipSeal: boolean | undefined;
+      if (args.skip_seal !== undefined) {
+        if (typeof args.skip_seal !== 'boolean') {
+          return this.error('"skip_seal" must be a boolean.');
+        }
+        skipSeal = args.skip_seal;
+      }
       // WM → SWM. The KA `swm/share` route is the same engine call
       // (`agent.assertion.promote`) the legacy promote used.
       const result = await this.client.knowledgeAssetShare(contextGraphId, name, {
         entities,
         subGraphName,
+        skipSeal,
       });
+      // #1116: surface the seal outcome. `sealed`/`publishReady` flow through the
+      // JSON; ALSO add the explicit warning when the share is NOT publish-ready
+      // (subset or skip_seal:true) so the agent knows a finalize is still needed.
+      if (result && (result as { publishReady?: boolean }).publishReady === false) {
+        return this.json({ ...result, warning: SHARE_NOT_PUBLISH_READY_WARNING });
+      }
       return this.json(result);
     } catch (err: any) {
+      // #1116: a default (sealing) share that cannot seal fails CLOSED — the
+      // daemon returns 409 UNSEALED_SHARE_BLOCKED with a recovery hint and WM
+      // preserved. The client throws an Error whose message carries the response
+      // body; surface the recovery text verbatim when present.
+      const recovery = extractUnsealedShareRecovery(err);
+      if (recovery) return this.error(recovery);
       return this.daemonError(err);
     }
   }

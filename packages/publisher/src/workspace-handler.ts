@@ -1331,15 +1331,24 @@ export class SharedMemoryHandler {
     fromPeerId: string,
     options?: {
       /**
-       * GH #1124 — the caller (host-mode ingest) has positively confirmed this
-       * CG is PUBLIC (open, no curated agent allowlist). When set, a CG with no
-       * agent gate is accepted as long as the envelope passes the SAME shared
-       * verifier as curated traffic (signature + timestamp-freshness — NOT a
-       * bespoke check), with the claimed signer as its own one-entry allowlist
-       * (self-consistency), AND the inner request targets THIS CG. When unset,
-       * a no-allowlist CG is rejected defensively (curated mid-race / unknown).
+       * GH #1124 — resolver the host-mode ingest caller injects to prove this CG
+       * is FULLY OPEN (`accessPolicy === 0` AND `publishPolicy === 1`). This
+       * verifier CALLS it and enforces BOTH axes itself, so the self-signed
+       * exception cannot be taken by merely passing a flag — it requires the
+       * caller's actual (forced-fresh, fail-closed) on-chain policy. Any
+       * undefined/throw → treated as NOT open (fail-closed). When the policy
+       * resolves open, the self-signed public path is taken REGARDLESS of
+       * whether a (possibly STALE) participant/agent allowlist still exists on
+       * the CG, because an open-publish CG admits ANY authorized publisher — the
+       * contract's `isAuthorizedPublisher` ignores `participantAgents` for open
+       * publish, so a CG flipped to open publish without clearing its old
+       * allowlist must NOT fall into the curated branch and drop valid open
+       * publishers (otReviewAgent #1239). When unset, only curated/allowlisted
+       * traffic is accepted (a no-allowlist CG is dropped defensively). Callers
+       * SHOULD skip passing this for obviously-ciphertext envelopes so the
+       * dominant curated path pays no chain read.
        */
-      allowSelfSignedForPublicCg?: boolean;
+      resolveOpenPublishPolicy?: () => Promise<{ accessPolicy?: number; publishPolicy?: number }>;
     },
   ): Promise<HostModeEnvelopeAuthorityVerdict> {
     const ctx = createOperationContext('share');
@@ -1356,19 +1365,32 @@ export class SharedMemoryHandler {
     }
     const agentGateAddresses = await this.getContextGraphAgentGateAddresses(contextGraphId);
     const allowedPeers = await this.getContextGraphAllowedPeers(contextGraphId);
-    if (agentGateAddresses === null) {
-      // GH #1124 — public (open) CGs have no curated agent allowlist. When the
-      // caller confirmed the CG is public, accept a self-signed envelope, but
-      // verify it through the SAME `verifyAgentEnvelope` the curated path uses —
-      // so the signature AND the 5-minute timestamp-freshness window (replay /
-      // store-eviction guard) are enforced identically; only the allowlist set
-      // diverges (the claimed signer is its own one-entry allowlist).
-      if (!options?.allowSelfSignedForPublicCg) {
-        // Not confirmed public → curated-mid-race or unknown. Drop defensively.
-        // (The host-mode ingest caller keys its transient-race log off
-        // `reasonCode === 'NO_AGENT_ALLOWLIST'` — keep the code stable.)
-        return { accepted: false, reasonCode: 'NO_AGENT_ALLOWLIST', reason: 'no agent allowlist on context graph' };
+
+    // GH #1124 — resolve "fully-open (self-publishable) CG" HERE rather than
+    // trusting a caller flag: the caller injects the (forced-fresh, fail-closed)
+    // on-chain policy resolver and THIS verifier enforces BOTH axes
+    // (accessPolicy === 0 AND publishPolicy === 1). Any undefined/throw → not
+    // open (fail-closed). Gated INDEPENDENTLY of `agentGateAddresses`: an
+    // open-publish CG admits ANY authorized publisher (the contract's
+    // `isAuthorizedPublisher` ignores `participantAgents` for open publish), so a
+    // CG that retains a STALE participant allowlist after being flipped open must
+    // NOT fall into the curated branch and drop valid open publishers.
+    let confirmedOpenPublish = false;
+    if (options?.resolveOpenPublishPolicy) {
+      try {
+        const { accessPolicy, publishPolicy } = await options.resolveOpenPublishPolicy();
+        confirmedOpenPublish = accessPolicy === 0 && publishPolicy === 1;
+      } catch {
+        confirmedOpenPublish = false;
       }
+    }
+
+    if (confirmedOpenPublish) {
+      // Self-signed public path — verify through the SAME `verifyAgentEnvelope`
+      // the curated path uses (signature + 5-minute timestamp-freshness window:
+      // replay / store-eviction guard), with the claimed signer as its own
+      // one-entry allowlist (self-consistency). Accepted regardless of any
+      // (stale) participant gate, per the open-publish rationale above.
       if (!envelope.agentAddress || !ethers.isAddress(envelope.agentAddress)) {
         return { accepted: false, reasonCode: 'SIG_VERIFY_FAILED', reason: 'public-CG envelope missing a valid signer address' };
       }
@@ -1402,6 +1424,14 @@ export class SharedMemoryHandler {
         return { accepted: false, reasonCode: 'PUBLISHER_PEER_MISMATCH', reason: `public-CG inner publisherPeerId "${request.publisherPeerId}" does not match sender "${fromPeerId}"` };
       }
       return { accepted: true };
+    }
+
+    if (agentGateAddresses === null) {
+      // Not confirmed open-publish AND no curated allowlist → curated mid-race or
+      // unknown → drop defensively. (The host-mode ingest caller keys its
+      // transient-race log off `reasonCode === 'NO_AGENT_ALLOWLIST'` — keep the
+      // code stable.)
+      return { accepted: false, reasonCode: 'NO_AGENT_ALLOWLIST', reason: 'no agent allowlist on context graph' };
     }
     if (allowedPeers !== null && !allowedPeers.includes(fromPeerId)) {
       return { accepted: false, reasonCode: 'PEER_NOT_IN_ALLOWLIST', reason: `peer ${fromPeerId} not in peer allowlist` };

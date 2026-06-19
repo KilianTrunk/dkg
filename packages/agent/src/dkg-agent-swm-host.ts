@@ -1067,31 +1067,43 @@ export class SwmHostModeMethods extends DKGAgentBase {
     // for both the plaintext gate and the authority check. UNKNOWN CGs stay on
     // the drop path (safe; member catchup heals once the policy resolves).
     //
-    // LAZY by design (Branimir review #1239 follow-on): `confirmedPublic` only
-    // ever GATES anything when `!isCiphertext` — line 1059 below reads it only
-    // then, and `verifyHostModeEnvelopeAuthority` ignores
-    // `allowSelfSignedForPublicCg` whenever an allowlist exists. So short-circuit
-    // on `!isCiphertext` to skip the (now chain-backed) policy resolution
-    // entirely on the dominant CIPHERTEXT/curated path — otherwise the bulk of
-    // host-mode traffic would pay a synchronous eth_call to compute a value it
-    // then discards. Security-preserving: a ciphertext envelope on a public CG
-    // just stays in the curated authority path / opaque append and heals via
-    // catchup.
+    // LAZY by design (Branimir review #1239 follow-on): the self-signed public
+    // exception only matters for `!isCiphertext` traffic. So short-circuit on
+    // `!isCiphertext` to skip the (now chain-backed) policy resolution entirely
+    // on the dominant CIPHERTEXT/curated path — otherwise the bulk of host-mode
+    // traffic would pay a synchronous eth_call to compute a value it discards.
+    // Security-preserving: a ciphertext envelope on a public CG just stays in the
+    // curated authority path / opaque append and heals via catchup.
     const confirmedPublic = !isCiphertext && await this.isConfirmedPublicForHostMode(storageCgId);
     if (!isCiphertext && !confirmedPublic) return;
 
     // Authority check. Curated traffic verifies the envelope signature against
-    // the CG's agent allowlist. A confirmed-public CG has no allowlist, so pass
-    // `allowSelfSignedForPublicCg`: the SHARED verifier then validates signature
-    // + timestamp-freshness (the replay/eviction guard) AND binds the inner
-    // request to THIS CG — same envelope validation as curated, only the
-    // allowlist decision diverges (see SharedMemoryHandler.verifyHostModeEnvelopeAuthority).
+    // the CG's agent allowlist. For a self-publishable (open) CG, inject the
+    // on-chain policy RESOLVER (not a pre-decided flag): the SHARED verifier
+    // re-checks accessPolicy===0 && publishPolicy===1 itself, then validates the
+    // signature + timestamp-freshness AND binds the inner request to THIS CG —
+    // same envelope validation as curated, only the allowlist decision diverges
+    // (see SharedMemoryHandler.verifyHostModeEnvelopeAuthority).
     //
     // Use `storageCgId` (cleartext from the envelope) so the meta-graph +
     // chain-fallback resolvers work on the canonical id shape.
     const handler = this.getOrCreateSharedMemoryHandler();
     const verdict = await handler.verifyHostModeEnvelopeAuthority(
-      data, storageCgId, fromPeerId, { allowSelfSignedForPublicCg: confirmedPublic },
+      data, storageCgId, fromPeerId,
+      // Inject the on-chain policy RESOLVER (not a pre-decided flag) so the
+      // verifier enforces accessPolicy===0 && publishPolicy===1 itself and can
+      // take the self-signed path even when a STALE participant allowlist
+      // survives an open-publish flip. Lazy: pass it only for non-ciphertext,
+      // so the dominant ciphertext/curated path pays no chain read (the resolver
+      // shares the same ~5s publishPolicy cache window as the confirmedPublic
+      // resolution above, so this is at most a warm cache hit, never a 2nd RPC).
+      isCiphertext
+        ? undefined
+        : {
+          resolveOpenPublishPolicy: () => this.getContextGraphOnChainPolicy(
+            storageCgId, { publishPolicyMaxCacheAgeMs: HOST_MODE_PUBLISH_POLICY_MAX_CACHE_AGE_MS },
+          ),
+        },
     );
     if (!verdict.accepted) {
       // 'no agent allowlist' on a NON-public CG is the expected brief chain-event

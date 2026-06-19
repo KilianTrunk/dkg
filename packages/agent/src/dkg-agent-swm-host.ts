@@ -688,18 +688,23 @@ export class SwmHostModeMethods extends DKGAgentBase {
    * unauthenticated plaintext envelope into curated storage.
    */
   async isConfirmedPublicForHostMode(this: DKGAgent, contextGraphId: string): Promise<boolean> {
-    const sub = this.subscribedContextGraphs.get(contextGraphId);
-    // Any curated marker is disqualifying.
-    if (sub?.onChainHash) return false;
-    if (sub?.onChainId) {
-      const cached = this.onChainAccessPolicyCache.get(sub.onChainId);
-      if (cached === 1) return false;
-      if (cached === 0) return true; // confirmed public on-chain
-    }
-    // Local `_meta` explicit accessPolicy is the authoritative tri-state:
-    // 'public' → yes, 'private' → no, null (unknown) → no (safe default).
+    // Resolve via the SHARED on-chain policy resolver rather than a direct
+    // cleartext `subscribedContextGraphs` lookup. `getContextGraphOnChainPolicy`
+    // re-keys cleartext↔on-chain-id (via subscribedContextGraphs OR
+    // getContextGraphOnChainId), consults the accessPolicy cache + local `_meta`,
+    // AND falls back to a direct chain RPC — so it resolves the policy even for a
+    // host-only core whose subscription is keyed by the wire HASH and that has no
+    // local `_meta` (the exact #1124 sharded topology). A cleartext-only
+    // subscribedContextGraphs probe would miss that entry and wrongly drop the
+    // public envelope.
+    //
+    // accessPolicy === 0 is the ONLY confirmed-public answer. Curated (1) and
+    // unknown (undefined) both → false — the safe bias: keep the ciphertext +
+    // allowlist gates so a curated CG mid chain-event race is never misclassified
+    // as public; it heals via member catchup once the policy resolves.
     try {
-      return (await this.getExplicitAccessPolicy(contextGraphId)) === 'public';
+      const { accessPolicy } = await this.getContextGraphOnChainPolicy(contextGraphId);
+      return accessPolicy === 0;
     } catch {
       return false;
     }
@@ -1067,11 +1072,27 @@ export class SwmHostModeMethods extends DKGAgentBase {
       // race (also 'no agent allowlist') is NEVER admitted — it stays a drop and
       // heals via member catchup. Every OTHER rejection reason (decode failure,
       // unsigned, sig mismatch, peer-not-in-allowlist) still drops for ALL CGs.
-      const noAllowlist = verdict.reason === 'no agent allowlist on context graph';
-      if (noAllowlist && (await this.isConfirmedPublicForHostMode(storageCgId))) {
+      const noAllowlist = verdict.reasonCode === 'NO_AGENT_ALLOWLIST';
+      // A public CG has no allowlist, so verifyHostModeEnvelopeAuthority returns
+      // NO_AGENT_ALLOWLIST and short-circuits BEFORE its signature check. So
+      // verify self-consistency here: the signature must recover to the claimed
+      // signer. This rejects a forged/garbage signature on the public path
+      // (the unsigned case — null envelope — is already dropped upstream as
+      // UNSIGNED, a different reasonCode that never reaches this branch).
+      let publicSigSelfConsistent = false;
+      if (noAllowlist && envelope.agentAddress && envelope.signature.length > 0) {
+        try {
+          const recovered = ethers.verifyMessage(
+            computeGossipSigningPayload(envelope.type, envelope.contextGraphId, envelope.timestamp, envelope.payload),
+            ethers.hexlify(envelope.signature),
+          );
+          publicSigSelfConsistent = recovered.toLowerCase() === envelope.agentAddress.toLowerCase();
+        } catch { publicSigSelfConsistent = false; }
+      }
+      if (noAllowlist && publicSigSelfConsistent && (await this.isConfirmedPublicForHostMode(storageCgId))) {
         this.log.debug(
           ctx,
-          `Host-mode accepting public-CG plaintext SWM cg=${storageCgId} from=${fromPeerId} (#1124; open CG has no curated allowlist, envelope is signed, per-CG byte cap remains the safety net)`,
+          `Host-mode accepting public-CG plaintext SWM cg=${storageCgId} from=${fromPeerId} (#1124; open CG has no curated allowlist; signature self-consistent; per-CG byte cap remains the safety net)`,
         );
         // fall through to the rate-limit + store path below
       } else {
@@ -1086,7 +1107,7 @@ export class SwmHostModeMethods extends DKGAgentBase {
       // state operation. Other rejection reasons (sig mismatch, peer
       // not in allowlist, decode failure) remain WARN — those are
       // real authority failures that operators need to see.
-      const isTransientRace = verdict.reason === 'no agent allowlist on context graph';
+      const isTransientRace = verdict.reasonCode === 'NO_AGENT_ALLOWLIST';
       if (isTransientRace) {
         this.log.debug(
           ctx,
@@ -1164,7 +1185,6 @@ export class SwmHostModeMethods extends DKGAgentBase {
         }
       }
     }
-
     const seqno = await this.swmHostModeStore.append(storageCgId, data);
     this.log.debug(
       ctx,

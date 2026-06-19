@@ -103,6 +103,23 @@ export interface ContextGraphMetaOracleRecord {
  * MUST fall back to NOT emitting an ack (silent best-effort, same
  * as pre-PR-D gossip behaviour).
  */
+/**
+ * Structured rejection code for {@link SharedMemoryHandler.verifyHostModeEnvelopeAuthority}.
+ * Callers (e.g. the host-mode ingest path's #1124 public-CG exception) key off
+ * this stable code rather than the free-form `reason` text, so a wording change
+ * to a log message can never silently flip a behavioral branch.
+ */
+export type HostModeRejectionCode =
+  | 'DECODE_FAILED'
+  | 'UNSIGNED'
+  | 'NO_AGENT_ALLOWLIST'
+  | 'PEER_NOT_IN_ALLOWLIST'
+  | 'SIG_VERIFY_FAILED';
+
+export type HostModeEnvelopeAuthorityVerdict =
+  | { accepted: true }
+  | { accepted: false; reasonCode: HostModeRejectionCode; reason: string };
+
 export type SharedMemoryApplyOutcome =
   | {
       applied: true;
@@ -1310,28 +1327,30 @@ export class SharedMemoryHandler {
     rawBytes: Uint8Array,
     contextGraphId: string,
     fromPeerId: string,
-  ): Promise<{ accepted: true } | { accepted: false; reason: string }> {
+  ): Promise<HostModeEnvelopeAuthorityVerdict> {
     const ctx = createOperationContext('share');
     let decoded: WorkspaceGossipDecodeResult;
     try {
       decoded = this.decodeWorkspaceGossipMessage(rawBytes);
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
-      return { accepted: false, reason: `decode failed: ${reason}` };
+      return { accepted: false, reasonCode: 'DECODE_FAILED', reason: `decode failed: ${reason}` };
     }
     const { envelope, signedPayload } = decoded;
     if (!envelope) {
-      return { accepted: false, reason: 'unsigned envelope (host mode requires agent-signed gossip)' };
+      return { accepted: false, reasonCode: 'UNSIGNED', reason: 'unsigned envelope (host mode requires agent-signed gossip)' };
     }
     const agentGateAddresses = await this.getContextGraphAgentGateAddresses(contextGraphId);
     const allowedPeers = await this.getContextGraphAllowedPeers(contextGraphId);
     if (agentGateAddresses === null) {
       // No agent gate → not curated → host mode shouldn't be
-      // active for this CG. Drop defensively.
-      return { accepted: false, reason: 'no agent allowlist on context graph' };
+      // active for this CG. Drop defensively. (The host-mode ingest caller keys
+      // its public-CG exception off `reasonCode === 'NO_AGENT_ALLOWLIST'`, NOT
+      // the free-form `reason` text — keep the code stable.)
+      return { accepted: false, reasonCode: 'NO_AGENT_ALLOWLIST', reason: 'no agent allowlist on context graph' };
     }
     if (allowedPeers !== null && !allowedPeers.includes(fromPeerId)) {
-      return { accepted: false, reason: `peer ${fromPeerId} not in peer allowlist` };
+      return { accepted: false, reasonCode: 'PEER_NOT_IN_ALLOWLIST', reason: `peer ${fromPeerId} not in peer allowlist` };
     }
     const verified = await this.verifyAgentEnvelope(
       envelope,
@@ -1342,7 +1361,7 @@ export class SharedMemoryHandler {
       { requireLocalMembership: false },
     );
     if (!verified) {
-      return { accepted: false, reason: 'agent envelope verification failed (see preceding WARN log)' };
+      return { accepted: false, reasonCode: 'SIG_VERIFY_FAILED', reason: 'agent envelope verification failed (see preceding WARN log)' };
     }
     return { accepted: true };
   }

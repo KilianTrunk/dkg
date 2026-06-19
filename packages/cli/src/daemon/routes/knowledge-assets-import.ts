@@ -490,6 +490,7 @@ export async function handleKaImportArtifactReadMarkdown(ctx: RequestContext): P
       ctx,
       parsed as Record<string, unknown>,
       'Import artifact Markdown can only be read from imported assertions owned by the requesting agent',
+      { allowSharedMemoryFallback: true },
     );
     const maxBytes = normalizeMarkdownReadLimit((parsed as Record<string, unknown>).maxBytes);
     if (!artifact.markdownHash) {

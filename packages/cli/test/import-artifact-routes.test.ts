@@ -1123,6 +1123,68 @@ describe('import artifact daemon routes', () => {
     await expect(fileStore.get(artifactHash)).resolves.toEqual(bytes);
   });
 
+  it('fetches verified Markdown remotely for an allowlisted private CG member using synced shared-memory metadata', async () => {
+    const bytes = Buffer.from('# Private Synced Metadata Markdown\n');
+    const artifactHash = keccak256ContentHash(bytes);
+    const contextGraphId = 'cg-private-allowlisted-swm-metadata-read';
+    const assertionName = 'imported-md';
+    const assertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:source', assertionName);
+    const fetchAndVerifyAssertionArtifact = vi.fn(async () => ({
+      response: {
+        version: 1,
+        contextGraphId,
+        assertionUri,
+        kind: 'markdown',
+        hash: artifactHash,
+        offset: 0,
+        totalBytes: bytes.length,
+        truncated: false,
+        contentType: 'text/markdown',
+        bytesB64: bytes.toString('base64'),
+      },
+      verifiedBytes: bytes,
+    }));
+    const { agent, queries } = makeAgent({
+      contextGraphId,
+      assertionName,
+      assertionUri,
+      fileHash: artifactHash,
+      markdownHash: artifactHash,
+      markdownForm: `urn:dkg:file:${artifactHash}`,
+      allowedAgents: ['did:dkg:agent:test'],
+      omitImportMeta: true,
+      fetchAndVerifyAssertionArtifact,
+    });
+    await startRoutes({ agent });
+
+    const read = await post('/api/knowledge-assets/import-artifact/read-markdown', {
+      contextGraphId,
+      assertionUri,
+      sourcePeerId: 'peer-owner',
+      maxBytes: 1024,
+    });
+
+    expect(read.status).toBe(200);
+    expect(read.body).toMatchObject({
+      markdownHash: artifactHash,
+      contentType: 'text/markdown',
+      bytes: bytes.length,
+      markdown: bytes.toString('utf8'),
+      source: { peerId: 'peer-owner', agentAddress: 'did:dkg:agent:source' },
+    });
+    expect(queries.some((sparql) => sparql.includes('SELECT ?sourceFile'))).toBe(true);
+    expect(fetchAndVerifyAssertionArtifact).toHaveBeenCalledWith(expect.objectContaining({
+      contextGraphId,
+      assertionUri,
+      kind: 'markdown',
+      hash: artifactHash,
+      sourcePeerId: 'peer-owner',
+      requestingAgentAddress: 'did:dkg:agent:test',
+      cache: true,
+    }));
+    await expect(fileStore.get(artifactHash)).resolves.toEqual(bytes);
+  });
+
   it('serves a remote artifact page even when the full artifact is not cache-promoted', async () => {
     const bytes = Buffer.from('remote page bytes');
     const artifactHash = sha256Hash(bytes);

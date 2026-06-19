@@ -682,7 +682,7 @@ export async function resolveImportedArtifact(
       assertionUri,
       ...(parsedAssertion.subGraphName ? { subGraphName: parsedAssertion.subGraphName } : {}),
       ...(requestedFileHash ? { requestedFileHash } : {}),
-      allowSharedMemoryFallback: ownerGuardRelaxed || opts?.allowSharedMemoryFallback,
+      allowSharedMemoryFallback: ownerGuardRelaxed || (opts?.allowSharedMemoryFallback && !parsedAssertion.legacy),
       fallbackDetectedContentType: extractionRecord?.detectedContentType,
       query: (sparql: string) => ctx.agent.store.query(sparql) as Promise<{ type?: string; bindings?: Array<Record<string, unknown>> }>,
     });

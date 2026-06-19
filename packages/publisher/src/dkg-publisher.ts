@@ -5235,6 +5235,25 @@ export class DKGPublisher implements Publisher {
     const graphUri = await this.wmGraphUri(contextGraphId, agentAddress, name, opts?.subGraphName);
     const swmGraphUri = await this.swmGraphUri(contextGraphId, agentAddress, name, opts?.subGraphName);
 
+    // #1116 (round 10) — the swmShareComplete marker MUST be maintained on EVERY
+    // return path of assertionPromote, not just the success tail. A non-full share
+    // (subset/partial/foreign-skipped) that filters to ZERO promotable quads (the
+    // early returns below) would otherwise leave a STALE marker from a prior full
+    // share, letting finalize(layer:"swm")/publish pass their gate against the OLD
+    // SWM contents. `promotingAllEntities` is hoisted here so every exit can
+    // compute the correct scope; `maintainMarker(isFull)` is called before each
+    // return with `isFull = promotingAllEntities && promotedAllRoots` for that path.
+    // (Member-row REPLACE stays at the success path — it only matters when quads
+    // are actually promoted; the MARKER is the cross-cutting invariant.)
+    const promotingAllEntities = !opts?.entities || opts.entities === 'all';
+    const maintainMarker = async (isFullCompletePromote: boolean): Promise<void> => {
+      if (isFullCompletePromote) {
+        await this.markSwmShareComplete(contextGraphId, name, agentAddress, opts?.subGraphName);
+      } else {
+        await this.clearSwmShareComplete(contextGraphId, name, agentAddress, opts?.subGraphName);
+      }
+    };
+
     const result = await this.store.query(
       `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <${graphUri}> { ?s ?p ?o } }`,
     );
@@ -5261,7 +5280,11 @@ export class DKGPublisher implements Publisher {
       // `assertionCreate` are not consulted: they fire for empty-write
       // flows where promoting nothing is legitimate.
       await this.assertAssertionDataPersisted(contextGraphId, graphUri);
-      // No roots to promote ⇒ none were foreign-skipped.
+      // No roots to promote ⇒ none were foreign-skipped. promotedAllRoots:true ⇒
+      // isFull == promotingAllEntities (a subset of an empty draft still CLEARS a
+      // stale marker; a full empty share SETS it — harmless, finalize finds no
+      // members). Maintain the marker before returning (round 10).
+      await maintainMarker(promotingAllEntities);
       return { promotedCount: 0, promotedAllRoots: true };
     }
 
@@ -5340,8 +5363,15 @@ export class DKGPublisher implements Publisher {
     }
 
     // Nothing left after the reserved-subject / selective-entity filters ⇒
-    // no roots were foreign-skipped.
-    if (quadsToPromote.length === 0) return { promotedCount: 0, promotedAllRoots: true };
+    // no roots were foreign-skipped. round 10 (reviewer 🔴): a SUBSET share whose
+    // selection matched ZERO current quads reaches here — it MUST clear a stale
+    // full-share marker (isFull == promotingAllEntities, which is false for a
+    // subset) before returning, else finalize(layer:"swm") passes its gate against
+    // the OLD SWM contents.
+    if (quadsToPromote.length === 0) {
+      await maintainMarker(promotingAllEntities);
+      return { promotedCount: 0, promotedAllRoots: true };
+    }
 
     const operationId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -5489,7 +5519,10 @@ export class DKGPublisher implements Publisher {
 
     if (effectiveRoots.length === 0) {
       // Every requested root was foreign-skipped — nothing promoted, and the
-      // sealed set is definitively not fully present in SWM.
+      // sealed set is definitively not fully present in SWM. promotedAllRoots is
+      // false here (skippedRoots.size > 0), so isFull is false ⇒ CLEAR the marker
+      // (round 10): a fully-foreign-skipped share is never a complete full share.
+      await maintainMarker(promotingAllEntities && promotedAllRoots);
       return { promotedCount: 0, promotedAllRoots };
     }
 
@@ -5552,7 +5585,8 @@ export class DKGPublisher implements Publisher {
     // gated-out, and over-deleting could drop a still-valid member. The audit
     // confirmed no reader needs the cumulative historical union; all read the
     // CURRENT set, so REPLACE-on-full is strictly more correct.
-    const promotingAllEntities = !opts?.entities || opts.entities === 'all';
+    // `promotingAllEntities` is hoisted to the top of the method (round 10) so the
+    // early-return marker maintenance can use it; reuse it here.
     const isFullCompletePromote = promotingAllEntities && promotedAllRoots;
     if (isFullCompletePromote) {
       const lifecycleSubject = assertionLifecycleUri(contextGraphId, agentAddress, name, opts?.subGraphName);
@@ -5576,20 +5610,15 @@ export class DKGPublisher implements Publisher {
     await this.store.delete(promoted.delete);
     await this.store.insert(promoted.insert);
 
-    // #1116 (round 9) — CO-LOCATE the swmShareComplete marker with the member-row
-    // REPLACE above, at the single publisher chokepoint. The marker and the member
+    // #1116 (round 9/10) — CO-LOCATE the swmShareComplete marker with the
+    // member-row REPLACE above, at the single publisher chokepoint, via the same
+    // `maintainMarker` helper every early-return uses. The marker and the member
     // rows MUST stay in lockstep: the marker says "the member rows describe a
     // complete full share". A FULL-COMPLETE promote (entities:"all" + no foreign
-    // root skipped) is the only state that is publishable/sealable-in-SWM, so it
-    // SETS the marker; any other promote (subset or foreign-skipped) CLEARS it.
-    // Doing it here (not in the agent `promote()` wrapper) means EVERY caller of
-    // the public assertionPromote keeps the invariant — no desync between the
-    // marker and the rows for a direct/alternate caller.
-    if (isFullCompletePromote) {
-      await this.markSwmShareComplete(contextGraphId, name, agentAddress, opts?.subGraphName);
-    } else {
-      await this.clearSwmShareComplete(contextGraphId, name, agentAddress, opts?.subGraphName);
-    }
+    // root skipped) SETS it; any other promote (subset/foreign-skipped) CLEARS it.
+    // Doing it in the publisher (not the agent wrapper) keeps the invariant for
+    // EVERY caller of the public assertionPromote — no desync on a direct caller.
+    await maintainMarker(isFullCompletePromote);
 
     // Write WorkspaceOperation metadata + ownership quads, mirroring what
     // _shareImpl and the remote SharedMemoryHandler both produce, so the

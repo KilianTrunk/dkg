@@ -468,4 +468,45 @@ describe('assertionPullFrom (OT-RFC-43 §10.5.3 wm/pull-from)', () => {
       .catch((e) => e);
     expect((err as any).code).toBe('SWM_SUBSET_NOT_SEALABLE');
   });
+
+  // #1116 (round 10): assertionPromote must maintain the swmShareComplete marker
+  // on EVERY return path — including the EARLY RETURN where a subset selection
+  // filters to ZERO promotable quads (the `quadsToPromote.length === 0` exit).
+  // Pre-fix that path returned BEFORE the marker maintenance, so a prior FULL
+  // share's marker SURVIVED a later zero-quad subset share, and finalize(layer:
+  // "swm")/pull-from then passed its gate against the OLD SWM contents.
+  it('#1116 (round 10): a zero-quad SUBSET share (early return) CLEARS a stale full-share marker', async () => {
+    const { publisher, store } = await makePublisher();
+
+    // 1. FULL share {A, B} — sets the marker, stamps member rows {A, B}, empties WM.
+    await publisher.assertionWrite(CG, NAME, AGENT, [
+      { subject: ENTITY_1, predicate: SCHEMA, object: '"Alice"' },
+      { subject: ENTITY_2, predicate: SCHEMA, object: '"Bob"' },
+    ]);
+    const full = await publisher.assertionPromote(CG, NAME, AGENT, { publisherPeerId: 'peer-self' });
+    expect(full.promotedAllRoots).toBe(true);
+    expect(await publisher.hasSwmShareComplete(CG, NAME, AGENT)).toBe(true);
+
+    // 2. Re-write a fresh WM draft, then SUBSET-share a selection that matches NONE
+    //    of the current draft's subjects → the selective filter empties
+    //    quadsToPromote → the early `length === 0` return path fires.
+    await publisher.assertionWrite(CG, NAME, AGENT, [
+      { subject: ENTITY_1, predicate: SCHEMA, object: '"Alice v2"' },
+      { subject: ENTITY_2, predicate: SCHEMA, object: '"Bob v2"' },
+    ]);
+    const zeroQuadSubset = await publisher.assertionPromote(CG, NAME, AGENT, {
+      entities: [OTHER_FILE_ENTITY], // not present in the draft → zero quads promoted
+      publisherPeerId: 'peer-self',
+    });
+    expect(zeroQuadSubset.promotedCount).toBe(0); // confirms the early-return path
+
+    // 3. The stale full-share marker MUST be cleared (round 10 fix).
+    expect(await publisher.hasSwmShareComplete(CG, NAME, AGENT)).toBe(false);
+
+    // 4. And the SWM pull / seal-in-SWM source now REJECTS (marker gone).
+    const err = await publisher
+      .assertionPullFrom(CG, NAME, AGENT, 'swm', { onConflict: 'replace' })
+      .catch((e) => e);
+    expect((err as any).code).toBe('SWM_SUBSET_NOT_SEALABLE');
+  });
 });

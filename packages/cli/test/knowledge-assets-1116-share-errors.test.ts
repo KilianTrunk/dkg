@@ -136,9 +136,15 @@ describe('#1116 share/seal route error mapping (fake agent)', () => {
     expect(String(res.body.recovery)).toContain('skipSeal');
   });
 
-  it('wm/finalize (layer:swm): SWM_SUBSET_NOT_SEALABLE → 409 { code, error }', async () => {
+  it('wm/finalize (layer:swm): forwards layer:"swm" to the engine AND maps SWM_SUBSET_NOT_SEALABLE → 409', async () => {
+    // Round 10 (reviewer 🟡): CAPTURE the finalize call args so we prove the route
+    // threaded `layer:"swm"` through resolveFinalizeOptions into
+    // agent.assertion.finalize — a fake that ignored its args would let a route
+    // that dropped `layer` (always finalizing WM) pass this test silently.
+    const finalizeCalls: Array<{ contextGraphId: unknown; name: unknown; opts: any }> = [];
     await startWith({
-      finalize: async () => {
+      finalize: async (contextGraphId: unknown, name: unknown, opts: any) => {
+        finalizeCalls.push({ contextGraphId, name, opts });
         throw Object.assign(
           new Error('Cannot seal-in-SWM: this asset was not fully shared to SWM — subset shares are not publishable. Share the full asset (entities:"all") first, then finalize(layer:"swm").'),
           { code: 'SWM_SUBSET_NOT_SEALABLE' },
@@ -150,6 +156,11 @@ describe('#1116 share/seal route error mapping (fake agent)', () => {
     expect(res.status).toBe(409);
     expect(res.body.code).toBe('SWM_SUBSET_NOT_SEALABLE');
     expect(String(res.body.error)).toContain('subset shares are not publishable');
+
+    // The route actually forwarded layer:"swm" (not dropped, not defaulted to WM).
+    expect(finalizeCalls.length).toBe(1);
+    expect(finalizeCalls[0]?.opts?.layer).toBe('swm');
+    expect(finalizeCalls[0]?.contextGraphId).toBe(CG_ID);
   });
 
   it('swm/share: an unrelated promote error still propagates (not silently 409ed)', async () => {

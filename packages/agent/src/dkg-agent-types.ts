@@ -957,7 +957,7 @@ export interface DKGAgentConfig {
    * Cadence at which the daemon re-publishes its own agent profile
    * (PR feat/chain-agents-cg-phonebook). Forwarded straight from
    * `DkgConfig.network.agentProfileHeartbeatMs`. Defaults to
-   * `AGENT_PROFILE_HEARTBEAT_MS` (5 min) when omitted; `0` disables
+   * `AGENT_PROFILE_HEARTBEAT_MS` (20 min) when omitted; `0` disables
    * the timer (the one-shot startup publish still fires).
    */
   agentProfileHeartbeatMs?: number;

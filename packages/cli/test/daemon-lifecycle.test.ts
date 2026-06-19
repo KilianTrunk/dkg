@@ -41,6 +41,27 @@ describe('daemon startup genesis validation', () => {
       ],
     });
   });
+
+  it('rejects pre-deployment configs with placeholder relay peer ids', async () => {
+    const networkId = await computeNetworkId('base-mainnet');
+
+    const result = await validateStartupGenesis({
+      networkName: 'DKG V10 Base Mainnet',
+      genesisId: 'base-mainnet',
+      networkId,
+      _status: 'pre-deployment: replace PEER_ID_* relay values before enabling Base mainnet',
+      relays: ['/ip4/178.105.87.39/tcp/9090/p2p/PEER_ID_SOLARIS'],
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.networkId).toBe(networkId);
+    if (!result.ok) {
+      expect(result.messages).toContain(
+        'FATAL: network config DKG V10 Base Mainnet is marked pre-deployment: replace PEER_ID_* relay values before enabling Base mainnet.',
+      );
+      expect(result.messages.some(message => message.includes('PEER_ID_SOLARIS'))).toBe(true);
+    }
+  });
 });
 
 async function writeWorkspaceTsconfig(tsconfigPath: string): Promise<void> {

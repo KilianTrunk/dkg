@@ -733,19 +733,32 @@ type StartupGenesisValidation =
   | { ok: false; networkId: string; messages: string[] };
 
 export async function validateStartupGenesis(
-  network: Pick<NetworkConfig, 'genesisId' | 'networkId' | 'networkName'> | null | undefined,
+  network: Pick<NetworkConfig, '_status' | 'genesisId' | 'networkId' | 'networkName' | 'relays'> | null | undefined,
 ): Promise<StartupGenesisValidation> {
   const networkId = await computeNetworkId(network?.genesisId);
-  if (network?.networkId && network.networkId !== networkId) {
-    return {
-      ok: false,
-      networkId,
-      messages: [
-        `FATAL: genesis mismatch! Expected networkId ${network.networkId.slice(0, 16)}... but computed ${networkId.slice(0, 16)}...`,
-        `This node's genesis does not match ${network.networkName}. Rebuild or update the selected network config.`,
-      ],
-    };
+  const networkName = network?.networkName ?? 'selected network';
+  const messages: string[] = [];
+  if (network?._status?.toLowerCase().startsWith('pre-deployment')) {
+    messages.push(
+      `FATAL: network config ${networkName} is marked ${network._status}.`,
+    );
   }
+  const placeholderRelays = network?.relays?.filter(relay => relay.includes('/p2p/PEER_ID_')) ?? [];
+  if (placeholderRelays.length > 0) {
+    messages.push(
+      `FATAL: network config ${networkName} contains placeholder relay peer IDs: ${placeholderRelays.join(', ')}`,
+    );
+    messages.push('Replace pre-deployment relay PeerIDs before selecting this network.');
+  }
+  if (network?.networkId && network.networkId !== networkId) {
+    messages.push(
+      `FATAL: genesis mismatch! Expected networkId ${network.networkId.slice(0, 16)}... but computed ${networkId.slice(0, 16)}...`,
+    );
+    messages.push(
+      `This node's genesis does not match ${network.networkName}. Rebuild or update the selected network config.`,
+    );
+  }
+  if (messages.length > 0) return { ok: false, networkId, messages };
   return { ok: true, networkId };
 }
 
@@ -891,6 +904,12 @@ export async function runDaemonInner(
   }
 
   const network = await loadNetworkConfig();
+  const genesisValidation = await validateStartupGenesis(network);
+  const networkId = genesisValidation.networkId;
+  if (!genesisValidation.ok) {
+    for (const message of genesisValidation.messages) log(message);
+    process.exit(1);
+  }
   const syncContextGraphs = [
     ...new Set([
       ...resolveContextGraphs(config),
@@ -1413,17 +1432,11 @@ export async function runDaemonInner(
   let promoteWorkerLifecycle: PromoteWorkerDaemonLifecycle | null = null;
   let shuttingDown = false;
 
-  const genesisValidation = await validateStartupGenesis(network);
-  const networkId = genesisValidation.networkId;
   const publisherControl = createPublisherControlFromStore(
     agent.store,
     createPublicSnapshotStore(dkgDir(), config),
   );
   log(`Network: ${networkId.slice(0, 16)}...`);
-  if (!genesisValidation.ok) {
-    for (const message of genesisValidation.messages) log(message);
-    process.exit(1);
-  }
   if (network) {
     log(
       `Network config: ${network.networkName} (genesis v${network.genesisVersion})`,

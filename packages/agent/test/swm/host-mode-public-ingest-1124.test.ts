@@ -26,7 +26,10 @@ import { SwmHostModeStore } from '../../src/swm/host-mode-store.js';
 
 interface ClassifierInternals {
   isConfirmedPublicForHostMode(cgId: string): Promise<boolean>;
-  getContextGraphOnChainPolicy(cgId: string): Promise<{ accessPolicy?: number; publishPolicy?: number }>;
+  getContextGraphOnChainPolicy(
+    cgId: string,
+    options?: { forcePublishPolicyChainRead?: boolean },
+  ): Promise<{ accessPolicy?: number; publishPolicy?: number }>;
 }
 
 interface IngestInternals {
@@ -87,6 +90,18 @@ describe('GH #1124 — isConfirmedPublicForHostMode safety bias (only accessPoli
     const g = (await makeCore()) as unknown as ClassifierInternals;
     g.getContextGraphOnChainPolicy = async () => { throw new Error('chain unavailable'); };
     expect(await g.isConfirmedPublicForHostMode('cg')).toBe(false);
+  });
+
+  it('forces a FRESH publishPolicy chain read for the admission gate (no ≤60s stale-permissive window)', async () => {
+    // publishPolicy is mutable on-chain; the cache is only ≤60s-TTL'd. This
+    // security-positive gate must re-verify on-chain, so it MUST pass
+    // forcePublishPolicyChainRead. (Branimir review #1239: an open→curated
+    // downgrade must not leave a stale-permissive admission window.)
+    const g = (await makeCore()) as unknown as ClassifierInternals;
+    let capturedOpts: { forcePublishPolicyChainRead?: boolean } | undefined;
+    g.getContextGraphOnChainPolicy = async (_cg, opts) => { capturedOpts = opts; return { accessPolicy: 0, publishPolicy: 1 }; };
+    await g.isConfirmedPublicForHostMode('cg');
+    expect(capturedOpts?.forcePublishPolicyChainRead).toBe(true);
   });
 });
 

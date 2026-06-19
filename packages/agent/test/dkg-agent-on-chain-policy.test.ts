@@ -454,6 +454,40 @@ describe('DKGAgent.getContextGraphOnChainPolicy', () => {
     expect(Date.now() - newTs).toBeLessThan(1_000);
   });
 
+  // Branimir review on #1239 — the host-mode self-signed admission gate
+  // (`isConfirmedPublicForHostMode`) is the first SECURITY-POSITIVE consumer of
+  // the cached `publishPolicy`, so it must NOT tolerate the ≤60s stale-permissive
+  // window: a host with a fresh `publishPolicy=1` entry would otherwise admit a
+  // self-signed plaintext write for up to the TTL after an owner downgrades
+  // open→curated. `forcePublishPolicyChainRead` treats the cache as always-stale
+  // so the chain RPC re-verifies. Same state, two answers: cached `1` without the
+  // flag, fresh-from-chain `0` with it.
+  it('forcePublishPolicyChainRead bypasses a FRESH publishPolicy cache and re-verifies on-chain (Branimir #1239)', async () => {
+    const getContextGraphPublishPolicy = recorder(async () => ({
+      publishPolicy: 0, // the owner just flipped open → curated
+      publishAuthority: '0x0000000000000000000000000000000000000000',
+    }));
+    const stub = makeStub({
+      subscribedContextGraphs: new Map([['cg-force', { onChainId: '88' }]]),
+      // FRESH cache says "1" (open) — seeded just now, well within the TTL.
+      onChainPublishPolicyCache: new Map([['cg-force', 1]]),
+      onChainPublishPolicyCacheUpdatedAt: new Map([['cg-force', Date.now()]]),
+      onChainAccessPolicyCache: new Map([['cg-force', 0]]),
+      isContextGraphRegistered: recorder(async () => true),
+      chain: { getContextGraphPublishPolicy },
+    });
+    // Default (no flag): the fresh cache hit returns the stale-permissive "1".
+    expect(await callPolicy(stub, 'cg-force')).toEqual({ accessPolicy: 0, publishPolicy: 1 });
+    expect(getContextGraphPublishPolicy.calls).toEqual([]); // no RPC — cache hit
+    // Forced: the cache is ignored, the chain RPC re-verifies → "0" (curated),
+    // so the admission gate sees the real (downgraded) policy and fails closed.
+    const forced = await (DKGAgent.prototype as any).getContextGraphOnChainPolicy.call(
+      stub, 'cg-force', { forcePublishPolicyChainRead: true },
+    );
+    expect(forced).toEqual({ accessPolicy: 0, publishPolicy: 0 });
+    expect(getContextGraphPublishPolicy.calls.at(-1)).toEqual([88n]);
+  });
+
   // Round 3 — degenerate state: registered locally but the on-chain
   // id resolution fails (e.g. corrupted ontology graph). We can't
   // RPC without a numeric id, so we return whatever local triples

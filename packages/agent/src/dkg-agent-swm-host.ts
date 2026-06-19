@@ -701,7 +701,17 @@ export class SwmHostModeMethods extends DKGAgentBase {
     // sharded topology). Both must positively resolve to their open value; any
     // undefined (unknown) → false (safe).
     try {
-      const { accessPolicy, publishPolicy } = await this.getContextGraphOnChainPolicy(contextGraphId);
+      // `forcePublishPolicyChainRead`: publishPolicy is mutable on-chain and the
+      // cache is only ≤60s-TTL'd, so it could be stale-PERMISSIVE for up to the
+      // TTL after an owner downgrades open→curated publish. This is a
+      // security-positive gate (it admits a self-signed plaintext write that host
+      // catchup later applies under trustedReplay), so it must re-verify the
+      // publishPolicy on-chain rather than trust the cached value. An RPC
+      // failure/timeout leaves publishPolicy undefined → we fail CLOSED (drop;
+      // the share heals via retry/catchup once the policy re-resolves).
+      const { accessPolicy, publishPolicy } = await this.getContextGraphOnChainPolicy(
+        contextGraphId, { forcePublishPolicyChainRead: true },
+      );
       return accessPolicy === 0 && publishPolicy === 1;
     } catch {
       return false;

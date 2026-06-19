@@ -98,8 +98,18 @@ async function makeNonMemberCores(count: number, seeded: boolean) {
   return { wallets, handlers };
 }
 
-function makeCollector(handlers: StorageACKHandler[]) {
+// Wire the collector with the PRODUCTION identity gate. Each non-member host's
+// signer wallet (wallets[i]) is "registered" on-chain to its node identity
+// (i+1) via this map, so `verifyIdentity` enforces the SAME check production
+// applies: an ACK is quorum-eligible only if its recovered signer is the
+// registered operational key for the claimed identity. Without this the
+// collector would skip identity verification entirely and accept any
+// syntactically-valid signature (otReviewAgent #1239) — this proves the ACKs
+// are genuinely on-chain-submittable, not just well-formed.
+function makeCollector(handlers: StorageACKHandler[], wallets: ethers.Wallet[]) {
   const peers = handlers.map((_, i) => `host-${i}`);
+  const registered = new Map<string, string>(); // identityId → registered signer address
+  wallets.forEach((w, i) => registered.set(String(i + 1), w.address.toLowerCase()));
   const deps: ACKCollectorDeps = {
     gossipPublish: async () => {},
     sendP2P: async (peerId, _protocol, data) => {
@@ -107,6 +117,8 @@ function makeCollector(handlers: StorageACKHandler[]) {
       return handlers[idx].handler(data, { toString: () => peerId });
     },
     getConnectedCorePeers: () => peers,
+    verifyIdentity: async (recoveredAddress: string, identityId: bigint) =>
+      registered.get(identityId.toString()) === recoveredAddress.toLowerCase(),
     log: () => {},
   };
   return new ACKCollector(deps);
@@ -127,13 +139,16 @@ const collectArgs = {
 };
 
 describe('#1124 end-state: public-CG quorum is REACHED purely via non-member host-mode cores', () => {
-  it('POST-FIX — 3 non-member hosts holding the host-mode-ingested plaintext reach quorum with valid signed ACKs', async () => {
+  it('POST-FIX — 3 non-member hosts holding the host-mode-ingested plaintext reach quorum with valid, IDENTITY-VERIFIED signed ACKs', async () => {
     const { wallets, handlers } = await makeNonMemberCores(3, /* seeded */ true);
-    const collector = makeCollector(handlers);
+    // verifyIdentity wired with the (identity→signer) registration → the
+    // collector applies the SAME on-chain identity gate production does.
+    const collector = makeCollector(handlers, wallets);
 
     const result = await collector.collect({ ...collectArgs });
 
-    // Quorum (DEFAULT_REQUIRED_ACKS = 3) reached entirely from non-members.
+    // Quorum (DEFAULT_REQUIRED_ACKS = 3) reached entirely from non-members, and
+    // every ACK passed the identity gate (registered signer for its identity).
     expect(result.acks).toHaveLength(3);
 
     // Every ACK is a real EIP-191 signature over the canonical V10 publish
@@ -151,6 +166,34 @@ describe('#1124 end-state: public-CG quorum is REACHED purely via non-member hos
         yParityAndS: ethers.hexlify(ack.signatureVS),
       });
       expect(hostAddresses).toContain(recovered.toLowerCase());
+    }
+  });
+
+  it('the identity gate is load-bearing — UNREGISTERED host signers are rejected (cannot reach quorum)', async () => {
+    // Proves the wired verifyIdentity actually gates: if the signers are NOT the
+    // registered operational keys for their identities, the collector rejects
+    // every ACK and quorum is unreachable — i.e. the POST-FIX quorum above is
+    // contingent on real registration, not just signature shape. Asserted at the
+    // handler+verifier layer (no full collect()) to avoid the ~31s quorum-fail
+    // retry budget.
+    const { wallets, handlers } = await makeNonMemberCores(3, /* seeded */ true);
+    // Registration map deliberately EMPTY → no signer is registered for any id.
+    const verifyIdentity = async (_addr: string, _id: bigint) => false;
+    const intent = encodePublishIntent({
+      merkleRoot, contextGraphId, publisherPeerId: 'publisher-edge',
+      publicByteSize: Number(publicByteSize), isPrivate: false, kaCount: 1,
+      rootEntities: [], merkleLeafCount,
+    });
+    for (let i = 0; i < handlers.length; i++) {
+      // The host still SIGNS a structurally-valid ACK...
+      const ack = decodeStorageACK(await handlers[i].handler(intent, { toString: () => `host-${i}` }));
+      expect(isStorageACKDecline(ack)).toBe(false);
+      // ...but the production identity gate the collector applies rejects it.
+      const recovered = ethers.recoverAddress(ethers.hashMessage(computePublishACKDigest(
+        TEST_CHAIN_ID, TEST_KAV10_ADDR, cgIdBigInt, merkleRoot, 1n, publicByteSize, 1n, 0n, BigInt(merkleLeafCount),
+      )), { r: ethers.hexlify(ack.coreNodeSignatureR), yParityAndS: ethers.hexlify(ack.coreNodeSignatureVS) });
+      expect(recovered.toLowerCase()).toBe(wallets[i].address.toLowerCase()); // sig is genuine
+      expect(await verifyIdentity(recovered, BigInt(i + 1))).toBe(false);      // but unregistered → rejected
     }
   });
 

@@ -861,6 +861,42 @@ export class SharedMemoryHandler {
           // become good on retry.
           return { applied: false, reason: 'agent envelope verification failed', retryable: false };
         }
+      } else if (trustedReplay && !hasPrivateAccessPolicy && !decoded.senderKeyMessage && !decoded.encryptedPayload) {
+        // GH #1124 (otReviewAgent #1239) — PUBLIC-CG host-catchup forgery gate.
+        // A public CG has no agent allowlist, so the curated branch above is
+        // skipped and a plaintext public envelope was previously applied with
+        // ZERO signature verification. That is acceptable on the LIVE gossip path
+        // (sender == publisher, bound by `publisherPeerId === fromPeerId` at the
+        // guard further below), but NOT on the `trustedReplay` host-catchup path:
+        // there the sender is an UNTRUSTED relaying host, the transport bind is
+        // skipped, and a malicious host can FABRICATE brand-new public bytes that
+        // never traversed any member's live ingest gate. So when replaying, the
+        // envelope MUST be self-signed and that signature MUST verify — otherwise
+        // a forged / unsigned / tampered public envelope would be applied.
+        //
+        // Self-consistency: the claimed signer is its own one-entry allowlist —
+        // a pure crypto check (no chain read). The signed payload
+        // (computeGossipSigningPayload over {type, contextGraphId, timestamp,
+        // encoded WorkspacePublishRequest}) authenticates the inner request
+        // (contextGraphId / publisherPeerId / nquads) as a unit, and
+        // verifyAgentEnvelope's `envelope.contextGraphId === contextGraphId`
+        // check is the cross-CG bind. Freshness is skipped (aged catchup), but
+        // the signature still must hold. Scoped to `trustedReplay` so the LIVE
+        // public path — including the legacy unsigned-public producer — is
+        // unchanged. (publisherPeerId OWNERSHIP attribution is NOT recoverable on
+        // catchup for an open-publish CG — see the residual note on the PR.)
+        if (!envelope || !envelope.agentAddress || !ethers.isAddress(envelope.agentAddress)) {
+          const reason = `public context graph "${contextGraphId}" host-catchup envelope is unsigned — refusing to replay`;
+          this.log.warn(ctx, `SWM write rejected: ${reason}`);
+          return { applied: false, reason, retryable: false };
+        }
+        const selfConsistent = await this.verifyAgentEnvelope(
+          envelope, signedPayload, contextGraphId, [ethers.getAddress(envelope.agentAddress)], ctx,
+          { requireLocalMembership: false, skipTimestampFreshness: true },
+        );
+        if (!selfConsistent) {
+          return { applied: false, reason: 'public-CG host-catchup envelope failed signature verification', retryable: false };
+        }
       }
 
       const requiresEncryptedPayload = hasPrivateAccessPolicy || agentGateAddresses !== null;

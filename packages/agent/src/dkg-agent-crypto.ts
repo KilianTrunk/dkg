@@ -387,7 +387,11 @@ export class WorkspaceCryptoMethods extends DKGAgentBase {
     for (const record of this.localAgents.values()) {
       if (!record.privateKey) continue;
       const signingRecord = { ...record, privateKey: record.privateKey };
-      if (defaultAddress && record.agentAddress.toLowerCase() === defaultAddress) {
+      // GH #787 — a node-level key record can carry a privateKey but no
+      // agentAddress (operational identity, not an agent). Guard the compare so
+      // it falls through to the fallback signer instead of throwing TypeError
+      // (`toLowerCase` of undefined → HTTP 500 on every SWM write via that token).
+      if (defaultAddress && record.agentAddress?.toLowerCase() === defaultAddress) {
         return signingRecord;
       }
       fallback ??= signingRecord;

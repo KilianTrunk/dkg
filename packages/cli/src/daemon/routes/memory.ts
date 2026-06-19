@@ -197,6 +197,7 @@ import {
 import {
   resolveNameToPeerId,
   isPublishQuad,
+  isWritableQuad,
   parsePublishRequestBody,
   jsonResponse,
   safeDecodeURIComponent,
@@ -1641,6 +1642,10 @@ WHERE {
     const contextGraphId = parsed.contextGraphId;
     if (!quads?.length)
       return jsonResponse(res, 400, { error: 'Missing "quads"' });
+    // GH #787 / #306 — reject string-shaped / malformed quads here (4xx) instead
+    // of crashing the SWM write path with a TypeError (HTTP 500).
+    if (!Array.isArray(quads) || !quads.every(isWritableQuad))
+      return jsonResponse(res, 400, { error: '"quads" must be an array of { subject, predicate, object } objects (graph optional); string-shaped quads are not accepted' });
     const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
       agent,
       contextGraphId,
@@ -2210,6 +2215,9 @@ WHERE {
     const contextGraphId = parsed.contextGraphId;
     if (!quads?.length)
       return jsonResponse(res, 400, { error: 'Missing "quads"' });
+    // GH #787 / #306 — reject string-shaped / malformed quads (4xx, not a 500 crash).
+    if (!Array.isArray(quads) || !quads.every(isWritableQuad))
+      return jsonResponse(res, 400, { error: '"quads" must be an array of { subject, predicate, object } objects (graph optional); string-shaped quads are not accepted' });
     const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
       agent,
       contextGraphId,

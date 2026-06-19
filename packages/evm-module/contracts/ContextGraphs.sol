@@ -90,23 +90,38 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable, Re
         contextGraphStorage = ContextGraphStorage(
             hub.getAssetStorageAddress("ContextGraphStorage")
         );
-        // OT-RFC-53 deposit refs — resolved tolerantly so ContextGraphs stays
-        // deployable without the full economic stack (e.g. isolated unit
-        // fixtures). `Hub.getContractAddress` reverts for unregistered names, so
-        // a missing ParametersStorage leaves these refs zero and the deposit is
-        // treated as disabled (createContextGraph guards on it below).
-        try hub.getContractAddress("ParametersStorage") returns (address p) {
-            parametersStorage = ParametersStorage(p);
-            tokenContract = IERC20(hub.getContractAddress("Token"));
-            convictionStakingStorage = ConvictionStakingStorage(hub.getContractAddress("ConvictionStakingStorage"));
-            epochStorage = EpochStorage(hub.getContractAddress("EpochStorageV8"));
-            chronos = Chronos(hub.getContractAddress("Chronos"));
+        // OT-RFC-53 deposit stack — resolve EACH dependency through a tolerant,
+        // individually-catchable Hub lookup (`getContractAddress` reverts for an
+        // unregistered name). The feature is enabled ONLY when the WHOLE stack
+        // resolves; any missing dependency leaves every ref zero and the deposit
+        // disabled (createContextGraph guards on `parametersStorage != 0`). This
+        // keeps ContextGraphs deployable on partial fixtures/upgrades without
+        // declaring the economic stack as hard deploy dependencies, and avoids
+        // the prior bug where a `try` over only the first lookup let a later
+        // lookup (Token/CSS/Epoch/Chronos) revert uncaught.
+        address ps = _tryResolveContract("ParametersStorage");
+        address tok = _tryResolveContract("Token");
+        address css = _tryResolveContract("ConvictionStakingStorage");
+        address es = _tryResolveContract("EpochStorageV8");
+        address chr = _tryResolveContract("Chronos");
+        if (ps != address(0) && tok != address(0) && css != address(0) && es != address(0) && chr != address(0)) {
+            parametersStorage = ParametersStorage(ps);
+            tokenContract = IERC20(tok);
+            convictionStakingStorage = ConvictionStakingStorage(css);
+            epochStorage = EpochStorage(es);
+            chronos = Chronos(chr);
+        }
+    }
+
+    /// @dev Tolerant single-contract Hub lookup: returns address(0) instead of
+    ///      reverting when the name is unregistered. Used to resolve the
+    ///      OT-RFC-53 deposit stack so a partial deployment disables the feature
+    ///      rather than bricking initialize().
+    function _tryResolveContract(string memory contractName) internal view returns (address) {
+        try hub.getContractAddress(contractName) returns (address a) {
+            return a;
         } catch {
-            // Any deposit-stack lookup missing ⇒ feature stays off. Reset
-            // parametersStorage so the createContextGraph guard
-            // (address(parametersStorage) != 0) treats a partial resolution
-            // (e.g. ParametersStorage present but Token absent) as fully off.
-            parametersStorage = ParametersStorage(address(0));
+            return address(0);
         }
     }
 
@@ -191,10 +206,12 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable, Re
     // OT-RFC-53 — registration-deposit pull + admin sweep
     // -----------------------------------------------------------------------
 
-    /// @dev Pulls `deposit` TRAC from the creator: net into the CSS vault
-    ///      (recorded as the CG's escrow), treasury fee to the treasury. The
-    ///      escrow is later spent on publishing (KnowledgeAssetsLifecycle) or
-    ///      swept by admin — never cash-refunded.
+    /// @dev Pulls the full `deposit` TRAC (GROSS) from the creator into the CSS
+    ///      vault and records it as the CG's escrow. No treasury fee is skimmed
+    ///      here: escrow-funded publishing routes the full amount to the staker
+    ///      pool, and only the wallet-funded remainder pays the treasury fee (via
+    ///      KnowledgeAssetsLifecycle._addTokens). The escrow is later spent on
+    ///      publishing or swept by admin — never cash-refunded.
     function _pullRegistrationDeposit(uint256 contextGraphId, uint96 deposit) internal {
         IERC20 token = tokenContract;
         uint256 allowance = token.allowance(msg.sender, address(this));
@@ -219,12 +236,21 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable, Re
         emit ContextGraphRegistrationDeposited(contextGraphId, msg.sender, deposit);
     }
 
-    /// @notice Admin: sweep a CG's residual registration escrow into the staker
-    ///         reward pool (current epoch). Reclaim path for abandoned / spam
-    ///         CGs whose deposit was never spent on publishing. The TRAC is
-    ///         already in the CSS vault, so this only credits the epoch pool and
-    ///         clears the per-CG accounting. Never refunds to the depositor.
+    /// @notice Admin: RETIRE a CG and reclaim its residual registration escrow
+    ///         into the staker reward pool (current epoch). For abandoned / spam
+    ///         CGs whose deposit was never spent on publishing. Deactivation is
+    ///         ATOMIC with the sweep, so this can never silently drain an ACTIVE
+    ///         CG owner's prepaid publishing budget while leaving the CG live —
+    ///         sweeping a CG is retiring it. The TRAC is already in the CSS vault,
+    ///         so this only deactivates, credits the epoch pool, and clears the
+    ///         per-CG accounting. Never refunds to the depositor.
     function sweepContextGraphEscrow(uint256 contextGraphId) external onlyHubOwner {
+        // Atomic retire-then-reclaim: deactivate first so a live CG's prepaid
+        // budget can't be drained out from under its owner while the CG stays
+        // active (otReviewAgent finding). An already-inactive CG is swept as-is.
+        if (contextGraphStorage.isContextGraphActive(contextGraphId)) {
+            contextGraphStorage.deactivateContextGraph(contextGraphId);
+        }
         uint96 swept = contextGraphStorage.clearRegistrationEscrow(contextGraphId);
         if (swept == 0) {
             revert KnowledgeAssetsLib.InvalidContextGraphConfig("no escrow");

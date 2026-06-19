@@ -383,13 +383,87 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     });
 
     // Escrow (100) is drawn first; the 900 remainder flows through the PCA
-    // discount branch as usual. The consume event fires with the drawn amount.
-    await expect(KAV10.connect(creator).publish(p))
-      .to.emit(KAV10, 'RegistrationEscrowConsumed')
-      .withArgs(cgId, deposit);
+    // discount branch. Assert BOTH the consume event AND that the staker pool
+    // received only escrow-gross(100) + discounted-remainder(720) = 820 — NOT
+    // the discounted FULL amount (800 → pool 900) a "consume-but-still-charge-
+    // full-tokenAmount" regression would produce.
+    const tx = await KAV10.connect(creator).publish(p);
+    const receipt = await tx.wait();
+    await expect(tx).to.emit(KAV10, 'RegistrationEscrowConsumed').withArgs(cgId, deposit);
 
-    // Fully consumed (1000 > 100).
+    const remainder = tokenAmount - deposit; // 900
+    const discountedRemainder = (remainder * (10_000n - EXPECTED_DISCOUNT_BPS)) / 10_000n; // 720
+    const expectedPool = deposit + discountedRemainder; // gross escrow 100 + 720 = 820
+    const epochStorageAddr = (await EpochStorageContract.getAddress()).toLowerCase();
+    let poolSum = 0n;
+    for (const log of receipt!.logs) {
+      if (log.address.toLowerCase() !== epochStorageAddr) continue;
+      try {
+        const parsed = EpochStorageContract.interface.parseLog({
+          topics: [...log.topics],
+          data: log.data,
+        });
+        if (parsed?.name === 'TokensAddedToEpochRange' && BigInt(parsed.args.shardId) === STAKER_SHARD_ID) {
+          poolSum += BigInt(parsed.args.tokenAmount);
+        }
+      } catch {
+        /* not the event we're after */
+      }
+    }
+    expect(poolSum).to.equal(expectedPool);
+
+    // Escrow fully consumed (1000 > 100).
     expect(await CGS.getRegistrationEscrow(cgId)).to.equal(0n);
+  });
+
+  // --------------------------------------------------------------------------
+  // OT-RFC-53 — lifetime extension also draws the registration escrow
+  // --------------------------------------------------------------------------
+  it('OT-RFC-53: extending a KA in an owner-funded CG draws the escrow (extension path)', async () => {
+    const Params = await hre.ethers.getContract<ParametersStorage>('ParametersStorage');
+    const deposit = ethers.parseEther('2000'); // large enough to survive a publish + cover the extend
+    await Params.connect(accounts[0]).setContextGraphRegistrationDeposit(deposit);
+
+    const creator = getDefaultKCCreator(accounts);
+    await Token.mint(creator.address, deposit);
+    await Token.connect(creator).approve(await CGFacade.getAddress(), deposit);
+
+    const { cgId, epochs, receivingNodes, publisherIdentityId, receiverIdentityIds } =
+      await setupRegisteredAgentPublish();
+    expect(await CGS.getRegistrationEscrow(cgId)).to.equal(deposit);
+
+    // Publish a KA (escrow covers it: 2000 → 1000).
+    const pubAmount = ethers.parseEther('1000');
+    const reservedKaId = packReservedKaId(creator.address, 1);
+    const p = await buildPublishParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes,
+      publisherIdentityId,
+      receiverIdentityIds,
+      author: creator,
+      contextGraphId: cgId,
+      merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('rfc53-extend')),
+      knowledgeAssetsAmount: 1,
+      byteSize: 1000,
+      epochs,
+      tokenAmount: pubAmount,
+      isImmutable: false,
+      publishOperationId: 'rfc53-extend-pub',
+      reservedKaId,
+    });
+    await KAV10.connect(creator).publish(p);
+    expect(await CGS.getRegistrationEscrow(cgId)).to.equal(deposit - pubAmount); // 1000 left
+
+    // Owner extends the KA — a DIFFERENT consume path (extension window
+    // endEpoch..endEpoch+epochs, direct distribution). Escrow covers it: 1000 → 0.
+    const extendAmount = ethers.parseEther('1000');
+    await expect(
+      KAV10.connect(creator).extendKnowledgeAssetLifetime(reservedKaId, epochs, extendAmount),
+    )
+      .to.emit(KAV10, 'RegistrationEscrowConsumed')
+      .withArgs(cgId, extendAmount);
+    expect(await CGS.getRegistrationEscrow(cgId)).to.equal(deposit - pubAmount - extendAmount); // 0
   });
 
   // --------------------------------------------------------------------------

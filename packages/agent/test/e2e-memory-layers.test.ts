@@ -898,6 +898,56 @@ describe('#1116 seal decoupled from CG — full vs skipSeal share, seal-in-SWM',
     expect(pubC.bindings.length).toBe(0);
   }, 40_000);
 
+  // round 8 (SCENARIO-G — direct wm/pull-from route closes the subset bypass):
+  // a full {A,B} share leaves a marker + seal; a SUBSET {A} re-share on the SAME
+  // name (no discard) CLEARS the marker but never re-seals, so a STALE full seal
+  // {A,B} survives. Pre-round-8 the direct pull-from read that seal for scope and
+  // SUCCEEDED (then a plain finalize + publish emitted the stale {A,B}). Round 8
+  // resolves SWM scope from the marker-gated member rows at the publisher
+  // chokepoint, so the DIRECT pull-from (not just the finalize(layer:swm) wrapper)
+  // now REJECTS — the subset asset can never be reconstructed/published.
+  it('round 8: a direct pullFrom(swm) REJECTS after a subset re-share, even with a stale full seal', async () => {
+    const agent = await createAgent('DirectPullSubsetBot');
+    await agent.createContextGraph({ id: CG_ID, name: 'Direct Pull Subset E2E' });
+    await agent.registerContextGraph(CG_ID);
+
+    const name = 'direct-pull-subset';
+    const A = `${ENTITY_BASE}:a`;
+    const B = `${ENTITY_BASE}:b`;
+
+    // 1. FULL share {A, B} — seals (stale seal {A,B}) + sets the full-share marker.
+    await agent.assertion.create(CG_ID, name);
+    await agent.assertion.write(CG_ID, name, [
+      { subject: A, predicate: 'http://schema.org/name', object: '"Entity A"' },
+      { subject: B, predicate: 'http://schema.org/name', object: '"Entity B"' },
+    ]);
+    const full = await agent.assertion.promote(CG_ID, name);
+    expect(full.sealed).toBe(true);
+
+    // 2. Re-open the SAME name WITHOUT discard, write {A, B} again.
+    await agent.assertion.create(CG_ID, name);
+    await agent.assertion.write(CG_ID, name, [
+      { subject: A, predicate: 'http://schema.org/name', object: '"Entity A v2"' },
+      { subject: B, predicate: 'http://schema.org/name', object: '"Entity B"' },
+    ]);
+
+    // 3. SUBSET re-share {A} — CLEARS the marker (round 6); never re-seals, so the
+    // stale full seal {A,B} survives (the round-8 bypass precondition).
+    const subset = await agent.assertion.promote(CG_ID, name, { entities: [A] });
+    expect(subset.sealed).toBe(false);
+
+    // 4. The DIRECT pull-from route (NOT finalize(layer:swm)) must REJECT — the
+    // stale seal no longer short-circuits the gate at the publisher chokepoint.
+    let thrown: any;
+    try {
+      await agent.assertion.pullFrom(CG_ID, name, 'swm', { onConflict: 'replace' });
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeTruthy();
+    expect(thrown.code).toBe('SWM_SUBSET_NOT_SEALABLE');
+  }, 40_000);
+
   // C (review): a DEFAULT full share whose internal seal FAILS with a residual
   // capability gap (NOT skipSeal, NOT stale/corrupt) must fail CLOSED:
   // UNSEALED_SHARE_BLOCKED is thrown BEFORE assertionPromote, so WM is preserved

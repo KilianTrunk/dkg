@@ -79,6 +79,8 @@ async function wmQuads(store: OxigraphStore): Promise<Quad[]> {
 describe('assertionPullFrom (OT-RFC-43 §10.5.3 wm/pull-from)', () => {
   it('seeds a WM draft from SWM, scoped to the file\'s sealed entities (+ skolem children)', async () => {
     const { publisher, store } = await makePublisher();
+    const lifecycleUri = assertionLifecycleUri(CG, AGENT, NAME);
+    const metaGraph = contextGraphMetaUri(CG);
     await store.insert([
       // this file's entities in SWM
       q(ENTITY_1, SCHEMA, '"Alice"', SWM_GRAPH),
@@ -89,7 +91,14 @@ describe('assertionPullFrom (OT-RFC-43 §10.5.3 wm/pull-from)', () => {
       // a DIFFERENT file's entity co-resident in the same SWM graph
       q(OTHER_FILE_ENTITY, SCHEMA, '"Carol"', SWM_GRAPH),
       ...sealEntities([ENTITY_1, ENTITY_2]),
+      // #1116 (round 8): an SWM pull resolves scope from the promote-stamped
+      // member rows + the full-share marker, NOT the seal (a stale seal must
+      // never short-circuit the subset gate). Represent a legitimately-finalized
+      // FULL share by stamping the member rows for the sealed set.
+      q(lifecycleUri, `${DKG}rootEntity`, ENTITY_1, metaGraph),
+      q(lifecycleUri, `${DKG}rootEntity`, ENTITY_2, metaGraph),
     ]);
+    await publisher.markSwmShareComplete(CG, NAME, AGENT);
 
     const result = await publisher.assertionPullFrom(CG, NAME, AGENT, 'swm');
     expect(result.fromLayer).toBe('swm');
@@ -120,7 +129,13 @@ describe('assertionPullFrom (OT-RFC-43 §10.5.3 wm/pull-from)', () => {
 
   it('onConflict:"replace" overwrites a dirty draft with the source layer', async () => {
     const { publisher, store } = await makePublisher();
-    await store.insert([q(ENTITY_2, SCHEMA, '"Bob from SWM"', SWM_GRAPH), ...sealEntities([ENTITY_2])]);
+    await store.insert([
+      q(ENTITY_2, SCHEMA, '"Bob from SWM"', SWM_GRAPH),
+      ...sealEntities([ENTITY_2]),
+      // #1116 (round 8): SWM scope comes from the member rows + marker, not the seal.
+      q(assertionLifecycleUri(CG, AGENT, NAME), `${DKG}rootEntity`, ENTITY_2, contextGraphMetaUri(CG)),
+    ]);
+    await publisher.markSwmShareComplete(CG, NAME, AGENT);
     await publisher.assertionWrite(CG, NAME, AGENT, [{ subject: ENTITY_1, predicate: SCHEMA, object: '"stale local"' }]);
 
     const result = await publisher.assertionPullFrom(CG, NAME, AGENT, 'swm', { onConflict: 'replace' });
@@ -134,9 +149,16 @@ describe('assertionPullFrom (OT-RFC-43 §10.5.3 wm/pull-from)', () => {
 
   it('validates the source BEFORE dropping — an empty-source replace pull preserves the dirty draft (PR #972/335e8d8)', async () => {
     const { publisher, store } = await makePublisher();
-    // Finalized file whose sealed entity has NO quads in SWM (e.g. never shared
-    // there), plus a dirty WM draft holding a precious local edit.
-    await store.insert([...sealEntities([ENTITY_1])]); // note: no ENTITY_1 quads in SWM_GRAPH
+    // Finalized FULL share whose member entity has NO quads in SWM (e.g. never
+    // shared there), plus a dirty WM draft holding a precious local edit. The
+    // member row + marker represent the full-share scope; the gather finds
+    // nothing in SWM, so the pull rejects with PULL_FROM_EMPTY_SOURCE BEFORE any
+    // drop. #1116 (round 8): SWM scope is the member rows, not the seal.
+    await store.insert([
+      ...sealEntities([ENTITY_1]), // note: no ENTITY_1 quads in SWM_GRAPH
+      q(assertionLifecycleUri(CG, AGENT, NAME), `${DKG}rootEntity`, ENTITY_1, contextGraphMetaUri(CG)),
+    ]);
+    await publisher.markSwmShareComplete(CG, NAME, AGENT);
     await publisher.assertionWrite(CG, NAME, AGENT, [{ subject: ENTITY_1, predicate: SCHEMA, object: '"precious local edit"' }]);
 
     const err = await publisher.assertionPullFrom(CG, NAME, AGENT, 'swm', { onConflict: 'replace' }).catch((e) => e);
@@ -409,5 +431,41 @@ describe('assertionPullFrom (OT-RFC-43 §10.5.3 wm/pull-from)', () => {
     // The stale prior root is GONE — replaced, not appended.
     expect(rows.has(OTHER_FILE_ENTITY)).toBe(false);
     expect(rows.size).toBe(2);
+  });
+
+  // #1116 (round 8): the subset gate must hold even when a STALE FULL seal exists.
+  // A subset re-share never re-seals, and `create` without discard doesn't clear
+  // the seal (it lives on the name-keyed assertion URI, outside the lifecycle-URN
+  // clean-slate) — so an SWM pull that trusts the seal's rootEntities would short-
+  // circuit the gate and reconstruct/publish the superseded FULL set. The fix
+  // resolves SWM scope ALWAYS from the marker-gated member rows, never the seal.
+  // This pins it: stale seal {A,B} + member rows {A,B} + marker CLEARED (the
+  // subset-reshare state) → the SWM pull must REJECT, NOT trust the seal.
+  it('#1116 (round 8): a STALE full seal does NOT bypass the subset gate on an SWM pull', async () => {
+    const { publisher, store } = await makePublisher();
+    const lifecycleUri = assertionLifecycleUri(CG, AGENT, NAME);
+    const metaGraph = contextGraphMetaUri(CG);
+
+    await store.insert([
+      // SWM content for both entities (a prior full share left them here)...
+      q(ENTITY_1, SCHEMA, '"Alice"', SWM_GRAPH),
+      q(ENTITY_2, SCHEMA, '"Bob"', SWM_GRAPH),
+      // ...a STALE FULL seal over {A, B} (a subset re-share never re-sealed it)...
+      ...sealEntities([ENTITY_1, ENTITY_2]),
+      // ...and the promote-stamped member rows {A, B}.
+      q(lifecycleUri, `${DKG}rootEntity`, ENTITY_1, metaGraph),
+      q(lifecycleUri, `${DKG}rootEntity`, ENTITY_2, metaGraph),
+    ]);
+    // The marker is CLEARED — this is the post-subset-reshare state (round 6
+    // clears it on a subset share). The member rows still exist (subset append),
+    // but the asset is NOT a publishable full share.
+    expect(await publisher.hasSwmShareComplete(CG, NAME, AGENT)).toBe(false);
+
+    // Pre-round-8 the seal's rootEntities short-circuited scope and the pull
+    // SUCCEEDED, reconstructing the stale full {A, B}. Now it must REJECT.
+    const err = await publisher
+      .assertionPullFrom(CG, NAME, AGENT, 'swm', { onConflict: 'replace' })
+      .catch((e) => e);
+    expect((err as any).code).toBe('SWM_SUBSET_NOT_SEALABLE');
   });
 });

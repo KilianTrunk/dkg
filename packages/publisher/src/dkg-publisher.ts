@@ -5100,18 +5100,24 @@ export class DKGPublisher implements Publisher {
     // layer=swm) and recovery reconstruct the WM draft without first finalizing.
     // VM pulls still require the seal (VM content is keyed by the published
     // roots, which only the seal records).
-    let entities = seal?.rootEntities ?? [];
-    if (entities.length === 0 && sourceLayer === 'swm') {
-      // #1116 (review A1, round 5) — the seal-less SWM reconstruction is the
-      // ROOT of the subset-publishability bypass: it reads the promoted root
-      // rows wholesale, and a SUBSET share also stamps those rows. The
-      // finalize(layer:"swm") wrapper guards on hasSwmShareComplete, but this
-      // source is ALSO reachable via the wm/pull-from route + a plain finalize,
-      // which skips that wrapper. Gate it here at the source: if promoted roots
-      // exist but the full-share marker is absent, the asset was only SUBSET-
-      // shared — reconstructing/sealing it would publish a partial asset under
-      // the KA name. (A real seal short-circuits before this branch, so a
-      // genuinely finalized asset is never blocked.)
+    // #1116 (review A1, rounds 5/7/8) — the SWM reconstruction is the ROOT of the
+    // subset-publishability bypass, and the guard MUST live here at the single
+    // publisher chokepoint so EVERY caller is covered (the finalize(layer:"swm")
+    // wrapper AND the direct wm/pull-from route + a plain finalize).
+    //
+    // Crucially, an SWM pull must NEVER trust the seal's rootEntities for scope:
+    // a stale FULL seal survives a SUBSET re-share (a subset share never
+    // re-seals, and `create` without a discard does not clear the seal — it lives
+    // on the name-keyed assertion URI, outside the lifecycle-URN clean-slate). If
+    // we read that stale seal it would short-circuit the subset gate below and let
+    // the direct route reconstruct + publish a superseded/partial asset under the
+    // KA name (round-8 live repro). So for SWM we ALWAYS resolve from the
+    // promote-stamped member rows, gated on the full-share completeness marker —
+    // the seal is rebuilt at the next finalize anyway (and torn down below). VM
+    // pulls still use the seal (VM content is keyed by the published roots, which
+    // only the seal records).
+    let entities: string[];
+    if (sourceLayer === 'swm') {
       const promotedRoots = await this.readPromotedRootEntities(contextGraphId, agentAddress, name, subGraphName);
       if (promotedRoots.length > 0) {
         const fullyShared = await this.hasSwmShareComplete(contextGraphId, name, agentAddress, subGraphName);
@@ -5127,6 +5133,8 @@ export class DKGPublisher implements Publisher {
         }
       }
       entities = promotedRoots;
+    } else {
+      entities = seal?.rootEntities ?? [];
     }
     if (entities.length === 0) {
       throw new Error(

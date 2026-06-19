@@ -249,50 +249,58 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
       );
     }
 
-    // OT-RFC-53: when the on-chain CG registration deposit is active, approve
-    // it to the ContextGraphs facade, which pulls it into the CSS vault as the
-    // CG's prepaid publishing escrow. No-op when the deposit is 0 (dormant) or
-    // ParametersStorage is unresolved.
-    const ps = this.contracts.parametersStorage as Contract | undefined;
-    if (ps) {
-      let deposit = 0n;
+    const contextGraphs = this.contracts.contextGraphs;
+    const createArgs = [
+      params.participantAgents ?? [],
+      params.metadataBatchId ?? 0n,
+      params.accessPolicy,
+      params.publishPolicy,
+      params.publishAuthority ?? ethers.ZeroAddress,
+      params.publishAuthorityAccountId ?? 0n,
+      // OT-RFC-38 / LU-6 Phase B — opt-in wire-id commitment. Default
+      // `bytes32(0)` opts out; the agent supplies a non-zero hash
+      // (typically `keccak256(bytes(cleartextId))`) to enable cores'
+      // chain-event-driven host-mode auto-subscribe path.
+      params.nameHash ?? ethers.ZeroHash,
+    ];
+    const submitCreate = () =>
+      this.sendContractTransaction(
+        contextGraphs,
+        'createContextGraph',
+        createArgs,
+        this.signer,
+        'create on-chain context graph',
+      );
+
+    // OT-RFC-53: when the registration deposit is active, createContextGraph
+    // pulls it via transferFrom and reverts until the ContextGraphs facade is
+    // approved. Recover LAZILY (mirrors the publish/update #888 allowance
+    // recovery): on a first-attempt revert, if a deposit is actually configured,
+    // approve it to the facade and retry once. The common path (deposit dormant)
+    // is a single tx with NO extra eth_call, so it never perturbs timing-
+    // sensitive integration tests.
+    const receipt = await (async () => {
       try {
-        deposit = await ps.contextGraphRegistrationDeposit();
-      } catch {
-        // Pre-OT-RFC-53 ParametersStorage (getter absent) or an ABI/bytecode
-        // mismatch — treat as no deposit. createContextGraph reverts loudly if
-        // a deposit is actually required on-chain, so this never underpays.
-        deposit = 0n;
-      }
-      if (deposit > 0n) {
+        return await submitCreate();
+      } catch (err) {
+        const ps = this.contracts.parametersStorage as Contract | undefined;
+        let deposit = 0n;
+        try {
+          deposit = ps ? await ps.contextGraphRegistrationDeposit() : 0n;
+        } catch {
+          deposit = 0n;
+        }
+        if (deposit === 0n) throw err;
         await this.ensureV10ApproveTrac(
           this.signer,
-          await this.contracts.contextGraphs.getAddress(),
+          await contextGraphs.getAddress(),
           deposit,
           'cg registration deposit',
+          true,
         );
+        return submitCreate();
       }
-    }
-
-    const receipt = await this.sendContractTransaction(
-      this.contracts.contextGraphs,
-      'createContextGraph',
-      [
-        params.participantAgents ?? [],
-        params.metadataBatchId ?? 0n,
-        params.accessPolicy,
-        params.publishPolicy,
-        params.publishAuthority ?? ethers.ZeroAddress,
-        params.publishAuthorityAccountId ?? 0n,
-        // OT-RFC-38 / LU-6 Phase B — opt-in wire-id commitment. Default
-        // `bytes32(0)` opts out; the agent supplies a non-zero hash
-        // (typically `keccak256(bytes(cleartextId))`) to enable cores'
-        // chain-event-driven host-mode auto-subscribe path.
-        params.nameHash ?? ethers.ZeroHash,
-      ],
-      this.signer,
-      'create on-chain context graph',
-    );
+    })();
 
     let contextGraphId: bigint | undefined;
     for (const log of receipt.logs) {

@@ -417,6 +417,38 @@ describe('/api/knowledge-assets routes (real daemon, real chain)', () => {
       const res = await postJson(daemon, '/api/knowledge-assets/pub-real/vm/publish', { contextGraphId: REG });
       expect(res.status).toBeGreaterThanOrEqual(500);
     });
+
+    // #1116 (round 5, FIX 3a): the /vm/publish auto-register branch. Publishing a
+    // FINALIZED+SHARED KA on a created-but-UNregistered CG must transparently
+    // register the CG on-chain (the deferred-registration step), NOT 400 with
+    // "not registered on-chain". After the call the CG has a truthy on-chain id,
+    // and the publish then fails ONLY at the edge-node ACK-quorum step (5xx,
+    // "no connected core peers"), never the registration precondition. A
+    // regression that drops the auto-register branch would 400 here instead.
+    it('auto-registers an UNregistered CG at publish time, then fails only at ACK quorum (5xx, not "not registered")', async () => {
+      // LOCAL was created (beforeAll) but DELIBERATELY never registered on-chain.
+      await createKa(LOCAL, 'pub-autoreg');
+      // Unique subject so the SWM selection can't cross-match another KA's quad.
+      await write(LOCAL, 'pub-autoreg', [{ subject: 'ex:autoreg-only', predicate: 'ex:p', object: '"x"' }]);
+      await postJson(daemon, '/api/knowledge-assets/pub-autoreg/wm/finalize', { contextGraphId: LOCAL });
+      await postJson(daemon, '/api/knowledge-assets/pub-autoreg/swm/share', { contextGraphId: LOCAL });
+
+      const res = await postJson(daemon, '/api/knowledge-assets/pub-autoreg/vm/publish', { contextGraphId: LOCAL });
+
+      // The auto-register branch fired: this is NOT the unregistered-CG 400 (nor
+      // the "could not be auto-registered" 400) — it proceeded to the on-chain
+      // publish and failed only at the edge-node ACK-quorum step (devnet-tier 5xx).
+      expect(res.status).toBeGreaterThanOrEqual(500);
+      expect(String(res.body?.error ?? '')).not.toMatch(/not registered on-chain/i);
+      expect(String(res.body?.error ?? '')).not.toMatch(/could not be auto-registered/i);
+
+      // And LOCAL now carries a truthy on-chain id — registration actually happened.
+      const list = await getJson(daemon, '/api/context-graph/list');
+      const local = (list.body?.contextGraphs ?? []).find((c: any) => c.id === LOCAL);
+      expect(local, `LOCAL CG descriptor: ${JSON.stringify(list.body)}`).toBeTruthy();
+      const onChainId = local?.onChainId ?? local?.onChainContextGraphId;
+      expect(onChainId, `expected a truthy on-chain id after auto-register, got ${JSON.stringify(local)}`).toBeTruthy();
+    });
   });
 
   // ── GET /:name descriptor ─────────────────────────────────────────

@@ -3222,13 +3222,31 @@ export class PublishMethods extends DKGAgentBase {
     const existingOnChainId = await this.getContextGraphOnChainId(contextGraphId);
     if (existingOnChainId) return;
     const storedOpts = await this.getStoredContextGraphRegistrationOptions(contextGraphId);
-    await this.registerContextGraph(contextGraphId, {
-      ...(opts?.callerAgentAddress != null ? { callerAgentAddress: opts.callerAgentAddress } : {}),
-      ...(storedOpts.publishPolicy !== undefined ? { publishPolicy: storedOpts.publishPolicy } : {}),
-      ...(storedOpts.publishAuthorityAccountId !== undefined
-        ? { publishAuthorityAccountId: storedOpts.publishAuthorityAccountId }
-        : {}),
-    });
+    try {
+      await this.registerContextGraph(contextGraphId, {
+        ...(opts?.callerAgentAddress != null ? { callerAgentAddress: opts.callerAgentAddress } : {}),
+        ...(storedOpts.publishPolicy !== undefined ? { publishPolicy: storedOpts.publishPolicy } : {}),
+        ...(storedOpts.publishAuthorityAccountId !== undefined
+          ? { publishAuthorityAccountId: storedOpts.publishAuthorityAccountId }
+          : {}),
+      });
+    } catch (err: any) {
+      // #1116 (round 5) — check-then-act race. Two first-publishers of the same
+      // CG can both pass the `existingOnChainId` check, then one's
+      // registerContextGraph lands first; the loser throws "already registered
+      // on-chain". That's success, not failure — the CG IS registered. Confirm
+      // an on-chain id now exists (the winner's) and return; rethrow anything
+      // else (a genuine registration failure: insufficient TRAC / no signer).
+      // No double-mint: registerContextGraph itself short-circuits on a present
+      // id; this only swallows the benign concurrent-winner rejection.
+      if (
+        /already registered on-chain/i.test(err?.message ?? String(err)) &&
+        (await this.getContextGraphOnChainId(contextGraphId))
+      ) {
+        return;
+      }
+      throw err;
+    }
   }
 
   /**
@@ -3472,6 +3490,26 @@ export class PublishMethods extends DKGAgentBase {
             `0n placeholder id would revert on-chain with KaIdNamespaceMismatch. ` +
             `Re-finalize the assertion (POST /api/knowledge-assets/${name}/wm/finalize) ` +
             `so the AuthorAttestation binds a valid packed kaId before publishing.`,
+        );
+      }
+      // #1116 (round 5) — no-data preflight BEFORE the inner publisher's
+      // CG-not-registered guard. `publishFromSharedMemory` checks registration
+      // (throws CG_NOT_REGISTERED) BEFORE its own no-quads check, so an
+      // UNregistered CG + valid seal + EMPTY sealed SWM would surface
+      // CG_NOT_REGISTERED first — the /vm/publish route then auto-registers
+      // (burning mint gas) and only the retry hits the no-quads 409. The legacy
+      // memory.ts publish path had a SWM preflight to avoid exactly this; mirror
+      // it here so the no-data precondition fires for ALL callers regardless of
+      // registration. Match the publisher's wording so the route's existing 409
+      // mapping (/No quads in shared memory/) still applies.
+      const sealedSwmQuads = await this._loadSelectedSWMQuads(
+        contextGraphId,
+        { rootEntities: seal.rootEntities },
+        opts?.subGraphName,
+      );
+      if (sealedSwmQuads.length === 0) {
+        throw new Error(
+          `No quads in shared memory for context graph ${contextGraphId} matching selection`,
         );
       }
       result = await this.publishFromSharedMemory(

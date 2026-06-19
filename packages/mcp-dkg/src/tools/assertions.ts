@@ -35,12 +35,23 @@ const errResult = (text: string): ToolResult => ({
 const formatError = (e: unknown): string =>
   e instanceof Error ? e.message : String(e);
 
-// #1116: the publishReady:false warning surfaced after a share that did NOT
-// seal (subset or skipSeal:true). Kept byte-identical across the MCP, OpenClaw,
-// and Hermes adapters (cross-adapter parity invariant).
+// #1116: the publishReady:false warning surfaced after a FULL share that opted
+// out of sealing (skipSeal:true) — a later finalize(layer:swm) DOES seal it.
+// Kept byte-identical across the MCP, OpenClaw, and Hermes adapters
+// (cross-adapter parity invariant).
 const SHARE_NOT_PUBLISH_READY_WARNING =
   'Shared to SWM but NOT publish-ready (sealed:false). Seal it with ' +
   'dkg_knowledge_asset_finalize (layer:swm works after sharing), then publish.';
+
+// #1116: a SUBSET share is publishReady:false too, but unlike a skipSeal full
+// share it is NOT sealable — finalize(layer:swm) now REJECTS it with
+// SWM_SUBSET_NOT_SEALABLE. Surface the real recovery (full share / new asset)
+// instead of the dead-end "seal it" advice. Byte-identical across all three
+// adapters (cross-adapter parity invariant).
+const SHARE_SUBSET_NOT_PUBLISH_READY_WARNING =
+  'Shared a SUBSET to SWM for peer visibility. A subset is NOT sealable/' +
+  'publishable (finalize layer:swm will reject it). To publish on-chain, share ' +
+  'the full asset (entities:"all"), or model this subset as its own knowledge asset.';
 
 /**
  * The daemon's real assertion-name rule, replicated verbatim from
@@ -357,16 +368,26 @@ export function registerAssertionTools(
           entities: trimmedEntities,
           skipSeal,
         });
-        const scope = Array.isArray(entities)
+        // A subset is a non-empty specific array (an empty array was rejected
+        // above; "all"/omitted is a full share). Reused for both the scope label
+        // and the not-publish-ready warning branch.
+        const isSubset = Array.isArray(entities);
+        const scope = isSubset
           ? `${entities.length} entit${entities.length === 1 ? 'y' : 'ies'}`
           : 'all root entities';
         // #1116: surface the seal outcome. A full share seals by default
-        // (publishReady:true); a subset / skipSeal:true is SWM-only and NOT
-        // publish-ready — warn so the agent knows a finalize is still required.
+        // (publishReady:true); a subset / skipSeal:true full share is SWM-only and
+        // NOT publish-ready. Branch the warning: a skipSeal full share is sealable
+        // later (finalize layer:swm works), but a SUBSET is NOT sealable —
+        // finalize layer:swm rejects it (SWM_SUBSET_NOT_SEALABLE) — so the only
+        // recovery is a full share or a new asset.
         if (result.publishReady === false) {
+          const warning = isSubset
+            ? SHARE_SUBSET_NOT_PUBLISH_READY_WARNING
+            : SHARE_NOT_PUBLISH_READY_WARNING;
           return ok(
             `Shared ${scope} from knowledge asset '${name}' (project '${pid}') to SWM. ` +
-            `${SHARE_NOT_PUBLISH_READY_WARNING}`,
+            `${warning}`,
           );
         }
         return ok(
@@ -406,8 +427,10 @@ export function registerAssertionTools(
         'named asset; it is multi-root-safe and avoids the legacy single-root ' +
         'SWM constraint. Fails 409 if the asset is not yet finalized + shared ' +
         '(run dkg_knowledge_asset_finalize / dkg_knowledge_asset_share first). ' +
-        'vm/publish requires the context graph to be registered on-chain — set ' +
-        '`registerIfNeeded: true` to register it first (idempotent) before publishing.',
+        'vm/publish AUTO-registers an unregistered context graph on-chain at ' +
+        'gas/TRAC cost regardless of `registerIfNeeded` (no explicit register ' +
+        'step is needed). `registerIfNeeded: true` only lets you choose the ' +
+        'registration\'s accessPolicy first.',
       inputSchema: {
         // CONTRACT §C: publishEpochs is a POSITIVE integer (zod rejects 0 /
         // negative / non-integer at the boundary → a fail-fast tool error).
@@ -426,21 +449,23 @@ export function registerAssertionTools(
           .regex(/^\d+$/, 'publisher_node_identity_id_override must be a non-negative integer (decimal string)')
           .optional()
           .describe('Optional publisher node identity id override (non-negative integer, decimal string)'),
-        // CONTRACT §G: vm/publish requires the CG to be registered on-chain and
-        // does NOT auto-register. registerIfNeeded registers first (idempotent),
-        // mirroring dkg_shared_memory_publish.
+        // CONTRACT §G: vm/publish AUTO-registers an unregistered CG transparently
+        // (#1116) at gas/TRAC cost regardless of registerIfNeeded. registerIfNeeded
+        // only runs an EXPLICIT register first so you can choose the registration's
+        // accessPolicy (the implicit auto-register defaults the policy).
         registerIfNeeded: z
           .boolean()
           .optional()
           .describe(
-            'If the context graph is not yet registered on-chain, register it first (idempotent), then ' +
-            'publish. Registration may spend gas/TRAC; opt-in. Default false — when false and the CG is ' +
-            'unregistered, publish fails with the daemon\'s not-registered error. CAVEAT: this uses the ' +
-            'explicit register route, which registers with the daemon\'s DEFAULT publishPolicy (derived from ' +
-            'accessPolicy) and does NOT preserve a context graph\'s stored custom publishPolicy / ' +
-            'contribution governance. For a CG created with a non-default publishPolicy/PCA, register it ' +
-            'explicitly with the desired policy first rather than relying on registerIfNeeded. (Read access ' +
-            'is unaffected; daemon-side rehydration tracked in OriginTrail/dkg#1085.)',
+            'Run an EXPLICIT on-chain registration before publishing, which lets you set `accessPolicy` on ' +
+            'that registration. NOTE: this does NOT gate whether registration happens — vm/publish ' +
+            'AUTO-registers an unregistered context graph at gas/TRAC cost regardless of this flag. Set it ' +
+            'only to choose the registration\'s accessPolicy (the implicit auto-register on publish otherwise ' +
+            'defaults the policy). CAVEAT: this explicit register route registers with the daemon\'s DEFAULT ' +
+            'publishPolicy (derived from accessPolicy) and does NOT preserve a context graph\'s stored custom ' +
+            'publishPolicy / contribution governance. For a CG created with a non-default publishPolicy/PCA, ' +
+            'register it explicitly with the desired policy first rather than relying on registerIfNeeded. ' +
+            '(Read access is unaffected; daemon-side rehydration tracked in OriginTrail/dkg#1085.)',
           ),
         accessPolicy: z
           .union([z.literal(0), z.literal(1)])
@@ -471,11 +496,12 @@ export function registerAssertionTools(
       if (accessPolicy !== undefined && registerIfNeeded !== true) {
         return errResult('"accessPolicy" requires "registerIfNeeded": true — it only applies when registering the context graph.');
       }
-      // CONTRACT §G: vm/publish requires the CG to be registered on-chain and does
-      // NOT auto-register. When registerIfNeeded is true, register first (the
-      // client short-circuits an already-registered CG via alreadyRegistered), then
-      // publish — mirroring dkg_shared_memory_publish. A hard registration failure
-      // is a tool error: do NOT publish.
+      // CONTRACT §G: vm/publish AUTO-registers an unregistered CG transparently
+      // (#1116) regardless of registerIfNeeded. When registerIfNeeded is true we
+      // run an EXPLICIT register first (the client short-circuits an already-
+      // registered CG via alreadyRegistered) so the caller can choose the
+      // registration's accessPolicy — mirroring dkg_shared_memory_publish. A hard
+      // registration failure is a tool error: do NOT publish.
       if (registerIfNeeded === true) {
         try {
           await client.registerContextGraph({ id: pid, accessPolicy });

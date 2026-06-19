@@ -154,8 +154,9 @@ export function buildAssertionTools(ctx: DkgToolHost): OpenClawTool[] {
         'overrides. Prefer this over dkg_shared_memory_publish when publishing a single named asset; it is ' +
         'multi-root-safe and avoids the legacy single-root SWM constraint. Fails 409 if the asset is not yet ' +
         'finalized + shared (run dkg_knowledge_asset_finalize / dkg_knowledge_asset_share first). vm/publish ' +
-        'requires the context graph to be registered on-chain — set `register_if_needed: true` to register it ' +
-        'first (idempotent) before publishing.',
+        'AUTO-registers an unregistered context graph on-chain at gas/TRAC cost regardless of ' +
+        '`register_if_needed` (no explicit register step is needed). `register_if_needed: true` only lets you ' +
+        'choose the registration\'s access_policy first.',
       parameters: {
         type: 'object',
         properties: {
@@ -169,14 +170,16 @@ export function buildAssertionTools(ctx: DkgToolHost): OpenClawTool[] {
           register_if_needed: {
             type: 'boolean',
             description:
-              'If the context graph is not yet registered on-chain, register it first (idempotent), then publish. ' +
-              'Registration may spend gas/TRAC; it is opt-in. Default false — when false and the CG is ' +
-              'unregistered, publish fails with the daemon\'s not-registered error. CAVEAT: this uses the ' +
-              'explicit register route, which registers with the daemon\'s DEFAULT publishPolicy (derived from ' +
-              'access_policy) and does NOT preserve a context graph\'s stored custom publishPolicy / ' +
-              'contribution governance. For a CG created with a non-default publishPolicy/PCA, register it ' +
-              'explicitly with the desired policy first rather than relying on register_if_needed. (Read access ' +
-              'is unaffected; daemon-side rehydration tracked in OriginTrail/dkg#1085.)',
+              'Run an EXPLICIT on-chain registration before publishing, which lets you set access_policy on ' +
+              'that registration. NOTE: this does NOT gate whether registration happens — vm/publish ' +
+              'AUTO-registers an unregistered context graph at gas/TRAC cost regardless of this flag. Set it ' +
+              'only to choose the registration\'s access_policy (the implicit auto-register on publish ' +
+              'otherwise defaults the policy). CAVEAT: this explicit register route registers with the ' +
+              'daemon\'s DEFAULT publishPolicy (derived from access_policy) and does NOT preserve a context ' +
+              'graph\'s stored custom publishPolicy / contribution governance. For a CG created with a ' +
+              'non-default publishPolicy/PCA, register it explicitly with the desired policy first rather than ' +
+              'relying on register_if_needed. (Read access is unaffected; daemon-side rehydration tracked in ' +
+              'OriginTrail/dkg#1085.)',
           },
           access_policy: {
             type: 'number',

@@ -19,6 +19,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { createServer, type Server } from 'node:http';
 import { handleKnowledgeAssetsRoutes } from '../src/daemon/routes/knowledge-assets.js';
+import { daemonState } from '../src/daemon/state.js';
 
 const CG_ID = 'issue-1116-cg';
 const ASSERTION_NAME = 'seal-asset';
@@ -162,5 +163,79 @@ describe('#1116 share/seal route error mapping (fake agent)', () => {
 
     const res = await post('swm/share', { contextGraphId: CG_ID });
     expect(res.status).toBeGreaterThanOrEqual(500);
+  });
+
+  // #1116 (round 5, FIX 1): the seal-less SWM reconstruction is reachable via the
+  // wm/pull-from route + a plain finalize, which bypasses the finalize(layer:"swm")
+  // wrapper guard. The publisher now rejects a subset-only asset at the source with
+  // SWM_SUBSET_NOT_SEALABLE; the wm/pull-from route must map it to 409 (parity with
+  // the wm/finalize verb) so a partial asset can't be reconstructed under the KA name.
+  it('wm/pull-from: SWM_SUBSET_NOT_SEALABLE → 409 { code, error }', async () => {
+    await startWith({
+      pullFrom: async () => {
+        throw Object.assign(
+          new Error('"seal-asset" in context graph "issue-1116-cg" was only shared to SWM as a SUBSET — reconstructing or sealing it would publish a partial asset under the KA name. Share the full asset (entities:"all") before sealing in SWM.'),
+          { code: 'SWM_SUBSET_NOT_SEALABLE' },
+        );
+      },
+    });
+
+    const res = await post('wm/pull-from', { contextGraphId: CG_ID, layer: 'swm' });
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe('SWM_SUBSET_NOT_SEALABLE');
+    expect(String(res.body.error)).toContain('only shared to SWM as a SUBSET');
+  });
+
+  it('wm/pull-from: an unrelated pull error still propagates (not silently 409ed)', async () => {
+    // Guard: the new 409 branch must only catch SWM_SUBSET_NOT_SEALABLE /
+    // WM_DRAFT_CONFLICT. Any other error rethrows to the outer handler (→ 500).
+    await startWith({
+      pullFrom: async () => {
+        throw new Error('some unrelated pull failure');
+      },
+    });
+
+    const res = await post('wm/pull-from', { contextGraphId: CG_ID, layer: 'swm' });
+    expect(res.status).toBeGreaterThanOrEqual(500);
+  });
+
+  // #1116 (round 5, FIX 5): the async swm/share queue ALWAYS seals (the safe
+  // default) and can't carry skipSeal through the job — it used to silently drop
+  // it. The route now rejects a non-boolean skipSeal (parity with the sync route)
+  // and a truthy boolean outright (rather than honoring it differently).
+  describe('swm/share-async skipSeal validation', () => {
+    afterEach(() => {
+      daemonState.promoteWorkerAvailable = false;
+    });
+
+    it('rejects a non-boolean skipSeal with 400', async () => {
+      daemonState.promoteWorkerAvailable = true;
+      await startWith({
+        promoteAsync: async () => ({ jobId: 'should-not-reach' }),
+      });
+      const res = await post('swm/share-async', { contextGraphId: CG_ID, skipSeal: 'false' });
+      expect(res.status).toBe(400);
+      expect(String(res.body.error)).toContain('skipSeal');
+    });
+
+    it('rejects a truthy boolean skipSeal with 400 (not supported for async)', async () => {
+      daemonState.promoteWorkerAvailable = true;
+      await startWith({
+        promoteAsync: async () => ({ jobId: 'should-not-reach' }),
+      });
+      const res = await post('swm/share-async', { contextGraphId: CG_ID, skipSeal: true });
+      expect(res.status).toBe(400);
+      expect(String(res.body.error)).toContain('not supported for async');
+    });
+
+    it('accepts skipSeal:false (the seal-always default) and enqueues', async () => {
+      daemonState.promoteWorkerAvailable = true;
+      await startWith({
+        promoteAsync: async () => ({ jobId: 'job-123' }),
+      });
+      const res = await post('swm/share-async', { contextGraphId: CG_ID, skipSeal: false });
+      expect(res.status).toBe(200);
+      expect(res.body.jobId).toBe('job-123');
+    });
   });
 });

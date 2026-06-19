@@ -4613,6 +4613,34 @@ export class DKGPublisher implements Publisher {
     }]);
   }
 
+  /**
+   * #1116 (review A1, round 5) — CLEAR the SWM-share-complete marker.
+   *
+   * `markSwmShareComplete` only ever SET the marker (so a benign full-share
+   * recreate-retry never lost it), but that left two holes: a marked
+   * full-share that was later DISCARDED, or RE-shared as a strict SUBSET, kept
+   * a stale marker — letting `finalize(layer:"swm")` (and the seal-less
+   * pull-from source) publish a partial asset under the KA name. We now clear
+   * the marker at exactly the two moments scope is genuinely reduced: on
+   * `assertionDiscard`, and on a subset share (promote's non-full branch). It
+   * survives a full-share recreate-retry because A2_PRESERVE re-arms it and the
+   * full-share path re-stamps it — it is only cleared when scope actually drops.
+   */
+  async clearSwmShareComplete(
+    contextGraphId: string,
+    name: string,
+    agentAddress: string,
+    subGraphName?: string,
+  ): Promise<void> {
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    const lifecycleUri = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
+    await this.store.deleteByPattern({
+      graph: metaGraph,
+      subject: lifecycleUri,
+      predicate: SWM_SHARE_COMPLETE_PRED,
+    });
+  }
+
   /** #1116 (review A1) — ASK whether the SWM-share-complete marker is present. */
   async hasSwmShareComplete(
     contextGraphId: string,
@@ -5042,7 +5070,31 @@ export class DKGPublisher implements Publisher {
     // roots, which only the seal records).
     let entities = seal?.rootEntities ?? [];
     if (entities.length === 0 && sourceLayer === 'swm') {
-      entities = await this.readPromotedRootEntities(contextGraphId, agentAddress, name, subGraphName);
+      // #1116 (review A1, round 5) — the seal-less SWM reconstruction is the
+      // ROOT of the subset-publishability bypass: it reads the promoted root
+      // rows wholesale, and a SUBSET share also stamps those rows. The
+      // finalize(layer:"swm") wrapper guards on hasSwmShareComplete, but this
+      // source is ALSO reachable via the wm/pull-from route + a plain finalize,
+      // which skips that wrapper. Gate it here at the source: if promoted roots
+      // exist but the full-share marker is absent, the asset was only SUBSET-
+      // shared — reconstructing/sealing it would publish a partial asset under
+      // the KA name. (A real seal short-circuits before this branch, so a
+      // genuinely finalized asset is never blocked.)
+      const promotedRoots = await this.readPromotedRootEntities(contextGraphId, agentAddress, name, subGraphName);
+      if (promotedRoots.length > 0) {
+        const fullyShared = await this.hasSwmShareComplete(contextGraphId, name, agentAddress, subGraphName);
+        if (!fullyShared) {
+          throw Object.assign(
+            new Error(
+              `"${name}" in context graph "${contextGraphId}" was only shared to SWM as a SUBSET — `
+              + `reconstructing or sealing it would publish a partial asset under the KA name. `
+              + `Share the full asset (entities:"all") before sealing in SWM.`,
+            ),
+            { code: 'SWM_SUBSET_NOT_SEALABLE' },
+          );
+        }
+      }
+      entities = promotedRoots;
     }
     if (entities.length === 0) {
       throw new Error(
@@ -5565,6 +5617,17 @@ export class DKGPublisher implements Publisher {
 
     const metaGraph = contextGraphMetaUri(contextGraphId);
     await this.store.deleteByPattern({ subject: graphUri, graph: metaGraph });
+    // #1116 (review A1, round 5) — drop the SWM-share-complete marker too. A
+    // marker survives discard via A2_PRESERVE on recreate, so a full-share →
+    // discard → recreate → subset-share cycle would otherwise leave a stale
+    // marker and let finalize(layer:"swm") publish the subset as the full KA.
+    // Clearing on discard re-arms the gate: the next share must re-prove
+    // completeness (a full share re-stamps it; a subset never sets it).
+    await this.store.deleteByPattern({
+      graph: metaGraph,
+      subject: lifecycleSubject,
+      predicate: SWM_SHARE_COMPLETE_PRED,
+    });
     await this.store.dropGraph(graphUri);
   }
 

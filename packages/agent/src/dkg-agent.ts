@@ -1987,12 +1987,20 @@ export class DKGAgent extends DKGAgentBase {
         // #1116 (review A1) — stamp the SWM-share-complete marker ONLY on a true
         // FULL share: entities:"all" AND every root actually landed in SWM
         // (promotedAllRoots — no foreign-owned roots skipped). finalize(layer:"swm")
-        // gates on this so a SUBSET share (which still stamps dkg:rootEntity member
-        // rows) cannot be sealed-in-SWM and published as a partial asset under the
-        // KA name. A later subset share must NEVER unset it — so it is only ever
-        // SET here, on a complete full share, never cleared.
+        // (and the seal-less pull-from source) gates on this so a SUBSET share
+        // (which still stamps dkg:rootEntity member rows) cannot be sealed-in-SWM
+        // and published as a partial asset under the KA name.
+        //
+        // round 5 — and CLEAR it on the inverse branch (a strict subset / a
+        // foreign-owned-root-skipped share). A2_PRESERVE carries the marker
+        // across a discard+recreate, so a full-share → recreate → subset-share
+        // would otherwise keep a stale marker. Clearing the instant scope is
+        // actually reduced re-arms the gate; a benign full-share recreate-retry
+        // re-stamps it here, so legit seal-in-SWM recovery is unaffected.
         if (promotingAllEntities && promotedAllRoots) {
           await agent.publisher.markSwmShareComplete(contextGraphId, name, agentAddress, opts?.subGraphName);
+        } else {
+          await agent.publisher.clearSwmShareComplete(contextGraphId, name, agentAddress, opts?.subGraphName);
         }
         // #1116: `sealed` reflects THIS share — a subset share or a skipSeal
         // share is `sealed:false` BY DESIGN, not a failure. `publishReady` means

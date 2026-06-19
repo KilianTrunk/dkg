@@ -170,6 +170,11 @@ describe('assertionPullFrom (OT-RFC-43 §10.5.3 wm/pull-from)', () => {
       // NO seal — instead the promote-stamped member row on the lifecycle URN:
       q(assertionLifecycleUri(CG, AGENT, NAME), `${DKG}rootEntity`, ENTITY_1, contextGraphMetaUri(CG)),
     ]);
+    // #1116 (round 5): the seal-less SWM reconstruction now requires the
+    // full-share marker (else it's a SUBSET share, not publishable). A real
+    // skipSeal FULL share stamps it via promote(); set it here to represent
+    // that legitimate full-share state.
+    await publisher.markSwmShareComplete(CG, NAME, AGENT);
     const result = await publisher.assertionPullFrom(CG, NAME, AGENT, 'swm');
     expect(result.fromLayer).toBe('swm');
     expect(result.entities).toBe(1);
@@ -197,6 +202,10 @@ describe('assertionPullFrom (OT-RFC-43 §10.5.3 wm/pull-from)', () => {
       q(SKOLEM_1, SCHEMA, '"Alice detail"', SWM_GRAPH),
       q(lifecycleUri, `${DKG}rootEntity`, ENTITY_1, metaGraph),
     ]);
+    // #1116 (round 5): a real FULL skipSeal share stamps the full-share marker
+    // (it survives assertionCreate's clean-slate via A2_PRESERVE), so the
+    // seal-less reconstruction is allowed; mark it to represent that state.
+    await publisher.markSwmShareComplete(CG, NAME, AGENT);
 
     // Mirror readPromotedRootEntities: the seal-independent member lookup.
     const readRoots = async (): Promise<string[]> => {
@@ -257,5 +266,66 @@ describe('assertionPullFrom (OT-RFC-43 §10.5.3 wm/pull-from)', () => {
       `SELECT ?o WHERE { GRAPH <${metaGraph}> { <${lifecycleUri}> <${DKG}swmShareComplete> ?o } }`,
     );
     expect(rows.type === 'bindings' && rows.bindings.length).toBe(1);
+  });
+
+  // #1116 (round 5): the marker MUST be cleared on discard — otherwise the
+  // A2_PRESERVE carry-over re-arms it on a recreate, and a full-share → discard
+  // → recreate → subset-share cycle would keep a stale marker and let
+  // finalize(layer:"swm") publish a partial asset under the KA name.
+  it('#1116: hasSwmShareComplete is FALSE after assertionDiscard (marker cleared)', async () => {
+    const { publisher } = await makePublisher();
+
+    // Open a WM draft, then fully-share (mark complete) — the state a full share
+    // leaves behind.
+    await publisher.assertionWrite(CG, NAME, AGENT, [
+      { subject: ENTITY_1, predicate: SCHEMA, object: '"Alice"' },
+    ]);
+    await publisher.markSwmShareComplete(CG, NAME, AGENT);
+    expect(await publisher.hasSwmShareComplete(CG, NAME, AGENT)).toBe(true);
+
+    // Discard MUST clear the marker.
+    await publisher.assertionDiscard(CG, NAME, AGENT);
+    expect(await publisher.hasSwmShareComplete(CG, NAME, AGENT)).toBe(false);
+  });
+
+  it('#1116: hasSwmShareComplete stays FALSE after discard + recreate (no stale re-arm)', async () => {
+    const { publisher } = await makePublisher();
+
+    await publisher.assertionWrite(CG, NAME, AGENT, [
+      { subject: ENTITY_1, predicate: SCHEMA, object: '"Alice"' },
+    ]);
+    await publisher.markSwmShareComplete(CG, NAME, AGENT);
+    await publisher.assertionDiscard(CG, NAME, AGENT);
+
+    // Recreate on the same name — assertionCreate's A2_PRESERVE clean-slate must
+    // NOT resurrect a marker that discard cleared (it was already gone, so there
+    // is nothing to preserve). The recreated draft is un-marked: a later seal-in-
+    // SWM must re-prove completeness.
+    await publisher.assertionCreate(CG, NAME, AGENT);
+    expect(await publisher.hasSwmShareComplete(CG, NAME, AGENT)).toBe(false);
+  });
+
+  // #1116 (round 5): the subset-publishability bypass is closed at the ROOT —
+  // the seal-less SWM reconstruction. A SUBSET share stamps dkg:rootEntity rows
+  // but NOT the full-share marker, so reconstructing/sealing it (reachable via
+  // the wm/pull-from route + a plain finalize, which bypasses the finalize(
+  // layer:"swm") wrapper guard) must be refused with SWM_SUBSET_NOT_SEALABLE.
+  it('#1116: seal-less SWM pull-from REJECTS a subset-only asset (no full-share marker)', async () => {
+    const { publisher, store } = await makePublisher();
+    const lifecycleUri = assertionLifecycleUri(CG, AGENT, NAME);
+    const metaGraph = contextGraphMetaUri(CG);
+
+    // SUBSET-shared, unsealed: SWM content + the promoted member row, but NO
+    // swmShareComplete marker (a subset share never sets it).
+    await store.insert([
+      q(ENTITY_1, SCHEMA, '"Alice"', SWM_GRAPH),
+      q(lifecycleUri, `${DKG}rootEntity`, ENTITY_1, metaGraph),
+    ]);
+    expect(await publisher.hasSwmShareComplete(CG, NAME, AGENT)).toBe(false);
+
+    const err = await publisher
+      .assertionPullFrom(CG, NAME, AGENT, 'swm')
+      .catch((e) => e);
+    expect((err as any).code).toBe('SWM_SUBSET_NOT_SEALABLE');
   });
 });

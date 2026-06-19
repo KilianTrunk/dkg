@@ -102,12 +102,23 @@ import { buildMessagingTools } from './tools/messaging-tools.js';
 import { buildAssertionTools } from './tools/assertion-tools.js';
 import { buildMemoryTools } from './tools/memory-tools.js';
 
-// #1116: the publishReady:false warning surfaced after a share that did NOT
-// seal (subset or skip_seal:true). Kept byte-identical across the MCP, OpenClaw,
-// and Hermes adapters (cross-adapter parity invariant).
+// #1116: the publishReady:false warning surfaced after a FULL share that opted
+// out of sealing (skip_seal:true) — a later finalize(layer:swm) DOES seal it.
+// Kept byte-identical across the MCP, OpenClaw, and Hermes adapters
+// (cross-adapter parity invariant).
 const SHARE_NOT_PUBLISH_READY_WARNING =
   'Shared to SWM but NOT publish-ready (sealed:false). Seal it with ' +
   'dkg_knowledge_asset_finalize (layer:swm works after sharing), then publish.';
+
+// #1116: a SUBSET share is publishReady:false too, but unlike a skip_seal full
+// share it is NOT sealable — finalize(layer:swm) now REJECTS it with
+// SWM_SUBSET_NOT_SEALABLE. Surface the real recovery (full share / new asset)
+// instead of the dead-end "seal it" advice. Byte-identical across all three
+// adapters (cross-adapter parity invariant).
+const SHARE_SUBSET_NOT_PUBLISH_READY_WARNING =
+  'Shared a SUBSET to SWM for peer visibility. A subset is NOT sealable/' +
+  'publishable (finalize layer:swm will reject it). To publish on-chain, share ' +
+  'the full asset (entities:"all"), or model this subset as its own knowledge asset.';
 
 /**
  * #1116: extract the daemon's recovery hint from a 409 UNSEALED_SHARE_BLOCKED
@@ -3644,10 +3655,17 @@ export class DkgNodePlugin {
         skipSeal,
       });
       // #1116: surface the seal outcome. `sealed`/`publishReady` flow through the
-      // JSON; ALSO add the explicit warning when the share is NOT publish-ready
-      // (subset or skip_seal:true) so the agent knows a finalize is still needed.
+      // JSON; ALSO add the explicit warning when the share is NOT publish-ready.
+      // Branch on the share scope: a skip_seal FULL share is sealable later
+      // (finalize layer:swm works), but a SUBSET is NOT sealable — finalize
+      // layer:swm rejects it (SWM_SUBSET_NOT_SEALABLE) — so the only recovery is a
+      // full share or a new asset. A subset is a non-empty specific array (an empty
+      // array was rejected above; "all"/undefined is a full share).
       if (result && (result as { publishReady?: boolean }).publishReady === false) {
-        return this.json({ ...result, warning: SHARE_NOT_PUBLISH_READY_WARNING });
+        const warning = Array.isArray(entities)
+          ? SHARE_SUBSET_NOT_PUBLISH_READY_WARNING
+          : SHARE_NOT_PUBLISH_READY_WARNING;
+        return this.json({ ...result, warning });
       }
       return this.json(result);
     } catch (err: any) {
@@ -3712,12 +3730,13 @@ export class DkgNodePlugin {
         return this.error('"access_policy" requires "register_if_needed": true — it only applies when registering the context graph.');
       }
 
-      // CONTRACT §G: vm/publish requires the CG to be registered on-chain and does
-      // NOT auto-register. When `register_if_needed` is true, register first
-      // (idempotent — "already registered" is success), mirroring
-      // dkg_shared_memory_publish. A hard registration failure is a tool error: do
-      // NOT publish. When false/omitted, publish directly and surface the daemon's
-      // not-registered error verbatim.
+      // CONTRACT §G: vm/publish AUTO-registers an unregistered CG transparently
+      // (#1116) at gas/TRAC cost regardless of `register_if_needed`. When
+      // `register_if_needed` is true we run an EXPLICIT register first (idempotent —
+      // "already registered" is success) so the caller can choose the registration's
+      // access_policy, mirroring dkg_shared_memory_publish. A hard registration
+      // failure is a tool error: do NOT publish. When false/omitted, publish
+      // directly — the daemon auto-registers and defaults the policy.
       const registration = registerIfNeeded
         ? await this.registerContextGraphIfNeeded(contextGraphId, args.access_policy as number | undefined)
         : undefined;

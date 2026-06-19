@@ -1034,6 +1034,15 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
           if (e?.code === "WM_DRAFT_CONFLICT") {
             return jsonResponse(res, 409, { code: "WM_DRAFT_CONFLICT", error: e.message });
           }
+          // #1116 (round 5): the seal-less SWM reconstruction is also reachable
+          // here (pull-from swm + a plain finalize bypasses the finalize(layer:
+          // "swm") wrapper guard). The publisher now rejects a subset-only asset
+          // at the source with SWM_SUBSET_NOT_SEALABLE — map it to 409 (parity
+          // with the wm/finalize verb's mapping) so a partial asset can't be
+          // reconstructed/published under the KA name.
+          if (e?.code === "SWM_SUBSET_NOT_SEALABLE") {
+            return jsonResponse(res, 409, { code: "SWM_SUBSET_NOT_SEALABLE", error: e.message });
+          }
           throw e; // -> outer catch -> 500
         }
       }
@@ -1090,6 +1099,20 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       if (asyncPromoteUnavailable(res)) return;
       const entities = parsed.entities;
       if (!validateEntities(entities, res)) return;
+      // #1116 (round 5): the sync swm/share validates `skipSeal` as a strict
+      // boolean; the async queue ALWAYS seals (the safe default) and can't carry
+      // skipSeal through the job, so it was silently dropped — a footgun where a
+      // caller asking to skip sealing got a sealed share. Reject a non-boolean
+      // (parity with the sync route) and reject a truthy boolean outright rather
+      // than honoring it differently than requested.
+      if (parsed?.skipSeal !== undefined) {
+        if (typeof parsed.skipSeal !== "boolean") {
+          return jsonResponse(res, 400, { error: '"skipSeal" must be a boolean when supplied' });
+        }
+        if (parsed.skipSeal === true) {
+          return jsonResponse(res, 400, { error: "skipSeal is not supported for async share; use swm/share (the synchronous route) to share without sealing" });
+        }
+      }
       try {
         const result = await agent.assertion.promoteAsync(contextGraphId, name, {
           entities: entities ?? "all",

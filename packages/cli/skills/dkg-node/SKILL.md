@@ -341,22 +341,22 @@ and `kas[].tokenId`.
 
 **Registering the CG for VM.** Verifiable-Memory publishing requires the context graph to
 be **registered on-chain** (the first registration is when you accept the chain cost). A
-project created with `dkg_context_graph_create` is local-only until then. Three ways to
-register:
-- **`register_if_needed` on the publish tools (simplest):** all three publish tools —
+project created with `dkg_context_graph_create` is local-only until then — but you do **not**
+need to register it yourself first. Three things to know:
+- **Automatic at publish (default — #1116):** the per-KA `POST /api/knowledge-assets/{name}/vm/publish`
+  **auto-registers** an unregistered CG on first publish (register-then-publish), so the whole
+  create → write → seal → share → publish flow works on a never-registered CG with **no
+  explicit register step and no flag** (the registration spends gas/TRAC; it is **not**
+  gas-free). The legacy CG-wide `POST /api/shared-memory/publish` auto-registers the same way.
+- **`register_if_needed` on the publish tools (to choose the policy):** all three publish tools —
   `dkg_publish`, `dkg_knowledge_asset_publish`, and `dkg_shared_memory_publish` — accept
   `register_if_needed: true` (`registerIfNeeded` on the MCP runtime) plus an optional
-  `access_policy` (`0` open / `1` private, used only when registering). It registers the CG
-  on-chain (idempotent; a no-op if already registered, may spend gas/TRAC) and then
-  publishes, in one call. Use this to complete `create → write → finalize → share →
-  publish` on a brand-new CG, or to one-shot `dkg_publish` fresh quads to an unregistered
-  CG. Default is `false` (publish a never-registered CG and you'll get the daemon's
-  not-registered error).
-- **Automatic at publish (default — #1116):** the per-KA `POST /api/knowledge-assets/{name}/vm/publish`
-  now **transparently registers** the CG on first publish (register-then-publish), so the
-  whole create → write → seal → share → publish flow works on a never-registered CG with **no
-  explicit register step**. The legacy CG-wide `POST /api/shared-memory/publish` auto-registers the same way.
-- **Explicit register (optional):** `POST /api/context-graph/register` `{ id, accessPolicy?, publishPolicy? }` (CLI: `dkg context-graph register <id>`).
+  `access_policy` (`0` open / `1` private, used only when registering). For the auto-registering
+  routes (`vm/publish` / `shared-memory/publish`) it does **not** gate whether registration
+  happens — they auto-register regardless; set it only to run an **explicit** registration first
+  so you can choose its `access_policy`/`publishPolicy` (the implicit auto-register otherwise
+  defaults the policy). Default is `false`.
+- **Explicit register (optional):** `POST /api/context-graph/register` `{ id, accessPolicy?, publishPolicy? }` (CLI: `dkg context-graph register <id>`) — only needed to **pre-set** a custom `accessPolicy`/`publishPolicy` before publishing.
 
 **Seal on share (default — #1116).** A full `swm/share` (`entities: "all"` / omitted)
 **seals the draft by default** before promoting — the asset is then publish-ready. Outcomes:

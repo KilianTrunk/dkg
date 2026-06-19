@@ -579,9 +579,18 @@ describe('#1116 seal decoupled from CG — full vs skipSeal share, seal-in-SWM',
 
     // And publishing the unregistered CG fails CLOSED for that exact reason —
     // proving the registration gap is real (not silently papered over at seal).
-    await expect(
-      agent.publishFromFinalizedAssertion(CG_ID, name),
-    ).rejects.toThrow(/not registered on-chain/i);
+    // #1116 (round 5, FIX 3b): assert BOTH the message AND the stable `.code`
+    // (the route's auto-register branch keys on code-first; mirrors this file's
+    // .code convention for SWM_SUBSET_NOT_SEALABLE / UNSEALED_SHARE_BLOCKED).
+    let notRegisteredErr: any;
+    try {
+      await agent.publishFromFinalizedAssertion(CG_ID, name);
+    } catch (e) {
+      notRegisteredErr = e;
+    }
+    expect(notRegisteredErr).toBeTruthy();
+    expect(notRegisteredErr.message).toMatch(/not registered on-chain/i);
+    expect(notRegisteredErr.code).toBe('CG_NOT_REGISTERED');
 
     // Registration happens at PUBLISH time (the /vm/publish route's
     // ensureRegisteredForPublish step). After it, the same sealed asset publishes
@@ -594,6 +603,46 @@ describe('#1116 seal decoupled from CG — full vs skipSeal share, seal-in-SWM',
     expect(pub.status).toBe('confirmed');
     expect(pub.ual).toBeDefined();
     expect(pub.seal).toBeDefined();
+  }, 30_000);
+
+  // #1116 (round 5, FIX 2): no-data precondition must fire BEFORE registration.
+  // publishFromSharedMemory checks CG-registration (CG_NOT_REGISTERED) BEFORE its
+  // own no-quads check, so an UNregistered CG + valid seal + EMPTY sealed SWM used
+  // to surface CG_NOT_REGISTERED first — the /vm/publish route would then mint
+  // (burn gas) and only the retry hit the no-quads 409. The engine now runs a
+  // SWM-empty preflight before the publisher's register guard, so the precondition
+  // wins. Here: finalize the WM draft directly (seals, but NEVER promotes to SWM),
+  // so SWM is empty on an unregistered CG.
+  it('FIX 2: unregistered CG + finalized seal + EMPTY SWM throws "No quads" (not "not registered")', async () => {
+    const agent = await createAgent('NoQuadsBeforeRegisterBot');
+    // DELIBERATELY unregistered, local-only CG.
+    await agent.createContextGraph({ id: CG_ID, name: 'No Quads Before Register E2E' });
+
+    const name = 'empty-swm-seal';
+    await agent.assertion.create(CG_ID, name);
+    await agent.assertion.write(CG_ID, name, [
+      { subject: `${ENTITY_BASE}:nq`, predicate: 'http://schema.org/name', object: '"No Quads"' },
+    ]);
+    // Finalize the WM draft (seals it) WITHOUT promoting — SWM stays empty.
+    // Use the public wrapper (default layer "wm") so the author is threaded
+    // through correctly (the low-level assertionFinalize needs an explicit author).
+    await agent.assertion.finalize(CG_ID, name);
+
+    let thrown: any;
+    try {
+      await agent.publishFromFinalizedAssertion(CG_ID, name);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeTruthy();
+    // The no-data precondition fired first — NOT the registration guard.
+    expect(thrown.message).toMatch(/No quads in shared memory/i);
+    expect(thrown.message).not.toMatch(/not registered on-chain/i);
+    expect(thrown.code).not.toBe('CG_NOT_REGISTERED');
+
+    // And the CG was NEVER registered as a side effect (no gas burned).
+    const onChainId = await agent.getContextGraphOnChainId(CG_ID);
+    expect(onChainId == null).toBe(true);
   }, 30_000);
 
   // A1 (review): a SUBSET share is SWM-ONLY — NOT publishable. It stamps the
@@ -632,6 +681,80 @@ describe('#1116 seal decoupled from CG — full vs skipSeal share, seal-in-SWM',
     await expect(
       agent.publishFromFinalizedAssertion(CG_ID, name),
     ).rejects.toThrow(/not finalized/i);
+  }, 30_000);
+
+  // A1' (round 5): the round-4 marker was SET-only, so a full-share → discard →
+  // recreate → SUBSET-share cycle kept a STALE marker (A2_PRESERVE re-armed it on
+  // recreate) and would let finalize(layer:"swm") publish the subset {A} as the
+  // full {A,B} KA. Round 5 CLEARS the marker on discard and on a subset share, so
+  // this cycle is correctly rejected.
+  it('finalize(layer:swm) REJECTS after full-share -> discard -> recreate -> SUBSET-share (no stale marker)', async () => {
+    const agent = await createAgent('StaleMarkerBot');
+    await agent.createContextGraph({ id: CG_ID, name: 'Stale Marker E2E' });
+    await agent.registerContextGraph(CG_ID);
+
+    const name = 'stale-marker';
+    const writeAB = () => agent.assertion.write(CG_ID, name, [
+      { subject: `${ENTITY_BASE}:a`, predicate: 'http://schema.org/name', object: '"Entity A"' },
+      { subject: `${ENTITY_BASE}:b`, predicate: 'http://schema.org/name', object: '"Entity B"' },
+    ]);
+
+    // 1. FULL share {A,B} — sets the full-share marker (seal-by-default).
+    await agent.assertion.create(CG_ID, name);
+    await writeAB();
+    const full = await agent.assertion.promote(CG_ID, name);
+    expect(full.sealed).toBe(true);
+
+    // 2. Discard the (now-sealed-in-SWM) asset, then recreate the same name.
+    await agent.assertion.discard(CG_ID, name);
+    await agent.assertion.create(CG_ID, name);
+    await writeAB();
+
+    // 3. SUBSET share {A} only — must NOT inherit the prior full-share marker.
+    const subset = await agent.assertion.promote(CG_ID, name, { entities: [`${ENTITY_BASE}:a`] });
+    expect(subset.sealed).toBe(false);
+
+    // 4. Seal-in-SWM is refused: the marker was cleared at discard AND on the
+    // subset share, so a partial asset can't be published under the KA name.
+    let thrown: any;
+    try {
+      await agent.assertion.finalize(CG_ID, name, { layer: 'swm' });
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeTruthy();
+    expect(thrown.code).toBe('SWM_SUBSET_NOT_SEALABLE');
+  }, 30_000);
+
+  // A1'' (round 5): the gate keys on COMPLETENESS, not on sealed. A FULL skipSeal
+  // share is publishable-by-construction (all roots reached SWM) — it sets the
+  // marker — so seal-in-SWM (finalize layer:"swm") must SUCCEED, the legit
+  // unsealed-recovery path. (Regression guard: the new subset guard must not
+  // block a genuine full share.)
+  it('finalize(layer:swm) SUCCEEDS on a FULL skipSeal share (completeness, not sealed, gates it)', async () => {
+    const agent = await createAgent('FullSkipSealBot');
+    await agent.createContextGraph({ id: CG_ID, name: 'Full SkipSeal E2E' });
+    await agent.registerContextGraph(CG_ID);
+
+    const name = 'full-skipseal';
+    await agent.assertion.create(CG_ID, name);
+    await agent.assertion.write(CG_ID, name, [
+      { subject: `${ENTITY_BASE}:fs`, predicate: 'http://schema.org/name', object: '"Full SkipSeal"' },
+    ]);
+
+    // FULL share, but skipSeal — unsealed yet COMPLETE (sets the full-share marker).
+    const share = await agent.assertion.promote(CG_ID, name, { skipSeal: true });
+    expect(share.sealed).toBe(false);
+
+    // Seal-in-SWM reconstructs from SWM and seals — allowed because the asset was
+    // fully shared. (A subset share would have been rejected; see A1/A1'.)
+    const seal = await agent.assertion.finalize(CG_ID, name, { layer: 'swm' });
+    expect(seal.merkleRoot).toBeDefined();
+    expect(seal.authorAddress).toBeDefined();
+
+    // And it now publishes (proves the reconstruction produced a real, mintable seal).
+    const pub = await agent.publishFromFinalizedAssertion(CG_ID, name);
+    expect(pub.status).toBe('confirmed');
   }, 30_000);
 
   // C (review): a DEFAULT full share whose internal seal FAILS with a residual

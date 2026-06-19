@@ -1,5 +1,5 @@
 {
-  "_status": "pre-deployment: replace PLACEHOLDER_MAINNET_NETWORK_ID and PEER_ID_* relay values before enabling Base mainnet",
+  "_status": "pre-deployment: replace PEER_ID_* relay values before enabling Base mainnet",
   "networkName": "DKG V10 Base Mainnet",
   "genesisId": "base-mainnet",
   "networkId": "562ea760dbe27fb4233d58dfc958bbddf844b82596ec3d51dff98718e6bf61ca",

@@ -1,5 +1,5 @@
 {
-  "_status": "pre-deployment: replace PLACEHOLDER_MAINNET_NETWORK_ID and PEER_ID_* relay values before enabling Gnosis mainnet",
+  "_status": "pre-deployment: replace PEER_ID_* relay values before enabling Gnosis mainnet",
   "networkName": "DKG V10 Gnosis Mainnet",
   "genesisId": "gnosis-mainnet",
   "networkId": "e08a9fb72a648ec2eb2fd9c152ded90a8ad67bb56f27df4781d9bb7e261fb7a7",

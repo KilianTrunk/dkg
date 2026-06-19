@@ -5,11 +5,64 @@ import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { computeNetworkId } from '../../core/src/genesis.js';
+import { validateStartupGenesis } from '../src/daemon.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, '..', '..', '..');
 const cliSource = join(__dirname, '..', 'src', 'cli.ts');
 const tsxLoader = join(repoRoot, 'node_modules', 'tsx', 'dist', 'loader.mjs');
+
+describe('daemon startup genesis validation', () => {
+  it('continues when the selected network genesis id matches its network id', async () => {
+    const networkId = await computeNetworkId('gnosis-mainnet');
+
+    await expect(validateStartupGenesis({
+      networkName: 'DKG V10 Gnosis Mainnet',
+      genesisId: 'gnosis-mainnet',
+      networkId,
+    })).resolves.toEqual({ ok: true, networkId });
+  });
+
+  it('reports the selected overlay when the selected genesis id mismatches its network id', async () => {
+    const staleNetworkId = await computeNetworkId('base-mainnet');
+    const selectedNetworkId = await computeNetworkId('neuroweb-mainnet');
+
+    await expect(validateStartupGenesis({
+      networkName: 'DKG V10 NeuroWeb Mainnet',
+      genesisId: 'neuroweb-mainnet',
+      networkId: staleNetworkId,
+    })).resolves.toEqual({
+      ok: false,
+      networkId: selectedNetworkId,
+      messages: [
+        `FATAL: genesis mismatch! Expected networkId ${staleNetworkId.slice(0, 16)}... but computed ${selectedNetworkId.slice(0, 16)}...`,
+        `This node's genesis does not match DKG V10 NeuroWeb Mainnet. Rebuild or update the selected network config.`,
+      ],
+    });
+  });
+
+  it('rejects pre-deployment configs with placeholder relay peer ids', async () => {
+    const networkId = await computeNetworkId('base-mainnet');
+
+    const result = await validateStartupGenesis({
+      networkName: 'DKG V10 Base Mainnet',
+      genesisId: 'base-mainnet',
+      networkId,
+      _status: 'pre-deployment: replace PEER_ID_* relay values before enabling Base mainnet',
+      relays: ['/ip4/178.105.87.39/tcp/9090/p2p/PEER_ID_SOLARIS'],
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.networkId).toBe(networkId);
+    if (!result.ok) {
+      expect(result.messages).toContain(
+        'FATAL: network config DKG V10 Base Mainnet is marked pre-deployment: replace PEER_ID_* relay values before enabling Base mainnet.',
+      );
+      expect(result.messages.some(message => message.includes('PEER_ID_SOLARIS'))).toBe(true);
+    }
+  });
+});
 
 async function writeWorkspaceTsconfig(tsconfigPath: string): Promise<void> {
   const packagesDir = join(repoRoot, 'packages');

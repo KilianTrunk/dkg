@@ -46,6 +46,17 @@ import {
 
 // Local (off-chain) CG — enough for create/write/quads/descriptor/import.
 const LOCAL = `ka-loc-${Date.now().toString(36)}`;
+// #1116 (round 6): a SEPARATE created-but-UNregistered CG, used ONLY by the
+// /vm/publish auto-register test. That test AUTO-REGISTERS its CG on-chain, so it
+// must not mutate the shared `LOCAL` (a later test relies on LOCAL having no
+// trusted on-chain mapping). No other test references this id.
+const LOCAL_AUTOREG = `ka-autoreg-${Date.now().toString(36)}`;
+// #1116 (round 6): a SEPARATE created-but-UNregistered CG, used ONLY by the FIX 2
+// gas-preflight route test (finalized-but-NOT-shared → empty SWM → no-quads
+// precondition must fire BEFORE any registration tx). The CG must stay UNregistered
+// after the call (proving no gas was burned), so it cannot share the auto-register
+// CG. No other test references this id.
+const LOCAL_NOSHARE = `ka-noshare-${Date.now().toString(36)}`;
 // On-chain-registered CG — required for finalize/share/publish preconditions.
 const REG = `ka-reg-${Date.now().toString(36)}`;
 // On-chain-registered PUBLIC CG — for preconditions that only hold on the public
@@ -72,6 +83,16 @@ describe('/api/knowledge-assets routes (real daemon, real chain)', () => {
     daemon = await startLiveDaemon();
     const loc = await postJson(daemon, '/api/context-graph/create', { id: LOCAL, name: 'Local' });
     expect(loc.status, `local CG create: ${JSON.stringify(loc.body)}`).toBeLessThan(300);
+    // #1116 (round 6): dedicated unregistered CG for the auto-register test — created
+    // (off-chain) here, NOT registered, so the test can drive the publish-time
+    // registration without polluting the shared `LOCAL`.
+    const locAutoreg = await postJson(daemon, '/api/context-graph/create', { id: LOCAL_AUTOREG, name: 'Local Autoreg' });
+    expect(locAutoreg.status, `local autoreg CG create: ${JSON.stringify(locAutoreg.body)}`).toBeLessThan(300);
+    // #1116 (round 6): dedicated unregistered CG for the FIX 2 gas-preflight test —
+    // created off-chain, NEVER registered, so the test can prove the no-quads
+    // precondition fires before any registration tx (and the CG stays unregistered).
+    const locNoshare = await postJson(daemon, '/api/context-graph/create', { id: LOCAL_NOSHARE, name: 'Local NoShare' });
+    expect(locNoshare.status, `local noshare CG create: ${JSON.stringify(locNoshare.body)}`).toBeLessThan(300);
     const reg = await postJson(daemon, '/api/context-graph/create', { id: REG, name: 'Reg', accessPolicy: 1 });
     expect(reg.status, `reg CG create: ${JSON.stringify(reg.body)}`).toBeLessThan(300);
     const onchain = await postJson(daemon, '/api/context-graph/register', { id: REG, accessPolicy: 1 });
@@ -267,6 +288,89 @@ describe('/api/knowledge-assets routes (real daemon, real chain)', () => {
       expect(res.body.swmShared).toBe(true);
       expect(res.body.promotedCount).toBeGreaterThan(0);
     });
+
+    // #1116 — the route's thin wrapper over the seal-by-default share contract.
+    // The B1/B2 agent e2e tests pin the ENGINE outcomes; these pin the ROUTE's
+    // strict-boolean validation + the seal-outcome fields it forwards (sealed /
+    // publishReady) so the HTTP surface can't silently drift from the engine.
+    describe('#1116 seal-outcome contract', () => {
+      it('strict-boolean: skipSeal:"false" (a string) → 400 "must be a boolean"', async () => {
+        // The validator runs BEFORE promote, so no finalized draft is needed; a
+        // stray string must 400 rather than silently flip the seal-by-default.
+        const res = await postJson(daemon, '/api/knowledge-assets/share/swm/share', {
+          contextGraphId: REG,
+          skipSeal: 'false',
+        });
+        expect(res.status).toBe(400);
+        expect(String(res.body.error)).toMatch(/"skipSeal" must be a boolean/);
+      });
+
+      it('a bare FULL share (no skipSeal) → 200 sealed:true / publishReady:true', async () => {
+        await createKa(REG, 'share-full-default');
+        await write(REG, 'share-full-default', [{ subject: 'ex:A', predicate: 'ex:p', object: '"x"' }]);
+        const res = await postJson(daemon, '/api/knowledge-assets/share-full-default/swm/share', {
+          contextGraphId: REG,
+        });
+        expect(res.status).toBe(200);
+        expect(res.body.swmShared).toBe(true);
+        expect(res.body.promotedCount).toBeGreaterThan(0);
+        expect(res.body.sealed).toBe(true);
+        expect(res.body.publishReady).toBe(true);
+      });
+
+      it('a skipSeal:true full share → 200 sealed:false / publishReady:false (unsealed in SWM)', async () => {
+        await createKa(REG, 'share-skip-seal');
+        await write(REG, 'share-skip-seal', [{ subject: 'ex:A', predicate: 'ex:p', object: '"x"' }]);
+        const res = await postJson(daemon, '/api/knowledge-assets/share-skip-seal/swm/share', {
+          contextGraphId: REG,
+          skipSeal: true,
+        });
+        expect(res.status).toBe(200);
+        expect(res.body.swmShared).toBe(true);
+        expect(res.body.promotedCount).toBeGreaterThan(0);
+        expect(res.body.sealed).toBe(false);
+        expect(res.body.publishReady).toBe(false);
+      });
+
+      // UNSEALED_SHARE_BLOCKED → 409: NOT covered here. It needs a residual
+      // signing-capability gap (no local key / non-V10 chain) on a default full
+      // share — the live daemon harness always HAS a signing key + a V10 chain,
+      // so the gap can't be staged cleanly without faking the agent (which this
+      // real-daemon suite deliberately avoids). The fail-closed + WM-preserved
+      // path is covered at the engine level by the agent e2e tests
+      // (packages/agent/test/e2e-memory-layers.test.ts, #1116 block) and the
+      // route's own try/catch maps e.code==='UNSEALED_SHARE_BLOCKED' → 409.
+    });
+
+    // #1116 — the bare daemon route is a PRIMITIVE: create-with-quads seals only
+    // (status 'wm-sealed') and does NOT auto-share. The "seal+share by default"
+    // convenience lives in the combined CLIENT functions (mcp-dkg / openclaw
+    // createKnowledgeAsset), which set alsoShareSwm:true for the caller — not in
+    // this route. Auto-sharing here would conflict with memory-graph-events and
+    // the "create stops at a sealed WM draft" invariant the agent-tooling relies
+    // on. The opt-in alsoShareSwm:true path is asserted separately below.
+    it('create one-shot {quads, finalize:true} stays SEAL-ONLY → wm-sealed, no auto-share', async () => {
+      const res = await createKa(REG, 'oneshot-seal-only', {
+        quads: [{ subject: 'ex:A', predicate: 'ex:p', object: '"x"' }],
+        finalize: true,
+      });
+      expect(res.status).toBe(201);
+      expect(res.body.status).toBe('wm-sealed');
+      expect(res.body.swmShared).toBeUndefined();
+    });
+
+    it('create one-shot with explicit alsoShareSwm:true → swm-shared + sealed:true', async () => {
+      const res = await createKa(REG, 'oneshot-explicit-share', {
+        quads: [{ subject: 'ex:A', predicate: 'ex:p', object: '"x"' }],
+        finalize: true,
+        alsoShareSwm: true,
+      });
+      expect(res.status).toBe(201);
+      expect(res.body.status).toBe('swm-shared');
+      expect(res.body.swmShared).toBe(true);
+      expect(res.body.sealed).toBe(true);
+      expect(res.body.publishReady).toBe(true);
+    });
   });
 
   // ── vm/publish: real preconditions + validation + failure mapping ──
@@ -280,22 +384,20 @@ describe('/api/knowledge-assets routes (real daemon, real chain)', () => {
       expect(String(res.body.error)).toMatch(/not finalized/);
     });
 
-    it('409 VM_PUBLISH_PRECONDITION when finalized but nothing shared into SWM', async () => {
-      // PUBLIC CG: post OT-RFC-49 a CURATED CG can publish catalog-only (the
-      // catalog is the on-chain commitment), so "nothing shared" is no longer a
-      // precondition there — it proceeds to ACK. The "No quads in shared memory"
-      // precondition still holds on the public path, which is what this checks.
+    it('409 PUBLISH_NOT_FULL_SHARE when finalized but nothing shared into SWM', async () => {
+      // #1116 (round 9): finalize-without-share leaves a seal but NO
+      // swmShareComplete marker, so the marker gate (a publish requires a complete
+      // full share resident in SWM) rejects FIRST with PUBLISH_NOT_FULL_SHARE,
+      // mapped to 409 (same precondition family as the old "No quads in shared
+      // memory" VM_PUBLISH_PRECONDITION — both are pre-chain caller preconditions).
       await createKa(PUBREG, 'pub-noshare');
-      // A UNIQUE subject so the seal's selection can't cross-match another KA's
-      // already-shared entity (real fact: SWM selection is by entity subject
-      // within the CG — a reused subject would let publish find someone else's
-      // shared quad and proceed to ACK instead of returning the 409).
+      // A UNIQUE subject so a later cross-match can't accidentally share it.
       await write(PUBREG, 'pub-noshare', [{ subject: 'ex:noshare-only', predicate: 'ex:p', object: '"x"' }]);
       await postJson(daemon, '/api/knowledge-assets/pub-noshare/wm/finalize', { contextGraphId: PUBREG });
       const res = await postJson(daemon, '/api/knowledge-assets/pub-noshare/vm/publish', { contextGraphId: PUBREG });
       expect(res.status).toBe(409);
-      expect(res.body.code).toBe('VM_PUBLISH_PRECONDITION');
-      expect(String(res.body.error)).toMatch(/shared memory/);
+      expect(res.body.code).toBe('PUBLISH_NOT_FULL_SHARE');
+      expect(String(res.body.error)).toMatch(/complete full share/i);
     });
 
     it('rejects a non-integer epochs option (400, no publish)', async () => {
@@ -333,6 +435,72 @@ describe('/api/knowledge-assets routes (real daemon, real chain)', () => {
       await postJson(daemon, '/api/knowledge-assets/pub-real/swm/share', { contextGraphId: REG });
       const res = await postJson(daemon, '/api/knowledge-assets/pub-real/vm/publish', { contextGraphId: REG });
       expect(res.status).toBeGreaterThanOrEqual(500);
+    });
+
+    // #1116 (round 5, FIX 3a): the /vm/publish auto-register branch. Publishing a
+    // FINALIZED+SHARED KA on a created-but-UNregistered CG must transparently
+    // register the CG on-chain (the deferred-registration step), NOT 400 with
+    // "not registered on-chain". After the call the CG has a truthy on-chain id,
+    // and the publish then fails ONLY at the edge-node ACK-quorum step (5xx,
+    // "no connected core peers"), never the registration precondition. A
+    // regression that drops the auto-register branch would 400 here instead.
+    it('auto-registers an UNregistered CG at publish time, then fails only at ACK quorum (5xx, not "not registered")', async () => {
+      // LOCAL_AUTOREG was created (beforeAll) but DELIBERATELY never registered
+      // on-chain — and is used ONLY here, so auto-registering it pollutes nothing.
+      await createKa(LOCAL_AUTOREG, 'pub-autoreg');
+      // Unique subject so the SWM selection can't cross-match another KA's quad.
+      await write(LOCAL_AUTOREG, 'pub-autoreg', [{ subject: 'ex:autoreg-only', predicate: 'ex:p', object: '"x"' }]);
+      await postJson(daemon, '/api/knowledge-assets/pub-autoreg/wm/finalize', { contextGraphId: LOCAL_AUTOREG });
+      await postJson(daemon, '/api/knowledge-assets/pub-autoreg/swm/share', { contextGraphId: LOCAL_AUTOREG });
+
+      const res = await postJson(daemon, '/api/knowledge-assets/pub-autoreg/vm/publish', { contextGraphId: LOCAL_AUTOREG });
+
+      // The auto-register branch fired: this is NOT the unregistered-CG 400 (nor
+      // the "could not be auto-registered" 400) — it proceeded to the on-chain
+      // publish and failed only at the edge-node ACK-quorum step (devnet-tier 5xx).
+      expect(res.status).toBeGreaterThanOrEqual(500);
+      expect(String(res.body?.error ?? '')).not.toMatch(/not registered on-chain/i);
+      expect(String(res.body?.error ?? '')).not.toMatch(/could not be auto-registered/i);
+
+      // And LOCAL_AUTOREG now carries a truthy on-chain id — registration happened.
+      const list = await getJson(daemon, '/api/context-graph/list');
+      const local = (list.body?.contextGraphs ?? []).find((c: any) => c.id === LOCAL_AUTOREG);
+      expect(local, `LOCAL_AUTOREG CG descriptor: ${JSON.stringify(list.body)}`).toBeTruthy();
+      const onChainId = local?.onChainId ?? local?.onChainContextGraphId;
+      expect(onChainId, `expected a truthy on-chain id after auto-register, got ${JSON.stringify(local)}`).toBeTruthy();
+    });
+
+    // #1116 (round 6, FIX 2 gas-preflight): an UNregistered CG + a FINALIZED seal
+    // + an EMPTY SWM (finalized but NEVER shared) must hit the no-quads precondition
+    // BEFORE any registration tx — so the route does NOT auto-register (burning gas)
+    // and then fail. This proves the engine's SWM-empty preflight runs ahead of the
+    // publisher's CG_NOT_REGISTERED guard: the response is the no-quads precondition
+    // (NOT "not registered on-chain"), and the CG stays UNregistered afterward.
+    it('FIX 2 gas-preflight: unregistered CG + finalized but UNshared (empty SWM) returns no-quads WITHOUT registering', async () => {
+      // LOCAL_NOSHARE was created off-chain (beforeAll), never registered.
+      await createKa(LOCAL_NOSHARE, 'pub-noshare-unreg');
+      // Unique subject so the seal's selection can't cross-match another KA's shared quad.
+      await write(LOCAL_NOSHARE, 'pub-noshare-unreg', [{ subject: 'ex:noshare-unreg-only', predicate: 'ex:p', object: '"x"' }]);
+      // FINALIZE (seals the WM draft) but DELIBERATELY do NOT swm/share → SWM stays empty.
+      await postJson(daemon, '/api/knowledge-assets/pub-noshare-unreg/wm/finalize', { contextGraphId: LOCAL_NOSHARE });
+
+      const res = await postJson(daemon, '/api/knowledge-assets/pub-noshare-unreg/vm/publish', { contextGraphId: LOCAL_NOSHARE });
+
+      // #1116 (round 9): finalize-without-share leaves no swmShareComplete marker,
+      // so the marker gate (PUBLISH_NOT_FULL_SHARE) fires as a pre-chain 4xx
+      // precondition BEFORE any registration tx — proving the gate runs ahead of
+      // the publisher's CG-not-registered guard (so no gas is burned).
+      expect(res.status).toBeGreaterThanOrEqual(400);
+      expect(res.status).toBeLessThan(500);
+      expect(res.body?.code).toBe('PUBLISH_NOT_FULL_SHARE');
+      expect(String(res.body?.error ?? '')).not.toMatch(/not registered on-chain/i);
+
+      // And the CG is STILL unregistered — no registration tx was sent (no gas burned).
+      const list = await getJson(daemon, '/api/context-graph/list');
+      const cg = (list.body?.contextGraphs ?? []).find((c: any) => c.id === LOCAL_NOSHARE);
+      expect(cg, `LOCAL_NOSHARE CG descriptor: ${JSON.stringify(list.body)}`).toBeTruthy();
+      const onChainId = cg?.onChainId ?? cg?.onChainContextGraphId;
+      expect(onChainId == null, `expected NO on-chain id (CG must stay unregistered), got ${JSON.stringify(cg)}`).toBe(true);
     });
   });
 

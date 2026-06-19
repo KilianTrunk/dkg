@@ -21,7 +21,7 @@ contract ParametersStorage is INamed, IVersioned, HubDependent {
     // protocol treasury fee (`protocolTreasuryFee`, `protocolTreasury`,
     // `MAX_PROTOCOL_TREASURY_FEE`) skimmed from the staker-bound TRAC on
     // every paid publish / update / lifetime-extension.
-    string private constant _VERSION = "10.0.3";
+    string private constant _VERSION = "10.0.4";
 
     uint96 public minimumStake;
     uint96 public maximumStake;
@@ -57,6 +57,15 @@ contract ParametersStorage is INamed, IVersioned, HubDependent {
     /// @notice Recipient of the protocol treasury fee. The zero address
     ///         disables the fee entirely regardless of `protocolTreasuryFee`.
     address public protocolTreasury;
+
+    /// @notice Minimum TRAC deposit required to register a Context Graph
+    ///         on-chain (`ContextGraphs.createContextGraph`). The deposit is
+    ///         held as the CG's prepaid publishing escrow — spendable by the
+    ///         CG owner on publish/update/extend into that CG — and is never
+    ///         cash-refundable (residue sweeps to the staker reward pool on
+    ///         deactivation). Anti-spam for the unbounded-CG-creation DoS
+    ///         (OT-RFC-53). Setting it to 0 disables the deposit (dormant).
+    uint96 public contextGraphRegistrationDeposit;
 
     /// @notice Hard upper bound on `protocolTreasuryFee` (10%). Bounds
     ///         governance so the fee can never be set to an extractive level
@@ -111,6 +120,13 @@ contract ParametersStorage is INamed, IVersioned, HubDependent {
         // the zero address), so a fresh deploy behaves exactly as before
         // until governance opts in.
         protocolTreasuryFee = 300;
+
+        // OT-RFC-53: constructor leaves the registration deposit at 0; the
+        // standard deploy sets the live value (100 TRAC) via a post-deploy
+        // script that calls `setContextGraphRegistrationDeposit`. This protects
+        // production automatically (no manual step, no silent-off) while keeping
+        // test fixtures — which don't run that script — unaffected. Governance
+        // can retune or disable it anytime.
     }
 
     function name() external pure virtual override returns (string memory) {
@@ -211,6 +227,12 @@ contract ParametersStorage is INamed, IVersioned, HubDependent {
         publishingConvictionEpochs = _publishingConvictionEpochs;
 
         emit ParameterChanged("publishingConvictionEpochs", _publishingConvictionEpochs);
+    }
+
+    function setContextGraphRegistrationDeposit(uint96 amount) external onlyOwnerOrMultiSigOwner {
+        contextGraphRegistrationDeposit = amount;
+
+        emit ParameterChanged("contextGraphRegistrationDeposit", amount);
     }
 
     function setProtocolTreasuryFee(uint16 protocolTreasuryFee_) external onlyOwnerOrMultiSigOwner {

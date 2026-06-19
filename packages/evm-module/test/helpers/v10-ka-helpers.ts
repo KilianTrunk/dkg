@@ -1,7 +1,7 @@
 import { SignerWithAddress } from '@nomicfoundation/hardhat-ethers/signers';
 import { ethers } from 'ethers';
 
-import { signMessage } from './kc-helpers';
+import { signMessage } from './ka-helpers';
 import { NodeAccounts } from './types';
 import { KnowledgeAssetsLifecycle } from '../../typechain';
 
@@ -34,10 +34,10 @@ import { KnowledgeAssetsLifecycle } from '../../typechain';
  *   || uint256(newMerkleLeafCount) || newCatalogRoot || uint256(newCatalogLeafCount)
  *
  * Author attestation (RFC-001) — EIP-712 typed data:
- *   domain   = EIP712Domain(name="KnowledgeAssetsLifecycle", version="2.0.0",
+ *   domain   = EIP712Domain(name="KnowledgeAssetsLifecycle", version="3.0.0",
  *                           chainId, verifyingContract=KAV10)
- *   struct   = AuthorAttestation(uint256 contextGraphId, bytes32 merkleRoot,
- *                                address authorAddress, uint8 schemeVersion)
+ *   struct   = AuthorAttestation(bytes32 merkleRoot, address authorAddress,
+ *                                uint8 schemeVersion, uint256 reservedKaId)  // #1116: no contextGraphId
  *   schemeVersion = 1 (only currently-supported scheme)
  *
  * The author attestation digest is built and signed via ethers'
@@ -109,7 +109,6 @@ export type AuthorAttestationPayload = {
   domain: ethers.TypedDataDomain;
   types: Record<string, { name: string; type: string }[]>;
   value: {
-    contextGraphId: bigint;
     merkleRoot: string;
     authorAddress: string;
     schemeVersion: number;
@@ -121,16 +120,16 @@ export type AuthorAttestationPayload = {
  * Build the EIP-712 typed-data payload for a V10 author attestation.
  *
  * Domain mirrors the contract's `_hashAuthorAttestation`:
- *   name="KnowledgeAssetsLifecycle", version="2.0.0", chainId, verifyingContract.
+ *   name="KnowledgeAssetsLifecycle", version="3.0.0", chainId, verifyingContract.
  *
- * The struct hash binds (contextGraphId, merkleRoot, authorAddress,
- * schemeVersion, reservedKaId). Drift between this builder and the contract
- * will surface as `InvalidAuthorSignature` at publish time.
+ * #1116: the struct hash binds (merkleRoot, authorAddress, schemeVersion,
+ * reservedKaId) — `contextGraphId` was REMOVED (the seal is now
+ * context-graph-independent). Drift between this builder and the contract will
+ * surface as `InvalidAuthorSignature` at publish time.
  */
 export function buildAuthorAttestationPayload(args: {
   chainId: bigint;
   kav10Address: string;
-  contextGraphId: bigint;
   merkleRoot: string;
   authorAddress: string;
   reservedKaId: bigint;
@@ -140,13 +139,12 @@ export function buildAuthorAttestationPayload(args: {
   return {
     domain: {
       name: 'KnowledgeAssetsLifecycle',
-      version: '2.0.0',
+      version: '3.0.0',
       chainId: args.chainId,
       verifyingContract: ethers.getAddress(args.kav10Address),
     },
     types: {
       AuthorAttestation: [
-        { name: 'contextGraphId', type: 'uint256' },
         { name: 'merkleRoot', type: 'bytes32' },
         { name: 'authorAddress', type: 'address' },
         { name: 'schemeVersion', type: 'uint8' },
@@ -154,7 +152,6 @@ export function buildAuthorAttestationPayload(args: {
       ],
     },
     value: {
-      contextGraphId: args.contextGraphId,
       merkleRoot: args.merkleRoot,
       authorAddress: ethers.getAddress(args.authorAddress),
       schemeVersion,
@@ -258,7 +255,7 @@ export function buildPublishAckDigest(
  * the contract will look up, or signature verification will fail.
  *
  * `preUpdateMerkleRootCount` is the length of `knowledgeCollections[id].merkleRoots`
- * BEFORE the update runs — 1 for a fresh KC from a single publish.
+ * BEFORE the update runs — 1 for a fresh KA from a single publish.
  */
 export function buildUpdateAckDigest(
   chainId: bigint,
@@ -434,7 +431,8 @@ export async function buildPublishParams(args: {
       buildAuthorAttestationPayload({
         chainId: args.chainId,
         kav10Address: args.kav10Address,
-        contextGraphId: args.contextGraphId,
+        // #1116: AuthorAttestation no longer binds contextGraphId (it stays in
+        // PublishParams for the on-chain mint target / authorization).
         merkleRoot: args.merkleRoot,
         authorAddress: args.author.address,
         reservedKaId,
@@ -496,7 +494,7 @@ export function buildUpdateAuthorAttestationPayload(args: {
   return {
     domain: {
       name: 'KnowledgeAssetsLifecycle',
-      version: '2.0.0',
+      version: '3.0.0',
       chainId: args.chainId,
       verifyingContract: ethers.getAddress(args.kav10Address),
     },

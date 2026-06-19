@@ -147,7 +147,12 @@ const PINNED_DIGESTS: Record<string, string> = {
   // `CuratedCGRequiresCatalogCommitment` / `IncompleteCatalogCommitment` (renamed
   // from the `*Ciphertext*` set), and `PublishParams`/`UpdateParams` now carry
   // `catalogRoot`/`catalogLeafCount` (was `ciphertextChunksRoot`/`ciphertextChunkCount`).
-  KnowledgeAssetsLifecycle:     'fcfe8541052c25c31775e0e5b6a2923bba024e59dd3c03e829f330f8499191cb',
+  // OT-RFC-53 (CG registration deposit): +event RegistrationEscrowConsumed on
+  // KnowledgeAssetsLifecycle; +events ContextGraphRegistrationDeposited /
+  // ContextGraphEscrowSwept + deposit accounting on ContextGraphs/ContextGraphStorage;
+  // +contextGraphRegistrationDeposit getter/setter on ParametersStorage. Chain-local
+  // ABIs refreshed in lockstep with evm-module/abi.
+  KnowledgeAssetsLifecycle:     '409efa6a580e3d374c0f53c70cd21dd6e78cd904b2f103edc9737803f0829820',
 
   // Re-pinned for OT-RFC-43 Option-1 (variant 1a, PR #975): deterministic
   // author-namespaced KA identity. `createKnowledgeAsset` now takes an explicit
@@ -180,8 +185,11 @@ const PINNED_DIGESTS: Record<string, string> = {
   // identifier so hosting cores can derive the SWM gossip topic directly
   // from chain events — no off-chain discovery channel required for
   // registered CGs.
-  ContextGraphs:                'a27718118b5d03626b0e3389ad854451caf3ed0c702cea1b770953bb439d589e',
-  ContextGraphStorage:          '3c020eecc06c6332738f80358be922d6837d9332fed194e4e2bdf87eec6050a0',
+  // Merged surface: OT-RFC-53 deposit events/functions + main's KC→KA getter
+  // rename (getContextGraphKCCount/At/List → getContextGraphKaCount/At/List).
+  // Digests recomputed post-merge from the combined ABI.
+  ContextGraphs:                '54583e20167c37f4356247cb6bc657b0dccf6f17f99a3267427674a35a151bcf',
+  ContextGraphStorage:          '29f1746bf6d82dfea40eb0365c9a664994c56b63c4a98d99962cd9b61c1df37a',
   // Identity / staking — consulted on every publish.
   Hub:                          '36976cc71bb87963b8b715791b32e4eb6b7bb85c712998afd6184221289a506b',
   Identity:                     'ca39efe9bd9ec4fd8ae67dccdf9eb888bf91232341c3a56216624477620ff4d8',
@@ -203,7 +211,7 @@ const PINNED_DIGESTS: Record<string, string> = {
   //
   // Updated PR #1083: added `ZeroShardingTableSizeLimit()` for the
   // governance guard that rejects `setShardingTableSizeLimit(0)`.
-  ParametersStorage:            '7816845cbccd120eaf44eccea56f530e9c8e8894023d0693fddcc8546161575d',
+  ParametersStorage:            'da6f8b6435f709e02d3730d04d79abe9a2ed27e04ad1a1d058ba00ebccc82aa9',
   // Added PR #470 round 3: pin the V10 NFT-backed PCA contract so that
   // any drift in its events (CostCovered / WindowSettled /
   // AccountFinalSwept / TokensAddedToEpochRange consumers) or errors
@@ -254,7 +262,9 @@ const PINNED_DIGESTS: Record<string, string> = {
   // Updated OT-RFC-51: see the conviction-pin note above — createAccount arity,
   // setPrimaryNode/ZeroPrimaryNode/PrimaryNodeUnchanged/moveEpochPublishingAllocation,
   // widened Account tuple, realized-publish credit removed / publishingAllocation rename.
-  PublishingConviction:         '6ad9aa97f4c049c126f302658257363a097ae4fdcc1a12f7d084082f81b44b07',
+  // Repinned: KC→KA rename of error InvalidConvictionKcEpochs → InvalidConvictionKaEpochs
+  // (error selector change; contract bumped to 10.0.5).
+  PublishingConviction:         'a4d44a594509e508091b1f91adfb1d68bec65e38e497f054116493af327ff096',
   // Updated OT-RFC-51: storage surface for the above — primaryNode field on the
   // widened Account tuple + the seeded per-epoch publishing allocation getters.
   PublishingConvictionStorage:  '7eeae71f0efd9183fce232ccc669227dfd70fe4f93b4663392a0a52c1ccba859',

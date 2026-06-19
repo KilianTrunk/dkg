@@ -45,7 +45,6 @@ async function buildSeal(
   const typed = buildAuthorAttestationTypedData({
     chainId: await chain.getEvmChainId(),
     kav10Address: await chain.getKnowledgeAssetsLifecycleAddress(),
-    contextGraphId,
     merkleRoot: canonical.kcMerkleRoot,
     authorAddress: author.address,
     schemeVersion: AUTHOR_SCHEME_VERSION_V1,

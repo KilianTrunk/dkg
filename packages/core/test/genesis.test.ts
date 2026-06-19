@@ -68,6 +68,45 @@ describe('getGenesisQuads', () => {
     expect(a).toEqual(b);
   });
 
+  it('selects Base mainnet genesis data by Genesis ID', () => {
+    const quads = getGenesisQuads('base-mainnet');
+    expect(quads).toContainEqual({
+      subject: 'did:dkg:network:base-mainnet',
+      predicate: DKG_ONTOLOGY.RDF_TYPE,
+      object: DKG_ONTOLOGY.DKG_NETWORK,
+      graph: '',
+    });
+  });
+
+  it('selects distinct mainnet genesis documents by Genesis ID', async () => {
+    const mainnetGenesis = [
+      { genesisId: 'base-mainnet', subject: 'did:dkg:network:base-mainnet', name: '"DKG V10 Base Mainnet"' },
+      { genesisId: 'gnosis-mainnet', subject: 'did:dkg:network:gnosis-mainnet', name: '"DKG V10 Gnosis Mainnet"' },
+      { genesisId: 'neuroweb-mainnet', subject: 'did:dkg:network:neuroweb-mainnet', name: '"DKG V10 NeuroWeb Mainnet"' },
+    ];
+    const networkIds: string[] = [];
+
+    for (const { genesisId, subject, name } of mainnetGenesis) {
+      const quads = getGenesisQuads(genesisId);
+      expect(quads).toContainEqual({
+        subject,
+        predicate: DKG_ONTOLOGY.SCHEMA_NAME,
+        object: name,
+        graph: '',
+      });
+      expect(quads).toContainEqual({
+        subject,
+        predicate: DKG_ONTOLOGY.DKG_CREATED_AT,
+        object: '"2026-06-20T00:00:00Z"',
+        graph: '',
+      });
+      networkIds.push(await computeNetworkId(genesisId));
+    }
+
+    expect(new Set(networkIds).size).toBe(mainnetGenesis.length);
+    expect(networkIds).not.toContain(await computeNetworkId('base-testnet'));
+  });
+
   it('genesis content integrity check — hash detects any modification', () => {
     const raw = getGenesisRaw();
     const hash = sha256(new TextEncoder().encode(raw));
@@ -103,6 +142,13 @@ describe('getGenesisRaw', () => {
     expect(raw).toContain('did:dkg:network:v9-testnet');
     expect(raw).toContain('did:dkg:context-graph:agents');
     expect(raw).toContain('did:dkg:context-graph:ontology');
+  });
+
+  it('returns selected mainnet Genesis Data as TriG', () => {
+    const raw = getGenesisRaw('gnosis-mainnet');
+    expect(raw).toContain('<did:dkg:network:gnosis-mainnet>');
+    expect(raw).toContain('schema:name "DKG V10 Gnosis Mainnet"');
+    expect(raw).toContain('dkg:createdAt "2026-06-20T00:00:00Z"^^xsd:dateTime');
   });
 });
 

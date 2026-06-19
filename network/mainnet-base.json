@@ -1,13 +1,28 @@
 {
-  "_status": "pre-deployment: hubAddress must be set after V10 contracts are deployed on Base",
+  "_status": "pre-deployment: replace PEER_ID_* relay values before enabling Base mainnet",
+  "networkName": "DKG V10 Base Mainnet",
+  "genesisId": "base-mainnet",
+  "networkId": "562ea760dbe27fb4233d58dfc958bbddf844b82596ec3d51dff98718e6bf61ca",
+  "genesisVersion": 1,
+  "relays": [
+    "/ip4/178.105.87.39/tcp/9090/p2p/PEER_ID_SOLARIS",
+    "/ip4/178.105.105.102/tcp/9090/p2p/PEER_ID_LUNARIS",
+    "/ip4/178.156.214.4/tcp/9090/p2p/PEER_ID_ORIONIS",
+    "/ip4/178.105.111.185/tcp/9090/p2p/PEER_ID_KEPLER"
+  ],
+  "defaultContextGraphs": [],
+  "defaultNodeRole": "edge",
   "chain": {
     "name": "base",
     "type": "evm",
     "chainId": "base:8453",
-    "rpcUrl": "https://mainnet.base.org"
+    "rpcUrl": "https://mainnet.base.org",
+    "hubAddress": "0x99Aa571fD5e681c2D27ee08A7b7989DB02541d13"
   },
   "autoUpdate": {
     "enabled": true,
-    "branch": "main"
+    "repo": "OriginTrail/dkg",
+    "branch": "main",
+    "checkIntervalMinutes": 5
   }
 }

@@ -10,6 +10,7 @@
  */
 
 import { EVMChainAdapterBase, CG_REGISTRY_MAX_SCAN_PAGES, CG_REGISTRY_REORG_BUFFER_BLOCKS } from './evm-adapter-base.js';
+import { isTooLowAllowanceError } from './evm-adapter-errors.js';
 import { ethers, Contract, type JsonRpcProvider } from 'ethers';
 import { ContextGraphChainScanPartialError, type CreateContextGraphParams, type TxResult, type ContextGraphOnChain, type ContextGraphChainScanOptions, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type VerifyParams, type PublishToContextGraphParams, type OnChainPublishResult } from './chain-adapter.js';
 import { buildAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1 } from '@origintrail-official/dkg-core';
@@ -248,25 +249,67 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
         'Pass both explicitly — e.g. { accessPolicy: 1, publishPolicy: 0 } for invite-only + curators-only.',
       );
     }
-    const receipt = await this.sendContractTransaction(
-      this.contracts.contextGraphs,
-      'createContextGraph',
-      [
-        params.participantAgents ?? [],
-        params.metadataBatchId ?? 0n,
-        params.accessPolicy,
-        params.publishPolicy,
-        params.publishAuthority ?? ethers.ZeroAddress,
-        params.publishAuthorityAccountId ?? 0n,
-        // OT-RFC-38 / LU-6 Phase B — opt-in wire-id commitment. Default
-        // `bytes32(0)` opts out; the agent supplies a non-zero hash
-        // (typically `keccak256(bytes(cleartextId))`) to enable cores'
-        // chain-event-driven host-mode auto-subscribe path.
-        params.nameHash ?? ethers.ZeroHash,
-      ],
-      this.signer,
-      'create on-chain context graph',
-    );
+
+    const contextGraphs = this.contracts.contextGraphs;
+    const createArgs = [
+      params.participantAgents ?? [],
+      params.metadataBatchId ?? 0n,
+      params.accessPolicy,
+      params.publishPolicy,
+      params.publishAuthority ?? ethers.ZeroAddress,
+      params.publishAuthorityAccountId ?? 0n,
+      // OT-RFC-38 / LU-6 Phase B — opt-in wire-id commitment. Default
+      // `bytes32(0)` opts out; the agent supplies a non-zero hash
+      // (typically `keccak256(bytes(cleartextId))`) to enable cores'
+      // chain-event-driven host-mode auto-subscribe path.
+      params.nameHash ?? ethers.ZeroHash,
+    ];
+    const submitCreate = () =>
+      this.sendContractTransaction(
+        contextGraphs,
+        'createContextGraph',
+        createArgs,
+        this.signer,
+        'create on-chain context graph',
+      );
+
+    // OT-RFC-53: when the registration deposit is active, createContextGraph
+    // pulls it via transferFrom and reverts until the ContextGraphs facade is
+    // approved. Recover LAZILY (mirrors the publish/update #888 allowance
+    // recovery): on a first-attempt revert, if a deposit is actually configured,
+    // approve it to the facade and retry once. The common path (deposit dormant)
+    // is a single tx with NO extra eth_call, so it never perturbs timing-
+    // sensitive integration tests.
+    const receipt = await (async () => {
+      try {
+        return await submitCreate();
+      } catch (err) {
+        // Only the deposit-allowance revert is recoverable here. Mirror the
+        // publish/update allowance recovery (`isTooLowAllowanceError`): an
+        // unrelated first-attempt revert (invalid access/publish policy, PCA
+        // coherence failure, paused contract, insufficient balance, RPC error)
+        // must NOT trigger a state-changing TRAC approval before re-failing.
+        if (!isTooLowAllowanceError(err)) {
+          throw err;
+        }
+        const ps = this.contracts.parametersStorage as Contract | undefined;
+        let deposit = 0n;
+        try {
+          deposit = ps ? await ps.contextGraphRegistrationDeposit() : 0n;
+        } catch {
+          deposit = 0n;
+        }
+        if (deposit === 0n) throw err;
+        await this.ensureV10ApproveTrac(
+          this.signer,
+          await contextGraphs.getAddress(),
+          deposit,
+          'cg registration deposit',
+          true,
+        );
+        return submitCreate();
+      }
+    })();
 
     let contextGraphId: bigint | undefined;
     for (const log of receipt.logs) {
@@ -428,7 +471,7 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
     const authorTypedData = buildAuthorAttestationTypedData({
       chainId: v10ChainId,
       kav10Address: v10KavAddress,
-      contextGraphId: params.contextGraphId,
+      // #1116: AuthorAttestation no longer binds contextGraphId.
       merkleRoot: params.merkleRoot,
       authorAddress: signer.address,
       reservedKaId: 0n,
@@ -474,14 +517,14 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
   async getContextGraphKCCount(contextGraphId: bigint): Promise<bigint> {
     await this.init();
     const cgs = this.requireContextGraphStorage();
-    const count: bigint = await cgs.getContextGraphKCCount(contextGraphId);
+    const count: bigint = await cgs.getContextGraphKaCount(contextGraphId);
     return BigInt(count);
   }
 
   async getContextGraphKCAt(contextGraphId: bigint, index: bigint): Promise<bigint> {
     await this.init();
     const cgs = this.requireContextGraphStorage();
-    const kaId: bigint = await cgs.getContextGraphKCAt(contextGraphId, index);
+    const kaId: bigint = await cgs.getContextGraphKaAt(contextGraphId, index);
     return BigInt(kaId);
   }
 

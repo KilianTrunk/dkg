@@ -51,9 +51,9 @@ import type { SyncPhase } from './sync/auth/request-build.js';
  * self-sovereign agents whose private key isn't held by the daemon.
  * Compact ECDSA `(r, vs)` over the EIP-712 typed data
  * `buildAuthorAttestationTypedData({ chainId, kav10Address,
- * contextGraphId, merkleRoot, authorAddress: address })`. The agent
- * verifies the recovered signer matches `address` before stamping the
- * seal.
+ * merkleRoot, authorAddress: address, reservedKaId })` (#1116: the
+ * attestation no longer binds `contextGraphId`). The agent verifies the
+ * recovered signer matches `address` before stamping the seal.
  *
  * Lives at the agent layer (rather than as a publisher
  * `PublishOptions` field) since RFC-001 §9.x — Phase C — the
@@ -826,6 +826,8 @@ export type ReplicationEventSink = (event: ReplicationEvent) => void;
 
 export interface DKGAgentConfig {
   name: string;
+  /** Selected genesis document. Defaults to the compatibility Base testnet genesis. */
+  genesisId?: string;
   /**
    * public-projection enable flag. When set, a private CG's confirmed VM
    * publishes emit/refresh a verifiable public projection (the floor: existence,

@@ -28,6 +28,7 @@ import {
 } from '@origintrail-official/dkg-core';
 import {
   DkgDaemonClient,
+  DkgDaemonHttpError,
   normalizeContextGraphId,
   type LocalAgentIntegrationRecord,
   type LocalAgentIntegrationTransport,
@@ -100,6 +101,80 @@ import { buildQueryTools } from './tools/query-tools.js';
 import { buildMessagingTools } from './tools/messaging-tools.js';
 import { buildAssertionTools } from './tools/assertion-tools.js';
 import { buildMemoryTools } from './tools/memory-tools.js';
+
+// #1116 share-outcome warnings. These three constants + classifyShareWarning are
+// duplicated byte-identical across the MCP, OpenClaw, and Hermes adapters. There
+// is intentionally NO shared runtime module: MCP has no dkg-core dependency
+// (dependency-light by design) and OpenClaw cannot import from dkg-mcp, so the
+// only "shared home" would be a new package (out of scope). Drift is caught by a
+// TEST: this adapter's suite asserts these values are byte-identical to the
+// canonical fixture at `tests/fixtures/share-seal-warnings.json`. Update the
+// fixture + all three adapters together; the parity tests flag any mismatch.
+
+// publishReady:false after a FULL share that opted out of sealing (skip_seal:true)
+// — a later finalize(layer:swm) DOES seal it.
+export const SHARE_NOT_PUBLISH_READY_WARNING =
+  'Shared to SWM but NOT publish-ready (sealed:false). Seal it with ' +
+  'dkg_knowledge_asset_finalize (layer:swm works after sharing), then publish.';
+
+// A SUBSET share is publishReady:false too, but unlike a skip_seal full share it
+// is NOT sealable — finalize(layer:swm) now REJECTS it with SWM_SUBSET_NOT_SEALABLE.
+// Surface the real recovery (full share / new asset) instead of "seal it".
+export const SHARE_SUBSET_NOT_PUBLISH_READY_WARNING =
+  'Shared a SUBSET to SWM for peer visibility. A subset is NOT sealable/' +
+  'publishable (finalize layer:swm will reject it). To publish on-chain, share ' +
+  'the full asset (entities:"all"), or model this subset as its own knowledge asset.';
+
+// A FULL share can come back sealed:true but publishReady:false when NOT every
+// sealed root reached SWM (promotedAllRoots false — e.g. foreign-owned roots were
+// skipped). The engine did NOT set the swmShareComplete marker, so finalize(layer:
+// swm) would REJECT — do NOT recommend it here. Re-sharing the full asset recovers.
+export const SHARE_INCOMPLETE_PROMOTE_WARNING =
+  'Sealed, but not all roots reached SWM (some roots may be owned by other ' +
+  'agents) — not yet publishable; re-share the full asset so every sealed root ' +
+  'is in SWM.';
+
+/**
+ * #1116: pick the not-publish-ready share warning from the share outcome. Returns
+ * `undefined` when the share IS publish-ready (no warning). Precedence:
+ *  1. sealed:true + publishReady:false → incomplete full promote (marker NOT set;
+ *     finalize layer:swm would reject) → re-share the full asset.
+ *  2. sealed:false + SUBSET → not sealable.
+ *  3. sealed:false + FULL (skip_seal) → sealable later (finalize layer:swm works).
+ * Duplicated byte-identical on MCP (TS) + Hermes (Python).
+ */
+export function classifyShareWarning(outcome: {
+  sealed?: boolean;
+  publishReady?: boolean;
+  isSubset: boolean;
+}): string | undefined {
+  if (outcome.publishReady !== false) return undefined;
+  if (outcome.sealed === true) return SHARE_INCOMPLETE_PROMOTE_WARNING;
+  if (outcome.isSubset) return SHARE_SUBSET_NOT_PUBLISH_READY_WARNING;
+  return SHARE_NOT_PUBLISH_READY_WARNING;
+}
+
+/**
+ * #1116: extract the daemon's recovery hint from a 409 UNSEALED_SHARE_BLOCKED
+ * share failure. The DkgDaemonClient throws a typed {@link DkgDaemonHttpError}
+ * carrying the response `status` and parsed JSON `body`, so branch structurally
+ * on the status + body code (no JSON-from-message parsing). Returns undefined
+ * for any other error (caller falls back to the generic daemonError).
+ */
+function extractUnsealedShareRecovery(err: unknown): string | undefined {
+  if (
+    err instanceof DkgDaemonHttpError &&
+    err.status === 409 &&
+    typeof err.body === 'object' &&
+    err.body !== null
+  ) {
+    const body = err.body as { code?: string; recovery?: string };
+    if (body.code === 'UNSEALED_SHARE_BLOCKED' && typeof body.recovery === 'string' && body.recovery) {
+      return body.recovery;
+    }
+  }
+  return undefined;
+}
 
 export class DkgNodePlugin {
   private config: DkgOpenClawConfig;
@@ -3543,6 +3618,20 @@ export class DkgNodePlugin {
         }
         schemeVersion = raw;
       }
+      // #1116: optional `layer` selects WHERE the content to seal lives. Default
+      // (omitted) seals the open WM draft; "swm" seals an asset already shared to
+      // SWM. Present-but-invalid is a tool error, never a silent default. Check
+      // `typeof === 'string'` BEFORE trimming/enum-checking — `String(args.layer)`
+      // would coerce a non-string like ['swm'] to "swm" and FORWARD it (parity
+      // with the Hermes direct-validation fix; not a String() coercion bypass).
+      let layer: 'wm' | 'swm' | undefined;
+      if (args.layer !== undefined) {
+        const raw = typeof args.layer === 'string' ? args.layer.trim() : args.layer;
+        if (raw !== 'wm' && raw !== 'swm') {
+          return this.error('"layer" must be "wm" or "swm".');
+        }
+        layer = raw;
+      }
       // Seal the WHOLE WM draft (CONTRACT §1 Stage3 — there is no subset scope on
       // finalize). The author defaults to the request token's agent when
       // `author_agent_address` is omitted; pre-signed attestations are not surfaced
@@ -3551,6 +3640,7 @@ export class DkgNodePlugin {
         subGraphName,
         authorAgentAddress,
         schemeVersion,
+        layer,
       });
       return this.json(result);
     } catch (err: any) {
@@ -3585,14 +3675,42 @@ export class DkgNodePlugin {
       } else {
         return this.error('"entities" must be omitted, the string "all", or a non-empty array of root entity URIs.');
       }
+      // #1116: a full share SEALS BY DEFAULT; `skip_seal:true` shares unsealed.
+      // Present-but-invalid is a tool error, never a silent default.
+      let skipSeal: boolean | undefined;
+      if (args.skip_seal !== undefined) {
+        if (typeof args.skip_seal !== 'boolean') {
+          return this.error('"skip_seal" must be a boolean.');
+        }
+        skipSeal = args.skip_seal;
+      }
       // WM → SWM. The KA `swm/share` route is the same engine call
       // (`agent.assertion.promote`) the legacy promote used.
       const result = await this.client.knowledgeAssetShare(contextGraphId, name, {
         entities,
         subGraphName,
+        skipSeal,
       });
+      // #1116: surface the seal outcome. `sealed`/`publishReady` flow through the
+      // JSON; ALSO add the explicit warning when the share is NOT publish-ready.
+      // classifyShareWarning picks the right of the three warnings from
+      // {sealed, publishReady, isSubset}. A subset is a non-empty specific array
+      // (an empty array was rejected above; "all"/undefined is a full share).
+      const seal = result as { publishReady?: boolean; sealed?: boolean };
+      const warning = result
+        ? classifyShareWarning({ sealed: seal.sealed, publishReady: seal.publishReady, isSubset: Array.isArray(entities) })
+        : undefined;
+      if (warning) {
+        return this.json({ ...result, warning });
+      }
       return this.json(result);
     } catch (err: any) {
+      // #1116: a default (sealing) share that cannot seal fails CLOSED — the
+      // daemon returns 409 UNSEALED_SHARE_BLOCKED with a recovery hint and WM
+      // preserved. The client throws an Error whose message carries the response
+      // body; surface the recovery text verbatim when present.
+      const recovery = extractUnsealedShareRecovery(err);
+      if (recovery) return this.error(recovery);
       return this.daemonError(err);
     }
   }
@@ -3648,12 +3766,13 @@ export class DkgNodePlugin {
         return this.error('"access_policy" requires "register_if_needed": true — it only applies when registering the context graph.');
       }
 
-      // CONTRACT §G: vm/publish requires the CG to be registered on-chain and does
-      // NOT auto-register. When `register_if_needed` is true, register first
-      // (idempotent — "already registered" is success), mirroring
-      // dkg_shared_memory_publish. A hard registration failure is a tool error: do
-      // NOT publish. When false/omitted, publish directly and surface the daemon's
-      // not-registered error verbatim.
+      // CONTRACT §G: vm/publish AUTO-registers an unregistered CG transparently
+      // (#1116) at gas/TRAC cost regardless of `register_if_needed`. When
+      // `register_if_needed` is true we run an EXPLICIT register first (idempotent —
+      // "already registered" is success) so the caller can choose the registration's
+      // access_policy, mirroring dkg_shared_memory_publish. A hard registration
+      // failure is a tool error: do NOT publish. When false/omitted, publish
+      // directly — the daemon auto-registers and defaults the policy.
       const registration = registerIfNeeded
         ? await this.registerContextGraphIfNeeded(contextGraphId, args.access_policy as number | undefined)
         : undefined;

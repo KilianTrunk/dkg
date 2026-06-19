@@ -617,7 +617,7 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
     const circuitAddrs = agent.multiaddrs.filter((a) =>
       a.includes("/p2p-circuit/"),
     );
-    const networkId = await computeNetworkId();
+    const networkId = await computeNetworkId(network?.genesisId);
     const chainConf = resolveChainConfig(config, network);
     const rpcEndpointCount = chainConf?.rpcUrl
       ? resolveRpcUrls(chainConf.rpcUrl, chainConf.rpcUrls).length

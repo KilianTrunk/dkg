@@ -750,7 +750,6 @@ describe('Diagram 11 — Phase 5 precomputedAttestation (sign-at-creation)', () 
     const td = buildAuthorAttestationTypedData({
       chainId: BigInt(chainIdNum),
       kav10Address,
-      contextGraphId: BigInt(CONTEXT_GRAPH),
       merkleRoot,
       authorAddress: author.address,
       schemeVersion: AUTHOR_SCHEME_VERSION_V1,
@@ -808,7 +807,6 @@ describe('Diagram 11 — Phase 5 precomputedAttestation (sign-at-creation)', () 
     const td = buildAuthorAttestationTypedData({
       chainId: BigInt(chainIdNum),
       kav10Address,
-      contextGraphId: BigInt(CONTEXT_GRAPH),
       merkleRoot: fakeRoot,
       authorAddress: author.address,
       schemeVersion: AUTHOR_SCHEME_VERSION_V1,
@@ -887,7 +885,6 @@ describe('Diagram 11 — Phase 5 precomputedAttestation (sign-at-creation)', () 
     const td = buildAuthorAttestationTypedData({
       chainId: BigInt(chainIdNum),
       kav10Address,
-      contextGraphId: BigInt(CONTEXT_GRAPH),
       merkleRoot: expectedRoot,
       authorAddress: author.address,
       schemeVersion: AUTHOR_SCHEME_VERSION_V1,

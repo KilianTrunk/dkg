@@ -463,7 +463,6 @@ describe('publishJsonLd', () => {
     const typed = buildAuthorAttestationTypedData({
       chainId,
       kav10Address,
-      contextGraphId: BigInt(onChainId),
       merkleRoot: merkleRootBytes,
       authorAddress: seal!.authorAddress,
       reservedKaId,
@@ -914,7 +913,6 @@ describe('publishJsonLd', () => {
     const typed = buildAuthorAttestationTypedData({
       chainId,
       kav10Address,
-      contextGraphId: BigInt(onChainId),
       merkleRoot: ethers.getBytes(seal!.merkleRoot),
       authorAddress: seal!.authorAddress,
       reservedKaId,

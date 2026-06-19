@@ -86,6 +86,25 @@ export async function handleKaShareAsyncEnqueue(ctx: RequestContext, name: strin
   if (!resolvedContextGraphId) return;
   if (!validateEntities(entities, res)) return;
   if (!validateOptionalSubGraphName(subGraphName, res)) return;
+  // #1116 (round 5) — the sync swm/share validates `skipSeal` as a strict
+  // boolean; the async queue ALWAYS seals (the safe default) and cannot carry
+  // skipSeal through the job, so it was silently dropped — a confusing footgun
+  // (a caller asking to skip sealing got a sealed share). Match the sync route's
+  // strict-boolean validation, and reject a truthy boolean outright rather than
+  // honoring it differently than requested.
+  if (parsed?.skipSeal !== undefined) {
+    if (typeof parsed.skipSeal !== "boolean") {
+      return jsonResponse(res, 400, {
+        error: '"skipSeal" must be a boolean when supplied',
+      });
+    }
+    if (parsed.skipSeal === true) {
+      return jsonResponse(res, 400, {
+        error:
+          "skipSeal is not supported for async share; use swm/share (the synchronous route) to share without sealing",
+      });
+    }
+  }
   try {
     const result = await agent.assertion.promoteAsync(
       resolvedContextGraphId,

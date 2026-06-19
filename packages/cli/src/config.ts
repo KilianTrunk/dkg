@@ -100,7 +100,9 @@ export type ResolvedAutoUpdateConfig = AutoUpdateConfig & {
 };
 
 export interface NetworkConfig {
+  _status?: string;
   networkName: string;
+  genesisId: string;
   networkId: string;
   genesisVersion: number;
   relays: string[];
@@ -741,6 +743,42 @@ export function resolveNetworkDefaultContextGraphs(network: NetworkConfig | null
   return network?.defaultContextGraphs ?? [];
 }
 
+type NetworkReadinessValidation =
+  | { ok: true; messages: [] }
+  | { ok: false; messages: string[] };
+
+type NetworkReadinessInput = Partial<Pick<NetworkConfig, '_status' | 'networkName' | 'relays'>>;
+
+export function validateNetworkConfigReadiness(
+  network: NetworkReadinessInput | null | undefined,
+): NetworkReadinessValidation {
+  const networkName = network?.networkName ?? 'selected network';
+  const messages: string[] = [];
+  if (network?._status?.toLowerCase().startsWith('pre-deployment')) {
+    messages.push(
+      `FATAL: network config ${networkName} is marked ${network._status}.`,
+    );
+  }
+  const placeholderRelays = network?.relays?.filter(relay => relay.includes('/p2p/PEER_ID_')) ?? [];
+  if (placeholderRelays.length > 0) {
+    messages.push(
+      `FATAL: network config ${networkName} contains placeholder relay peer IDs: ${placeholderRelays.join(', ')}`,
+    );
+    messages.push('Replace pre-deployment relay PeerIDs before selecting this network.');
+  }
+  if (messages.length > 0) return { ok: false, messages };
+  return { ok: true, messages: [] };
+}
+
+export function assertNetworkConfigReadiness(
+  network: NetworkReadinessInput | null | undefined,
+): void {
+  const readiness = validateNetworkConfigReadiness(network);
+  if (!readiness.ok) {
+    throw new Error(readiness.messages.join('\n'));
+  }
+}
+
 /** Resolve shared memory TTL from config, accepting both V10 and legacy keys. */
 export function resolveSharedMemoryTtlMs(config: DkgConfig): number | undefined {
   return config.sharedMemoryTtlMs ?? config.workspaceTtlMs;
@@ -1013,6 +1051,9 @@ export function resolveAutoUpdateSource(
  * The return type is `Partial<ChainConfig>` because either source may be
  * partial; consumers that need both `rpcUrl` and `hubAddress` (lifecycle,
  * publisher-runner) MUST guard for those fields before passing to the agent.
+ *
+ * This is a raw field-merge helper. Call {@link resolveReadyChainConfig} at
+ * CLI/daemon activation boundaries that must reject pre-deployment networks.
  */
 export function resolveChainConfig(
   config: Pick<DkgConfig, 'chain'> | null | undefined,
@@ -1067,6 +1108,16 @@ export function resolveChainConfig(
   if (cgRegistryScanPageSize !== undefined) merged.cgRegistryScanPageSize = cgRegistryScanPageSize;
   if (cfg?.mockIdentityId !== undefined) merged.mockIdentityId = cfg.mockIdentityId;
   return merged;
+}
+
+export function resolveReadyChainConfig(
+  config: Pick<DkgConfig, 'chain'> | null | undefined,
+  network: (Pick<NetworkConfig, 'chain'> & NetworkReadinessInput) | null | undefined,
+): ResolvedChainConfig | undefined {
+  if (config?.chain?.type !== 'mock') {
+    assertNetworkConfigReadiness(network);
+  }
+  return resolveChainConfig(config, network);
 }
 
 /**

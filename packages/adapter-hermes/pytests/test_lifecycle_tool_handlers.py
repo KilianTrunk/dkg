@@ -41,9 +41,11 @@ class _FakeClient:
         return self.register_response
 
     def finalize_assertion(self, name, cg, sub_graph_name=None,
-                           author_agent_address=None, scheme_version=None):
+                           author_agent_address=None, scheme_version=None,
+                           layer=None):
+        # #1116: accept the new `layer` kwarg ("wm"|"swm") the handler now forwards.
         self.calls.append(("finalize", name, cg, sub_graph_name,
-                           author_agent_address, scheme_version))
+                           author_agent_address, scheme_version, layer))
         return {"merkleRoot": "0xroot", "authorAddress": author_agent_address or "0xdefault"}
 
     def publish_finalized_assertion(self, name, cg, sub_graph_name=None, options=None):
@@ -56,8 +58,10 @@ class _FakeClient:
         self.calls.append(("pull", name, cg, layer, on_conflict, sub_graph_name))
         return {"wmDraft": "open", "seededFrom": {"layer": layer}}
 
-    def promote_assertion(self, name, cg, entities, sub_graph_name=None):
-        self.calls.append(("share", name, cg, entities, sub_graph_name))
+    def promote_assertion(self, name, cg, entities, sub_graph_name=None,
+                          skip_seal=None):
+        # #1116: accept the new `skip_seal` kwarg the handler now forwards.
+        self.calls.append(("share", name, cg, entities, sub_graph_name, skip_seal))
         return {"swmShared": True, "promotedCount": 1}
 
 
@@ -138,16 +142,20 @@ def test_share_description_carries_subset_language(provider):
 
 
 def test_share_description_softens_publish_ready_and_notes_finalize(provider):
-    # #1076:96 — "publish-ready" must be CONDITIONAL: full share auto-seals
-    # best-effort; on a signing/capability gap it shares UNSEALED and a later
-    # publish 409s, so finalize explicitly for predictable publishing.
+    # #1116 — a full share now SEALS BY DEFAULT (publish-ready). skip_seal=true
+    # opts out into an unsealed SWM share; a default share that cannot seal fails
+    # CLOSED (409, WM preserved) with a recovery hint. Finalize stays the explicit
+    # path for custom options and for sealing an already-shared asset (layer:swm).
     share = next(s for s in provider.get_tool_schemas()
                  if s["name"] == "dkg_knowledge_asset_share")
     desc = share["description"]
-    assert "BEST-EFFORT" in desc
-    assert "UNSEALED" in desc
-    assert "409" in desc
+    assert "SEALS BY DEFAULT" in desc
+    assert "skip_seal=true" in desc
+    assert "WITHOUT sealing" in desc
+    assert "fails CLOSED" in desc and "409" in desc
     assert "dkg_knowledge_asset_finalize EXPLICITLY first" in desc
+    # layer:swm note for sealing after sharing
+    assert "layer=\"swm\" works after" in desc
     # custom finalize options note is preserved
     assert "author_agent_address" in desc and "scheme_version" in desc
 
@@ -883,3 +891,178 @@ def test_create_name_description_aligns_to_validation(provider):
     assert "256" in desc
     assert "IRI-unsafe" in desc
     assert "reserved" in desc
+
+
+# -- #1116 _annotate_share_seal helper (warning branch + recovery surfacing) ---
+
+def test_annotate_share_seal_full_skip_seal_warns_sealable(plugin_module):
+    # publishReady:false on a FULL share (entities None/"all") → the seal-it hint
+    # (finalize layer:swm DOES seal a skip_seal full share).
+    f = plugin_module._annotate_share_seal
+    out = f({"swmShared": True, "publishReady": False}, None)
+    assert "NOT publish-ready (sealed:false)" in out["warning"]
+    assert "layer:swm works after sharing" in out["warning"]
+    assert "NOT sealable" not in out["warning"]
+    # "all" is also a full share → same sealable warning.
+    out_all = f({"swmShared": True, "publishReady": False}, "all")
+    assert "layer:swm works after sharing" in out_all["warning"]
+
+
+def test_annotate_share_seal_subset_warns_not_sealable(plugin_module):
+    # publishReady:false on a SUBSET (non-empty list) → the not-sealable recovery
+    # (finalize layer:swm REJECTS a subset with SWM_SUBSET_NOT_SEALABLE).
+    f = plugin_module._annotate_share_seal
+    out = f({"swmShared": True, "publishReady": False}, ["urn:a"])
+    assert "A subset is NOT sealable/publishable" in out["warning"]
+    assert 'entities:"all"' in out["warning"]
+    assert "Seal it with" not in out["warning"]
+
+
+def test_annotate_share_seal_incomplete_full_promote_warns_no_finalize(plugin_module):
+    # sealed:true + publishReady:false → an incomplete FULL promote (not every
+    # sealed root reached SWM, e.g. foreign-owned roots skipped). The
+    # swmShareComplete marker is NOT set, so finalize layer:swm would REJECT — the
+    # third warning must NOT recommend it. The `sealed:true` case takes precedence
+    # over the entities/subset branch.
+    f = plugin_module._annotate_share_seal
+    for ent in (None, "all", ["urn:a"]):
+        out = f({"swmShared": True, "sealed": True, "publishReady": False}, ent)
+        assert "not all roots reached SWM" in out["warning"], ent
+        assert "re-share the full asset" in out["warning"], ent
+        # NOT the dead-end finalize layer:swm hint, NOT the subset hint.
+        assert "layer:swm works after sharing" not in out["warning"], ent
+        assert "NOT sealable" not in out["warning"], ent
+
+
+def test_annotate_share_seal_blocked_surfaces_recovery(plugin_module):
+    # A 409 UNSEALED_SHARE_BLOCKED body (returned by the client as a dict) →
+    # surface the recovery verbatim as {error: recovery}.
+    f = plugin_module._annotate_share_seal
+    out = f({"code": "UNSEALED_SHARE_BLOCKED", "recovery": "pass skip_seal=true"})
+    assert out == {"error": "pass skip_seal=true"}
+
+
+def test_annotate_share_seal_blocked_without_recovery_passes_through(plugin_module):
+    # blocked but no recovery hint → pass the raw body through untouched.
+    f = plugin_module._annotate_share_seal
+    body = {"code": "UNSEALED_SHARE_BLOCKED"}
+    assert f(body) == body
+
+
+def test_annotate_share_seal_publish_ready_and_non_dict_pass_through(plugin_module):
+    f = plugin_module._annotate_share_seal
+    # publishReady true → untouched (no warning key).
+    ready = {"swmShared": True, "publishReady": True}
+    assert f(ready, None) == ready
+    assert "warning" not in f(ready, None)
+    # non-dict → passthrough.
+    assert f("x", None) == "x"
+
+
+# -- #1116 share handler: skip_seal validation + wire forwarding -----------
+
+def test_share_handler_rejects_non_boolean_skip_seal(provider):
+    before = len(provider._client.calls)
+    out = json.loads(provider.handle_tool_call("dkg_knowledge_asset_share", {
+        "context_graph_id": "cg1", "name": "ka", "skip_seal": "yes",
+    }))
+    assert out["error"] == "skip_seal must be a boolean."
+    # invalid value never reached the wire
+    assert len(provider._client.calls) == before
+
+
+def test_share_handler_forwards_skip_seal_true_to_client(provider):
+    provider.handle_tool_call("dkg_knowledge_asset_share", {
+        "context_graph_id": "cg1", "name": "ka", "skip_seal": True,
+    })
+    # promote_assertion records ("share", name, cg, entities, sub_graph_name, skip_seal)
+    assert provider._client.calls[-1][0] == "share"
+    assert provider._client.calls[-1][5] is True
+
+
+# -- #1116 finalize handler: layer validation + wire forwarding ------------
+
+def test_finalize_handler_rejects_invalid_layer(provider):
+    before = len(provider._client.calls)
+    out = json.loads(provider.handle_tool_call("dkg_knowledge_asset_finalize", {
+        "context_graph_id": "cg1", "name": "ka", "layer": "bogus",
+    }))
+    assert out["error"] == 'layer must be "wm" or "swm".'
+    assert len(provider._client.calls) == before
+
+
+@pytest.mark.parametrize("bad", [True, False, ["swm"], 1, 0, {"l": "swm"}])
+def test_finalize_handler_rejects_non_string_layer(provider, bad):
+    # Round-6 reviewer: a PRESENT non-string layer must NOT silently fall through
+    # to the default WM seal. The old _first_text() validator coerced any non-string
+    # to "" -> treated as omitted -> sealed the default WM layer. Validate
+    # args.get("layer") directly: a present non-string ("True"/list/number/dict) is a
+    # tool error AND nothing reaches the wire.
+    before = len(provider._client.calls)
+    out = json.loads(provider.handle_tool_call("dkg_knowledge_asset_finalize", {
+        "context_graph_id": "cg1", "name": "ka", "layer": bad,
+    }))
+    assert out["error"] == 'layer must be "wm" or "swm".', (bad, out)
+    assert len(provider._client.calls) == before, bad  # nothing on the wire
+
+
+def test_finalize_handler_omitted_layer_defaults_to_none(provider):
+    # absent layer key -> default WM seal (layer forwarded as None), no error.
+    provider.handle_tool_call("dkg_knowledge_asset_finalize", {
+        "context_graph_id": "cg1", "name": "ka",
+    })
+    assert provider._client.calls[-1][0] == "finalize"
+    assert provider._client.calls[-1][6] is None
+
+
+def test_finalize_handler_forwards_layer_swm_to_client(provider):
+    provider.handle_tool_call("dkg_knowledge_asset_finalize", {
+        "context_graph_id": "cg1", "name": "ka", "layer": "swm",
+    })
+    # finalize records ("finalize", name, cg, sub_graph_name, author, scheme_version, layer)
+    assert provider._client.calls[-1][0] == "finalize"
+    assert provider._client.calls[-1][6] == "swm"
+
+
+# -- #1116 share handler: publishReady:false warning end-to-end ------------
+
+def test_share_handler_full_skip_seal_warns_via_annotate(provider):
+    # A FULL skip_seal share whose daemon reply is publishReady:false surfaces the
+    # sealable warning through the handler (parity with the helper test).
+    provider._client.promote_assertion = (  # type: ignore[assignment]
+        lambda name, cg, entities, sub_graph_name=None, skip_seal=None: {
+            "swmShared": True, "promotedCount": 2, "sealed": False, "publishReady": False,
+        }
+    )
+    out = json.loads(provider.handle_tool_call("dkg_knowledge_asset_share", {
+        "context_graph_id": "cg1", "name": "ka", "skip_seal": True,
+    }))
+    assert "layer:swm works after sharing" in out["warning"]
+
+
+def test_share_handler_subset_warns_not_sealable_via_annotate(provider):
+    provider._client.promote_assertion = (  # type: ignore[assignment]
+        lambda name, cg, entities, sub_graph_name=None, skip_seal=None: {
+            "swmShared": True, "promotedCount": 1, "sealed": False, "publishReady": False,
+        }
+    )
+    out = json.loads(provider.handle_tool_call("dkg_knowledge_asset_share", {
+        "context_graph_id": "cg1", "name": "ka", "entities": ["urn:a"],
+    }))
+    assert "A subset is NOT sealable/publishable" in out["warning"]
+
+
+def test_share_handler_incomplete_full_promote_warns_via_annotate(provider):
+    # A FULL share that sealed but did NOT promote every root → sealed:true +
+    # publishReady:false → the incomplete-promote warning (do NOT finalize layer:swm).
+    provider._client.promote_assertion = (  # type: ignore[assignment]
+        lambda name, cg, entities, sub_graph_name=None, skip_seal=None: {
+            "swmShared": True, "promotedCount": 1, "sealed": True, "publishReady": False,
+        }
+    )
+    out = json.loads(provider.handle_tool_call("dkg_knowledge_asset_share", {
+        "context_graph_id": "cg1", "name": "ka",
+    }))
+    assert "not all roots reached SWM" in out["warning"]
+    assert "re-share the full asset" in out["warning"]
+    assert "layer:swm works after sharing" not in out["warning"]

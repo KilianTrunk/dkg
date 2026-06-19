@@ -141,6 +141,25 @@ export type SharedMemoryApplyOutcome =
   | { applied: false; reason: string; retryable: boolean };
 
 /**
+ * Structured rejection code for {@link SharedMemoryHandler.verifyHostModeEnvelopeAuthority}.
+ * Callers (e.g. the host-mode ingest path's #1124 public-CG exception) key off
+ * this stable code rather than the free-form `reason` text, so a wording change
+ * to a log message can never silently flip a behavioral branch.
+ */
+export type HostModeRejectionCode =
+  | 'DECODE_FAILED'
+  | 'UNSIGNED'
+  | 'NO_AGENT_ALLOWLIST'
+  | 'PEER_NOT_IN_ALLOWLIST'
+  | 'SIG_VERIFY_FAILED'
+  | 'CG_MISMATCH'
+  | 'PUBLISHER_PEER_MISMATCH';
+
+export type HostModeEnvelopeAuthorityVerdict =
+  | { accepted: true }
+  | { accepted: false; reasonCode: HostModeRejectionCode; reason: string };
+
+/**
  * Unambiguous composite key for `seenShareOps`.
  *
  * **Why not `${cgId}|${shareOperationId}` (rc.9 PR-A codex follow-up
@@ -842,6 +861,42 @@ export class SharedMemoryHandler {
           // become good on retry.
           return { applied: false, reason: 'agent envelope verification failed', retryable: false };
         }
+      } else if (trustedReplay && !hasPrivateAccessPolicy && !decoded.senderKeyMessage && !decoded.encryptedPayload) {
+        // GH #1124 (otReviewAgent #1239) — PUBLIC-CG host-catchup forgery gate.
+        // A public CG has no agent allowlist, so the curated branch above is
+        // skipped and a plaintext public envelope was previously applied with
+        // ZERO signature verification. That is acceptable on the LIVE gossip path
+        // (sender == publisher, bound by `publisherPeerId === fromPeerId` at the
+        // guard further below), but NOT on the `trustedReplay` host-catchup path:
+        // there the sender is an UNTRUSTED relaying host, the transport bind is
+        // skipped, and a malicious host can FABRICATE brand-new public bytes that
+        // never traversed any member's live ingest gate. So when replaying, the
+        // envelope MUST be self-signed and that signature MUST verify — otherwise
+        // a forged / unsigned / tampered public envelope would be applied.
+        //
+        // Self-consistency: the claimed signer is its own one-entry allowlist —
+        // a pure crypto check (no chain read). The signed payload
+        // (computeGossipSigningPayload over {type, contextGraphId, timestamp,
+        // encoded WorkspacePublishRequest}) authenticates the inner request
+        // (contextGraphId / publisherPeerId / nquads) as a unit, and
+        // verifyAgentEnvelope's `envelope.contextGraphId === contextGraphId`
+        // check is the cross-CG bind. Freshness is skipped (aged catchup), but
+        // the signature still must hold. Scoped to `trustedReplay` so the LIVE
+        // public path — including the legacy unsigned-public producer — is
+        // unchanged. (publisherPeerId OWNERSHIP attribution is NOT recoverable on
+        // catchup for an open-publish CG — see the residual note on the PR.)
+        if (!envelope || !envelope.agentAddress || !ethers.isAddress(envelope.agentAddress)) {
+          const reason = `public context graph "${contextGraphId}" host-catchup envelope is unsigned — refusing to replay`;
+          this.log.warn(ctx, `SWM write rejected: ${reason}`);
+          return { applied: false, reason, retryable: false };
+        }
+        const selfConsistent = await this.verifyAgentEnvelope(
+          envelope, signedPayload, contextGraphId, [ethers.getAddress(envelope.agentAddress)], ctx,
+          { requireLocalMembership: false, skipTimestampFreshness: true },
+        );
+        if (!selfConsistent) {
+          return { applied: false, reason: 'public-CG host-catchup envelope failed signature verification', retryable: false };
+        }
       }
 
       const requiresEncryptedPayload = hasPrivateAccessPolicy || agentGateAddresses !== null;
@@ -1310,28 +1365,112 @@ export class SharedMemoryHandler {
     rawBytes: Uint8Array,
     contextGraphId: string,
     fromPeerId: string,
-  ): Promise<{ accepted: true } | { accepted: false; reason: string }> {
+    options?: {
+      /**
+       * GH #1124 — resolver the host-mode ingest caller injects to prove this CG
+       * is FULLY OPEN (`accessPolicy === 0` AND `publishPolicy === 1`). This
+       * verifier CALLS it and enforces BOTH axes itself, so the self-signed
+       * exception cannot be taken by merely passing a flag — it requires the
+       * caller's actual (forced-fresh, fail-closed) on-chain policy. Any
+       * undefined/throw → treated as NOT open (fail-closed). When the policy
+       * resolves open, the self-signed public path is taken REGARDLESS of
+       * whether a (possibly STALE) participant/agent allowlist still exists on
+       * the CG, because an open-publish CG admits ANY authorized publisher — the
+       * contract's `isAuthorizedPublisher` ignores `participantAgents` for open
+       * publish, so a CG flipped to open publish without clearing its old
+       * allowlist must NOT fall into the curated branch and drop valid open
+       * publishers (otReviewAgent #1239). When unset, only curated/allowlisted
+       * traffic is accepted (a no-allowlist CG is dropped defensively). Callers
+       * SHOULD skip passing this for obviously-ciphertext envelopes so the
+       * dominant curated path pays no chain read.
+       */
+      resolveOpenPublishPolicy?: () => Promise<{ accessPolicy?: number; publishPolicy?: number }>;
+    },
+  ): Promise<HostModeEnvelopeAuthorityVerdict> {
     const ctx = createOperationContext('share');
     let decoded: WorkspaceGossipDecodeResult;
     try {
       decoded = this.decodeWorkspaceGossipMessage(rawBytes);
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
-      return { accepted: false, reason: `decode failed: ${reason}` };
+      return { accepted: false, reasonCode: 'DECODE_FAILED', reason: `decode failed: ${reason}` };
     }
-    const { envelope, signedPayload } = decoded;
+    const { envelope, signedPayload, request } = decoded;
     if (!envelope) {
-      return { accepted: false, reason: 'unsigned envelope (host mode requires agent-signed gossip)' };
+      return { accepted: false, reasonCode: 'UNSIGNED', reason: 'unsigned envelope (host mode requires agent-signed gossip)' };
     }
     const agentGateAddresses = await this.getContextGraphAgentGateAddresses(contextGraphId);
     const allowedPeers = await this.getContextGraphAllowedPeers(contextGraphId);
+
+    // GH #1124 — resolve "fully-open (self-publishable) CG" HERE rather than
+    // trusting a caller flag: the caller injects the (forced-fresh, fail-closed)
+    // on-chain policy resolver and THIS verifier enforces BOTH axes
+    // (accessPolicy === 0 AND publishPolicy === 1). Any undefined/throw → not
+    // open (fail-closed). Gated INDEPENDENTLY of `agentGateAddresses`: an
+    // open-publish CG admits ANY authorized publisher (the contract's
+    // `isAuthorizedPublisher` ignores `participantAgents` for open publish), so a
+    // CG that retains a STALE participant allowlist after being flipped open must
+    // NOT fall into the curated branch and drop valid open publishers.
+    let confirmedOpenPublish = false;
+    if (options?.resolveOpenPublishPolicy) {
+      try {
+        const { accessPolicy, publishPolicy } = await options.resolveOpenPublishPolicy();
+        confirmedOpenPublish = accessPolicy === 0 && publishPolicy === 1;
+      } catch {
+        confirmedOpenPublish = false;
+      }
+    }
+
+    if (confirmedOpenPublish) {
+      // Self-signed public path — verify through the SAME `verifyAgentEnvelope`
+      // the curated path uses (signature + 5-minute timestamp-freshness window:
+      // replay / store-eviction guard), with the claimed signer as its own
+      // one-entry allowlist (self-consistency). Accepted regardless of any
+      // (stale) participant gate, per the open-publish rationale above.
+      if (!envelope.agentAddress || !ethers.isAddress(envelope.agentAddress)) {
+        return { accepted: false, reasonCode: 'SIG_VERIFY_FAILED', reason: 'public-CG envelope missing a valid signer address' };
+      }
+      const selfConsistent = await this.verifyAgentEnvelope(
+        envelope, signedPayload, contextGraphId, [ethers.getAddress(envelope.agentAddress)], ctx, { requireLocalMembership: false },
+      );
+      if (!selfConsistent) {
+        return { accepted: false, reasonCode: 'SIG_VERIFY_FAILED', reason: 'public-CG envelope failed signature/freshness verification' };
+      }
+      // A public self-signed host-mode entry is later applied via host catchup
+      // with `trustedReplay` (which SKIPS the publisherPeerId↔sender transport
+      // binding at apply time — see the `!trustedReplay && publisherPeerId !==
+      // fromPeerId` guard below). So bind it HERE, before it is ever stored:
+      //   1. REQUIRE a decoded WorkspacePublishRequest — a ciphertext / garbage
+      //      payload has no verifiable inner identity, so reject it (don't fall
+      //      through to accept as the prior `request && …` check did).
+      //   2. Bind the inner request to THIS CG (the apply path derives the target
+      //      from `request.contextGraphId`) — block cross-CG injection on the
+      //      open host-mode topic.
+      //   3. Bind `request.publisherPeerId` to the actual sender. Without this a
+      //      peer could relay an honestly-signed public envelope naming a
+      //      DIFFERENT publisherPeerId and have catchup apply the write under that
+      //      spoofed publisher/ownership identity (otReviewAgent #1239-r4).
+      if (!request) {
+        return { accepted: false, reasonCode: 'CG_MISMATCH', reason: 'public-CG envelope carries no decodable WorkspacePublishRequest' };
+      }
+      if (request.contextGraphId !== contextGraphId) {
+        return { accepted: false, reasonCode: 'CG_MISMATCH', reason: `inner request contextGraphId "${request.contextGraphId}" != envelope CG "${contextGraphId}"` };
+      }
+      if (request.publisherPeerId !== fromPeerId) {
+        return { accepted: false, reasonCode: 'PUBLISHER_PEER_MISMATCH', reason: `public-CG inner publisherPeerId "${request.publisherPeerId}" does not match sender "${fromPeerId}"` };
+      }
+      return { accepted: true };
+    }
+
     if (agentGateAddresses === null) {
-      // No agent gate → not curated → host mode shouldn't be
-      // active for this CG. Drop defensively.
-      return { accepted: false, reason: 'no agent allowlist on context graph' };
+      // Not confirmed open-publish AND no curated allowlist → curated mid-race or
+      // unknown → drop defensively. (The host-mode ingest caller keys its
+      // transient-race log off `reasonCode === 'NO_AGENT_ALLOWLIST'` — keep the
+      // code stable.)
+      return { accepted: false, reasonCode: 'NO_AGENT_ALLOWLIST', reason: 'no agent allowlist on context graph' };
     }
     if (allowedPeers !== null && !allowedPeers.includes(fromPeerId)) {
-      return { accepted: false, reason: `peer ${fromPeerId} not in peer allowlist` };
+      return { accepted: false, reasonCode: 'PEER_NOT_IN_ALLOWLIST', reason: `peer ${fromPeerId} not in peer allowlist` };
     }
     const verified = await this.verifyAgentEnvelope(
       envelope,
@@ -1342,7 +1481,7 @@ export class SharedMemoryHandler {
       { requireLocalMembership: false },
     );
     if (!verified) {
-      return { accepted: false, reason: 'agent envelope verification failed (see preceding WARN log)' };
+      return { accepted: false, reasonCode: 'SIG_VERIFY_FAILED', reason: 'agent envelope verification failed (see preceding WARN log)' };
     }
     return { accepted: true };
   }

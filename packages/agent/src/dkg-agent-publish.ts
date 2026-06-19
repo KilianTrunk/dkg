@@ -173,7 +173,10 @@ import {
   createSwmAckQuorum,
   type SwmAckQuorum,
 } from './swm/ack-quorum.js';
-import type { SelectSwmFanoutPeersResult } from './swm/swm-fanout-peer-selection.js';
+import {
+  classifySwmFanoutPeerOutcome,
+  type SelectSwmFanoutPeersResult,
+} from './swm/swm-fanout-peer-selection.js';
 import { SwmHostModeStore, type SwmHostModeStoreLimits } from './swm/host-mode-store.js';
 import {
   BEACON_ACCESS_POLICY_CURATED,
@@ -607,16 +610,28 @@ export class PublishMethods extends DKGAgentBase {
     //      we don't pretend we can verify those deliveries.
     //      Cross-peer SWM-inbox SPARQL remains the ground-truth
     //      check.
+    // #1227 regression fix: gate + track on the FULL dialable set
+    // (`plan.substrateMembers`), NOT the churn-selector-narrowed
+    // `substrateMembers` send set. The active-fanout selector only
+    // bounds which peers we ATTEMPT this round (to limit churn); the
+    // ack-quorum's `expectedMembers` must stay the complete
+    // roundtrip-eligible roster so a peer the selector skipped this
+    // round still counts toward quorum once it acks (via gossip or a
+    // later top-up). Narrowing `expectedMembers` to the probe-limited
+    // subset silently dropped real subscribers from the quorum target
+    // — the same class of bug the codex-RED note in
+    // `enumerate-cg-members.ts` (`members` must not shrink
+    // `expectedMembers`) was added to prevent.
     const ackQuorumActive = !!shareOperationId
       && plan.useGossip
-      && substrateMembers.length > 0;
+      && plan.substrateMembers.length > 0;
     let trackedQuorum: SwmAckQuorum | null = null;
     if (ackQuorumActive && shareOperationId) {
       trackedQuorum = this.getOrCreateSwmAckQuorum();
       trackedQuorum.track({
         shareOperationId,
         cgId: contextGraphId,
-        expectedMembers: substrateMembers,
+        expectedMembers: plan.substrateMembers,
         preAckedFromSubstrate: [],
         payload: wireMessage,
         enumerationSource: plan.enumerationSource,
@@ -657,7 +672,22 @@ export class PublishMethods extends DKGAgentBase {
                 ) {
                   trackedQuorum.onAck(shareOperationId, record.peerId);
                 }
-                if (plan.enumerationSource === 'topic-subscribers') {
+                // #1227 regression fix: only feed TERMINAL initial-fanout
+                // outcomes (delivered→good, failed/rejected→failed/
+                // unsupported) into the active-fanout churn selector. A
+                // transient `queued`/`retryable`/`inFlight` outcome
+                // classifies as `nonTerminal` and would be cached with the
+                // negative TTL (2m) — which is longer than the watchdog
+                // interval (30s), so it suppressed the SAME share's first
+                // watchdog top-up of that very peer (the watchdog exists
+                // precisely to retry those queued/transient peers). Cross-
+                // share churn limiting still works: a genuinely failed/
+                // unsupported peer is remembered, and the top-up path
+                // (swmSubstrateTopUp) keeps feeding its own outcomes.
+                if (
+                  plan.enumerationSource === 'topic-subscribers'
+                  && classifySwmFanoutPeerOutcome(record) !== 'nonTerminal'
+                ) {
                   this.recordSwmFanoutPeerRecord(contextGraphId, record);
                 }
                 if (

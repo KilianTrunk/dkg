@@ -954,9 +954,17 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
         (agent.node.libp2p.peerStore as any).get = recorder(async () => ({
           protocols: [PROTOCOL_SYNC],
         } as any));
-        (agent as any).syncFromPeer = recorder(async () => 0);
+        // `runSyncOnConnect` calls `syncFromPeerDetailed` /
+        // `syncSharedMemoryFromPeerDetailed` (the seams `trySyncFromPeer`
+        // wires in), NOT the bare `syncFromPeer` helpers. Stub the real
+        // seams to a clean (zero, no-backoff) result so the durable round
+        // does not trip the "stop on backoff-worthy failure" early-return
+        // (added by `4b50883c6`), which would otherwise skip
+        // `refreshMetaSyncedFlags` and make this assertion pass only
+        // vacuously.
+        (agent as any).syncFromPeerDetailed = recorder(async () => 0);
+        (agent as any).syncSharedMemoryFromPeerDetailed = recorder(async () => 0);
         (agent as any).discoverContextGraphsFromStore = recorder(async () => 0);
-        (agent as any).syncSharedMemoryFromPeer = recorder(async () => 0);
 
         await (agent as any).trySyncFromPeer(remotePeer.toString());
 
@@ -997,9 +1005,17 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
         (agent.node.libp2p.peerStore as any).get = recorder(async () => ({
           protocols: [PROTOCOL_SYNC],
         } as any));
-        (agent as any).syncFromPeer = recorder(async () => 0);
+        // `runSyncOnConnect` calls `syncFromPeerDetailed` /
+        // `syncSharedMemoryFromPeerDetailed` (the seams `trySyncFromPeer`
+        // wires in), NOT the bare `syncFromPeer` helpers. Stub the real
+        // seams to a clean (zero, no-backoff) result so the durable round
+        // does not trip the "stop on backoff-worthy failure" early-return
+        // (added by `4b50883c6`), which would otherwise skip
+        // `refreshMetaSyncedFlags` and leave `metaSynced` false even though
+        // the ontology confirms the CG.
+        (agent as any).syncFromPeerDetailed = recorder(async () => 0);
+        (agent as any).syncSharedMemoryFromPeerDetailed = recorder(async () => 0);
         (agent as any).discoverContextGraphsFromStore = recorder(async () => 0);
-        (agent as any).syncSharedMemoryFromPeer = recorder(async () => 0);
 
         await (agent as any).trySyncFromPeer(remotePeer.toString());
 

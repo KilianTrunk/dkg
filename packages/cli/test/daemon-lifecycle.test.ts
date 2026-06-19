@@ -23,6 +23,24 @@ describe('daemon startup genesis validation', () => {
       networkId,
     })).resolves.toEqual({ ok: true, networkId });
   });
+
+  it('reports the selected overlay when the selected genesis id mismatches its network id', async () => {
+    const staleNetworkId = await computeNetworkId('base-mainnet');
+    const selectedNetworkId = await computeNetworkId('neuroweb-mainnet');
+
+    await expect(validateStartupGenesis({
+      networkName: 'DKG V10 NeuroWeb Mainnet',
+      genesisId: 'neuroweb-mainnet',
+      networkId: staleNetworkId,
+    })).resolves.toEqual({
+      ok: false,
+      networkId: selectedNetworkId,
+      messages: [
+        `FATAL: genesis mismatch! Expected networkId ${staleNetworkId.slice(0, 16)}... but computed ${selectedNetworkId.slice(0, 16)}...`,
+        `This node's genesis does not match DKG V10 NeuroWeb Mainnet. Rebuild or update the selected network config.`,
+      ],
+    });
+  });
 });
 
 async function writeWorkspaceTsconfig(tsconfigPath: string): Promise<void> {

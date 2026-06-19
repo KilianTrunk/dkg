@@ -121,6 +121,8 @@ function fakeAgent(args: {
   queryBindings?: Array<Record<string, unknown>>;
   bytes?: Buffer;
   onChainPolicy?: { accessPolicy?: number; publishPolicy?: number };
+  allowedAgents?: string[];
+  participantAgents?: string[];
 }) {
   const authorizeSyncRequest = vi.fn(async (
     syncReq: SyncRequestEnvelope,
@@ -168,6 +170,8 @@ function fakeAgent(args: {
     getContextGraphOnChainPolicy: args.onChainPolicy
       ? vi.fn(async () => args.onChainPolicy)
       : vi.fn(async () => ({})),
+    getContextGraphAllowedAgents: vi.fn(async () => args.allowedAgents ?? []),
+    getContextGraphParticipantAgentAddresses: vi.fn(async () => args.participantAgents ?? []),
     findLocalAgentForContextGraph: vi.fn(async () => 'did:dkg:agent:owner'),
     sendToPeer: vi.fn(async () => new TextEncoder().encode(JSON.stringify({
       version: 1,
@@ -305,9 +309,9 @@ describe('generic imported artifact peer handler', () => {
     expect(res.hashMismatch).toBe(true);
   });
 
-  it('allows non-owner artifact reads when context graph sync auth and selector-bound requester proof pass', async () => {
+  it('allows non-owner artifact reads when the requester is an authorized CG read agent', async () => {
     const bytes = Buffer.from('abcdef');
-    const agent = fakeAgent({ bytes });
+    const agent = fakeAgent({ bytes, allowedAgents: [otherAgentAddress] });
     const nonOwner = await request({}, {
       requesterAgentAddress: otherAgentAddress,
       signer: otherWallet,
@@ -318,6 +322,24 @@ describe('generic imported artifact peer handler', () => {
     expect(agent.store.query).toHaveBeenCalled();
     expect(res.denied).toBeUndefined();
     expect(res.bytesB64).toBe(bytes.subarray(0, 4).toString('base64'));
+  });
+
+  it('denies non-owner artifact reads on public curators-only CGs without read-agent membership', async () => {
+    const agent = fakeAgent({
+      bytes: Buffer.from('abcdef'),
+      onChainPolicy: { accessPolicy: 0, publishPolicy: 0 },
+    });
+    const nonOwner = await request({}, {
+      requesterAgentAddress: otherAgentAddress,
+      signer: otherWallet,
+    });
+    const res = await invoke(agent, nonOwner);
+
+    expect(agent.authorizeSyncRequest).toHaveBeenCalledTimes(1);
+    expect(agent.getContextGraphAllowedAgents).toHaveBeenCalledWith(contextGraphId);
+    expect(agent.getContextGraphParticipantAgentAddresses).toHaveBeenCalledWith(contextGraphId);
+    expect(agent.store.query).not.toHaveBeenCalled();
+    expect(res.denied).toBe('denied');
   });
 
   it('denies forged owner claims on direct artifact reads without selector-bound owner proof', async () => {

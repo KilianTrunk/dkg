@@ -358,6 +358,24 @@ async function isPublicOpenContextGraph(
   }
 }
 
+async function isContextGraphAuthorizedReadAgent(
+  agent: DKGAgent,
+  contextGraphId: string,
+  requesterAgentAddress: string | undefined,
+): Promise<boolean> {
+  if (!requesterAgentAddress) return false;
+  const [allowedAgents, participantAgents] = await Promise.all([
+    typeof agent.getContextGraphAllowedAgents === 'function'
+      ? agent.getContextGraphAllowedAgents(contextGraphId).catch(() => [] as string[])
+      : Promise.resolve([] as string[]),
+    typeof agent.getContextGraphParticipantAgentAddresses === 'function'
+      ? agent.getContextGraphParticipantAgentAddresses(contextGraphId).catch(() => [] as string[])
+      : Promise.resolve([] as string[]),
+  ]);
+  return [...allowedAgents, ...participantAgents].some((agentAddress) =>
+    isSameAgentAddress(agentAddress, requesterAgentAddress));
+}
+
 function hasSelectorBoundRequesterProof(
   agent: DKGAgent,
   syncReq: SyncRequestEnvelope,
@@ -424,7 +442,20 @@ async function resolveImportedArtifactReadSubject(
     isSameAgentAddress(parsedAssertion.assertionAgentAddress, syncReq.requesterAgentAddress) &&
     requesterProof,
   );
-  if (!ownerAllowed && (!syncReq.requesterAgentAddress || !requesterProof || parsedAssertion.legacy)) return null;
+  if (ownerAllowed) {
+    return {
+      assertionUri: canonicalImportedAssertionUri(req.contextGraphId, parsedAssertion),
+      ...(parsedAssertion.subGraphName ? { subGraphName: parsedAssertion.subGraphName } : {}),
+    };
+  }
+
+  if (!syncReq.requesterAgentAddress || !requesterProof || parsedAssertion.legacy) return null;
+  const requesterIsAuthorizedReadAgent = await isContextGraphAuthorizedReadAgent(
+    agent,
+    req.contextGraphId,
+    syncReq.requesterAgentAddress,
+  );
+  if (!requesterIsAuthorizedReadAgent) return null;
   return {
     assertionUri: canonicalImportedAssertionUri(req.contextGraphId, parsedAssertion),
     ...(parsedAssertion.subGraphName ? { subGraphName: parsedAssertion.subGraphName } : {}),

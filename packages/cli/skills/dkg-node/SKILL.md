@@ -180,7 +180,7 @@ Drop to HTTP when the operation isn't in the table — participant self-service 
 | `dkg_join_request_list` | `GET /api/context-graph/{id}/join-requests` | List pending join requests for a context graph |
 | `dkg_join_request_approve` | `POST /api/context-graph/{id}/approve-join` | Approve a pending join request by agent address |
 | `dkg_join_request_reject` | `POST /api/context-graph/{id}/reject-join` | Reject a pending join request by agent address |
-| `dkg_knowledge_asset_create` | `POST /api/knowledge-assets` | Start a WM assertion (knowledge asset). Non-empty `quads` here write+seal in one call AND **share to SWM by default** (`alsoShareSwm:false` to stop at a sealed WM draft). Sealing needs no on-chain registration |
+| `dkg_knowledge_asset_create` | `POST /api/knowledge-assets` | Start a WM assertion (knowledge asset). Non-empty `quads` here write+seal in one call and **stop at a sealed WM draft**; pass `alsoShareSwm:true` to also share to SWM (the combined client `createKnowledgeAsset` defaults that on when sealing). Sealing needs no on-chain registration |
 | `dkg_knowledge_asset_write` | `POST /api/knowledge-assets/{name}/wm/write` | Append triples (`{subject,predicate,object}` — no per-quad `graph`) to a WM assertion |
 | `dkg_knowledge_asset_finalize` | `POST /api/knowledge-assets/{name}/wm/finalize` | **Seal** the WM draft (the "git commit" — EIP-712 AuthorAttestation over the whole assertion). Returns `merkleRoot`, `authorAddress`, `schemeVersion`, `chainId`, `kav10Address`, `eip712Digest` |
 | `dkg_knowledge_asset_share` | `POST /api/knowledge-assets/{name}/swm/share` | Share a WM assertion's triples to SWM (formerly "promote"). A full share (`entities: "all"` / omitted) **seals by default** (publish-ready); `skipSeal:true` opts out; a subset share is SWM-only — see §5 |
@@ -871,9 +871,10 @@ This entire surface was empirically driven by [PR #720](https://github.com/Origi
 > Shortcut: a full `swm/share` **seals by default**, so steps 4–5 collapse into a single
 > `swm/share` for the common case (see §5 VM). The explicit finalize in step 4 is still
 > available when you want custom attestation options. You can also pass `quads` directly to
-> `POST /api/knowledge-assets` (step 2) to write+seal AND share to SWM by default, then add
-> `alsoPublishVm` to run the whole lifecycle atomically — and since `vm/publish` auto-registers,
-> this now works on a never-registered CG too.
+> `POST /api/knowledge-assets` (step 2) to write+seal in one call (it stops at a sealed WM
+> draft — add `alsoShareSwm:true` to also share, and `alsoPublishVm` to run the whole
+> lifecycle atomically) — and since `vm/publish` auto-registers, this now works on a
+> never-registered CG too.
 
 **Private project for me alone (the default):**
 

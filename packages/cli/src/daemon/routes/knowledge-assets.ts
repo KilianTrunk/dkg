@@ -701,11 +701,12 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
     // CG to be registered). OT-RFC-43 §10.5.5.
     const hasQuads = Array.isArray(quads) && quads.length > 0;
     const shouldFinalize = hasQuads && finalize !== false;
-    // #1116 D5: the combined create one-shot SHARES BY DEFAULT when it seals
-    // (create→write→seal→share). An explicit `alsoShareSwm`/`promote` wins; with
-    // neither set, default to sharing iff this request seals — never default-on
-    // when it can't seal (that would trip the "finalized required" guard below).
-    const effectiveShareSwm = alsoShareSwm === undefined ? shouldFinalize : alsoShareSwm;
+    // #1116 D5: the create ROUTE stays a primitive — create+write+seal, with
+    // opt-in share (this preserves the "create stops at a sealed WM draft"
+    // invariant the agent-tooling work relies on). The "default to seal AND
+    // share to SWM" convenience is owned by the combined CLIENT function
+    // `createKnowledgeAsset` (MCP/OpenClaw), which defaults `alsoShareSwm` when
+    // it seals. So here `alsoShareSwm` is honored exactly as sent.
     // alsoShareSwm/alsoPublishVm advance a SEALED assertion to SWM/VM, so they
     // require this request to finalize. Reject upfront — before any create/write
     // mutation — whenever it won't (no quads, or finalize:false); otherwise the
@@ -763,7 +764,7 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       }
 
       const errors: Array<{ phase: string; error: string }> = [];
-      if (effectiveShareSwm === true) {
+      if (alsoShareSwm === true) {
         try {
           const share = await agent.assertion.promote(resolvedContextGraphId, name, { subGraphName });
           result.swmShared = true;

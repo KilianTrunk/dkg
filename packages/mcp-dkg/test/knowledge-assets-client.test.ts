@@ -202,7 +202,10 @@ describe('DkgClient knowledge-assets — publish/finalize option serialization',
     expect(calls[0].body).toMatchObject({ contextGraphId: 'cg-1', name: 'f', finalize: false });
   });
 
-  it('createKnowledgeAsset omits finalize when unspecified (server default seals)', async () => {
+  it('createKnowledgeAsset omits finalize when unspecified, but defaults alsoShareSwm:true (seal+share)', async () => {
+    // #1116 D5: quads present + finalize unspecified ⇒ the draft seals (server
+    // default), so the combined CLIENT function also defaults alsoShareSwm to
+    // true. `finalize` is still omitted (the server defaults it to seal).
     const { client, calls } = makeClient();
     await client.createKnowledgeAsset({
       contextGraphId: 'cg-1',
@@ -210,6 +213,39 @@ describe('DkgClient knowledge-assets — publish/finalize option serialization',
       quads: [{ subject: 's', predicate: 'p', object: 'o', graph: 'urn:g' }],
     });
     expect(calls[0].body).not.toHaveProperty('finalize');
+    expect(calls[0].body.alsoShareSwm).toBe(true);
+  });
+
+  it('createKnowledgeAsset does NOT default alsoShareSwm when finalize:false (no seal ⇒ no share)', async () => {
+    // #1116 D5: an unsealed draft can't be shared, so the client must NOT
+    // default-on alsoShareSwm — the route guard would otherwise reject it.
+    const { client, calls } = makeClient();
+    await client.createKnowledgeAsset({
+      contextGraphId: 'cg-1',
+      name: 'f',
+      finalize: false,
+      quads: [{ subject: 's', predicate: 'p', object: 'o', graph: 'urn:g' }],
+    });
+    expect(calls[0].body).not.toHaveProperty('alsoShareSwm');
+  });
+
+  it('createKnowledgeAsset does NOT default alsoShareSwm without quads', async () => {
+    // No quads ⇒ nothing to seal ⇒ no auto-share default.
+    const { client, calls } = makeClient();
+    await client.createKnowledgeAsset({ contextGraphId: 'cg-1', name: 'f' });
+    expect(calls[0].body).not.toHaveProperty('alsoShareSwm');
+  });
+
+  it('createKnowledgeAsset honors an explicit alsoShareSwm:false over the seal-default', async () => {
+    // An explicit false must win — stop at a sealed WM draft.
+    const { client, calls } = makeClient();
+    await client.createKnowledgeAsset({
+      contextGraphId: 'cg-1',
+      name: 'f',
+      quads: [{ subject: 's', predicate: 'p', object: 'o', graph: 'urn:g' }],
+      alsoShareSwm: false,
+    });
+    expect(calls[0].body.alsoShareSwm).toBe(false);
   });
 
   it('createKnowledgeAsset rejects finalize-only fields when finalize:false (parity with daemon)', async () => {

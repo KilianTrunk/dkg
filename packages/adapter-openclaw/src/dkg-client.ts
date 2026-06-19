@@ -1226,10 +1226,12 @@ export class DkgDaemonClient {
 
   /**
    * Create a KA + open its WM draft. Pass `quads` to atomically write+seal.
-   * With `quads` present the create one-shot now seals AND shares to SWM by
-   * default (`alsoShareSwm` defaults true when sealing); pass
-   * `alsoShareSwm: false` to stop at a sealed WM draft, or `finalize: false`
-   * to keep an unsealed editable WM draft.
+   * #1116 D5: this combined CLIENT function defaults `alsoShareSwm` to true when
+   * the draft will seal (quads present and `finalize !== false`), so the
+   * one-shot seals AND shares to SWM. Pass `alsoShareSwm: false` to stop at a
+   * sealed WM draft, or `finalize: false` to keep an unsealed editable WM draft.
+   * (The bare daemon route is a primitive — seal-only — and never auto-shares;
+   * the default-share lives here in the client.)
    */
   async createKnowledgeAsset(
     contextGraphId: string,
@@ -1258,6 +1260,18 @@ export class DkgDaemonClient {
       name,
       ...(opts ?? {}),
     };
+    // #1116 D5: the combined client SEALS AND SHARES TO SWM by default. When
+    // quads are present and the draft will seal (finalize !== false), default
+    // `alsoShareSwm` to true so the one-shot lands the asset in SWM. An explicit
+    // `alsoShareSwm` (true OR false, already copied by the spread) always wins;
+    // never default-on when there are no quads or `finalize:false`. The bare
+    // daemon route stays a primitive (seal-only); the default-share is a
+    // CLIENT-side convenience.
+    const sealsByDefault =
+      Array.isArray(opts?.quads) && opts.quads.length > 0 && opts?.finalize !== false;
+    if (opts?.alsoShareSwm === undefined && sealsByDefault) {
+      payload.alsoShareSwm = true;
+    }
     // Object form carries finalized-publish controls; translate to the daemon
     // body shape (mirrors the cli ApiClient). Booleans pass through.
     if (opts?.alsoPublishVm !== undefined) {

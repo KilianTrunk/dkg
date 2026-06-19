@@ -1124,10 +1124,12 @@ export class DkgClient {
 
   /**
    * Create a KA + open its WM draft. Pass `quads` to atomically write+seal.
-   * With `quads` present the create one-shot now seals AND shares to SWM by
-   * default (`alsoShareSwm` defaults true when sealing); pass
-   * `alsoShareSwm: false` to stop at a sealed WM draft, or `finalize: false`
-   * to keep an unsealed editable WM draft.
+   * #1116 D5: this combined CLIENT function defaults `alsoShareSwm` to true when
+   * the draft will seal (quads present and `finalize !== false`), so the
+   * one-shot seals AND shares to SWM. Pass `alsoShareSwm: false` to stop at a
+   * sealed WM draft, or `finalize: false` to keep an unsealed editable WM draft.
+   * (The bare daemon route is a primitive — seal-only — and never auto-shares;
+   * the default-share lives here in the client.)
    */
   async createKnowledgeAsset(args: {
     contextGraphId: string;
@@ -1161,7 +1163,21 @@ export class DkgClient {
       body.preSignedAuthorAttestation = args.preSignedAuthorAttestation;
     }
     if (args.schemeVersion !== undefined) body.schemeVersion = args.schemeVersion;
-    if (args.alsoShareSwm !== undefined) body.alsoShareSwm = args.alsoShareSwm;
+    // #1116 D5: the combined client SEALS AND SHARES TO SWM by default. When
+    // quads are present and the draft will seal (finalize !== false), default
+    // `alsoShareSwm` to true so the one-shot lands the asset in SWM. An explicit
+    // `alsoShareSwm` (true OR false) always wins; never default-on when there
+    // are no quads or `finalize:false` (those keep an unsealed/sealed WM draft
+    // that the route's "alsoShareSwm requires a finalized assertion" guard would
+    // reject). The bare daemon route stays a primitive (seal-only); the
+    // default-share is a CLIENT-side convenience.
+    const sealsByDefault =
+      Array.isArray(args.quads) && args.quads.length > 0 && args.finalize !== false;
+    if (args.alsoShareSwm !== undefined) {
+      body.alsoShareSwm = args.alsoShareSwm;
+    } else if (sealsByDefault) {
+      body.alsoShareSwm = true;
+    }
     if (args.alsoPublishVm !== undefined) {
       // Object form carries finalized-publish controls; translate to the daemon
       // body shape (mirrors the cli ApiClient). `true`/`false` pass through.

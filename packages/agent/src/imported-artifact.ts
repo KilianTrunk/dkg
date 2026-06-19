@@ -418,12 +418,13 @@ async function resolveImportedArtifactReadSubject(
     };
   }
 
+  const requesterProof = hasSelectorBoundRequesterProof(agent, syncReq);
   const ownerAllowed = Boolean(
     syncReq.requesterAgentAddress &&
     isSameAgentAddress(parsedAssertion.assertionAgentAddress, syncReq.requesterAgentAddress) &&
-    hasSelectorBoundRequesterProof(agent, syncReq),
+    requesterProof,
   );
-  if (!ownerAllowed) return null;
+  if (!ownerAllowed && (!syncReq.requesterAgentAddress || !requesterProof || parsedAssertion.legacy)) return null;
   return {
     assertionUri: canonicalImportedAssertionUri(req.contextGraphId, parsedAssertion),
     ...(parsedAssertion.subGraphName ? { subGraphName: parsedAssertion.subGraphName } : {}),
@@ -668,6 +669,7 @@ export class ImportedArtifactMethods extends DKGAgentBase {
       if (
         page.offset !== requestedRange.offset ||
         page.hash !== params.hash ||
+        Buffer.byteLength(page.bytesB64, 'base64') > requestedRange.maxBytes ||
         (page.totalBytes != null && page.offset + Buffer.byteLength(page.bytesB64, 'base64') > page.totalBytes) ||
         (page.truncated && (page.nextOffset == null || page.nextOffset <= page.offset))
       ) {

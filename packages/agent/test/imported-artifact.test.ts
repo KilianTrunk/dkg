@@ -305,8 +305,9 @@ describe('generic imported artifact peer handler', () => {
     expect(res.hashMismatch).toBe(true);
   });
 
-  it('denies non-owner artifact reads even when context graph sync auth passes', async () => {
-    const agent = fakeAgent({ bytes: Buffer.from('abcdef') });
+  it('allows non-owner artifact reads when context graph sync auth and selector-bound requester proof pass', async () => {
+    const bytes = Buffer.from('abcdef');
+    const agent = fakeAgent({ bytes });
     const nonOwner = await request({}, {
       requesterAgentAddress: otherAgentAddress,
       signer: otherWallet,
@@ -314,8 +315,9 @@ describe('generic imported artifact peer handler', () => {
     const res = await invoke(agent, nonOwner);
 
     expect(agent.authorizeSyncRequest).toHaveBeenCalledTimes(1);
-    expect(agent.store.query).not.toHaveBeenCalled();
-    expect(res.denied).toBe('denied');
+    expect(agent.store.query).toHaveBeenCalled();
+    expect(res.denied).toBeUndefined();
+    expect(res.bytesB64).toBe(bytes.subarray(0, 4).toString('base64'));
   });
 
   it('denies forged owner claims on direct artifact reads without selector-bound owner proof', async () => {
@@ -676,6 +678,40 @@ describe('generic imported artifact peer handler', () => {
       offset: 1,
       maxBytes: 3,
     }));
+  });
+
+  it('rejects an unverified remote page that exceeds the requested range', async () => {
+    const bytes = Buffer.from('abcdef');
+    const artifactHash = keccakHash(bytes);
+    const agent = {
+      readAssertionArtifact: vi.fn(async () => ({
+        version: 1,
+        contextGraphId,
+        assertionUri,
+        kind: 'source',
+        hash: artifactHash,
+        offset: 1,
+        totalBytes: bytes.length,
+        nextOffset: bytes.length,
+        truncated: true,
+        bytesB64: bytes.toString('base64'),
+      })),
+    };
+
+    const res = await ImportedArtifactMethods.prototype.fetchAndVerifyAssertionArtifact.call(agent, {
+      contextGraphId,
+      assertionUri,
+      kind: 'source',
+      hash: artifactHash,
+      offset: 1,
+      maxBytes: 3,
+      sourcePeerId: 'peer-local',
+      cache: false,
+    });
+
+    expect(res.response.hashMismatch).toBe(true);
+    expect(res.response.bytesB64).toBeUndefined();
+    expect(res.verifiedBytes).toBeUndefined();
   });
 
   it('serves requested pages for artifacts larger than the cache promotion cap', async () => {

@@ -55,6 +55,9 @@ import {
   normalizeGeneratedAt,
   normalizeGeneratedBy,
   normalizeMarkdownReadLimit,
+  parseImportedAssertionUri,
+  isSameAgentAddress,
+  isContextGraphAuthorizedReadAgent,
   type ImportedArtifactResolution,
 } from "./shared-assertion-helpers.js";
 import { parseBoundary, parseMultipart, MultipartParseError } from "../../http/multipart.js";
@@ -145,6 +148,7 @@ async function fetchFirstAvailableAssertionArtifact(
   resolved: AssertionArtifactResolution,
   opts: {
     sourcePeerIds: string[];
+    requesterAgentAddress: string;
     offset: number;
     maxBytes: number;
     cache: boolean;
@@ -158,7 +162,7 @@ async function fetchFirstAvailableAssertionArtifact(
       assertionUri: resolved.assertionUri,
       kind: resolved.kind,
       hash: resolved.hash,
-      requestingAgentAddress: resolved.assertionAgentAddress,
+      requestingAgentAddress: opts.requesterAgentAddress,
       offset: opts.offset,
       maxBytes: opts.maxBytes,
       ...(resolved.subGraphName ? { subGraphName: resolved.subGraphName } : {}),
@@ -168,7 +172,8 @@ async function fetchFirstAvailableAssertionArtifact(
     if (remote.verifiedBytes) return { availability: 'verified', remote, sourcePeerId };
     const page = remote.response;
     if (!page.denied && !page.unavailable && !page.hashMismatch && page.bytesB64 != null) {
-      return { availability: 'unverified_page', remote, sourcePeerId };
+      fallback ??= { availability: 'unverified_page', remote, sourcePeerId };
+      continue;
     }
     fallback ??= { availability: 'unavailable', remote, sourcePeerId };
   }
@@ -187,15 +192,22 @@ async function resolveAssertionArtifact(
     throw new ImportArtifactRouteError(400, 'Invalid hash');
   }
 
-  const artifact = await resolveImportedArtifactForRead(
-    ctx,
-    {
-      ...raw,
-      fileHash: undefined,
-    },
-    'Import artifact bytes can only be read from imported assertions owned by the requesting agent',
-    { allowSharedMemoryFallback: true },
-  );
+  let artifact: ImportedArtifactResolution;
+  try {
+    artifact = await resolveImportedArtifactForRead(
+      ctx,
+      {
+        ...raw,
+        fileHash: undefined,
+      },
+      'Import artifact bytes can only be read from imported assertions owned by the requesting agent',
+      { allowSharedMemoryFallback: true },
+    );
+  } catch (err) {
+    const directRemote = await resolveExplicitAuthorizedRemoteArtifact(ctx, raw, kind, requestedHash, err);
+    if (directRemote) return directRemote;
+    throw err;
+  }
 
   const resolvedHash = kind === 'markdown'
     ? artifact.markdownHash
@@ -213,6 +225,58 @@ async function resolveAssertionArtifact(
   };
 }
 
+async function resolveExplicitAuthorizedRemoteArtifact(
+  ctx: RequestContext,
+  raw: Record<string, unknown>,
+  kind: AssertionArtifactKind,
+  requestedHash: string | undefined,
+  cause: unknown,
+): Promise<AssertionArtifactResolution | null> {
+  if (!isMissingImportMetadataError(cause)) return null;
+  if (!requestedHash) return null;
+  if (typeof raw.sourcePeerId !== 'string' || !raw.sourcePeerId.trim()) return null;
+  if (typeof raw.contextGraphId !== 'string' || !raw.contextGraphId.trim()) return null;
+  if (typeof raw.assertionUri !== 'string' || !raw.assertionUri.trim()) return null;
+
+  const contextGraphId = normalizeContextGraphIdOrUri(raw.contextGraphId);
+  const parsedAssertion = parseImportedAssertionUri(raw.assertionUri.trim(), contextGraphId, ctx.requestAgentAddress);
+  if (!parsedAssertion) return null;
+  if (typeof raw.subGraphName === 'string' && raw.subGraphName.trim() !== (parsedAssertion.subGraphName ?? '')) return null;
+  const allowed = isSameAgentAddress(parsedAssertion.assertionAgentAddress, ctx.requestAgentAddress)
+    || await isContextGraphAuthorizedReadAgent(ctx.agent, contextGraphId, ctx.requestAgentAddress);
+  if (!allowed) return null;
+
+  const sourceContentType = kind === 'markdown' ? 'text/markdown' : 'application/octet-stream';
+  return {
+    contextGraphId,
+    assertionUri: contextGraphAssertionUri(
+      contextGraphId,
+      parsedAssertion.assertionAgentAddress,
+      parsedAssertion.assertionName,
+      parsedAssertion.subGraphName,
+    ),
+    assertionName: parsedAssertion.assertionName,
+    assertionAgentAddress: parsedAssertion.assertionAgentAddress,
+    ...(parsedAssertion.subGraphName ? { subGraphName: parsedAssertion.subGraphName } : {}),
+    fileHash: requestedHash,
+    sourceFileHash: requestedHash,
+    detectedContentType: sourceContentType,
+    sourceContentType,
+    extractionStatus: 'completed',
+    canReadMarkdown: kind === 'markdown',
+    ...(kind === 'markdown' ? { markdownHash: requestedHash } : {}),
+    kind,
+    hash: requestedHash,
+    contentType: sourceContentType,
+  };
+}
+
+function isMissingImportMetadataError(err: unknown): boolean {
+  return err instanceof ImportArtifactRouteError
+    && err.statusCode === 404
+    && /No completed import metadata found for assertionUri/i.test(err.message);
+}
+
 function importedArtifactReadOwnerGuard(
   ctx: RequestContext,
   message: string,
@@ -221,6 +285,7 @@ function importedArtifactReadOwnerGuard(
     requestAgentAddress: ctx.requestAgentAddress,
     message,
     relaxOnPublicOpenCg: true,
+    relaxOnAuthorizedReadCg: true,
   };
 }
 
@@ -325,6 +390,7 @@ export async function handleKaImportArtifactRead(ctx: RequestContext): Promise<v
     const cache = raw.cache !== false && offset === 0;
     const fetched = await fetchFirstAvailableAssertionArtifact(agent, resolved, {
       sourcePeerIds,
+      requesterAgentAddress: ctx.requestAgentAddress,
       offset,
       maxBytes,
       cache,
@@ -415,7 +481,7 @@ export async function handleKaImportArtifactRead(ctx: RequestContext): Promise<v
 // POST /api/knowledge-assets/import-artifact/read-markdown
 // Read only the Markdown blob tied to a completed imported assertion.
 export async function handleKaImportArtifactReadMarkdown(ctx: RequestContext): Promise<void> {
-  const { req, res, fileStore } = ctx;
+  const { req, res, agent, fileStore } = ctx;
   const body = await readBody(req, SMALL_BODY_BYTES);
   const parsed = safeParseJson(body, res);
   if (!parsed) return;
@@ -434,6 +500,43 @@ export async function handleKaImportArtifactReadMarkdown(ctx: RequestContext): P
     }
     const bytes = await fileStore.get(artifact.markdownHash);
     if (!bytes) {
+      const resolved: AssertionArtifactResolution = {
+        ...artifact,
+        kind: 'markdown',
+        hash: artifact.markdownHash,
+        contentType: 'text/markdown',
+      };
+      const rawSourcePeerId = (parsed as Record<string, unknown>).sourcePeerId;
+      const sourcePeerId = typeof rawSourcePeerId === 'string' && rawSourcePeerId.trim()
+        ? rawSourcePeerId.trim()
+        : undefined;
+      const discoveredPeerIds = await discoverArtifactCandidatePeers(agent, resolved);
+      const sourcePeerIds = orderedArtifactCandidatePeers(sourcePeerId, discoveredPeerIds);
+      const fetched = await fetchFirstAvailableAssertionArtifact(agent, resolved, {
+        sourcePeerIds,
+        requesterAgentAddress: ctx.requestAgentAddress,
+        offset: 0,
+        maxBytes,
+        cache: true,
+      });
+      if (fetched?.availability === 'verified' && fetched.remote.verifiedBytes) {
+        await fileStore.put(fetched.remote.verifiedBytes, 'text/markdown');
+        if (fetched.remote.verifiedBytes.length > maxBytes) {
+          return jsonResponse(res, 413, {
+            error: `Markdown content exceeds maxBytes (${maxBytes})`,
+            artifact,
+            bytes: fetched.remote.verifiedBytes.length,
+          });
+        }
+        return jsonResponse(res, 200, {
+          artifact,
+          markdownHash: artifact.markdownHash,
+          contentType: 'text/markdown',
+          bytes: fetched.remote.verifiedBytes.length,
+          markdown: fetched.remote.verifiedBytes.toString('utf8'),
+          source: { peerId: fetched.sourcePeerId, agentAddress: artifact.assertionAgentAddress },
+        });
+      }
       // Issue #872 — when the owner guard was relaxed (public + open
       // CG, cross-agent request), the missing bytes are the
       // expected outcome: peers replicate the SWM triples for the

@@ -129,6 +129,8 @@ describe('import artifact daemon routes', () => {
     structuralTripleCount?: string;
     mdIntermediateHash?: string;
     omitImportMeta?: boolean;
+    omitSharedMemoryArtifact?: boolean;
+    allowedAgents?: string[];
     publisherCreateError?: Error;
     publisherWriteError?: Error;
     publisherDiscardError?: Error;
@@ -240,6 +242,12 @@ describe('import artifact daemon routes', () => {
       ...(args.fetchAndVerifyAssertionArtifact
         ? { fetchAndVerifyAssertionArtifact: args.fetchAndVerifyAssertionArtifact }
         : {}),
+      async getContextGraphAllowedAgents(contextGraphId: string) {
+        return contextGraphId === args.contextGraphId ? args.allowedAgents ?? [] : [];
+      },
+      async getContextGraphParticipantAgentAddresses(contextGraphId: string) {
+        return contextGraphId === args.contextGraphId ? args.allowedAgents ?? [] : [];
+      },
       store: {
         async hasGraph() {
           return Boolean(args.targetGraphExists);
@@ -274,6 +282,9 @@ describe('import artifact daemon routes', () => {
             expect(sparql).toContain('GRAPH ?g');
             expect(sparql).toContain(sharedMemoryReadBothFilter(contextGraphSharedMemoryUri(args.contextGraphId)));
             expect(sparql).toContain(`<${args.assertionUri}> <${DKG}sourceFile>`);
+            if (args.omitSharedMemoryArtifact) {
+              return { type: 'bindings', bindings: [] };
+            }
             return {
               type: 'bindings',
               bindings: [{
@@ -921,6 +932,197 @@ describe('import artifact daemon routes', () => {
     expect(fetchAndVerifyAssertionArtifact).toHaveBeenCalledTimes(1);
   });
 
+  it('lets an assertion owner fetch explicit remote bytes before local metadata has replicated', async () => {
+    const bytes = Buffer.from('# Private Owner Remote\n');
+    const artifactHash = keccak256ContentHash(bytes);
+    const contextGraphId = 'cg-private-owner-explicit-remote-read';
+    const assertionName = 'imported-md';
+    const assertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:test', assertionName);
+    const fetchAndVerifyAssertionArtifact = vi.fn(async () => ({
+      response: {
+        version: 1,
+        contextGraphId,
+        assertionUri,
+        kind: 'source',
+        hash: artifactHash,
+        offset: 0,
+        totalBytes: bytes.length,
+        truncated: false,
+        contentType: 'application/x-spoofed',
+        bytesB64: bytes.toString('base64'),
+      },
+      verifiedBytes: bytes,
+    }));
+    const { agent } = makeAgent({
+      contextGraphId,
+      assertionName,
+      assertionUri,
+      fileHash: artifactHash,
+      markdownHash: artifactHash,
+      markdownForm: `urn:dkg:file:${artifactHash}`,
+      omitImportMeta: true,
+      omitSharedMemoryArtifact: true,
+      fetchAndVerifyAssertionArtifact,
+    });
+    await startRoutes({ agent });
+
+    const fetched = await post('/api/knowledge-assets/import-artifact/read', {
+      contextGraphId,
+      assertionUri,
+      kind: 'source',
+      hash: artifactHash,
+      sourcePeerId: 'peer-with-private-blob',
+      maxBytes: 1024,
+    });
+
+    expect(fetched.status).toBe(200);
+    expect(fetched.body).toMatchObject({
+      status: 'fetched',
+      contextGraphId,
+      assertionUri,
+      kind: 'source',
+      hash: artifactHash,
+      contentType: 'application/octet-stream',
+      bytesB64: bytes.toString('base64'),
+      source: { peerId: 'peer-with-private-blob', agentAddress: 'did:dkg:agent:test' },
+    });
+    expect(fetchAndVerifyAssertionArtifact).toHaveBeenCalledWith(expect.objectContaining({
+      contextGraphId,
+      assertionUri,
+      kind: 'source',
+      hash: artifactHash,
+      sourcePeerId: 'peer-with-private-blob',
+      requestingAgentAddress: 'did:dkg:agent:test',
+      cache: true,
+    }));
+    await expect(fileStore.get(artifactHash)).resolves.toEqual(bytes);
+  });
+
+  it('lets an allowlisted private CG member fetch imported artifact bytes from the owner peer', async () => {
+    const bytes = Buffer.from('# Private Allowlisted Remote\n');
+    const artifactHash = keccak256ContentHash(bytes);
+    const contextGraphId = 'cg-private-allowlisted-byte-read';
+    const assertionName = 'imported-md';
+    const assertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:source', assertionName);
+    const fetchAndVerifyAssertionArtifact = vi.fn(async () => ({
+      response: {
+        version: 1,
+        contextGraphId,
+        assertionUri,
+        kind: 'markdown',
+        hash: artifactHash,
+        offset: 0,
+        totalBytes: bytes.length,
+        truncated: false,
+        contentType: 'text/markdown',
+        bytesB64: bytes.toString('base64'),
+      },
+      verifiedBytes: bytes,
+    }));
+    const { agent } = makeAgent({
+      contextGraphId,
+      assertionName,
+      assertionUri,
+      fileHash: artifactHash,
+      markdownHash: artifactHash,
+      markdownForm: `urn:dkg:file:${artifactHash}`,
+      allowedAgents: ['did:dkg:agent:test'],
+      fetchAndVerifyAssertionArtifact,
+    });
+    await startRoutes({ agent });
+
+    const fetched = await post('/api/knowledge-assets/import-artifact/read', {
+      contextGraphId,
+      assertionUri,
+      kind: 'markdown',
+      hash: artifactHash,
+      sourcePeerId: 'peer-owner',
+      maxBytes: 1024,
+    });
+
+    expect(fetched.status).toBe(200);
+    expect(fetched.body).toMatchObject({
+      status: 'fetched',
+      contextGraphId,
+      assertionUri,
+      kind: 'markdown',
+      hash: artifactHash,
+      contentType: 'text/markdown',
+      bytesB64: bytes.toString('base64'),
+      source: { peerId: 'peer-owner', agentAddress: 'did:dkg:agent:source' },
+    });
+    expect(fetchAndVerifyAssertionArtifact).toHaveBeenCalledWith(expect.objectContaining({
+      contextGraphId,
+      assertionUri,
+      kind: 'markdown',
+      hash: artifactHash,
+      sourcePeerId: 'peer-owner',
+      requestingAgentAddress: 'did:dkg:agent:test',
+      cache: true,
+    }));
+    await expect(fileStore.get(artifactHash)).resolves.toEqual(bytes);
+  });
+
+  it('fetches verified Markdown remotely for an allowlisted private CG member before returning 404', async () => {
+    const bytes = Buffer.from('# Private Allowlisted Markdown\n');
+    const artifactHash = keccak256ContentHash(bytes);
+    const contextGraphId = 'cg-private-allowlisted-markdown-read';
+    const assertionName = 'imported-md';
+    const assertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:source', assertionName);
+    const fetchAndVerifyAssertionArtifact = vi.fn(async () => ({
+      response: {
+        version: 1,
+        contextGraphId,
+        assertionUri,
+        kind: 'markdown',
+        hash: artifactHash,
+        offset: 0,
+        totalBytes: bytes.length,
+        truncated: false,
+        contentType: 'text/markdown',
+        bytesB64: bytes.toString('base64'),
+      },
+      verifiedBytes: bytes,
+    }));
+    const { agent } = makeAgent({
+      contextGraphId,
+      assertionName,
+      assertionUri,
+      fileHash: artifactHash,
+      markdownHash: artifactHash,
+      markdownForm: `urn:dkg:file:${artifactHash}`,
+      allowedAgents: ['did:dkg:agent:test'],
+      fetchAndVerifyAssertionArtifact,
+    });
+    await startRoutes({ agent });
+
+    const read = await post('/api/knowledge-assets/import-artifact/read-markdown', {
+      contextGraphId,
+      assertionUri,
+      sourcePeerId: 'peer-owner',
+      maxBytes: 1024,
+    });
+
+    expect(read.status).toBe(200);
+    expect(read.body).toMatchObject({
+      markdownHash: artifactHash,
+      contentType: 'text/markdown',
+      bytes: bytes.length,
+      markdown: bytes.toString('utf8'),
+      source: { peerId: 'peer-owner', agentAddress: 'did:dkg:agent:source' },
+    });
+    expect(fetchAndVerifyAssertionArtifact).toHaveBeenCalledWith(expect.objectContaining({
+      contextGraphId,
+      assertionUri,
+      kind: 'markdown',
+      hash: artifactHash,
+      sourcePeerId: 'peer-owner',
+      requestingAgentAddress: 'did:dkg:agent:test',
+      cache: true,
+    }));
+    await expect(fileStore.get(artifactHash)).resolves.toEqual(bytes);
+  });
+
   it('serves a remote artifact page even when the full artifact is not cache-promoted', async () => {
     const bytes = Buffer.from('remote page bytes');
     const artifactHash = sha256Hash(bytes);
@@ -983,7 +1185,7 @@ describe('import artifact daemon routes', () => {
       offset: 1024,
       maxBytes: 4096,
       cache: false,
-      requestingAgentAddress: 'did:dkg:agent:source',
+      requestingAgentAddress: 'did:dkg:agent:test',
     }));
   });
 
@@ -1055,6 +1257,63 @@ describe('import artifact daemon routes', () => {
     expect(fetchAndVerifyAssertionArtifact.mock.calls.map(([params]) => params.sourcePeerId)).toEqual([
       'peer-poisoned',
       'peer-good',
+    ]);
+    await expect(fileStore.get(artifactHash)).resolves.toEqual(bytes);
+  });
+
+  it('prefers a later verified peer over an earlier unverified remote page', async () => {
+    const bytes = Buffer.from('# Verified Candidate\n');
+    const artifactHash = sha256Hash(bytes);
+    const contextGraphId = 'cg-public-open-discovered-unverified-fallback';
+    const assertionName = 'imported-md';
+    const assertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:source', assertionName);
+    const discoverAssertionArtifactCandidates = vi.fn(async () => ['peer-unverified', 'peer-verified']);
+    const fetchAndVerifyAssertionArtifact = vi.fn(async (params: { sourcePeerId: string }) => ({
+      response: {
+        version: 1,
+        contextGraphId,
+        assertionUri,
+        kind: 'markdown',
+        hash: artifactHash,
+        offset: 0,
+        totalBytes: bytes.length,
+        truncated: false,
+        contentType: 'text/markdown',
+        bytesB64: bytes.toString('base64'),
+      },
+      ...(params.sourcePeerId === 'peer-verified' ? { verifiedBytes: bytes } : {}),
+    }));
+    const { agent } = makeAgent({
+      contextGraphId,
+      assertionName,
+      assertionUri,
+      fileHash: artifactHash,
+      markdownHash: artifactHash,
+      markdownForm: `urn:dkg:file:${artifactHash}`,
+      onChainPolicy: { accessPolicy: 0, publishPolicy: 1 },
+      discoverAssertionArtifactCandidates,
+      fetchAndVerifyAssertionArtifact,
+    });
+    await startRoutes({ agent });
+
+    const read = await post('/api/knowledge-assets/import-artifact/read', {
+      contextGraphId,
+      assertionUri,
+      kind: 'markdown',
+      hash: artifactHash,
+      maxBytes: 1024,
+    });
+
+    expect(read.status).toBe(200);
+    expect(read.body).toMatchObject({
+      status: 'fetched',
+      hash: artifactHash,
+      bytesB64: bytes.toString('base64'),
+      source: { peerId: 'peer-verified' },
+    });
+    expect(fetchAndVerifyAssertionArtifact.mock.calls.map(([params]) => params.sourcePeerId)).toEqual([
+      'peer-unverified',
+      'peer-verified',
     ]);
     await expect(fileStore.get(artifactHash)).resolves.toEqual(bytes);
   });

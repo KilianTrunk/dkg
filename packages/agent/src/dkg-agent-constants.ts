@@ -201,12 +201,16 @@ export const MESSAGE_OUTBOX_TICK_MS = 30_000;
  * the `agents` Context Graph (PR feat/chain-agents-cg-phonebook).
  *
  * Each heartbeat refreshes the profile's `dkg:multiaddr` triples
- * (current dialable addrs) and `dkg:lastSeen` timestamp, so other
- * peers querying agents-CG see fresh phonebook entries even when
- * direct connections haven't been exchanged recently. Mirrors the
- * `beaconReannounceTimer` (5 min) cadence and the relay reservation
- * lifecycle (~30 min default duration limit), so we publish at least
- * a few times per reservation epoch.
+ * (current dialable addrs) and `dkg:lastSeen` timestamp. This is a
+ * FALLBACK source only: live peer addresses come primarily from
+ * libp2p `peerRouting.findPeer` (signed peer records), and the
+ * agents-CG dial fallback already tolerates entries up to
+ * `AGENT_PROFILE_STALE_THRESHOLD_MS` (24h) old. The cadence therefore
+ * does not need to track the `beaconReannounceTimer` (5 min): at
+ * 20 min we still re-announce at least once per ~30-min relay-
+ * reservation epoch while cutting profile publish + gossip churn ~4x
+ * (the previous 5-min cadence was ~288x more frequent than the 24h
+ * freshness budget it feeds). Complements the agents/_meta growth fix.
  *
  * Tuning: lower for chatty small networks (more responsive but more
  * gossip volume), higher for large meshes (less volume; slower
@@ -214,7 +218,7 @@ export const MESSAGE_OUTBOX_TICK_MS = 30_000;
  * `config.network.agentProfileHeartbeatMs`. Set to `0` to disable
  * (the one-shot startup publish still fires).
  */
-export const AGENT_PROFILE_HEARTBEAT_MS = 5 * 60 * 1000;
+export const AGENT_PROFILE_HEARTBEAT_MS = 20 * 60 * 1000;
 
 /**
  * Staleness threshold for an agents-CG profile read during dial

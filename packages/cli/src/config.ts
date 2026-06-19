@@ -688,7 +688,7 @@ export interface DkgConfig {
     dhtQuerySelfIntervalMs?: number;
     /**
      * Cadence at which the daemon re-publishes its own profile to the
-     * `agents` Context Graph (default 5min — see
+     * `agents` Context Graph (default 20min — see
      * `AGENT_PROFILE_HEARTBEAT_MS`). Set to `0` to disable; the
      * one-shot startup publish still fires.
      *

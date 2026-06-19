@@ -1122,7 +1122,15 @@ export class DkgClient {
   // /api/assertion/* routes are retired); only the shared-memory/* methods
   // remain on their own routes.
 
-  /** Create a KA + open its WM draft. Pass `quads` to atomically write+finalize. */
+  /**
+   * Create a KA + open its WM draft. Pass `quads` to atomically write+seal.
+   * #1116 D5: this combined CLIENT function defaults `alsoShareSwm` to true when
+   * the draft will seal (quads present and `finalize !== false`), so the
+   * one-shot seals AND shares to SWM. Pass `alsoShareSwm: false` to stop at a
+   * sealed WM draft, or `finalize: false` to keep an unsealed editable WM draft.
+   * (The bare daemon route is a primitive — seal-only — and never auto-shares;
+   * the default-share lives here in the client.)
+   */
   async createKnowledgeAsset(args: {
     contextGraphId: string;
     name: string;
@@ -1155,7 +1163,21 @@ export class DkgClient {
       body.preSignedAuthorAttestation = args.preSignedAuthorAttestation;
     }
     if (args.schemeVersion !== undefined) body.schemeVersion = args.schemeVersion;
-    if (args.alsoShareSwm !== undefined) body.alsoShareSwm = args.alsoShareSwm;
+    // #1116 D5: the combined client SEALS AND SHARES TO SWM by default. When
+    // quads are present and the draft will seal (finalize !== false), default
+    // `alsoShareSwm` to true so the one-shot lands the asset in SWM. An explicit
+    // `alsoShareSwm` (true OR false) always wins; never default-on when there
+    // are no quads or `finalize:false` (those keep an unsealed/sealed WM draft
+    // that the route's "alsoShareSwm requires a finalized assertion" guard would
+    // reject). The bare daemon route stays a primitive (seal-only); the
+    // default-share is a CLIENT-side convenience.
+    const sealsByDefault =
+      Array.isArray(args.quads) && args.quads.length > 0 && args.finalize !== false;
+    if (args.alsoShareSwm !== undefined) {
+      body.alsoShareSwm = args.alsoShareSwm;
+    } else if (sealsByDefault) {
+      body.alsoShareSwm = true;
+    }
     if (args.alsoPublishVm !== undefined) {
       // Object form carries finalized-publish controls; translate to the daemon
       // body shape (mirrors the cli ApiClient). `true`/`false` pass through.
@@ -1219,6 +1241,10 @@ export class DkgClient {
     authorAgentAddress?: string;
     preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
     schemeVersion?: number;
+    // #1116: optional layer selects WHERE the content to seal lives. "wm"
+    // (default) seals the open WM draft; "swm" reconstructs a draft from an
+    // already-shared SWM asset and seals it (recover-without-recreate).
+    layer?: 'wm' | 'swm';
   }): Promise<{ merkleRoot: string; eip712Digest: string }> {
     assertExclusiveAuthorFields(args);
     const body: Record<string, unknown> = {
@@ -1230,6 +1256,7 @@ export class DkgClient {
       body.preSignedAuthorAttestation = args.preSignedAuthorAttestation;
     }
     if (args.schemeVersion !== undefined) body.schemeVersion = args.schemeVersion;
+    if (args.layer !== undefined) body.layer = args.layer;
     return this.request<{ merkleRoot: string; eip712Digest: string }>(
       'POST',
       `/api/knowledge-assets/${encodeURIComponent(args.name)}/wm/finalize`,
@@ -1281,13 +1308,18 @@ export class DkgClient {
     name: string;
     subGraphName?: string;
     entities?: string[] | 'all';
-  }): Promise<{ swmShared: boolean; promotedCount: number }> {
+    // #1116: a full share SEALS BY DEFAULT (publish-ready). `skipSeal:true`
+    // opts out into an unsealed SWM share. A subset share is SWM-only and is
+    // never sealed regardless of this flag.
+    skipSeal?: boolean;
+  }): Promise<{ swmShared: boolean; promotedCount: number; sealed: boolean; publishReady: boolean }> {
     const body: Record<string, unknown> = {
       contextGraphId: normalizeContextGraphId(args.contextGraphId),
     };
     if (args.subGraphName) body.subGraphName = args.subGraphName;
     if (args.entities !== undefined) body.entities = args.entities;
-    return this.request<{ swmShared: boolean; promotedCount: number }>(
+    if (args.skipSeal !== undefined) body.skipSeal = args.skipSeal;
+    return this.request<{ swmShared: boolean; promotedCount: number; sealed: boolean; publishReady: boolean }>(
       'POST',
       `/api/knowledge-assets/${encodeURIComponent(args.name)}/swm/share`,
       body,

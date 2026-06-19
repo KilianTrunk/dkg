@@ -113,7 +113,6 @@ async function submitWithCostMismatch(
   const authorTyped = buildAuthorAttestationTypedData({
     chainId: CHAIN_ID,
     kav10Address,
-    contextGraphId: cgId,
     merkleRoot: MERKLE_ROOT,
     authorAddress: signer.address,
     reservedKaId,

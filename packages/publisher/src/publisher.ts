@@ -303,8 +303,8 @@ export interface PublishOptions {
    *      `computeFlatKCRoot` / `skolemizeByEntity` semantics).
    *   2. Signed (or collected a signature for) the typed data
    *      `buildAuthorAttestationTypedData({ chainId, kav10Address,
-   *      contextGraphId, merkleRoot: expectedMerkleRoot,
-   *      authorAddress })`.
+   *      merkleRoot: expectedMerkleRoot, authorAddress, reservedKaId })`
+   *      (#1116: the attestation no longer binds `contextGraphId`).
    *
    * The publisher independently re-derives `kcMerkleRoot` from the
    * supplied `quads` and asserts equality with

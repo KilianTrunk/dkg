@@ -49,6 +49,50 @@ def test_finalize_url_encodes_name(recording_client):
     assert path == "/api/knowledge-assets/a%20b/wm/finalize"
 
 
+def test_finalize_puts_layer_swm_in_body(recording_client):
+    # #1116 — the `layer` field must reach the wire (the FakeClient handler tests
+    # only prove the tool→client arg pass-through; this pins the actual POST body).
+    client = recording_client
+    client.finalize_assertion("k", "cg1", layer="swm")
+    path, body = client.posts[-1]
+    assert path == "/api/knowledge-assets/k/wm/finalize"
+    assert body == {"contextGraphId": "cg1", "layer": "swm"}
+
+
+def test_finalize_omits_layer_when_none(recording_client):
+    client = recording_client
+    client.finalize_assertion("k", "cg1")
+    _, body = client.posts[-1]
+    assert "layer" not in body
+
+
+# -- promote_assertion (swm/share) ------------------------------------------
+
+def test_promote_puts_skip_seal_in_body(recording_client):
+    # #1116 — `skip_seal=True` must reach the wire as camelCase `skipSeal:true`.
+    client = recording_client
+    client.promote_assertion("k", "cg1", None, skip_seal=True)
+    path, body = client.posts[-1]
+    assert path == "/api/knowledge-assets/k/swm/share"
+    assert body == {"contextGraphId": "cg1", "skipSeal": True}
+
+
+def test_promote_omits_skip_seal_when_none(recording_client):
+    client = recording_client
+    client.promote_assertion("k", "cg1", None)
+    _, body = client.posts[-1]
+    assert body == {"contextGraphId": "cg1"}
+    assert "skipSeal" not in body
+    assert "entities" not in body
+
+
+def test_promote_forwards_entities_and_skip_seal_together(recording_client):
+    client = recording_client
+    client.promote_assertion("k", "cg1", "all", skip_seal=False)
+    _, body = client.posts[-1]
+    assert body == {"contextGraphId": "cg1", "entities": "all", "skipSeal": False}
+
+
 # -- publish_finalized_assertion --------------------------------------------
 
 def test_publish_nests_options_and_omits_author_selection(recording_client):

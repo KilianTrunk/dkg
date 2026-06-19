@@ -260,7 +260,16 @@ function resolveFinalizeOptions(
     authorAgentAddress,
     preSignedAuthorAttestation,
     schemeVersion,
+    layer,
   } = raw;
+  // #1116: optional `layer` selects WHERE the content to seal lives. "wm"
+  // (default) seals the Working-Memory draft; "swm" seals content already
+  // shared to SWM (reconstructs a transient WM draft from SWM, then finalizes)
+  // — mirrors the body-field `layer` precedent on pull-from.
+  if (layer != null && layer !== "wm" && layer !== "swm") {
+    jsonResponse(res, 400, { error: 'finalize "layer" must be "wm" or "swm" when supplied' });
+    return null;
+  }
   if (authorAgentAddress != null && preSignedAuthorAttestation != null) {
     jsonResponse(res, 400, {
       error: '"authorAgentAddress" and "preSignedAuthorAttestation" are mutually exclusive',
@@ -296,6 +305,7 @@ function resolveFinalizeOptions(
     ...(typeof authorAgentAddress === "string" ? { authorAgentAddress } : {}),
     ...(resolvedPreSignedAttestation ? { preSignedAuthorAttestation: resolvedPreSignedAttestation } : {}),
     ...(schemeVersion != null ? { schemeVersion } : {}),
+    ...(layer === "swm" ? { layer } : {}),
   };
 }
 
@@ -692,6 +702,12 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
     // CG to be registered). OT-RFC-43 §10.5.5.
     const hasQuads = Array.isArray(quads) && quads.length > 0;
     const shouldFinalize = hasQuads && finalize !== false;
+    // #1116 D5: the create ROUTE stays a primitive — create+write+seal, with
+    // opt-in share (this preserves the "create stops at a sealed WM draft"
+    // invariant the agent-tooling work relies on). The "default to seal AND
+    // share to SWM" convenience is owned by the combined CLIENT function
+    // `createKnowledgeAsset` (MCP/OpenClaw), which defaults `alsoShareSwm` when
+    // it seals. So here `alsoShareSwm` is honored exactly as sent.
     // alsoShareSwm/alsoPublishVm advance a SEALED assertion to SWM/VM, so they
     // require this request to finalize. Reject upfront — before any create/write
     // mutation — whenever it won't (no quads, or finalize:false); otherwise the
@@ -754,7 +770,12 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
           const share = await agent.assertion.promote(resolvedContextGraphId, name, { subGraphName });
           result.swmShared = true;
           result.promotedCount = share.promotedCount;
-          result.status = "swm-shared";
+          result.sealed = share.sealed;
+          result.publishReady = share.publishReady;
+          // #1116: the one-shot finalizes BEFORE sharing, so a shared asset is
+          // normally sealed ("swm-shared"). The unsealed status is only reachable
+          // if a future path shares without sealing.
+          result.status = share.sealed ? "swm-shared" : "swm-shared-unsealed";
           if (share.promotedCount !== 0) {
             emitMemoryGraphChanged?.({ contextGraphId: resolvedContextGraphId, layers: ["wm", "swm"], subGraphName, operation: "assertion_promoted", source: "api", counts: { triples: share.promotedCount } });
             recordActivityAndNotify(ctx, { contextGraphId: resolvedContextGraphId, kind: "promoted", actorAgentAddress: resolvedAuthorAgentAddress ?? requestAgentAddress, subGraphName, tripleCount: share.promotedCount });
@@ -968,8 +989,23 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       if (verb === "finalize") {
         const finalizeOptions = resolveFinalizeOptions(parsed, res);
         if (finalizeOptions === null) return;
-        const seal = await agent.assertion.finalize(contextGraphId, name, finalizeOptions);
-        emitMemoryGraphChanged?.({ contextGraphId, layers: ["wm"], subGraphName, operation: "assertion_finalized", source: "api" });
+        let seal;
+        try {
+          seal = await agent.assertion.finalize(contextGraphId, name, finalizeOptions);
+        } catch (e: any) {
+          // #1116 (review A1): a finalize(layer:"swm") on an asset that was only
+          // SUBSET-shared is rejected — subset shares are SWM-only, not
+          // publishable. Map it to a 409 (parity with the swm/share
+          // UNSEALED_SHARE_BLOCKED mapping) carrying the recovery hint in the
+          // message; everything else propagates to the outer handler unchanged.
+          if (e?.code === "SWM_SUBSET_NOT_SEALABLE") {
+            return jsonResponse(res, 409, { code: "SWM_SUBSET_NOT_SEALABLE", error: e.message });
+          }
+          throw e;
+        }
+        // #1116: a layer:"swm" finalize touches SWM (it reconstructs a WM draft
+        // from SWM, then seals), so reflect both layers in the change event.
+        emitMemoryGraphChanged?.({ contextGraphId, layers: finalizeOptions.layer === "swm" ? ["wm", "swm"] : ["wm"], subGraphName, operation: "assertion_finalized", source: "api" });
         // Full seal payload (PR #971) — clients inspect the attestation.
         return jsonResponse(res, 200, {
           assertionUri: seal.assertionUri,
@@ -1004,6 +1040,15 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
           if (e?.code === "WM_DRAFT_CONFLICT") {
             return jsonResponse(res, 409, { code: "WM_DRAFT_CONFLICT", error: e.message });
           }
+          // #1116 (round 5): the seal-less SWM reconstruction is also reachable
+          // here (pull-from swm + a plain finalize bypasses the finalize(layer:
+          // "swm") wrapper guard). The publisher now rejects a subset-only asset
+          // at the source with SWM_SUBSET_NOT_SEALABLE — map it to 409 (parity
+          // with the wm/finalize verb's mapping) so a partial asset can't be
+          // reconstructed/published under the KA name.
+          if (e?.code === "SWM_SUBSET_NOT_SEALABLE") {
+            return jsonResponse(res, 409, { code: "SWM_SUBSET_NOT_SEALABLE", error: e.message });
+          }
           throw e; // -> outer catch -> 500
         }
       }
@@ -1015,12 +1060,35 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       // agent config default (`swmAwaitCuratorAck`). The promote aborts with 503
       // (mapped in respondAssertionError) if the curator doesn't confirm.
       const awaitCuratorAck = typeof parsed?.awaitCuratorAck === "boolean" ? parsed.awaitCuratorAck : undefined;
-      const share = await agent.assertion.promote(contextGraphId, name, { entities: parsed.entities, subGraphName, awaitCuratorAck });
-      if (share.promotedCount !== 0) {
-        emitMemoryGraphChanged?.({ contextGraphId, layers: ["wm", "swm"], subGraphName, operation: "assertion_promoted", source: "api", counts: { triples: share.promotedCount } });
-        recordActivityAndNotify(ctx, { contextGraphId, kind: "promoted", actorAgentAddress: requestAgentAddress, subGraphName, tripleCount: share.promotedCount });
+      // #1116: a full share SEALS BY DEFAULT; `skipSeal:true` opts out into an
+      // unsealed SWM share. Strict-boolean: a stray "false" string must 400, not
+      // silently flip the default.
+      let skipSeal: boolean | undefined;
+      if (parsed?.skipSeal !== undefined) {
+        if (typeof parsed.skipSeal !== "boolean") {
+          return jsonResponse(res, 400, { error: '"skipSeal" must be a boolean when supplied' });
+        }
+        skipSeal = parsed.skipSeal;
       }
-      return jsonResponse(res, 200, { swmShared: true, promotedCount: share.promotedCount });
+      try {
+        const share = await agent.assertion.promote(contextGraphId, name, { entities: parsed.entities, subGraphName, awaitCuratorAck, skipSeal });
+        if (share.promotedCount !== 0) {
+          emitMemoryGraphChanged?.({ contextGraphId, layers: ["wm", "swm"], subGraphName, operation: "assertion_promoted", source: "api", counts: { triples: share.promotedCount } });
+          recordActivityAndNotify(ctx, { contextGraphId, kind: "promoted", actorAgentAddress: requestAgentAddress, subGraphName, tripleCount: share.promotedCount });
+        }
+        // #1116: surface the seal outcome. `sealed`/`publishReady` describe THIS
+        // share (subset or skipSeal → false by design, not a failure).
+        return jsonResponse(res, 200, { swmShared: true, promotedCount: share.promotedCount, sealed: share.sealed, publishReady: share.publishReady });
+      } catch (e: any) {
+        // #1116 D1: a default full share that can't seal (a residual capability
+        // gap, no skipSeal) fails CLOSED with WM preserved — map to a 409 that
+        // carries the recovery hint. Everything else (e.g. the curator-ack 503)
+        // propagates to the outer handler unchanged.
+        if (e?.code === "UNSEALED_SHARE_BLOCKED") {
+          return jsonResponse(res, 409, { code: "UNSEALED_SHARE_BLOCKED", error: e.message, recovery: e.recovery });
+        }
+        throw e;
+      }
     }
 
     // ── SWM verb: share-async (WM → SWM, enqueued) ──
@@ -1037,6 +1105,20 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       if (asyncPromoteUnavailable(res)) return;
       const entities = parsed.entities;
       if (!validateEntities(entities, res)) return;
+      // #1116 (round 5): the sync swm/share validates `skipSeal` as a strict
+      // boolean; the async queue ALWAYS seals (the safe default) and can't carry
+      // skipSeal through the job, so it was silently dropped — a footgun where a
+      // caller asking to skip sealing got a sealed share. Reject a non-boolean
+      // (parity with the sync route) and reject a truthy boolean outright rather
+      // than honoring it differently than requested.
+      if (parsed?.skipSeal !== undefined) {
+        if (typeof parsed.skipSeal !== "boolean") {
+          return jsonResponse(res, 400, { error: '"skipSeal" must be a boolean when supplied' });
+        }
+        if (parsed.skipSeal === true) {
+          return jsonResponse(res, 400, { error: "skipSeal is not supported for async share; use swm/share (the synchronous route) to share without sealing" });
+        }
+      }
       try {
         const result = await agent.assertion.promoteAsync(contextGraphId, name, {
           entities: entities ?? "all",
@@ -1076,7 +1158,36 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         if (!validateFinalizedAssertionPublishRequest(parsed, res)) return;
         const opts = resolveFinalizedPublishOptions(ctx, parsed.options);
         if (opts === null) return;
-        const pub: any = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts });
+        // #1116: registration moved from seal-time to publish-time, but it must
+        // run AFTER the local preconditions, not before — otherwise a doomed
+        // publish (not finalized / nothing in SWM) would burn registration gas
+        // and only THEN surface the 409. publishFromFinalizedAssertion checks
+        // those preconditions BEFORE any chain interaction (they throw
+        // "is not finalized" / "No quads in shared memory"), and the
+        // unregistered-CG guard fires only after them. So: try the publish
+        // first; ONLY if the sole remaining blocker is an unregistered CG do we
+        // transparently register and retry (idempotent). All other errors
+        // propagate to the precondition/500 mapping below unchanged.
+        let pub: any;
+        try {
+          pub = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts });
+        } catch (firstErr: any) {
+          // #1116 (review B): code-first, message fallback. The publisher now
+          // stamps `code: 'CG_NOT_REGISTERED'` on this throw; match on it and
+          // keep the message regex for back-compat (older publisher builds /
+          // re-wrapped errors that lost the code).
+          if (firstErr?.code !== "CG_NOT_REGISTERED" && !/not registered on-chain/i.test(firstErr?.message ?? String(firstErr))) throw firstErr;
+          try {
+            await agent.ensureRegisteredForPublish(contextGraphId, { callerAgentAddress: requestAgentAddress });
+          } catch (regErr: any) {
+            return jsonResponse(res, 400, {
+              error:
+                `Context graph "${contextGraphId}" could not be auto-registered on-chain before publish: ` +
+                `${regErr?.message ?? String(regErr)}`,
+            });
+          }
+          pub = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts });
+        }
         const { httpStatus, reason } = classifyVmPublish(pub);
         if (httpStatus === 200) {
           // Activity attributed to the SEAL author (PR #971), not the requester.
@@ -1111,8 +1222,11 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         // shared memory`: a curated publish with nothing private shared (only
         // the public catalog entry) — a caller precondition, thrown before any
         // chain interaction, so 409 is safe + consistent with the public path.
-        if (/is not finalized/.test(msg) || /No quads in shared memory/.test(msg) || /has no private payload/.test(msg)) {
-          return jsonResponse(res, 409, { code: "VM_PUBLISH_PRECONDITION", error: msg });
+        // #1116 (round 9): PUBLISH_NOT_FULL_SHARE — the marker gate (a publish
+        // requires a complete full share resident in SWM) is also a pre-chain
+        // caller precondition; map it to the same 409 (code-first).
+        if (e?.code === "PUBLISH_NOT_FULL_SHARE" || /is not finalized/.test(msg) || /No quads in shared memory/.test(msg) || /has no private payload/.test(msg)) {
+          return jsonResponse(res, 409, { code: e?.code === "PUBLISH_NOT_FULL_SHARE" ? "PUBLISH_NOT_FULL_SHARE" : "VM_PUBLISH_PRECONDITION", error: msg });
         }
         return jsonResponse(res, 500, { error: msg });
       }

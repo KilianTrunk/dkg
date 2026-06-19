@@ -1960,6 +1960,8 @@ WHERE {
           message.includes('seal binds KAv10') ||
           message.includes('expectedMerkleRoot mismatch') ||
           message.includes('precomputedAttestation signer mismatch') ||
+          // #1116 (review B): code-first, message fallback for the unregistered-CG case.
+          err?.code === 'CG_NOT_REGISTERED' ||
           message.includes('not registered on-chain') ||
           message.includes('signer mismatch')
         ) {

@@ -471,7 +471,7 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
     const authorTypedData = buildAuthorAttestationTypedData({
       chainId: v10ChainId,
       kav10Address: v10KavAddress,
-      contextGraphId: params.contextGraphId,
+      // #1116: AuthorAttestation no longer binds contextGraphId.
       merkleRoot: params.merkleRoot,
       authorAddress: signer.address,
       reservedKaId: 0n,

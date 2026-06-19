@@ -204,7 +204,8 @@ describe('loadNetworkConfig', () => {
       const config = await loadNetworkConfig(expected.name);
       expect(config).not.toBeNull();
       const cfg = config! as any;
-      expect(cfg._status).toMatch(/replace PLACEHOLDER_MAINNET_NETWORK_ID and PEER_ID_\*/);
+      expect(cfg._status).toMatch(/pre-deployment: replace PEER_ID_\* relay values before enabling/);
+      expect(cfg._status).not.toContain('PLACEHOLDER_MAINNET_NETWORK_ID');
       expect(cfg.networkId).not.toBe(testnetNetworkId);
       expect(cfg.relays).not.toEqual(testnetRelays);
       expect({

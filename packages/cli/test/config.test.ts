@@ -172,6 +172,7 @@ describe('loadNetworkConfig', () => {
       {
         name: 'mainnet-base',
         networkName: 'DKG V10 Base Mainnet',
+        genesisId: 'base-mainnet',
         chainName: 'base',
         chainId: 'base:8453',
         rpcUrl: 'https://mainnet.base.org',
@@ -180,6 +181,7 @@ describe('loadNetworkConfig', () => {
       {
         name: 'mainnet-gnosis',
         networkName: 'DKG V10 Gnosis Mainnet',
+        genesisId: 'gnosis-mainnet',
         chainName: 'gnosis',
         chainId: 'gnosis:100',
         rpcUrl: 'https://rpc.gnosischain.com',
@@ -188,6 +190,7 @@ describe('loadNetworkConfig', () => {
       {
         name: 'mainnet-neuroweb',
         networkName: 'DKG V10 NeuroWeb Mainnet',
+        genesisId: 'neuroweb-mainnet',
         chainName: 'neuroweb',
         chainId: 'neuroweb:2043',
         rpcUrl: 'https://astrosat-parachain-rpc.origin-trail.network',
@@ -212,6 +215,7 @@ describe('loadNetworkConfig', () => {
         autoUpdate: cfg.autoUpdate,
       }).toEqual(sharedMainnetPrep);
       expect(cfg.networkName).toBe(expected.networkName);
+      expect(cfg.genesisId).toBe(expected.genesisId);
       for (const relay of cfg.relays) {
         expect(relay).toMatch(/^\/ip4\/178\./);
         expect(relay).toMatch(/\/p2p\/PEER_ID_/);

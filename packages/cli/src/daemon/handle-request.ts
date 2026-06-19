@@ -209,7 +209,7 @@ import {
   shortId,
   sleep,
   deriveBlockExplorerUrl,
-  type InFlightLimiter,
+  type AdmissionStatsView,
 } from './http-utils.js';
 import {
   normalizeRepo,
@@ -364,7 +364,7 @@ export async function handleRequest(
   apiHost: string,
   apiPortRef: { value: number },
   routePlugins: RoutePlugin[],
-  inFlightLimiter: InFlightLimiter,
+  admission: AdmissionStatsView,
   emitMemoryGraphChanged?: (event: MemoryGraphChangedEvent) => void,
   emitNotification?: (event: NotificationSseEvent) => void,
 ): Promise<void> {
@@ -404,7 +404,7 @@ export async function handleRequest(
     apiHost,
     apiPortRef,
     routePlugins,
-    admission: inFlightLimiter,
+    admission,
     url,
     path,
     requestToken,

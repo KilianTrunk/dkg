@@ -129,6 +129,10 @@ describe('/api/status selected overlay details', () => {
         },
         nodeVersion: '0.0.0-test',
         nodeCommit: '',
+        // Read-only admission stats view — the daemon supplies this in prod via
+        // handleRequest; stubbed here because this hand-built ctx drives the full
+        // /api/status body, which now surfaces the admission block.
+        admission: { inFlight: 0, max: 0, rejectedTotal: 0 },
       } as unknown as RequestContext);
     });
 

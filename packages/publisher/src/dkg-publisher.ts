@@ -7,7 +7,7 @@ import { GraphManager, PrivateContentStore } from '@origintrail-official/dkg-sto
 import { DEFAULT_PUBLISH_EPOCHS, MAX_PUBLISH_EPOCHS, type Publisher, type PublishOptions, type PublishResult, type KAManifestEntry, type PhaseCallback, type V10CoreNodeACK } from './publisher.js';
 import { skolemizeByEntity } from './auto-partition.js';
 import { canonicalPublishPayload } from './canonical-publish-payload.js';
-import { partitionCatalogQuads, catalogCommittedLeaves, computeCatalogRoot, contextGraphCatalogUri } from '@origintrail-official/dkg-core';
+import { partitionCatalogQuads, catalogCommittedLeaves, computeCatalogRoot, contextGraphCatalogUri, isAgentRegistryContextGraph } from '@origintrail-official/dkg-core';
 import { RESERVED_SUBJECT_PREFIXES, findReservedSubjectPrefix, isReservedSubject } from './reserved-subjects.js';
 import { skolemize } from './skolemize.js';
 import {
@@ -2603,7 +2603,13 @@ export class DKGPublisher implements Publisher {
       // GH #1078 — persist private slices on this intentional-local terminal
       // branch too (a chainless / ownerOnly publish still finalizes here).
       await persistFinalizedPrivateSlices();
-      await this.store.insert(tentativeMeta);
+      // #1233 — the agents registry CG never confirms on-chain and its
+      // per-publish tentative `_meta` record has no consumer (agent facts are
+      // served from the DATA graph); persisting one per heartbeat would grow
+      // `agents/_meta` without bound and stall offset-0 sync. Skip it there.
+      if (!isAgentRegistryContextGraph(contextGraphId)) {
+        await this.store.insert(tentativeMeta);
+      }
       // B3: only now that the local publish has persisted do we refresh the
       // public catalog entry (CLEAR/REPLACE — see persistCatalogEntry).
       await persistCatalogEntry();

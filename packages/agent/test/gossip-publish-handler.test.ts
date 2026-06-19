@@ -157,6 +157,48 @@ describe('GossipPublishHandler', () => {
     ).toBe(countBefore);
   });
 
+  it('does NOT persist tentative _meta for the agents registry CG (#1233 — agents/_meta bloat)', async () => {
+    const { store, handler } = createHandler();
+    const agentsCg = SYSTEM_CONTEXT_GRAPHS.AGENTS;
+    const entity = 'did:dkg:agent:0x1111111111111111111111111111111111111111';
+
+    const data = makePublishMessage({
+      ual: 'did:dkg:mock:31337/0x1/t-session-1',
+      contextGraphId: agentsCg,
+      nquads: `<${entity}> <http://schema.org/name> "Agent" .`,
+      kas: [{ tokenId: 1, rootEntity: entity, privateMerkleRoot: new Uint8Array(0), privateTripleCount: 0 }],
+    });
+
+    await handler.handlePublishMessage(data, agentsCg);
+
+    // The profile data is still stored in the agents DATA graph...
+    const dataCount = await store.countQuads(`did:dkg:context-graph:${agentsCg}`);
+    expect(dataCount, 'agent profile data must still land in the data graph').toBeGreaterThan(0);
+
+    // ...but NO per-publish tentative tracking record lands in agents/_meta.
+    // That record has no consumer (the registry is served from the data graph)
+    // and a fresh one per peer heartbeat is what grows agents/_meta unbounded.
+    const metaCount = await store.countQuads(`did:dkg:context-graph:${agentsCg}/_meta`);
+    expect(metaCount, 'agents/_meta must not accumulate per-publish tentative records').toBe(0);
+  });
+
+  it('DOES persist tentative _meta for a non-registry data CG (control)', async () => {
+    const { store, handler } = createHandler();
+    const entity = 'did:dkg:test:meta-control-entity';
+
+    const data = makePublishMessage({
+      ual: 'did:dkg:mock:31337/0x1/1',
+      contextGraphId: CONTEXT_GRAPH,
+      nquads: `<${entity}> <http://schema.org/name> "Thing" .`,
+      kas: [{ tokenId: 1, rootEntity: entity, privateMerkleRoot: new Uint8Array(0), privateTripleCount: 0 }],
+    });
+
+    await handler.handlePublishMessage(data, CONTEXT_GRAPH);
+
+    const metaCount = await store.countQuads(`did:dkg:context-graph:${CONTEXT_GRAPH}/_meta`);
+    expect(metaCount, 'non-registry CGs keep the tentative publish-tracking record').toBeGreaterThan(0);
+  });
+
   it('inserts quads for UAL with empty kas (no structural validation)', async () => {
     const { store, handler } = createHandler();
 

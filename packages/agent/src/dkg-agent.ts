@@ -1377,10 +1377,25 @@ export class DKGAgent extends DKGAgentBase {
       throw new Error(`Genesis ${genesisId ?? 'default'} is missing its network definition`);
     }
 
-    const result = await store.query(
-      `SELECT ?v WHERE { <${networkDefinition.subject}> <https://dkg.network/ontology#genesisVersion> ?v } LIMIT 1`,
+    const existingGenesis = await store.query(
+      `SELECT ?network WHERE {
+        ?network <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_NETWORK}> .
+        ?network <${DKG_ONTOLOGY.DKG_GENESIS_VERSION}> ?v .
+      }`,
     );
-    if (result.type === 'bindings' && result.bindings.length > 0) return;
+    if (existingGenesis.type === 'bindings') {
+      const existingSubjects = existingGenesis.bindings
+        .map((binding: any) => String(binding.network?.value ?? binding.network).replace(/^<|>$/g, ''));
+      const foreignSubjects = existingSubjects.filter(subject => subject !== networkDefinition.subject);
+      if (foreignSubjects.length > 0) {
+        throw new Error(
+          `Triple store contains a different genesis (${foreignSubjects.join(', ')}) than selected ` +
+          `${networkDefinition.subject}. Start with an empty DKG home or run the network reset/migration ` +
+          `before switching genesis.`,
+        );
+      }
+      if (existingSubjects.includes(networkDefinition.subject)) return;
+    }
 
     // Insert genesis quads
     const quads: Quad[] = genesisQuads.map(gq => ({

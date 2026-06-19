@@ -93,6 +93,23 @@ describe('Genesis Knowledge', () => {
       await agent.stop().catch(() => {});
     });
 
+    it('rejects switching an existing store to a different genesis', async () => {
+      const store = new OxigraphStore();
+      const defaultAgent = await DKGAgent.create({
+        name: 'DefaultGenesisStore',
+        store,
+        chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+      });
+      await defaultAgent.stop().catch(() => {});
+
+      await expect(DKGAgent.create({
+        name: 'ForeignGenesisStore',
+        genesisId: 'gnosis-mainnet',
+        store,
+        chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+      })).rejects.toThrow(/contains a different genesis/);
+    });
+
 
     it('genesis loading is idempotent', async () => {
       const store = new OxigraphStore();

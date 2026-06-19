@@ -1,0 +1,84 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { computeNetworkId } from '../../core/src/genesis.js';
+
+const mocks = vi.hoisted(() => ({
+  agentCreate: vi.fn(),
+  loadNetworkConfig: vi.fn(),
+}));
+
+vi.mock('@origintrail-official/dkg-agent', () => ({
+  DKGAgent: { create: mocks.agentCreate },
+  loadOpWallets: vi.fn(),
+  KaNumberAllocator: class KaNumberAllocator {},
+}));
+
+vi.mock('../src/config.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/config.js')>();
+  return {
+    ...actual,
+    loadNetworkConfig: mocks.loadNetworkConfig,
+  };
+});
+
+const { runDaemonInner } = await import('../src/daemon/lifecycle.js');
+
+describe('daemon startup network validation', () => {
+  let tempHome: string | undefined;
+  let originalDkgHome: string | undefined;
+  let stdoutWrite: typeof process.stdout.write;
+  let stderrWrite: typeof process.stderr.write;
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    process.stdout.write = stdoutWrite;
+    process.stderr.write = stderrWrite;
+    if (originalDkgHome === undefined) {
+      delete process.env.DKG_HOME;
+    } else {
+      process.env.DKG_HOME = originalDkgHome;
+    }
+    if (tempHome) await rm(tempHome, { recursive: true, force: true });
+    tempHome = undefined;
+  });
+
+  it('exits before agent creation when the selected network is pre-deployment', async () => {
+    tempHome = await mkdtemp(join(tmpdir(), 'dkg-predeployment-startup-'));
+    originalDkgHome = process.env.DKG_HOME;
+    process.env.DKG_HOME = tempHome;
+    stdoutWrite = process.stdout.write;
+    stderrWrite = process.stderr.write;
+
+    const networkId = await computeNetworkId('base-mainnet');
+    mocks.loadNetworkConfig.mockResolvedValue({
+      _status: 'pre-deployment: replace PEER_ID_* relay values before enabling Base mainnet',
+      networkName: 'DKG V10 Base Mainnet',
+      genesisId: 'base-mainnet',
+      networkId,
+      genesisVersion: 1,
+      relays: ['/ip4/178.105.87.39/tcp/9090/p2p/PEER_ID_SOLARIS'],
+      defaultNodeRole: 'edge',
+    });
+    const stdoutSpy = vi
+      .spyOn(process.stdout, 'write')
+      .mockImplementation(() => true);
+    vi
+      .spyOn(process, 'exit')
+      .mockImplementation(((code?: string | number | null) => {
+        throw new Error(`process.exit:${code}`);
+      }) as never);
+
+    await expect(runDaemonInner(true, {
+      name: 'predeployment-startup-test',
+      listenPort: 0,
+      nodeRole: 'edge',
+    } as any, Date.now())).rejects.toThrow('process.exit:1');
+
+    expect(mocks.agentCreate).not.toHaveBeenCalled();
+    expect(stdoutSpy.mock.calls.map(call => String(call[0])).join('')).toContain(
+      'FATAL: network config DKG V10 Base Mainnet is marked pre-deployment',
+    );
+  });
+});

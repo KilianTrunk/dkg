@@ -147,7 +147,6 @@ describe('loadNetworkConfig', () => {
     const { _resetNetworkConfigCache } = await import('../src/config.js');
     const testnetNetworkId = '7449c543ff04a550b2dafa999fe8ee577a00b212023bb4d4244e8d58a4792c7b';
     const sharedMainnetPrep = {
-      networkName: 'DKG V10 Mainnet',
       networkId: 'PLACEHOLDER_MAINNET_NETWORK_ID',
       genesisVersion: 1,
       relays: [
@@ -171,6 +170,7 @@ describe('loadNetworkConfig', () => {
     const mainnets = [
       {
         name: 'mainnet-base',
+        networkName: 'DKG V10 Base Mainnet',
         chainName: 'base',
         chainId: 'base:8453',
         rpcUrl: 'https://mainnet.base.org',
@@ -178,6 +178,7 @@ describe('loadNetworkConfig', () => {
       },
       {
         name: 'mainnet-gnosis',
+        networkName: 'DKG V10 Gnosis Mainnet',
         chainName: 'gnosis',
         chainId: 'gnosis:100',
         rpcUrl: 'https://rpc.gnosischain.com',
@@ -185,6 +186,7 @@ describe('loadNetworkConfig', () => {
       },
       {
         name: 'mainnet-neuroweb',
+        networkName: 'DKG V10 NeuroWeb Mainnet',
         chainName: 'neuroweb',
         chainId: 'neuroweb:2043',
         rpcUrl: 'https://astrosat-parachain-rpc.origin-trail.network',
@@ -201,7 +203,6 @@ describe('loadNetworkConfig', () => {
       expect(cfg.networkId).not.toBe(testnetNetworkId);
       expect(cfg.relays).not.toEqual(testnetRelays);
       expect({
-        networkName: cfg.networkName,
         networkId: cfg.networkId,
         genesisVersion: cfg.genesisVersion,
         relays: cfg.relays,
@@ -209,6 +210,7 @@ describe('loadNetworkConfig', () => {
         defaultNodeRole: cfg.defaultNodeRole,
         autoUpdate: cfg.autoUpdate,
       }).toEqual(sharedMainnetPrep);
+      expect(cfg.networkName).toBe(expected.networkName);
       for (const relay of cfg.relays) {
         expect(relay).toMatch(/^\/ip4\/178\./);
         expect(relay).toMatch(/\/p2p\/PEER_ID_/);

@@ -1,6 +1,6 @@
 {
   "_status": "pre-deployment: replace PLACEHOLDER_MAINNET_NETWORK_ID and PEER_ID_* relay values before enabling NeuroWeb mainnet",
-  "networkName": "DKG V10 Mainnet",
+  "networkName": "DKG V10 NeuroWeb Mainnet",
   "networkId": "PLACEHOLDER_MAINNET_NETWORK_ID",
   "genesisVersion": 1,
   "relays": [

@@ -39,6 +39,22 @@ const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
     parametersStorageAddress,
   );
 
+  // OT-RFC-53 (deploy-robustness): the deposit is only ENFORCED if ContextGraphs
+  // initialized with its deposit stack cached — `createContextGraph` gates the
+  // feature on the cached `parametersStorage`. A misordered/partial deploy could
+  // leave that cache empty, silently making this anti-spam mitigation inert even
+  // though the parameter reads as set. Fail loud instead of shipping it dormant.
+  const contextGraphsAddress =
+    hre.helpers.contractDeployments.contracts['ContextGraphs'].evmAddress;
+  const ContextGraphs = await hre.ethers.getContractAt('ContextGraphs', contextGraphsAddress);
+  if ((await ContextGraphs.parametersStorage()) === hre.ethers.ZeroAddress) {
+    throw new Error(
+      'OT-RFC-53: ContextGraphs has not cached its deposit stack (parametersStorage == 0); ' +
+        'the registration deposit would be inert. (Re)initialize ContextGraphs after ' +
+        'ParametersStorage/CSS/EpochStorage/Chronos/Token are deployed before activating.',
+    );
+  }
+
   const current = await ParametersStorage.contextGraphRegistrationDeposit();
   if (current === CONTEXT_GRAPH_REGISTRATION_DEPOSIT) {
     console.log(
@@ -62,4 +78,7 @@ export default func;
 // or a fixture explicitly listing this tag activates the deposit, so v10-group
 // test fixtures stay at 0.
 func.tags = ['SetContextGraphRegistrationDeposit'];
-func.dependencies = ['ParametersStorage'];
+// ContextGraphs is a dependency so it is deployed + initialized (caching its
+// deposit stack) BEFORE this script activates the deposit — see the readiness
+// check above.
+func.dependencies = ['ParametersStorage', 'ContextGraphs'];

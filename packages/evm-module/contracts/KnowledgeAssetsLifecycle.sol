@@ -542,16 +542,13 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         (currentEpoch, kaId) = _executePublishCore(p);
 
         // OT-RFC-53: spend the CG owner's prepaid registration escrow first
-        // (no-op for third-party publishers into an open CG, or when the CG has
-        // no escrow). The escrow-funded portion is already gross in the CSS vault,
-        // so distribute it directly; charge only the remainder below.
-        uint96 fromEscrow = _useCgEscrow(p.contextGraphId, p.tokenAmount);
-        if (fromEscrow > 0) {
-            // Route the treasury fee on the escrow-funded portion out of the vault,
-            // distribute only the net to stakers (parity with the wallet path).
-            _distributeTokens(_chargeEscrowTreasuryFee(fromEscrow), p.epochs, currentEpoch);
+        // (no-op for third-party publishers into an open CG, or when the CG has no
+        // escrow). The net (after the treasury fee) is distributed here over the
+        // publish window; the wallet covers the remainder below.
+        (uint96 netEscrow, uint96 walletCost) = _consumeEscrowNet(p.contextGraphId, p.tokenAmount);
+        if (netEscrow > 0) {
+            _distributeTokens(netEscrow, p.epochs, currentEpoch);
         }
-        uint96 walletCost = p.tokenAmount - fromEscrow;
         if (walletCost == 0) {
             return kaId;
         }
@@ -909,18 +906,15 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         // return cgId == 0 and skip both the escrow draw and the CG-value write.
         uint256 cgId = contextGraphStorage.kaToContextGraph(id);
 
-        // OT-RFC-53: spend the CG owner's prepaid registration escrow first.
-        // The escrow-funded portion is already gross in the CSS vault, so
-        // distribute it over the extension window directly; charge only the
-        // remainder. The CG-value write below stays on the GROSS `tokenAmount`
-        // regardless of payment source, so random-sampling weight tracks the
-        // publisher's full committed value.
-        uint96 fromEscrow = _useCgEscrow(cgId, tokenAmount);
-        if (fromEscrow > 0) {
-            // Treasury fee on the escrow portion → treasury; net → extension window.
-            epochStorage.addTokensToEpochRange(1, endEpoch, endEpoch + epochs, _chargeEscrowTreasuryFee(fromEscrow));
+        // OT-RFC-53: spend the CG owner's prepaid registration escrow first. The net
+        // (after the treasury fee) is distributed over the extension window; the
+        // wallet covers the remainder. The CG-value write below stays on the GROSS
+        // `tokenAmount` regardless of payment source, so random-sampling weight
+        // tracks the publisher's full committed value.
+        (uint96 netEscrow, uint96 walletCost) = _consumeEscrowNet(cgId, tokenAmount);
+        if (netEscrow > 0) {
+            epochStorage.addTokensToEpochRange(1, endEpoch, endEpoch + epochs, netEscrow);
         }
-        uint96 walletCost = tokenAmount - fromEscrow;
         if (walletCost > 0) {
             // Pull gross from the publisher, distribute net into the pool.
             uint96 netTokenAmount = _addTokens(walletCost);
@@ -1301,6 +1295,22 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         }
     }
 
+    /// @dev OT-RFC-53: consume the CG owner's prepaid escrow for `amount` and charge
+    ///      the treasury fee on the consumed portion — the SHARED escrow accounting
+    ///      for publish / extend / update (kept in one place so fee/escrow changes
+    ///      stay in sync). Returns the NET escrow (after fee) for the caller to
+    ///      distribute over its own window, plus the wallet remainder still owed.
+    ///      No-op (0 net, full `walletRemainder`) when the CG has no escrow or the
+    ///      caller isn't the owner (`_useCgEscrow` returns 0).
+    function _consumeEscrowNet(uint256 contextGraphId, uint96 amount)
+        internal
+        returns (uint96 netEscrow, uint96 walletRemainder)
+    {
+        uint96 fromEscrow = _useCgEscrow(contextGraphId, amount);
+        netEscrow = fromEscrow > 0 ? _chargeEscrowTreasuryFee(fromEscrow) : 0;
+        walletRemainder = amount - fromEscrow;
+    }
+
     // ========================================================================
     // V10 Update Entries
     // ========================================================================
@@ -1347,15 +1357,16 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
 
         if (deltaTokenAmount == 0) return;
 
-        // OT-RFC-53: spend the CG owner's prepaid registration escrow first.
-        // The escrow-funded portion is already gross in the CSS vault, so
-        // distribute it directly; charge only the remainder below.
-        uint96 fromEscrow = _useCgEscrow(contextGraphStorage.kaToContextGraph(p.id), deltaTokenAmount);
-        if (fromEscrow > 0) {
-            // Treasury fee on the escrow portion → treasury; net → staker pool.
-            _distributeTokens(_chargeEscrowTreasuryFee(fromEscrow), uint256(remainingEpochs), currentEpoch);
+        // OT-RFC-53: spend the CG owner's prepaid registration escrow first. The net
+        // (after the treasury fee) is distributed over the remaining epochs; the
+        // wallet covers the remainder below.
+        (uint96 netEscrow, uint96 walletDelta) = _consumeEscrowNet(
+            contextGraphStorage.kaToContextGraph(p.id),
+            deltaTokenAmount
+        );
+        if (netEscrow > 0) {
+            _distributeTokens(netEscrow, uint256(remainingEpochs), currentEpoch);
         }
-        uint96 walletDelta = deltaTokenAmount - fromEscrow;
         if (walletDelta == 0) return;
 
         // PCA branch eligibility (mirrors `publish()`, with `<=` for the

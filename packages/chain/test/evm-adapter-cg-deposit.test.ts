@@ -71,12 +71,27 @@ describe('EVMChainAdapter — OT-RFC-53 CG registration deposit approval', () =>
     return cgs.getRegistrationEscrow(cgId);
   };
 
+  // Count CORE_OP→ContextGraphs TRAC approvals since `fromBlock` — proves whether the
+  // adapter's deposit-approval branch ran (0 = dormant no-op; >=1 = approved + retried).
+  const approvalCount = async (owner: string, fromBlock: number): Promise<number> => {
+    const tokenAddr = await hub().getContractAddress('Token');
+    const cgAddr = await hub().getContractAddress('ContextGraphs');
+    const token = new Contract(
+      tokenAddr,
+      ['event Approval(address indexed owner, address indexed spender, uint256 value)'],
+      provider,
+    );
+    const logs = await token.queryFilter(token.filters.Approval(owner, cgAddr), fromBlock, 'latest');
+    return logs.length;
+  };
+
   it('approves + pays the deposit when active, recording the CG escrow', async () => {
     await setDeposit(DEPOSIT);
     const coreOp = new Wallet(HARDHAT_KEYS.CORE_OP, provider);
     await mintTokens(provider, hubAddress, HARDHAT_KEYS.DEPLOYER, coreOp.address, DEPOSIT);
 
     const adapter = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+    const fromBlock = await provider.getBlockNumber();
     const result = await adapter.createOnChainContextGraph({
       accessPolicy: 0, // public
       publishPolicy: 1, // open
@@ -87,12 +102,18 @@ describe('EVMChainAdapter — OT-RFC-53 CG registration deposit approval', () =>
     expect(result.success).toBe(true);
     expect(result.contextGraphId > 0n).toBe(true);
     expect(await getEscrow(result.contextGraphId)).toBe(DEPOSIT);
+    // ...and the approval branch actually ran: a CORE_OP→ContextGraphs approval is
+    // present (>=1), proving the TooLowAllowance recovery + retry fired (not that the
+    // create just happened to have a pre-existing allowance).
+    expect(await approvalCount(coreOp.address, fromBlock + 1)).toBeGreaterThan(0);
   });
 
   it('is a no-op when the deposit is 0 (dormant): creates the CG with no approval/escrow', async () => {
     await setDeposit(0n);
 
     const adapter = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+    const coreOpAddress = new Wallet(HARDHAT_KEYS.CORE_OP).address;
+    const fromBlock = await provider.getBlockNumber();
     const result = await adapter.createOnChainContextGraph({
       accessPolicy: 0,
       publishPolicy: 1,
@@ -100,5 +121,9 @@ describe('EVMChainAdapter — OT-RFC-53 CG registration deposit approval', () =>
 
     expect(result.success).toBe(true);
     expect(await getEscrow(result.contextGraphId)).toBe(0n);
+    // PROVE the dormant path approved nothing — a regression that always approved
+    // (or called ensureV10ApproveTrac(..., 0n)) would still pass the assertions above
+    // but leave a stray CORE_OP→ContextGraphs approval, which this catches.
+    expect(await approvalCount(coreOpAddress, fromBlock + 1)).toBe(0);
   });
 });

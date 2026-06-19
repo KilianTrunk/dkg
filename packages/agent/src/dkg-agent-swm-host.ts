@@ -679,32 +679,30 @@ export class SwmHostModeMethods extends DKGAgentBase {
   }
 
   /**
-   * GH #1124 — DEFINITIVE public-CG check for the host-mode ingest gates. Unlike
-   * `!isCuratedForHostMode` (which treats UNKNOWN as public), this returns true
-   * ONLY for a CG we can positively confirm is public (open). Curated AND unknown
-   * both return false, so an in-flight chain-event race (policy not loaded yet)
-   * keeps the conservative ciphertext+allowlist gates and heals via member
-   * catchup — it can NEVER misclassify a curated CG as public and admit an
-   * unauthenticated plaintext envelope into curated storage.
+   * GH #1124 — DEFINITIVE "fully-open CG" check gating the self-signed public
+   * host-mode ingest path. "Open" requires BOTH axes, because this codebase
+   * separates READ visibility from WRITE authority:
+   *   - accessPolicy === 0  → publicly READABLE (SWM is plaintext), AND
+   *   - publishPolicy === 1 → OPEN PUBLISH (anyone may write).
+   * A public-readable but curated-publish CG (accessPolicy 0, publishPolicy 0 /
+   * PCA) still restricts WHO may publish, so the self-signed path must NOT apply
+   * — otherwise any key could store plaintext SWM on host-mode cores and bypass
+   * the on-chain publisher authorization (otReviewAgent #1239-r3). Curated OR
+   * unknown on EITHER axis → false: the conservative ciphertext + allowlist gates
+   * stay in force and a chain-event race heals via member catchup, so a curated
+   * (or restricted-publish) CG is never misclassified as self-publishable.
    */
   async isConfirmedPublicForHostMode(this: DKGAgent, contextGraphId: string): Promise<boolean> {
     // Resolve via the SHARED on-chain policy resolver rather than a direct
     // cleartext `subscribedContextGraphs` lookup. `getContextGraphOnChainPolicy`
-    // re-keys cleartext↔on-chain-id (via subscribedContextGraphs OR
-    // getContextGraphOnChainId), consults the accessPolicy cache + local `_meta`,
-    // AND falls back to a direct chain RPC — so it resolves the policy even for a
-    // host-only core whose subscription is keyed by the wire HASH and that has no
-    // local `_meta` (the exact #1124 sharded topology). A cleartext-only
-    // subscribedContextGraphs probe would miss that entry and wrongly drop the
-    // public envelope.
-    //
-    // accessPolicy === 0 is the ONLY confirmed-public answer. Curated (1) and
-    // unknown (undefined) both → false — the safe bias: keep the ciphertext +
-    // allowlist gates so a curated CG mid chain-event race is never misclassified
-    // as public; it heals via member catchup once the policy resolves.
+    // re-keys cleartext↔on-chain-id, consults the cache + local `_meta`, AND
+    // falls back to a direct chain RPC — so it resolves BOTH policies even for a
+    // host-only core keyed by the wire HASH with no local `_meta` (the #1124
+    // sharded topology). Both must positively resolve to their open value; any
+    // undefined (unknown) → false (safe).
     try {
-      const { accessPolicy } = await this.getContextGraphOnChainPolicy(contextGraphId);
-      return accessPolicy === 0;
+      const { accessPolicy, publishPolicy } = await this.getContextGraphOnChainPolicy(contextGraphId);
+      return accessPolicy === 0 && publishPolicy === 1;
     } catch {
       return false;
     }

@@ -55,21 +55,31 @@ describe('GH #1124 — isConfirmedPublicForHostMode safety bias (only accessPoli
     return core;
   }
 
-  it('on-chain accessPolicy === 0 → public', async () => {
+  it('open read + open publish (accessPolicy 0, publishPolicy 1) → public', async () => {
     const g = (await makeCore()) as unknown as ClassifierInternals;
-    g.getContextGraphOnChainPolicy = async () => ({ accessPolicy: 0 });
+    g.getContextGraphOnChainPolicy = async () => ({ accessPolicy: 0, publishPolicy: 1 });
     expect(await g.isConfirmedPublicForHostMode('cg')).toBe(true);
   });
 
-  it('on-chain accessPolicy === 1 (curated) → NOT public', async () => {
+  it('public READ but curated PUBLISH (accessPolicy 0, publishPolicy 0) → NOT self-publishable', async () => {
+    // The #1239-r3 🔴: read visibility ≠ write authority. A publicly-readable CG
+    // can still restrict who may publish; the self-signed path must NOT apply.
     const g = (await makeCore()) as unknown as ClassifierInternals;
-    g.getContextGraphOnChainPolicy = async () => ({ accessPolicy: 1 });
+    g.getContextGraphOnChainPolicy = async () => ({ accessPolicy: 0, publishPolicy: 0 });
     expect(await g.isConfirmedPublicForHostMode('cg')).toBe(false);
   });
 
-  it('UNKNOWN policy (accessPolicy undefined — chain-event race) → NOT public (the misclassification guard)', async () => {
+  it('curated read (accessPolicy 1) → NOT public, regardless of publishPolicy', async () => {
     const g = (await makeCore()) as unknown as ClassifierInternals;
-    g.getContextGraphOnChainPolicy = async () => ({}); // unresolved
+    g.getContextGraphOnChainPolicy = async () => ({ accessPolicy: 1, publishPolicy: 1 });
+    expect(await g.isConfirmedPublicForHostMode('cg')).toBe(false);
+  });
+
+  it('UNKNOWN policy (either axis undefined — chain-event race) → NOT public (the misclassification guard)', async () => {
+    const g = (await makeCore()) as unknown as ClassifierInternals;
+    g.getContextGraphOnChainPolicy = async () => ({ accessPolicy: 0 }); // publishPolicy unresolved
+    expect(await g.isConfirmedPublicForHostMode('cg')).toBe(false);
+    g.getContextGraphOnChainPolicy = async () => ({}); // both unresolved
     expect(await g.isConfirmedPublicForHostMode('cg')).toBe(false);
   });
 
@@ -128,7 +138,7 @@ describe('GH #1124 — ingestSwmHostModeEnvelope gate behaviour (signed plaintex
   it('CONFIRMED-PUBLIC: a signed plaintext SWM envelope is STORED (was dropped pre-#1124)', async () => {
     const g = (await makeHostCore()) as unknown as IngestInternals;
     const cg = 'cg-ingest-public';
-    g.getContextGraphOnChainPolicy = async () => ({ accessPolicy: 0 }); // resolves public
+    g.getContextGraphOnChainPolicy = async () => ({ accessPolicy: 0, publishPolicy: 1 }); // resolves fully-open (public read + open publish)
     const env = await g.encodeWorkspaceGossipMessage(cg, plaintextRequest(cg));
     await g.ingestSwmHostModeEnvelope(cg, env, PEER);
     expect(await entriesFor(g, cg)).toBe(1);
@@ -137,7 +147,7 @@ describe('GH #1124 — ingestSwmHostModeEnvelope gate behaviour (signed plaintex
   it('CURATED (accessPolicy 1): a plaintext envelope is DROPPED (Gate 1 — curated must be ciphertext)', async () => {
     const g = (await makeHostCore()) as unknown as IngestInternals;
     const cg = 'cg-ingest-curated';
-    g.getContextGraphOnChainPolicy = async () => ({ accessPolicy: 1 });
+    g.getContextGraphOnChainPolicy = async () => ({ accessPolicy: 1, publishPolicy: 0 });
     const env = await g.encodeWorkspaceGossipMessage(cg, plaintextRequest(cg));
     await g.ingestSwmHostModeEnvelope(cg, env, PEER);
     expect(await entriesFor(g, cg)).toBe(0);
@@ -155,7 +165,7 @@ describe('GH #1124 — ingestSwmHostModeEnvelope gate behaviour (signed plaintex
   it('PUBLIC but TAMPERED signature: DROPPED (shared verifier rejects bad signature/freshness)', async () => {
     const g = (await makeHostCore()) as unknown as IngestInternals;
     const cg = 'cg-ingest-public-forged';
-    g.getContextGraphOnChainPolicy = async () => ({ accessPolicy: 0 });
+    g.getContextGraphOnChainPolicy = async () => ({ accessPolicy: 0, publishPolicy: 1 });
     const env = await g.encodeWorkspaceGossipMessage(cg, plaintextRequest(cg));
     const tampered = Uint8Array.from(env);
     for (let i = 1; i <= 8 && i <= tampered.length; i++) tampered[tampered.length - i] ^= 0xff;
@@ -167,7 +177,7 @@ describe('GH #1124 — ingestSwmHostModeEnvelope gate behaviour (signed plaintex
     const g = (await makeHostCore()) as unknown as IngestInternals;
     const cgEnvelope = 'cg-ingest-A';
     const cgInner = 'cg-ingest-B';
-    g.getContextGraphOnChainPolicy = async () => ({ accessPolicy: 0 }); // both public
+    g.getContextGraphOnChainPolicy = async () => ({ accessPolicy: 0, publishPolicy: 1 }); // both fully-open (isolate the CG-binding check)
     // Envelope is signed for CG-A but its inner WorkspacePublishRequest targets CG-B.
     const env = await g.encodeWorkspaceGossipMessage(cgEnvelope, plaintextRequest(cgInner));
     await g.ingestSwmHostModeEnvelope(cgEnvelope, env, PEER);

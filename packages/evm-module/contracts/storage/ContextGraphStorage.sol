@@ -393,10 +393,12 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
     }
 
     function setRegistrationEscrow(uint256 contextGraphId, uint96 amount) external onlyContracts {
+        _requireExists(contextGraphId);
         _cgRegistrationEscrow[contextGraphId] = amount;
     }
 
     function decreaseRegistrationEscrow(uint256 contextGraphId, uint96 amount) external onlyContracts {
+        _requireExists(contextGraphId);
         uint96 current = _cgRegistrationEscrow[contextGraphId];
         if (amount > current) {
             revert KnowledgeAssetsLib.InvalidContextGraphConfig("escrow underflow");
@@ -405,6 +407,7 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
     }
 
     function clearRegistrationEscrow(uint256 contextGraphId) external onlyContracts returns (uint96 cleared) {
+        _requireExists(contextGraphId);
         cleared = _cgRegistrationEscrow[contextGraphId];
         if (cleared != 0) {
             _cgRegistrationEscrow[contextGraphId] = 0;

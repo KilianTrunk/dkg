@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { dkgAuthTokenPath } from '@origintrail-official/dkg-core';
+import { computeNetworkId } from '../../core/src/genesis.js';
 import {
   loadNetworkConfig,
   loadConfig,
@@ -149,7 +150,6 @@ describe('loadNetworkConfig', () => {
     const { _resetNetworkConfigCache } = await import('../src/config.js');
     const testnetNetworkId = '7449c543ff04a550b2dafa999fe8ee577a00b212023bb4d4244e8d58a4792c7b';
     const sharedMainnetPrep = {
-      networkId: 'PLACEHOLDER_MAINNET_NETWORK_ID',
       genesisVersion: 1,
       relays: [
         '/ip4/178.105.87.39/tcp/9090/p2p/PEER_ID_SOLARIS',
@@ -208,7 +208,6 @@ describe('loadNetworkConfig', () => {
       expect(cfg.networkId).not.toBe(testnetNetworkId);
       expect(cfg.relays).not.toEqual(testnetRelays);
       expect({
-        networkId: cfg.networkId,
         genesisVersion: cfg.genesisVersion,
         relays: cfg.relays,
         defaultContextGraphs: cfg.defaultContextGraphs,
@@ -217,6 +216,7 @@ describe('loadNetworkConfig', () => {
       }).toEqual(sharedMainnetPrep);
       expect(cfg.networkName).toBe(expected.networkName);
       expect(cfg.genesisId).toBe(expected.genesisId);
+      expect(cfg.networkId).toBe(await computeNetworkId(expected.genesisId));
       for (const relay of cfg.relays) {
         expect(relay).toMatch(/^\/ip4\/178\./);
         expect(relay).toMatch(/\/p2p\/PEER_ID_/);

@@ -1,25 +1,14 @@
 {
-  "networkName": "DKG V10 Mainnet",
-  "networkId": "7449c543ff04a550b2dafa999fe8ee577a00b212023bb4d4244e8d58a4792c7b",
-  "genesisVersion": 1,
-  "relays": [
-    "/ip4/178.104.54.178/tcp/9090/p2p/12D3KooWSmU3owJvB9sFw8uApDgKrv2VBMecsGGvgAc4Gq6hB57M",
-    "/ip4/157.180.37.169/tcp/9090/p2p/12D3KooWAbLiM6Xy2TfXtFpUrXqttnTSuctW8Lo1mkauaijsNrWw",
-    "/ip4/178.156.252.147/tcp/9090/p2p/12D3KooWPyTpqBBtU1AvzSsd5rWXCQzFcGtG44qDmeYenWcpzsge",
-    "/ip4/49.12.4.64/tcp/9090/p2p/12D3KooWJqhnnfouiNRUyJBEREpuKtV4A448LUbS6JiVCe8Q82bZ"
-  ],
-  "defaultContextGraphs": [],
-  "defaultNodeRole": "edge",
+  "_status": "pre-deployment: distinct mainnet genesis networkId and relay peer IDs must be set before enabling NeuroWeb mainnet",
+  "chain": {
+    "name": "neuroweb",
+    "type": "evm",
+    "chainId": "neuroweb:2043",
+    "rpcUrl": "https://astrosat-parachain-rpc.origin-trail.network",
+    "hubAddress": "0x0957e25BD33034948abc28204ddA54b6E1142D6F"
+  },
   "autoUpdate": {
     "enabled": true,
-    "repo": "OriginTrail/dkg",
-    "branch": "main",
-    "checkIntervalMinutes": 5
-  },
-  "chain": {
-    "type": "evm",
-    "rpcUrl": "https://astrosat-parachain-rpc.origin-trail.network",
-    "hubAddress": "0x0957e25BD33034948abc28204ddA54b6E1142D6F",
-    "chainId": "neuroweb:2043"
+    "branch": "main"
   }
 }

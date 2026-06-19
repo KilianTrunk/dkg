@@ -1,10 +1,11 @@
 {
-  "_status": "pre-deployment: hubAddress must be set after V10 contracts are deployed on NeuroWeb",
+  "networkId": "7449c543ff04a550b2dafa999fe8ee577a00b212023bb4d4244e8d58a4792c7b",
   "chain": {
     "name": "neuroweb",
     "type": "evm",
     "chainId": "neuroweb:2043",
-    "rpcUrl": "https://astrosat-parachain-rpc.origin-trail.network"
+    "rpcUrl": "https://astrosat-parachain-rpc.origin-trail.network",
+    "hubAddress": "0x0957e25BD33034948abc28204ddA54b6E1142D6F"
   },
   "autoUpdate": {
     "enabled": true,

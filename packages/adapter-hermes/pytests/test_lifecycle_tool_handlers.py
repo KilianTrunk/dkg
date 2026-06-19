@@ -975,6 +975,30 @@ def test_finalize_handler_rejects_invalid_layer(provider):
     assert len(provider._client.calls) == before
 
 
+@pytest.mark.parametrize("bad", [True, False, ["swm"], 1, 0, {"l": "swm"}])
+def test_finalize_handler_rejects_non_string_layer(provider, bad):
+    # Round-6 reviewer: a PRESENT non-string layer must NOT silently fall through
+    # to the default WM seal. The old _first_text() validator coerced any non-string
+    # to "" -> treated as omitted -> sealed the default WM layer. Validate
+    # args.get("layer") directly: a present non-string ("True"/list/number/dict) is a
+    # tool error AND nothing reaches the wire.
+    before = len(provider._client.calls)
+    out = json.loads(provider.handle_tool_call("dkg_knowledge_asset_finalize", {
+        "context_graph_id": "cg1", "name": "ka", "layer": bad,
+    }))
+    assert out["error"] == 'layer must be "wm" or "swm".', (bad, out)
+    assert len(provider._client.calls) == before, bad  # nothing on the wire
+
+
+def test_finalize_handler_omitted_layer_defaults_to_none(provider):
+    # absent layer key -> default WM seal (layer forwarded as None), no error.
+    provider.handle_tool_call("dkg_knowledge_asset_finalize", {
+        "context_graph_id": "cg1", "name": "ka",
+    })
+    assert provider._client.calls[-1][0] == "finalize"
+    assert provider._client.calls[-1][6] is None
+
+
 def test_finalize_handler_forwards_layer_swm_to_client(provider):
     provider.handle_tool_call("dkg_knowledge_asset_finalize", {
         "context_graph_id": "cg1", "name": "ka", "layer": "swm",

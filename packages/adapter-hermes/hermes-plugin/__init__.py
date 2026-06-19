@@ -2283,10 +2283,17 @@ class DKGMemoryProvider(MemoryProvider):
         author = _first_text(args, "author_agent_address")
         author = _normalize_wm_agent_address(author) if author else None
         # #1116: optional `layer` selects WHERE the content to seal lives. Default
-        # (omitted) seals the open WM draft; "swm" seals an asset already shared to
-        # SWM. Present-but-invalid is a tool error, never a silent default.
-        layer = _first_text(args, "layer") or None
-        if layer is not None and layer not in ("wm", "swm"):
+        # (omitted/null) seals the open WM draft; "swm" seals an asset already
+        # shared to SWM. Validate args.get("layer") DIRECTLY (NOT via _first_text,
+        # which coerces any non-string to "" → an absent/omitted layer): a PRESENT
+        # non-string (True / a list / a number) or a string outside {wm,swm} is a
+        # tool error, never a silent fall-through to the default WM seal.
+        layer_raw = args.get("layer")
+        if layer_raw is None:
+            layer = None
+        elif layer_raw in ("wm", "swm"):
+            layer = layer_raw
+        else:
             return tool_error('layer must be "wm" or "swm".')
         return json.dumps(self._client.finalize_assertion(
             name,

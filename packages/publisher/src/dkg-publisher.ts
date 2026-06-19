@@ -4871,7 +4871,9 @@ export class DKGPublisher implements Publisher {
       // pull-from's clean-slate (the seal-in-SWM reconstruction) MUST preserve it,
       // or a finalize that fails after the re-seed would strip the marker and make
       // the already-fully-shared asset un-sealable — the inverse of the bug it guards.
-      `${A2_DKG}swmShareComplete`,
+      // Round 6 — use the shared SWM_SHARE_COMPLETE_PRED constant (the same one
+      // mark/clear/has use) so a future rename can't silently break preservation.
+      SWM_SHARE_COMPLETE_PRED,
     ]);
     const lifecycleSubject = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
     const metaGraph = contextGraphMetaUri(contextGraphId);

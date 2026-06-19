@@ -1,0 +1,104 @@
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { ethers, Wallet, Contract, type JsonRpcProvider } from 'ethers';
+import {
+  getSharedContext,
+  createProvider,
+  createEVMAdapter,
+  takeSnapshot,
+  revertSnapshot,
+} from './evm-test-context.js';
+import { HARDHAT_KEYS, mintTokens } from './hardhat-harness.js';
+
+/**
+ * OT-RFC-53 — EVMChainAdapter.createOnChainContextGraph deposit auto-approval.
+ *
+ * Validates the client-side path users rely on to create a CG when the on-chain
+ * registration deposit is active: the adapter reads
+ * `ParametersStorage.contextGraphRegistrationDeposit()` and approves it to the
+ * ContextGraphs facade before submitting `createContextGraph`. Without that
+ * approval the facade's `transferFrom` reverts `TooLowAllowance`, so a successful
+ * create + a recorded escrow proves the approval branch ran. Also covers the
+ * dormant (deposit == 0) no-op path.
+ */
+describe('EVMChainAdapter — OT-RFC-53 CG registration deposit approval', () => {
+  let provider: JsonRpcProvider;
+  let hubAddress: string;
+  let baseSnapshot: string;
+  const DEPOSIT = ethers.parseEther('100');
+
+  beforeAll(async () => {
+    const ctx = getSharedContext();
+    hubAddress = ctx.hubAddress;
+    provider = createProvider();
+    // File-level isolation: this suite flips the global deposit param, so
+    // snapshot once up front and restore after to keep other files unaffected.
+    baseSnapshot = await takeSnapshot();
+  });
+
+  afterAll(async () => {
+    await revertSnapshot(baseSnapshot);
+  });
+
+  const hub = () =>
+    new Contract(
+      hubAddress,
+      [
+        'function getContractAddress(string) view returns (address)',
+        'function getAssetStorageAddress(string) view returns (address)',
+      ],
+      provider,
+    );
+
+  // ParametersStorage setter is onlyOwnerOrMultiSigOwner; DEPLOYER is the owner.
+  const setDeposit = async (amount: bigint): Promise<void> => {
+    const deployer = new Wallet(HARDHAT_KEYS.DEPLOYER, provider);
+    const psAddr = await hub().getContractAddress('ParametersStorage');
+    const ps = new Contract(
+      psAddr,
+      ['function setContextGraphRegistrationDeposit(uint96) external'],
+      deployer,
+    );
+    await (await ps.setContextGraphRegistrationDeposit(amount)).wait();
+  };
+
+  const getEscrow = async (cgId: bigint): Promise<bigint> => {
+    const cgsAddr = await hub().getAssetStorageAddress('ContextGraphStorage');
+    const cgs = new Contract(
+      cgsAddr,
+      ['function getRegistrationEscrow(uint256) view returns (uint96)'],
+      provider,
+    );
+    return cgs.getRegistrationEscrow(cgId);
+  };
+
+  it('approves + pays the deposit when active, recording the CG escrow', async () => {
+    await setDeposit(DEPOSIT);
+    const coreOp = new Wallet(HARDHAT_KEYS.CORE_OP, provider);
+    await mintTokens(provider, hubAddress, HARDHAT_KEYS.DEPLOYER, coreOp.address, DEPOSIT);
+
+    const adapter = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+    const result = await adapter.createOnChainContextGraph({
+      accessPolicy: 0, // public
+      publishPolicy: 1, // open
+    });
+
+    // Success proves the adapter approved the deposit — otherwise the facade's
+    // transferFrom would have reverted TooLowAllowance.
+    expect(result.success).toBe(true);
+    expect(result.contextGraphId > 0n).toBe(true);
+    expect(await getEscrow(result.contextGraphId)).toBe(DEPOSIT);
+  });
+
+  it('is a no-op when the deposit is 0 (dormant): creates the CG with no approval/escrow', async () => {
+    await setDeposit(0n);
+
+    const adapter = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+    const result = await adapter.createOnChainContextGraph({
+      accessPolicy: 0,
+      publishPolicy: 1,
+    });
+
+    expect(result.success).toBe(true);
+    expect(await getEscrow(result.contextGraphId)).toBe(0n);
+  });
+});

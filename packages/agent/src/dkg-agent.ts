@@ -544,8 +544,10 @@ export class DKGAgent extends DKGAgentBase {
     const eventBus = new TypedEventBus();
     const keypair = wallet.keypair;
 
+    const genesisId = config.genesisId;
+
     // Load genesis knowledge into the store (idempotent)
-    await DKGAgent.loadGenesis(store);
+    await DKGAgent.loadGenesis(store, genesisId);
 
     const port = config.listenPort ?? 0;
     const host = config.listenHost ?? '0.0.0.0';
@@ -751,7 +753,7 @@ export class DKGAgent extends DKGAgentBase {
   }
 
   async networkId(): Promise<string> {
-    return computeNetworkId();
+    return computeNetworkId(this.config.genesisId);
   }
 
   get peerId(): string {
@@ -1358,7 +1360,7 @@ export class DKGAgent extends DKGAgentBase {
    * Loads genesis knowledge into the triple store if not already present.
    * Creates the system context graph graphs and inserts the genesis quads.
    */
-  private static async loadGenesis(store: TripleStore): Promise<void> {
+  private static async loadGenesis(store: TripleStore, genesisId?: string): Promise<void> {
     const gm = new GraphManager(store);
 
     // Ensure system context graphs exist
@@ -1366,13 +1368,35 @@ export class DKGAgent extends DKGAgentBase {
     await gm.ensureContextGraph(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
 
     // Check if genesis is already loaded by looking for the network definition
-    const result = await store.query(
-      `SELECT ?v WHERE { <did:dkg:network:v9-testnet> <https://dkg.network/ontology#genesisVersion> ?v } LIMIT 1`,
+    const genesisQuads = getGenesisQuads(genesisId);
+    const networkDefinition = genesisQuads.find(
+      q => q.predicate === DKG_ONTOLOGY.DKG_GENESIS_VERSION && q.graph === '',
     );
-    if (result.type === 'bindings' && result.bindings.length > 0) return;
+    if (!networkDefinition) {
+      throw new Error(`Genesis ${genesisId ?? 'default'} is missing its network definition`);
+    }
+
+    const existingGenesis = await store.query(
+      `SELECT ?network WHERE {
+        ?network <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_NETWORK}> .
+        ?network <${DKG_ONTOLOGY.DKG_GENESIS_VERSION}> ?v .
+      }`,
+    );
+    if (existingGenesis.type === 'bindings') {
+      const existingSubjects = existingGenesis.bindings
+        .map((binding: any) => String(binding.network?.value ?? binding.network).replace(/^<|>$/g, ''));
+      const foreignSubjects = existingSubjects.filter(subject => subject !== networkDefinition.subject);
+      if (foreignSubjects.length > 0) {
+        throw new Error(
+          `Triple store contains a different genesis (${foreignSubjects.join(', ')}) than selected ` +
+          `${networkDefinition.subject}. Start with an empty DKG home or run the network reset/migration ` +
+          `before switching genesis.`,
+        );
+      }
+      if (existingSubjects.includes(networkDefinition.subject)) return;
+    }
 
     // Insert genesis quads
-    const genesisQuads = getGenesisQuads();
     const quads: Quad[] = genesisQuads.map(gq => ({
       subject: gq.subject,
       predicate: gq.predicate,

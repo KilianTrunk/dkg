@@ -522,7 +522,6 @@ export async function handleKaImportArtifactReadMarkdown(ctx: RequestContext): P
         cache: true,
       });
       if (fetched?.availability === 'verified' && fetched.remote.verifiedBytes) {
-        await fileStore.put(fetched.remote.verifiedBytes, 'text/markdown');
         if (fetched.remote.verifiedBytes.length > maxBytes) {
           return jsonResponse(res, 413, {
             error: `Markdown content exceeds maxBytes (${maxBytes})`,
@@ -530,6 +529,7 @@ export async function handleKaImportArtifactReadMarkdown(ctx: RequestContext): P
             bytes: fetched.remote.verifiedBytes.length,
           });
         }
+        await fileStore.put(fetched.remote.verifiedBytes, 'text/markdown');
         return jsonResponse(res, 200, {
           artifact,
           markdownHash: artifact.markdownHash,

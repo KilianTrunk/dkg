@@ -1185,6 +1185,54 @@ describe('import artifact daemon routes', () => {
     await expect(fileStore.get(artifactHash)).resolves.toEqual(bytes);
   });
 
+  it('does not cache oversized verified remote Markdown when read-markdown returns 413', async () => {
+    const bytes = Buffer.from('# Too Large\n');
+    const artifactHash = keccak256ContentHash(bytes);
+    const contextGraphId = 'cg-private-oversized-markdown-read';
+    const assertionName = 'imported-md';
+    const assertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:source', assertionName);
+    const fetchAndVerifyAssertionArtifact = vi.fn(async () => ({
+      response: {
+        version: 1,
+        contextGraphId,
+        assertionUri,
+        kind: 'markdown',
+        hash: artifactHash,
+        offset: 0,
+        totalBytes: bytes.length,
+        truncated: false,
+        contentType: 'text/markdown',
+        bytesB64: bytes.toString('base64'),
+      },
+      verifiedBytes: bytes,
+    }));
+    const { agent } = makeAgent({
+      contextGraphId,
+      assertionName,
+      assertionUri,
+      fileHash: artifactHash,
+      markdownHash: artifactHash,
+      markdownForm: `urn:dkg:file:${artifactHash}`,
+      allowedAgents: ['did:dkg:agent:test'],
+      fetchAndVerifyAssertionArtifact,
+    });
+    await startRoutes({ agent });
+
+    const read = await post('/api/knowledge-assets/import-artifact/read-markdown', {
+      contextGraphId,
+      assertionUri,
+      sourcePeerId: 'peer-owner',
+      maxBytes: bytes.length - 1,
+    });
+
+    expect(read.status).toBe(413);
+    expect(read.body).toMatchObject({
+      error: `Markdown content exceeds maxBytes (${bytes.length - 1})`,
+      bytes: bytes.length,
+    });
+    await expect(fileStore.get(artifactHash)).resolves.toBeNull();
+  });
+
   it('serves a remote artifact page even when the full artifact is not cache-promoted', async () => {
     const bytes = Buffer.from('remote page bytes');
     const artifactHash = sha256Hash(bytes);

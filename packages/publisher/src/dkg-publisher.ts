@@ -4671,12 +4671,16 @@ export class DKGPublisher implements Publisher {
    * lives on a DIFFERENT subject than the lifecycle URN, so the create/discard
    * clean-slates that key on the lifecycle URN don't reach it.
    *
-   * Used by the seal-in-SWM reconstruction (finalize layer="swm") to drop a
-   * STALE seal from a PRIOR lifecycle BEFORE pull-from: pull-from reads
-   * `seal.rootEntities` ahead of the member-row fallback, so a stale seal from a
-   * superseded share (e.g. full {A,C} → recreate → full {A,B}) would otherwise
-   * make it reconstruct the OLD root set. finalize(layer="swm") mints a fresh
-   * seal immediately after, so clearing here loses nothing.
+   * Callers: `assertionDiscard` (drops the seal when a non-published draft is
+   * discarded) and `assertionPullFrom` (re-opens a draft for editing, so the
+   * stale seal must go — it is rebuilt at the next finalize with the same
+   * reservedKaId via assertionCreate's A2 carry-over).
+   *
+   * NOTE (#1116 round 8+): finalize(layer="swm") does NOT pre-clear the seal.
+   * The SWM pull resolves scope from the marker-gated promoted member rows —
+   * never `seal.rootEntities` — and `assertionPullFrom` does its own seal
+   * teardown only AFTER validating a non-empty source, which keeps the operation
+   * atomic-on-failure (a failed pull no longer strands a previously-valid seal).
    */
   async clearAssertionSeal(
     contextGraphId: string,
@@ -5209,12 +5213,11 @@ export class DKGPublisher implements Publisher {
     // "already finalized with a different merkleRoot" and the edit loop was
     // permanently wedged. Pull-from re-opens the draft for editing, so the
     // stale seal MUST go (it is rebuilt — same reservedKaId, preserved by
-    // assertionCreate's A2 carry-over — at the next finalize).
-    for (const sealSubj of new Set([sealSubject, wmGraph])) {
-      for (const pred of Object.values(ASSERTION_SEAL_PREDICATES)) {
-        await this.store.deleteByPattern({ graph: metaGraph, subject: sealSubj, predicate: pred });
-      }
-    }
+    // assertionCreate's A2 carry-over — at the next finalize). Reuse the single
+    // clearAssertionSeal helper so the seal subject/predicate set has one source
+    // of truth (sealSubject == the helper's name-keyed assertion URI; wmGraph is
+    // re-resolved identically).
+    await this.clearAssertionSeal(contextGraphId, name, agentAddress, subGraphName);
     await this.assertionWrite(contextGraphId, name, agentAddress, gathered, subGraphName);
     return { seeded: gathered.length, fromLayer: sourceLayer, entities: entities.length };
   }

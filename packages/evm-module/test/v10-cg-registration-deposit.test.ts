@@ -147,6 +147,7 @@ describe('@unit OT-RFC-53 — CG registration deposit', () => {
     await fundAndApprove(creator, DEPOSIT);
     const cgId = await createOpenCG(creator);
     expect(await CGS.getRegistrationEscrow(cgId)).to.equal(DEPOSIT);
+    expect(await CGS.isContextGraphActive(cgId)).to.equal(true);
 
     // Non-owner cannot sweep.
     await expect(Facade.connect(stranger).sweepContextGraphEscrow(cgId)).to.be.reverted;
@@ -163,6 +164,9 @@ describe('@unit OT-RFC-53 — CG registration deposit', () => {
       'ContextGraphEscrowSwept',
     );
     expect(await CGS.getRegistrationEscrow(cgId)).to.equal(0n);
+    // Sweep retires the CG (atomic deactivate + sweep); a regression that stopped
+    // deactivating an active CG would otherwise still pass this test.
+    expect(await CGS.isContextGraphActive(cgId)).to.equal(false);
     // The swept escrow actually landed in the reward pool.
     expect(await Epoch.getEpochPool(1n, epoch)).to.equal(poolBefore + DEPOSIT);
 

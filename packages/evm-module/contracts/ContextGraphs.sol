@@ -208,10 +208,13 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable, Re
 
     /// @dev Pulls the full `deposit` TRAC (GROSS) from the creator into the CSS
     ///      vault and records it as the CG's escrow. No treasury fee is skimmed
-    ///      here: escrow-funded publishing routes the full amount to the staker
-    ///      pool, and only the wallet-funded remainder pays the treasury fee (via
-    ///      KnowledgeAssetsLifecycle._addTokens). The escrow is later spent on
-    ///      publishing or swept by admin — never cash-refunded.
+    ///      HERE (at deposit) — the deposit is escrowed gross. The protocol
+    ///      treasury fee is instead taken per-publish at CONSUME, on the escrow
+    ///      actually spent (`KnowledgeAssetsLifecycle._chargeEscrowTreasuryFee`),
+    ///      at parity with the wallet path's `_addTokens` — so escrow-funded
+    ///      publishing is not a fee loophole, and an unspent or admin-swept
+    ///      deposit owes no fee. The escrow is later spent on publishing or swept
+    ///      by admin — never cash-refunded.
     function _pullRegistrationDeposit(uint256 contextGraphId, uint96 deposit) internal {
         IERC20 token = tokenContract;
         uint256 allowance = token.allowance(msg.sender, address(this));
@@ -221,14 +224,13 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable, Re
         if (token.balanceOf(msg.sender) < deposit) {
             revert TokenLib.TooLowBalance(address(token), token.balanceOf(msg.sender), deposit);
         }
-        // The deposit is escrowed GROSS in the CSS vault and tracked gross, so
-        // the consume path subtracts it directly from the gross publish cost
-        // (no net-vs-gross mismatch). The protocol treasury fee is intentionally
-        // NOT skimmed here: escrow-funded publishing routes the full amount to
-        // the staker pool, and only the wallet-funded remainder pays the fee via
-        // `KnowledgeAssetsLifecycle._addTokens`. (A treasury cut on escrow, if
-        // ever wanted, would be skimmed at consume/sweep — out of scope while
-        // the treasury fee is dormant.)
+        // The deposit is escrowed GROSS in the CSS vault and tracked gross, so the
+        // consume path subtracts it directly from the gross publish cost (no
+        // net-vs-gross mismatch). The protocol treasury fee is NOT skimmed at
+        // deposit; it is taken at CONSUME on the escrow actually spent, via
+        // `KnowledgeAssetsLifecycle._chargeEscrowTreasuryFee` (parity with the
+        // wallet path's `_addTokens`). Charging at consume — not deposit — keeps
+        // the fee on real publishing: an unspent or admin-swept deposit owes none.
         if (!token.transferFrom(msg.sender, address(convictionStakingStorage), deposit)) {
             revert TokenLib.TransferFailed();
         }

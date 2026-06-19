@@ -10,6 +10,7 @@
  */
 
 import { EVMChainAdapterBase, CG_REGISTRY_MAX_SCAN_PAGES, CG_REGISTRY_REORG_BUFFER_BLOCKS } from './evm-adapter-base.js';
+import { isTooLowAllowanceError } from './evm-adapter-errors.js';
 import { ethers, Contract, type JsonRpcProvider } from 'ethers';
 import { ContextGraphChainScanPartialError, type CreateContextGraphParams, type TxResult, type ContextGraphOnChain, type ContextGraphChainScanOptions, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type VerifyParams, type PublishToContextGraphParams, type OnChainPublishResult } from './chain-adapter.js';
 import { buildAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1 } from '@origintrail-official/dkg-core';
@@ -283,6 +284,14 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
       try {
         return await submitCreate();
       } catch (err) {
+        // Only the deposit-allowance revert is recoverable here. Mirror the
+        // publish/update allowance recovery (`isTooLowAllowanceError`): an
+        // unrelated first-attempt revert (invalid access/publish policy, PCA
+        // coherence failure, paused contract, insufficient balance, RPC error)
+        // must NOT trigger a state-changing TRAC approval before re-failing.
+        if (!isTooLowAllowanceError(err)) {
+          throw err;
+        }
         const ps = this.contracts.parametersStorage as Contract | undefined;
         let deposit = 0n;
         try {

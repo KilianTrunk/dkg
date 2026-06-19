@@ -149,7 +149,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     //          publish / update / extend (escrow-funded portion distributed from
     //          the CSS vault gross-for-gross; wallet/PCA covers the remainder).
     //          PATCH bump — no ACK / EIP-712 domain change.
-    string private constant _VERSION = "10.1.3";
+    string private constant _VERSION = "10.1.4";
 
     /// @notice OT-RFC-49 / WS-B Trap 3: domain-separation version prepended to the
     ///         RAW publish/update ACK preimage (`abi.encodePacked`, later wrapped by
@@ -542,7 +542,9 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         // so distribute it directly; charge only the remainder below.
         uint96 fromEscrow = _useCgEscrow(p.contextGraphId, p.tokenAmount);
         if (fromEscrow > 0) {
-            _distributeTokens(fromEscrow, p.epochs, currentEpoch);
+            // Route the treasury fee on the escrow-funded portion out of the vault,
+            // distribute only the net to stakers (parity with the wallet path).
+            _distributeTokens(_chargeEscrowTreasuryFee(fromEscrow), p.epochs, currentEpoch);
         }
         uint96 walletCost = p.tokenAmount - fromEscrow;
         if (walletCost == 0) {
@@ -910,7 +912,8 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         // publisher's full committed value.
         uint96 fromEscrow = _useCgEscrow(cgId, tokenAmount);
         if (fromEscrow > 0) {
-            epochStorage.addTokensToEpochRange(1, endEpoch, endEpoch + epochs, fromEscrow);
+            // Treasury fee on the escrow portion → treasury; net → extension window.
+            epochStorage.addTokensToEpochRange(1, endEpoch, endEpoch + epochs, _chargeEscrowTreasuryFee(fromEscrow));
         }
         uint96 walletCost = tokenAmount - fromEscrow;
         if (walletCost > 0) {
@@ -1277,6 +1280,22 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         }
     }
 
+    /// @dev OT-RFC-53: applies the protocol treasury fee to an escrow-funded spend.
+    ///      The registration deposit is escrowed GROSS in the CSS vault, so when
+    ///      escrow funds a publish/update/extend the treasury fee owed on the
+    ///      consumed portion is routed out of the vault to the treasury here —
+    ///      mirroring `_addTokens` for the wallet path, so escrow-funded publishing
+    ///      is NOT a treasury-fee loophole. Returns the net (escrow − fee) for the
+    ///      caller to distribute to the staker pool. No-op (returns `fromEscrow`)
+    ///      while the treasury is unset or the fee is 0 (`_treasuryFee` returns 0).
+    function _chargeEscrowTreasuryFee(uint96 fromEscrow) internal returns (uint96 net) {
+        (uint96 fee, address treasury) = _treasuryFee(fromEscrow);
+        net = fromEscrow - fee;
+        if (fee > 0 && treasury != address(0)) {
+            convictionStakingStorage.transferRegistrationDepositFee(treasury, fee);
+        }
+    }
+
     // ========================================================================
     // V10 Update Entries
     // ========================================================================
@@ -1328,7 +1347,8 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         // distribute it directly; charge only the remainder below.
         uint96 fromEscrow = _useCgEscrow(contextGraphStorage.kaToContextGraph(p.id), deltaTokenAmount);
         if (fromEscrow > 0) {
-            _distributeTokens(fromEscrow, uint256(remainingEpochs), currentEpoch);
+            // Treasury fee on the escrow portion → treasury; net → staker pool.
+            _distributeTokens(_chargeEscrowTreasuryFee(fromEscrow), uint256(remainingEpochs), currentEpoch);
         }
         uint96 walletDelta = deltaTokenAmount - fromEscrow;
         if (walletDelta == 0) return;

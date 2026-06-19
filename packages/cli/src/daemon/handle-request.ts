@@ -404,7 +404,7 @@ export async function handleRequest(
     apiHost,
     apiPortRef,
     routePlugins,
-    inFlightLimiter,
+    admission: inFlightLimiter,
     url,
     path,
     requestToken,

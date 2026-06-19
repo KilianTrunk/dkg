@@ -518,7 +518,7 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
     validTokens,
     apiHost,
     apiPortRef,
-    inFlightLimiter,
+    admission,
     url,
     path,
     requestToken,
@@ -700,9 +700,9 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
       // monotonic count of 503-shed requests since boot. Surfaced so operators
       // can see whether the daemon is shedding load (and read the effective cap).
       admission: {
-        inFlight: inFlightLimiter.inFlight,
-        max: inFlightLimiter.max,
-        rejectedTotal: inFlightLimiter.rejectedTotal,
+        inFlight: admission.inFlight,
+        max: admission.max,
+        rejectedTotal: admission.rejectedTotal,
       },
       connectedPeers: uniquePeers.size,
       connections: {

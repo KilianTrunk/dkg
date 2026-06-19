@@ -95,20 +95,35 @@ describe('daemon admission control (real node, maxInFlightRequests=1)', () => {
     expect(burstStatuses.every((s) => s === 200 || s === 503)).toBe(true); // no unexpected failures
   }, 60_000);
 
-  it('surfaces admission stats on /api/status (effective cap + cumulative sheds)', async () => {
+  it('surfaces admission stats on /api/status (effective cap + per-burst shed delta)', async () => {
     const d = daemon!;
-    // Force some shedding so rejectedTotal is provably non-zero regardless of
-    // test order, then read the stats off the exempt status endpoint.
-    await Promise.all(
+    // Read the surfaced admission block off the exempt status endpoint.
+    const readAdmission = async (): Promise<{ inFlight: number; max: number; rejectedTotal: number }> => {
+      const res = await fetch(`${d.base}/api/status`, { headers: authHeaders(d) });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        admission?: { inFlight: number; max: number; rejectedTotal: number };
+      };
+      expect(body.admission).toBeDefined();
+      return body.admission!;
+    };
+
+    // Snapshot BEFORE this burst — earlier tests in this file already shed, so a
+    // bare `rejectedTotal > 0` would pass without proving THIS burst moved the
+    // counter (i.e. that the surfaced value still tracks live shedding).
+    const before = await readAdmission();
+    expect(before.max).toBe(1); // the pinned effective cap is surfaced
+    expect(typeof before.inFlight).toBe('number');
+
+    // Saturate the non-exempt path so this burst provably sheds.
+    const burst = await Promise.all(
       Array.from({ length: 50 }, () => selectQuery(d).then((r) => r.status).catch(() => 0)),
     );
-    const res = await fetch(`${d.base}/api/status`, { headers: authHeaders(d) });
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { admission?: { inFlight: number; max: number; rejectedTotal: number } };
+    expect(burst.filter((s) => s === 503).length).toBeGreaterThan(0); // this burst really shed
 
-    expect(body.admission).toBeDefined();
-    expect(body.admission!.max).toBe(1); // the pinned effective cap is surfaced
-    expect(typeof body.admission!.inFlight).toBe('number');
-    expect(body.admission!.rejectedTotal).toBeGreaterThan(0); // cumulative sheds are observable
+    // /api/status is admission-exempt, so reading it doesn't perturb the counter:
+    // `after` MUST exceed `before` by the sheds we just caused.
+    const after = await readAdmission();
+    expect(after.rejectedTotal).toBeGreaterThan(before.rejectedTotal);
   }, 60_000);
 });

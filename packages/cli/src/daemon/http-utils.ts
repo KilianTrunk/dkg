@@ -1246,6 +1246,21 @@ export class HttpRateLimiter {
 }
 
 /**
+ * Read-only view of {@link InFlightLimiter}'s admission-control counters. This
+ * is what `/api/status` (and the plugin-facing `RequestContext`) consume, so
+ * route/plugin code can read inFlight/max/rejectedTotal without gaining access
+ * to the mutating `tryAcquire()`/`release()` and corrupting slot accounting.
+ */
+export interface AdmissionStatsView {
+  /** Requests currently holding a slot. */
+  readonly inFlight: number;
+  /** Effective concurrency cap; 0 disables the limiter (always admits). */
+  readonly max: number;
+  /** Monotonic count of requests shed (503) since boot. */
+  readonly rejectedTotal: number;
+}
+
+/**
  * Bounds the number of HTTP requests being processed concurrently by the
  * daemon, independent of client IP. This is admission control, not rate
  * limiting: the single-process daemon funnels every request onto one event
@@ -1257,7 +1272,7 @@ export class HttpRateLimiter {
  *
  * `tryAcquire()` must be paired with exactly one `release()` in a `finally`.
  */
-export class InFlightLimiter {
+export class InFlightLimiter implements AdmissionStatsView {
   private _inFlight = 0;
   private _rejectedTotal = 0;
   private readonly _max: number;

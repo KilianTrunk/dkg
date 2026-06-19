@@ -742,7 +742,7 @@ export async function validateStartupGenesis(
       networkId,
       messages: [
         `FATAL: genesis mismatch! Expected networkId ${network.networkId.slice(0, 16)}... but computed ${networkId.slice(0, 16)}...`,
-        `This node's genesis does not match network/testnet.json. Rebuild or update the repo.`,
+        `This node's genesis does not match ${network.networkName}. Rebuild or update the selected network config.`,
       ],
     };
   }

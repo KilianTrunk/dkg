@@ -125,6 +125,7 @@ import {
   slotEntryPoint,
   CLI_NPM_PACKAGE,
   exitOnStoreConfigErrors,
+  validateNetworkConfigReadiness,
 } from '../config.js';
 import { createPublicSnapshotStore, createPublisherControlFromStore, startPublisherRuntimeIfEnabled, type PublisherRuntime } from '../publisher-runner.js';
 import { createCatchupRunner, type CatchupJobResult, type CatchupRunner } from '../catchup-runner.js';
@@ -736,20 +737,8 @@ export async function validateStartupGenesis(
   network: Pick<NetworkConfig, '_status' | 'genesisId' | 'networkId' | 'networkName' | 'relays'> | null | undefined,
 ): Promise<StartupGenesisValidation> {
   const networkId = await computeNetworkId(network?.genesisId);
-  const networkName = network?.networkName ?? 'selected network';
-  const messages: string[] = [];
-  if (network?._status?.toLowerCase().startsWith('pre-deployment')) {
-    messages.push(
-      `FATAL: network config ${networkName} is marked ${network._status}.`,
-    );
-  }
-  const placeholderRelays = network?.relays?.filter(relay => relay.includes('/p2p/PEER_ID_')) ?? [];
-  if (placeholderRelays.length > 0) {
-    messages.push(
-      `FATAL: network config ${networkName} contains placeholder relay peer IDs: ${placeholderRelays.join(', ')}`,
-    );
-    messages.push('Replace pre-deployment relay PeerIDs before selecting this network.');
-  }
+  const readiness = validateNetworkConfigReadiness(network);
+  const messages = readiness.ok ? [] : [...readiness.messages];
   if (network?.networkId && network.networkId !== networkId) {
     messages.push(
       `FATAL: genesis mismatch! Expected networkId ${network.networkId.slice(0, 16)}... but computed ${networkId.slice(0, 16)}...`,

@@ -569,6 +569,15 @@ describe('resolveChainConfig (field-level merge)', () => {
     });
   });
 
+  it('refuses to resolve chain defaults from a pre-deployment network', () => {
+    expect(() => resolveChainConfig({}, {
+      _status: 'pre-deployment: replace PEER_ID_* relay values before enabling Base mainnet',
+      networkName: 'DKG V10 Base Mainnet',
+      relays: ['/ip4/178.105.87.39/tcp/9090/p2p/PEER_ID_SOLARIS'],
+      chain: fullNetworkChain,
+    })).toThrow(/pre-deployment/);
+  });
+
   it('overrides only the fields the operator set, inheriting the rest from network', () => {
     // Operator wants their private RPC but should inherit hub + chainId.
     const merged = resolveChainConfig(

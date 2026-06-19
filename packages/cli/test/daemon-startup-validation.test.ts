@@ -9,11 +9,15 @@ const mocks = vi.hoisted(() => ({
   loadNetworkConfig: vi.fn(),
 }));
 
-vi.mock('@origintrail-official/dkg-agent', () => ({
-  DKGAgent: { create: mocks.agentCreate },
-  loadOpWallets: vi.fn(),
-  KaNumberAllocator: class KaNumberAllocator {},
-}));
+vi.mock('@origintrail-official/dkg-agent', async importOriginal => {
+  const actual = await importOriginal<typeof import('@origintrail-official/dkg-agent')>();
+  return {
+    ...actual,
+    DKGAgent: { create: mocks.agentCreate },
+    loadOpWallets: vi.fn(),
+    KaNumberAllocator: class KaNumberAllocator {},
+  };
+});
 
 vi.mock('../src/config.js', async importOriginal => {
   const actual = await importOriginal<typeof import('../src/config.js')>();
@@ -28,13 +32,23 @@ const { runDaemonInner } = await import('../src/daemon/lifecycle.js');
 describe('daemon startup network validation', () => {
   let tempHome: string | undefined;
   let originalDkgHome: string | undefined;
-  let stdoutWrite: typeof process.stdout.write;
-  let stderrWrite: typeof process.stderr.write;
+  let stdoutWrite: typeof process.stdout.write = process.stdout.write;
+  let stderrWrite: typeof process.stderr.write = process.stderr.write;
+  let uncaughtExceptionListeners: NodeJS.UncaughtExceptionListener[] = [];
+  let unhandledRejectionListeners: NodeJS.UnhandledRejectionListener[] = [];
 
   afterEach(async () => {
     vi.restoreAllMocks();
     process.stdout.write = stdoutWrite;
     process.stderr.write = stderrWrite;
+    process.removeAllListeners('uncaughtException');
+    for (const listener of uncaughtExceptionListeners) {
+      process.on('uncaughtException', listener);
+    }
+    process.removeAllListeners('unhandledRejection');
+    for (const listener of unhandledRejectionListeners) {
+      process.on('unhandledRejection', listener);
+    }
     if (originalDkgHome === undefined) {
       delete process.env.DKG_HOME;
     } else {
@@ -50,6 +64,8 @@ describe('daemon startup network validation', () => {
     process.env.DKG_HOME = tempHome;
     stdoutWrite = process.stdout.write;
     stderrWrite = process.stderr.write;
+    uncaughtExceptionListeners = process.listeners('uncaughtException') as NodeJS.UncaughtExceptionListener[];
+    unhandledRejectionListeners = process.listeners('unhandledRejection') as NodeJS.UnhandledRejectionListener[];
 
     const networkId = await computeNetworkId('base-mainnet');
     mocks.loadNetworkConfig.mockResolvedValue({

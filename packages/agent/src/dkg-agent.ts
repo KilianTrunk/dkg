@@ -388,7 +388,7 @@ import { QueryMethods } from './dkg-agent-query.js';
 import { AgentRegistryMethods } from './dkg-agent-registry.js';
 import { WorkspaceCryptoMethods } from './dkg-agent-crypto.js';
 import { LifecycleSyncMethods } from './dkg-agent-lifecycle.js';
-import { PublishMethods } from './dkg-agent-publish.js';
+import { PublishMethods, SEAL_CAPABILITY_GAP_CODE } from './dkg-agent-publish.js';
 import { SwmHostModeMethods } from './dkg-agent-swm-host.js';
 import { ContextGraphMethods } from './dkg-agent-context-graph.js';
 import { ImportedArtifactMethods } from './imported-artifact.js';
@@ -1916,21 +1916,32 @@ export class DKGAgent extends DKGAgentBase {
             sealed = true;
           } catch (err: any) {
             const msg = err?.message ?? String(err);
-            // Seal-integrity failures — the assertion was edited after finalize
-            // (stale seal) or the seal is corrupt — MUST fail fast: promoting
-            // unsealed would empty WM and leave only a later, confusing publish
-            // error. Re-throw so the caller re-finalizes (or discards) first.
-            if (/already finalized with a different merkleRoot|seal for .* is corrupt/i.test(msg)) {
+            // #1116 (round 11, reviewer 🟡) — CLASSIFY the finalize failure. Only a
+            // genuine signing/chain CAPABILITY GAP is recoverable by skipSeal — a
+            // VALIDATION/INTEGRITY error (empty draft, reserved-only/unsafe content,
+            // preSigned mismatch, author change, stale/corrupt seal) is a real input
+            // problem: telling the caller to skipSeal would push invalid content into
+            // SWM. So translate ONLY capability gaps to UNSEALED_SHARE_BLOCKED and
+            // RETHROW everything else with its ORIGINAL message/code.
+            //
+            // Capability gaps carry the stable SEAL_CAPABILITY_GAP code (tagged at the
+            // assertionFinalize throw sites). The message regex is a back-compat
+            // fallback ONLY for the same known capability messages, in case an error
+            // was re-wrapped and lost its code — it must NOT broaden the net to
+            // validation errors.
+            const isCapabilityGap =
+              err?.code === SEAL_CAPABILITY_GAP_CODE ||
+              /requires a V10-capable chain adapter|has no private key on file|no publisher signer is available|failed to reconcile KA-number floor|no\s+kaNumberAllocator is configured/i.test(msg);
+            if (!isCapabilityGap) {
+              // Validation/integrity (incl. the stale-seal / corrupt-seal cases that
+              // were previously special-cased) — fail fast with the real error. WM is
+              // preserved because we throw BEFORE assertionPromote.
               throw err;
             }
-            // #1116 D1 — FAIL-CLOSED. The seal is now context-graph-independent,
-            // so an unregistered CG no longer fails finalize: the only failures
-            // left here are genuine capability gaps (no local signing key /
-            // non-V10 chain adapter / the KA-number reconcile read failed). Do
-            // NOT silently promote unsealed and empty WM (the original #1116
-            // trap). Throw BEFORE assertionPromote so WM is preserved; the
-            // caller resolves the gap or passes skipSeal:true to deliberately
-            // share unsealed.
+            // #1116 D1 — FAIL-CLOSED on a capability gap. Do NOT silently promote
+            // unsealed and empty WM (the original #1116 trap). Throw BEFORE
+            // assertionPromote so WM is preserved; the caller resolves the gap or
+            // passes skipSeal:true to deliberately share unsealed.
             throw Object.assign(
               new Error(
                 `Cannot seal "${name}" for sharing to Shared Memory — the asset would be left ` +
@@ -1945,19 +1956,23 @@ export class DKGAgent extends DKGAgentBase {
               },
             );
           }
-        } else {
-          // #1116 (round 9, reviewer 🔴 #1) — a NON-SEALING share (a `skipSeal`
-          // full share OR any subset share — the inverse of the finalize block
-          // above) must leave NO full-share seal. Otherwise a prior FULL seal
-          // survives (it lives on the name-keyed assertion URI, outside the
-          // lifecycle-URN clean-slates) and could be published via the
-          // merkle-still-matches path under the KA name, even though the current
-          // share is a subset / explicitly-unsealed. No-op when there was no seal.
-          // The subsequent finalize(layer:"swm") re-stamps a fresh seal, so a
-          // legit skipSeal→seal-in-SWM flow is unaffected (skipSeal is the agent's
-          // concern, so this seal-clear stays in the wrapper, not assertionPromote).
-          await agent.publisher.clearAssertionSeal(contextGraphId, name, agentAddress, opts?.subGraphName);
         }
+        // #1116 (round 9 → round 11, reviewer 🔴 #1) — a NON-SEALING share (a
+        // `skipSeal` full share OR any subset share — the inverse of the finalize
+        // block above) must leave NO full-share seal. Otherwise a prior FULL seal
+        // survives (it lives on the name-keyed assertion URI, outside the
+        // lifecycle-URN clean-slates) and could be published via the
+        // merkle-still-matches path under the KA name, even though the current share
+        // is a subset / explicitly-unsealed. The subsequent finalize(layer:"swm")
+        // re-stamps a fresh seal, so a legit skipSeal→seal-in-SWM flow is unaffected.
+        //
+        // Round 11: the seal-clear is now TRANSACTIONAL with the share — it runs
+        // AFTER assertionPromote SUCCEEDS (below), not before. If assertionPromote
+        // throws (gossip-signer resolution, curator confirmation, payload-size
+        // validation, …) the prior seal survives: the old content is still in SWM,
+        // so the old seal is still valid — a FAILED non-sealing share no longer
+        // strands a previously-publishable asset with no seal.
+        const isNonSealingShare = !(promotingAllEntities && !opts?.skipSeal);
         // Resolve the gossip signer up-front (mirrors `share()` /
         // `conditionalShare()` patterns) so the publisher can wrap the
         // promoted SWM gossip in the Sender Key encrypted envelope.
@@ -1985,6 +2000,15 @@ export class DKGAgent extends DKGAgentBase {
             confirmBeforeCommit,
           },
         );
+        // #1116 (round 11, reviewer 🔴 #1) — clear the prior full-share seal NOW
+        // that assertionPromote has COMMITTED the (non-sealing) share to SWM. Doing
+        // it here (not before the promote) keeps the seal-clear transactional with
+        // the share: a promote that threw (curator-unconfirmed, payload-too-large,
+        // …) left the prior SWM content + seal intact, so the asset stays publishable
+        // under the old seal until a share actually succeeds.
+        if (isNonSealingShare) {
+          await agent.publisher.clearAssertionSeal(contextGraphId, name, agentAddress, opts?.subGraphName);
+        }
         if (gossipMessage) {
           try {
             await agent.publishWorkspaceGossip(contextGraphId, gossipMessage, createOperationContext('share'), gossipSigner);

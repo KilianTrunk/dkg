@@ -393,6 +393,19 @@ import {
 import { DKGAgentBase } from './dkg-agent-base.js';
 import type { DKGAgent } from './dkg-agent.js';
 
+/**
+ * #1116 (round 11) — stable code tagged on the `assertionFinalize` throws that are
+ * recoverable SIGNING/CHAIN CAPABILITY GAPS (no local signing key, non-V10 chain
+ * adapter, KA-number reconcile read failure, no KaNumberAllocator) as opposed to
+ * VALIDATION/INTEGRITY errors (empty draft, reserved-only/unsafe content, preSigned
+ * mismatch, author-change, stale/corrupt seal). The seal-by-default `promote()`
+ * classifies on this code: a capability gap is wrapped as UNSEALED_SHARE_BLOCKED
+ * (with a "retry, or skipSeal:true" recovery hint); a validation error is rethrown
+ * with its original message so the caller sees the real input problem and bad
+ * content is NEVER pushed into SWM via skipSeal.
+ */
+export const SEAL_CAPABILITY_GAP_CODE = 'SEAL_CAPABILITY_GAP';
+
 export class PublishMethods extends DKGAgentBase {
   async publishWorkspaceGossip(this: DKGAgent,
     contextGraphId: string,
@@ -2142,9 +2155,16 @@ export class PublishMethods extends DKGAgentBase {
       typeof this.chain.getEvmChainId !== 'function' ||
       typeof this.chain.getKnowledgeAssetsLifecycleAddress !== 'function'
     ) {
-      throw new Error(
-        'assertionFinalize requires a V10-capable chain adapter that exposes ' +
-          'getEvmChainId() and getKnowledgeAssetsLifecycleAddress(); the current adapter does not.',
+      // #1116 (round 11) — CAPABILITY GAP (non-V10 chain adapter). Tagged with a
+      // stable code so the seal-by-default promote() can distinguish a recoverable
+      // capability gap (→ UNSEALED_SHARE_BLOCKED + skipSeal hint) from a validation
+      // error (which must propagate). See SEAL_CAPABILITY_GAP_CODE.
+      throw Object.assign(
+        new Error(
+          'assertionFinalize requires a V10-capable chain adapter that exposes ' +
+            'getEvmChainId() and getKnowledgeAssetsLifecycleAddress(); the current adapter does not.',
+        ),
+        { code: SEAL_CAPABILITY_GAP_CODE },
       );
     }
     const chainId = await this.chain.getEvmChainId();
@@ -2179,8 +2199,12 @@ export class PublishMethods extends DKGAgentBase {
       }
       signerPrivateKey = this.getCustodialAgentPrivateKey(opts.authorAgentAddress);
       if (!signerPrivateKey) {
-        throw new Error(
-          `assertionFinalize: custodial agent ${opts.authorAgentAddress} has no private key on file`,
+        // #1116 (round 11) — CAPABILITY GAP (no local signing key for this agent).
+        throw Object.assign(
+          new Error(
+            `assertionFinalize: custodial agent ${opts.authorAgentAddress} has no private key on file`,
+          ),
+          { code: SEAL_CAPABILITY_GAP_CODE },
         );
       }
       authorAddress = opts.authorAgentAddress;
@@ -2190,9 +2214,13 @@ export class PublishMethods extends DKGAgentBase {
       // signs on its own behalf when no agent attribution is supplied.
       const fallbackAddress = await this.publisher.publisherFallbackAuthorAddress();
       if (!fallbackAddress) {
-        throw new Error(
-          'assertionFinalize: no agent override supplied and no publisher signer is available. ' +
-            'Either supply authorAgentAddress / preSignedAuthorAttestation, or configure a publisher private key on the daemon.',
+        // #1116 (round 11) — CAPABILITY GAP (no publisher signer configured).
+        throw Object.assign(
+          new Error(
+            'assertionFinalize: no agent override supplied and no publisher signer is available. ' +
+              'Either supply authorAgentAddress / preSignedAuthorAttestation, or configure a publisher private key on the daemon.',
+          ),
+          { code: SEAL_CAPABILITY_GAP_CODE },
         );
       }
       authorAddress = fallbackAddress;
@@ -2306,9 +2334,14 @@ export class PublishMethods extends DKGAgentBase {
           try {
             chainMax = await this.chain.getMaxKaNumberForAuthor(authorAddress);
           } catch (err) {
-            throw new Error(
-              `OT-RFC-43 A2: failed to reconcile KA-number floor for author ${authorAddress} at finalize: ` +
-                (err instanceof Error ? err.message : String(err)),
+            // #1116 (round 11) — CAPABILITY GAP (the chain read to reconcile the
+            // KA-number floor failed — a transient/RPC capability problem, not bad input).
+            throw Object.assign(
+              new Error(
+                `OT-RFC-43 A2: failed to reconcile KA-number floor for author ${authorAddress} at finalize: ` +
+                  (err instanceof Error ? err.message : String(err)),
+              ),
+              { code: SEAL_CAPABILITY_GAP_CODE },
             );
           }
         }
@@ -2329,14 +2362,20 @@ export class PublishMethods extends DKGAgentBase {
       // on-chain mint rejects it with KaIdNamespaceMismatch — the seal would be
       // signed and persisted but permanently unpublishable. Fail fast rather than
       // bind an unusable placeholder into the AuthorAttestation digest.
-      throw new Error(
-        `assertionFinalize: cannot reserve a kaId for author ${authorAddress} — ` +
-          `no preSignedAuthorAttestation (which would carry its own slot) and no ` +
-          `kaNumberAllocator is configured on this daemon (OT-RFC-43 §F2). The packed ` +
-          `kaId must be (uint160(author) << 96) | number; a 0n placeholder is rejected ` +
-          `on-chain (KaIdNamespaceMismatch), leaving the seal unpublishable. Configure a ` +
-          `KaNumberAllocator on the agent (daemon lifecycle) or supply a ` +
-          `preSignedAuthorAttestation whose reservedKaId lives in the author's namespace.`,
+      // #1116 (round 11) — CAPABILITY GAP (no kaNumberAllocator configured on this
+      // daemon — a node-config capability gap, resolvable by configuring one or
+      // supplying a preSigned slot; not a bad-input/validation error).
+      throw Object.assign(
+        new Error(
+          `assertionFinalize: cannot reserve a kaId for author ${authorAddress} — ` +
+            `no preSignedAuthorAttestation (which would carry its own slot) and no ` +
+            `kaNumberAllocator is configured on this daemon (OT-RFC-43 §F2). The packed ` +
+            `kaId must be (uint160(author) << 96) | number; a 0n placeholder is rejected ` +
+            `on-chain (KaIdNamespaceMismatch), leaving the seal unpublishable. Configure a ` +
+            `KaNumberAllocator on the agent (daemon lifecycle) or supply a ` +
+            `preSignedAuthorAttestation whose reservedKaId lives in the author's namespace.`,
+        ),
+        { code: SEAL_CAPABILITY_GAP_CODE },
       );
     }
 

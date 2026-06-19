@@ -12,6 +12,7 @@
 import { describe, it, expect, afterEach, beforeAll, afterAll, vi } from 'vitest';
 import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { DKGAgent } from '../src/index.js';
+import { SEAL_CAPABILITY_GAP_CODE } from '../src/dkg-agent-publish.js';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 import { ethers } from 'ethers';
@@ -1115,12 +1116,16 @@ describe('#1116 seal decoupled from CG — full vs skipSeal share, seal-in-SWM',
       { subject: `${ENTITY_BASE}:cg`, predicate: 'http://schema.org/name', object: '"Capability Gap"' },
     ]);
 
-    // Inject a residual capability-gap failure into the seal step. The message
-    // must NOT match the stale-seal / corrupt-seal regex (those re-throw as-is),
-    // so promote wraps it as UNSEALED_SHARE_BLOCKED and fails BEFORE promoting.
+    // Inject a CAPABILITY-GAP finalize failure (round 11: tagged with the stable
+    // SEAL_CAPABILITY_GAP_CODE, exactly as assertionFinalize tags a no-signing-key /
+    // non-V10-adapter / KA-number gap). promote() classifies it as recoverable and
+    // wraps it as UNSEALED_SHARE_BLOCKED, failing BEFORE promoting.
     const spy = vi
       .spyOn(agent, 'assertionFinalize')
-      .mockRejectedValue(new Error('no local signing key available for this agent'));
+      .mockRejectedValue(Object.assign(
+        new Error('assertionFinalize: custodial agent 0x.. has no private key on file'),
+        { code: SEAL_CAPABILITY_GAP_CODE },
+      ));
     try {
       let thrown: any;
       try {
@@ -1145,6 +1150,122 @@ describe('#1116 seal decoupled from CG — full vs skipSeal share, seal-in-SWM',
       { contextGraphId: CG_ID, graphSuffix: '_shared_memory' },
     );
     expect(swmAfter.bindings.length).toBe(0);
+  }, 30_000);
+
+  // round 11 (reviewer 🟡 #2): a VALIDATION/integrity finalize error (NOT a
+  // capability gap) must PROPAGATE with its ORIGINAL code — NOT be re-wrapped as
+  // UNSEALED_SHARE_BLOCKED (whose recovery hint says "skipSeal:true", which would
+  // push the invalid content into SWM). And it must NOT be promoted.
+  it('round 11: a VALIDATION finalize error propagates (original error, NOT UNSEALED_SHARE_BLOCKED, NOT promoted)', async () => {
+    const agent = await createAgent('ValidationNotUnsealedBot');
+    await agent.createContextGraph({ id: CG_ID, name: 'Validation E2E' });
+    await agent.registerContextGraph(CG_ID);
+
+    const name = 'validation-err';
+    await agent.assertion.create(CG_ID, name);
+    await agent.assertion.write(CG_ID, name, [
+      { subject: `${ENTITY_BASE}:val`, predicate: 'http://schema.org/name', object: '"Valid"' },
+    ]);
+
+    // A validation error has NO SEAL_CAPABILITY_GAP code and does NOT match the
+    // capability message regex — promote() must rethrow it untouched.
+    const spy = vi
+      .spyOn(agent, 'assertionFinalize')
+      .mockRejectedValue(Object.assign(
+        new Error('Cannot finalize assertion <...>: it has no quads. Write at least one quad before finalizing.'),
+        { code: 'SOME_VALIDATION_CODE' },
+      ));
+    try {
+      let thrown: any;
+      try {
+        await agent.assertion.promote(CG_ID, name);
+      } catch (e) {
+        thrown = e;
+      }
+      expect(thrown).toBeTruthy();
+      // The ORIGINAL error surfaces — not the UNSEALED_SHARE_BLOCKED wrapper.
+      expect(thrown.code).toBe('SOME_VALIDATION_CODE');
+      expect(thrown.code).not.toBe('UNSEALED_SHARE_BLOCKED');
+      expect(String(thrown.message)).toMatch(/it has no quads/);
+    } finally {
+      spy.mockRestore();
+    }
+
+    // WM preserved; nothing promoted to SWM.
+    expect((await agent.assertion.query(CG_ID, name)).length).toBeGreaterThan(0);
+    const swmAfter = await agent.query(
+      `SELECT ?name WHERE { <${ENTITY_BASE}:val> <http://schema.org/name> ?name }`,
+      { contextGraphId: CG_ID, graphSuffix: '_shared_memory' },
+    );
+    expect(swmAfter.bindings.length).toBe(0);
+  }, 30_000);
+
+  // round 11 (reviewer 🔴 #1): the non-sealing seal-clear is TRANSACTIONAL — it
+  // runs only AFTER assertionPromote COMMITS. A non-sealing share whose promote
+  // THROWS must NOT clear a prior full-share seal (the old SWM content + seal stay
+  // valid, so the asset stays publishable until a share actually succeeds).
+  it('round 11: a non-sealing share whose PROMOTE FAILS does NOT clear the prior seal', async () => {
+    const agent = await createAgent('TxnSealClearFailBot');
+    await agent.createContextGraph({ id: CG_ID, name: 'Txn Seal Clear Fail E2E' });
+    await agent.registerContextGraph(CG_ID);
+
+    const name = 'txn-fail';
+    const A = `${ENTITY_BASE}:a`, B = `${ENTITY_BASE}:b`;
+    await agent.assertion.create(CG_ID, name);
+    await agent.assertion.write(CG_ID, name, [
+      { subject: A, predicate: 'http://schema.org/name', object: '"A"' },
+      { subject: B, predicate: 'http://schema.org/name', object: '"B"' },
+    ]);
+    // FULL share → seal present.
+    await agent.assertion.promote(CG_ID, name);
+    expect(await sealExists(agent, CG_ID, name)).toBe(true);
+
+    // Re-open (no discard) + write, then a SUBSET (non-sealing) share whose
+    // assertionPromote THROWS (simulate a curator-unconfirmed / payload failure).
+    await agent.assertion.create(CG_ID, name);
+    await agent.assertion.write(CG_ID, name, [
+      { subject: A, predicate: 'http://schema.org/name', object: '"A2"' },
+      { subject: B, predicate: 'http://schema.org/name', object: '"B2"' },
+    ]);
+    const spy = vi
+      .spyOn(agent.publisher, 'assertionPromote')
+      .mockRejectedValue(new Error('simulated promote failure (curator unconfirmed)'));
+    try {
+      await expect(agent.assertion.promote(CG_ID, name, { entities: [A] })).rejects.toThrow(/simulated promote failure/);
+    } finally {
+      spy.mockRestore();
+    }
+
+    // The prior seal MUST survive the failed non-sealing share (round 11 fix).
+    expect(await sealExists(agent, CG_ID, name)).toBe(true);
+  }, 30_000);
+
+  // round 11 (reviewer 🔴 #1): the converse — a non-sealing share that SUCCEEDS
+  // DOES clear the prior seal (the clear now runs AFTER the committed promote).
+  it('round 11: a non-sealing share that SUCCEEDS clears the prior seal (after commit)', async () => {
+    const agent = await createAgent('TxnSealClearOkBot');
+    await agent.createContextGraph({ id: CG_ID, name: 'Txn Seal Clear Ok E2E' });
+    await agent.registerContextGraph(CG_ID);
+
+    const name = 'txn-ok';
+    const A = `${ENTITY_BASE}:a`, B = `${ENTITY_BASE}:b`;
+    await agent.assertion.create(CG_ID, name);
+    await agent.assertion.write(CG_ID, name, [
+      { subject: A, predicate: 'http://schema.org/name', object: '"A"' },
+      { subject: B, predicate: 'http://schema.org/name', object: '"B"' },
+    ]);
+    await agent.assertion.promote(CG_ID, name);
+    expect(await sealExists(agent, CG_ID, name)).toBe(true);
+
+    // Re-open + a successful SUBSET (non-sealing) share → seal cleared after commit.
+    await agent.assertion.create(CG_ID, name);
+    await agent.assertion.write(CG_ID, name, [
+      { subject: A, predicate: 'http://schema.org/name', object: '"A2"' },
+      { subject: B, predicate: 'http://schema.org/name', object: '"B2"' },
+    ]);
+    const subset = await agent.assertion.promote(CG_ID, name, { entities: [A] });
+    expect(subset.sealed).toBe(false);
+    expect(await sealExists(agent, CG_ID, name)).toBe(false);
   }, 30_000);
 });
 

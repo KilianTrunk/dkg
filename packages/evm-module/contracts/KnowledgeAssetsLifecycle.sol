@@ -1695,11 +1695,18 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         if (contextGraphId == 0 || cost == 0) {
             return 0;
         }
-        if (msg.sender != contextGraphStorage.getContextGraphOwner(contextGraphId)) {
-            return 0;
-        }
+        // Read the per-CG escrow FIRST. While the deposit is dormant (escrow == 0
+        // — always true when the registration deposit param is 0, the default)
+        // this single light read short-circuits BEFORE the heavier
+        // getContextGraphOwner (ERC-721 ownerOf) lookup. PR #1229: doing the owner
+        // lookup first added enough gas to the publish path to tip the off-chain
+        // publisher's gas estimation and shift its tx signer, breaking
+        // publisher[4/4]. Escrow-first keeps the dormant path's footprint minimal.
         uint96 esc = contextGraphStorage.getRegistrationEscrow(contextGraphId);
         if (esc == 0) {
+            return 0;
+        }
+        if (msg.sender != contextGraphStorage.getContextGraphOwner(contextGraphId)) {
             return 0;
         }
         used = esc >= cost ? cost : esc;

@@ -9,7 +9,7 @@
  * 6. SWM query view vs default view
  * 7. Working memory view
  */
-import { describe, it, expect, afterEach, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, afterEach, beforeAll, afterAll, vi } from 'vitest';
 import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { DKGAgent } from '../src/index.js';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
@@ -594,6 +594,91 @@ describe('#1116 seal decoupled from CG — full vs skipSeal share, seal-in-SWM',
     expect(pub.status).toBe('confirmed');
     expect(pub.ual).toBeDefined();
     expect(pub.seal).toBeDefined();
+  }, 30_000);
+
+  // A1 (review): a SUBSET share is SWM-ONLY — NOT publishable. It stamps the
+  // dkg:rootEntity member rows (the seal-independent recovery source) but does
+  // NOT set the full-SWM-share marker, so finalize(layer:"swm") must REJECT with
+  // SWM_SUBSET_NOT_SEALABLE — otherwise a {A,B} KA only subset-shared (A) could be
+  // sealed and published as a PARTIAL asset under the KA name.
+  it('finalize(layer:swm) REJECTS a subset-shared asset (subset shares are not publishable)', async () => {
+    const agent = await createAgent('SubsetNotSealableBot');
+    await agent.createContextGraph({ id: CG_ID, name: 'Subset Not Sealable E2E' });
+    await agent.registerContextGraph(CG_ID);
+
+    const name = 'subset-share';
+    await agent.assertion.create(CG_ID, name);
+    await agent.assertion.write(CG_ID, name, [
+      { subject: `${ENTITY_BASE}:a`, predicate: 'http://schema.org/name', object: '"Entity A"' },
+      { subject: `${ENTITY_BASE}:b`, predicate: 'http://schema.org/name', object: '"Entity B"' },
+    ]);
+
+    // SUBSET share — only entity A reaches SWM (a selective promote never seals).
+    const subset = await agent.assertion.promote(CG_ID, name, { entities: [`${ENTITY_BASE}:a`] });
+    expect(subset.promotedCount).toBeGreaterThan(0);
+    expect(subset.sealed).toBe(false);
+
+    // The marker was NOT set (this was a subset share), so seal-in-SWM is refused.
+    let thrown: any;
+    try {
+      await agent.assertion.finalize(CG_ID, name, { layer: 'swm' });
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeTruthy();
+    expect(thrown.code).toBe('SWM_SUBSET_NOT_SEALABLE');
+
+    // The asset is NOT sealed ⇒ stays unpublishable (no partial asset escapes).
+    await expect(
+      agent.publishFromFinalizedAssertion(CG_ID, name),
+    ).rejects.toThrow(/not finalized/i);
+  }, 30_000);
+
+  // C (review): a DEFAULT full share whose internal seal FAILS with a residual
+  // capability gap (NOT skipSeal, NOT stale/corrupt) must fail CLOSED:
+  // UNSEALED_SHARE_BLOCKED is thrown BEFORE assertionPromote, so WM is preserved
+  // (non-empty, not promoted) and SWM gains no new promotion.
+  it('a full share whose seal fails (capability gap) fails closed with UNSEALED_SHARE_BLOCKED, preserving WM', async () => {
+    const agent = await createAgent('UnsealedBlockedBot');
+    await agent.createContextGraph({ id: CG_ID, name: 'Unsealed Blocked E2E' });
+    await agent.registerContextGraph(CG_ID);
+
+    const name = 'capability-gap';
+    await agent.assertion.create(CG_ID, name);
+    await agent.assertion.write(CG_ID, name, [
+      { subject: `${ENTITY_BASE}:cg`, predicate: 'http://schema.org/name', object: '"Capability Gap"' },
+    ]);
+
+    // Inject a residual capability-gap failure into the seal step. The message
+    // must NOT match the stale-seal / corrupt-seal regex (those re-throw as-is),
+    // so promote wraps it as UNSEALED_SHARE_BLOCKED and fails BEFORE promoting.
+    const spy = vi
+      .spyOn(agent, 'assertionFinalize')
+      .mockRejectedValue(new Error('no local signing key available for this agent'));
+    try {
+      let thrown: any;
+      try {
+        await agent.assertion.promote(CG_ID, name); // DEFAULT full share — seals by default.
+      } catch (e) {
+        thrown = e;
+      }
+      expect(thrown).toBeTruthy();
+      expect(thrown.code).toBe('UNSEALED_SHARE_BLOCKED');
+      expect(typeof thrown.recovery).toBe('string');
+    } finally {
+      spy.mockRestore();
+    }
+
+    // WM draft is PRESERVED (not emptied by a doomed promote).
+    const wmAfter = await agent.assertion.query(CG_ID, name);
+    expect(wmAfter.length).toBeGreaterThan(0);
+
+    // SWM gained NO new promotion — the entity never reached shared memory.
+    const swmAfter = await agent.query(
+      `SELECT ?name WHERE { <${ENTITY_BASE}:cg> <http://schema.org/name> ?name }`,
+      { contextGraphId: CG_ID, graphSuffix: '_shared_memory' },
+    );
+    expect(swmAfter.bindings.length).toBe(0);
   }, 30_000);
 });
 

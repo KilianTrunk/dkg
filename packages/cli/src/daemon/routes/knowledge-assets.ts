@@ -983,7 +983,20 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       if (verb === "finalize") {
         const finalizeOptions = resolveFinalizeOptions(parsed, res);
         if (finalizeOptions === null) return;
-        const seal = await agent.assertion.finalize(contextGraphId, name, finalizeOptions);
+        let seal;
+        try {
+          seal = await agent.assertion.finalize(contextGraphId, name, finalizeOptions);
+        } catch (e: any) {
+          // #1116 (review A1): a finalize(layer:"swm") on an asset that was only
+          // SUBSET-shared is rejected — subset shares are SWM-only, not
+          // publishable. Map it to a 409 (parity with the swm/share
+          // UNSEALED_SHARE_BLOCKED mapping) carrying the recovery hint in the
+          // message; everything else propagates to the outer handler unchanged.
+          if (e?.code === "SWM_SUBSET_NOT_SEALABLE") {
+            return jsonResponse(res, 409, { code: "SWM_SUBSET_NOT_SEALABLE", error: e.message });
+          }
+          throw e;
+        }
         // #1116: a layer:"swm" finalize touches SWM (it reconstructs a WM draft
         // from SWM, then seals), so reflect both layers in the change event.
         emitMemoryGraphChanged?.({ contextGraphId, layers: finalizeOptions.layer === "swm" ? ["wm", "swm"] : ["wm"], subGraphName, operation: "assertion_finalized", source: "api" });
@@ -1130,7 +1143,11 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         try {
           pub = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts });
         } catch (firstErr: any) {
-          if (!/not registered on-chain/i.test(firstErr?.message ?? String(firstErr))) throw firstErr;
+          // #1116 (review B): code-first, message fallback. The publisher now
+          // stamps `code: 'CG_NOT_REGISTERED'` on this throw; match on it and
+          // keep the message regex for back-compat (older publisher builds /
+          // re-wrapped errors that lost the code).
+          if (firstErr?.code !== "CG_NOT_REGISTERED" && !/not registered on-chain/i.test(firstErr?.message ?? String(firstErr))) throw firstErr;
           try {
             await agent.ensureRegisteredForPublish(contextGraphId, { callerAgentAddress: requestAgentAddress });
           } catch (regErr: any) {

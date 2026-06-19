@@ -72,6 +72,12 @@ export {
 
 const WORKSPACE_OWNER_PREDICATE = 'http://dkg.io/ontology/workspaceOwner';
 
+// #1116 (review A1) — marker predicate stamped on the lifecycle URN when a KA
+// has been FULLY shared to SWM (entities:"all", all roots landed). It gates
+// finalize(layer:"swm") so a subset share — which also stamps dkg:rootEntity
+// member rows — cannot be sealed-in-SWM and published as a partial asset.
+const SWM_SHARE_COMPLETE_PRED = 'http://dkg.io/ontology/swmShareComplete';
+
 async function listGraphFamily(store: TripleStore, rootGraph: string): Promise<string[]> {
   const graphs = await listGraphsByPrefix(store, `${rootGraph}/`);
   if (await store.hasGraph(rootGraph)) {
@@ -1305,9 +1311,16 @@ export class DKGPublisher implements Publisher {
         const hasOnChainId = onChainResult.type === 'bindings' && onChainResult.bindings.length > 0;
 
         if (!hasOnChainId) {
-          throw new Error(
-            `Context graph "${contextGraphId}" is not registered on-chain. ` +
-            `Run 'dkg context-graph register ${contextGraphId}' first to enable Verifiable Memory publishing.`,
+          // #1116 (review B): carry a stable `code` so route matchers no longer
+          // have to key on the message text. The MESSAGE stays verbatim — the
+          // e2e test (rejects.toThrow(/not registered on-chain/i)) and back-compat
+          // route fallbacks still rely on it.
+          throw Object.assign(
+            new Error(
+              `Context graph "${contextGraphId}" is not registered on-chain. ` +
+              `Run 'dkg context-graph register ${contextGraphId}' first to enable Verifiable Memory publishing.`,
+            ),
+            { code: 'CG_NOT_REGISTERED' },
           );
         }
       }
@@ -4565,6 +4578,56 @@ export class DKGPublisher implements Publisher {
     return roots;
   }
 
+  /**
+   * #1116 (review A1) — SWM-share-complete marker.
+   *
+   * A FULL share (entities:"all", all roots actually landed in SWM) stamps a
+   * single boolean marker on the lifecycle URN. `finalize(layer:"swm")` gates
+   * on it so a SUBSET share — which also stamps `dkg:rootEntity` member rows,
+   * the source `readPromotedRootEntities` reads — can NOT be sealed-in-SWM and
+   * published as a partial asset under the KA name. Subset shares are SWM-only,
+   * never publishable; only a complete full share sets this marker (a later
+   * subset share never unsets it). Modelled on `readPromotedRootEntities` /
+   * `_stampSwmPointer`: same meta graph (`contextGraphMetaUri(cg)`) and subject
+   * (`assertionLifecycleUri(...)`).
+   */
+  async markSwmShareComplete(
+    contextGraphId: string,
+    name: string,
+    agentAddress: string,
+    subGraphName?: string,
+  ): Promise<void> {
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    const lifecycleUri = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
+    // Idempotent: drop any prior marker first, then insert exactly one.
+    await this.store.deleteByPattern({
+      graph: metaGraph,
+      subject: lifecycleUri,
+      predicate: SWM_SHARE_COMPLETE_PRED,
+    });
+    await this.store.insert([{
+      subject: lifecycleUri,
+      predicate: SWM_SHARE_COMPLETE_PRED,
+      object: '"true"',
+      graph: metaGraph,
+    }]);
+  }
+
+  /** #1116 (review A1) — ASK whether the SWM-share-complete marker is present. */
+  async hasSwmShareComplete(
+    contextGraphId: string,
+    name: string,
+    agentAddress: string,
+    subGraphName?: string,
+  ): Promise<boolean> {
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    const lifecycleUri = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
+    const res = await this.store.query(
+      `ASK { GRAPH <${metaGraph}> { <${lifecycleUri}> <${SWM_SHARE_COMPLETE_PRED}> ?o } }`,
+    );
+    return res.type === 'boolean' && res.value;
+  }
+
   // ── Working Memory Assertion Operations (spec §6) ───────────────────
 
   private static validateOptionalSubGraph(subGraphName: string | undefined): void {
@@ -4776,6 +4839,11 @@ export class DKGPublisher implements Publisher {
       // finalize layer=swm safely retryable.
       `${A2_DKG}rootEntity`,
       `${A2_DKG}entity`,
+      // #1116 (review A1): the full-SWM-share marker that gates finalize(layer:"swm").
+      // pull-from's clean-slate (the seal-in-SWM reconstruction) MUST preserve it,
+      // or a finalize that fails after the re-seed would strip the marker and make
+      // the already-fully-shared asset un-sealable — the inverse of the bug it guards.
+      `${A2_DKG}swmShareComplete`,
     ]);
     const lifecycleSubject = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
     const metaGraph = contextGraphMetaUri(contextGraphId);

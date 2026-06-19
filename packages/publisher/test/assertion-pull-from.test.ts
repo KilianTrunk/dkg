@@ -225,4 +225,37 @@ describe('assertionPullFrom (OT-RFC-43 §10.5.3 wm/pull-from)', () => {
     expect(subjects.has(ENTITY_1)).toBe(true);
     expect(subjects.has(SKOLEM_1)).toBe(true);
   });
+
+  // #1116 (review A1): the swmShareComplete marker gates finalize(layer:"swm").
+  // seal-in-SWM runs a replace pull-from (assertionCreate clean-slate) BEFORE
+  // sealing — so the marker MUST survive that wipe (it was added to
+  // A2_PRESERVE_PREDS), otherwise a finalize that fails after the re-seed would
+  // strip the marker and make an already-fully-shared asset un-sealable.
+  it('#1116: swmShareComplete marker SURVIVES a replace pull-from (A2 preserve)', async () => {
+    const { publisher, store } = await makePublisher();
+    const lifecycleUri = assertionLifecycleUri(CG, AGENT, NAME);
+    const metaGraph = contextGraphMetaUri(CG);
+
+    // Fully-shared (marker present) + the seal-independent member row, NO seal —
+    // exactly the state seal-in-SWM reconstructs from.
+    await publisher.markSwmShareComplete(CG, NAME, AGENT);
+    await store.insert([
+      q(ENTITY_1, SCHEMA, '"Alice"', SWM_GRAPH),
+      q(lifecycleUri, `${DKG}rootEntity`, ENTITY_1, metaGraph),
+    ]);
+    expect(await publisher.hasSwmShareComplete(CG, NAME, AGENT)).toBe(true);
+
+    // The replace pull-from re-opens the WM draft via assertionCreate's clean
+    // slate; the marker must carry over.
+    const result = await publisher.assertionPullFrom(CG, NAME, AGENT, 'swm', { onConflict: 'replace' });
+    expect(result.entities).toBe(1);
+    expect(await publisher.hasSwmShareComplete(CG, NAME, AGENT)).toBe(true);
+
+    // markSwmShareComplete is idempotent — re-marking leaves exactly one row.
+    await publisher.markSwmShareComplete(CG, NAME, AGENT);
+    const rows = await store.query(
+      `SELECT ?o WHERE { GRAPH <${metaGraph}> { <${lifecycleUri}> <${DKG}swmShareComplete> ?o } }`,
+    );
+    expect(rows.type === 'bindings' && rows.bindings.length).toBe(1);
+  });
 });

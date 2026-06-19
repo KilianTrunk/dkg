@@ -4765,6 +4765,15 @@ export class DKGPublisher implements Publisher {
       `${A2_DKG}swmCurrentAssertion`,
       `${A2_DKG}vmCurrentAssertion`,
       'http://www.w3.org/ns/prov#wasRevisionOf',
+      // #1116: the promote-stamped member rows (dkg:rootEntity / dkg:entity) are
+      // the SEAL-INDEPENDENT recovery source readPromotedRootEntities uses. Pull-from
+      // (the seal-in-SWM reconstruction path) MUST preserve them across this
+      // clean-slate, otherwise a finalize that fails AFTER the re-seed would leave
+      // the asset with neither a seal nor the member rows — stranding the very asset
+      // seal-in-SWM exists to rescue (a non-atomic recovery). Keeping them makes
+      // finalize layer=swm safely retryable.
+      `${A2_DKG}rootEntity`,
+      `${A2_DKG}entity`,
     ]);
     const lifecycleSubject = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
     const metaGraph = contextGraphMetaUri(contextGraphId);
@@ -5470,6 +5479,31 @@ export class DKGPublisher implements Publisher {
     await this.store.delete(discarded.delete);
     await this.store.insert(discarded.insert);
 
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    await this.store.deleteByPattern({ subject: graphUri, graph: metaGraph });
+    await this.store.dropGraph(graphUri);
+  }
+
+  /**
+   * #1116 — clear ONLY the Working-Memory draft DATA graph for an assertion,
+   * leaving every `_meta` block intact: the seal (keyed by the assertion URI),
+   * the lifecycle URN (incl. dkg:rootEntity / kaId), everything. Used by the
+   * seal-in-SWM flow (finalize layer=swm) to drop the transient WM draft it
+   * reconstructed from SWM, so the asset ends up resident PURELY in SWM (with
+   * its fresh seal) instead of duplicated across WM+SWM. This mirrors
+   * `assertionDiscard`'s data-graph teardown but does NOT stamp a "discarded"
+   * lifecycle event and does NOT touch the seal: the seal's subject is the
+   * assertion URI, while the rows removed here are keyed by the WM data-graph
+   * URI (the memoryLayer pointer etc.), a different subject.
+   */
+  async clearWmDraftDataGraph(
+    contextGraphId: string,
+    name: string,
+    agentAddress: string,
+    subGraphName?: string,
+  ): Promise<void> {
+    DKGPublisher.validateOptionalSubGraph(subGraphName);
+    const graphUri = await this.wmGraphUri(contextGraphId, agentAddress, name, subGraphName);
     const metaGraph = contextGraphMetaUri(contextGraphId);
     await this.store.deleteByPattern({ subject: graphUri, graph: metaGraph });
     await this.store.dropGraph(graphUri);

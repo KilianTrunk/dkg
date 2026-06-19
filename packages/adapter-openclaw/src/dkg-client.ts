@@ -8,6 +8,40 @@
 
 import { loadAuthTokenSync } from '@origintrail-official/dkg-core';
 
+/**
+ * Typed daemon HTTP error. Carries the response `status` and the parsed JSON
+ * `body` (when the daemon returned JSON) so callers can branch structurally
+ * (e.g. a 409 `UNSEALED_SHARE_BLOCKED` recovery hint) instead of re-parsing
+ * JSON out of the message string. The human-readable `message` is preserved
+ * verbatim (`DKG daemon <path> responded <status>: <text>`) for back-compat
+ * with the existing `responded NNN` substring checks (e.g. the chat-turns 404
+ * probe and the `wm/import-file` 404 path).
+ */
+export class DkgDaemonHttpError extends Error {
+  readonly status: number;
+  readonly body?: unknown;
+  constructor(message: string, status: number, body?: unknown) {
+    super(message);
+    this.name = 'DkgDaemonHttpError';
+    this.status = status;
+    this.body = body;
+  }
+}
+
+/**
+ * Build a {@link DkgDaemonHttpError} from a non-2xx daemon response. Attempts to
+ * parse `text` as JSON for the typed `body`; a non-JSON body leaves `body`
+ * undefined (the raw text still appears in the message). The message format is
+ * fixed — do NOT change it without auditing the `responded ` substring checks.
+ */
+function daemonHttpError(message: string, status: number, text: string): DkgDaemonHttpError {
+  let body: unknown;
+  if (text) {
+    try { body = JSON.parse(text); } catch { body = undefined; }
+  }
+  return new DkgDaemonHttpError(message, status, body);
+}
+
 export interface DkgClientOptions {
   /** Base URL of the DKG daemon (default: "http://127.0.0.1:9200"). */
   baseUrl?: string;
@@ -711,8 +745,10 @@ export class DkgDaemonClient {
     );
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw new Error(
+      throw daemonHttpError(
         `DKG daemon /api/knowledge-assets/${name}/wm/import-file responded ${res.status}: ${text}`,
+        res.status,
+        text,
       );
     }
     return res.json() as Promise<Record<string, unknown>>;
@@ -1148,8 +1184,8 @@ export class DkgDaemonClient {
       signal: AbortSignal.timeout(this.timeoutMs),
     });
     if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new Error(`DKG daemon ${path} responded ${res.status}: ${body}`);
+      const text = await res.text().catch(() => '');
+      throw daemonHttpError(`DKG daemon ${path} responded ${res.status}: ${text}`, res.status, text);
     }
     return res.json() as Promise<T>;
   }
@@ -1163,7 +1199,7 @@ export class DkgDaemonClient {
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw new Error(`DKG daemon ${path} responded ${res.status}: ${text}`);
+      throw daemonHttpError(`DKG daemon ${path} responded ${res.status}: ${text}`, res.status, text);
     }
     return res.json() as Promise<T>;
   }
@@ -1177,7 +1213,7 @@ export class DkgDaemonClient {
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw new Error(`DKG daemon ${path} responded ${res.status}: ${text}`);
+      throw daemonHttpError(`DKG daemon ${path} responded ${res.status}: ${text}`, res.status, text);
     }
     return res.json() as Promise<T>;
   }
@@ -1188,7 +1224,13 @@ export class DkgDaemonClient {
   // of member entities. WM → SWM → VM via the git-shaped verbs write →
   // finalize → share → publish.
 
-  /** Create a KA + open its WM draft. Pass `quads` to atomically write+finalize. */
+  /**
+   * Create a KA + open its WM draft. Pass `quads` to atomically write+seal.
+   * With `quads` present the create one-shot now seals AND shares to SWM by
+   * default (`alsoShareSwm` defaults true when sealing); pass
+   * `alsoShareSwm: false` to stop at a sealed WM draft, or `finalize: false`
+   * to keep an unsealed editable WM draft.
+   */
   async createKnowledgeAsset(
     contextGraphId: string,
     name: string,

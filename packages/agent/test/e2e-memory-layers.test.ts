@@ -430,6 +430,106 @@ describe('WM → SWM → VM pipeline (single agent)', () => {
   }, 20_000);
 });
 
+describe('#1116 seal decoupled from CG — full vs skipSeal share, seal-in-SWM', () => {
+  // B1: a FULL share seals by default (sealed:true / publishReady:true) and the
+  // asset publishes; a skipSeal:true full share leaves it UNSEALED
+  // (sealed:false / publishReady:false) so publishFromFinalizedAssertion rejects.
+  it('full share seals by default and publishes; skipSeal share stays unsealed and is unpublishable', async () => {
+    const agent = await createAgent('SealDefaultBot');
+    await agent.createContextGraph({ id: CG_ID, name: 'Seal Default E2E' });
+    await agent.registerContextGraph(CG_ID);
+
+    // --- Full share: seals by default ---
+    await agent.assertion.create(CG_ID, 'sealed-share');
+    await agent.assertion.write(CG_ID, 'sealed-share', [
+      { subject: `${ENTITY_BASE}:sealed`, predicate: 'http://schema.org/name', object: '"Sealed Share"' },
+    ]);
+    const fullShare = await agent.assertion.promote(CG_ID, 'sealed-share');
+    expect(fullShare.sealed).toBe(true);
+    expect(fullShare.publishReady).toBe(true);
+
+    // A sealed full share is publishable from the finalized assertion.
+    const pub = await agent.publishFromFinalizedAssertion(CG_ID, 'sealed-share');
+    expect(pub.status).toBe('confirmed');
+    expect(pub.ual).toBeDefined();
+    expect(pub.seal).toBeDefined();
+
+    // --- skipSeal share: stays unsealed ---
+    await agent.assertion.create(CG_ID, 'unsealed-share');
+    await agent.assertion.write(CG_ID, 'unsealed-share', [
+      { subject: `${ENTITY_BASE}:unsealed`, predicate: 'http://schema.org/name', object: '"Unsealed Share"' },
+    ]);
+    const skipShare = await agent.assertion.promote(CG_ID, 'unsealed-share', { skipSeal: true });
+    expect(skipShare.promotedCount).toBeGreaterThan(0);
+    expect(skipShare.sealed).toBe(false);
+    expect(skipShare.publishReady).toBe(false);
+
+    // The content reached SWM despite no seal...
+    const swm = await agent.query(
+      `SELECT ?name WHERE { <${ENTITY_BASE}:unsealed> <http://schema.org/name> ?name }`,
+      { contextGraphId: CG_ID, graphSuffix: '_shared_memory' },
+    );
+    expect(swm.bindings.length).toBe(1);
+
+    // ...but with no seal, publishFromFinalizedAssertion refuses it.
+    await expect(
+      agent.publishFromFinalizedAssertion(CG_ID, 'unsealed-share'),
+    ).rejects.toThrow(/not finalized/i);
+  }, 30_000);
+
+  // B2: SEAL-IN-SWM round trip — the key new capability. An asset shared
+  // UNSEALED (stuck, unpublishable) is made publishable by finalize(layer:'swm')
+  // WITHOUT recreating it: pull-from reconstructs a transient WM draft, finalize
+  // seals it, then the transient WM draft is dropped so the asset is left PURELY
+  // in SWM (now sealed) and publishes.
+  it('finalize(layer:swm) seals a stuck unsealed SWM asset, empties the WM draft, and makes it publishable', async () => {
+    const agent = await createAgent('SealInSwmBot');
+    await agent.createContextGraph({ id: CG_ID, name: 'Seal-in-SWM E2E' });
+    await agent.registerContextGraph(CG_ID);
+
+    const name = 'seal-in-swm';
+    await agent.assertion.create(CG_ID, name);
+    await agent.assertion.write(CG_ID, name, [
+      { subject: `${ENTITY_BASE}:sis`, predicate: 'http://schema.org/name', object: '"Seal In SWM"' },
+    ]);
+
+    // Share UNSEALED: content moves to SWM, WM draft is emptied, no seal exists.
+    const share = await agent.assertion.promote(CG_ID, name, { skipSeal: true });
+    expect(share.sealed).toBe(false);
+    const wmAfterShare = await agent.assertion.query(CG_ID, name);
+    expect(wmAfterShare.length).toBe(0); // WM emptied by promote
+    // Unsealed ⇒ not yet publishable.
+    await expect(
+      agent.publishFromFinalizedAssertion(CG_ID, name),
+    ).rejects.toThrow(/not finalized/i);
+
+    // Seal in SWM — reconstruct from SWM, finalize, drop the transient WM draft.
+    const seal = await agent.assertion.finalize(CG_ID, name, { layer: 'swm' });
+    expect(seal.merkleRoot).toBeDefined();
+    expect(seal.authorAddress).toBeDefined();
+
+    // Post-condition #1: the asset is left PURELY in SWM — the WM draft is empty
+    // again (the transient reconstruction draft was dropped).
+    const wmAfterSeal = await agent.assertion.query(CG_ID, name);
+    expect(wmAfterSeal.length).toBe(0);
+
+    // Post-condition #2: the SWM content is still present (the seal never
+    // modified the SWM copy).
+    const swmAfterSeal = await agent.query(
+      `SELECT ?name WHERE { <${ENTITY_BASE}:sis> <http://schema.org/name> ?name }`,
+      { contextGraphId: CG_ID, graphSuffix: '_shared_memory' },
+    );
+    expect(swmAfterSeal.bindings.length).toBe(1);
+
+    // Post-condition #3: the seal now exists, so the previously-stuck asset
+    // publishes WITHOUT being recreated.
+    const pub = await agent.publishFromFinalizedAssertion(CG_ID, name);
+    expect(pub.status).toBe('confirmed');
+    expect(pub.ual).toBeDefined();
+    expect(pub.seal).toBeDefined();
+  }, 30_000);
+});
+
 describe('WM → SWM gossip → VM (2 nodes)', () => {
   async function pollUntil(
     queryFn: () => Promise<{ bindings: any[] }>,

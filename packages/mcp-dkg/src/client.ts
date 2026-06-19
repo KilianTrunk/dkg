@@ -1122,7 +1122,13 @@ export class DkgClient {
   // /api/assertion/* routes are retired); only the shared-memory/* methods
   // remain on their own routes.
 
-  /** Create a KA + open its WM draft. Pass `quads` to atomically write+finalize. */
+  /**
+   * Create a KA + open its WM draft. Pass `quads` to atomically write+seal.
+   * With `quads` present the create one-shot now seals AND shares to SWM by
+   * default (`alsoShareSwm` defaults true when sealing); pass
+   * `alsoShareSwm: false` to stop at a sealed WM draft, or `finalize: false`
+   * to keep an unsealed editable WM draft.
+   */
   async createKnowledgeAsset(args: {
     contextGraphId: string;
     name: string;

@@ -299,7 +299,6 @@ describe('V10 Publish E2E', () => {
     const authorTyped = buildAuthorAttestationTypedData({
       chainId: TEST_CHAIN_ID,
       kav10Address: realKAV10Addr,
-      contextGraphId: chainCgId,
       merkleRoot,
       authorAddress: pubWallet.address,
       reservedKaId,

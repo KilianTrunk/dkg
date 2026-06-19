@@ -177,4 +177,52 @@ describe('assertionPullFrom (OT-RFC-43 §10.5.3 wm/pull-from)', () => {
     expect(subjects.has(ENTITY_1)).toBe(true);
     expect(subjects.has(SKOLEM_1)).toBe(true);
   });
+
+  // #1116 atomicity: a pull-from re-opens the WM draft via `assertionCreate`,
+  // whose clean-slate WIPES every row under the lifecycle URN before re-seeding.
+  // The promote-stamped member rows (dkg:rootEntity) are the SEAL-INDEPENDENT
+  // recovery source pull-from falls back to — so they MUST survive that wipe, or
+  // a SECOND pull-from (and seal-in-SWM recovery in general) would lose the
+  // members and fail. #1116 added dkg:rootEntity to assertionCreate's
+  // A2_PRESERVE_PREDS carry-over; this guards that.
+  it('#1116: dkg:rootEntity rows on the lifecycle URN SURVIVE a replace pull-from (a second pull still finds the members)', async () => {
+    const { publisher, store } = await makePublisher();
+    const lifecycleUri = assertionLifecycleUri(CG, AGENT, NAME);
+    const metaGraph = contextGraphMetaUri(CG);
+
+    // Unsealed, promote-stamped asset: SWM content + the dkg:rootEntity member
+    // row on the lifecycle URN, NO seal — exactly what seal-in-SWM consumes.
+    await store.insert([
+      q(ENTITY_1, SCHEMA, '"Alice"', SWM_GRAPH),
+      q(SKOLEM_1, SCHEMA, '"Alice detail"', SWM_GRAPH),
+      q(lifecycleUri, `${DKG}rootEntity`, ENTITY_1, metaGraph),
+    ]);
+
+    // Mirror readPromotedRootEntities: the seal-independent member lookup.
+    const readRoots = async (): Promise<string[]> => {
+      const r = await store.query(
+        `SELECT ?root WHERE { GRAPH <${metaGraph}> { <${lifecycleUri}> <${DKG}rootEntity> ?root } }`,
+      );
+      return r.type === 'bindings' ? r.bindings.map((b) => String(b['root'])) : [];
+    };
+
+    // First pull-from succeeds via the rootEntity fallback...
+    const first = await publisher.assertionPullFrom(CG, NAME, AGENT, 'swm', { onConflict: 'replace' });
+    expect(first.entities).toBe(1);
+    // ...and the row survived assertionCreate's clean-slate (it routes through
+    // the A2_PRESERVE_PREDS carry-over).
+    expect(await readRoots()).toContain(ENTITY_1);
+
+    // The crux: a SECOND replace pull-from still resolves the member — only
+    // possible if the dkg:rootEntity row was preserved across the first pull's
+    // clean-slate. Pre-#1116 (row wiped) this threw "No member entities".
+    const second = await publisher.assertionPullFrom(CG, NAME, AGENT, 'swm', { onConflict: 'replace' });
+    expect(second.entities).toBe(1);
+    expect(await readRoots()).toContain(ENTITY_1);
+
+    // And the reconstructed draft still holds the member + its skolem child.
+    const subjects = new Set((await wmQuads(store)).map((d) => d.subject));
+    expect(subjects.has(ENTITY_1)).toBe(true);
+    expect(subjects.has(SKOLEM_1)).toBe(true);
+  });
 });

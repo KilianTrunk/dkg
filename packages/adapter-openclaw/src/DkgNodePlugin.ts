@@ -28,6 +28,7 @@ import {
 } from '@origintrail-official/dkg-core';
 import {
   DkgDaemonClient,
+  DkgDaemonHttpError,
   normalizeContextGraphId,
   type LocalAgentIntegrationRecord,
   type LocalAgentIntegrationTransport,
@@ -110,23 +111,22 @@ const SHARE_NOT_PUBLISH_READY_WARNING =
 
 /**
  * #1116: extract the daemon's recovery hint from a 409 UNSEALED_SHARE_BLOCKED
- * share failure. The DkgDaemonClient throws a plain Error whose message embeds
- * the response body JSON ("... responded 409: {json}"), so parse the trailing
- * JSON object and return `recovery` only when the body's code matches. Returns
- * undefined for any other error (caller falls back to the generic daemonError).
+ * share failure. The DkgDaemonClient throws a typed {@link DkgDaemonHttpError}
+ * carrying the response `status` and parsed JSON `body`, so branch structurally
+ * on the status + body code (no JSON-from-message parsing). Returns undefined
+ * for any other error (caller falls back to the generic daemonError).
  */
 function extractUnsealedShareRecovery(err: unknown): string | undefined {
-  const message = err instanceof Error ? err.message : String(err ?? '');
-  if (!message.includes('UNSEALED_SHARE_BLOCKED')) return undefined;
-  const start = message.indexOf('{');
-  if (start === -1) return undefined;
-  try {
-    const body = JSON.parse(message.slice(start)) as { code?: string; recovery?: string };
-    if (body?.code === 'UNSEALED_SHARE_BLOCKED' && typeof body.recovery === 'string' && body.recovery) {
+  if (
+    err instanceof DkgDaemonHttpError &&
+    err.status === 409 &&
+    typeof err.body === 'object' &&
+    err.body !== null
+  ) {
+    const body = err.body as { code?: string; recovery?: string };
+    if (body.code === 'UNSEALED_SHARE_BLOCKED' && typeof body.recovery === 'string' && body.recovery) {
       return body.recovery;
     }
-  } catch {
-    // Not parseable as JSON — fall through to the generic daemon error.
   }
   return undefined;
 }

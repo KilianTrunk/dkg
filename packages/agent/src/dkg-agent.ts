@@ -2054,23 +2054,47 @@ export class DKGAgent extends DKGAgentBase {
       }> {
         // #1116 seal-in-SWM: pull the asset's roots back out of SWM into a
         // transient WM draft (reusing pull-from — incl. its seal-independent
-        // root resolution), then run the ordinary finalize over that draft. The
-        // seal is content-based, so it is valid for the SWM-resident content;
-        // the SWM copy is left untouched and the asset becomes publishable
-        // without recreating it. We reconstruct unconditionally (onConflict
-        // 'replace') so a stale WM draft never blocks the re-seal.
-        if (opts?.layer === 'swm') {
-          await agent.publisher.assertionPullFrom(contextGraphId, name, agentAddress, 'swm', {
+        // root resolution), run the ordinary finalize over that draft, then DROP
+        // the transient draft so the asset is left resident PURELY in SWM (with
+        // its fresh seal), not duplicated across WM+SWM. The seal is
+        // content-based, so it is valid for the SWM-resident content; the SWM
+        // copy itself is never modified. We reconstruct unconditionally
+        // (onConflict 'replace') so a stale WM draft never blocks the re-seal;
+        // pull-from now PRESERVES the dkg:rootEntity recovery rows across its
+        // clean-slate, so a finalize that fails here leaves the asset safely
+        // re-tryable (seal-in-SWM is atomic-on-failure).
+        if (opts?.layer !== 'swm') {
+          return agent.assertionFinalize(contextGraphId, name, agentAddress, {
             subGraphName: opts?.subGraphName,
-            onConflict: 'replace',
+            authorAgentAddress: opts?.authorAgentAddress,
+            preSignedAuthorAttestation: opts?.preSignedAuthorAttestation,
+            schemeVersion: opts?.schemeVersion,
           });
         }
-        return agent.assertionFinalize(contextGraphId, name, agentAddress, {
+        await agent.publisher.assertionPullFrom(contextGraphId, name, agentAddress, 'swm', {
+          subGraphName: opts?.subGraphName,
+          onConflict: 'replace',
+        });
+        const swmSeal = await agent.assertionFinalize(contextGraphId, name, agentAddress, {
           subGraphName: opts?.subGraphName,
           authorAgentAddress: opts?.authorAgentAddress,
           preSignedAuthorAttestation: opts?.preSignedAuthorAttestation,
           schemeVersion: opts?.schemeVersion,
         });
+        // Best-effort: the seal (in _meta) and the SWM content are already
+        // durable, so a cleanup failure is harmless (it only leaves a sealed WM
+        // draft alongside SWM — which the finalize-after-edit guards still
+        // protect). Drop it so the post-condition is "purely in SWM".
+        try {
+          await agent.publisher.clearWmDraftDataGraph(contextGraphId, name, agentAddress, opts?.subGraphName);
+        } catch (cleanupErr: any) {
+          agent.log.warn(
+            createOperationContext('share'),
+            `seal-in-SWM: WM-draft cleanup failed (asset is sealed and resident in SWM; ` +
+              `a harmless WM copy remains): ${cleanupErr?.message ?? String(cleanupErr)}`,
+          );
+        }
+        return swmSeal;
       },
 
       async history(contextGraphId: string, name: string, opts?: { agentAddress?: string; subGraphName?: string }): Promise<AssertionHistoryDescriptor | null> {

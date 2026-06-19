@@ -1115,22 +1115,32 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         if (!validateFinalizedAssertionPublishRequest(parsed, res)) return;
         const opts = resolveFinalizedPublishOptions(ctx, parsed.options);
         if (opts === null) return;
-        // #1116: the seal is now context-graph-independent, so finalize no
-        // longer registers the CG on-chain. Register transparently here
-        // (idempotent) so the canonical VM publish works on a CG that was
-        // sealed/shared before registration — registration moved from seal
-        // time to publish time. Surface a failure as a clear 400, mirroring
-        // the legacy bridge's auto-register error shape.
+        // #1116: registration moved from seal-time to publish-time, but it must
+        // run AFTER the local preconditions, not before — otherwise a doomed
+        // publish (not finalized / nothing in SWM) would burn registration gas
+        // and only THEN surface the 409. publishFromFinalizedAssertion checks
+        // those preconditions BEFORE any chain interaction (they throw
+        // "is not finalized" / "No quads in shared memory"), and the
+        // unregistered-CG guard fires only after them. So: try the publish
+        // first; ONLY if the sole remaining blocker is an unregistered CG do we
+        // transparently register and retry (idempotent). All other errors
+        // propagate to the precondition/500 mapping below unchanged.
+        let pub: any;
         try {
-          await agent.ensureRegisteredForPublish(contextGraphId, { callerAgentAddress: requestAgentAddress });
-        } catch (regErr: any) {
-          return jsonResponse(res, 400, {
-            error:
-              `Context graph "${contextGraphId}" could not be auto-registered on-chain before publish: ` +
-              `${regErr?.message ?? String(regErr)}`,
-          });
+          pub = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts });
+        } catch (firstErr: any) {
+          if (!/not registered on-chain/i.test(firstErr?.message ?? String(firstErr))) throw firstErr;
+          try {
+            await agent.ensureRegisteredForPublish(contextGraphId, { callerAgentAddress: requestAgentAddress });
+          } catch (regErr: any) {
+            return jsonResponse(res, 400, {
+              error:
+                `Context graph "${contextGraphId}" could not be auto-registered on-chain before publish: ` +
+                `${regErr?.message ?? String(regErr)}`,
+            });
+          }
+          pub = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts });
         }
-        const pub: any = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts });
         const { httpStatus, reason } = classifyVmPublish(pub);
         if (httpStatus === 200) {
           // Activity attributed to the SEAL author (PR #971), not the requester.

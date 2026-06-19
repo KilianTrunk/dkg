@@ -984,13 +984,19 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
      *
      * Domain pins (chainId, verifyingContract) to defeat cross-chain and
      * cross-deployment replay. The struct hash binds the publication's
-     * (contextGraphId, merkleRoot) to a specific (authorAddress,
-     * schemeVersion) — leaked signatures cannot be redirected to a different
-     * CG, a different content root, or a different author identity.
+     * `merkleRoot` to a specific (authorAddress, schemeVersion, reservedKaId)
+     * — leaked signatures cannot be redirected to a different content root, a
+     * different author identity, or a different KA id/slot.
      *
-     * One-shot consumption of `(contextGraphId, merkleRoot)` at the
-     * `DKGKnowledgeAssets` layer is the temporal replay defense; no
-     * `signedAtBlock` window is included in the digest (see RFC-001 §3.2).
+     * The seal is intentionally context-graph-independent (#1116): an
+     * assertion can be sealed before its CG is registered on-chain. CG
+     * binding happens at publish via `PublishParams.contextGraphId` plus the
+     * separate ACK digest, not by this author signature.
+     *
+     * Replay defense is the one-shot consumption of the author-namespaced
+     * `reservedKaId` (the packed `(uint160(author) << 96) | uint96(number)`
+     * slot) at the `DKGKnowledgeAssets` layer; no `signedAtBlock` window is
+     * included in the digest (see RFC-001 §3.2).
      */
     function _hashAuthorAttestation(
         bytes32 _merkleRoot,

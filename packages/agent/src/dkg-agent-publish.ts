@@ -1205,12 +1205,15 @@ export class PublishMethods extends DKGAgentBase {
     // mints one here at the publish boundary using the publisher
     // fallback signer (legacy `agent.publish(quads)` callers don't
     // carry author identity hints — mode (a) of Phase 4: daemon signs
-    // as itself). The seal binds (chainId, kav10Address,
-    // contextGraphId, merkleRoot, authorAddress); any drift between
-    // the agent-computed merkleRoot and the publisher's recompute
-    // surfaces as the publisher's `expectedMerkleRoot mismatch`
-    // guard. Skip when the chain isn't V10-capable or the CG isn't
-    // on-chain — the publisher will go tentative anyway.
+    // as itself). The seal binds (chainId, kav10Address, merkleRoot,
+    // authorAddress, reservedKaId) — it is CG-independent (#1116); the
+    // CG is bound at publish via PublishParams.contextGraphId + the
+    // separate ACK digest, and the author-namespaced one-shot
+    // reservedKaId is the replay defense. Any drift between the
+    // agent-computed merkleRoot and the publisher's recompute surfaces
+    // as the publisher's `expectedMerkleRoot mismatch` guard. Skip when
+    // the chain isn't V10-capable or the CG isn't on-chain — the
+    // publisher will go tentative anyway.
     let precomputedAttestation: PublishOptions['precomputedAttestation'];
     if (
       onChainId != null &&

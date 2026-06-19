@@ -169,32 +169,26 @@ describe('#1124 end-state: public-CG quorum is REACHED purely via non-member hos
     }
   });
 
-  it('the identity gate is load-bearing — UNREGISTERED host signers are rejected (cannot reach quorum)', async () => {
-    // Proves the wired verifyIdentity actually gates: if the signers are NOT the
-    // registered operational keys for their identities, the collector rejects
-    // every ACK and quorum is unreachable — i.e. the POST-FIX quorum above is
-    // contingent on real registration, not just signature shape. Asserted at the
-    // handler+verifier layer (no full collect()) to avoid the ~31s quorum-fail
-    // retry budget.
-    const { wallets, handlers } = await makeNonMemberCores(3, /* seeded */ true);
-    // Registration map deliberately EMPTY → no signer is registered for any id.
-    const verifyIdentity = async (_addr: string, _id: bigint) => false;
-    const intent = encodePublishIntent({
-      merkleRoot, contextGraphId, publisherPeerId: 'publisher-edge',
-      publicByteSize: Number(publicByteSize), isPrivate: false, kaCount: 1,
-      rootEntities: [], merkleLeafCount,
-    });
-    for (let i = 0; i < handlers.length; i++) {
-      // The host still SIGNS a structurally-valid ACK...
-      const ack = decodeStorageACK(await handlers[i].handler(intent, { toString: () => `host-${i}` }));
-      expect(isStorageACKDecline(ack)).toBe(false);
-      // ...but the production identity gate the collector applies rejects it.
-      const recovered = ethers.recoverAddress(ethers.hashMessage(computePublishACKDigest(
-        TEST_CHAIN_ID, TEST_KAV10_ADDR, cgIdBigInt, merkleRoot, 1n, publicByteSize, 1n, 0n, BigInt(merkleLeafCount),
-      )), { r: ethers.hexlify(ack.coreNodeSignatureR), yParityAndS: ethers.hexlify(ack.coreNodeSignatureVS) });
-      expect(recovered.toLowerCase()).toBe(wallets[i].address.toLowerCase()); // sig is genuine
-      expect(await verifyIdentity(recovered, BigInt(i + 1))).toBe(false);      // but unregistered → rejected
-    }
+  it('the identity gate is load-bearing — the REAL collector cannot reach quorum when no host signer is a registered identity', async () => {
+    // Drives the ACTUAL ACKCollector with verifyIdentity rejecting every signer
+    // (no registration), so the test fails if the collector ever stopped calling
+    // verifyIdentity or ignored its result. The hosts still SIGN valid ACKs, but
+    // identity rejection is non-retryable (not a transient decline), so the
+    // collector settles all peers and fails quorum fast — no ~31s retry budget.
+    const { handlers } = await makeNonMemberCores(3, /* seeded */ true);
+    const peers = handlers.map((_, i) => `host-${i}`);
+    const deps: ACKCollectorDeps = {
+      gossipPublish: async () => {},
+      sendP2P: async (peerId, _protocol, data) => {
+        const idx = parseInt(peerId.replace('host-', ''), 10);
+        return handlers[idx].handler(data, { toString: () => peerId });
+      },
+      getConnectedCorePeers: () => peers,
+      verifyIdentity: async () => false, // no signer is a registered identity
+      log: () => {},
+    };
+    const collector = new ACKCollector(deps);
+    await expect(collector.collect({ ...collectArgs })).rejects.toThrow();
   });
 
   it('PRE-FIX (negative control) — with the plaintext DROPPED (empty SWM) every host DECLINEs NO_DATA, the quorum-blocking signal', async () => {

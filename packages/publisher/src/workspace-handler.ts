@@ -103,25 +103,6 @@ export interface ContextGraphMetaOracleRecord {
  * MUST fall back to NOT emitting an ack (silent best-effort, same
  * as pre-PR-D gossip behaviour).
  */
-/**
- * Structured rejection code for {@link SharedMemoryHandler.verifyHostModeEnvelopeAuthority}.
- * Callers (e.g. the host-mode ingest path's #1124 public-CG exception) key off
- * this stable code rather than the free-form `reason` text, so a wording change
- * to a log message can never silently flip a behavioral branch.
- */
-export type HostModeRejectionCode =
-  | 'DECODE_FAILED'
-  | 'UNSIGNED'
-  | 'NO_AGENT_ALLOWLIST'
-  | 'PEER_NOT_IN_ALLOWLIST'
-  | 'SIG_VERIFY_FAILED'
-  | 'CG_MISMATCH'
-  | 'PUBLISHER_PEER_MISMATCH';
-
-export type HostModeEnvelopeAuthorityVerdict =
-  | { accepted: true }
-  | { accepted: false; reasonCode: HostModeRejectionCode; reason: string };
-
 export type SharedMemoryApplyOutcome =
   | {
       applied: true;
@@ -158,6 +139,25 @@ export type SharedMemoryApplyOutcome =
       insertedTriples?: number;
     }
   | { applied: false; reason: string; retryable: boolean };
+
+/**
+ * Structured rejection code for {@link SharedMemoryHandler.verifyHostModeEnvelopeAuthority}.
+ * Callers (e.g. the host-mode ingest path's #1124 public-CG exception) key off
+ * this stable code rather than the free-form `reason` text, so a wording change
+ * to a log message can never silently flip a behavioral branch.
+ */
+export type HostModeRejectionCode =
+  | 'DECODE_FAILED'
+  | 'UNSIGNED'
+  | 'NO_AGENT_ALLOWLIST'
+  | 'PEER_NOT_IN_ALLOWLIST'
+  | 'SIG_VERIFY_FAILED'
+  | 'CG_MISMATCH'
+  | 'PUBLISHER_PEER_MISMATCH';
+
+export type HostModeEnvelopeAuthorityVerdict =
+  | { accepted: true }
+  | { accepted: false; reasonCode: HostModeRejectionCode; reason: string };
 
 /**
  * Unambiguous composite key for `seenShareOps`.

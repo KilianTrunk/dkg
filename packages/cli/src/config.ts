@@ -101,6 +101,7 @@ export type ResolvedAutoUpdateConfig = AutoUpdateConfig & {
 
 export interface NetworkConfig {
   networkName: string;
+  genesisId: string;
   networkId: string;
   genesisVersion: number;
   relays: string[];

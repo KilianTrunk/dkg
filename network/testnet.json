@@ -1,5 +1,6 @@
 {
   "networkName": "DKG V10 Testnet",
+  "genesisId": "base-testnet",
   "networkId": "7449c543ff04a550b2dafa999fe8ee577a00b212023bb4d4244e8d58a4792c7b",
   "genesisVersion": 1,
   "relays": [

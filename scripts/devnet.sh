@@ -367,6 +367,13 @@ start_oxigraph_servers() {
 }
 
 stop_oxigraph_servers() {
+  # Local daemon-managed oxigraph-server binaries (the `oxigraph-server` backend,
+  # nodes 1-N) are spawned as node children; a SIGKILL'd node can ORPHAN them,
+  # leaving the :79xx port bound so the NEXT `start` dies with "Address already
+  # in use" and those nodes silently fail to boot. Sweep any belonging to THIS
+  # devnet (path-scoped — unrelated oxigraph processes are untouched). Runs
+  # regardless of docker availability (the local binaries are not docker).
+  pkill -f "$DEVNET_DIR/node.*oxigraph/oxigraph" 2>/dev/null || true
   if ! docker_responsive 3; then return 0; fi
   for name in $OXIGRAPH_CONTAINER_5 $OXIGRAPH_CONTAINER_6; do
     if docker inspect "$name" > /dev/null 2>&1; then

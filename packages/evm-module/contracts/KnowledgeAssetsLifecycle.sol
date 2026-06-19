@@ -146,9 +146,14 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     //          weights. No ACK / attestation change — PATCH bump keeps the EIP-712
     //          domain (major.minor "10.1") stable.
     // 10.1.3 — OT-RFC-53: CG registration-deposit consume wired into
-    //          publish / update / extend (escrow-funded portion distributed from
-    //          the CSS vault gross-for-gross; wallet/PCA covers the remainder).
-    //          PATCH bump — no ACK / EIP-712 domain change.
+    //          publish / update / extend (escrow-funded portion drawn from the CSS
+    //          vault; wallet/PCA covers the remainder). PATCH bump — no ACK /
+    //          EIP-712 domain change.
+    // 10.1.4 — OT-RFC-53: the escrow-funded portion now pays the protocol treasury
+    //          fee at consume, at parity with the wallet path's `_addTokens` — net
+    //          distributed to stakers, fee routed out of the CSS vault to the
+    //          treasury via `_chargeEscrowTreasuryFee`. Supersedes 10.1.3's
+    //          gross-for-gross distribution. PATCH bump — no ACK / EIP-712 change.
     string private constant _VERSION = "10.1.4";
 
     /// @notice OT-RFC-49 / WS-B Trap 3: domain-separation version prepended to the

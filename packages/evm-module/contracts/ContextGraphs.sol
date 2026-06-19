@@ -14,6 +14,8 @@ import {ParametersStorage} from "./storage/ParametersStorage.sol";
 import {ConvictionStakingStorage} from "./storage/ConvictionStakingStorage.sol";
 import {EpochStorage} from "./storage/EpochStorage.sol";
 import {Chronos} from "./storage/Chronos.sol";
+import {CGWeightTreeStorage} from "./storage/CGWeightTreeStorage.sol";
+import {ContextGraphValueStorage} from "./storage/ContextGraphValueStorage.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
@@ -61,7 +63,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
  */
 contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable, ReentrancyGuard {
     string private constant _NAME = "ContextGraphs";
-    string private constant _VERSION = "10.0.3";
+    string private constant _VERSION = "10.0.4";
 
     ContextGraphStorage public contextGraphStorage;
 
@@ -247,6 +249,24 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable, Re
     ///         so this only deactivates, credits the epoch pool, and clears the
     ///         per-CG accounting. Never refunds to the depositor.
     function sweepContextGraphEscrow(uint256 contextGraphId) external onlyHubOwner {
+        // RandomSampling invariant (RS leaf-zeroing mandate, see RandomSampling.sol):
+        // retiring a CG must not strand its sampling weight. Settle the CG's leaf to
+        // its TRUE current value first — an abandoned/expired CG (this sweep's target)
+        // settles to 0, so any stale leaf is zeroed before deactivation. A CG that
+        // still holds LIVE value is REFUSED: deactivating a weighted CG strands its
+        // leaf, and past MAX_CG_RETRIES RandomSampling reverts challenge selection.
+        // Gated on the sampling stack being deployed — always true in production; a
+        // minimal deploy without CGWeightTreeStorage has no sampling weight to strand.
+        // Storages resolved at call time (admin-only path; no cached binding to stale).
+        if (hub.isContract("CGWeightTreeStorage")) {
+            CGWeightTreeStorage(hub.getContractAddress("CGWeightTreeStorage")).settle(contextGraphId);
+            if (
+                ContextGraphValueStorage(hub.getContractAddress("ContextGraphValueStorage"))
+                    .getCurrentCGValue(contextGraphId) != 0
+            ) {
+                revert KnowledgeAssetsLib.InvalidContextGraphConfig("CG has live value");
+            }
+        }
         // Atomic retire-then-reclaim: deactivate first so a live CG's prepaid
         // budget can't be drained out from under its owner while the CG stays
         // active (otReviewAgent finding). An already-inactive CG is swept as-is.

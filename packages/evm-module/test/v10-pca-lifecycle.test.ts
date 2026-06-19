@@ -667,6 +667,53 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
   });
 
   // --------------------------------------------------------------------------
+  // OT-RFC-53 — sweep refuses a CG that still holds live value (RS leaf-zeroing
+  // mandate: retiring a weighted CG would strand its RandomSampling leaf)
+  // --------------------------------------------------------------------------
+  it('OT-RFC-53: sweepContextGraphEscrow refuses a CG with live published value', async () => {
+    const Params = await hre.ethers.getContract<ParametersStorage>('ParametersStorage');
+    const deposit = ethers.parseEther('2000');
+    await Params.connect(accounts[0]).setContextGraphRegistrationDeposit(deposit);
+
+    const creator = getDefaultKACreator(accounts);
+    await Token.mint(creator.address, deposit);
+    await Token.connect(creator).approve(await CGFacade.getAddress(), deposit);
+
+    const { cgId, epochs, receivingNodes, publisherIdentityId, receiverIdentityIds } =
+      await setupRegisteredAgentPublish();
+
+    // Publish a KA → the CG now carries live sampling value/weight.
+    const pubAmount = ethers.parseEther('1000');
+    await KAV10.connect(creator).publish(
+      await buildPublishParams({
+        chainId: DEFAULT_CHAIN_ID,
+        kav10Address: await KAV10.getAddress(),
+        receivingNodes,
+        publisherIdentityId,
+        receiverIdentityIds,
+        author: creator,
+        contextGraphId: cgId,
+        merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('rfc53-sweep-live')),
+        knowledgeAssetsAmount: 1,
+        byteSize: 1000,
+        epochs,
+        tokenAmount: pubAmount,
+        isImmutable: false,
+        publishOperationId: 'rfc53-sweep-live-op',
+        reservedKaId: packReservedKaId(creator.address, 1),
+      }),
+    );
+
+    // Sweep is REFUSED while the CG holds live value — deactivating it would strand
+    // its RandomSampling weight. The CG stays active and its escrow intact.
+    await expect(
+      CGFacade.connect(accounts[0]).sweepContextGraphEscrow(cgId),
+    ).to.be.revertedWithCustomError(CGFacade, 'InvalidContextGraphConfig');
+    expect(await CGS.isContextGraphActive(cgId)).to.equal(true);
+    expect(await CGS.getRegistrationEscrow(cgId)).to.equal(deposit - pubAmount);
+  });
+
+  // --------------------------------------------------------------------------
   // 2. registered agent publishes via real KnowledgeAssetsLifecycle.publish()
   // --------------------------------------------------------------------------
   it('takes the discount branch when epochs == lockDurationEpochs and the discounted cost is asserted on chain', async () => {

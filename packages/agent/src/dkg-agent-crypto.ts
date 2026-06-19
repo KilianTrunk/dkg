@@ -386,6 +386,14 @@ export class WorkspaceCryptoMethods extends DKGAgentBase {
     let fallback: (AgentKeyRecord & { privateKey: string }) | null = null;
     for (const record of this.localAgents.values()) {
       if (!record.privateKey) continue;
+      // GH #787 — a node-level key record can carry a privateKey but no (or an
+      // invalid) agentAddress (an operational identity, not an agent). Such a
+      // record is NOT a usable gossip signer: encodeWorkspaceGossipMessage emits
+      // `agentAddress` into the envelope and the downstream host-mode authority
+      // check rejects a missing/invalid one. Skip it entirely — that both avoids
+      // the original `toLowerCase()`-of-undefined crash (HTTP 500 on SWM write)
+      // AND prevents it becoming a fallback that emits an unverifiable envelope.
+      if (!record.agentAddress || !ethers.isAddress(record.agentAddress)) continue;
       const signingRecord = { ...record, privateKey: record.privateKey };
       if (defaultAddress && record.agentAddress.toLowerCase() === defaultAddress) {
         return signingRecord;

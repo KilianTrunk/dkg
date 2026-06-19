@@ -388,6 +388,16 @@ import type { DKGAgent } from './dkg-agent.js';
 
 const DEFAULT_HOST_MODE_RECONCILE_BATCH_SIZE = 32;
 
+/**
+ * Max age (ms) of a cached `publishPolicy` value the host-mode self-signed
+ * admission gate (`isConfirmedPublicForHostMode`) will trust. Deliberately
+ * short: it bounds the open→curated downgrade staleness to a few seconds
+ * (vs the general 60s `ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS`) AND rate-caps the
+ * chain RPC to ~1 per window per CG, so spammed public-plaintext gossip can't
+ * amplify into a per-message `eth_call` (Branimir review #1239 follow-on).
+ */
+const HOST_MODE_PUBLISH_POLICY_MAX_CACHE_AGE_MS = 5_000;
+
 function normalizeHostModeReconcileBatchSize(value: number | undefined): number {
   if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_HOST_MODE_RECONCILE_BATCH_SIZE;
   return Math.max(1, Math.floor(value));
@@ -673,6 +683,48 @@ export class SwmHostModeMethods extends DKGAgentBase {
     if (sub?.onChainId && this.onChainAccessPolicyCache.get(sub.onChainId) === 1) return true;
     try {
       return await this.isPrivateContextGraph(contextGraphId);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * GH #1124 — DEFINITIVE "fully-open CG" check gating the self-signed public
+   * host-mode ingest path. "Open" requires BOTH axes, because this codebase
+   * separates READ visibility from WRITE authority:
+   *   - accessPolicy === 0  → publicly READABLE (SWM is plaintext), AND
+   *   - publishPolicy === 1 → OPEN PUBLISH (anyone may write).
+   * A public-readable but curated-publish CG (accessPolicy 0, publishPolicy 0 /
+   * PCA) still restricts WHO may publish, so the self-signed path must NOT apply
+   * — otherwise any key could store plaintext SWM on host-mode cores and bypass
+   * the on-chain publisher authorization (otReviewAgent #1239-r3). Curated OR
+   * unknown on EITHER axis → false: the conservative ciphertext + allowlist gates
+   * stay in force and a chain-event race heals via member catchup, so a curated
+   * (or restricted-publish) CG is never misclassified as self-publishable.
+   */
+  async isConfirmedPublicForHostMode(this: DKGAgent, contextGraphId: string): Promise<boolean> {
+    // Resolve via the SHARED on-chain policy resolver rather than a direct
+    // cleartext `subscribedContextGraphs` lookup. `getContextGraphOnChainPolicy`
+    // re-keys cleartext↔on-chain-id, consults the cache + local `_meta`, AND
+    // falls back to a direct chain RPC — so it resolves BOTH policies even for a
+    // host-only core keyed by the wire HASH with no local `_meta` (the #1124
+    // sharded topology). Both must positively resolve to their open value; any
+    // undefined (unknown) → false (safe).
+    try {
+      // `publishPolicyMaxCacheAgeMs`: publishPolicy is mutable on-chain and the
+      // general cache is ≤60s-TTL'd, so it could be stale-PERMISSIVE for up to
+      // the TTL after an owner downgrades open→curated publish. This is a
+      // security-positive gate (it admits a self-signed plaintext write that host
+      // catchup later applies under trustedReplay), so it accepts only a SHORT
+      // (~5s) cache window — bounding the downgrade staleness to seconds while
+      // rate-capping the chain RPC to ~1 per window per CG (vs an eth_call on
+      // every admitted envelope). An RPC failure/timeout leaves publishPolicy
+      // undefined → we fail CLOSED (drop; the share heals via retry/catchup
+      // once the policy re-resolves).
+      const { accessPolicy, publishPolicy } = await this.getContextGraphOnChainPolicy(
+        contextGraphId, { publishPolicyMaxCacheAgeMs: HOST_MODE_PUBLISH_POLICY_MAX_CACHE_AGE_MS },
+      );
+      return accessPolicy === 0 && publishPolicy === 1;
     } catch {
       return false;
     }
@@ -1009,33 +1061,57 @@ export class SwmHostModeMethods extends DKGAgentBase {
         isCiphertext = skm.type === SWM_SENDER_KEY_MESSAGE_TYPE;
       } catch { /* fall through */ }
     }
-    if (!isCiphertext) return;
-
-    // Authority check: verify the envelope signature against the
-    // curated CG's agent allowlist. Without this, a topic-reachable
-    // peer can fill per-CG storage with valid-looking ciphertext
-    // and evict legitimate history.
+    // GH #1124 — a curated CG MUST carry ciphertext, so a non-ciphertext
+    // envelope there is garbage → drop early. A CONFIRMED-public (open) CG
+    // legitimately gossips PLAINTEXT SWM. Resolve the public flag and reuse it
+    // for both the plaintext gate and the authority check. UNKNOWN CGs stay on
+    // the drop path (safe; member catchup heals once the policy resolves).
     //
-    // Use `storageCgId` (cleartext from the envelope) so the
-    // member-side meta-graph + chain-fallback resolvers in
-    // `verifyHostModeEnvelopeAuthority` work on the canonical id
-    // shape. The hash subscription key is internal bookkeeping;
-    // never crosses an external authorization boundary.
+    // LAZY by design (Branimir review #1239 follow-on): the self-signed public
+    // exception only matters for `!isCiphertext` traffic. So short-circuit on
+    // `!isCiphertext` to skip the (now chain-backed) policy resolution entirely
+    // on the dominant CIPHERTEXT/curated path — otherwise the bulk of host-mode
+    // traffic would pay a synchronous eth_call to compute a value it discards.
+    // Security-preserving: a ciphertext envelope on a public CG just stays in the
+    // curated authority path / opaque append and heals via catchup.
+    const confirmedPublic = !isCiphertext && await this.isConfirmedPublicForHostMode(storageCgId);
+    if (!isCiphertext && !confirmedPublic) return;
+
+    // Authority check. Curated traffic verifies the envelope signature against
+    // the CG's agent allowlist. For a self-publishable (open) CG, inject the
+    // on-chain policy RESOLVER (not a pre-decided flag): the SHARED verifier
+    // re-checks accessPolicy===0 && publishPolicy===1 itself, then validates the
+    // signature + timestamp-freshness AND binds the inner request to THIS CG —
+    // same envelope validation as curated, only the allowlist decision diverges
+    // (see SharedMemoryHandler.verifyHostModeEnvelopeAuthority).
+    //
+    // Use `storageCgId` (cleartext from the envelope) so the meta-graph +
+    // chain-fallback resolvers work on the canonical id shape.
     const handler = this.getOrCreateSharedMemoryHandler();
-    const verdict = await handler.verifyHostModeEnvelopeAuthority(data, storageCgId, fromPeerId);
+    const verdict = await handler.verifyHostModeEnvelopeAuthority(
+      data, storageCgId, fromPeerId,
+      // Inject the on-chain policy RESOLVER (not a pre-decided flag) so the
+      // verifier enforces accessPolicy===0 && publishPolicy===1 itself and can
+      // take the self-signed path even when a STALE participant allowlist
+      // survives an open-publish flip. Lazy: pass it only for non-ciphertext,
+      // so the dominant ciphertext/curated path pays no chain read (the resolver
+      // shares the same ~5s publishPolicy cache window as the confirmedPublic
+      // resolution above, so this is at most a warm cache hit, never a 2nd RPC).
+      isCiphertext
+        ? undefined
+        : {
+          resolveOpenPublishPolicy: () => this.getContextGraphOnChainPolicy(
+            storageCgId, { publishPolicyMaxCacheAgeMs: HOST_MODE_PUBLISH_POLICY_MAX_CACHE_AGE_MS },
+          ),
+        },
+    );
     if (!verdict.accepted) {
-      // "no agent allowlist" is the expected outcome during the brief
-      // chain-event race window (cores see the beacon, auto-engage
-      // host-mode, then receive ciphertext BEFORE the
-      // `ContextGraphCreated` event lands AND before the curator
-      // beacon arrived). The beaconCuratorOracle fallback closes
-      // most of that window; the remaining race (envelope arrives
-      // before the beacon is received & verified) is recoverable
-      // via member catchup and should not spam WARN logs in steady-
-      // state operation. Other rejection reasons (sig mismatch, peer
-      // not in allowlist, decode failure) remain WARN — those are
-      // real authority failures that operators need to see.
-      const isTransientRace = verdict.reason === 'no agent allowlist on context graph';
+      // 'no agent allowlist' on a NON-public CG is the expected brief chain-event
+      // race (curated allowlist not loaded yet) — recoverable via member catchup,
+      // so log at debug. Every other rejection (decode / unsigned / signature-or-
+      // freshness / peer-not-allowed / CG-mismatch) is a real authority failure
+      // operators should see.
+      const isTransientRace = verdict.reasonCode === 'NO_AGENT_ALLOWLIST';
       if (isTransientRace) {
         this.log.debug(
           ctx,
@@ -1110,6 +1186,64 @@ export class SwmHostModeMethods extends DKGAgentBase {
           );
           return;
         }
+      }
+    }
+    // GH #1124 — make a CONFIRMED-PUBLIC host-only (non-member) core ACK-CAPABLE.
+    // The opaque `append` below retains the raw envelope so this host can serve
+    // member host-catchup (LU-6 replay), but the StorageACKHandler a publisher
+    // dials reads `<cg>/_shared_memory` from `this.store` (loadSWMQuads /
+    // sharedMemoryReadBothFilter) — it has NO path into SwmHostModeStore. So
+    // without ALSO applying the plaintext into that triple-store graph, a
+    // non-member host would still DECLINE `NO_DATA_IN_SWM` and a public CG's
+    // storage-ACK quorum stays unreachable on a host-mode (non-member) topology
+    // — the exact bug this PR claims to fix. Reuse the member apply path
+    // (`handle`) on the SAME, already-authority-verified envelope bytes; for a
+    // public CG it routes the plaintext quads to the per-KA SWM layer the ACK
+    // handler reads (graph-agnostic merkle, no re-skolemize), so the recompute
+    // matches and this host signs a quorum-eligible ACK exactly as a member does.
+    //
+    // SECURITY — the `if (confirmedPublic)` wrapper is the SOLE authority gate
+    // for this apply, and it is LOAD-BEARING: on a host-only core `handle()`
+    // CANNOT distinguish curated from public (a non-member holds no local `_meta`
+    // allowlist nor accessPolicy, so a curated AND a public CG both resolve to
+    // `agentGateAddresses === null` && `hasPrivateAccessPolicy === false`, and
+    // `handle()` would apply plaintext for EITHER). What guarantees this CG is
+    // genuinely public is `isConfirmedPublicForHostMode` — accessPolicy === 0
+    // (immutable) AND a FORCED-fresh publishPolicy === 1 (fail-closed on RPC
+    // error). DO NOT hoist this apply out of the `confirmedPublic` branch or
+    // reuse a `confirmedPublic` resolved further from the apply — either silently
+    // re-opens curated-plaintext injection into a non-member's SWM store.
+    // `verifyHostModeEnvelopeAuthority` already bound sig + 5-min freshness + CG +
+    // `publisherPeerId === fromPeerId` on these exact `data` bytes one block up,
+    // so `handle({ trustedReplay: true })` skips only the transport re-checks it
+    // already performed — for a public CG (agentGateAddresses === null) it skips
+    // no cryptography. Mirrors the catchup-replay call (~line 3575).
+    if (confirmedPublic) {
+      try {
+        const apply = await handler.handle(data, fromPeerId, undefined, { trustedReplay: true });
+        if (apply.applied) {
+          this.log.info(
+            ctx,
+            `Host-mode applied confirmed-public SWM plaintext cg=${storageCgId} triples=${apply.insertedTriples ?? 0} (now ACK-capable)`,
+          );
+        } else {
+          // Apply declined (validation / CAS / dedup). Keep going to the opaque
+          // append so member catchup still works; this host just won't ACK this
+          // share (it falls back to the pre-fix NO_DATA_IN_SWM decline). Logged
+          // at WARN so a SYSTEMATIC public-CG apply failure is observable here
+          // rather than only downstream as quorum-unmet.
+          const reason = 'reason' in apply ? apply.reason : 'unknown';
+          this.log.warn(
+            ctx,
+            `Host-mode confirmed-public SWM apply NOT applied cg=${storageCgId}: ${reason} (host keeps opaque copy for catchup but will DECLINE NO_DATA_IN_SWM on ACK)`,
+          );
+        }
+      } catch (err) {
+        // Never let an apply error drop the opaque retention path below.
+        this.log.warn(
+          ctx,
+          `Host-mode confirmed-public SWM apply threw cg=${storageCgId}: ${err instanceof Error ? err.message : String(err)} (opaque retention below unaffected)`,
+        );
       }
     }
 

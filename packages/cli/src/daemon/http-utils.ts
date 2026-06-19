@@ -100,6 +100,26 @@ export function isPublishQuad(value: unknown): value is PublishQuad {
   );
 }
 
+/**
+ * GH #306 / #787 — shape guard for the WRITE routes (wm/write,
+ * shared-memory/write). Unlike {@link isPublishQuad} the `graph` term is
+ * OPTIONAL here: those routes legitimately accept `{subject,predicate,object}`
+ * and fill the graph internally. Without this guard, a string-shaped quad
+ * (e.g. an N-Quad line `"<s> <p> <o> ."`) slips past a bare `Array.isArray`
+ * check and crashes the agent write path with a TypeError → HTTP 500 instead
+ * of an actionable 4xx.
+ */
+export function isWritableQuad(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v.subject === "string" &&
+    typeof v.predicate === "string" &&
+    typeof v.object === "string" &&
+    (v.graph === undefined || typeof v.graph === "string")
+  );
+}
+
 function validatePublishQuadObjectTerms(
   label: string,
   quads: PublishQuad[],

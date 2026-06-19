@@ -35,6 +35,7 @@ import {
   validateOptionalSubGraphName,
   validateRequiredContextGraphId,
   parsePublishRequestBody,
+  isWritableQuad,
   normalizeContextGraphIdOrUri,
   resolveRequiredWriteContextGraphId,
 } from "../http-utils.js";
@@ -938,6 +939,11 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
     if (layer === "wm") {
       if (verb === "write") {
         if (!Array.isArray(parsed.quads)) return jsonResponse(res, 400, { error: 'Missing "quads"' });
+        // GH #306 — reject string-shaped / malformed quads here (4xx) instead of
+        // letting them crash the agent write path with a TypeError (HTTP 500).
+        if (!parsed.quads.every(isWritableQuad)) {
+          return jsonResponse(res, 400, { error: '"quads" must be an array of { subject, predicate, object } objects (graph optional); string-shaped quads are not accepted' });
+        }
         // A bare write to a name that was never created used to fall through to
         // the legacy `/assertion/{addr}/{name}` graph and produce a KA that is
         // permanently 404 in the descriptor API (no `_meta` lifecycle record,

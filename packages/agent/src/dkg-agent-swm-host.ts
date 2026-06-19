@@ -1154,6 +1154,65 @@ export class SwmHostModeMethods extends DKGAgentBase {
         }
       }
     }
+    // GH #1124 — make a CONFIRMED-PUBLIC host-only (non-member) core ACK-CAPABLE.
+    // The opaque `append` below retains the raw envelope so this host can serve
+    // member host-catchup (LU-6 replay), but the StorageACKHandler a publisher
+    // dials reads `<cg>/_shared_memory` from `this.store` (loadSWMQuads /
+    // sharedMemoryReadBothFilter) — it has NO path into SwmHostModeStore. So
+    // without ALSO applying the plaintext into that triple-store graph, a
+    // non-member host would still DECLINE `NO_DATA_IN_SWM` and a public CG's
+    // storage-ACK quorum stays unreachable on a host-mode (non-member) topology
+    // — the exact bug this PR claims to fix. Reuse the member apply path
+    // (`handle`) on the SAME, already-authority-verified envelope bytes; for a
+    // public CG it routes the plaintext quads to the per-KA SWM layer the ACK
+    // handler reads (graph-agnostic merkle, no re-skolemize), so the recompute
+    // matches and this host signs a quorum-eligible ACK exactly as a member does.
+    //
+    // SECURITY — the `if (confirmedPublic)` wrapper is the SOLE authority gate
+    // for this apply, and it is LOAD-BEARING: on a host-only core `handle()`
+    // CANNOT distinguish curated from public (a non-member holds no local `_meta`
+    // allowlist nor accessPolicy, so a curated AND a public CG both resolve to
+    // `agentGateAddresses === null` && `hasPrivateAccessPolicy === false`, and
+    // `handle()` would apply plaintext for EITHER). What guarantees this CG is
+    // genuinely public is `isConfirmedPublicForHostMode` — accessPolicy === 0
+    // (immutable) AND a FORCED-fresh publishPolicy === 1 (fail-closed on RPC
+    // error). DO NOT hoist this apply out of the `confirmedPublic` branch or
+    // reuse a `confirmedPublic` resolved further from the apply — either silently
+    // re-opens curated-plaintext injection into a non-member's SWM store.
+    // `verifyHostModeEnvelopeAuthority` already bound sig + 5-min freshness + CG +
+    // `publisherPeerId === fromPeerId` on these exact `data` bytes one block up,
+    // so `handle({ trustedReplay: true })` skips only the transport re-checks it
+    // already performed — for a public CG (agentGateAddresses === null) it skips
+    // no cryptography. Mirrors the catchup-replay call (~line 3575).
+    if (confirmedPublic) {
+      try {
+        const apply = await handler.handle(data, fromPeerId, undefined, { trustedReplay: true });
+        if (apply.applied) {
+          this.log.info(
+            ctx,
+            `Host-mode applied confirmed-public SWM plaintext cg=${storageCgId} triples=${apply.insertedTriples ?? 0} (now ACK-capable)`,
+          );
+        } else {
+          // Apply declined (validation / CAS / dedup). Keep going to the opaque
+          // append so member catchup still works; this host just won't ACK this
+          // share (it falls back to the pre-fix NO_DATA_IN_SWM decline). Logged
+          // at WARN so a SYSTEMATIC public-CG apply failure is observable here
+          // rather than only downstream as quorum-unmet.
+          const reason = 'reason' in apply ? apply.reason : 'unknown';
+          this.log.warn(
+            ctx,
+            `Host-mode confirmed-public SWM apply NOT applied cg=${storageCgId}: ${reason} (host keeps opaque copy for catchup but will DECLINE NO_DATA_IN_SWM on ACK)`,
+          );
+        }
+      } catch (err) {
+        // Never let an apply error drop the opaque retention path below.
+        this.log.warn(
+          ctx,
+          `Host-mode confirmed-public SWM apply threw cg=${storageCgId}: ${err instanceof Error ? err.message : String(err)} (opaque retention below unaffected)`,
+        );
+      }
+    }
+
     const seqno = await this.swmHostModeStore.append(storageCgId, data);
     this.log.debug(
       ctx,

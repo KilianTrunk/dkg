@@ -20,7 +20,21 @@ import { ethers } from 'ethers';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { encodeWorkspacePublishRequest } from '@origintrail-official/dkg-core';
+import {
+  encodeWorkspacePublishRequest,
+  encodePublishIntent,
+  decodeStorageACK,
+  isStorageACKDecline,
+  STORAGE_ACK_DECLINE_CODES,
+  computePublishACKDigest,
+  sharedMemoryReadBothFilter,
+  TypedEventBus,
+} from '@origintrail-official/dkg-core';
+import {
+  StorageACKHandler,
+  computeFlatKCRootV10,
+  computeFlatKCMerkleLeafCountV10,
+} from '@origintrail-official/dkg-publisher';
 import { DKGAgent, agentFromPrivateKey, type AgentKeyRecord } from '../../src/index.js';
 import { SwmHostModeStore } from '../../src/swm/host-mode-store.js';
 
@@ -213,5 +227,170 @@ describe('GH #1124 — ingestSwmHostModeEnvelope gate behaviour (signed plaintex
     const env = await g.encodeWorkspaceGossipMessage(cg, plaintextRequest(cg));
     await g.ingestSwmHostModeEnvelope(cg, env, '12D3KooWSomeOtherRelayPeerNotThePublisher');
     expect(await entriesFor(g, cg)).toBe(0);
+  });
+});
+
+/**
+ * GH #1124 END-STATE (otReviewAgent 🔴 round-2 #1239) — admitting the public
+ * plaintext into the host-mode store is necessary but NOT sufficient: the
+ * StorageACKHandler a publisher dials reads `<cg>/_shared_memory` from the
+ * triple store, NOT SwmHostModeStore. So a non-member host that only retains
+ * the opaque envelope still DECLINEs `NO_DATA_IN_SWM` and public-CG quorum
+ * stays unreachable. The fix ALSO applies the plaintext (via the member apply
+ * path) into the SWM graph the ACK handler reads.
+ *
+ * These tests drive the REAL `ingestSwmHostModeEnvelope` end-to-end and then a
+ * REAL `StorageACKHandler` over the SAME agent store — they go RED against the
+ * pre-fix code (which only appended the opaque envelope), unlike a test that
+ * seeds the triple store directly. The negative controls pin that the apply is
+ * gated SOLELY by `isConfirmedPublicForHostMode` (the load-bearing wrapper):
+ * a curated CG (accessPolicy=1) AND a public-READABLE-but-restricted-PUBLISH CG
+ * (accessPolicy=0, publishPolicy=0) both leave `_shared_memory` empty.
+ */
+describe('GH #1124 — a confirmed-public ingest makes a NON-MEMBER host ACK-capable (the quorum bridge)', () => {
+  const tempDirs: string[] = [];
+  const agents: DKGAgent[] = [];
+  afterEach(async () => {
+    await Promise.all(agents.splice(0).map((a) => a.stop().catch(() => {}).then(() => a.store.close().catch(() => {}))));
+    await Promise.all(tempDirs.splice(0).map((d) => rm(d, { recursive: true, force: true })));
+  });
+
+  const PEER = '12D3KooWHostModePublisherPeerForAckTest';
+  const TEST_CHAIN_ID = 31337n;
+  const TEST_KAV10_ADDR = '0x000000000000000000000000000000000000c10a';
+  const NQUAD = '<urn:ack1124:s> <http://schema.org/name> "AckCapable1124" .';
+
+  async function makeHostCore(): Promise<DKGAgent> {
+    const dataDir = await mkdtemp(join(tmpdir(), 'dkg-1124-ack-'));
+    tempDirs.push(dataDir);
+    const core = await DKGAgent.create({ name: 'Ack1124Host', listenHost: '127.0.0.1', dataDir, nodeRole: 'core', swmHostMode: { enabled: true } });
+    agents.push(core);
+    const g = core as unknown as IngestInternals;
+    // Wire the host-mode store explicitly — ingestSwmHostModeEnvelope returns
+    // early when `swmHostModeStore` is unset (it's lazily inited on start()).
+    const store = new SwmHostModeStore({ dataDir: join(dataDir, 'swm-host'), ...SwmHostModeStore.defaultLimits() });
+    await store.init();
+    g.swmHostModeStore = store;
+    const signer = agentFromPrivateKey(ethers.Wallet.createRandom().privateKey, 'signer');
+    g.localAgents.set(signer.agentAddress, signer);
+    g.defaultAgentAddress = signer.agentAddress;
+    return core;
+  }
+
+  // The publish envelope the host receives off gossip (numeric cg — the ACK
+  // digest requires a numeric on-chain id). publisherPeerId === sender so the
+  // anti-spoof bind passes.
+  const publishEnvelope = (g: IngestInternals, cg: string) => g.encodeWorkspaceGossipMessage(cg, encodeWorkspacePublishRequest({
+    contextGraphId: cg,
+    nquads: new TextEncoder().encode(NQUAD),
+    manifest: [{ rootEntity: 'urn:ack1124:s' }],
+    publisherPeerId: PEER,
+    shareOperationId: `op-ack-${cg}`,
+    timestampMs: 1_700_000_000_000,
+  }));
+
+  // Read the SWM graph EXACTLY as StorageACKHandler.loadSWMQuads does.
+  async function readSwmQuads(core: DKGAgent, cg: string) {
+    const swmGraphUri = `did:dkg:context-graph:${cg}/_shared_memory`;
+    const sparql = `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH ?g { ?s ?p ?o } ${sharedMemoryReadBothFilter(swmGraphUri)} }`;
+    const res = await core.store.query(sparql);
+    return res.type === 'quads' ? res.quads : [];
+  }
+
+  function ackHandler(core: DKGAgent, signer: ethers.Wallet) {
+    return new StorageACKHandler(core.store as any, {
+      nodeRole: 'core',
+      nodeIdentityId: 7n,
+      signerWallet: signer,
+      contextGraphSharedMemoryUri: (id: string) => `did:dkg:context-graph:${id}/_shared_memory`,
+      chainId: TEST_CHAIN_ID,
+      kav10Address: TEST_KAV10_ADDR,
+    }, new TypedEventBus() as any);
+  }
+
+  it('CONFIRMED-PUBLIC: real ingest applies plaintext to _shared_memory → host signs a quorum-eligible ACK (not NO_DATA)', async () => {
+    const core = await makeHostCore();
+    const g = core as unknown as IngestInternals;
+    const cg = '4242001';
+    g.getContextGraphOnChainPolicy = async () => ({ accessPolicy: 0, publishPolicy: 1 });
+
+    // The REAL ingest path — NOT a direct store.insert.
+    const env = await publishEnvelope(g, cg);
+    await g.ingestSwmHostModeEnvelope(cg, env, PEER);
+
+    // 1) The plaintext landed in the ACK-readable SWM scope (empty pre-fix).
+    const quads = await readSwmQuads(core, cg);
+    expect(quads.length).toBe(1);
+    expect(quads[0].subject).toBe('urn:ack1124:s');
+    expect(quads[0].object).toContain('AckCapable1124');
+
+    // 2) A REAL StorageACKHandler over the SAME store now signs an ACK. The
+    //    publisher's claimed root = the flat-KC root over those quads (what a
+    //    publisher that published this KA would submit); the host recomputes
+    //    over its applied copy and they match by construction.
+    const merkleRoot = computeFlatKCRootV10(quads, []);
+    const leafCount = computeFlatKCMerkleLeafCountV10(quads, []);
+    const byteSize = new TextEncoder().encode(NQUAD).length;
+    const signer = ethers.Wallet.createRandom();
+    const intent = encodePublishIntent({
+      merkleRoot, contextGraphId: cg, publisherPeerId: PEER,
+      publicByteSize: byteSize, isPrivate: false, kaCount: 1,
+      rootEntities: [], merkleLeafCount: leafCount,
+    });
+    const ack = decodeStorageACK(await ackHandler(core, signer).handler(intent, { toString: () => PEER }));
+
+    expect(isStorageACKDecline(ack)).toBe(false);
+    // The ACK is a real EIP-191 signature over the canonical V10 digest.
+    const digest = computePublishACKDigest(
+      TEST_CHAIN_ID, TEST_KAV10_ADDR, BigInt(cg), merkleRoot,
+      1n, BigInt(byteSize), 1n, 0n, BigInt(leafCount),
+    );
+    const recovered = ethers.recoverAddress(ethers.hashMessage(digest), {
+      r: ethers.hexlify(ack.coreNodeSignatureR instanceof Uint8Array ? ack.coreNodeSignatureR : new Uint8Array(ack.coreNodeSignatureR)),
+      yParityAndS: ethers.hexlify(ack.coreNodeSignatureVS instanceof Uint8Array ? ack.coreNodeSignatureVS : new Uint8Array(ack.coreNodeSignatureVS)),
+    });
+    expect(recovered.toLowerCase()).toBe(signer.address.toLowerCase());
+  });
+
+  it('CURATED (accessPolicy 1): real ingest does NOT apply → _shared_memory empty → StorageACKHandler DECLINEs NO_DATA', async () => {
+    const core = await makeHostCore();
+    const g = core as unknown as IngestInternals;
+    const cg = '4242002';
+    g.getContextGraphOnChainPolicy = async () => ({ accessPolicy: 1, publishPolicy: 0 });
+
+    const env = await publishEnvelope(g, cg);
+    await g.ingestSwmHostModeEnvelope(cg, env, PEER);
+
+    expect((await readSwmQuads(core, cg)).length).toBe(0);
+    const signer = ethers.Wallet.createRandom();
+    const intent = encodePublishIntent({
+      merkleRoot: new Uint8Array(32), contextGraphId: cg, publisherPeerId: PEER,
+      publicByteSize: 10, isPrivate: false, kaCount: 1, rootEntities: ['urn:ack1124:s'],
+    });
+    const ack = decodeStorageACK(await ackHandler(core, signer).handler(intent, { toString: () => PEER }));
+    expect(isStorageACKDecline(ack)).toBe(true);
+    expect(ack.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM);
+  });
+
+  it('PUBLIC READ but RESTRICTED PUBLISH (accessPolicy 0, publishPolicy 0): real ingest does NOT apply → NO_DATA (the #1239-r3 case)', async () => {
+    // The case a naive accessPolicy-only check would miss: readable ≠ self-
+    // publishable. The apply must stay gated on BOTH axes (publishPolicy===1).
+    const core = await makeHostCore();
+    const g = core as unknown as IngestInternals;
+    const cg = '4242003';
+    g.getContextGraphOnChainPolicy = async () => ({ accessPolicy: 0, publishPolicy: 0 });
+
+    const env = await publishEnvelope(g, cg);
+    await g.ingestSwmHostModeEnvelope(cg, env, PEER);
+
+    expect((await readSwmQuads(core, cg)).length).toBe(0);
+    const signer = ethers.Wallet.createRandom();
+    const intent = encodePublishIntent({
+      merkleRoot: new Uint8Array(32), contextGraphId: cg, publisherPeerId: PEER,
+      publicByteSize: 10, isPrivate: false, kaCount: 1, rootEntities: ['urn:ack1124:s'],
+    });
+    const ack = decodeStorageACK(await ackHandler(core, signer).handler(intent, { toString: () => PEER }));
+    expect(isStorageACKDecline(ack)).toBe(true);
+    expect(ack.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM);
   });
 });

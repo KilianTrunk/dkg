@@ -17,30 +17,30 @@ import { ethers } from 'ethers';
 import type { Quad } from '@origintrail-official/dkg-storage';
 
 /**
- * Issue #1124 / PR #1239 — the *end-state* demonstration Branimir asked for.
+ * Issue #1124 / PR #1239 — the COLLECTOR half of the end-state: given the public
+ * plaintext is present in N non-member hosts' SWM, the publisher's quorum is
+ * reachable purely from them.
  *
- * The PR's stated purpose is "public CGs **reach** storage-ACK quorum." The
- * agent-side gate fix (`isConfirmedPublicForHostMode` admitting a self-signed
- * public plaintext on a non-member host) is *necessary*, but the review's open
- * question was whether it is *sufficient*: does the quorum actually become
- * reachable on a host-mode sharded topology whose storage cores are
- * NON-MEMBERS of the CG?
+ * SCOPE — read this with its sibling. The claim "the real host-mode ingest
+ * actually WRITES the public plaintext into `<cg>/_shared_memory` (the graph the
+ * ACK handler reads)" is proved by the agent-side test that drives the REAL
+ * `ingestSwmHostModeEnvelope` end-to-end into a real `StorageACKHandler`:
+ * `packages/agent/test/swm/host-mode-public-ingest-1124.test.ts`
+ * ("a confirmed-public ingest makes a NON-MEMBER host ACK-capable"). THIS test
+ * does NOT drive the ingest path — it seeds the SWM graph directly and isolates
+ * the next link: that the `ACKCollector` reaches quorum from N non-member cores
+ * once their SWM holds the share. (A direct seed alone would stay green even if
+ * ingest never populated `_shared_memory`, which is exactly why the agent-side
+ * real-ingest test — not this one — is the guard for the apply.)
  *
- * That sub-scenario can't be reproduced on a small all-staked devnet, because
- * there every core is a member of every *registered* CG (live: a CG-4 publish
- * reached quorum with every ACK tagged `source=member`, including the
- * host-mode node). So this proves it deterministically at the layer that
- * actually decides quorum, wiring the REAL `ACKCollector` to REAL
- * `StorageACKHandler`s over REAL stores.
- *
- * The load-bearing architectural fact: `StorageACKHandlerConfig` has NO
- * membership input. A core signs a quorum-eligible ACK iff (role=core ∧
- * data-present-in-SWM ∧ merkle-matches ∧ signer-registered) — membership is
- * never consulted. So a non-member host that obtained the public plaintext
- * purely via the #1124 host-mode ingest contributes an ACK identical to a
- * member's. These cores are seeded EXACTLY as the host-mode ingest seeds them:
- * the public plaintext written into `<cg>/_shared_memory` (the same graph
- * `loadSWMQuads` reads). No membership, no on-chain shard assignment.
+ * Why prove it here at the collector layer at all: the NON-member sub-scenario
+ * can't be reproduced on a small all-staked devnet, where every core is a member
+ * of every *registered* CG (live: a CG-4 publish reached quorum with every ACK
+ * tagged `source=member`, including the host-mode node). The load-bearing
+ * architectural fact: `StorageACKHandlerConfig` has NO membership input. A core
+ * signs a quorum-eligible ACK iff (role=core ∧ data-present-in-SWM ∧
+ * merkle-matches ∧ signer-registered) — membership is never consulted, so a
+ * non-member host's ACK is consensus-identical to a member's.
  */
 const TEST_CHAIN_ID = 31337n;
 const TEST_KAV10_ADDR = '0x000000000000000000000000000000000000c10a';
@@ -76,8 +76,11 @@ async function makeNonMemberCores(count: number, seeded: boolean) {
   for (let i = 0; i < count; i++) {
     const store = new OxigraphStore();
     if (seeded) {
-      // EXACTLY what `ingestSwmHostModeEnvelope` writes for a public CG: the
-      // plaintext quads into `<cg>/_shared_memory`. Nothing about membership.
+      // Seed the SWM graph the ACK handler reads. That the REAL host-mode ingest
+      // actually produces this state (writes the public plaintext into
+      // `<cg>/_shared_memory`) is proved separately by the agent-side real-ingest
+      // test (see the file header); here we take it as given and isolate the
+      // collector's quorum behaviour. Nothing about membership.
       await store.insert(publicQuads.map((q) => ({ ...q })));
     }
     const config: StorageACKHandlerConfig = {

@@ -28,7 +28,7 @@ import {
 } from '../typechain';
 import { createProfile, createProfiles } from './helpers/profile-helpers';
 import {
-  getDefaultKCCreator,
+  getDefaultKACreator,
   getDefaultPublishingNode,
   getDefaultReceivingNodes,
 } from './helpers/setup-helpers';
@@ -37,7 +37,7 @@ import {
   buildUpdateParams,
   packReservedKaId,
   DEFAULT_CHAIN_ID,
-} from './helpers/v10-kc-helpers';
+} from './helpers/v10-ka-helpers';
 
 const COMMITTED_TRAC = ethers.parseEther('50000'); // 20% discount tier
 const EXPECTED_DISCOUNT_BPS = 2000n;
@@ -178,7 +178,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
   // 1. create → topUp → registerAgent → deregisterAgent → settle
   // --------------------------------------------------------------------------
   it('asserts on-chain state across create/topUp/registerAgent/deregisterAgent/settle', async () => {
-    const creator = getDefaultKCCreator(accounts);
+    const creator = getDefaultKACreator(accounts);
     const agent = accounts[8];
     const stranger = accounts[7];
 
@@ -290,7 +290,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
       );
     }
 
-    const creator = getDefaultKCCreator(accounts);
+    const creator = getDefaultKACreator(accounts);
     const accountId = await createAccountFor(creator);
     await NFT.connect(creator).registerAgent(accountId, creator.address);
     expect(await NFT.agentToAccountId(creator.address)).to.equal(accountId);
@@ -353,7 +353,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     // Fund the creator's deposit allowance to the CG facade BEFORE setup —
     // `setupRegisteredAgentPublish` creates the CG as the creator, which now
     // pulls the deposit.
-    const creator = getDefaultKCCreator(accounts);
+    const creator = getDefaultKACreator(accounts);
     await Token.mint(creator.address, deposit);
     await Token.connect(creator).approve(await CGFacade.getAddress(), deposit);
 
@@ -424,7 +424,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     const deposit = ethers.parseEther('2000'); // large enough to survive a publish + cover the extend
     await Params.connect(accounts[0]).setContextGraphRegistrationDeposit(deposit);
 
-    const creator = getDefaultKCCreator(accounts);
+    const creator = getDefaultKACreator(accounts);
     await Token.mint(creator.address, deposit);
     await Token.connect(creator).approve(await CGFacade.getAddress(), deposit);
 
@@ -540,7 +540,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     }
     expect(activeSinkSum).to.equal(expectedDiscounted);
 
-    // KC records the FULL tokenAmount; only the staker-pool distribution is
+    // KA records the FULL tokenAmount; only the staker-pool distribution is
     // discounted — the on-chain proof the discount branch (not direct
     // spend) executed. OT-RFC-43 Option 1 (1a): the minted kaId equals the
     // packed reservedKaId we supplied (ids are no longer globally sequential).
@@ -562,11 +562,11 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
   // agent. The registered agent here was only ever funded for the up-front
   // `committedTRAC` (consumed by createAccount) and never approved KAV10
   // for a direct spend, so the post-expiry publish reverts with
-  // `TooLowAllowance` and no KC is created (atomic rollback). The same
+  // `TooLowAllowance` and no KA is created (atomic rollback). The same
   // agent publishing the SAME unfunded params BEFORE expiry succeeds via
   // the NFT-funded discount branch (asserted in test 2) — the revert is
   // expiry-driven, not a missing-approval artifact.
-  it('expired account: real publish() drops the discount, reverts TooLowAllowance, creates no KC', async () => {
+  it('expired account: real publish() drops the discount, reverts TooLowAllowance, creates no KA', async () => {
     const {
       creator,
       accountId,
@@ -610,7 +610,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
       KAV10.connect(creator).publish(p),
     ).to.be.revertedWithCustomError(KAV10, 'TooLowAllowance');
 
-    // Atomic rollback: the expired publish minted no knowledge collection.
+    // Atomic rollback: the expired publish minted no knowledge asset.
     // OT-RFC-43 Option 1 (1a): `getLatestKnowledgeAssetId` is deprecated (it
     // reverts), so we assert the reserved id was never minted — `ownerOf`
     // reverts on a non-existent token.
@@ -620,11 +620,11 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
   });
 
   // --------------------------------------------------------------------------
-  // 4. Greenfield KA invariants (KC→KA rename / PR #815)
+  // 4. Greenfield KA invariants (KA→KA rename / PR #815)
   // --------------------------------------------------------------------------
   //
   // These guard the core economic + ownership invariants of the greenfield
-  // Knowledge Asset model that the KC→KA rename re-plumbed. Before this
+  // Knowledge Asset model that the KA→KA rename re-plumbed. Before this
   // block the `KnowledgeAssetsLifecycle.publish` negatives (one-KA-per-tx,
   // strict-positive token floor) and the owner-sealed update gate had no
   // direct on-chain coverage — only happy-path publishes were exercised, so
@@ -1397,7 +1397,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
   // --------------------------------------------------------------------------
   // 7. OT-RFC-43 Option 1 (variant 1a) — caller-supplied, author-namespaced
   //    KA ids (§B5). The KA id is now a deterministic packed value
-  //    `(uint160(author) << 96) | uint96(number)` chosen off-chain. KCS
+  //    `(uint160(author) << 96) | uint96(number)` chosen off-chain. KAS
   //    enforces `(reservedKaId >> 96) == author` (the EIP-712 attestation
   //    signer / NFT mint recipient, NOT msg.sender) so a wallet can only mint
   //    in its own namespace; a re-used id reverts (no silent clobber); the old

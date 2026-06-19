@@ -152,7 +152,7 @@ const PINNED_DIGESTS: Record<string, string> = {
   // ContextGraphEscrowSwept + deposit accounting on ContextGraphs/ContextGraphStorage;
   // +contextGraphRegistrationDeposit getter/setter on ParametersStorage. Chain-local
   // ABIs refreshed in lockstep with evm-module/abi.
-  KnowledgeAssetsLifecycle:     'e382ff3b33acd5f1e18acd7bfe48caa445c6e1aaa99f6556a684035b8208b846',
+  KnowledgeAssetsLifecycle:     '409efa6a580e3d374c0f53c70cd21dd6e78cd904b2f103edc9737803f0829820',
 
   // Re-pinned for OT-RFC-43 Option-1 (variant 1a, PR #975): deterministic
   // author-namespaced KA identity. `createKnowledgeAsset` now takes an explicit
@@ -185,8 +185,11 @@ const PINNED_DIGESTS: Record<string, string> = {
   // identifier so hosting cores can derive the SWM gossip topic directly
   // from chain events — no off-chain discovery channel required for
   // registered CGs.
+  // Merged surface: OT-RFC-53 deposit events/functions + main's KC→KA getter
+  // rename (getContextGraphKCCount/At/List → getContextGraphKaCount/At/List).
+  // Digests recomputed post-merge from the combined ABI.
   ContextGraphs:                '54583e20167c37f4356247cb6bc657b0dccf6f17f99a3267427674a35a151bcf',
-  ContextGraphStorage:          'b850ffc2ac00daf3f9667ec73d8a36ea59648db3c60829faf4dfb036c3a54aa0',
+  ContextGraphStorage:          '29f1746bf6d82dfea40eb0365c9a664994c56b63c4a98d99962cd9b61c1df37a',
   // Identity / staking — consulted on every publish.
   Hub:                          '36976cc71bb87963b8b715791b32e4eb6b7bb85c712998afd6184221289a506b',
   Identity:                     'ca39efe9bd9ec4fd8ae67dccdf9eb888bf91232341c3a56216624477620ff4d8',
@@ -259,7 +262,9 @@ const PINNED_DIGESTS: Record<string, string> = {
   // Updated OT-RFC-51: see the conviction-pin note above — createAccount arity,
   // setPrimaryNode/ZeroPrimaryNode/PrimaryNodeUnchanged/moveEpochPublishingAllocation,
   // widened Account tuple, realized-publish credit removed / publishingAllocation rename.
-  PublishingConviction:         '6ad9aa97f4c049c126f302658257363a097ae4fdcc1a12f7d084082f81b44b07',
+  // Repinned: KC→KA rename of error InvalidConvictionKcEpochs → InvalidConvictionKaEpochs
+  // (error selector change; contract bumped to 10.0.5).
+  PublishingConviction:         'a4d44a594509e508091b1f91adfb1d68bec65e38e497f054116493af327ff096',
   // Updated OT-RFC-51: storage surface for the above — primaryNode field on the
   // widened Account tuple + the seeded per-epoch publishing allocation getters.
   PublishingConvictionStorage:  '7eeae71f0efd9183fce232ccc669227dfd70fe4f93b4663392a0a52c1ccba859',

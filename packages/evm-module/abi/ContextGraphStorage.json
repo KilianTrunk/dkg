@@ -886,7 +886,7 @@
         "type": "uint256"
       }
     ],
-    "name": "getContextGraphKCAt",
+    "name": "getContextGraphKaAt",
     "outputs": [
       {
         "internalType": "uint256",
@@ -905,7 +905,7 @@
         "type": "uint256"
       }
     ],
-    "name": "getContextGraphKCCount",
+    "name": "getContextGraphKaCount",
     "outputs": [
       {
         "internalType": "uint256",
@@ -924,7 +924,7 @@
         "type": "uint256"
       }
     ],
-    "name": "getContextGraphKCList",
+    "name": "getContextGraphKaList",
     "outputs": [
       {
         "internalType": "uint256[]",

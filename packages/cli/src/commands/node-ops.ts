@@ -22,7 +22,7 @@ import {
   loadConfig, saveConfig, configExists, configPath,
   readPid, readApiPort, isProcessRunning, dkgDir, logPath, ensureDkgDir, removeApiPort,
   apiPortPath,
-  loadNetworkConfig, loadProjectConfig, resolveAutoUpdateConfig, resolveAutoUpdateSource, resolveChainConfig,
+  loadNetworkConfig, loadProjectConfig, resolveAutoUpdateConfig, resolveAutoUpdateSource, resolveChainConfig, resolveReadyChainConfig,
   releasesDir, activeSlot, swapSlot,
   slotEntryPoint, isStandaloneInstall, repoDir, isDkgMonorepo,
   resolveContextGraphs, resolveNetworkDefaultContextGraphs,
@@ -236,7 +236,7 @@ program
         process.exit(1);
       }
 
-      const chainResolved = resolveChainConfig(config, network);
+      const chainResolved = resolveReadyChainConfig(config, network);
       const rpcUrl = chainResolved?.rpcUrl;
       const hubAddress = chainResolved?.hubAddress;
       if (!rpcUrl || !hubAddress) {

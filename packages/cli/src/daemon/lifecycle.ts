@@ -733,8 +733,10 @@ type StartupGenesisValidation =
   | { ok: true; networkId: string }
   | { ok: false; networkId: string; messages: string[] };
 
+type StartupGenesisValidationInput = Partial<Pick<NetworkConfig, '_status' | 'genesisId' | 'networkId' | 'networkName' | 'relays'>>;
+
 export async function validateStartupGenesis(
-  network: Pick<NetworkConfig, '_status' | 'genesisId' | 'networkId' | 'networkName' | 'relays'> | null | undefined,
+  network: StartupGenesisValidationInput | null | undefined,
 ): Promise<StartupGenesisValidation> {
   const networkId = await computeNetworkId(network?.genesisId);
   const readiness = validateNetworkConfigReadiness(network);

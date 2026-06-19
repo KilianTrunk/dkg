@@ -27,6 +27,7 @@ import {
   resolveAutoUpdateSource,
   resolveApprovalPolicy,
   resolveChainConfig,
+  resolveReadyChainConfig,
 } from '../src/config.js';
 
 describe('classifyMonorepoInit (dkg init monorepo home guard — issue #960)', () => {
@@ -569,8 +570,19 @@ describe('resolveChainConfig (field-level merge)', () => {
     });
   });
 
-  it('refuses to resolve chain defaults from a pre-deployment network', () => {
-    expect(() => resolveChainConfig({}, {
+  it('keeps raw chain merging side-effect-free for pre-deployment network metadata', () => {
+    const merged = resolveChainConfig({}, {
+      _status: 'pre-deployment: replace PEER_ID_* relay values before enabling Base mainnet',
+      networkName: 'DKG V10 Base Mainnet',
+      relays: ['/ip4/178.105.87.39/tcp/9090/p2p/PEER_ID_SOLARIS'],
+      chain: fullNetworkChain,
+    });
+
+    expect(merged?.hubAddress).toBe(fullNetworkChain.hubAddress);
+  });
+
+  it('refuses ready chain resolution from a pre-deployment network', () => {
+    expect(() => resolveReadyChainConfig({}, {
       _status: 'pre-deployment: replace PEER_ID_* relay values before enabling Base mainnet',
       networkName: 'DKG V10 Base Mainnet',
       relays: ['/ip4/178.105.87.39/tcp/9090/p2p/PEER_ID_SOLARIS'],

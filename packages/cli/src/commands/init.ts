@@ -23,7 +23,7 @@ import {
   loadConfig, saveConfig, configExists, configPath,
   readPid, readApiPort, isProcessRunning, dkgDir, logPath, ensureDkgDir, removeApiPort,
   apiPortPath,
-  loadNetworkConfig, loadProjectConfig, resolveAutoUpdateConfig, resolveAutoUpdateSource, resolveChainConfig,
+  loadNetworkConfig, loadProjectConfig, resolveAutoUpdateConfig, resolveAutoUpdateSource, resolveChainConfig, validateNetworkConfigReadiness,
   releasesDir, activeSlot, swapSlot,
   slotEntryPoint, isStandaloneInstall, repoDir, isDkgMonorepo, classifyMonorepoInit, sharedHomeInitGate,
   resolveContextGraphs, resolveNetworkDefaultContextGraphs,
@@ -196,6 +196,11 @@ program
     await ensureDkgDir();
     const existing = await loadConfig();
     const network = await loadNetworkConfig();
+    const readiness = validateNetworkConfigReadiness(network);
+    if (!readiness.ok) {
+      for (const message of readiness.messages) console.error(message);
+      process.exit(1);
+    }
     const rl = createInterface({ input: process.stdin, output: process.stdout });
     const ask = (q: string, def?: string): Promise<string> =>
       new Promise(resolve => {

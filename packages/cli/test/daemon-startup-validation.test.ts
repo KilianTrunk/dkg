@@ -6,6 +6,7 @@ import { computeNetworkId } from '../../core/src/genesis.js';
 
 const mocks = vi.hoisted(() => ({
   agentCreate: vi.fn(),
+  loadOpWallets: vi.fn(),
   loadNetworkConfig: vi.fn(),
 }));
 
@@ -14,7 +15,7 @@ vi.mock('@origintrail-official/dkg-agent', async importOriginal => {
   return {
     ...actual,
     DKGAgent: { create: mocks.agentCreate },
-    loadOpWallets: vi.fn(),
+    loadOpWallets: mocks.loadOpWallets,
     KaNumberAllocator: class KaNumberAllocator {},
   };
 });
@@ -39,6 +40,7 @@ describe('daemon startup network validation', () => {
 
   afterEach(async () => {
     vi.restoreAllMocks();
+    vi.clearAllMocks();
     process.stdout.write = stdoutWrite;
     process.stderr.write = stderrWrite;
     process.removeAllListeners('uncaughtException');
@@ -96,5 +98,39 @@ describe('daemon startup network validation', () => {
     expect(stdoutSpy.mock.calls.map(call => String(call[0])).join('')).toContain(
       'FATAL: network config DKG V10 Base Mainnet is marked pre-deployment',
     );
+  });
+
+  it('passes the selected network genesis id into agent creation', async () => {
+    tempHome = await mkdtemp(join(tmpdir(), 'dkg-genesis-startup-'));
+    originalDkgHome = process.env.DKG_HOME;
+    process.env.DKG_HOME = tempHome;
+    stdoutWrite = process.stdout.write;
+    stderrWrite = process.stderr.write;
+    uncaughtExceptionListeners = process.listeners('uncaughtException') as NodeJS.UncaughtExceptionListener[];
+    unhandledRejectionListeners = process.listeners('unhandledRejection') as NodeJS.UnhandledRejectionListener[];
+
+    const networkId = await computeNetworkId('gnosis-mainnet');
+    mocks.loadNetworkConfig.mockResolvedValue({
+      networkName: 'DKG V10 Gnosis Mainnet',
+      genesisId: 'gnosis-mainnet',
+      networkId,
+      genesisVersion: 1,
+      relays: [],
+      defaultNodeRole: 'edge',
+    });
+    mocks.loadOpWallets.mockResolvedValue({ adminWallet: undefined, wallets: [] });
+    mocks.agentCreate.mockRejectedValue(new Error('after-agent-create'));
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+    await expect(runDaemonInner(true, {
+      name: 'genesis-startup-test',
+      listenPort: 0,
+      nodeRole: 'edge',
+    } as any, Date.now())).rejects.toThrow('after-agent-create');
+
+    expect(mocks.agentCreate).toHaveBeenCalledTimes(1);
+    expect(mocks.agentCreate.mock.calls[0]?.[0]).toMatchObject({
+      genesisId: 'gnosis-mainnet',
+    });
   });
 });

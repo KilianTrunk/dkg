@@ -30,6 +30,18 @@ const GENESIS_NETWORKS = {
     createdAt: '2026-06-20T00:00:00Z',
     systemContextGraphs: [GENESIS_AGENTS_GRAPH, GENESIS_ONTOLOGY_GRAPH],
   },
+  'gnosis-mainnet': {
+    subject: 'did:dkg:network:gnosis-mainnet',
+    name: 'DKG V10 Gnosis Mainnet',
+    createdAt: '2026-06-20T00:00:00Z',
+    systemContextGraphs: [GENESIS_AGENTS_GRAPH, GENESIS_ONTOLOGY_GRAPH],
+  },
+  'neuroweb-mainnet': {
+    subject: 'did:dkg:network:neuroweb-mainnet',
+    name: 'DKG V10 NeuroWeb Mainnet',
+    createdAt: '2026-06-20T00:00:00Z',
+    systemContextGraphs: [GENESIS_AGENTS_GRAPH, GENESIS_ONTOLOGY_GRAPH],
+  },
 } satisfies Record<string, GenesisNetworkDefinition>;
 
 export type GenesisId = keyof typeof GENESIS_NETWORKS;

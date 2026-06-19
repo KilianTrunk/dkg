@@ -37,7 +37,7 @@ describe('#1116 share/seal route error mapping (fake agent)', () => {
     }
   });
 
-  async function startWith(assertion: Record<string, unknown>) {
+  async function startWith(assertion: Record<string, unknown>, agentOverrides: Record<string, unknown> = {}) {
     const agent = {
       async listContextGraphs() {
         return [{
@@ -53,6 +53,9 @@ describe('#1116 share/seal route error mapping (fake agent)', () => {
       },
       resolveAgentByToken: () => undefined,
       assertion,
+      // Agent-level methods (e.g. publishFromFinalizedAssertion /
+      // ensureRegisteredForPublish for the vm/publish path) — opt-in per test.
+      ...agentOverrides,
     };
     server = createServer(async (req, res) => {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
@@ -247,6 +250,84 @@ describe('#1116 share/seal route error mapping (fake agent)', () => {
       const res = await post('swm/share-async', { contextGraphId: CG_ID, skipSeal: false });
       expect(res.status).toBe(200);
       expect(res.body.jobId).toBe('job-123');
+    });
+  });
+
+  // #1116 follow-up (reviewer 🟡 #2): the /vm/publish auto-register branch must
+  // complete the register-then-RETRY sequence — publishFromFinalizedAssertion
+  // throws CG_NOT_REGISTERED, the route registers ONCE, then RE-CALLS
+  // publishFromFinalizedAssertion and returns THAT result. The live-daemon test
+  // can only assert "5xx + not 'not registered'", which a regression that
+  // registers then fails-before-retry would still pass. This pins the exact
+  // call order with a fake agent.
+  describe('vm/publish auto-register retry sequence', () => {
+    it('on CG_NOT_REGISTERED: registers ONCE between TWO publish calls and returns the retry result', async () => {
+      const calls: string[] = [];
+      let publishCount = 0;
+
+      await startWith(
+        {}, // no `assertion` methods needed for vm/publish
+        {
+          async publishFromFinalizedAssertion(_cg: string, _name: string, _opts: unknown) {
+            publishCount += 1;
+            calls.push(`publish#${publishCount}`);
+            if (publishCount === 1) {
+              // First attempt: the CG isn't registered on-chain yet.
+              throw Object.assign(
+                new Error(`Context graph "${CG_ID}" is not registered on-chain. Run 'dkg context-graph register' first.`),
+                { code: 'CG_NOT_REGISTERED' },
+              );
+            }
+            // Retry (after register): confirmed publish.
+            return { status: 'confirmed', ual: 'did:dkg:test/1/42', kaId: '42', seal: { authorAddress: '0x00000000000000000000000000000000000000a1' } };
+          },
+          async ensureRegisteredForPublish(_cg: string, _opts: unknown) {
+            calls.push('register');
+            // success — the CG is now registered.
+          },
+        },
+      );
+
+      const res = await post('vm/publish', { contextGraphId: CG_ID });
+
+      // Exact call order: publish (throws) → register (once) → publish (succeeds).
+      expect(calls).toEqual(['publish#1', 'register', 'publish#2']);
+      expect(publishCount).toBe(2);
+      expect(calls.filter((c) => c === 'register').length).toBe(1);
+
+      // The response reflects the SECOND (success) call, NOT the first 409.
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('confirmed');
+      expect(res.body.ual).toBe('did:dkg:test/1/42');
+      expect(String(res.body.error ?? '')).not.toMatch(/not registered on-chain/i);
+    });
+
+    it('if auto-register itself fails, returns 400 and does NOT retry the publish', async () => {
+      const calls: string[] = [];
+      let publishCount = 0;
+
+      await startWith(
+        {},
+        {
+          async publishFromFinalizedAssertion() {
+            publishCount += 1;
+            calls.push(`publish#${publishCount}`);
+            throw Object.assign(new Error(`Context graph "${CG_ID}" is not registered on-chain.`), { code: 'CG_NOT_REGISTERED' });
+          },
+          async ensureRegisteredForPublish() {
+            calls.push('register');
+            throw new Error('insufficient TRAC to register context graph');
+          },
+        },
+      );
+
+      const res = await post('vm/publish', { contextGraphId: CG_ID });
+
+      // Only ONE publish attempt — no retry after a failed register.
+      expect(calls).toEqual(['publish#1', 'register']);
+      expect(publishCount).toBe(1);
+      expect(res.status).toBe(400);
+      expect(String(res.body.error)).toMatch(/could not be auto-registered on-chain/i);
     });
   });
 });

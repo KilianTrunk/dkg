@@ -143,6 +143,13 @@ describe('getGenesisRaw', () => {
     expect(raw).toContain('did:dkg:context-graph:agents');
     expect(raw).toContain('did:dkg:context-graph:ontology');
   });
+
+  it('returns selected mainnet Genesis Data as TriG', () => {
+    const raw = getGenesisRaw('gnosis-mainnet');
+    expect(raw).toContain('<did:dkg:network:gnosis-mainnet>');
+    expect(raw).toContain('schema:name "DKG V10 Gnosis Mainnet"');
+    expect(raw).toContain('dkg:createdAt "2026-06-20T00:00:00Z"^^xsd:dateTime');
+  });
 });
 
 describe('SYSTEM_CONTEXT_GRAPHS', () => {

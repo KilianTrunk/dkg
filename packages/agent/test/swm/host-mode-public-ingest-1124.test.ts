@@ -184,4 +184,19 @@ describe('GH #1124 — ingestSwmHostModeEnvelope gate behaviour (signed plaintex
     expect(await entriesFor(g, cgEnvelope)).toBe(0);
     expect(await entriesFor(g, cgInner)).toBe(0);
   });
+
+  it('PUBLIC but inner publisherPeerId names a DIFFERENT peer than the sender: DROPPED (no publisher spoof)', async () => {
+    // Host catchup later applies stored entries with trustedReplay (skipping the
+    // publisherPeerId↔sender binding), so it must be enforced at ingest: a peer
+    // relaying an honestly-signed envelope whose inner publisherPeerId names
+    // ANOTHER peer must NOT be stored (otherwise catchup applies it under the
+    // spoofed publisher/ownership identity).
+    const g = (await makeHostCore()) as unknown as IngestInternals;
+    const cg = 'cg-ingest-spoof';
+    g.getContextGraphOnChainPolicy = async () => ({ accessPolicy: 0, publishPolicy: 1 });
+    // plaintextRequest(cg) sets publisherPeerId = PEER; deliver it from a DIFFERENT sender.
+    const env = await g.encodeWorkspaceGossipMessage(cg, plaintextRequest(cg));
+    await g.ingestSwmHostModeEnvelope(cg, env, '12D3KooWSomeOtherRelayPeerNotThePublisher');
+    expect(await entriesFor(g, cg)).toBe(0);
+  });
 });

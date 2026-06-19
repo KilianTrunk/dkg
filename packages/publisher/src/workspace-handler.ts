@@ -115,7 +115,8 @@ export type HostModeRejectionCode =
   | 'NO_AGENT_ALLOWLIST'
   | 'PEER_NOT_IN_ALLOWLIST'
   | 'SIG_VERIFY_FAILED'
-  | 'CG_MISMATCH';
+  | 'CG_MISMATCH'
+  | 'PUBLISHER_PEER_MISMATCH';
 
 export type HostModeEnvelopeAuthorityVerdict =
   | { accepted: true }
@@ -1377,13 +1378,28 @@ export class SharedMemoryHandler {
       if (!selfConsistent) {
         return { accepted: false, reasonCode: 'SIG_VERIFY_FAILED', reason: 'public-CG envelope failed signature/freshness verification' };
       }
-      // Bind the inner request to THIS CG: the apply/catchup path derives the
-      // target from `request.contextGraphId`, so an envelope signed for CG-A
-      // carrying a payload for CG-B must NOT be stored under A (cross-CG
-      // injection on the open host-mode topic). The plaintext request is always
-      // decoded for a public envelope (`decoded.request`).
-      if (request && request.contextGraphId !== contextGraphId) {
+      // A public self-signed host-mode entry is later applied via host catchup
+      // with `trustedReplay` (which SKIPS the publisherPeerId↔sender transport
+      // binding at apply time — see the `!trustedReplay && publisherPeerId !==
+      // fromPeerId` guard below). So bind it HERE, before it is ever stored:
+      //   1. REQUIRE a decoded WorkspacePublishRequest — a ciphertext / garbage
+      //      payload has no verifiable inner identity, so reject it (don't fall
+      //      through to accept as the prior `request && …` check did).
+      //   2. Bind the inner request to THIS CG (the apply path derives the target
+      //      from `request.contextGraphId`) — block cross-CG injection on the
+      //      open host-mode topic.
+      //   3. Bind `request.publisherPeerId` to the actual sender. Without this a
+      //      peer could relay an honestly-signed public envelope naming a
+      //      DIFFERENT publisherPeerId and have catchup apply the write under that
+      //      spoofed publisher/ownership identity (otReviewAgent #1239-r4).
+      if (!request) {
+        return { accepted: false, reasonCode: 'CG_MISMATCH', reason: 'public-CG envelope carries no decodable WorkspacePublishRequest' };
+      }
+      if (request.contextGraphId !== contextGraphId) {
         return { accepted: false, reasonCode: 'CG_MISMATCH', reason: `inner request contextGraphId "${request.contextGraphId}" != envelope CG "${contextGraphId}"` };
+      }
+      if (request.publisherPeerId !== fromPeerId) {
+        return { accepted: false, reasonCode: 'PUBLISHER_PEER_MISMATCH', reason: `public-CG inner publisherPeerId "${request.publisherPeerId}" does not match sender "${fromPeerId}"` };
       }
       return { accepted: true };
     }

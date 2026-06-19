@@ -143,8 +143,31 @@ describe('loadNetworkConfig', () => {
     expect(config.networkName).toMatch(/testnet/i);
   });
 
-  it('keeps mainnet chain targets as placeholders until distinct genesis and relays exist', async () => {
+  it('loads mainnet prep configs without activating testnet genesis or relays', async () => {
     const { _resetNetworkConfigCache } = await import('../src/config.js');
+    const testnetNetworkId = '7449c543ff04a550b2dafa999fe8ee577a00b212023bb4d4244e8d58a4792c7b';
+    const sharedMainnetPrep = {
+      networkName: 'DKG V10 Mainnet',
+      networkId: 'PLACEHOLDER_MAINNET_NETWORK_ID',
+      genesisVersion: 1,
+      relays: [
+        '/ip4/178.105.87.39/tcp/9090/p2p/PEER_ID_SOLARIS',
+        '/ip4/178.105.105.102/tcp/9090/p2p/PEER_ID_LUNARIS',
+        '/ip4/178.156.214.4/tcp/9090/p2p/PEER_ID_ORIONIS',
+        '/ip4/178.105.111.185/tcp/9090/p2p/PEER_ID_KEPLER',
+      ],
+      defaultContextGraphs: [],
+      defaultNodeRole: 'edge',
+      autoUpdate: {
+        enabled: true,
+        repo: 'OriginTrail/dkg',
+        branch: 'main',
+        checkIntervalMinutes: 5,
+      },
+    };
+    _resetNetworkConfigCache();
+    const testnetConfig = await loadNetworkConfig('testnet');
+    const testnetRelays = testnetConfig?.relays ?? [];
     const mainnets = [
       {
         name: 'mainnet-base',
@@ -174,17 +197,22 @@ describe('loadNetworkConfig', () => {
       const config = await loadNetworkConfig(expected.name);
       expect(config).not.toBeNull();
       const cfg = config! as any;
-      expect(cfg._status).toMatch(/distinct mainnet genesis networkId and relay peer IDs/);
-      expect(cfg.networkName).toBeUndefined();
-      expect(cfg.networkId).toBeUndefined();
-      expect(cfg.genesisVersion).toBeUndefined();
-      expect(cfg.relays).toBeUndefined();
-      expect(cfg.defaultNodeRole).toBeUndefined();
-      expect(cfg.defaultContextGraphs).toBeUndefined();
-      expect(cfg.autoUpdate).toEqual({
-        enabled: true,
-        branch: 'main',
-      });
+      expect(cfg._status).toMatch(/replace PLACEHOLDER_MAINNET_NETWORK_ID and PEER_ID_\*/);
+      expect(cfg.networkId).not.toBe(testnetNetworkId);
+      expect(cfg.relays).not.toEqual(testnetRelays);
+      expect({
+        networkName: cfg.networkName,
+        networkId: cfg.networkId,
+        genesisVersion: cfg.genesisVersion,
+        relays: cfg.relays,
+        defaultContextGraphs: cfg.defaultContextGraphs,
+        defaultNodeRole: cfg.defaultNodeRole,
+        autoUpdate: cfg.autoUpdate,
+      }).toEqual(sharedMainnetPrep);
+      for (const relay of cfg.relays) {
+        expect(relay).toMatch(/^\/ip4\/178\./);
+        expect(relay).toMatch(/\/p2p\/PEER_ID_/);
+      }
       expect(cfg.chain).toEqual({
         name: expected.chainName,
         type: 'evm',

@@ -1,5 +1,16 @@
 {
-  "_status": "pre-deployment: distinct mainnet genesis networkId and relay peer IDs must be set before enabling Gnosis mainnet",
+  "_status": "pre-deployment: replace PLACEHOLDER_MAINNET_NETWORK_ID and PEER_ID_* relay values before enabling Gnosis mainnet",
+  "networkName": "DKG V10 Mainnet",
+  "networkId": "PLACEHOLDER_MAINNET_NETWORK_ID",
+  "genesisVersion": 1,
+  "relays": [
+    "/ip4/178.105.87.39/tcp/9090/p2p/PEER_ID_SOLARIS",
+    "/ip4/178.105.105.102/tcp/9090/p2p/PEER_ID_LUNARIS",
+    "/ip4/178.156.214.4/tcp/9090/p2p/PEER_ID_ORIONIS",
+    "/ip4/178.105.111.185/tcp/9090/p2p/PEER_ID_KEPLER"
+  ],
+  "defaultContextGraphs": [],
+  "defaultNodeRole": "edge",
   "chain": {
     "name": "gnosis",
     "type": "evm",
@@ -9,6 +20,8 @@
   },
   "autoUpdate": {
     "enabled": true,
-    "branch": "main"
+    "repo": "OriginTrail/dkg",
+    "branch": "main",
+    "checkIntervalMinutes": 5
   }
 }

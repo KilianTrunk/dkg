@@ -2,7 +2,7 @@
   "_status": "pre-deployment: replace PLACEHOLDER_MAINNET_NETWORK_ID and PEER_ID_* relay values before enabling Gnosis mainnet",
   "networkName": "DKG V10 Gnosis Mainnet",
   "genesisId": "gnosis-mainnet",
-  "networkId": "PLACEHOLDER_MAINNET_NETWORK_ID",
+  "networkId": "e08a9fb72a648ec2eb2fd9c152ded90a8ad67bb56f27df4781d9bb7e261fb7a7",
   "genesisVersion": 1,
   "relays": [
     "/ip4/178.105.87.39/tcp/9090/p2p/PEER_ID_SOLARIS",

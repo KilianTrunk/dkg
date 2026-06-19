@@ -2116,6 +2116,17 @@ export class DKGAgent extends DKGAgentBase {
             { code: 'SWM_SUBSET_NOT_SEALABLE' },
           );
         }
+        // #1116 (round 7) — drop any STALE seal from a PRIOR lifecycle BEFORE
+        // pull-from. The seal lives on the name-keyed assertion subject, which
+        // neither discard nor create clean-slates reach (they key on the
+        // lifecycle URN), so a full {A,C} → recreate → full {A,B} cycle could
+        // leave the OLD {A,C} seal. pull-from reads `seal.rootEntities` ahead of
+        // the (now-correct, REPLACEd) member rows, so without this it would
+        // reconstruct the stale root set. We re-seal from the reconstructed SWM
+        // draft immediately below, so clearing here loses nothing — and the
+        // full-share marker check above already proved this is a sealable full
+        // asset.
+        await agent.publisher.clearAssertionSeal(contextGraphId, name, agentAddress, opts?.subGraphName);
         await agent.publisher.assertionPullFrom(contextGraphId, name, agentAddress, 'swm', {
           subGraphName: opts?.subGraphName,
           onConflict: 'replace',

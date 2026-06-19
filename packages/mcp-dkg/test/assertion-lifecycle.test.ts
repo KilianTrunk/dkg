@@ -681,6 +681,24 @@ describe('rc.17 lifecycle verbs — finalize / publish / pull_from (parity with 
     expect(res.content[0].text).not.toContain('Seal it with');
   });
 
+  it('share with sealed:true + publishReady:false (incomplete full promote) warns NOT to finalize layer:swm (#1116)', async () => {
+    // A FULL share that sealed but did NOT promote every root (foreign-owned roots
+    // skipped) → swmShareComplete marker NOT set → finalize layer:swm would REJECT.
+    const localClient = new FakeClient({
+      knowledgeAssetShare: async () => ({ swmShared: true, promotedCount: 1, sealed: true, publishReady: false }),
+    });
+    const localServer = new FakeServer();
+    registerAssertionTools(localServer.asMcpServer(), localClient.asDkgClient(), makeConfig());
+
+    const res = await localServer.call('dkg_knowledge_asset_share', { name: 'doc' });
+    expect(res.isError).toBeFalsy();
+    expect(res.content[0].text).toContain('not all roots reached SWM');
+    expect(res.content[0].text).toContain('re-share the full asset');
+    // Must NOT recommend the dead-end finalize layer:swm here (it would reject).
+    expect(res.content[0].text).not.toContain('layer:swm works after sharing');
+    expect(res.content[0].text).not.toContain('NOT sealable');
+  });
+
   it('share with publishReady:true emits NO warning, reports sealed + publish-ready (#1116)', async () => {
     const localClient = new FakeClient({
       knowledgeAssetShare: async () => ({ swmShared: true, promotedCount: 2, sealed: true, publishReady: true }),
@@ -744,6 +762,17 @@ describe('rc.17 lifecycle verbs — finalize / publish / pull_from (parity with 
     await expect(
       server.call('dkg_knowledge_asset_finalize', { name: 'doc', layer: 'vm' }),
     ).rejects.toThrow();
+  });
+
+  it('finalize rejects a NON-STRING layer at the schema boundary (zod enum, no String() coercion) (#1116)', async () => {
+    // Parity with the OpenClaw/Hermes non-string-layer guard: the MCP zod
+    // .enum(['wm','swm']) rejects a present non-string structurally (it never
+    // String()-coerces ['swm'] → 'swm' and forwards it).
+    for (const bad of [true, ['swm'], 1, { l: 'swm' }] as unknown[]) {
+      await expect(
+        server.call('dkg_knowledge_asset_finalize', { name: 'doc', layer: bad as never }),
+      ).rejects.toThrow();
+    }
   });
 });
 

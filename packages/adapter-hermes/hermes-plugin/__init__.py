@@ -3063,19 +3063,38 @@ SHARE_SUBSET_NOT_PUBLISH_READY_WARNING = (
     "the full asset (entities:\"all\"), or model this subset as its own knowledge asset."
 )
 
+# #1116: a FULL share can come back sealed:true but publishReady:false when NOT
+# every sealed root reached SWM (promotedAllRoots false — e.g. foreign-owned roots
+# were skipped). The engine did NOT set the swmShareComplete marker, so
+# finalize(layer:swm) would REJECT — do NOT recommend it here. Re-sharing the full
+# asset is the recovery. Byte-identical across all three adapters (cross-adapter
+# parity invariant).
+SHARE_INCOMPLETE_PROMOTE_WARNING = (
+    "Sealed, but not all roots reached SWM (some roots may be owned by other "
+    "agents) — not yet publishable; re-share the full asset so every sealed root "
+    "is in SWM."
+)
+
 
 def _annotate_share_seal(result: Any, entities: Any = None) -> Any:
     """Surface the #1116 seal outcome of a knowledge-asset share.
 
     On a default (sealing) share the daemon returns
-    ``{ swmShared, promotedCount, sealed, publishReady }``. A share that did NOT
-    seal carries ``publishReady: false`` — add a parity warning so the agent knows
-    a finalize is still required before publishing. The warning branches on the
-    share scope (``entities``): a ``skip_seal`` FULL share ("all"/omitted) is
-    sealable later (``finalize layer:swm`` works), but a SUBSET (a non-empty
-    specific list) is NOT sealable — ``finalize layer:swm`` rejects it
-    (``SWM_SUBSET_NOT_SEALABLE``) — so the only recovery is a full share or a new
-    asset. A default share that CANNOT seal fails CLOSED: the daemon returns 409
+    ``{ swmShared, promotedCount, sealed, publishReady }``. When ``publishReady``
+    is false, add a parity warning that branches on the ACTUAL outcome (three
+    cases):
+
+      1. ``sealed:false`` + SUBSET (a non-empty specific list) → NOT sealable
+         (``finalize layer:swm`` rejects it with ``SWM_SUBSET_NOT_SEALABLE``);
+         recover via a full share or a new asset.
+      2. ``sealed:false`` + FULL ("all"/omitted ``skip_seal``) → sealable later
+         (``finalize layer:swm`` works — the marker is set).
+      3. ``sealed:true`` + ``publishReady:false`` → an incomplete full promote
+         (not every sealed root reached SWM, e.g. foreign-owned roots skipped). The
+         ``swmShareComplete`` marker is NOT set, so ``finalize layer:swm`` would
+         REJECT — re-share the full asset instead.
+
+    A default share that CANNOT seal fails CLOSED: the daemon returns 409
     ``UNSEALED_SHARE_BLOCKED`` with a ``recovery`` hint and Working Memory
     preserved; ``client._post`` surfaces that body as a dict, so re-raise the
     recovery text as the tool error (parity with MCP/OpenClaw, which return only
@@ -3089,12 +3108,12 @@ def _annotate_share_seal(result: Any, entities: Any = None) -> Any:
             return {"error": recovery}
         return result
     if result.get("publishReady") is False:
-        is_subset = isinstance(entities, list) and len(entities) > 0
-        warning = (
-            SHARE_SUBSET_NOT_PUBLISH_READY_WARNING
-            if is_subset
-            else SHARE_NOT_PUBLISH_READY_WARNING
-        )
+        if result.get("sealed") is True:
+            warning = SHARE_INCOMPLETE_PROMOTE_WARNING
+        elif isinstance(entities, list) and len(entities) > 0:
+            warning = SHARE_SUBSET_NOT_PUBLISH_READY_WARNING
+        else:
+            warning = SHARE_NOT_PUBLISH_READY_WARNING
         return {**result, "warning": warning}
     return result
 

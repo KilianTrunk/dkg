@@ -328,4 +328,86 @@ describe('assertionPullFrom (OT-RFC-43 §10.5.3 wm/pull-from)', () => {
       .catch((e) => e);
     expect((err as any).code).toBe('SWM_SUBSET_NOT_SEALABLE');
   });
+
+  // ── round 7: lifecycle-URN member-row staleness (append-only bug) ──
+  // The member rows (dkg:rootEntity) are the seal-less reconstruction source.
+  // generateAssertionPromotedMetadata only INSERTs them (never deletes prior),
+  // and they survive discard+recreate via A2_PRESERVE — so without round-7 they
+  // accumulate a stale UNION and the seal-less reconstruction seals a SUPERSET.
+
+  // Read the lifecycle-URN member roots exactly as readPromotedRootEntities does.
+  async function readMemberRoots(store: OxigraphStore): Promise<Set<string>> {
+    const lifecycleUri = assertionLifecycleUri(CG, AGENT, NAME);
+    const metaGraph = contextGraphMetaUri(CG);
+    const r = await store.query(
+      `SELECT DISTINCT ?root WHERE { GRAPH <${metaGraph}> { <${lifecycleUri}> (<${DKG}rootEntity>|<${DKG}entity>) ?root } }`,
+    );
+    const out = new Set<string>();
+    if (r.type === 'bindings') for (const b of r.bindings) if (b['root']) out.add(String(b['root']));
+    return out;
+  }
+
+  it('#1116 (round 7): member rows are CLEARED after assertionDiscard (no VM version)', async () => {
+    const { publisher, store } = await makePublisher();
+    const lifecycleUri = assertionLifecycleUri(CG, AGENT, NAME);
+    const metaGraph = contextGraphMetaUri(CG);
+
+    // A promoted (unsealed) asset: SWM content + the promote-stamped member rows.
+    await publisher.assertionWrite(CG, NAME, AGENT, [
+      { subject: ENTITY_1, predicate: SCHEMA, object: '"Alice"' },
+    ]);
+    await store.insert([
+      q(lifecycleUri, `${DKG}rootEntity`, ENTITY_1, metaGraph),
+      q(lifecycleUri, `${DKG}rootEntity`, ENTITY_2, metaGraph),
+    ]);
+    expect((await readMemberRoots(store)).size).toBe(2);
+
+    // Discard a NON-published asset → membership is gone (nothing to reconstruct).
+    await publisher.assertionDiscard(CG, NAME, AGENT);
+    expect((await readMemberRoots(store)).size).toBe(0);
+  });
+
+  it('#1116 (round 7): a stale member row does NOT survive discard+recreate into a new draft', async () => {
+    const { publisher, store } = await makePublisher();
+    const lifecycleUri = assertionLifecycleUri(CG, AGENT, NAME);
+    const metaGraph = contextGraphMetaUri(CG);
+
+    await publisher.assertionWrite(CG, NAME, AGENT, [
+      { subject: ENTITY_1, predicate: SCHEMA, object: '"Alice"' },
+    ]);
+    await store.insert([q(lifecycleUri, `${DKG}rootEntity`, ENTITY_1, metaGraph)]);
+    await publisher.assertionDiscard(CG, NAME, AGENT);
+    // Recreate the SAME name: A2_PRESERVE must NOT carry the member row that
+    // discard cleared (the round-7 stale-superset bug starts here).
+    await publisher.assertionCreate(CG, NAME, AGENT);
+    expect((await readMemberRoots(store)).size).toBe(0);
+  });
+
+  it('#1116 (round 7): a FULL-COMPLETE promote REPLACES the member rows (drops a stale prior root)', async () => {
+    const { publisher, store } = await makePublisher();
+    const lifecycleUri = assertionLifecycleUri(CG, AGENT, NAME);
+    const metaGraph = contextGraphMetaUri(CG);
+
+    // Pre-seed a STALE member row for a root NOT in the current draft (e.g. left
+    // over from a prior full share {A, OTHER} that A2_PRESERVE carried across a
+    // recreate).
+    await store.insert([q(lifecycleUri, `${DKG}rootEntity`, OTHER_FILE_ENTITY, metaGraph)]);
+
+    // Current draft holds A and B; a FULL promote (entities:"all", no skip) is the
+    // authoritative current set → member rows must become EXACTLY {A, B}, not the
+    // union {A, B, OTHER}.
+    await publisher.assertionWrite(CG, NAME, AGENT, [
+      { subject: ENTITY_1, predicate: SCHEMA, object: '"Alice"' },
+      { subject: ENTITY_2, predicate: SCHEMA, object: '"Bob"' },
+    ]);
+    const res = await publisher.assertionPromote(CG, NAME, AGENT, { publisherPeerId: 'peer-self' });
+    expect(res.promotedAllRoots).toBe(true);
+
+    const rows = await readMemberRoots(store);
+    expect(rows.has(ENTITY_1)).toBe(true);
+    expect(rows.has(ENTITY_2)).toBe(true);
+    // The stale prior root is GONE — replaced, not appended.
+    expect(rows.has(OTHER_FILE_ENTITY)).toBe(false);
+    expect(rows.size).toBe(2);
+  });
 });

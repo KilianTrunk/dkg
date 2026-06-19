@@ -863,6 +863,21 @@ describe("DkgNodePlugin", () => {
       expect((res.details as { publishReady?: boolean }).publishReady).toBe(true);
     });
 
+    it('dkg_knowledge_asset_share with sealed:true + publishReady:false warns NOT to finalize layer:swm (#1116)', async () => {
+      // A FULL share that sealed but did NOT promote every root (foreign-owned roots
+      // skipped) → swmShareComplete marker NOT set → finalize layer:swm would REJECT.
+      const { byName } = setupPluginWithFetch({ swmShared: true, promotedCount: 1, sealed: true, publishReady: false });
+      const res = await byName.get('dkg_knowledge_asset_share')!.execute('tc', {
+        context_graph_id: 'ctx',
+        name: 'notes',
+      });
+      expect(res.details?.warning).toContain('not all roots reached SWM');
+      expect(res.details?.warning).toContain('re-share the full asset');
+      // Must NOT recommend the dead-end finalize layer:swm here (it would reject).
+      expect(res.details?.warning).not.toContain('layer:swm works after sharing');
+      expect(res.details?.warning).not.toContain('NOT sealable');
+    });
+
     it('dkg_knowledge_asset_share surfaces a 409 UNSEALED_SHARE_BLOCKED recovery verbatim (#1116)', async () => {
       const recovery = 'No local signing key; pass skip_seal:true to share unsealed.';
       const fetchMock = vi.fn(async () =>
@@ -928,6 +943,22 @@ describe("DkgNodePlugin", () => {
       });
       expect(fetchMock).not.toHaveBeenCalled();
       expect(res.details?.error).toMatch(/layer.*"wm".*"swm"/);
+    });
+
+    it('dkg_knowledge_asset_finalize rejects a NON-STRING layer, nothing on the wire (#1116)', async () => {
+      // A present non-string (['swm'] / true / a number) must NOT be String()-coerced
+      // to "swm" and forwarded — it is a tool-boundary error (parity with Hermes/MCP).
+      const { fetchMock, byName } = setupPluginWithFetch({ merkleRoot: '0xroot' });
+      for (const bad of [['swm'], true, 1, { l: 'swm' }] as unknown[]) {
+        fetchMock.mockClear();
+        const res = await byName.get('dkg_knowledge_asset_finalize')!.execute('tc', {
+          context_graph_id: 'ctx',
+          name: 'notes',
+          layer: bad as never,
+        });
+        expect(fetchMock, `layer: ${JSON.stringify(bad)}`).not.toHaveBeenCalled();
+        expect(res.details?.error).toMatch(/layer.*"wm".*"swm"/);
+      }
     });
 
 

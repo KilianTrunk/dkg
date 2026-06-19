@@ -120,6 +120,17 @@ const SHARE_SUBSET_NOT_PUBLISH_READY_WARNING =
   'publishable (finalize layer:swm will reject it). To publish on-chain, share ' +
   'the full asset (entities:"all"), or model this subset as its own knowledge asset.';
 
+// #1116: a FULL share can come back sealed:true but publishReady:false when NOT
+// every sealed root reached SWM (promotedAllRoots false — e.g. foreign-owned
+// roots were skipped). The engine did NOT set the swmShareComplete marker, so
+// finalize(layer:swm) would REJECT — do NOT recommend it here. Re-sharing the
+// full asset is the recovery. Byte-identical across all three adapters
+// (cross-adapter parity invariant).
+const SHARE_INCOMPLETE_PROMOTE_WARNING =
+  'Sealed, but not all roots reached SWM (some roots may be owned by other ' +
+  'agents) — not yet publishable; re-share the full asset so every sealed root ' +
+  'is in SWM.';
+
 /**
  * #1116: extract the daemon's recovery hint from a 409 UNSEALED_SHARE_BLOCKED
  * share failure. The DkgDaemonClient throws a typed {@link DkgDaemonHttpError}
@@ -3586,10 +3597,13 @@ export class DkgNodePlugin {
       }
       // #1116: optional `layer` selects WHERE the content to seal lives. Default
       // (omitted) seals the open WM draft; "swm" seals an asset already shared to
-      // SWM. Present-but-invalid is a tool error, never a silent default.
+      // SWM. Present-but-invalid is a tool error, never a silent default. Check
+      // `typeof === 'string'` BEFORE trimming/enum-checking — `String(args.layer)`
+      // would coerce a non-string like ['swm'] to "swm" and FORWARD it (parity
+      // with the Hermes direct-validation fix; not a String() coercion bypass).
       let layer: 'wm' | 'swm' | undefined;
       if (args.layer !== undefined) {
-        const raw = String(args.layer).trim();
+        const raw = typeof args.layer === 'string' ? args.layer.trim() : args.layer;
         if (raw !== 'wm' && raw !== 'swm') {
           return this.error('"layer" must be "wm" or "swm".');
         }
@@ -3656,15 +3670,27 @@ export class DkgNodePlugin {
       });
       // #1116: surface the seal outcome. `sealed`/`publishReady` flow through the
       // JSON; ALSO add the explicit warning when the share is NOT publish-ready.
-      // Branch on the share scope: a skip_seal FULL share is sealable later
-      // (finalize layer:swm works), but a SUBSET is NOT sealable — finalize
-      // layer:swm rejects it (SWM_SUBSET_NOT_SEALABLE) — so the only recovery is a
-      // full share or a new asset. A subset is a non-empty specific array (an empty
-      // array was rejected above; "all"/undefined is a full share).
-      if (result && (result as { publishReady?: boolean }).publishReady === false) {
-        const warning = Array.isArray(entities)
-          ? SHARE_SUBSET_NOT_PUBLISH_READY_WARNING
-          : SHARE_NOT_PUBLISH_READY_WARNING;
+      // Branch on the ACTUAL outcome (three cases):
+      //  1. sealed:false + SUBSET → not sealable (finalize layer:swm rejects it);
+      //     recover via a full share or a new asset.
+      //  2. sealed:false + FULL (skip_seal) → sealable later (finalize layer:swm
+      //     works — the marker is set).
+      //  3. sealed:TRUE + publishReady:false → an incomplete full promote (not every
+      //     sealed root reached SWM, e.g. foreign-owned roots skipped). The
+      //     swmShareComplete marker is NOT set, so finalize layer:swm would REJECT —
+      //     re-share the full asset instead.
+      // A subset is a non-empty specific array (an empty array was rejected above;
+      // "all"/undefined is a full share).
+      const seal = result as { publishReady?: boolean; sealed?: boolean };
+      if (result && seal.publishReady === false) {
+        let warning: string;
+        if (seal.sealed === true) {
+          warning = SHARE_INCOMPLETE_PROMOTE_WARNING;
+        } else if (Array.isArray(entities)) {
+          warning = SHARE_SUBSET_NOT_PUBLISH_READY_WARNING;
+        } else {
+          warning = SHARE_NOT_PUBLISH_READY_WARNING;
+        }
         return this.json({ ...result, warning });
       }
       return this.json(result);

@@ -51,6 +51,12 @@ const LOCAL = `ka-loc-${Date.now().toString(36)}`;
 // must not mutate the shared `LOCAL` (a later test relies on LOCAL having no
 // trusted on-chain mapping). No other test references this id.
 const LOCAL_AUTOREG = `ka-autoreg-${Date.now().toString(36)}`;
+// #1116 (round 6): a SEPARATE created-but-UNregistered CG, used ONLY by the FIX 2
+// gas-preflight route test (finalized-but-NOT-shared → empty SWM → no-quads
+// precondition must fire BEFORE any registration tx). The CG must stay UNregistered
+// after the call (proving no gas was burned), so it cannot share the auto-register
+// CG. No other test references this id.
+const LOCAL_NOSHARE = `ka-noshare-${Date.now().toString(36)}`;
 // On-chain-registered CG — required for finalize/share/publish preconditions.
 const REG = `ka-reg-${Date.now().toString(36)}`;
 // On-chain-registered PUBLIC CG — for preconditions that only hold on the public
@@ -82,6 +88,11 @@ describe('/api/knowledge-assets routes (real daemon, real chain)', () => {
     // registration without polluting the shared `LOCAL`.
     const locAutoreg = await postJson(daemon, '/api/context-graph/create', { id: LOCAL_AUTOREG, name: 'Local Autoreg' });
     expect(locAutoreg.status, `local autoreg CG create: ${JSON.stringify(locAutoreg.body)}`).toBeLessThan(300);
+    // #1116 (round 6): dedicated unregistered CG for the FIX 2 gas-preflight test —
+    // created off-chain, NEVER registered, so the test can prove the no-quads
+    // precondition fires before any registration tx (and the CG stays unregistered).
+    const locNoshare = await postJson(daemon, '/api/context-graph/create', { id: LOCAL_NOSHARE, name: 'Local NoShare' });
+    expect(locNoshare.status, `local noshare CG create: ${JSON.stringify(locNoshare.body)}`).toBeLessThan(300);
     const reg = await postJson(daemon, '/api/context-graph/create', { id: REG, name: 'Reg', accessPolicy: 1 });
     expect(reg.status, `reg CG create: ${JSON.stringify(reg.body)}`).toBeLessThan(300);
     const onchain = await postJson(daemon, '/api/context-graph/register', { id: REG, accessPolicy: 1 });
@@ -459,6 +470,37 @@ describe('/api/knowledge-assets routes (real daemon, real chain)', () => {
       expect(local, `LOCAL_AUTOREG CG descriptor: ${JSON.stringify(list.body)}`).toBeTruthy();
       const onChainId = local?.onChainId ?? local?.onChainContextGraphId;
       expect(onChainId, `expected a truthy on-chain id after auto-register, got ${JSON.stringify(local)}`).toBeTruthy();
+    });
+
+    // #1116 (round 6, FIX 2 gas-preflight): an UNregistered CG + a FINALIZED seal
+    // + an EMPTY SWM (finalized but NEVER shared) must hit the no-quads precondition
+    // BEFORE any registration tx — so the route does NOT auto-register (burning gas)
+    // and then fail. This proves the engine's SWM-empty preflight runs ahead of the
+    // publisher's CG_NOT_REGISTERED guard: the response is the no-quads precondition
+    // (NOT "not registered on-chain"), and the CG stays UNregistered afterward.
+    it('FIX 2 gas-preflight: unregistered CG + finalized but UNshared (empty SWM) returns no-quads WITHOUT registering', async () => {
+      // LOCAL_NOSHARE was created off-chain (beforeAll), never registered.
+      await createKa(LOCAL_NOSHARE, 'pub-noshare-unreg');
+      // Unique subject so the seal's selection can't cross-match another KA's shared quad.
+      await write(LOCAL_NOSHARE, 'pub-noshare-unreg', [{ subject: 'ex:noshare-unreg-only', predicate: 'ex:p', object: '"x"' }]);
+      // FINALIZE (seals the WM draft) but DELIBERATELY do NOT swm/share → SWM stays empty.
+      await postJson(daemon, '/api/knowledge-assets/pub-noshare-unreg/wm/finalize', { contextGraphId: LOCAL_NOSHARE });
+
+      const res = await postJson(daemon, '/api/knowledge-assets/pub-noshare-unreg/vm/publish', { contextGraphId: LOCAL_NOSHARE });
+
+      // The no-quads precondition fired (4xx), NOT the registration error — proving
+      // the preflight ran before any register tx.
+      expect(res.status).toBeGreaterThanOrEqual(400);
+      expect(res.status).toBeLessThan(500);
+      expect(String(res.body?.error ?? '')).toMatch(/No quads in shared memory|nothing shared/i);
+      expect(String(res.body?.error ?? '')).not.toMatch(/not registered on-chain/i);
+
+      // And the CG is STILL unregistered — no registration tx was sent (no gas burned).
+      const list = await getJson(daemon, '/api/context-graph/list');
+      const cg = (list.body?.contextGraphs ?? []).find((c: any) => c.id === LOCAL_NOSHARE);
+      expect(cg, `LOCAL_NOSHARE CG descriptor: ${JSON.stringify(list.body)}`).toBeTruthy();
+      const onChainId = cg?.onChainId ?? cg?.onChainContextGraphId;
+      expect(onChainId == null, `expected NO on-chain id (CG must stay unregistered), got ${JSON.stringify(cg)}`).toBe(true);
     });
   });
 

@@ -4656,6 +4656,36 @@ export class DKGPublisher implements Publisher {
     return res.type === 'boolean' && res.value;
   }
 
+  /**
+   * #1116 (round 7) — delete the assertion SEAL (all ASSERTION_SEAL_PREDICATES)
+   * for this KA, under BOTH the name-keyed assertion URI and the numbered WM
+   * graph URI (the seal lives under one or the other, pre/post-mint). The seal
+   * lives on a DIFFERENT subject than the lifecycle URN, so the create/discard
+   * clean-slates that key on the lifecycle URN don't reach it.
+   *
+   * Used by the seal-in-SWM reconstruction (finalize layer="swm") to drop a
+   * STALE seal from a PRIOR lifecycle BEFORE pull-from: pull-from reads
+   * `seal.rootEntities` ahead of the member-row fallback, so a stale seal from a
+   * superseded share (e.g. full {A,C} → recreate → full {A,B}) would otherwise
+   * make it reconstruct the OLD root set. finalize(layer="swm") mints a fresh
+   * seal immediately after, so clearing here loses nothing.
+   */
+  async clearAssertionSeal(
+    contextGraphId: string,
+    name: string,
+    agentAddress: string,
+    subGraphName?: string,
+  ): Promise<void> {
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    const nameKeyed = contextGraphAssertionUri(contextGraphId, agentAddress, name, subGraphName);
+    const wmGraph = await this.wmGraphUri(contextGraphId, agentAddress, name, subGraphName);
+    for (const sealSubj of new Set([nameKeyed, wmGraph])) {
+      for (const pred of Object.values(ASSERTION_SEAL_PREDICATES)) {
+        await this.store.deleteByPattern({ graph: metaGraph, subject: sealSubj, predicate: pred });
+      }
+    }
+  }
+
   // ── Working Memory Assertion Operations (spec §6) ───────────────────
 
   private static validateOptionalSubGraph(subGraphName: string | undefined): void {
@@ -5496,6 +5526,31 @@ export class DKGPublisher implements Publisher {
     // carried by the seal's `dkg:assertionRootEntity`/`dkg:assertionEntity`
     // rows and the lifecycle record's member-entity stamps.
 
+    // #1116 (round 7) — REPLACE (not append) the lifecycle-URN member rows on a
+    // FULL-COMPLETE share. `generateAssertionPromotedMetadata` only INSERTs the
+    // member rows (its delete set never removes prior ones — metadata.ts), so a
+    // full {A,C} → discard → recreate → full {A,B} cycle (or a no-discard full
+    // re-share) accumulates the stale UNION {A,B,C}. The seal-less SWM
+    // reconstruction (readPromotedRootEntities) then seals a stale SUPERSET. When
+    // this promote is the AUTHORITATIVE current full set (entities:"all" AND no
+    // foreign root skipped — exactly the markSwmShareComplete condition), the rows
+    // must end up as EXACTLY the just-promoted roots. Clear the prior member rows
+    // for the lifecycle URN here, then stamp the current ones below.
+    //
+    // A SUBSET / partial promote is intentionally NOT replaced: it shares only some
+    // roots, the marker is cleared (round 6) so readPromotedRootEntities output is
+    // gated-out, and over-deleting could drop a still-valid member. The audit
+    // confirmed no reader needs the cumulative historical union; all read the
+    // CURRENT set, so REPLACE-on-full is strictly more correct.
+    const promotingAllEntities = !opts?.entities || opts.entities === 'all';
+    const isFullCompletePromote = promotingAllEntities && promotedAllRoots;
+    if (isFullCompletePromote) {
+      const lifecycleSubject = assertionLifecycleUri(contextGraphId, agentAddress, name, opts?.subGraphName);
+      const promoteMetaGraph = contextGraphMetaUri(contextGraphId);
+      await this.store.deleteByPattern({ graph: promoteMetaGraph, subject: lifecycleSubject, predicate: DKG_ROOT_ENTITY_LEGACY });
+      await this.store.deleteByPattern({ graph: promoteMetaGraph, subject: lifecycleSubject, predicate: DKG_ENTITY });
+    }
+
     // Update assertion lifecycle record in _meta: created → promoted
     const promotedKaNumber = await this.resolveKaNumber(contextGraphId, agentAddress, name, opts?.subGraphName);
     const promoted = generateAssertionPromotedMetadata({
@@ -5630,6 +5685,36 @@ export class DKGPublisher implements Publisher {
       subject: lifecycleSubject,
       predicate: SWM_SHARE_COMPLETE_PRED,
     });
+    // #1116 (round 7) — CLEAR the lifecycle-URN member rows (dkg:rootEntity /
+    // dkg:entity) too. They are the seal-less SWM-reconstruction source and they
+    // SURVIVE a discard+recreate via A2_PRESERVE; without clearing them, a
+    // discarded asset's stale members are carried into the recreated draft and a
+    // later full skipSeal re-share would seal the stale UNION (the round-7 bug).
+    // ONLY clear when the KA has no confirmed VM version: a draft-discard of an
+    // already-PUBLISHED KA (hasVmVersion) preserves the on-chain state, and its
+    // members back the receipt lookups — leave them (the next full publish
+    // REPLACEs them with the current set anyway). A SWM-only / never-published
+    // asset has no membership once discarded.
+    if (!hasVmVersion) {
+      await this.store.deleteByPattern({ graph: metaGraph, subject: lifecycleSubject, predicate: DKG_ROOT_ENTITY_LEGACY });
+      await this.store.deleteByPattern({ graph: metaGraph, subject: lifecycleSubject, predicate: DKG_ENTITY });
+      // #1116 (round 7) — CLEAR the assertion SEAL too. The seal is keyed by the
+      // name-keyed assertion URI (`contextGraphAssertionUri`), NOT the numbered WM
+      // graph URI (`graphUri`) that the `_meta` cleanup above deletes — so a seal
+      // from a prior FULL share SURVIVED discard. Then `finalize(layer:"swm")`'s
+      // pull-from reads `seal.rootEntities` FIRST (before the member-row fallback),
+      // so a discard → recreate → re-share → seal-in-SWM reconstructed from the
+      // STALE seal's roots, not the current share's — publishing the old set. A
+      // discarded (non-published) asset must leave NO seal. Clear both the
+      // name-keyed subject and the numbered WM subject (the seal may live under
+      // either, pre/post-mint), mirroring pull-from's stale-seal teardown.
+      const discardSealSubject = contextGraphAssertionUri(contextGraphId, agentAddress, name, subGraphName);
+      for (const sealSubj of new Set([discardSealSubject, graphUri])) {
+        for (const pred of Object.values(ASSERTION_SEAL_PREDICATES)) {
+          await this.store.deleteByPattern({ graph: metaGraph, subject: sealSubj, predicate: pred });
+        }
+      }
+    }
     await this.store.dropGraph(graphUri);
   }
 

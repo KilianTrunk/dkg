@@ -918,6 +918,22 @@ def test_annotate_share_seal_subset_warns_not_sealable(plugin_module):
     assert "Seal it with" not in out["warning"]
 
 
+def test_annotate_share_seal_incomplete_full_promote_warns_no_finalize(plugin_module):
+    # sealed:true + publishReady:false → an incomplete FULL promote (not every
+    # sealed root reached SWM, e.g. foreign-owned roots skipped). The
+    # swmShareComplete marker is NOT set, so finalize layer:swm would REJECT — the
+    # third warning must NOT recommend it. The `sealed:true` case takes precedence
+    # over the entities/subset branch.
+    f = plugin_module._annotate_share_seal
+    for ent in (None, "all", ["urn:a"]):
+        out = f({"swmShared": True, "sealed": True, "publishReady": False}, ent)
+        assert "not all roots reached SWM" in out["warning"], ent
+        assert "re-share the full asset" in out["warning"], ent
+        # NOT the dead-end finalize layer:swm hint, NOT the subset hint.
+        assert "layer:swm works after sharing" not in out["warning"], ent
+        assert "NOT sealable" not in out["warning"], ent
+
+
 def test_annotate_share_seal_blocked_surfaces_recovery(plugin_module):
     # A 409 UNSEALED_SHARE_BLOCKED body (returned by the client as a dict) →
     # surface the recovery verbatim as {error: recovery}.
@@ -1034,3 +1050,19 @@ def test_share_handler_subset_warns_not_sealable_via_annotate(provider):
         "context_graph_id": "cg1", "name": "ka", "entities": ["urn:a"],
     }))
     assert "A subset is NOT sealable/publishable" in out["warning"]
+
+
+def test_share_handler_incomplete_full_promote_warns_via_annotate(provider):
+    # A FULL share that sealed but did NOT promote every root → sealed:true +
+    # publishReady:false → the incomplete-promote warning (do NOT finalize layer:swm).
+    provider._client.promote_assertion = (  # type: ignore[assignment]
+        lambda name, cg, entities, sub_graph_name=None, skip_seal=None: {
+            "swmShared": True, "promotedCount": 1, "sealed": True, "publishReady": False,
+        }
+    )
+    out = json.loads(provider.handle_tool_call("dkg_knowledge_asset_share", {
+        "context_graph_id": "cg1", "name": "ka",
+    }))
+    assert "not all roots reached SWM" in out["warning"]
+    assert "re-share the full asset" in out["warning"]
+    assert "layer:swm works after sharing" not in out["warning"]

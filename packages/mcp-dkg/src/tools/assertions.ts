@@ -53,6 +53,17 @@ const SHARE_SUBSET_NOT_PUBLISH_READY_WARNING =
   'publishable (finalize layer:swm will reject it). To publish on-chain, share ' +
   'the full asset (entities:"all"), or model this subset as its own knowledge asset.';
 
+// #1116: a FULL share can come back sealed:true but publishReady:false when NOT
+// every sealed root reached SWM (promotedAllRoots false — e.g. foreign-owned
+// roots were skipped). The engine did NOT set the swmShareComplete marker, so
+// finalize(layer:swm) would REJECT — do NOT recommend it here. Re-sharing the
+// full asset is the recovery. Byte-identical across all three adapters
+// (cross-adapter parity invariant).
+const SHARE_INCOMPLETE_PROMOTE_WARNING =
+  'Sealed, but not all roots reached SWM (some roots may be owned by other ' +
+  'agents) — not yet publishable; re-share the full asset so every sealed root ' +
+  'is in SWM.';
+
 /**
  * The daemon's real assertion-name rule, replicated verbatim from
  * `@origintrail-official/dkg-core` `validateAssertionName`
@@ -376,15 +387,25 @@ export function registerAssertionTools(
           ? `${entities.length} entit${entities.length === 1 ? 'y' : 'ies'}`
           : 'all root entities';
         // #1116: surface the seal outcome. A full share seals by default
-        // (publishReady:true); a subset / skipSeal:true full share is SWM-only and
-        // NOT publish-ready. Branch the warning: a skipSeal full share is sealable
-        // later (finalize layer:swm works), but a SUBSET is NOT sealable —
-        // finalize layer:swm rejects it (SWM_SUBSET_NOT_SEALABLE) — so the only
-        // recovery is a full share or a new asset.
+        // (publishReady:true). When NOT publish-ready, branch on the ACTUAL
+        // outcome (three cases):
+        //  1. sealed:false + SUBSET → not sealable (finalize layer:swm rejects it);
+        //     recover via a full share or a new asset.
+        //  2. sealed:false + FULL (skipSeal) → sealable later (finalize layer:swm
+        //     works — the marker is set).
+        //  3. sealed:TRUE + publishReady:false → an incomplete full promote (not
+        //     every sealed root reached SWM, e.g. foreign-owned roots skipped). The
+        //     swmShareComplete marker is NOT set, so finalize layer:swm would
+        //     REJECT — re-share the full asset instead.
         if (result.publishReady === false) {
-          const warning = isSubset
-            ? SHARE_SUBSET_NOT_PUBLISH_READY_WARNING
-            : SHARE_NOT_PUBLISH_READY_WARNING;
+          let warning: string;
+          if (result.sealed === true) {
+            warning = SHARE_INCOMPLETE_PROMOTE_WARNING;
+          } else if (isSubset) {
+            warning = SHARE_SUBSET_NOT_PUBLISH_READY_WARNING;
+          } else {
+            warning = SHARE_NOT_PUBLISH_READY_WARNING;
+          }
           return ok(
             `Shared ${scope} from knowledge asset '${name}' (project '${pid}') to SWM. ` +
             `${warning}`,

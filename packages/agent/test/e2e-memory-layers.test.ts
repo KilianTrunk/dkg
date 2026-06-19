@@ -726,6 +726,53 @@ describe('#1116 seal decoupled from CG — full vs skipSeal share, seal-in-SWM',
     expect(thrown.code).toBe('SWM_SUBSET_NOT_SEALABLE');
   }, 30_000);
 
+  // A1''' (round 6 — ISOLATES the promote() subset-clear branch): the A1' cycle
+  // above ALSO goes through discard (which independently clears the marker), so it
+  // doesn't pin the `else { clearSwmShareComplete(...) }` line in promote(). This
+  // one re-shares as a SUBSET on the SAME name WITHOUT an intervening discard — so
+  // the prior full-share marker SURVIVES the re-create (A2_PRESERVE carries it),
+  // and ONLY the subset-clear branch can re-arm the gate. If that line is removed,
+  // the stale full-share marker survives and finalize(layer:"swm") WRONGLY succeeds;
+  // this test catches that regression.
+  it('finalize(layer:swm) REJECTS after full-share -> RE-share SUBSET on same name (NO discard) — isolates the subset-clear', async () => {
+    const agent = await createAgent('SubsetReshareNoDiscardBot');
+    await agent.createContextGraph({ id: CG_ID, name: 'Subset Reshare No Discard E2E' });
+    await agent.registerContextGraph(CG_ID);
+
+    const name = 'subset-reshare';
+    const writeAB = () => agent.assertion.write(CG_ID, name, [
+      { subject: `${ENTITY_BASE}:a`, predicate: 'http://schema.org/name', object: '"Entity A"' },
+      { subject: `${ENTITY_BASE}:b`, predicate: 'http://schema.org/name', object: '"Entity B"' },
+    ]);
+
+    // 1. FULL share {A,B} — sets the full-share marker (seal-by-default).
+    await agent.assertion.create(CG_ID, name);
+    await writeAB();
+    const full = await agent.assertion.promote(CG_ID, name);
+    expect(full.sealed).toBe(true);
+
+    // 2. Re-open the SAME name WITHOUT a discard — the full-share marker survives
+    // this clean-slate via A2_PRESERVE (the exact carry-over that strands a stale
+    // marker if the subset-clear branch is absent).
+    await agent.assertion.create(CG_ID, name);
+    await writeAB();
+
+    // 3. SUBSET re-share {A} only — the ONLY thing that re-arms the gate now is
+    // promote()'s `else { clearSwmShareComplete(...) }` branch (no discard fired).
+    const subset = await agent.assertion.promote(CG_ID, name, { entities: [`${ENTITY_BASE}:a`] });
+    expect(subset.sealed).toBe(false);
+
+    // 4. Seal-in-SWM MUST be refused — a partial asset can't be published as the KA.
+    let thrown: any;
+    try {
+      await agent.assertion.finalize(CG_ID, name, { layer: 'swm' });
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeTruthy();
+    expect(thrown.code).toBe('SWM_SUBSET_NOT_SEALABLE');
+  }, 30_000);
+
   // A1'' (round 5): the gate keys on COMPLETENESS, not on sealed. A FULL skipSeal
   // share is publishable-by-construction (all roots reached SWM) — it sets the
   // marker — so seal-in-SWM (finalize layer:"swm") must SUCCEED, the legit
@@ -756,6 +803,100 @@ describe('#1116 seal decoupled from CG — full vs skipSeal share, seal-in-SWM',
     const pub = await agent.publishFromFinalizedAssertion(CG_ID, name);
     expect(pub.status).toBe('confirmed');
   }, 30_000);
+
+  // round 7 (reviewer's EXACT scenario — member-row staleness): the member rows
+  // are APPEND-ONLY and survive discard+recreate via A2_PRESERVE, so full share
+  // {A,C} → discard → recreate → full skipSeal {A,B} left rows {A,B,C} and the
+  // seal-less reconstruction sealed the stale SUPERSET {A,B,C}. Round 7 CLEARS the
+  // rows on discard and REPLACES them on a full-complete share, so the seal-in-SWM
+  // covers EXACTLY {A,B} and the publish never carries the stale C.
+  it('round 7: full {A,C} -> discard -> recreate -> full skipSeal {A,B} seals/publishes EXACTLY {A,B}, NOT C', async () => {
+    const agent = await createAgent('StaleSupersetBot');
+    await agent.createContextGraph({ id: CG_ID, name: 'Stale Superset E2E' });
+    await agent.registerContextGraph(CG_ID);
+
+    const name = 'stale-superset';
+    const A = `${ENTITY_BASE}:a`;
+    const B = `${ENTITY_BASE}:b`;
+    const C = `${ENTITY_BASE}:c`;
+    // 1. FULL share {A, C} (seal-by-default) — stamps member rows {A, C}.
+    await agent.assertion.create(CG_ID, name);
+    await agent.assertion.write(CG_ID, name, [
+      { subject: A, predicate: 'http://schema.org/name', object: '"Entity A"' },
+      { subject: C, predicate: 'http://schema.org/name', object: '"Entity C"' },
+    ]);
+    const first = await agent.assertion.promote(CG_ID, name);
+    expect(first.sealed).toBe(true);
+
+    // 2. Discard (clears member rows — round 7) and recreate the SAME name.
+    await agent.assertion.discard(CG_ID, name);
+    await agent.assertion.create(CG_ID, name);
+    await agent.assertion.write(CG_ID, name, [
+      { subject: A, predicate: 'http://schema.org/name', object: '"Entity A v2"' },
+      { subject: B, predicate: 'http://schema.org/name', object: '"Entity B"' },
+    ]);
+
+    // 3. FULL skipSeal share {A, B} — unsealed but COMPLETE; REPLACES member rows
+    // with EXACTLY {A, B} (the round-7 fix; pre-fix they were the union {A,B,C}).
+    const reshare = await agent.assertion.promote(CG_ID, name, { skipSeal: true });
+    expect(reshare.sealed).toBe(false);
+
+    // 4. Seal-in-SWM reconstructs from the member rows + SWM → must cover {A,B} only.
+    await agent.assertion.finalize(CG_ID, name, { layer: 'swm' });
+    const pub = await agent.publishFromFinalizedAssertion(CG_ID, name);
+    expect(pub.status).toBe('confirmed');
+
+    // 5. The published data graph holds A and B but NOT the stale C.
+    const pubA = await agent.query(`SELECT ?n WHERE { <${A}> <http://schema.org/name> ?n }`, CG_ID);
+    const pubB = await agent.query(`SELECT ?n WHERE { <${B}> <http://schema.org/name> ?n }`, CG_ID);
+    const pubC = await agent.query(`SELECT ?n WHERE { <${C}> <http://schema.org/name> ?n }`, CG_ID);
+    expect(pubA.bindings.length).toBeGreaterThan(0);
+    expect(pubB.bindings.length).toBeGreaterThan(0);
+    expect(pubC.bindings.length).toBe(0); // the stale superset member never escapes
+  }, 40_000);
+
+  // round 7 (no-discard variant): full {A,C} -> full {A,B} re-share on the SAME
+  // name WITHOUT a discard. The REPLACE-on-full-complete branch (not discard) is
+  // what drops the stale C here, so this isolates the promote-side fix.
+  it('round 7: full {A,C} -> full {A,B} re-share (NO discard) seals EXACTLY {A,B}, NOT C', async () => {
+    const agent = await createAgent('StaleSupersetNoDiscardBot');
+    await agent.createContextGraph({ id: CG_ID, name: 'Stale Superset No Discard E2E' });
+    await agent.registerContextGraph(CG_ID);
+
+    const name = 'stale-superset-nodiscard';
+    const A = `${ENTITY_BASE}:a`;
+    const B = `${ENTITY_BASE}:b`;
+    const C = `${ENTITY_BASE}:c`;
+
+    // 1. FULL share {A, C} — member rows {A, C}.
+    await agent.assertion.create(CG_ID, name);
+    await agent.assertion.write(CG_ID, name, [
+      { subject: A, predicate: 'http://schema.org/name', object: '"Entity A"' },
+      { subject: C, predicate: 'http://schema.org/name', object: '"Entity C"' },
+    ]);
+    await agent.assertion.promote(CG_ID, name);
+
+    // 2. Re-open the SAME name WITHOUT discard, write {A, B}.
+    await agent.assertion.create(CG_ID, name);
+    await agent.assertion.write(CG_ID, name, [
+      { subject: A, predicate: 'http://schema.org/name', object: '"Entity A v2"' },
+      { subject: B, predicate: 'http://schema.org/name', object: '"Entity B"' },
+    ]);
+
+    // 3. FULL skipSeal re-share {A, B} — REPLACE drops the stale C member row.
+    const reshare = await agent.assertion.promote(CG_ID, name, { skipSeal: true });
+    expect(reshare.sealed).toBe(false);
+
+    // 4. Seal-in-SWM + publish cover {A,B} only.
+    await agent.assertion.finalize(CG_ID, name, { layer: 'swm' });
+    const pub = await agent.publishFromFinalizedAssertion(CG_ID, name);
+    expect(pub.status).toBe('confirmed');
+
+    const pubB = await agent.query(`SELECT ?n WHERE { <${B}> <http://schema.org/name> ?n }`, CG_ID);
+    const pubC = await agent.query(`SELECT ?n WHERE { <${C}> <http://schema.org/name> ?n }`, CG_ID);
+    expect(pubB.bindings.length).toBeGreaterThan(0);
+    expect(pubC.bindings.length).toBe(0);
+  }, 40_000);
 
   // C (review): a DEFAULT full share whose internal seal FAILS with a residual
   // capability gap (NOT skipSeal, NOT stale/corrupt) must fail CLOSED:

@@ -113,6 +113,12 @@ register "v10-rc-validation"   "smoke" "$REPO_ROOT/scripts/v10-rc-validation.sh"
 # Group: sweep
 register "devnet-full-sweep"   "sweep" "$REPO_ROOT/scripts/_devnet-full-sweep.sh"
 
+# Group: cutover — OT-RFC-49 ciphertext->catalog proof (canonical + current).
+# Previously not wired into any orchestrator; included so the cutover (curated
+# publish/update + catalog-root commitment + random-sampling-proves-the-catalog)
+# is exercised by the comprehensive run. Gate off with SKIP_RFC49=1.
+[ -n "${SKIP_RFC49:-}" ] || register "rfc49-catalog" "cutover" "$REPO_ROOT/scripts/devnet-test-rfc49-catalog-sampling.sh"
+
 # Group: rc11 recovery
 register "rc11-promote-crash"  "rc11-recovery" "$REPO_ROOT/scripts/devnet-test-rc11-promote-crash-recovery.sh"
 register "rc11-shutdown-mid"   "rc11-recovery" "$REPO_ROOT/scripts/devnet-test-rc11-shutdown-mid-publish.sh"

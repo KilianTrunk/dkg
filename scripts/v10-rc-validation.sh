@@ -227,6 +227,14 @@ JSON
   PRIV_STATUS=$(echo "$PRIV_RESULT" | pyfield "d.get('status','?')")
   if [ "$PRIV_STATUS" = "confirmed" ] || [ "$PRIV_STATUS" = "finalized" ]; then
     ok "Update with private triples confirmed, status=$PRIV_STATUS"
+  elif echo "$PRIV_RESULT" | grep -q 'NO_DATA_IN_SWM'; then
+    # OT-RFC-49 (Rung-1 strip): cores hold ZERO private SWM ciphertext, so a
+    # private-quad update on a curated CG cannot draw its ACK quorum FROM the
+    # cores — that decline is the privacy model working as intended, not a
+    # failure. The durable private-update path now routes through the curator
+    # and is covered by scripts/devnet-test-curator-ack-gate.sh. Treat as an
+    # expected post-RFC-49 outcome here.
+    warn "Private update declined NO_DATA_IN_SWM — expected post-RFC-49 (cores don't host private SWM; curator path covered by devnet-test-curator-ack-gate.sh)"
   else
     fail "Private update status=$PRIV_STATUS: $PRIV_RESULT"
   fi
@@ -618,12 +626,21 @@ fi
 # ────────────────────────────────────────────────────────────────────────────
 section "14. SKILL.MD ENDPOINT"
 
-SKILL=$(get 9201 /.well-known/skill.md 2>/dev/null || echo '')
-if echo "$SKILL" | grep -q "assertion"; then
-  ok "SKILL.md served and contains 'assertion' terminology"
+# Fetch to a temp FILE and grep the file (not an 83KB shell variable, which was
+# brittle under the runner's shell state). Case-insensitive for any current
+# KA/memory term — the #1116 SKILL.md rewrite changed exact wording, so the old
+# literal `grep -q "assertion"` on a piped variable was stale. One retry — the
+# static route can lag on a cold daemon.
+SKILL_FILE=$(mktemp "${TMPDIR:-/tmp}/v10rc-skill-XXXXXX")
+get 9201 /.well-known/skill.md > "$SKILL_FILE" 2>/dev/null
+[ -s "$SKILL_FILE" ] || get 9201 /.well-known/skill.md > "$SKILL_FILE" 2>/dev/null
+SKILL_BYTES=$(wc -c < "$SKILL_FILE" | tr -d ' ')
+if [ "${SKILL_BYTES:-0}" -gt 1000 ] && grep -qiE 'assertion|knowledge asset|verifiable memory|working memory' "$SKILL_FILE"; then
+  ok "SKILL.md served ($SKILL_BYTES bytes) with current KA/memory terminology"
 else
-  fail "SKILL.md missing or doesn't contain assertion terminology"
+  fail "SKILL.md missing or stale ($SKILL_BYTES bytes)"
 fi
+rm -f "$SKILL_FILE"
 
 # ────────────────────────────────────────────────────────────────────────────
 section "15. IDENTITY / AGENT PROFILE"

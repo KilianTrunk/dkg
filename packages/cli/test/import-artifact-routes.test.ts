@@ -1380,6 +1380,84 @@ describe('import artifact daemon routes', () => {
     await expect(fileStore.get(artifactHash)).resolves.toEqual(bytes);
   });
 
+  it('uses an unverified remote page fallback after an earlier unavailable peer', async () => {
+    const bytes = Buffer.from('late unverified page bytes');
+    const artifactHash = sha256Hash(bytes);
+    const contextGraphId = 'cg-public-open-unavailable-then-unverified';
+    const assertionName = 'large-imported-md';
+    const assertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:source', assertionName);
+    const discoverAssertionArtifactCandidates = vi.fn(async () => ['peer-dead', 'peer-page']);
+    const fetchAndVerifyAssertionArtifact = vi.fn(async (params: { sourcePeerId: string }) => {
+      if (params.sourcePeerId === 'peer-dead') {
+        return {
+          response: {
+            version: 1,
+            contextGraphId,
+            assertionUri,
+            kind: 'markdown',
+            hash: artifactHash,
+            offset: 1024,
+            unavailable: true,
+          },
+        };
+      }
+      return {
+        response: {
+          version: 1,
+          contextGraphId,
+          assertionUri,
+          kind: 'markdown',
+          hash: artifactHash,
+          offset: 1024,
+          totalBytes: 64 * 1024 * 1024 + 1,
+          nextOffset: 1024 + bytes.length,
+          truncated: true,
+          contentType: 'text/markdown',
+          bytesB64: bytes.toString('base64'),
+        },
+      };
+    });
+    const { agent } = makeAgent({
+      contextGraphId,
+      assertionName,
+      assertionUri,
+      fileHash: artifactHash,
+      markdownHash: artifactHash,
+      markdownForm: `urn:dkg:file:${artifactHash}`,
+      onChainPolicy: { accessPolicy: 0, publishPolicy: 1 },
+      discoverAssertionArtifactCandidates,
+      fetchAndVerifyAssertionArtifact,
+    });
+    await startRoutes({ agent });
+
+    const read = await post('/api/knowledge-assets/import-artifact/read', {
+      contextGraphId,
+      assertionUri,
+      kind: 'markdown',
+      hash: artifactHash,
+      offset: 1024,
+      maxBytes: 4096,
+      cache: false,
+    });
+
+    expect(read.status).toBe(200);
+    expect(read.body).toMatchObject({
+      status: 'unverified',
+      contextGraphId,
+      assertionUri,
+      kind: 'markdown',
+      hash: artifactHash,
+      offset: 1024,
+      bytesB64: bytes.toString('base64'),
+      source: { peerId: 'peer-page', agentAddress: 'did:dkg:agent:source' },
+      reason: 'Remote page fetched without full-artifact hash verification',
+    });
+    expect(fetchAndVerifyAssertionArtifact.mock.calls.map(([params]) => params.sourcePeerId)).toEqual([
+      'peer-dead',
+      'peer-page',
+    ]);
+  });
+
   it('derives non-owner public + open read metadata from replicated SWM linkage when _meta is absent (#872 devnet)', async () => {
     // Devnet peers receive the promoted SWM assertion triples but do not
     // receive the origin node's CG-root `_meta` rows. The read route should

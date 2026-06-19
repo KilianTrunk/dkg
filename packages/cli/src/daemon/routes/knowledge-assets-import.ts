@@ -155,7 +155,8 @@ async function fetchFirstAvailableAssertionArtifact(
   },
 ): Promise<AssertionArtifactRemoteResult | null> {
   if (typeof agent.fetchAndVerifyAssertionArtifact !== 'function') return null;
-  let fallback: AssertionArtifactRemoteResult | null = null;
+  let unverifiedFallback: AssertionArtifactRemoteResult | null = null;
+  let failureFallback: AssertionArtifactRemoteResult | null = null;
   for (const sourcePeerId of opts.sourcePeerIds) {
     const remote = await agent.fetchAndVerifyAssertionArtifact({
       contextGraphId: resolved.contextGraphId,
@@ -172,12 +173,12 @@ async function fetchFirstAvailableAssertionArtifact(
     if (remote.verifiedBytes) return { availability: 'verified', remote, sourcePeerId };
     const page = remote.response;
     if (!page.denied && !page.unavailable && !page.hashMismatch && page.bytesB64 != null) {
-      fallback ??= { availability: 'unverified_page', remote, sourcePeerId };
+      unverifiedFallback ??= { availability: 'unverified_page', remote, sourcePeerId };
       continue;
     }
-    fallback ??= { availability: 'unavailable', remote, sourcePeerId };
+    failureFallback ??= { availability: 'unavailable', remote, sourcePeerId };
   }
-  return fallback;
+  return unverifiedFallback ?? failureFallback;
 }
 
 async function resolveAssertionArtifact(

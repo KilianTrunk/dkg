@@ -143,6 +143,61 @@ describe('loadNetworkConfig', () => {
     expect(config.networkName).toMatch(/testnet/i);
   });
 
+  it('loads mainnet configs with complete network defaults and expected chain hubs', async () => {
+    const { _resetNetworkConfigCache } = await import('../src/config.js');
+    const networkId = '7449c543ff04a550b2dafa999fe8ee577a00b212023bb4d4244e8d58a4792c7b';
+    const mainnets = [
+      {
+        name: 'mainnet-base',
+        chainId: 'base:8453',
+        rpcUrl: 'https://mainnet.base.org',
+        hubAddress: '0x99Aa571fD5e681c2D27ee08A7b7989DB02541d13',
+      },
+      {
+        name: 'mainnet-gnosis',
+        chainId: 'gnosis:100',
+        rpcUrl: 'https://rpc.gnosischain.com',
+        hubAddress: '0x882D0BF07F956b1b94BBfe9E77F47c6fc7D4EC8f',
+      },
+      {
+        name: 'mainnet-neuroweb',
+        chainId: 'neuroweb:2043',
+        rpcUrl: 'https://astrosat-parachain-rpc.origin-trail.network',
+        hubAddress: '0x0957e25BD33034948abc28204ddA54b6E1142D6F',
+      },
+    ];
+
+    for (const expected of mainnets) {
+      _resetNetworkConfigCache();
+      const config = await loadNetworkConfig(expected.name);
+      expect(config).not.toBeNull();
+      const cfg = config!;
+      expect((cfg as any)._status).toBeUndefined();
+      expect(cfg.networkName).toBe('DKG V10 Mainnet');
+      expect(cfg.networkId).toBe(networkId);
+      expect(cfg.genesisVersion).toBe(1);
+      expect(cfg.defaultNodeRole).toBe('edge');
+      expect(Array.isArray(cfg.relays)).toBe(true);
+      expect(cfg.relays.length).toBeGreaterThan(0);
+      for (const relay of cfg.relays) {
+        expect(relay).toMatch(/^\/ip4\/\d+\.\d+\.\d+\.\d+\/tcp\/\d+\/p2p\/12D3KooW/);
+        expect(relay).not.toMatch(/PLACEHOLDER|PEER_ID/);
+      }
+      expect(cfg.autoUpdate).toMatchObject({
+        enabled: true,
+        repo: 'OriginTrail/dkg',
+        branch: 'main',
+        checkIntervalMinutes: 5,
+      });
+      expect(cfg.chain).toEqual({
+        type: 'evm',
+        rpcUrl: expected.rpcUrl,
+        hubAddress: expected.hubAddress,
+        chainId: expected.chainId,
+      });
+    }
+  });
+
   it('returns null when network config file does not exist', async () => {
     const { _resetNetworkConfigCache } = await import('../src/config.js');
     _resetNetworkConfigCache();

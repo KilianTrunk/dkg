@@ -114,7 +114,8 @@ export type HostModeRejectionCode =
   | 'UNSIGNED'
   | 'NO_AGENT_ALLOWLIST'
   | 'PEER_NOT_IN_ALLOWLIST'
-  | 'SIG_VERIFY_FAILED';
+  | 'SIG_VERIFY_FAILED'
+  | 'CG_MISMATCH';
 
 export type HostModeEnvelopeAuthorityVerdict =
   | { accepted: true }
@@ -1327,6 +1328,18 @@ export class SharedMemoryHandler {
     rawBytes: Uint8Array,
     contextGraphId: string,
     fromPeerId: string,
+    options?: {
+      /**
+       * GH #1124 — the caller (host-mode ingest) has positively confirmed this
+       * CG is PUBLIC (open, no curated agent allowlist). When set, a CG with no
+       * agent gate is accepted as long as the envelope passes the SAME shared
+       * verifier as curated traffic (signature + timestamp-freshness — NOT a
+       * bespoke check), with the claimed signer as its own one-entry allowlist
+       * (self-consistency), AND the inner request targets THIS CG. When unset,
+       * a no-allowlist CG is rejected defensively (curated mid-race / unknown).
+       */
+      allowSelfSignedForPublicCg?: boolean;
+    },
   ): Promise<HostModeEnvelopeAuthorityVerdict> {
     const ctx = createOperationContext('share');
     let decoded: WorkspaceGossipDecodeResult;
@@ -1336,18 +1349,43 @@ export class SharedMemoryHandler {
       const reason = err instanceof Error ? err.message : String(err);
       return { accepted: false, reasonCode: 'DECODE_FAILED', reason: `decode failed: ${reason}` };
     }
-    const { envelope, signedPayload } = decoded;
+    const { envelope, signedPayload, request } = decoded;
     if (!envelope) {
       return { accepted: false, reasonCode: 'UNSIGNED', reason: 'unsigned envelope (host mode requires agent-signed gossip)' };
     }
     const agentGateAddresses = await this.getContextGraphAgentGateAddresses(contextGraphId);
     const allowedPeers = await this.getContextGraphAllowedPeers(contextGraphId);
     if (agentGateAddresses === null) {
-      // No agent gate → not curated → host mode shouldn't be
-      // active for this CG. Drop defensively. (The host-mode ingest caller keys
-      // its public-CG exception off `reasonCode === 'NO_AGENT_ALLOWLIST'`, NOT
-      // the free-form `reason` text — keep the code stable.)
-      return { accepted: false, reasonCode: 'NO_AGENT_ALLOWLIST', reason: 'no agent allowlist on context graph' };
+      // GH #1124 — public (open) CGs have no curated agent allowlist. When the
+      // caller confirmed the CG is public, accept a self-signed envelope, but
+      // verify it through the SAME `verifyAgentEnvelope` the curated path uses —
+      // so the signature AND the 5-minute timestamp-freshness window (replay /
+      // store-eviction guard) are enforced identically; only the allowlist set
+      // diverges (the claimed signer is its own one-entry allowlist).
+      if (!options?.allowSelfSignedForPublicCg) {
+        // Not confirmed public → curated-mid-race or unknown. Drop defensively.
+        // (The host-mode ingest caller keys its transient-race log off
+        // `reasonCode === 'NO_AGENT_ALLOWLIST'` — keep the code stable.)
+        return { accepted: false, reasonCode: 'NO_AGENT_ALLOWLIST', reason: 'no agent allowlist on context graph' };
+      }
+      if (!envelope.agentAddress || !ethers.isAddress(envelope.agentAddress)) {
+        return { accepted: false, reasonCode: 'SIG_VERIFY_FAILED', reason: 'public-CG envelope missing a valid signer address' };
+      }
+      const selfConsistent = await this.verifyAgentEnvelope(
+        envelope, signedPayload, contextGraphId, [ethers.getAddress(envelope.agentAddress)], ctx, { requireLocalMembership: false },
+      );
+      if (!selfConsistent) {
+        return { accepted: false, reasonCode: 'SIG_VERIFY_FAILED', reason: 'public-CG envelope failed signature/freshness verification' };
+      }
+      // Bind the inner request to THIS CG: the apply/catchup path derives the
+      // target from `request.contextGraphId`, so an envelope signed for CG-A
+      // carrying a payload for CG-B must NOT be stored under A (cross-CG
+      // injection on the open host-mode topic). The plaintext request is always
+      // decoded for a public envelope (`decoded.request`).
+      if (request && request.contextGraphId !== contextGraphId) {
+        return { accepted: false, reasonCode: 'CG_MISMATCH', reason: `inner request contextGraphId "${request.contextGraphId}" != envelope CG "${contextGraphId}"` };
+      }
+      return { accepted: true };
     }
     if (allowedPeers !== null && !allowedPeers.includes(fromPeerId)) {
       return { accepted: false, reasonCode: 'PEER_NOT_IN_ALLOWLIST', reason: `peer ${fromPeerId} not in peer allowlist` };

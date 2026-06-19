@@ -1042,71 +1042,33 @@ export class SwmHostModeMethods extends DKGAgentBase {
       } catch { /* fall through */ }
     }
     // GH #1124 — a curated CG MUST carry ciphertext, so a non-ciphertext
-    // envelope there is garbage → drop early (unchanged). A CONFIRMED-public
-    // (open) CG legitimately gossips PLAINTEXT SWM, so let it through to the
-    // authority + storage path below. Unknown CGs stay on the drop path (safe;
-    // member catchup heals once the policy resolves) — see
-    // isConfirmedPublicForHostMode for why UNKNOWN is treated as not-public.
-    if (!isCiphertext && !(await this.isConfirmedPublicForHostMode(storageCgId))) return;
+    // envelope there is garbage → drop early. A CONFIRMED-public (open) CG
+    // legitimately gossips PLAINTEXT SWM. Resolve the public flag ONCE
+    // (key-independent — see isConfirmedPublicForHostMode) and reuse it for both
+    // the plaintext gate and the authority check. UNKNOWN CGs stay on the drop
+    // path (safe; member catchup heals once the policy resolves).
+    const confirmedPublic = await this.isConfirmedPublicForHostMode(storageCgId);
+    if (!isCiphertext && !confirmedPublic) return;
 
-    // Authority check: verify the envelope signature against the
-    // curated CG's agent allowlist. Without this, a topic-reachable
-    // peer can fill per-CG storage with valid-looking ciphertext
-    // and evict legitimate history.
+    // Authority check. Curated traffic verifies the envelope signature against
+    // the CG's agent allowlist. A confirmed-public CG has no allowlist, so pass
+    // `allowSelfSignedForPublicCg`: the SHARED verifier then validates signature
+    // + timestamp-freshness (the replay/eviction guard) AND binds the inner
+    // request to THIS CG — same envelope validation as curated, only the
+    // allowlist decision diverges (see SharedMemoryHandler.verifyHostModeEnvelopeAuthority).
     //
-    // Use `storageCgId` (cleartext from the envelope) so the
-    // member-side meta-graph + chain-fallback resolvers in
-    // `verifyHostModeEnvelopeAuthority` work on the canonical id
-    // shape. The hash subscription key is internal bookkeeping;
-    // never crosses an external authorization boundary.
+    // Use `storageCgId` (cleartext from the envelope) so the meta-graph +
+    // chain-fallback resolvers work on the canonical id shape.
     const handler = this.getOrCreateSharedMemoryHandler();
-    const verdict = await handler.verifyHostModeEnvelopeAuthority(data, storageCgId, fromPeerId);
+    const verdict = await handler.verifyHostModeEnvelopeAuthority(
+      data, storageCgId, fromPeerId, { allowSelfSignedForPublicCg: confirmedPublic },
+    );
     if (!verdict.accepted) {
-      // GH #1124 — a CONFIRMED-public (open) CG has no curated agent allowlist,
-      // so the authority check returns 'no agent allowlist'. Accept it for such
-      // CGs: the envelope is already confirmed SIGNED (verifyHostModeEnvelopeAuthority
-      // rejects unsigned envelopes BEFORE the allowlist check), and public-CG
-      // host-mode storage is bounded by the per-CG byte cap + registration
-      // economics (the same safety net the pre-reg fail-open below relies on).
-      // Scoped to isConfirmedPublicForHostMode so a curated CG mid chain-event
-      // race (also 'no agent allowlist') is NEVER admitted — it stays a drop and
-      // heals via member catchup. Every OTHER rejection reason (decode failure,
-      // unsigned, sig mismatch, peer-not-in-allowlist) still drops for ALL CGs.
-      const noAllowlist = verdict.reasonCode === 'NO_AGENT_ALLOWLIST';
-      // A public CG has no allowlist, so verifyHostModeEnvelopeAuthority returns
-      // NO_AGENT_ALLOWLIST and short-circuits BEFORE its signature check. So
-      // verify self-consistency here: the signature must recover to the claimed
-      // signer. This rejects a forged/garbage signature on the public path
-      // (the unsigned case — null envelope — is already dropped upstream as
-      // UNSIGNED, a different reasonCode that never reaches this branch).
-      let publicSigSelfConsistent = false;
-      if (noAllowlist && envelope.agentAddress && envelope.signature.length > 0) {
-        try {
-          const recovered = ethers.verifyMessage(
-            computeGossipSigningPayload(envelope.type, envelope.contextGraphId, envelope.timestamp, envelope.payload),
-            ethers.hexlify(envelope.signature),
-          );
-          publicSigSelfConsistent = recovered.toLowerCase() === envelope.agentAddress.toLowerCase();
-        } catch { publicSigSelfConsistent = false; }
-      }
-      if (noAllowlist && publicSigSelfConsistent && (await this.isConfirmedPublicForHostMode(storageCgId))) {
-        this.log.debug(
-          ctx,
-          `Host-mode accepting public-CG plaintext SWM cg=${storageCgId} from=${fromPeerId} (#1124; open CG has no curated allowlist; signature self-consistent; per-CG byte cap remains the safety net)`,
-        );
-        // fall through to the rate-limit + store path below
-      } else {
-      // "no agent allowlist" is the expected outcome during the brief
-      // chain-event race window (cores see the beacon, auto-engage
-      // host-mode, then receive ciphertext BEFORE the
-      // `ContextGraphCreated` event lands AND before the curator
-      // beacon arrived). The beaconCuratorOracle fallback closes
-      // most of that window; the remaining race (envelope arrives
-      // before the beacon is received & verified) is recoverable
-      // via member catchup and should not spam WARN logs in steady-
-      // state operation. Other rejection reasons (sig mismatch, peer
-      // not in allowlist, decode failure) remain WARN — those are
-      // real authority failures that operators need to see.
+      // 'no agent allowlist' on a NON-public CG is the expected brief chain-event
+      // race (curated allowlist not loaded yet) — recoverable via member catchup,
+      // so log at debug. Every other rejection (decode / unsigned / signature-or-
+      // freshness / peer-not-allowed / CG-mismatch) is a real authority failure
+      // operators should see.
       const isTransientRace = verdict.reasonCode === 'NO_AGENT_ALLOWLIST';
       if (isTransientRace) {
         this.log.debug(
@@ -1120,7 +1082,6 @@ export class SwmHostModeMethods extends DKGAgentBase {
         );
       }
       return;
-      }
     }
 
     // OT-RFC-38 / LU-6 Phase B — pre-registration ciphertext rate-

@@ -30,7 +30,7 @@ interface ClassifierInternals {
 }
 
 interface IngestInternals {
-  isConfirmedPublicForHostMode(cgId: string): Promise<boolean>;
+  getContextGraphOnChainPolicy(cgId: string): Promise<{ accessPolicy?: number; publishPolicy?: number }>;
   encodeWorkspaceGossipMessage(contextGraphId: string, message: Uint8Array): Promise<Uint8Array>;
   ingestSwmHostModeEnvelope(contextGraphId: string, data: Uint8Array, fromPeerId: string): Promise<void>;
   swmHostModeStore?: SwmHostModeStore;
@@ -122,42 +122,56 @@ describe('GH #1124 — ingestSwmHostModeEnvelope gate behaviour (signed plaintex
     return stats?.perCg?.[cg]?.entries ?? 0;
   }
 
+  // Drive the REAL classifier via the resolver it depends on (getContextGraphOnChainPolicy),
+  // NOT by stubbing isConfirmedPublicForHostMode — so these exercise the actual
+  // public-policy resolution + the two ingest gates end to end.
   it('CONFIRMED-PUBLIC: a signed plaintext SWM envelope is STORED (was dropped pre-#1124)', async () => {
     const g = (await makeHostCore()) as unknown as IngestInternals;
     const cg = 'cg-ingest-public';
-    g.isConfirmedPublicForHostMode = async () => true; // positively public
+    g.getContextGraphOnChainPolicy = async () => ({ accessPolicy: 0 }); // resolves public
     const env = await g.encodeWorkspaceGossipMessage(cg, plaintextRequest(cg));
     await g.ingestSwmHostModeEnvelope(cg, env, PEER);
     expect(await entriesFor(g, cg)).toBe(1);
   });
 
-  it('CURATED: a plaintext envelope is DROPPED (Gate 1 — curated must be ciphertext)', async () => {
+  it('CURATED (accessPolicy 1): a plaintext envelope is DROPPED (Gate 1 — curated must be ciphertext)', async () => {
     const g = (await makeHostCore()) as unknown as IngestInternals;
     const cg = 'cg-ingest-curated';
-    g.isConfirmedPublicForHostMode = async () => false; // curated/not-public
+    g.getContextGraphOnChainPolicy = async () => ({ accessPolicy: 1 });
     const env = await g.encodeWorkspaceGossipMessage(cg, plaintextRequest(cg));
     await g.ingestSwmHostModeEnvelope(cg, env, PEER);
     expect(await entriesFor(g, cg)).toBe(0);
   });
 
-  it('UNKNOWN policy: a plaintext envelope is DROPPED (safe default — heals via catchup)', async () => {
+  it('UNKNOWN policy (unresolved): a plaintext envelope is DROPPED (safe default — heals via catchup)', async () => {
     const g = (await makeHostCore()) as unknown as IngestInternals;
     const cg = 'cg-ingest-unknown';
-    g.isConfirmedPublicForHostMode = async () => false; // unknown resolves to not-public
+    g.getContextGraphOnChainPolicy = async () => ({}); // accessPolicy undefined
     const env = await g.encodeWorkspaceGossipMessage(cg, plaintextRequest(cg));
     await g.ingestSwmHostModeEnvelope(cg, env, PEER);
     expect(await entriesFor(g, cg)).toBe(0);
   });
 
-  it('PUBLIC but TAMPERED signature: DROPPED (public path verifies signature self-consistency)', async () => {
+  it('PUBLIC but TAMPERED signature: DROPPED (shared verifier rejects bad signature/freshness)', async () => {
     const g = (await makeHostCore()) as unknown as IngestInternals;
     const cg = 'cg-ingest-public-forged';
-    g.isConfirmedPublicForHostMode = async () => true; // public, but…
+    g.getContextGraphOnChainPolicy = async () => ({ accessPolicy: 0 });
     const env = await g.encodeWorkspaceGossipMessage(cg, plaintextRequest(cg));
-    // Corrupt the trailing signature bytes so it no longer recovers to the signer.
     const tampered = Uint8Array.from(env);
     for (let i = 1; i <= 8 && i <= tampered.length; i++) tampered[tampered.length - i] ^= 0xff;
     await g.ingestSwmHostModeEnvelope(cg, tampered, PEER);
     expect(await entriesFor(g, cg)).toBe(0);
+  });
+
+  it('PUBLIC but inner request targets a DIFFERENT CG: DROPPED (no cross-CG injection)', async () => {
+    const g = (await makeHostCore()) as unknown as IngestInternals;
+    const cgEnvelope = 'cg-ingest-A';
+    const cgInner = 'cg-ingest-B';
+    g.getContextGraphOnChainPolicy = async () => ({ accessPolicy: 0 }); // both public
+    // Envelope is signed for CG-A but its inner WorkspacePublishRequest targets CG-B.
+    const env = await g.encodeWorkspaceGossipMessage(cgEnvelope, plaintextRequest(cgInner));
+    await g.ingestSwmHostModeEnvelope(cgEnvelope, env, PEER);
+    expect(await entriesFor(g, cgEnvelope)).toBe(0);
+    expect(await entriesFor(g, cgInner)).toBe(0);
   });
 });

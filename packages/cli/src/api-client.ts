@@ -156,6 +156,15 @@ export interface DaemonStatusResponse {
   storeBackend?: string;
   storeUrl?: string | null;
   storeQuads?: number | null;
+  // Concurrency admission control (PR #1209 limiter, surfaced by #1230):
+  // inFlight = requests currently holding a slot, max = effective cap
+  // (0 = disabled), rejectedTotal = cumulative 503-shed count since boot.
+  // Optional: daemons predating #1230 omit it.
+  admission?: {
+    inFlight: number;
+    max: number;
+    rejectedTotal: number;
+  };
 }
 
 export interface ApiClientConnectOptions {

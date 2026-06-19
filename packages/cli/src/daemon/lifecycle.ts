@@ -241,6 +241,7 @@ import {
   corsHeaders,
   HttpRateLimiter,
   InFlightLimiter,
+  type AdmissionStatsView,
   admitRequest,
   resolveIntSetting,
   applyServerLimits,
@@ -2734,6 +2735,22 @@ export async function runDaemonInner(
     { allowNonPositive: true },
   );
   const inFlightLimiter = new InFlightLimiter(maxInFlight);
+  // Read-only live view of the limiter's counters for the plugin-facing
+  // RequestContext / /api/status: only the three getters, never the mutating
+  // tryAcquire()/release(). The enforcement path (admitRequest, below) keeps the
+  // real limiter; route/plugin code can read shed stats but can't reach — even
+  // via a runtime cast — the methods that corrupt slot accounting.
+  const admissionStats: AdmissionStatsView = {
+    get inFlight() {
+      return inFlightLimiter.inFlight;
+    },
+    get max() {
+      return inFlightLimiter.max;
+    },
+    get rejectedTotal() {
+      return inFlightLimiter.rejectedTotal;
+    },
+  };
   // Throttle the "shedding" warning so a sustained burst can't spam the log,
   // while still letting operators see the limiter is active (per review).
   let lastShedLogAt = 0;
@@ -2940,6 +2957,7 @@ export async function runDaemonInner(
         apiHost,
         apiPortRef,
         routePlugins,
+        admissionStats,
         emitMemoryGraphChanged,
         emitNotification,
       );

@@ -22,6 +22,7 @@ import type { FileStore } from '../../file-store.js';
 import type { VectorStore, EmbeddingProvider } from '../../vector-store.js';
 import type { CatchupTracker } from '../types.js';
 import type { RoutePlugin } from '../plugin-api.js';
+import type { AdmissionStatsView } from '../http-utils.js';
 
 export type MemoryGraphLayer = 'wm' | 'swm' | 'vm';
 
@@ -83,6 +84,11 @@ export interface RequestContext {
   apiPortRef: { value: number };
   // Route plugins; dispatched by `handlePluginRoutes` before the trailing 404.
   routePlugins: RoutePlugin[];
+  // Concurrency admission stats (read-only view); `/api/status` surfaces its
+  // inFlight/max/rejectedTotal so operators can see whether the daemon is
+  // shedding load. Deliberately the read-only `AdmissionStatsView`, not the
+  // concrete limiter — plugin-facing routes must not reach tryAcquire()/release().
+  admission: AdmissionStatsView;
   // Derived per-request (from req.url + headers + token). Routes read
   // `path`, `url`, `requestAgentAddress` extensively; pre-computing
   // here keeps every group on the same fast path.

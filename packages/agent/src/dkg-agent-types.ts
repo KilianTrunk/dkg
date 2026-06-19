@@ -824,6 +824,8 @@ export type ReplicationEventSink = (event: ReplicationEvent) => void;
 
 export interface DKGAgentConfig {
   name: string;
+  /** Selected genesis document. Defaults to the compatibility Base testnet genesis. */
+  genesisId?: string;
   /**
    * public-projection enable flag. When set, a private CG's confirmed VM
    * publishes emit/refresh a verifiable public projection (the floor: existence,

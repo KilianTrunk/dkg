@@ -63,6 +63,36 @@ describe('Genesis Knowledge', () => {
       await agent.stop().catch(() => {});
     });
 
+    it('loads the selected genesis into store and reports its network id', async () => {
+      const store = new OxigraphStore();
+      const agent = await DKGAgent.create({
+        name: 'SelectedGenesisTest',
+        genesisId: 'gnosis-mainnet',
+        store,
+        chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+      });
+
+      const selectedGenesis = await store.query(
+        `SELECT ?v WHERE { <did:dkg:network:gnosis-mainnet> <https://dkg.network/ontology#genesisVersion> ?v }`,
+      );
+      expect(selectedGenesis.type).toBe('bindings');
+      if (selectedGenesis.type === 'bindings') {
+        expect(selectedGenesis.bindings.length).toBe(1);
+      }
+
+      const defaultGenesis = await store.query(
+        `SELECT ?v WHERE { <did:dkg:network:v9-testnet> <https://dkg.network/ontology#genesisVersion> ?v }`,
+      );
+      expect(defaultGenesis.type).toBe('bindings');
+      if (defaultGenesis.type === 'bindings') {
+        expect(defaultGenesis.bindings.length).toBe(0);
+      }
+
+      expect(await agent.networkId()).toBe(await computeNetworkId('gnosis-mainnet'));
+
+      await agent.stop().catch(() => {});
+    });
+
 
     it('genesis loading is idempotent', async () => {
       const store = new OxigraphStore();

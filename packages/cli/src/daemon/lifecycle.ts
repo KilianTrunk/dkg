@@ -1247,6 +1247,7 @@ export async function runDaemonInner(
   const agent = await DKGAgent.create({
     kaNumberAllocator,
     name: config.name,
+    genesisId: network?.genesisId,
     framework: "DKG",
     listenPort: config.listenPort,
     dataDir: dkgDir(),

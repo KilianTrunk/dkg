@@ -46,24 +46,6 @@ const GENESIS_NETWORKS = {
 
 export type GenesisId = keyof typeof GENESIS_NETWORKS;
 
-const GENESIS_TRIG = `\
-@prefix dkg:     <https://dkg.network/ontology#> .
-@prefix erc8004: <https://eips.ethereum.org/erc-8004#> .
-@prefix prov:    <http://www.w3.org/ns/prov#> .
-@prefix schema:  <https://schema.org/> .
-@prefix rdfs:    <http://www.w3.org/2000/01/rdf-schema#> .
-@prefix rdf:     <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
-@prefix xsd:     <http://www.w3.org/2001/XMLSchema#> .
-
-<did:dkg:network:v9-testnet>
-    a dkg:Network ;
-    schema:name "DKG V9 Testnet" ;
-    dkg:genesisVersion "1"^^xsd:integer ;
-    dkg:createdAt "2026-02-24T00:00:00Z"^^xsd:dateTime ;
-    dkg:systemContextGraphs <did:dkg:context-graph:agents> ;
-    dkg:systemContextGraphs <did:dkg:context-graph:ontology> .
-`;
-
 export interface GenesisQuad {
   subject: string;
   predicate: string;
@@ -222,9 +204,6 @@ ${systemContextGraphLines}
 }
 
 export function getGenesisRaw(genesisId: string = DEFAULT_GENESIS_ID): string {
-  if (genesisId === DEFAULT_GENESIS_ID) {
-    return GENESIS_TRIG;
-  }
   return buildGenesisRaw(getGenesisNetwork(genesisId));
 }
 

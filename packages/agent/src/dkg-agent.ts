@@ -544,8 +544,10 @@ export class DKGAgent extends DKGAgentBase {
     const eventBus = new TypedEventBus();
     const keypair = wallet.keypair;
 
+    const genesisId = config.genesisId;
+
     // Load genesis knowledge into the store (idempotent)
-    await DKGAgent.loadGenesis(store);
+    await DKGAgent.loadGenesis(store, genesisId);
 
     const port = config.listenPort ?? 0;
     const host = config.listenHost ?? '0.0.0.0';
@@ -751,7 +753,7 @@ export class DKGAgent extends DKGAgentBase {
   }
 
   async networkId(): Promise<string> {
-    return computeNetworkId();
+    return computeNetworkId(this.config.genesisId);
   }
 
   get peerId(): string {
@@ -1359,7 +1361,7 @@ export class DKGAgent extends DKGAgentBase {
    * Loads genesis knowledge into the triple store if not already present.
    * Creates the system context graph graphs and inserts the genesis quads.
    */
-  private static async loadGenesis(store: TripleStore): Promise<void> {
+  private static async loadGenesis(store: TripleStore, genesisId?: string): Promise<void> {
     const gm = new GraphManager(store);
 
     // Ensure system context graphs exist
@@ -1367,13 +1369,20 @@ export class DKGAgent extends DKGAgentBase {
     await gm.ensureContextGraph(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
 
     // Check if genesis is already loaded by looking for the network definition
+    const genesisQuads = getGenesisQuads(genesisId);
+    const networkDefinition = genesisQuads.find(
+      q => q.predicate === DKG_ONTOLOGY.DKG_GENESIS_VERSION && q.graph === '',
+    );
+    if (!networkDefinition) {
+      throw new Error(`Genesis ${genesisId ?? 'default'} is missing its network definition`);
+    }
+
     const result = await store.query(
-      `SELECT ?v WHERE { <did:dkg:network:v9-testnet> <https://dkg.network/ontology#genesisVersion> ?v } LIMIT 1`,
+      `SELECT ?v WHERE { <${networkDefinition.subject}> <https://dkg.network/ontology#genesisVersion> ?v } LIMIT 1`,
     );
     if (result.type === 'bindings' && result.bindings.length > 0) return;
 
     // Insert genesis quads
-    const genesisQuads = getGenesisQuads();
     const quads: Quad[] = genesisQuads.map(gq => ({
       subject: gq.subject,
       predicate: gq.predicate,

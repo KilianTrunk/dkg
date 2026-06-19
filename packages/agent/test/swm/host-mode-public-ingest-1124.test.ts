@@ -23,6 +23,8 @@ import { join } from 'node:path';
 import {
   encodeWorkspacePublishRequest,
   encodePublishIntent,
+  encodeEncryptedWorkspacePayload,
+  ENCRYPTED_WORKSPACE_ENVELOPE_TYPE,
   decodeStorageACK,
   isStorageACKDecline,
   STORAGE_ACK_DECLINE_CODES,
@@ -42,7 +44,7 @@ interface ClassifierInternals {
   isConfirmedPublicForHostMode(cgId: string): Promise<boolean>;
   getContextGraphOnChainPolicy(
     cgId: string,
-    options?: { forcePublishPolicyChainRead?: boolean },
+    options?: { publishPolicyMaxCacheAgeMs?: number },
   ): Promise<{ accessPolicy?: number; publishPolicy?: number }>;
 }
 
@@ -106,16 +108,18 @@ describe('GH #1124 — isConfirmedPublicForHostMode safety bias (only accessPoli
     expect(await g.isConfirmedPublicForHostMode('cg')).toBe(false);
   });
 
-  it('forces a FRESH publishPolicy chain read for the admission gate (no ≤60s stale-permissive window)', async () => {
-    // publishPolicy is mutable on-chain; the cache is only ≤60s-TTL'd. This
-    // security-positive gate must re-verify on-chain, so it MUST pass
-    // forcePublishPolicyChainRead. (Branimir review #1239: an open→curated
-    // downgrade must not leave a stale-permissive admission window.)
+  it('passes a SHORT publishPolicy cache window for the admission gate (bounded staleness + rate-capped RPC)', async () => {
+    // publishPolicy is mutable on-chain; the general cache is ≤60s-TTL'd. This
+    // security-positive gate passes a SHORT window so an open→curated downgrade
+    // is re-verified within seconds AND the chain RPC is rate-capped to ~1 per
+    // window per CG — not force-every-time (Branimir review #1239 follow-on).
     const g = (await makeCore()) as unknown as ClassifierInternals;
-    let capturedOpts: { forcePublishPolicyChainRead?: boolean } | undefined;
+    let capturedOpts: { publishPolicyMaxCacheAgeMs?: number } | undefined;
     g.getContextGraphOnChainPolicy = async (_cg, opts) => { capturedOpts = opts; return { accessPolicy: 0, publishPolicy: 1 }; };
     await g.isConfirmedPublicForHostMode('cg');
-    expect(capturedOpts?.forcePublishPolicyChainRead).toBe(true);
+    // A short window: positive, and far under the general 60s TTL.
+    expect(capturedOpts?.publishPolicyMaxCacheAgeMs).toBeGreaterThan(0);
+    expect(capturedOpts?.publishPolicyMaxCacheAgeMs).toBeLessThanOrEqual(10_000);
   });
 });
 
@@ -227,6 +231,29 @@ describe('GH #1124 — ingestSwmHostModeEnvelope gate behaviour (signed plaintex
     const env = await g.encodeWorkspaceGossipMessage(cg, plaintextRequest(cg));
     await g.ingestSwmHostModeEnvelope(cg, env, '12D3KooWSomeOtherRelayPeerNotThePublisher');
     expect(await entriesFor(g, cg)).toBe(0);
+  });
+
+  it('CIPHERTEXT envelope: never resolves publishPolicy (lazy confirmedPublic — no per-message eth_call on the curated path)', async () => {
+    // Branimir review #1239 follow-on: `confirmedPublic` only gates anything when
+    // `!isCiphertext`, so it must NOT be computed for the dominant ciphertext
+    // (curated) path — else the bulk of host-mode traffic pays a synchronous
+    // chain read it then discards. A ciphertext envelope must flow to the
+    // authority check WITHOUT any getContextGraphOnChainPolicy (eth_call).
+    const g = (await makeHostCore()) as unknown as IngestInternals;
+    const cg = 'cg-ingest-ciphertext';
+    let policyCalls = 0;
+    g.getContextGraphOnChainPolicy = async () => { policyCalls += 1; return { accessPolicy: 0, publishPolicy: 1 }; };
+    // A real ciphertext payload (passes the `isCiphertext` sniff) in a signed envelope.
+    const ciphertext = encodeEncryptedWorkspacePayload({
+      version: '1', type: ENCRYPTED_WORKSPACE_ENVELOPE_TYPE, contextGraphId: cg,
+      senderIdentity: 'sender', operationId: 'op', shareOperationId: `op-ct-${cg}`,
+      timestampMs: 1_700_000_000_000, cipherAlgorithm: 'aes-256-gcm',
+      nonce: new Uint8Array(12), ciphertext: new Uint8Array([1, 2, 3]),
+      recipients: [], keyAgreementAlgorithm: 'x25519', ephemeralPublicKey: new Uint8Array(32),
+    });
+    const env = await g.encodeWorkspaceGossipMessage(cg, ciphertext);
+    await g.ingestSwmHostModeEnvelope(cg, env, PEER);
+    expect(policyCalls).toBe(0);
   });
 });
 

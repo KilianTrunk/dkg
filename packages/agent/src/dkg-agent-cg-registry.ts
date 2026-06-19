@@ -476,18 +476,23 @@ export class ContextGraphRegistryMethods extends DKGAgentBase {
    */
   async getContextGraphOnChainPolicy(this: DKGAgent, contextGraphId: string, options?: {
     /**
-     * Force a fresh chain RPC for `publishPolicy`, ignoring the (≤60s-TTL)
-     * cache. `publishPolicy` is mutable on-chain (`PublishPolicyUpdated`) and the
-     * agent has no event watcher, so the cache can be stale-PERMISSIVE for up to
-     * the TTL after an owner downgrades open→curated publish. Most callers (e.g.
-     * the import-artifact owner guard) tolerate that window, but a SECURITY-
-     * POSITIVE admission decision (host-mode self-signed plaintext ingest, see
-     * isConfirmedPublicForHostMode) must NOT — a stale `publishPolicy=1` there
-     * would admit a non-authorized write. With this set, the publishPolicy cache
-     * is treated as always-stale so the chain RPC re-verifies; an RPC
-     * failure/timeout leaves it undefined → the caller fails closed.
+     * Cap the age (ms) of a cached `publishPolicy` entry this call will accept;
+     * default `ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS` (60s). `publishPolicy` is
+     * mutable on-chain (`PublishPolicyUpdated`) and the agent has no event
+     * watcher, so the cache can be stale-PERMISSIVE for up to its age after an
+     * owner downgrades open→curated publish. Most callers (e.g. the
+     * import-artifact owner guard) tolerate the full 60s. A SECURITY-POSITIVE
+     * admission decision (host-mode self-signed plaintext ingest, see
+     * `isConfirmedPublicForHostMode`) passes a SHORT window
+     * (`HOST_MODE_PUBLISH_POLICY_MAX_CACHE_AGE_MS` = 5s): an open→curated
+     * downgrade is then honored within seconds, AND — because the resolver
+     * writes through to this same cache — the chain RPC is rate-capped to ~1
+     * per window per CG instead of an `eth_call` on every admitted envelope
+     * (Branimir review #1239 follow-on). An RPC failure/timeout still leaves
+     * `publishPolicy` undefined → the caller fails closed. (`accessPolicy` is
+     * immutable on-chain, so its cache read below is left un-TTL'd.)
      */
-    forcePublishPolicyChainRead?: boolean;
+    publishPolicyMaxCacheAgeMs?: number;
   }): Promise<{
     accessPolicy?: number;
     publishPolicy?: number;
@@ -504,12 +509,14 @@ export class ContextGraphRegistryMethods extends DKGAgentBase {
     // escalate privilege (gossip decrypt is gated by sender-key
     // issuance) and stale-restrictive only causes a transient deny.
     const isPublishPolicyCacheFresh = (key: string): boolean => {
-      // A security-positive caller can force a fresh chain re-verify (the cache
-      // may be stale-permissive for up to the TTL after an open→curated downgrade).
-      if (options?.forcePublishPolicyChainRead) return false;
       const fetchedAt = this.onChainPublishPolicyCacheUpdatedAt.get(key);
       if (fetchedAt === undefined) return false;
-      return Date.now() - fetchedAt <= ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS;
+      // A security-positive caller can shrink the accepted cache age (e.g. the
+      // host-mode admission gate passes ~5s) so an open→curated downgrade is
+      // re-verified within seconds, while still rate-capping the chain RPC to
+      // ~1 per window per CG. Default is the general 60s TTL.
+      const maxAge = options?.publishPolicyMaxCacheAgeMs ?? ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS;
+      return Date.now() - fetchedAt <= maxAge;
     };
     let publishPolicy = isPublishPolicyCacheFresh(contextGraphId)
       ? this.onChainPublishPolicyCache.get(contextGraphId)

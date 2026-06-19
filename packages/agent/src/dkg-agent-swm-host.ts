@@ -388,6 +388,16 @@ import type { DKGAgent } from './dkg-agent.js';
 
 const DEFAULT_HOST_MODE_RECONCILE_BATCH_SIZE = 32;
 
+/**
+ * Max age (ms) of a cached `publishPolicy` value the host-mode self-signed
+ * admission gate (`isConfirmedPublicForHostMode`) will trust. Deliberately
+ * short: it bounds the open→curated downgrade staleness to a few seconds
+ * (vs the general 60s `ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS`) AND rate-caps the
+ * chain RPC to ~1 per window per CG, so spammed public-plaintext gossip can't
+ * amplify into a per-message `eth_call` (Branimir review #1239 follow-on).
+ */
+const HOST_MODE_PUBLISH_POLICY_MAX_CACHE_AGE_MS = 5_000;
+
 function normalizeHostModeReconcileBatchSize(value: number | undefined): number {
   if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_HOST_MODE_RECONCILE_BATCH_SIZE;
   return Math.max(1, Math.floor(value));
@@ -701,16 +711,18 @@ export class SwmHostModeMethods extends DKGAgentBase {
     // sharded topology). Both must positively resolve to their open value; any
     // undefined (unknown) → false (safe).
     try {
-      // `forcePublishPolicyChainRead`: publishPolicy is mutable on-chain and the
-      // cache is only ≤60s-TTL'd, so it could be stale-PERMISSIVE for up to the
-      // TTL after an owner downgrades open→curated publish. This is a
+      // `publishPolicyMaxCacheAgeMs`: publishPolicy is mutable on-chain and the
+      // general cache is ≤60s-TTL'd, so it could be stale-PERMISSIVE for up to
+      // the TTL after an owner downgrades open→curated publish. This is a
       // security-positive gate (it admits a self-signed plaintext write that host
-      // catchup later applies under trustedReplay), so it must re-verify the
-      // publishPolicy on-chain rather than trust the cached value. An RPC
-      // failure/timeout leaves publishPolicy undefined → we fail CLOSED (drop;
-      // the share heals via retry/catchup once the policy re-resolves).
+      // catchup later applies under trustedReplay), so it accepts only a SHORT
+      // (~5s) cache window — bounding the downgrade staleness to seconds while
+      // rate-capping the chain RPC to ~1 per window per CG (vs an eth_call on
+      // every admitted envelope). An RPC failure/timeout leaves publishPolicy
+      // undefined → we fail CLOSED (drop; the share heals via retry/catchup
+      // once the policy re-resolves).
       const { accessPolicy, publishPolicy } = await this.getContextGraphOnChainPolicy(
-        contextGraphId, { forcePublishPolicyChainRead: true },
+        contextGraphId, { publishPolicyMaxCacheAgeMs: HOST_MODE_PUBLISH_POLICY_MAX_CACHE_AGE_MS },
       );
       return accessPolicy === 0 && publishPolicy === 1;
     } catch {
@@ -1051,11 +1063,21 @@ export class SwmHostModeMethods extends DKGAgentBase {
     }
     // GH #1124 — a curated CG MUST carry ciphertext, so a non-ciphertext
     // envelope there is garbage → drop early. A CONFIRMED-public (open) CG
-    // legitimately gossips PLAINTEXT SWM. Resolve the public flag ONCE
-    // (key-independent — see isConfirmedPublicForHostMode) and reuse it for both
-    // the plaintext gate and the authority check. UNKNOWN CGs stay on the drop
-    // path (safe; member catchup heals once the policy resolves).
-    const confirmedPublic = await this.isConfirmedPublicForHostMode(storageCgId);
+    // legitimately gossips PLAINTEXT SWM. Resolve the public flag and reuse it
+    // for both the plaintext gate and the authority check. UNKNOWN CGs stay on
+    // the drop path (safe; member catchup heals once the policy resolves).
+    //
+    // LAZY by design (Branimir review #1239 follow-on): `confirmedPublic` only
+    // ever GATES anything when `!isCiphertext` — line 1059 below reads it only
+    // then, and `verifyHostModeEnvelopeAuthority` ignores
+    // `allowSelfSignedForPublicCg` whenever an allowlist exists. So short-circuit
+    // on `!isCiphertext` to skip the (now chain-backed) policy resolution
+    // entirely on the dominant CIPHERTEXT/curated path — otherwise the bulk of
+    // host-mode traffic would pay a synchronous eth_call to compute a value it
+    // then discards. Security-preserving: a ciphertext envelope on a public CG
+    // just stays in the curated authority path / opaque append and heals via
+    // catchup.
+    const confirmedPublic = !isCiphertext && await this.isConfirmedPublicForHostMode(storageCgId);
     if (!isCiphertext && !confirmedPublic) return;
 
     // Authority check. Curated traffic verifies the envelope signature against

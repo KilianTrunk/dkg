@@ -19,7 +19,10 @@ import { installHardhatACKProvider } from './_helpers/v10-acks.js';
 import {
   assertionLifecycleUri,
   contextGraphMetaUri,
+  contextGraphAssertionUri,
   contextGraphLayerUri,
+  ASSERTION_SEAL_PREDICATES,
+  createOperationContext,
   MemoryLayer,
 } from '@origintrail-official/dkg-core';
 
@@ -605,15 +608,14 @@ describe('#1116 seal decoupled from CG — full vs skipSeal share, seal-in-SWM',
     expect(pub.seal).toBeDefined();
   }, 30_000);
 
-  // #1116 (round 5, FIX 2): no-data precondition must fire BEFORE registration.
-  // publishFromSharedMemory checks CG-registration (CG_NOT_REGISTERED) BEFORE its
-  // own no-quads check, so an UNregistered CG + valid seal + EMPTY sealed SWM used
-  // to surface CG_NOT_REGISTERED first — the /vm/publish route would then mint
-  // (burn gas) and only the retry hit the no-quads 409. The engine now runs a
-  // SWM-empty preflight before the publisher's register guard, so the precondition
-  // wins. Here: finalize the WM draft directly (seals, but NEVER promotes to SWM),
-  // so SWM is empty on an unregistered CG.
-  it('FIX 2: unregistered CG + finalized seal + EMPTY SWM throws "No quads" (not "not registered")', async () => {
+  // #1116 (round 5 FIX 2 → round 9): a no-data precondition must fire BEFORE
+  // registration so a doomed publish never burns mint gas. A finalized-but-
+  // UNSHARED asset (valid seal, SWM empty) has NO swmShareComplete marker (no
+  // promote ever ran), so round 9's marker gate (PUBLISH_NOT_FULL_SHARE) is now
+  // the FIRST precondition — it fires before the publisher's CG-not-registered
+  // guard, so the CG stays unregistered (no gas). (Round 5's SWM-empty preflight
+  // is still present as a deeper backstop, but the marker gate wins here.)
+  it('FIX 2: unregistered CG + finalized-but-UNSHARED asset rejects BEFORE registration (no gas burned)', async () => {
     const agent = await createAgent('NoQuadsBeforeRegisterBot');
     // DELIBERATELY unregistered, local-only CG.
     await agent.createContextGraph({ id: CG_ID, name: 'No Quads Before Register E2E' });
@@ -623,9 +625,8 @@ describe('#1116 seal decoupled from CG — full vs skipSeal share, seal-in-SWM',
     await agent.assertion.write(CG_ID, name, [
       { subject: `${ENTITY_BASE}:nq`, predicate: 'http://schema.org/name', object: '"No Quads"' },
     ]);
-    // Finalize the WM draft (seals it) WITHOUT promoting — SWM stays empty.
-    // Use the public wrapper (default layer "wm") so the author is threaded
-    // through correctly (the low-level assertionFinalize needs an explicit author).
+    // Finalize the WM draft (seals it) WITHOUT promoting — SWM stays empty and
+    // NO full-share marker is set.
     await agent.assertion.finalize(CG_ID, name);
 
     let thrown: any;
@@ -635,8 +636,8 @@ describe('#1116 seal decoupled from CG — full vs skipSeal share, seal-in-SWM',
       thrown = e;
     }
     expect(thrown).toBeTruthy();
-    // The no-data precondition fired first — NOT the registration guard.
-    expect(thrown.message).toMatch(/No quads in shared memory/i);
+    // The not-a-full-share precondition fired first — NOT the registration guard.
+    expect(thrown.code).toBe('PUBLISH_NOT_FULL_SHARE');
     expect(thrown.message).not.toMatch(/not registered on-chain/i);
     expect(thrown.code).not.toBe('CG_NOT_REGISTERED');
 
@@ -946,6 +947,157 @@ describe('#1116 seal decoupled from CG — full vs skipSeal share, seal-in-SWM',
     }
     expect(thrown).toBeTruthy();
     expect(thrown.code).toBe('SWM_SUBSET_NOT_SEALABLE');
+  }, 40_000);
+
+  // ── round 9: ONE seal-lifecycle invariant (the seal exists IFF a sealed,
+  // COMPLETE full share resident in SWM). Every staleness path → blocked. ──
+
+  // Probe: does the assertion SEAL exist on the name-keyed assertion URI in _meta?
+  async function sealExists(agent: DKGAgent, cg: string, name: string): Promise<boolean> {
+    const subj = contextGraphAssertionUri(cg, agent.defaultAgentAddress ?? agent.peerId, name);
+    const metaGraph = contextGraphMetaUri(cg);
+    for (const pred of Object.values(ASSERTION_SEAL_PREDICATES)) {
+      const r = await agent.store.query(`ASK { GRAPH <${metaGraph}> { <${subj}> <${pred}> ?o } }`);
+      if (r.type === 'boolean' && r.value) return true;
+    }
+    return false;
+  }
+
+  // (a) full-sealed {A,B} → subset {A} re-share → the NON-SEALING share CLEARS the
+  // seal (round 9 step 1), so publishFromFinalizedAssertion REJECTS at the seal-read
+  // precondition ("not finalized" — no seal survives the subset share). This is the
+  // primary defense; the marker gate (step 2) is the backstop for the seal-present-
+  // marker-absent case (exercised by round 9 (d) and the FIX 2 test). Together they
+  // close the "publish a subset via a stale full seal" path. Also asserts the marker
+  // is cleared, so even a re-finalize-then-publish would hit the marker gate.
+  it('round 9 (a): a subset re-share clears the seal AND the marker, making it unpublishable', async () => {
+    const agent = await createAgent('Round9SubsetBot');
+    await agent.createContextGraph({ id: CG_ID, name: 'Round9 Subset E2E' });
+    await agent.registerContextGraph(CG_ID);
+    const name = 'r9-subset';
+    const A = `${ENTITY_BASE}:a`, B = `${ENTITY_BASE}:b`;
+
+    await agent.assertion.create(CG_ID, name);
+    await agent.assertion.write(CG_ID, name, [
+      { subject: A, predicate: 'http://schema.org/name', object: '"A"' },
+      { subject: B, predicate: 'http://schema.org/name', object: '"B"' },
+    ]);
+    const full = await agent.assertion.promote(CG_ID, name);
+    expect(full.sealed).toBe(true);
+    expect(await sealExists(agent, CG_ID, name)).toBe(true);
+
+    // Re-open (no discard) + subset {A} re-share — non-sealing → clears the seal.
+    await agent.assertion.create(CG_ID, name);
+    await agent.assertion.write(CG_ID, name, [
+      { subject: A, predicate: 'http://schema.org/name', object: '"A2"' },
+      { subject: B, predicate: 'http://schema.org/name', object: '"B2"' },
+    ]);
+    const subset = await agent.assertion.promote(CG_ID, name, { entities: [A] });
+    expect(subset.sealed).toBe(false);
+    // step 1: the non-sealing (subset) share cleared the seal...
+    expect(await sealExists(agent, CG_ID, name)).toBe(false);
+    // ...and the marker is cleared too (step 5: assertionPromote clears on a subset).
+    expect(await agent.publisher.hasSwmShareComplete(CG_ID, name, agent.defaultAgentAddress ?? agent.peerId)).toBe(false);
+
+    // No seal survives → publish rejects at the seal-read precondition.
+    await expect(agent.publishFromFinalizedAssertion(CG_ID, name)).rejects.toThrow(/not finalized/i);
+  }, 40_000);
+
+  // (b) full-sealed {A,B} → skipSeal full re-share → the skipSeal share CLEARS the
+  // seal (step 1); publish REJECTS until re-finalized (no seal → "not finalized";
+  // and even after seal-in-SWM the gate needs the marker, which the full skipSeal set).
+  it('round 9 (b): a skipSeal full re-share clears the seal; publish rejects until re-finalized', async () => {
+    const agent = await createAgent('Round9SkipSealBot');
+    await agent.createContextGraph({ id: CG_ID, name: 'Round9 SkipSeal E2E' });
+    await agent.registerContextGraph(CG_ID);
+    const name = 'r9-skipseal';
+    const A = `${ENTITY_BASE}:a`, B = `${ENTITY_BASE}:b`;
+
+    await agent.assertion.create(CG_ID, name);
+    await agent.assertion.write(CG_ID, name, [
+      { subject: A, predicate: 'http://schema.org/name', object: '"A"' },
+      { subject: B, predicate: 'http://schema.org/name', object: '"B"' },
+    ]);
+    await agent.assertion.promote(CG_ID, name);
+    expect(await sealExists(agent, CG_ID, name)).toBe(true);
+
+    // Re-open (no discard) + FULL skipSeal re-share — clears the seal.
+    await agent.assertion.create(CG_ID, name);
+    await agent.assertion.write(CG_ID, name, [
+      { subject: A, predicate: 'http://schema.org/name', object: '"A2"' },
+      { subject: B, predicate: 'http://schema.org/name', object: '"B2"' },
+    ]);
+    const reshare = await agent.assertion.promote(CG_ID, name, { skipSeal: true });
+    expect(reshare.sealed).toBe(false);
+    expect(await sealExists(agent, CG_ID, name)).toBe(false); // step 1: seal cleared
+
+    // No seal now → publish rejects with "not finalized" (the seal-read precondition).
+    await expect(agent.publishFromFinalizedAssertion(CG_ID, name)).rejects.toThrow(/not finalized/i);
+
+    // Re-finalize via seal-in-SWM (full skipSeal set the marker) → now publishes.
+    await agent.assertion.finalize(CG_ID, name, { layer: 'swm' });
+    expect(await sealExists(agent, CG_ID, name)).toBe(true);
+    const pub = await agent.publishFromFinalizedAssertion(CG_ID, name);
+    expect(pub.status).toBe('confirmed');
+  }, 40_000);
+
+  // (d) a CONFIRMED publish CLEARS the marker (step 3); a subsequent
+  // finalize(layer:swm) REJECTS (SWM_SUBSET_NOT_SEALABLE — the marker is gone)
+  // WITHOUT stranding the seal (the wrapper pre-clear is gone, step 4).
+  it('round 9 (d): confirmed publish clears the marker; a later finalize(layer:swm) rejects without stranding the seal', async () => {
+    const agent = await createAgent('Round9PostPublishBot');
+    await agent.createContextGraph({ id: CG_ID, name: 'Round9 PostPublish E2E' });
+    await agent.registerContextGraph(CG_ID);
+    const name = 'r9-postpub';
+    const A = `${ENTITY_BASE}:a`;
+
+    await agent.assertion.create(CG_ID, name);
+    await agent.assertion.write(CG_ID, name, [{ subject: A, predicate: 'http://schema.org/name', object: '"A"' }]);
+    await agent.assertion.promote(CG_ID, name);
+    expect(await agent.publisher.hasSwmShareComplete(CG_ID, name, agent.defaultAgentAddress ?? agent.peerId)).toBe(true);
+
+    const pub = await agent.publishFromFinalizedAssertion(CG_ID, name);
+    expect(pub.status).toBe('confirmed');
+    // step 3: the confirmed publish consumed the SWM share → marker cleared.
+    expect(await agent.publisher.hasSwmShareComplete(CG_ID, name, agent.defaultAgentAddress ?? agent.peerId)).toBe(false);
+
+    // A post-publish seal-in-SWM must REJECT (no live full share) and must NOT
+    // strand the seal (the published seal survives for VM ops).
+    const sealBefore = await sealExists(agent, CG_ID, name);
+    let thrown: any;
+    try { await agent.assertion.finalize(CG_ID, name, { layer: 'swm' }); } catch (e) { thrown = e; }
+    expect(thrown).toBeTruthy();
+    expect(thrown.code).toBe('SWM_SUBSET_NOT_SEALABLE');
+    expect(await sealExists(agent, CG_ID, name)).toBe(sealBefore); // seal not stranded
+  }, 40_000);
+
+  // (e) finalize(layer:swm) whose SWM is EMPTY but the marker survived (simulate by
+  // clearing SWM after a full share) no longer strands the seal — the wrapper
+  // pre-clear is gone (step 4), so a PULL_FROM_EMPTY_SOURCE leaves the seal intact.
+  it('round 9 (e): finalize(layer:swm) on an empty-SWM (marker survived) does NOT strand the seal', async () => {
+    const agent = await createAgent('Round9NoStrandBot');
+    await agent.createContextGraph({ id: CG_ID, name: 'Round9 NoStrand E2E' });
+    await agent.registerContextGraph(CG_ID);
+    const name = 'r9-nostrand';
+    const A = `${ENTITY_BASE}:a`;
+    const addr = agent.defaultAgentAddress ?? agent.peerId;
+
+    await agent.assertion.create(CG_ID, name);
+    await agent.assertion.write(CG_ID, name, [{ subject: A, predicate: 'http://schema.org/name', object: '"A"' }]);
+    await agent.assertion.promote(CG_ID, name); // full share: seal + marker + SWM content
+    expect(await sealExists(agent, CG_ID, name)).toBe(true);
+
+    // Simulate an empty SWM while the marker survives: drain the SWM roots directly
+    // (without clearing the marker), mimicking a consumed/missing SWM slice.
+    await agent.publisher.clearPublishedSwmRoots(CG_ID, [A], undefined, createOperationContext('publishFromSWM'));
+
+    // finalize(layer:swm) passes the marker gate, runs pull-from which finds an
+    // EMPTY source → PULL_FROM_EMPTY_SOURCE. The seal must SURVIVE (atomic-on-failure).
+    let thrown: any;
+    try { await agent.assertion.finalize(CG_ID, name, { layer: 'swm' }); } catch (e) { thrown = e; }
+    expect(thrown).toBeTruthy();
+    expect(thrown.code).toBe('PULL_FROM_EMPTY_SOURCE');
+    expect(await sealExists(agent, CG_ID, name)).toBe(true); // NOT stranded (step 4)
   }, 40_000);
 
   // C (review): a DEFAULT full share whose internal seal FAILS with a residual

@@ -1216,8 +1216,11 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         // shared memory`: a curated publish with nothing private shared (only
         // the public catalog entry) — a caller precondition, thrown before any
         // chain interaction, so 409 is safe + consistent with the public path.
-        if (/is not finalized/.test(msg) || /No quads in shared memory/.test(msg) || /has no private payload/.test(msg)) {
-          return jsonResponse(res, 409, { code: "VM_PUBLISH_PRECONDITION", error: msg });
+        // #1116 (round 9): PUBLISH_NOT_FULL_SHARE — the marker gate (a publish
+        // requires a complete full share resident in SWM) is also a pre-chain
+        // caller precondition; map it to the same 409 (code-first).
+        if (e?.code === "PUBLISH_NOT_FULL_SHARE" || /is not finalized/.test(msg) || /No quads in shared memory/.test(msg) || /has no private payload/.test(msg)) {
+          return jsonResponse(res, 409, { code: e?.code === "PUBLISH_NOT_FULL_SHARE" ? "PUBLISH_NOT_FULL_SHARE" : "VM_PUBLISH_PRECONDITION", error: msg });
         }
         return jsonResponse(res, 500, { error: msg });
       }

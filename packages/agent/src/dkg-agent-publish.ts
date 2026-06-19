@@ -3326,6 +3326,30 @@ export class PublishMethods extends DKGAgentBase {
       }
     }
 
+    // #1116 (round 9, reviewer 🔴 #1/#2) — MARKER GATE. A valid seal is no longer
+    // SUFFICIENT to publish: it must be backed by a LIVE complete full share
+    // resident in SWM (the swmShareComplete marker). This closes the whole
+    // seal-staleness class at the consumer: a stale full seal that survived a
+    // subset re-share (subset never re-seals) or an already-consumed share
+    // (confirmed publish drains SWM + clears the marker, round 9 step 3) would
+    // otherwise be publishable via the merkle-still-matches path under the KA
+    // name. Placed AFTER the seal-read (so a genuinely-unfinalized asset still
+    // throws "is not finalized" — preserving that precondition) and BEFORE the
+    // create-vs-update routing + SWM gather, so it covers BOTH the MINT and UPDATE
+    // paths. A legitimate full-share publish has the marker (assertionPromote set
+    // it on the full share); an UPDATE re-publish re-sets it via the required
+    // re-promote (a confirmed publish drained SWM, so a re-publish MUST re-share).
+    if (!(await this.publisher.hasSwmShareComplete(contextGraphId, name, agentAddress, opts?.subGraphName))) {
+      throw Object.assign(
+        new Error(
+          `Cannot publish "${name}" in context graph "${contextGraphId}": it is not a complete full share ` +
+            `resident in Shared Memory (a subset/partial share, an explicitly-unsealed share, or an ` +
+            `already-consumed/published share). Seal and share the full asset (entities:"all") before publishing.`,
+        ),
+        { code: 'PUBLISH_NOT_FULL_SHARE' },
+      );
+    }
+
     // Merge note (PR #1107 ← main): #1097's "auto-promote a sealed-but-unstaged
     // assertion before publish" was dropped here. main reworked the memory
     // model so that publishing a finalized-but-unshared assertion is an
@@ -3684,6 +3708,26 @@ export class PublishMethods extends DKGAgentBase {
       }
     }
 
+    // #1116 (round 9, reviewer 🔴 #2) — a CONFIRMED publish CONSUMES the SWM full
+    // share: the mint path (publishFromSharedMemory) and the update path both
+    // DRAIN the published roots from SWM after on-chain confirmation. The
+    // swmShareComplete marker asserts "a complete full share is resident in SWM",
+    // which no longer holds once SWM is drained. Clear it (best-effort, after the
+    // chain commit) so a post-publish finalize(layer:"swm") can't pass the gate
+    // against an empty SWM, and the next publish requires a fresh full share (which
+    // re-sets the marker via assertionPromote). Covers BOTH MINT and UPDATE.
+    if (result.status === 'confirmed') {
+      try {
+        await this.publisher.clearSwmShareComplete(contextGraphId, name, agentAddress, opts?.subGraphName);
+      } catch (err) {
+        this.log.warn(
+          opts?.operationCtx ?? createOperationContext('publishFromSWM'),
+          `Failed to clear swmShareComplete after confirmed publish of <${lifecycleUri}>: ` +
+            (err instanceof Error ? err.message : String(err)),
+        );
+      }
+    }
+
     return { ...result, assertionUri, seal };
   }
 
@@ -3889,6 +3933,13 @@ export class PublishMethods extends DKGAgentBase {
    * Publish shared memory content: read from SWM graph and publish with full finality (data graph + chain).
    * After on-chain confirmation, broadcasts a lightweight FinalizationMessage so peers with matching
    * SWM state can promote it to canonical without re-downloading the full payload.
+   *
+   * #1116 (round 9) — INTENTIONALLY NOT marker-gated. This is the
+   * "publish an arbitrary caller-selected SWM slice" escape hatch (the legacy
+   * /api/shared-memory/publish path, #1087): it mints a FRESH inline seal over the
+   * selected slice rather than consuming a finalized named lifecycle, so the
+   * swmShareComplete full-share invariant does not apply. The marker gate lives on
+   * `publishFromFinalizedAssertion` (the named-lifecycle /vm/publish path) only.
    */
   async publishFromSharedMemory(this: DKGAgent,
     contextGraphId: string,

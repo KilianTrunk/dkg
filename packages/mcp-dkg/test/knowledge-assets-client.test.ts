@@ -150,6 +150,37 @@ describe('DkgClient knowledge-assets — publish/finalize option serialization',
     expect(calls).toHaveLength(0);
   });
 
+  // #1116 — the `layer` field must reach the wire (FakeClient tests only prove the
+  // tool→client arg pass-through; this pins the actual POST body).
+  it('knowledgeAssetFinalize puts layer:"swm" in the POST body', async () => {
+    const { client, calls } = makeClient();
+    await client.knowledgeAssetFinalize({ contextGraphId: 'cg-1', name: 'f', layer: 'swm' });
+    expect(calls[0].url).toContain('/api/knowledge-assets/f/wm/finalize');
+    expect(calls[0].body).toMatchObject({ contextGraphId: 'cg-1', layer: 'swm' });
+  });
+
+  it('knowledgeAssetFinalize omits the layer key when not passed', async () => {
+    const { client, calls } = makeClient();
+    await client.knowledgeAssetFinalize({ contextGraphId: 'cg-1', name: 'f' });
+    expect(calls[0].body).not.toHaveProperty('layer');
+  });
+
+  // #1116 — the `skipSeal` field must reach the wire.
+  it('knowledgeAssetShare puts skipSeal:true in the POST body', async () => {
+    const { client, calls } = makeClient();
+    await client.knowledgeAssetShare({ contextGraphId: 'cg-1', name: 'f', skipSeal: true });
+    expect(calls[0].url).toContain('/api/knowledge-assets/f/swm/share');
+    expect(calls[0].body).toMatchObject({ contextGraphId: 'cg-1', skipSeal: true });
+  });
+
+  it('knowledgeAssetShare omits skipSeal (and entities) when not passed', async () => {
+    const { client, calls } = makeClient();
+    await client.knowledgeAssetShare({ contextGraphId: 'cg-1', name: 'f' });
+    expect(calls[0].body).toEqual({ contextGraphId: 'cg-1' });
+    expect(calls[0].body).not.toHaveProperty('skipSeal');
+    expect(calls[0].body).not.toHaveProperty('entities');
+  });
+
   it('createKnowledgeAsset translates an alsoPublishVm options object', async () => {
     const { client, calls } = makeClient();
     await client.createKnowledgeAsset({

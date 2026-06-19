@@ -102,34 +102,57 @@ import { buildMessagingTools } from './tools/messaging-tools.js';
 import { buildAssertionTools } from './tools/assertion-tools.js';
 import { buildMemoryTools } from './tools/memory-tools.js';
 
-// #1116: the publishReady:false warning surfaced after a FULL share that opted
-// out of sealing (skip_seal:true) — a later finalize(layer:swm) DOES seal it.
-// Kept byte-identical across the MCP, OpenClaw, and Hermes adapters
-// (cross-adapter parity invariant).
-const SHARE_NOT_PUBLISH_READY_WARNING =
+// #1116 share-outcome warnings. These three constants + classifyShareWarning are
+// duplicated byte-identical across the MCP, OpenClaw, and Hermes adapters. There
+// is intentionally NO shared runtime module: MCP has no dkg-core dependency
+// (dependency-light by design) and OpenClaw cannot import from dkg-mcp, so the
+// only "shared home" would be a new package (out of scope). Drift is caught by a
+// TEST: this adapter's suite asserts these values are byte-identical to the
+// canonical fixture at `tests/fixtures/share-seal-warnings.json`. Update the
+// fixture + all three adapters together; the parity tests flag any mismatch.
+
+// publishReady:false after a FULL share that opted out of sealing (skip_seal:true)
+// — a later finalize(layer:swm) DOES seal it.
+export const SHARE_NOT_PUBLISH_READY_WARNING =
   'Shared to SWM but NOT publish-ready (sealed:false). Seal it with ' +
   'dkg_knowledge_asset_finalize (layer:swm works after sharing), then publish.';
 
-// #1116: a SUBSET share is publishReady:false too, but unlike a skip_seal full
-// share it is NOT sealable — finalize(layer:swm) now REJECTS it with
-// SWM_SUBSET_NOT_SEALABLE. Surface the real recovery (full share / new asset)
-// instead of the dead-end "seal it" advice. Byte-identical across all three
-// adapters (cross-adapter parity invariant).
-const SHARE_SUBSET_NOT_PUBLISH_READY_WARNING =
+// A SUBSET share is publishReady:false too, but unlike a skip_seal full share it
+// is NOT sealable — finalize(layer:swm) now REJECTS it with SWM_SUBSET_NOT_SEALABLE.
+// Surface the real recovery (full share / new asset) instead of "seal it".
+export const SHARE_SUBSET_NOT_PUBLISH_READY_WARNING =
   'Shared a SUBSET to SWM for peer visibility. A subset is NOT sealable/' +
   'publishable (finalize layer:swm will reject it). To publish on-chain, share ' +
   'the full asset (entities:"all"), or model this subset as its own knowledge asset.';
 
-// #1116: a FULL share can come back sealed:true but publishReady:false when NOT
-// every sealed root reached SWM (promotedAllRoots false — e.g. foreign-owned
-// roots were skipped). The engine did NOT set the swmShareComplete marker, so
-// finalize(layer:swm) would REJECT — do NOT recommend it here. Re-sharing the
-// full asset is the recovery. Byte-identical across all three adapters
-// (cross-adapter parity invariant).
-const SHARE_INCOMPLETE_PROMOTE_WARNING =
+// A FULL share can come back sealed:true but publishReady:false when NOT every
+// sealed root reached SWM (promotedAllRoots false — e.g. foreign-owned roots were
+// skipped). The engine did NOT set the swmShareComplete marker, so finalize(layer:
+// swm) would REJECT — do NOT recommend it here. Re-sharing the full asset recovers.
+export const SHARE_INCOMPLETE_PROMOTE_WARNING =
   'Sealed, but not all roots reached SWM (some roots may be owned by other ' +
   'agents) — not yet publishable; re-share the full asset so every sealed root ' +
   'is in SWM.';
+
+/**
+ * #1116: pick the not-publish-ready share warning from the share outcome. Returns
+ * `undefined` when the share IS publish-ready (no warning). Precedence:
+ *  1. sealed:true + publishReady:false → incomplete full promote (marker NOT set;
+ *     finalize layer:swm would reject) → re-share the full asset.
+ *  2. sealed:false + SUBSET → not sealable.
+ *  3. sealed:false + FULL (skip_seal) → sealable later (finalize layer:swm works).
+ * Duplicated byte-identical on MCP (TS) + Hermes (Python).
+ */
+export function classifyShareWarning(outcome: {
+  sealed?: boolean;
+  publishReady?: boolean;
+  isSubset: boolean;
+}): string | undefined {
+  if (outcome.publishReady !== false) return undefined;
+  if (outcome.sealed === true) return SHARE_INCOMPLETE_PROMOTE_WARNING;
+  if (outcome.isSubset) return SHARE_SUBSET_NOT_PUBLISH_READY_WARNING;
+  return SHARE_NOT_PUBLISH_READY_WARNING;
+}
 
 /**
  * #1116: extract the daemon's recovery hint from a 409 UNSEALED_SHARE_BLOCKED
@@ -3670,27 +3693,14 @@ export class DkgNodePlugin {
       });
       // #1116: surface the seal outcome. `sealed`/`publishReady` flow through the
       // JSON; ALSO add the explicit warning when the share is NOT publish-ready.
-      // Branch on the ACTUAL outcome (three cases):
-      //  1. sealed:false + SUBSET → not sealable (finalize layer:swm rejects it);
-      //     recover via a full share or a new asset.
-      //  2. sealed:false + FULL (skip_seal) → sealable later (finalize layer:swm
-      //     works — the marker is set).
-      //  3. sealed:TRUE + publishReady:false → an incomplete full promote (not every
-      //     sealed root reached SWM, e.g. foreign-owned roots skipped). The
-      //     swmShareComplete marker is NOT set, so finalize layer:swm would REJECT —
-      //     re-share the full asset instead.
-      // A subset is a non-empty specific array (an empty array was rejected above;
-      // "all"/undefined is a full share).
+      // classifyShareWarning picks the right of the three warnings from
+      // {sealed, publishReady, isSubset}. A subset is a non-empty specific array
+      // (an empty array was rejected above; "all"/undefined is a full share).
       const seal = result as { publishReady?: boolean; sealed?: boolean };
-      if (result && seal.publishReady === false) {
-        let warning: string;
-        if (seal.sealed === true) {
-          warning = SHARE_INCOMPLETE_PROMOTE_WARNING;
-        } else if (Array.isArray(entities)) {
-          warning = SHARE_SUBSET_NOT_PUBLISH_READY_WARNING;
-        } else {
-          warning = SHARE_NOT_PUBLISH_READY_WARNING;
-        }
+      const warning = result
+        ? classifyShareWarning({ sealed: seal.sealed, publishReady: seal.publishReady, isSubset: Array.isArray(entities) })
+        : undefined;
+      if (warning) {
         return this.json({ ...result, warning });
       }
       return this.json(result);

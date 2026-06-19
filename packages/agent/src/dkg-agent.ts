@@ -1945,6 +1945,18 @@ export class DKGAgent extends DKGAgentBase {
               },
             );
           }
+        } else {
+          // #1116 (round 9, reviewer 🔴 #1) — a NON-SEALING share (a `skipSeal`
+          // full share OR any subset share — the inverse of the finalize block
+          // above) must leave NO full-share seal. Otherwise a prior FULL seal
+          // survives (it lives on the name-keyed assertion URI, outside the
+          // lifecycle-URN clean-slates) and could be published via the
+          // merkle-still-matches path under the KA name, even though the current
+          // share is a subset / explicitly-unsealed. No-op when there was no seal.
+          // The subsequent finalize(layer:"swm") re-stamps a fresh seal, so a
+          // legit skipSeal→seal-in-SWM flow is unaffected (skipSeal is the agent's
+          // concern, so this seal-clear stays in the wrapper, not assertionPromote).
+          await agent.publisher.clearAssertionSeal(contextGraphId, name, agentAddress, opts?.subGraphName);
         }
         // Resolve the gossip signer up-front (mirrors `share()` /
         // `conditionalShare()` patterns) so the publisher can wrap the
@@ -1984,24 +1996,11 @@ export class DKGAgent extends DKGAgentBase {
         // lifecycle URN so the SWM pointer is observable (and can diverge from
         // WM/VM). Best-effort; never blocks the share result.
         await agent._stampSwmPointer(contextGraphId, name, agentAddress, opts?.subGraphName);
-        // #1116 (review A1) — stamp the SWM-share-complete marker ONLY on a true
-        // FULL share: entities:"all" AND every root actually landed in SWM
-        // (promotedAllRoots — no foreign-owned roots skipped). finalize(layer:"swm")
-        // (and the seal-less pull-from source) gates on this so a SUBSET share
-        // (which still stamps dkg:rootEntity member rows) cannot be sealed-in-SWM
-        // and published as a partial asset under the KA name.
-        //
-        // round 5 — and CLEAR it on the inverse branch (a strict subset / a
-        // foreign-owned-root-skipped share). A2_PRESERVE carries the marker
-        // across a discard+recreate, so a full-share → recreate → subset-share
-        // would otherwise keep a stale marker. Clearing the instant scope is
-        // actually reduced re-arms the gate; a benign full-share recreate-retry
-        // re-stamps it here, so legit seal-in-SWM recovery is unaffected.
-        if (promotingAllEntities && promotedAllRoots) {
-          await agent.publisher.markSwmShareComplete(contextGraphId, name, agentAddress, opts?.subGraphName);
-        } else {
-          await agent.publisher.clearSwmShareComplete(contextGraphId, name, agentAddress, opts?.subGraphName);
-        }
+        // #1116 (round 9) — the swmShareComplete marker mark/clear now lives INSIDE
+        // assertionPromote (co-located with the member-row REPLACE, gated on the
+        // same isFullCompletePromote), so it stays in lockstep with the rows for
+        // EVERY caller of the public assertionPromote — not just this wrapper. The
+        // `promotedAllRoots` result is still used below for `publishReady`.
         // #1116: `sealed` reflects THIS share — a subset share or a skipSeal
         // share is `sealed:false` BY DESIGN, not a failure. `publishReady` means
         // a subsequent /vm/publish won't 409 on "not finalized"; it is true only
@@ -2116,17 +2115,14 @@ export class DKGAgent extends DKGAgentBase {
             { code: 'SWM_SUBSET_NOT_SEALABLE' },
           );
         }
-        // #1116 (round 7) — drop any STALE seal from a PRIOR lifecycle BEFORE
-        // pull-from. The seal lives on the name-keyed assertion subject, which
-        // neither discard nor create clean-slates reach (they key on the
-        // lifecycle URN), so a full {A,C} → recreate → full {A,B} cycle could
-        // leave the OLD {A,C} seal. pull-from reads `seal.rootEntities` ahead of
-        // the (now-correct, REPLACEd) member rows, so without this it would
-        // reconstruct the stale root set. We re-seal from the reconstructed SWM
-        // draft immediately below, so clearing here loses nothing — and the
-        // full-share marker check above already proved this is a sealable full
-        // asset.
-        await agent.publisher.clearAssertionSeal(contextGraphId, name, agentAddress, opts?.subGraphName);
+        // #1116 (round 9) — NO pre-clear of the seal here. Round 8 made the SWM
+        // pull resolve entities from the member rows (NOT seal.rootEntities), so a
+        // stale seal can no longer mis-scope the reconstruction; and
+        // assertionPullFrom's INTERNAL teardown clears the seal AFTER it validates
+        // the source is non-empty. A pre-clear ran BEFORE the pull and stranded the
+        // asset (seal gone, no fresh seal) if the pull threw PULL_FROM_EMPTY_SOURCE.
+        // Dropping it makes finalize(layer:"swm") atomic-on-failure: on a failed
+        // pull the prior seal survives and the asset stays re-tryable.
         await agent.publisher.assertionPullFrom(contextGraphId, name, agentAddress, 'swm', {
           subGraphName: opts?.subGraphName,
           onConflict: 'replace',

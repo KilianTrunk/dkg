@@ -5576,6 +5576,21 @@ export class DKGPublisher implements Publisher {
     await this.store.delete(promoted.delete);
     await this.store.insert(promoted.insert);
 
+    // #1116 (round 9) — CO-LOCATE the swmShareComplete marker with the member-row
+    // REPLACE above, at the single publisher chokepoint. The marker and the member
+    // rows MUST stay in lockstep: the marker says "the member rows describe a
+    // complete full share". A FULL-COMPLETE promote (entities:"all" + no foreign
+    // root skipped) is the only state that is publishable/sealable-in-SWM, so it
+    // SETS the marker; any other promote (subset or foreign-skipped) CLEARS it.
+    // Doing it here (not in the agent `promote()` wrapper) means EVERY caller of
+    // the public assertionPromote keeps the invariant — no desync between the
+    // marker and the rows for a direct/alternate caller.
+    if (isFullCompletePromote) {
+      await this.markSwmShareComplete(contextGraphId, name, agentAddress, opts?.subGraphName);
+    } else {
+      await this.clearSwmShareComplete(contextGraphId, name, agentAddress, opts?.subGraphName);
+    }
+
     // Write WorkspaceOperation metadata + ownership quads, mirroring what
     // _shareImpl and the remote SharedMemoryHandler both produce, so the
     // promoting node and replicas converge on identical ownership state.
@@ -5690,6 +5705,16 @@ export class DKGPublisher implements Publisher {
     // marker and let finalize(layer:"swm") publish the subset as the full KA.
     // Clearing on discard re-arms the gate: the next share must re-prove
     // completeness (a full share re-stamps it; a subset never sets it).
+    //
+    // #1116 (round 9) — ASYMMETRY (verified sound): the marker is cleared
+    // UNconditionally here, but the seal + member rows only when !hasVmVersion
+    // below. This is consistent: a confirmed publish already cleared the marker
+    // (round 9 step 3), so a published KA (hasVmVersion) has NO marker at discard
+    // and the unconditional clear is a no-op for it; its seal + rows are preserved
+    // (they back the on-chain state / receipt lookups). There is no state where the
+    // marker's absence misleads a consumer about a surviving seal: the marker gates
+    // "publishable full share", and a published KA is correctly NOT re-publishable
+    // as a fresh full share (its seal is the published one, used only for VM ops).
     await this.store.deleteByPattern({
       graph: metaGraph,
       subject: lifecycleSubject,

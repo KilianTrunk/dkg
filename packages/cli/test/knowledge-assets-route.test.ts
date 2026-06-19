@@ -384,22 +384,20 @@ describe('/api/knowledge-assets routes (real daemon, real chain)', () => {
       expect(String(res.body.error)).toMatch(/not finalized/);
     });
 
-    it('409 VM_PUBLISH_PRECONDITION when finalized but nothing shared into SWM', async () => {
-      // PUBLIC CG: post OT-RFC-49 a CURATED CG can publish catalog-only (the
-      // catalog is the on-chain commitment), so "nothing shared" is no longer a
-      // precondition there — it proceeds to ACK. The "No quads in shared memory"
-      // precondition still holds on the public path, which is what this checks.
+    it('409 PUBLISH_NOT_FULL_SHARE when finalized but nothing shared into SWM', async () => {
+      // #1116 (round 9): finalize-without-share leaves a seal but NO
+      // swmShareComplete marker, so the marker gate (a publish requires a complete
+      // full share resident in SWM) rejects FIRST with PUBLISH_NOT_FULL_SHARE,
+      // mapped to 409 (same precondition family as the old "No quads in shared
+      // memory" VM_PUBLISH_PRECONDITION — both are pre-chain caller preconditions).
       await createKa(PUBREG, 'pub-noshare');
-      // A UNIQUE subject so the seal's selection can't cross-match another KA's
-      // already-shared entity (real fact: SWM selection is by entity subject
-      // within the CG — a reused subject would let publish find someone else's
-      // shared quad and proceed to ACK instead of returning the 409).
+      // A UNIQUE subject so a later cross-match can't accidentally share it.
       await write(PUBREG, 'pub-noshare', [{ subject: 'ex:noshare-only', predicate: 'ex:p', object: '"x"' }]);
       await postJson(daemon, '/api/knowledge-assets/pub-noshare/wm/finalize', { contextGraphId: PUBREG });
       const res = await postJson(daemon, '/api/knowledge-assets/pub-noshare/vm/publish', { contextGraphId: PUBREG });
       expect(res.status).toBe(409);
-      expect(res.body.code).toBe('VM_PUBLISH_PRECONDITION');
-      expect(String(res.body.error)).toMatch(/shared memory/);
+      expect(res.body.code).toBe('PUBLISH_NOT_FULL_SHARE');
+      expect(String(res.body.error)).toMatch(/complete full share/i);
     });
 
     it('rejects a non-integer epochs option (400, no publish)', async () => {
@@ -488,11 +486,13 @@ describe('/api/knowledge-assets routes (real daemon, real chain)', () => {
 
       const res = await postJson(daemon, '/api/knowledge-assets/pub-noshare-unreg/vm/publish', { contextGraphId: LOCAL_NOSHARE });
 
-      // The no-quads precondition fired (4xx), NOT the registration error — proving
-      // the preflight ran before any register tx.
+      // #1116 (round 9): finalize-without-share leaves no swmShareComplete marker,
+      // so the marker gate (PUBLISH_NOT_FULL_SHARE) fires as a pre-chain 4xx
+      // precondition BEFORE any registration tx — proving the gate runs ahead of
+      // the publisher's CG-not-registered guard (so no gas is burned).
       expect(res.status).toBeGreaterThanOrEqual(400);
       expect(res.status).toBeLessThan(500);
-      expect(String(res.body?.error ?? '')).toMatch(/No quads in shared memory|nothing shared/i);
+      expect(res.body?.code).toBe('PUBLISH_NOT_FULL_SHARE');
       expect(String(res.body?.error ?? '')).not.toMatch(/not registered on-chain/i);
 
       // And the CG is STILL unregistered — no registration tx was sent (no gas burned).

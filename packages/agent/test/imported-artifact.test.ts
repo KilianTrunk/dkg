@@ -121,6 +121,8 @@ function fakeAgent(args: {
   queryBindings?: Array<Record<string, unknown>>;
   bytes?: Buffer;
   onChainPolicy?: { accessPolicy?: number; publishPolicy?: number };
+  allowedAgents?: string[];
+  participantAgents?: string[];
 }) {
   const authorizeSyncRequest = vi.fn(async (
     syncReq: SyncRequestEnvelope,
@@ -168,6 +170,8 @@ function fakeAgent(args: {
     getContextGraphOnChainPolicy: args.onChainPolicy
       ? vi.fn(async () => args.onChainPolicy)
       : vi.fn(async () => ({})),
+    getContextGraphAllowedAgents: vi.fn(async () => args.allowedAgents ?? []),
+    getContextGraphParticipantAgentAddresses: vi.fn(async () => args.participantAgents ?? []),
     findLocalAgentForContextGraph: vi.fn(async () => 'did:dkg:agent:owner'),
     sendToPeer: vi.fn(async () => new TextEncoder().encode(JSON.stringify({
       version: 1,
@@ -305,8 +309,9 @@ describe('generic imported artifact peer handler', () => {
     expect(res.hashMismatch).toBe(true);
   });
 
-  it('denies non-owner artifact reads even when context graph sync auth passes', async () => {
-    const agent = fakeAgent({ bytes: Buffer.from('abcdef') });
+  it('allows non-owner artifact reads when the requester is an authorized CG read agent', async () => {
+    const bytes = Buffer.from('abcdef');
+    const agent = fakeAgent({ bytes, allowedAgents: [otherAgentAddress] });
     const nonOwner = await request({}, {
       requesterAgentAddress: otherAgentAddress,
       signer: otherWallet,
@@ -314,6 +319,25 @@ describe('generic imported artifact peer handler', () => {
     const res = await invoke(agent, nonOwner);
 
     expect(agent.authorizeSyncRequest).toHaveBeenCalledTimes(1);
+    expect(agent.store.query).toHaveBeenCalled();
+    expect(res.denied).toBeUndefined();
+    expect(res.bytesB64).toBe(bytes.subarray(0, 4).toString('base64'));
+  });
+
+  it('denies non-owner artifact reads on public curators-only CGs without read-agent membership', async () => {
+    const agent = fakeAgent({
+      bytes: Buffer.from('abcdef'),
+      onChainPolicy: { accessPolicy: 0, publishPolicy: 0 },
+    });
+    const nonOwner = await request({}, {
+      requesterAgentAddress: otherAgentAddress,
+      signer: otherWallet,
+    });
+    const res = await invoke(agent, nonOwner);
+
+    expect(agent.authorizeSyncRequest).toHaveBeenCalledTimes(1);
+    expect(agent.getContextGraphAllowedAgents).toHaveBeenCalledWith(contextGraphId);
+    expect(agent.getContextGraphParticipantAgentAddresses).toHaveBeenCalledWith(contextGraphId);
     expect(agent.store.query).not.toHaveBeenCalled();
     expect(res.denied).toBe('denied');
   });
@@ -676,6 +700,40 @@ describe('generic imported artifact peer handler', () => {
       offset: 1,
       maxBytes: 3,
     }));
+  });
+
+  it('rejects an unverified remote page that exceeds the requested range', async () => {
+    const bytes = Buffer.from('abcdef');
+    const artifactHash = keccakHash(bytes);
+    const agent = {
+      readAssertionArtifact: vi.fn(async () => ({
+        version: 1,
+        contextGraphId,
+        assertionUri,
+        kind: 'source',
+        hash: artifactHash,
+        offset: 1,
+        totalBytes: bytes.length,
+        nextOffset: bytes.length,
+        truncated: true,
+        bytesB64: bytes.toString('base64'),
+      })),
+    };
+
+    const res = await ImportedArtifactMethods.prototype.fetchAndVerifyAssertionArtifact.call(agent, {
+      contextGraphId,
+      assertionUri,
+      kind: 'source',
+      hash: artifactHash,
+      offset: 1,
+      maxBytes: 3,
+      sourcePeerId: 'peer-local',
+      cache: false,
+    });
+
+    expect(res.response.hashMismatch).toBe(true);
+    expect(res.response.bytesB64).toBeUndefined();
+    expect(res.verifiedBytes).toBeUndefined();
   });
 
   it('serves requested pages for artifacts larger than the cache promotion cap', async () => {

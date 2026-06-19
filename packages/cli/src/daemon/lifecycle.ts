@@ -101,6 +101,7 @@ import {
   ensureDkgDir,
   TELEMETRY_ENDPOINTS,
   type DkgConfig,
+  type NetworkConfig,
   type AutoUpdateConfig,
   type LocalAgentIntegrationCapabilities,
   type LocalAgentIntegrationConfig,
@@ -725,6 +726,27 @@ export function startPromoteWorkerDaemonLifecycle(input: {
     stop,
     getSupervisor: () => promoteWorkerSupervisor,
   };
+}
+
+type StartupGenesisValidation =
+  | { ok: true; networkId: string }
+  | { ok: false; networkId: string; messages: string[] };
+
+export async function validateStartupGenesis(
+  network: Pick<NetworkConfig, 'genesisId' | 'networkId' | 'networkName'> | null | undefined,
+): Promise<StartupGenesisValidation> {
+  const networkId = await computeNetworkId(network?.genesisId);
+  if (network?.networkId && network.networkId !== networkId) {
+    return {
+      ok: false,
+      networkId,
+      messages: [
+        `FATAL: genesis mismatch! Expected networkId ${network.networkId.slice(0, 16)}... but computed ${networkId.slice(0, 16)}...`,
+        `This node's genesis does not match network/testnet.json. Rebuild or update the repo.`,
+      ],
+    };
+  }
+  return { ok: true, networkId };
 }
 
 export async function runDaemon(foreground: boolean): Promise<void> {
@@ -1390,19 +1412,15 @@ export async function runDaemonInner(
   let promoteWorkerLifecycle: PromoteWorkerDaemonLifecycle | null = null;
   let shuttingDown = false;
 
-  const networkId = await computeNetworkId();
+  const genesisValidation = await validateStartupGenesis(network);
+  const networkId = genesisValidation.networkId;
   const publisherControl = createPublisherControlFromStore(
     agent.store,
     createPublicSnapshotStore(dkgDir(), config),
   );
   log(`Network: ${networkId.slice(0, 16)}...`);
-  if (network?.networkId && network.networkId !== networkId) {
-    log(
-      `FATAL: genesis mismatch! Expected networkId ${network.networkId.slice(0, 16)}... but computed ${networkId.slice(0, 16)}...`,
-    );
-    log(
-      `This node's genesis does not match network/testnet.json. Rebuild or update the repo.`,
-    );
+  if (!genesisValidation.ok) {
+    for (const message of genesisValidation.messages) log(message);
     process.exit(1);
   }
   if (network) {

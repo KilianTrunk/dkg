@@ -127,9 +127,12 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     // underfunded-active case.
     // 2.0.0 → 2.0.1 (PATCH): protocol treasury fee skimmed inside
     // `_addTokens` (publisher pays the same gross amount; the fee is taken
-    // out of the staker-bound net). Patch-level on purpose — the EIP-712
-    // author-attestation domain version (`_EIP712_VERSION_HASH`) MUST stay
-    // pinned at "2.0.0" so previously signed attestations keep verifying.
+    // out of the staker-bound net). Patch-level on purpose.
+    // #1116: the EIP-712 author-attestation domain version
+    // (`_EIP712_VERSION_HASH`) is bumped "2.0.0" → "3.0.0" — a DELIBERATE
+    // breaking change for the context-graph-independent author attestation
+    // (the `contextGraphId` struct field was removed). Pre-cutover
+    // attestations no longer verify (acceptable pre-mainnet, no backcompat).
     // 10.1.0 — OT-RFC-49 catalog model + ACK domain separation (see
     //          `ACK_DIGEST_VERSION` below).
     // 10.1.1 — OT-RFC-51 "Publishing Allocation": realized publishing no
@@ -350,7 +353,14 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     error InvalidAuthorSignature1271();
 
     /// @dev RFC-001 §3.2 — EIP-712 type hash for `AuthorAttestation`.
-    /// `keccak256("AuthorAttestation(uint256 contextGraphId,bytes32 merkleRoot,address authorAddress,uint8 schemeVersion,uint256 reservedKaId)")`.
+    /// `keccak256("AuthorAttestation(bytes32 merkleRoot,address authorAddress,uint8 schemeVersion,uint256 reservedKaId)")`.
+    /// @dev #1116: the seal is now CONTEXT-GRAPH-INDEPENDENT — `contextGraphId`
+    ///      was removed from the author attestation so an assertion can be
+    ///      finalized (sealed) BEFORE its CG is registered on-chain. The CG is
+    ///      still bound to the publication via `PublishParams.contextGraphId`
+    ///      (mint target / `isAuthorizedPublisher` / KA→CG registration) and the
+    ///      separate ACK digest — just not by the author signature. The domain
+    ///      version (`_EIP712_VERSION_HASH`) is bumped to 3.0.0 for the cutover.
     /// @dev OT-RFC-43 Option-1 (variant 1a): `reservedKaId` is bound into the
     ///      author attestation so the author signs the *slot* (the packed
     ///      `(author << 96) | number`) as well as the content. Without it a
@@ -361,7 +371,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     ///      which already binds `kaId`.
     bytes32 private constant _AUTHOR_ATTESTATION_TYPEHASH =
         keccak256(
-            "AuthorAttestation(uint256 contextGraphId,bytes32 merkleRoot,address authorAddress,uint8 schemeVersion,uint256 reservedKaId)"
+            "AuthorAttestation(bytes32 merkleRoot,address authorAddress,uint8 schemeVersion,uint256 reservedKaId)"
         );
 
     bytes32 private constant _UPDATE_AUTHOR_ATTESTATION_TYPEHASH =
@@ -381,11 +391,13 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     ///      the digest and must update both sites.
     bytes32 private constant _EIP712_NAME_HASH = keccak256(bytes("KnowledgeAssetsLifecycle"));
 
-    /// @dev `version` hash for the EIP-712 domain. Bound to the major.minor
-    ///      portion of `_VERSION` ("10.1") so off-chain signers can pin the
-    ///      attestation to the contract semantic version. Patch bumps do not
-    ///      change this — only major.minor changes do.
-    bytes32 private constant _EIP712_VERSION_HASH = keccak256(bytes("2.0.0"));
+    /// @dev `version` hash for the EIP-712 domain — must match the off-chain
+    ///      attestation builder (`AUTHOR_ATTESTATION_DOMAIN_VERSION`). #1116:
+    ///      bumped 2.0.0 → 3.0.0 for the CONTEXT-GRAPH-INDEPENDENT author
+    ///      attestation cutover (the `contextGraphId` struct field was removed),
+    ///      which deliberately invalidates any pre-cutover attestation. Patch
+    ///      bumps do not change this — only a deliberate breaking change does.
+    bytes32 private constant _EIP712_VERSION_HASH = keccak256(bytes("3.0.0"));
 
     /// @dev Magic value returned by EIP-1271-compliant smart wallets on a
     ///      successful signature check. `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
@@ -981,7 +993,6 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
      * `signedAtBlock` window is included in the digest (see RFC-001 §3.2).
      */
     function _hashAuthorAttestation(
-        uint256 _contextGraphId,
         bytes32 _merkleRoot,
         address _authorAddress,
         uint8 _schemeVersion,
@@ -999,7 +1010,6 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         bytes32 structHash = keccak256(
             abi.encode(
                 _AUTHOR_ATTESTATION_TYPEHASH,
-                _contextGraphId,
                 _merkleRoot,
                 _authorAddress,
                 _schemeVersion,
@@ -1093,7 +1103,6 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         if (p.authorSchemeVersion != 1) revert UnsupportedAuthorScheme(p.authorSchemeVersion);
 
         bytes32 digest = _hashAuthorAttestation(
-            p.contextGraphId,
             p.merkleRoot,
             p.authorAddress,
             p.authorSchemeVersion,

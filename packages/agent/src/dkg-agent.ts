@@ -1965,7 +1965,7 @@ export class DKGAgent extends DKGAgentBase {
           { awaitCuratorAck: opts?.awaitCuratorAck, curatorAckTimeoutMs: opts?.curatorAckTimeoutMs },
           createOperationContext('share'),
         );
-        const { promotedCount, gossipMessage } = await agent.publisher.assertionPromote(
+        const { promotedCount, gossipMessage, promotedAllRoots } = await agent.publisher.assertionPromote(
           contextGraphId, name, agentAddress,
           {
             ...opts,
@@ -1989,7 +1989,15 @@ export class DKGAgent extends DKGAgentBase {
         // share is `sealed:false` BY DESIGN, not a failure. `publishReady` means
         // a subsequent /vm/publish won't 409 on "not finalized"; it is true only
         // for a sealed FULL share. Kept distinct from `sealed` for forward-compat.
-        const publishReady = promotingAllEntities && sealed;
+        //
+        // #1116 FIX 1 — the seal covers ALL roots, but assertionPromote's advisory
+        // ownership skip can promote only a SUBSET (foreign-owned roots are left in
+        // the owner's SWM copy). When that happens the SWM slice is missing part of
+        // the sealed set, so publishFromFinalizedAssertion would recompute a
+        // different merkleRoot and fail the seal guard. The seal still EXISTS
+        // (`sealed:true`), but the asset is NOT publish-ready. The single-author
+        // happy path skips no roots ⇒ promotedAllRoots:true ⇒ publishReady:true.
+        const publishReady = promotingAllEntities && sealed && promotedAllRoots;
         return { promotedCount, sealed, publishReady };
       },
       async discard(contextGraphId: string, name: string, opts?: { subGraphName?: string }): Promise<void> {
@@ -2081,6 +2089,13 @@ export class DKGAgent extends DKGAgentBase {
           preSignedAuthorAttestation: opts?.preSignedAuthorAttestation,
           schemeVersion: opts?.schemeVersion,
         });
+        // #1116 FIX 2 — make the SWM-resident position observable. The original
+        // (possibly skipSeal) promote had no seal yet, so `_stampSwmPointer` ran a
+        // no-op then; now that the seal EXISTS, stamp dkg:swmCurrentAssertion to it
+        // so status reports "swm-shared". This must precede the WM-draft cleanup
+        // below, whose stale-WM-pointer retirement is gated on the SWM pointer
+        // being present (the content is genuinely SWM-resident).
+        await agent._stampSwmPointer(contextGraphId, name, agentAddress, opts?.subGraphName);
         // Best-effort: the seal (in _meta) and the SWM content are already
         // durable, so a cleanup failure is harmless (it only leaves a sealed WM
         // draft alongside SWM — which the finalize-after-edit guards still

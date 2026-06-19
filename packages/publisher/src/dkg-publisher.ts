@@ -27,6 +27,8 @@ import {
   generateAssertionPromotedMetadata,
   generateAssertionDiscardedMetadata,
   generateTentativeMetadata,
+  WM_CURRENT_ASSERTION_PRED,
+  SWM_CURRENT_ASSERTION_PRED,
   VM_CURRENT_ASSERTION_PRED,
   toHex,
   resolveUalByBatchId,
@@ -5066,7 +5068,7 @@ export class DKGPublisher implements Publisher {
        */
       confirmBeforeCommit?: (message: Uint8Array) => Promise<{ applied: boolean; rejected?: boolean }>;
     },
-  ): Promise<{ promotedCount: number; gossipMessage?: Uint8Array }> {
+  ): Promise<{ promotedCount: number; gossipMessage?: Uint8Array; promotedAllRoots: boolean }> {
     await this.ensureSubGraphRegistered(contextGraphId, opts?.subGraphName);
     const graphUri = await this.wmGraphUri(contextGraphId, agentAddress, name, opts?.subGraphName);
     const swmGraphUri = await this.swmGraphUri(contextGraphId, agentAddress, name, opts?.subGraphName);
@@ -5097,7 +5099,8 @@ export class DKGPublisher implements Publisher {
       // `assertionCreate` are not consulted: they fire for empty-write
       // flows where promoting nothing is legitimate.
       await this.assertAssertionDataPersisted(contextGraphId, graphUri);
-      return { promotedCount: 0 };
+      // No roots to promote ⇒ none were foreign-skipped.
+      return { promotedCount: 0, promotedAllRoots: true };
     }
 
     let quadsToPromote = result.quads;
@@ -5174,7 +5177,9 @@ export class DKGPublisher implements Publisher {
       );
     }
 
-    if (quadsToPromote.length === 0) return { promotedCount: 0 };
+    // Nothing left after the reserved-subject / selective-entity filters ⇒
+    // no roots were foreign-skipped.
+    if (quadsToPromote.length === 0) return { promotedCount: 0, promotedAllRoots: true };
 
     const operationId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -5311,8 +5316,19 @@ export class DKGPublisher implements Publisher {
       ? normalizedQuads.filter(q => !skippedRoots.has(q.subject) && !skippedRoots.has(q.subject.split('/.well-known/genid/')[0]))
       : normalizedQuads;
 
+    // #1116 FIX 1 — did this promote cover the FULL requested/sealed root set?
+    // A FULL share seals ALL of `rootEntities`, but the advisory ownership skip
+    // above can promote only `effectiveRoots`. When any root is foreign-skipped
+    // the SWM copy is missing part of the sealed set, so the seal exists but the
+    // asset is NOT publish-ready (publishFromFinalizedAssertion would recompute a
+    // different merkleRoot over the partial SWM slice and fail the seal guard).
+    // The agent's promote() threads this into `publishReady`.
+    const promotedAllRoots = skippedRoots.size === 0;
+
     if (effectiveRoots.length === 0) {
-      return { promotedCount: 0 };
+      // Every requested root was foreign-skipped — nothing promoted, and the
+      // sealed set is definitively not fully present in SWM.
+      return { promotedCount: 0, promotedAllRoots };
     }
 
     // Delete-then-insert for existing SWM entities (upsert), matching
@@ -5415,7 +5431,7 @@ export class DKGPublisher implements Publisher {
       }
     }
 
-    return { promotedCount: swmQuads.length, gossipMessage };
+    return { promotedCount: swmQuads.length, gossipMessage, promotedAllRoots };
   }
 
   async assertionDiscard(contextGraphId: string, name: string, agentAddress: string, subGraphName?: string): Promise<void> {
@@ -5485,16 +5501,27 @@ export class DKGPublisher implements Publisher {
   }
 
   /**
-   * #1116 — clear ONLY the Working-Memory draft DATA graph for an assertion,
-   * leaving every `_meta` block intact: the seal (keyed by the assertion URI),
-   * the lifecycle URN (incl. dkg:rootEntity / kaId), everything. Used by the
-   * seal-in-SWM flow (finalize layer=swm) to drop the transient WM draft it
-   * reconstructed from SWM, so the asset ends up resident PURELY in SWM (with
+   * #1116 — clear the Working-Memory draft DATA graph for an assertion plus the
+   * now-stale WM lifecycle pointer, leaving the seal + SWM/VM state intact. Used
+   * by the seal-in-SWM flow (finalize layer=swm) to drop the transient WM draft
+   * it reconstructed from SWM, so the asset ends up resident PURELY in SWM (with
    * its fresh seal) instead of duplicated across WM+SWM. This mirrors
    * `assertionDiscard`'s data-graph teardown but does NOT stamp a "discarded"
-   * lifecycle event and does NOT touch the seal: the seal's subject is the
-   * assertion URI, while the rows removed here are keyed by the WM data-graph
-   * URI (the memoryLayer pointer etc.), a different subject.
+   * lifecycle event.
+   *
+   * Two `_meta` clean-ups happen here:
+   *   1. Rows keyed by the WM DATA-graph URI (the memoryLayer pointer etc.).
+   *   2. #1116 FIX 2 — the `dkg:wmCurrentAssertion` pointer on the LIFECYCLE URN.
+   *      `assertionFinalize` stamped it when it sealed the reconstructed WM draft,
+   *      but once that draft is dropped the WM data no longer exists; without
+   *      removing the pointer `agent.assertion.history()` / status APIs keep
+   *      reporting a sealed WM draft ("wm-sealed") that is gone. We only clear it
+   *      when `dkg:swmCurrentAssertion` IS present on the lifecycle URN — i.e. the
+   *      content is genuinely SWM-resident — so the status flips to "swm-shared"
+   *      (SWM-resident), consistent with the dropped WM data.
+   *
+   * Deliberately UNtouched: the seal (keyed by the assertion URI), `dkg:rootEntity`,
+   * `dkg:kaId`, and `dkg:swmCurrentAssertion`/`dkg:vmCurrentAssertion`.
    */
   async clearWmDraftDataGraph(
     contextGraphId: string,
@@ -5507,6 +5534,23 @@ export class DKGPublisher implements Publisher {
     const metaGraph = contextGraphMetaUri(contextGraphId);
     await this.store.deleteByPattern({ subject: graphUri, graph: metaGraph });
     await this.store.dropGraph(graphUri);
+
+    // #1116 FIX 2 — retire the stale WM lifecycle pointer once the WM draft is
+    // gone, but only for SWM-resident content (swmCurrentAssertion set). The WM
+    // pointer lives on the lifecycle URN, a DIFFERENT subject than the WM data
+    // graph cleared above, so the deleteByPattern there never reaches it.
+    const lifecycleUri = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
+    const swmPointerRes = await this.store.query(
+      `ASK { GRAPH <${metaGraph}> { <${lifecycleUri}> <${SWM_CURRENT_ASSERTION_PRED}> ?swm } }`,
+    );
+    const isSwmResident = swmPointerRes.type === 'boolean' && swmPointerRes.value === true;
+    if (isSwmResident) {
+      await this.store.deleteByPattern({
+        subject: lifecycleUri,
+        predicate: WM_CURRENT_ASSERTION_PRED,
+        graph: metaGraph,
+      });
+    }
   }
 
   private async resolveKaUal(kaId: bigint): Promise<string> {

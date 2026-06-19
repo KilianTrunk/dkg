@@ -521,8 +521,75 @@ describe('#1116 seal decoupled from CG — full vs skipSeal share, seal-in-SWM',
     );
     expect(swmAfterSeal.bindings.length).toBe(1);
 
+    // Post-condition #2b (#1116 FIX 2): the WM data was dropped, so the lifecycle
+    // descriptor must report the asset as SWM-resident with NO open WM draft —
+    // the stale dkg:wmCurrentAssertion pointer that finalize stamped on the
+    // transient WM draft has been retired by clearWmDraftDataGraph.
+    const descAfterSeal = await agent.assertion.history(CG_ID, name);
+    expect(descAfterSeal).toBeTruthy();
+    expect(descAfterSeal!.status).toBe('swm-shared');
+    // The SWM pointer must be set (SWM-resident); divergence-only stamping means
+    // the WM pointer row is GONE from the lifecycle URN (it would otherwise make
+    // the WM-layer status read 'wm-sealed' for a draft that no longer exists).
+    expect(descAfterSeal!.swmCurrentAssertion).toBeTruthy();
+    const defaultAuthor = agent.defaultAgentAddress ?? agent.peerId;
+    const lifecycleUri = assertionLifecycleUri(CG_ID, defaultAuthor, name);
+    const metaGraph = contextGraphMetaUri(CG_ID);
+    const wmPointerRows = await (agent as any).store.query(
+      `SELECT ?wm WHERE { GRAPH <${metaGraph}> { <${lifecycleUri}> <http://dkg.io/ontology/wmCurrentAssertion> ?wm } }`,
+    );
+    expect(wmPointerRows.type).toBe('bindings');
+    expect(wmPointerRows.bindings.length).toBe(0);
+
     // Post-condition #3: the seal now exists, so the previously-stuck asset
     // publishes WITHOUT being recreated.
+    const pub = await agent.publishFromFinalizedAssertion(CG_ID, name);
+    expect(pub.status).toBe('confirmed');
+    expect(pub.ual).toBeDefined();
+    expect(pub.seal).toBeDefined();
+  }, 30_000);
+
+  // B3 (#1116 CORE REGRESSION GUARD): the seal is context-graph-INDEPENDENT, so
+  // a default FULL share SEALS even when the CG was NEVER registered on-chain —
+  // registration is deferred to publish time. This is the claim the existing
+  // seal-decoupled tests do NOT cover (they register the CG first). A regression
+  // that reintroduces seal-time CG registration FAILS the `getContextGraphOnChainId`
+  // assertion below (the CG would already be on-chain after the share).
+  it('seals a FULL share on an UNregistered CG (no seal-time registration); registers + publishes at publish time', async () => {
+    const agent = await createAgent('UnregisteredCgSealBot');
+    // LOCAL-ONLY CG: created but DELIBERATELY never registered on-chain.
+    await agent.createContextGraph({ id: CG_ID, name: 'Unregistered CG Seal E2E' });
+
+    const name = 'unregistered-cg-seal';
+    await agent.assertion.create(CG_ID, name);
+    await agent.assertion.write(CG_ID, name, [
+      { subject: `${ENTITY_BASE}:ucs`, predicate: 'http://schema.org/name', object: '"Unregistered CG Seal"' },
+    ]);
+
+    // Default FULL share — must SEAL despite the CG being unregistered (the seal
+    // no longer depends on CG registration).
+    const fullShare = await agent.assertion.promote(CG_ID, name);
+    expect(fullShare.sealed).toBe(true);
+    expect(fullShare.publishReady).toBe(true);
+
+    // CORE ASSERTION: the CG is STILL unregistered after sealing — sealing did
+    // NOT register it on-chain. Reintroducing seal-time registration breaks here.
+    const onChainIdAfterSeal = await agent.getContextGraphOnChainId(CG_ID);
+    expect(onChainIdAfterSeal == null).toBe(true);
+
+    // And publishing the unregistered CG fails CLOSED for that exact reason —
+    // proving the registration gap is real (not silently papered over at seal).
+    await expect(
+      agent.publishFromFinalizedAssertion(CG_ID, name),
+    ).rejects.toThrow(/not registered on-chain/i);
+
+    // Registration happens at PUBLISH time (the /vm/publish route's
+    // ensureRegisteredForPublish step). After it, the same sealed asset publishes
+    // to VM and confirms — no re-seal, no recreate.
+    await agent.ensureRegisteredForPublish(CG_ID);
+    const onChainIdAfterRegister = await agent.getContextGraphOnChainId(CG_ID);
+    expect(onChainIdAfterRegister).toBeTruthy();
+
     const pub = await agent.publishFromFinalizedAssertion(CG_ID, name);
     expect(pub.status).toBe('confirmed');
     expect(pub.ual).toBeDefined();

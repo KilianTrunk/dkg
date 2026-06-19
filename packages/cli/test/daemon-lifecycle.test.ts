@@ -5,11 +5,25 @@ import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { computeNetworkId } from '../../core/src/genesis.js';
+import { validateStartupGenesis } from '../src/daemon.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, '..', '..', '..');
 const cliSource = join(__dirname, '..', 'src', 'cli.ts');
 const tsxLoader = join(repoRoot, 'node_modules', 'tsx', 'dist', 'loader.mjs');
+
+describe('daemon startup genesis validation', () => {
+  it('continues when the selected network genesis id matches its network id', async () => {
+    const networkId = await computeNetworkId('gnosis-mainnet');
+
+    await expect(validateStartupGenesis({
+      networkName: 'DKG V10 Gnosis Mainnet',
+      genesisId: 'gnosis-mainnet',
+      networkId,
+    })).resolves.toEqual({ ok: true, networkId });
+  });
+});
 
 async function writeWorkspaceTsconfig(tsconfigPath: string): Promise<void> {
   const packagesDir = join(repoRoot, 'packages');

@@ -24,6 +24,7 @@ const DKG_BATCH_ID = `${DKG}batchId`;
 const SCHEMA_NAME = 'http://schema.org/name';
 const PROV_GENERATED = 'http://www.w3.org/ns/prov#generated';
 const PROV_USED = 'http://www.w3.org/ns/prov#used';
+const COMPLETED_SYNC_RESPONDER_SESSION_GRACE_MS = 30_000;
 
 export interface GraphListMemo {
   get(options?: { refresh?: boolean; signal?: AbortSignal }): Promise<readonly string[]>;
@@ -39,6 +40,7 @@ export interface SyncRowListMemo {
     loadRows: () => Promise<readonly SyncRow[]>,
     options?: { refresh?: boolean; requireExisting?: boolean; signal?: AbortSignal },
   ): Promise<readonly SyncRow[] | null>;
+  release(key: string, options?: { graceMs?: number }): void;
 }
 
 export class SyncRowSnapshotLimitError extends Error {
@@ -214,6 +216,14 @@ export function createResponderSyncRowListMemo(
 
       const load = loadRows()
         .then((rows) => {
+          // The owner's snapshot load (`readRowsAcrossGraphs` et al.) is NOT
+          // abort-aware — it carries no signal, so a settled `rows` here is the
+          // COMPLETE snapshot regardless of whether the owner's stream aborted
+          // mid-wait. Cache it unconditionally so a later same-session request
+          // (which coalesces on this `key`) reuses it instead of re-querying the
+          // store. The owner's own abort still surfaces at the `throwIfAborted`
+          // below, after `await load`, so the aborted request still rejects; it
+          // just no longer discards the snapshot it already paid to build.
           const value = [...rows];
           storeCached(key, value);
           return value;
@@ -225,6 +235,22 @@ export function createResponderSyncRowListMemo(
       const rows = await load;
       throwIfAborted(options?.signal);
       return [...rows];
+    },
+    release(key, options?: { graceMs?: number }) {
+      const existing = cached.get(key);
+      if (!existing) return;
+      const graceMs = Math.max(0, Math.min(options?.graceMs ?? 0, ttlMs));
+      if (graceMs === 0) {
+        markExpired(key);
+        return;
+      }
+      const cachedAt = Date.now() - (ttlMs - graceMs);
+      clearTimeout(existing.cleanupTimer);
+      cached.set(key, {
+        value: existing.value,
+        cachedAt,
+        cleanupTimer: scheduleCleanup(key, cachedAt),
+      });
     },
   };
 }
@@ -645,7 +671,11 @@ async function readCachedRowsPage(
   if (rows == null) {
     throw new Error(cache.expiredMessage ?? 'Sync session snapshot expired before page completion');
   }
-  return [...rows].slice(safeOffset, safeOffset + safeLimit);
+  const page = [...rows].slice(safeOffset, safeOffset + safeLimit);
+  if (page.length < safeLimit) {
+    cache.memo.release(cache.key, { graceMs: COMPLETED_SYNC_RESPONDER_SESSION_GRACE_MS });
+  }
+  return page;
 }
 
 function asAbortError(reason: unknown): Error {

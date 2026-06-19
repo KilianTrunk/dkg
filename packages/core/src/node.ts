@@ -13,6 +13,7 @@ import { circuitRelayTransport } from '@libp2p/circuit-relay-v2';
 import { circuitRelayServer } from '@libp2p/circuit-relay-v2';
 import { dcutr } from '@libp2p/dcutr';
 import { autoNAT } from '@libp2p/autonat';
+import type { ConnectionGater } from '@libp2p/interface';
 import { generateKeyPair, privateKeyFromRaw } from '@libp2p/crypto/keys';
 import { peerIdFromString, peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { ed25519GetPublicKey } from './crypto/ed25519.js';
@@ -20,6 +21,7 @@ import type { ConnectionTransport, DKGNodeConfig } from './types.js';
 import { DHT_PROTOCOL, DKG_GOSSIP_MAX_RPC_BYTES } from './constants.js';
 import { RelayMetricsAdapter, RELAY_V2_STOP_CODEC } from './libp2p-metrics-adapter.js';
 import { readRelayReservations, readConnectionStreams } from './relay-internal-shapes.js';
+import { RelayFlapGuard, parseCircuitRelayPeerIds } from './relay-flap-guard.js';
 
 export interface DKGServices extends Record<string, unknown> {
   dht: KadDHT;
@@ -482,6 +484,7 @@ export class DKGNode {
   private readonly config: DKGNodeConfig;
   /** Peers currently connected only via relay (candidates for DCUtR upgrade). */
   private readonly relayedPeers = new Set<string>();
+  private readonly relayFlapGuard = new RelayFlapGuard();
   private relayWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
   private relayTargets: RelayTarget[] = [];
   private relayWatchdogConsecutiveFailures = 0;
@@ -1070,6 +1073,7 @@ export class DKGNode {
       streamMuxers: [yamux()],
       peerDiscovery,
       services,
+      connectionGater: this.createRelayFlapConnectionGater(),
       connectionManager: {
         minConnections: 0,
         // Core Nodes scale this with relayServerCapacity (default
@@ -1411,6 +1415,44 @@ export class DKGNode {
     }
   }
 
+  private createRelayFlapConnectionGater(): ConnectionGater {
+    const short = (id: string) => id.slice(-8);
+    const ts = () => new Date().toISOString();
+    const denyRelayedPath = (
+      direction: 'inbound' | 'outbound',
+      relayPeerId: string,
+      remotePeerId: string,
+      addr?: string,
+    ): boolean => {
+      const result = this.relayFlapGuard.checkRelayedConnection({
+        relayPeerId,
+        remotePeerId,
+      });
+      if (!result.deny) return false;
+
+      if (result.shouldLog) {
+        const remainingSeconds = Math.ceil((result.quarantineMsRemaining ?? 0) / 1000);
+        console.warn(
+          `[${ts()}] Relay flap guard: denying ${direction} relayed connection ` +
+          `remote=${short(remotePeerId)} relay=${short(relayPeerId)} ` +
+          `quarantineRemaining=${remainingSeconds}s${addr ? ` addr=${addr}` : ''}`,
+        );
+      }
+      return true;
+    };
+
+    return {
+      denyInboundRelayedConnection: (relay, remotePeer) =>
+        denyRelayedPath('inbound', relay.toString(), remotePeer.toString()),
+      denyDialMultiaddr: (multiaddr) => {
+        const addr = multiaddr.toString();
+        const parsed = parseCircuitRelayPeerIds(addr);
+        if (!parsed?.remotePeerId) return false;
+        return denyRelayedPath('outbound', parsed.relayPeerId, parsed.remotePeerId, addr);
+      },
+    };
+  }
+
   /**
    * Wire up connection:open / connection:close listeners that track transport
    * type (direct vs relayed) and detect DCUtR upgrades from relay to direct.
@@ -1437,6 +1479,7 @@ export class DKGNode {
         const upgraded = this.relayedPeers.has(pid);
         if (upgraded) {
           this.relayedPeers.delete(pid);
+          this.relayFlapGuard.clearRemotePeer(pid);
           console.log(
             `[${ts()}] DCUtR upgrade: ${short(pid)} relayed -> direct ` +
             `dir=${dir} addr=${addr}`,
@@ -1457,7 +1500,7 @@ export class DKGNode {
       const transport: ConnectionTransport = addr.includes('/p2p-circuit') ? 'relayed' : 'direct';
       const durationMs = conn.timeline.close
         ? conn.timeline.close - conn.timeline.open
-        : '?';
+        : null;
 
       // If this was the last connection to the peer, clean up tracking state.
       const remaining = node.getConnections(conn.remotePeer);
@@ -1465,9 +1508,30 @@ export class DKGNode {
         this.relayedPeers.delete(pid);
       }
 
+      if (transport === 'relayed' && durationMs != null) {
+        const relayPath = parseCircuitRelayPeerIds(addr);
+        if (relayPath) {
+          const result = this.relayFlapGuard.recordRelayedClose({
+            relayPeerId: relayPath.relayPeerId,
+            remotePeerId: pid,
+            durationMs,
+          });
+          if (result.enteredQuarantine) {
+            console.warn(
+              `[${ts()}] Relay flap guard: quarantined relayed path ` +
+              `remote=${short(pid)} relay=${short(relayPath.relayPeerId)} ` +
+              `shortCloses=${result.shortCloseCount} ` +
+              `ttl=${Math.ceil((result.quarantineTtlMs ?? 0) / 1000)}s`,
+            );
+          }
+        }
+      } else if (transport === 'direct' && durationMs != null) {
+        this.relayFlapGuard.recordDirectClose({ remotePeerId: pid, durationMs });
+      }
+
       console.log(
         `[${ts()}] Connection closed: ${short(pid)} transport=${transport} ` +
-        `duration=${durationMs}ms addr=${addr}`,
+        `duration=${durationMs ?? '?'}ms addr=${addr}`,
       );
     });
 

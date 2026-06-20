@@ -333,6 +333,15 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     ///      off-chain indexers about which KAs are sampleable).
     error PublicCGCannotHaveCatalogCommitment(uint256 contextGraphId);
 
+    /// @dev A public-CG publish/update supplied `merkleLeafCount == 0`. Public KAs
+    ///      are challenged against their `merkleLeafCount` by RandomSampling; zero
+    ///      leaves make the KA permanently unchallengeable. Reject it at the source
+    ///      so a griefer cannot pack a CG with live zero-leaf KAs that burn the
+    ///      bounded `MAX_KA_RETRIES` sampling budget and skew/strand the whole CG.
+    ///      (RandomSampling still SKIPS any such legacy KA defensively.) Curated KAs
+    ///      are unaffected — they commit a separate `catalogLeafCount`.
+    error PublicKARequiresMerkleLeafCount(uint256 contextGraphId);
+
     /// @dev A curated-CG publish or paid update attempted to introduce sampling
     ///      value without a full PUBLIC `_catalog` commitment. Post-RFC-49 cores
     ///      prove the catalog, not the ciphertext, so a curated KA without a catalog
@@ -801,8 +810,16 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
             if (p.catalogRoot == bytes32(0) || p.catalogLeafCount == 0) {
                 revert IncompleteCatalogCommitment();
             }
-        } else if (_hasCatalogCommitment) {
-            revert PublicCGCannotHaveCatalogCommitment(p.contextGraphId);
+        } else {
+            if (_hasCatalogCommitment) {
+                revert PublicCGCannotHaveCatalogCommitment(p.contextGraphId);
+            }
+            // F08 (audit follow-up): a public KA is sampled against its
+            // `merkleLeafCount`; zero makes it unchallengeable. Reject at publish so
+            // no new live zero-leaf KA can grief a CG's challenge draw.
+            if (p.merkleLeafCount == 0) {
+                revert PublicKARequiresMerkleLeafCount(p.contextGraphId);
+            }
         }
 
         // H7: SafeCast guards the uint96 cast in _validateTokenAmount.
@@ -1697,8 +1714,17 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
             }
             // else: legacy curated KA not yet re-published, no commitment yet —
             // zero-pair metadata-only update is permitted.
-        } else if (_hasNewCatalogCommitment) {
-            revert PublicCGCannotHaveCatalogCommitment(contextGraphId);
+        } else {
+            if (_hasNewCatalogCommitment) {
+                revert PublicCGCannotHaveCatalogCommitment(contextGraphId);
+            }
+            // F08 (audit follow-up): a content update must keep a public KA
+            // challengeable — a zero `newMerkleLeafCount` would strand it from the
+            // sampling draw. (Pure top-ups/extends use extendKnowledgeAssetLifetime,
+            // not this content-update path, so they are unaffected.)
+            if (p.newMerkleLeafCount == 0) {
+                revert PublicKARequiresMerkleLeafCount(contextGraphId);
+            }
         }
 
         // --- 7. CG value delta + per-node produced-value bookkeeping ---

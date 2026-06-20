@@ -19,8 +19,13 @@ import { DKGQueryEngine } from '../src/dkg-query-engine.js';
 
 const CG_ID = 'dkg-v10-dev';
 const SUB = 'code';
+const ADDR = '0x000000000000000000000000000000000000abcd';
 const ROOT_SWM = contextGraphSharedMemoryUri(CG_ID); // did:dkg:context-graph:<cg>/_shared_memory
 const SUB_SWM = contextGraphSharedMemoryUri(CG_ID, SUB); // did:dkg:context-graph:<cg>/code/_shared_memory
+// Per-KA SWM graphs live under the …/_shared_memory/{addr}/{number} prefix; the SWM view
+// discovers them via the (subGraphName-prefixed) `graphPrefixes`, separately from the bare bucket.
+const ROOT_SWM_PERKA = `${ROOT_SWM}/${ADDR}/1`;
+const SUB_SWM_PERKA = `${SUB_SWM}/${ADDR}/1`;
 
 function q(s: string, p: string, o: string, g: string): Quad {
   return { subject: s, predicate: p, object: o, graph: g };
@@ -33,25 +38,29 @@ describe('GH #1185 — shared-working-memory view + subGraphName read', () => {
   beforeEach(async () => {
     store = new OxigraphStore();
     engine = new DKGQueryEngine(store);
-    // Distinct rows in the ROOT SWM and the sub-graph SWM so we can prove the
-    // read targets the sub-graph graph, not the root bucket.
+    // Distinct rows in the ROOT vs sub-graph SWM, in BOTH the bare bucket (resolveViewGraphs
+    // `graphs`) and a per-KA graph (resolveViewGraphs `graphPrefixes` discovery), so the test
+    // guards subGraphName threading into *both* — a regression dropping it from either is caught.
     await store.insert([
       q('urn:swm:root', 'http://ex.org/name', '"RootShare"', ROOT_SWM),
       q('urn:swm:code', 'http://ex.org/name', '"CodeShare"', SUB_SWM),
+      q('urn:swm:rootperka', 'http://ex.org/name', '"RootPerKa"', ROOT_SWM_PERKA),
+      q('urn:swm:codeperka', 'http://ex.org/name', '"CodePerKa"', SUB_SWM_PERKA),
     ]);
   });
 
-  it('reads the sub-graph SWM (not the root SWM) when view=shared-working-memory + subGraphName are combined', async () => {
+  it('reads the sub-graph SWM (bare + per-KA) and excludes the root SWM when view + subGraphName are combined', async () => {
     const result = await engine.query(
       'SELECT ?s ?name WHERE { ?s <http://ex.org/name> ?name }',
       { contextGraphId: CG_ID, view: 'shared-working-memory' as GetView, subGraphName: SUB },
     );
 
-    // Pre-fix: 0 rows / rejected / the root bucket. Fix routes to <cg>/code/_shared_memory.
-    expect(result.bindings).toHaveLength(1);
-    expect(result.bindings[0]['name']).toBe('"CodeShare"');
     const subjects = result.bindings.map((b) => b['s']);
-    expect(subjects).toContain('urn:swm:code');
-    expect(subjects).not.toContain('urn:swm:root'); // isolation from the root SWM bucket
+    // Pre-fix: 0 rows / rejected / the root bucket. Fix routes to <cg>/code/_shared_memory.
+    expect(subjects).toContain('urn:swm:code'); // bare sub-graph SWM (`graphs`)
+    expect(subjects).toContain('urn:swm:codeperka'); // per-KA sub-graph SWM (`graphPrefixes`)
+    // Isolation: neither root bucket nor root per-KA leaks into the sub-graph view.
+    expect(subjects).not.toContain('urn:swm:root');
+    expect(subjects).not.toContain('urn:swm:rootperka');
   });
 });

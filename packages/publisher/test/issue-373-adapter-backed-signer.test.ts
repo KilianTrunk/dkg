@@ -24,11 +24,13 @@ const TEST_KEY = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78
 // carries NO local publisher private key on the publisher itself.
 class AdapterOnlySigningChain {
   readonly chainId = 'mock:31337';
+  lastSignAddress?: string; // capture the address the publisher forwards
   constructor(private readonly wallet: ethers.Wallet) {}
   isV10Ready(): boolean {
     return true;
   }
-  async signMessageAs(_address: string, messageHash: Uint8Array): Promise<{ r: Uint8Array; vs: Uint8Array }> {
+  async signMessageAs(address: string, messageHash: Uint8Array): Promise<{ r: Uint8Array; vs: Uint8Array }> {
+    this.lastSignAddress = address;
     const sig = ethers.Signature.from(await this.wallet.signMessage(messageHash));
     return { r: ethers.getBytes(sig.r), vs: ethers.getBytes(sig.yParityAndS) };
   }
@@ -37,9 +39,10 @@ class AdapterOnlySigningChain {
 describe('GH #373 — adapter-backed publisher signing', () => {
   it('getPublisherSigner falls back to a chainAdapter-sourced signer when no local key is set', async () => {
     const wallet = new ethers.Wallet(TEST_KEY);
+    const chain = new AdapterOnlySigningChain(wallet);
     const publisher = new DKGPublisher({
       store: new OxigraphStore(),
-      chain: new AdapterOnlySigningChain(wallet) as unknown as ChainAdapter,
+      chain: chain as unknown as ChainAdapter,
       eventBus: new TypedEventBus(),
       keypair: await generateEd25519Keypair(),
       publisherNodeIdentityId: 1n,
@@ -58,5 +61,10 @@ describe('GH #373 — adapter-backed publisher signing', () => {
     const msg = ethers.toUtf8Bytes('gh-373-adapter-signing');
     const sig = await signer!.signMessage(msg);
     expect(ethers.verifyMessage(msg, sig).toLowerCase()).toBe(wallet.address.toLowerCase());
+
+    // getPublisherSigner must forward the SELECTED publisher address to the adapter
+    // (a regression passing `undefined` / `this.publisherAddress` / a pool address
+    // could still produce a valid sig here but fail against the real address-keyed adapter).
+    expect(chain.lastSignAddress?.toLowerCase()).toBe(wallet.address.toLowerCase());
   });
 });

@@ -654,6 +654,19 @@ describe('@unit ConvictionStakingStorage', () => {
       ).to.be.revertedWith('Tier exists');
     });
 
+    it('addTier caps the lock duration so the expiry queue stays bounded (F02)', async () => {
+      const MAX = 1095n * DAY; // MAX_TIER_DURATION (~3y)
+      // Just over the cap: rejected. An unbounded tier (e.g. a 10-year lock) would
+      // leave thousands of pending day-buckets on a dormant node, re-opening the
+      // settlement-brick gas DoS the bucketing is meant to close.
+      await expect(
+        ConvictionStakingStorage.addTier(25, MAX + 1n, TWO_X),
+      ).to.be.revertedWith('Tier duration too long');
+      // Exactly at the cap with a valid boost: accepted.
+      await expect(ConvictionStakingStorage.addTier(25, MAX, TWO_X)).to.not.be.reverted;
+      expect(await ConvictionStakingStorage.tierDuration(25)).to.equal(MAX);
+    });
+
     it('Non-owner cannot addTier / deactivateTier', async () => {
       await expect(
         ConvictionStakingStorage.connect(accounts[1]).addTier(24, 100n, ONE_AND_HALF_X),
@@ -830,6 +843,22 @@ describe('@unit ConvictionStakingStorage', () => {
       await expect(
         ConvictionStakingStorage.createPosition(1, ALICE_ID, 1000, 12, 0, SIXTY_DAYS),
       ).to.be.revertedWith('Credit requires migrationEpoch');
+    });
+
+    it('preserves a non-day-aligned credit exactly — no silent re-bucket rounding (F02)', async () => {
+      // `convictionCreditSeconds` (passed as `expiryShortenedBy`) can be arbitrary
+      // seconds. The migration expiry is `bucketedDefault - credit` with NO second
+      // re-bucket, so a non-day-aligned credit is applied to the exact second. (A
+      // re-bucket would silently round it UP to the day grid — e.g. `60d - 1h` would
+      // become a full `60d`, quietly shrinking the configured credit.)
+      const credit = SIXTY_DAYS - 3600n; // 60 days minus 1 hour (not day-aligned)
+      await ConvictionStakingStorage.createPosition(1, ALICE_ID, 1000, 12, 1, credit);
+      const tsNow = await latestTimestamp();
+      const pos = await ConvictionStakingStorage.getPosition(1);
+      // exact: the bucketed default minus the FULL credit (not rounded back up).
+      expect(pos.expiryTimestamp).to.equal(bucketUp(tsNow + TIER_DURATIONS[12]) - credit);
+      // crucially NOT snapped back to the day grid:
+      expect(pos.expiryTimestamp % DAY).to.not.equal(0n);
     });
   });
 });

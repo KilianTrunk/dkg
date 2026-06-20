@@ -13,7 +13,7 @@ contract ProfileStorage is INamed, IVersioned, HubDependent {
     // (RFC 04 v0.3 / Issue #461). New mapping reads on existing keys return
     // false for the new field. Multiaddrs were briefly added on a prior
     // revision but are deliberately not stored on Profile (RFC 04 §5.2).
-    string private constant _VERSION = "10.0.2";
+    string private constant _VERSION = "10.0.3";
 
     event ProfileCreated(uint72 indexed identityId, string nodeName, bytes nodeId, uint16 initialOperatorFee);
     event ProfileDeleted(uint72 indexed identityId, bytes nodeId);
@@ -234,17 +234,20 @@ contract ProfileStorage is INamed, IVersioned, HubDependent {
     }
 
     function getActiveOperatorFee(uint72 identityId) external view returns (ProfileLib.OperatorFee memory) {
-        if (profiles[identityId].operatorFees.length == 0) {
+        ProfileLib.OperatorFee[] storage fees = profiles[identityId].operatorFees;
+        uint256 length = fees.length;
+        if (length == 0) {
             return ProfileLib.OperatorFee({feePercentage: 0, effectiveDate: 0});
         }
 
-        if (
-            block.timestamp >
-            profiles[identityId].operatorFees[profiles[identityId].operatorFees.length - 1].effectiveDate
-        ) {
-            return profiles[identityId].operatorFees[profiles[identityId].operatorFees.length - 1];
+        // A single fee is always the active one. This guards the `length - 2`
+        // underflow below when exactly one (not-yet-effective) fee exists —
+        // e.g. right after profile creation, where the initial fee's
+        // effectiveDate == block.timestamp falls into the else branch.
+        if (length == 1 || block.timestamp > fees[length - 1].effectiveDate) {
+            return fees[length - 1];
         } else {
-            return profiles[identityId].operatorFees[profiles[identityId].operatorFees.length - 2];
+            return fees[length - 2];
         }
     }
 
@@ -268,17 +271,20 @@ contract ProfileStorage is INamed, IVersioned, HubDependent {
     }
 
     function getActiveOperatorFeePercentage(uint72 identityId) public view returns (uint16) {
-        if (profiles[identityId].operatorFees.length == 0) {
+        ProfileLib.OperatorFee[] storage fees = profiles[identityId].operatorFees;
+        uint256 length = fees.length;
+        if (length == 0) {
             return 0;
         }
 
-        if (
-            block.timestamp >
-            profiles[identityId].operatorFees[profiles[identityId].operatorFees.length - 1].effectiveDate
-        ) {
-            return profiles[identityId].operatorFees[profiles[identityId].operatorFees.length - 1].feePercentage;
+        // A single fee is always the active one. This guards the `length - 2`
+        // underflow below when exactly one (not-yet-effective) fee exists —
+        // e.g. right after profile creation, where the initial fee's
+        // effectiveDate == block.timestamp falls into the else branch.
+        if (length == 1 || block.timestamp > fees[length - 1].effectiveDate) {
+            return fees[length - 1].feePercentage;
         } else {
-            return profiles[identityId].operatorFees[profiles[identityId].operatorFees.length - 2].feePercentage;
+            return fees[length - 2].feePercentage;
         }
     }
 

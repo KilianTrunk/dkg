@@ -367,6 +367,22 @@ start_oxigraph_servers() {
 }
 
 stop_oxigraph_servers() {
+  # Local daemon-managed oxigraph-server binaries (the `oxigraph-server` backend,
+  # nodes 1-N) are spawned as node children; a SIGKILL'd node can ORPHAN them,
+  # leaving the :79xx port bound so the NEXT `start` dies with "Address already
+  # in use" and those nodes silently fail to boot. Sweep any belonging to THIS
+  # devnet (path-scoped — unrelated oxigraph processes are untouched). Runs
+  # regardless of docker availability (the local binaries are not docker).
+  #
+  # DEVNET_DIR is user-configurable and may contain regex/glob metacharacters, so
+  # we do NOT feed it to `pkill -f` as a raw regex (where `.`/`[`/`+`/spaces would
+  # change the match and could over-match). Instead match the dir as a LITERAL
+  # substring of each process's command line via a quoted `case` glob.
+  ps axww -o pid=,command= 2>/dev/null | while read -r _pid _cmd; do
+    case "$_cmd" in
+      *"$DEVNET_DIR/node"*"oxigraph/oxigraph"*) kill "$_pid" 2>/dev/null || true ;;
+    esac
+  done
   if ! docker_responsive 3; then return 0; fi
   for name in $OXIGRAPH_CONTAINER_5 $OXIGRAPH_CONTAINER_6; do
     if docker inspect "$name" > /dev/null 2>&1; then

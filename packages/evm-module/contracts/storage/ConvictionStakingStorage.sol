@@ -1018,6 +1018,10 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
             require(uint256(expiryShortenedBy) < dur, "Credit >= tier duration");
             expiryTimestamp = uint40(uint256(expiryTimestamp) - uint256(expiryShortenedBy));
             require(expiryTimestamp > tsNow, "Credit leaves no remaining lock");
+            // F02: the migration-credit subtraction lands off the bucket grid;
+            // round back UP so this expiry coalesces with its bucket like every
+            // other (keeps the queue bounded and Position.expiryTimestamp on-grid).
+            expiryTimestamp = _bucketExpiry(expiryTimestamp);
         }
 
         positions[tokenId] = Position({
@@ -1652,17 +1656,41 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     //                       Internal helpers
     // ============================================================
 
+    /// @notice F02 — expiry bucket granularity. Wall-clock expiries are rounded
+    ///         UP to the next multiple of this, so the per-node expiry queue
+    ///         (`nodeExpiryTimes[id]`) can hold at most
+    ///         `maxLockDuration / EXPIRY_BUCKET_SECONDS` DISTINCT timestamps
+    ///         regardless of how many (dust) positions are opened against a node.
+    ///         This structurally bounds the `_settleNodeTo` drain loop and makes
+    ///         the dust-spam settlement-brick DoS impossible (a node could
+    ///         previously be frozen — and its delegators' funds locked — by
+    ///         opening thousands of distinct-second expiries against it).
+    uint256 internal constant EXPIRY_BUCKET_SECONDS = 1 days;
+
+    /// @dev Round a wall-clock expiry UP to the next `EXPIRY_BUCKET_SECONDS`
+    ///      boundary. Rounding UP never shortens a lock — a boost lasts at most
+    ///      one bucket (< 1 day) longer than its exact duration, which is uniform
+    ///      and delegator-favorable. `0` (tier-0 / no expiry) passes through
+    ///      unchanged so it is never queued.
+    function _bucketExpiry(uint40 ts) internal pure returns (uint40) {
+        if (ts == 0) return 0;
+        uint256 bucketed = ((uint256(ts) + EXPIRY_BUCKET_SECONDS - 1) / EXPIRY_BUCKET_SECONDS) *
+            EXPIRY_BUCKET_SECONDS;
+        require(bucketed <= type(uint40).max, "Expiry overflow");
+        return uint40(bucketed);
+    }
+
     /**
-     * @dev Wall-clock expiry computation (D26). Timestamp-accurate:
-     *      the boost ends exactly at `block.timestamp + duration`.
-     *      Returns 0 for tier-0 (permanent rest state).
+     * @dev Wall-clock expiry computation (D26), bucketed (F02). The boost ends
+     *      at the `EXPIRY_BUCKET_SECONDS` boundary at or after
+     *      `block.timestamp + duration`. Returns 0 for tier-0 (permanent rest).
      */
     function _computeExpiryTimestamp(uint40 lockTier) internal view returns (uint40) {
         if (lockTier == 0) return 0;
         uint256 duration = _tierDuration(lockTier);
         uint256 exp = block.timestamp + duration;
         require(exp <= type(uint40).max, "Expiry overflow");
-        return uint40(exp);
+        return _bucketExpiry(uint40(exp));
     }
 
     function _pushNodeToken(uint72 identityId, uint256 tokenId) internal {

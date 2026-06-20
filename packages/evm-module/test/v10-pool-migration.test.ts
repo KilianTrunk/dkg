@@ -41,6 +41,10 @@ const DAY = 24n * 60n * 60n;
 const TIER12_DURATION = 366n * DAY;
 const CREDIT_SECONDS = 70n * DAY; // configurable, < tier-6 (180d) cap
 
+// F02: on-chain boost expiry is rounded UP to the next whole day. Tier/credit
+// durations are day-aligned, so bucketUp(blockTs + dur) - credit == final expiry.
+const bucketUp = (t: bigint): bigint => ((t + DAY - 1n) / DAY) * DAY;
+
 type Fixture = {
   accounts: SignerWithAddress[];
   Hub: Hub;
@@ -216,7 +220,7 @@ describe('@integration pool & allocate migration', function () {
       expect(pos.raw).to.equal(stake);
       expect(pos.lockTier).to.equal(12n);
       expect(pos.migrationEpoch).to.be.greaterThan(0n); // drives the "Migrated from V8" badge
-      expect(pos.expiryTimestamp).to.equal(blockTs + TIER12_DURATION - CREDIT_SECONDS);
+      expect(pos.expiryTimestamp).to.equal(bucketUp(blockTs + TIER12_DURATION) - CREDIT_SECONDS);
 
       // Credit fully spent.
       expect(await NFT.migrationCredit(d.address)).to.equal(0n);
@@ -268,7 +272,7 @@ describe('@integration pool & allocate migration', function () {
       // tier-12 allocation, but creditApplied=false because no credit was configured
       await expect(tx).to.emit(NFT, 'Allocated').withArgs(d.address, 1n, id, stake, 12n, false);
       // and the expiry is NOT shortened (full tier-12 duration)
-      expect((await CSS.getPosition(1)).expiryTimestamp).to.equal(blockTs + TIER12_DURATION);
+      expect((await CSS.getPosition(1)).expiryTimestamp).to.equal(bucketUp(blockTs + TIER12_DURATION));
     });
   });
 

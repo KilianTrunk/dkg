@@ -31,6 +31,12 @@ const TWO_X = 2n * SCALE18;
 const THREE_AND_HALF_X = (35n * SCALE18) / 10n;
 const SIX_X = 6n * SCALE18;
 
+// F02: on-chain boost expiry is now rounded UP to the next whole day.
+const bucketUp = (t: bigint): bigint => {
+  const day = 24n * 60n * 60n;
+  return ((t + day - 1n) / day) * day;
+};
+
 type Fixture = {
   accounts: SignerWithAddress[];
   Hub: Hub;
@@ -551,7 +557,7 @@ describe('@unit DKGStakingConvictionNFT', () => {
       const relockTs = BigInt(txBlock!.timestamp);
       // Tier 12 wall-clock duration = 366 days.
       const DAY = 24n * 60n * 60n;
-      const expectedExpiryTs = relockTs + 366n * DAY;
+      const expectedExpiryTs = bucketUp(relockTs + 366n * DAY);
 
       await expect(tx).to.emit(NFT, 'PositionRelocked').withArgs(1n, newTokenId, 12);
       await expect(tx)
@@ -613,7 +619,7 @@ describe('@unit DKGStakingConvictionNFT', () => {
       const relockTs = BigInt(txBlock!.timestamp);
       // D26: tier 6 commits 180 days of boost exactly.
       const DAY = 24n * 60n * 60n;
-      const expectedExpiryTs = relockTs + 180n * DAY;
+      const expectedExpiryTs = bucketUp(relockTs + 180n * DAY);
       const pos = await ConvictionStakingStorageContract.getPosition(newTokenId);
       expect(pos.expiryTimestamp).to.equal(expectedExpiryTs);
       expect(pos.multiplier18).to.equal(THREE_AND_HALF_X);
@@ -642,6 +648,12 @@ describe('@unit DKGStakingConvictionNFT', () => {
       // exactly 1 epoch so currentEpoch == expiryTimestamp — under the old
       // `<=` check this would still revert as LockStillActive.
       await advanceEpochs(1);
+      // F02: boost expiry is bucketed UP to the next day, so the unlock boundary
+      // moved up to a day later — advance to the contract's actual expiry.
+      const relockExpiry = (await ConvictionStakingStorageContract.getPosition(1)).expiryTimestamp;
+      if (BigInt(await time.latest()) < relockExpiry) {
+        await time.increaseTo(Number(relockExpiry));
+      }
       await NFT.connect(accounts[0]).claim(1); // satisfy UnclaimedEpochs guard
 
       const newTokenId = await NFT.connect(accounts[0]).relock.staticCall(1, 6);
@@ -996,6 +1008,12 @@ describe('@unit DKGStakingConvictionNFT', () => {
       // exactly 1 epoch so currentEpoch == expiryTimestamp (the unlock
       // boundary). Under `currentEpoch >= expiryTimestamp` this must pass.
       await advanceEpochs(1);
+      // F02: boost expiry is bucketed UP to the next day — advance to the
+      // contract's actual (bucketed) unlock boundary.
+      const wExpiry = (await ConvictionStakingStorageContract.getPosition(1)).expiryTimestamp;
+      if (BigInt(await time.latest()) < wExpiry) {
+        await time.increaseTo(Number(wExpiry));
+      }
 
       // `withdraw` auto-claims internally — no separate claim() required.
       await NFT.connect(accounts[0]).withdraw(1);

@@ -36,6 +36,7 @@ import {
   Logger, createOperationContext, sparqlString, isSafeIri, assertSafeIri,
   TrustLevel,
   TRUST_LEVEL_PREDICATE,
+  LEGACY_TRUST_LEVEL_PREDICATE,
   buildTrustLevelQuads,
   isTrustLevelQuad,
   buildAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1, type AuthorAttestationTypedData,
@@ -121,6 +122,8 @@ import {
   type WorkspaceAgentRecipientResolverInput,
   type WorkspaceSenderKeyEncryptInput,
   type SharedMemoryPublicSnapshotStorageConfig, type WorkspacePublicSnapshotStore,
+  readMaterializedVersion, shouldApplyMaterialization, writeMaterializedVersion, withMaterializationLock,
+  type MaterializedVersion,
 } from '@origintrail-official/dkg-publisher';
 import { ethers } from 'ethers';
 import { join } from 'node:path';
@@ -401,6 +404,24 @@ const HOST_MODE_PUBLISH_POLICY_MAX_CACHE_AGE_MS = 5_000;
 function normalizeHostModeReconcileBatchSize(value: number | undefined): number {
   if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_HOST_MODE_RECONCILE_BATCH_SIZE;
   return Math.max(1, Math.floor(value));
+}
+
+/**
+ * Strip surrounding quotes from a SPARQL SELECT binding value — mirrors
+ * `ka-extractor.ts:stripQuotes` verbatim so the RS-heal resolves the SAME
+ * `?ual`/`?root` strings the prover does. IRIs come back bare from both store
+ * adapters (oxigraph/sparql-http), so this is a no-op for them; it only peels
+ * the `"..."` / `"value"^^<dt>` literal wrappers some result formats apply.
+ */
+function stripBindingQuotes(v: string): string {
+  if (v.startsWith('"') && v.endsWith('"')) {
+    return v.slice(1, -1);
+  }
+  const ix = v.indexOf('"^^');
+  if (v.startsWith('"') && ix !== -1) {
+    return v.slice(1, ix);
+  }
+  return v;
 }
 
 export class SwmHostModeMethods extends DKGAgentBase {
@@ -2491,6 +2512,9 @@ export class SwmHostModeMethods extends DKGAgentBase {
       // Member subscriptions AND Phase D core-hosted public CGs get swept.
       if ((!sub.subscribed && !sub.coreHosted) || !sub.onChainId) continue;
       void this.reconcileCoalescer.trigger(localCgId);
+      // RS heal: relocate any legacy-stranded KC into the scoped graphs the
+      // prover reads (the sweep is the safety net for a missed live nudge).
+      void this.healStrandedScopedKCs(localCgId, sub);
     }
   }
 
@@ -2573,6 +2597,9 @@ export class SwmHostModeMethods extends DKGAgentBase {
           if (bound) {
             this.log.info(ctx, `Phase B: KACG nudge cg=${onChainId} ka=${kaId} -> bound + reconcile pre-subscribed "${lcg}"`);
             if (this.reconcileCoalescer) void this.reconcileCoalescer.trigger(lcg);
+            // RS heal immediately so a live KARegistered doesn't wait ~60s for
+            // the periodic sweep to relocate the stranded KC.
+            void this.healStrandedScopedKCs(lcg, sub);
             return lcg;
           }
         }
@@ -2586,6 +2613,8 @@ export class SwmHostModeMethods extends DKGAgentBase {
     if (!sub?.subscribed && !sub?.coreHosted) return null;
     this.log.info(ctx, `Phase B: KACG nudge cg=${onChainId} ka=${kaId} -> reconcile "${localCgId}"`);
     if (this.reconcileCoalescer) void this.reconcileCoalescer.trigger(localCgId);
+    // RS heal immediately on the already-bound path too.
+    void this.healStrandedScopedKCs(localCgId, sub);
     return localCgId;
   }
 
@@ -2665,6 +2694,170 @@ export class SwmHostModeMethods extends DKGAgentBase {
       this.log.warn(
         createOperationContext('system'),
         `VM reconcile for "${localCgId}" failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * RELOCATE stranded legacy-label KCs into the SCOPED per-onChainId graphs
+   * the Random Sampling prover reads.
+   *
+   * The bug: when a KC is finalized BEFORE its on-chain cgId is locally
+   * resolvable, finalization falls back to writing it into the LEGACY label
+   * graphs (`<cg>/_meta` + `<cg>` root data) instead of the scoped
+   * `<cg>/context/<onChainId>/_meta` + `.../context/<onChainId>` graphs. The
+   * RS prover (`extractV10KCFromStore`) only reads the scoped graphs, so such
+   * a KC reports `kc-not-synced` forever even though the node holds it.
+   *
+   * This COPIES (never moves/deletes) the legacy KC into the scoped graphs so
+   * the prover can find it, while leaving the label-graph view intact.
+   *
+   * CONTENT-BINDING RULE: the data/meta copies go through
+   * `this.store.update(INSERT…WHERE)` so the terms NEVER leave the store. A
+   * `query()`/CONSTRUCT → `insert(quads)` round-trip would double backslashes
+   * in escape-bearing literals and change the leaf bytes the on-chain
+   * `challengeRoot` was committed over, making the proof permanently
+   * unprovable. The projection (root + `.well-known/genid/` descendants,
+   * minus post-publish trustLevel stamps) mirrors `ka-extractor.ts` exactly.
+   *
+   * Idempotent + version-guarded so a re-run is a no-op and a later stale
+   * writer cannot clobber. NEVER calls `isAlreadyConfirmed` — that read-both
+   * guard is the permanence mechanism that made the legacy promotion stick.
+   */
+  async healStrandedScopedKCs(this: DKGAgent, localCgId: string, sub: ContextGraphSub): Promise<void> {
+    try {
+      if (!sub.onChainId) return;
+      // Server-side byte-safe copy is the ONLY safe relocation mechanism; if the
+      // backend can't do SPARQL UPDATE we bail rather than risk a lossy JS round-trip.
+      const storeUpdate = this.store.update;
+      if (typeof storeUpdate !== 'function') return;
+      const update = (sparql: string): Promise<void> => storeUpdate.call(this.store, sparql);
+
+      const DKG = 'http://dkg.io/ontology/';
+      const legacyMeta = contextGraphMetaUri(localCgId);
+      const scopedMeta = contextGraphMetaUri(localCgId, sub.onChainId);
+      const rootData = contextGraphDataUri(localCgId);
+      const scopedData = contextGraphDataUri(localCgId, sub.onChainId);
+
+      // 2a ASK-guard: is there at least one legacy-only KC (batchId present in
+      // legacy meta, absent in scoped meta)? In steady state this is one ASK per
+      // bound CG and returns false once healed.
+      const askGuard = await this.store.query(
+        `ASK {
+           GRAPH <${legacyMeta}> { ?ual <${DKG}batchId> ?b }
+           FILTER NOT EXISTS { GRAPH <${scopedMeta}> { ?ual <${DKG}batchId> ?b } }
+         }`,
+      );
+      if (askGuard.type !== 'boolean' || !askGuard.value) return;
+
+      // 2b: enumerate the stranded UALs.
+      const stranded = await this.store.query(
+        `SELECT ?ual ?b WHERE {
+           GRAPH <${legacyMeta}> { ?ual <${DKG}batchId> ?b }
+           FILTER NOT EXISTS { GRAPH <${scopedMeta}> { ?ual <${DKG}batchId> ?b } }
+         }`,
+      );
+      if (stranded.type !== 'bindings') return;
+
+      for (const row of stranded.bindings) {
+        // Bindings come back stripped to bare values by the store adapters
+        // (oxigraph/sparql-http both emit IRIs unwrapped); strip + validate
+        // exactly as the extractor does for its `ual`.
+        const ual = stripBindingQuotes(row['ual'] ?? '');
+        if (!ual || !isSafeIri(ual)) continue;
+        try {
+          await withMaterializationLock(scopedMeta, ual, async () => {
+            const version = await readMaterializedVersion(this.store, legacyMeta, ual);
+            if (version === null) return; // not safely stampable — skip
+            if (!(await shouldApplyMaterialization(this.store, scopedMeta, ual, version))) return; // idempotent
+
+            assertSafeIri(ual);
+
+            // Resolve roots from legacy meta with the extractor's read-both UNION.
+            const rootsRes = await this.store.query(
+              `SELECT ?root WHERE {
+                 GRAPH <${legacyMeta}> {
+                   { ?ka <${DKG}partOf> <${ual}> ; <${DKG}rootEntity> ?root . }
+                   UNION
+                   { <${ual}> <${DKG}rootEntity> ?root . }
+                 }
+               }`,
+            );
+            if (rootsRes.type !== 'bindings') return;
+            const roots: string[] = [];
+            const seen = new Set<string>();
+            for (const r of rootsRes.bindings) {
+              const root = stripBindingQuotes(r['root'] ?? '');
+              if (root && !seen.has(root) && isSafeIri(root)) {
+                seen.add(root);
+                roots.push(root);
+              }
+            }
+            if (roots.length === 0) return;
+
+            // CRASH-PARTIAL GUARD (all-or-nothing across roots): the extractor
+            // roots a concatenation over EVERY root, so if ANY root's legacy
+            // data is missing locally this is a Factor-B sync gap, not a
+            // relocation. Write NOTHING — must NOT trade kc-not-synced for
+            // KCDataMissingError. ASK each root first.
+            for (const root of roots) {
+              const present = await this.store.query(
+                `ASK {
+                   GRAPH <${rootData}> {
+                     ?s ?p ?o .
+                     FILTER(?s = <${root}> || STRSTARTS(STR(?s), "${root}/.well-known/genid/"))
+                   }
+                 }`,
+              );
+              if (present.type !== 'boolean' || !present.value) return;
+            }
+
+            // DATA copy (per root) — MANDATORY server-side, byte-safe. Skip the
+            // post-publish trustLevel stamps so the recomputed leaf set stays
+            // bit-identical with the on-chain merkleLeafCount.
+            for (const root of roots) {
+              await update(
+                `INSERT { GRAPH <${scopedData}> { ?s ?p ?o } } WHERE {
+                   GRAPH <${rootData}> {
+                     ?s ?p ?o .
+                     FILTER(?s = <${root}> || STRSTARTS(STR(?s), "${root}/.well-known/genid/"))
+                     FILTER(?p != <${TRUST_LEVEL_PREDICATE}> && ?p != <${LEGACY_TRUST_LEVEL_PREDICATE}>)
+                   }
+                 }`,
+              );
+            }
+
+            // META copy — server-side. Carries the `<ual>` subject (batchId
+            // discriminator) + the `<ual>/<tokenId>` token rows
+            // (rootEntity/privateMerkleRoot).
+            await update(
+              `INSERT { GRAPH <${scopedMeta}> { ?s ?p ?o } } WHERE {
+                 GRAPH <${legacyMeta}> {
+                   ?s ?p ?o .
+                   FILTER(?s = <${ual}> || STRSTARTS(STR(?s), "${ual}/"))
+                 }
+               }`,
+            );
+
+            // Stamp so a later stale writer can't clobber.
+            await writeMaterializedVersion(this.store, scopedMeta, ual, version);
+
+            this.log.info(
+              createOperationContext('system'),
+              `RS heal: relocated stranded legacy KC ${ual} -> scoped cg=${sub.onChainId} (${roots.length} root(s))`,
+            );
+          });
+        } catch (err) {
+          this.log.warn(
+            createOperationContext('system'),
+            `RS heal: relocate failed for ${ual} (cg=${sub.onChainId}): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+    } catch (err) {
+      this.log.warn(
+        createOperationContext('system'),
+        `RS heal sweep for "${localCgId}" failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }

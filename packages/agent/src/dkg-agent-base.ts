@@ -483,6 +483,18 @@ export function createListContextGraphsCacheInvalidatingStore(
     countQuads(graphUri) {
       return innerStore.countQuads(graphUri);
     },
+    // Defined iff the inner store supports it, so the capability propagates
+    // truthfully up the decorator chain (callers gate on `typeof store.update
+    // === 'function'`). A server-side UPDATE can create/drop named graphs and
+    // mutate projected content, so it invalidates the listGraphs cache and
+    // marks the projection dirty just like insert/delete.
+    update: innerStore.update
+      ? (sparql: string) => invalidateAfterMutation(
+        () => innerStore.update!(sparql),
+        () => true,
+        () => markProjectionDirty?.(),
+      )
+      : undefined,
     flush: innerStore.flush ? () => innerStore.flush!() : undefined,
     close() {
       return innerStore.close();

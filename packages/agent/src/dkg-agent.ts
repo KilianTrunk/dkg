@@ -1184,6 +1184,14 @@ export class DKGAgent extends DKGAgentBase {
       // the in-memory subscribedContextGraphs map).
       const cgUri = contextGraphDataGraphUri(p.name);
       const ontoGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+      // Single-valued binding guard (RS heal): on-chain id is immutable; clear
+      // any prior value so the cgId resolver / heal never read a multi-valued
+      // (LIMIT-1-nondeterministic) binding.
+      await this.store.deleteByPattern({
+        graph: ontoGraph,
+        subject: cgUri,
+        predicate: `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId`,
+      });
       await this.store.insert([{
         subject: cgUri,
         predicate: `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId`,

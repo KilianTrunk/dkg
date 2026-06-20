@@ -54,6 +54,11 @@ export class FinalizationHandler {
   private readonly markContextGraphMetaDirtyFromQuads: MarkContextGraphMetaDirtyFromQuads | undefined;
   private readonly log = new Logger('FinalizationHandler');
   private readonly processedUals = new Set<string>();
+  // Forward-prevention for the cgId-resolution race (RS heal): chain-authoritative
+  // kaId(batchId)->cgId bindings, cached POSITIVE-ONLY. A 0/miss is NEVER cached —
+  // caching a miss for a KC finalized before its on-chain KA->CG binding lands
+  // would pin it to the legacy `/_meta` fallback forever, re-opening the race.
+  private readonly chainCgIdByBatchId = new Map<string, string>();
 
   constructor(
     store: TripleStore,
@@ -114,15 +119,45 @@ export class FinalizationHandler {
       // the id locally when the wire is empty; resolver failures or
       // not-on-chain CGs fall back to legacy behavior unchanged.
       let ctxGraphId = msg.targetContextGraphId || undefined;
-      if (!ctxGraphId && this.resolveContextGraphOnChainId) {
-        try {
-          const resolved = await this.resolveContextGraphOnChainId(contextGraphId);
-          if (resolved !== null && resolved !== undefined && String(resolved).length > 0) {
-            ctxGraphId = String(resolved);
-            this.log.info(ctx, `Finalization: gossip omitted targetContextGraphId; resolved locally to ${ctxGraphId} (defensive lookup)`);
+      if (!ctxGraphId) {
+        // Forward-prevention (RS cgId-race): resolve from CHAIN TRUTH first.
+        // `getKAContextGraphId(batchId)` is authoritative and immune to the
+        // local ontology-binding lag that strands KCs in legacy `/_meta` — the
+        // root cause the heal-sweep exists to repair. Caching POSITIVE results
+        // only (never a 0/miss) keeps a finalization that races ahead of its
+        // on-chain KA->CG binding from being pinned to legacy forever.
+        let batchIdForResolve = 0n;
+        try { batchIdForResolve = protoToBigInt(msg.batchId); } catch { batchIdForResolve = 0n; }
+        const cacheKey = batchIdForResolve > 0n ? batchIdForResolve.toString() : '';
+        if (cacheKey && this.chainCgIdByBatchId.has(cacheKey)) {
+          ctxGraphId = this.chainCgIdByBatchId.get(cacheKey);
+        } else if (
+          cacheKey && this.chain && this.chain.chainId !== 'none'
+          && typeof this.chain.getKAContextGraphId === 'function'
+        ) {
+          try {
+            const boundCg = await this.chain.getKAContextGraphId(batchIdForResolve);
+            if (boundCg !== null && boundCg !== undefined && BigInt(boundCg) > 0n) {
+              ctxGraphId = boundCg.toString();
+              this.chainCgIdByBatchId.set(cacheKey, ctxGraphId); // POSITIVE-only
+              this.log.info(ctx, `Finalization: resolved cgId from chain truth getKAContextGraphId(${batchIdForResolve})=${ctxGraphId}`);
+            }
+          } catch (err) {
+            this.log.info(ctx, `Finalization: chain getKAContextGraphId(${batchIdForResolve}) failed (RPC lag?), falling back to local resolve: ${err instanceof Error ? err.message : String(err)}`);
           }
-        } catch (err) {
-          this.log.warn(ctx, `Finalization: defensive on-chain CG id lookup failed for ${contextGraphId}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        // Local name-based resolver — the existing belt-and-braces for rolling
+        // upgrades when the chain method is absent/lagging.
+        if (!ctxGraphId && this.resolveContextGraphOnChainId) {
+          try {
+            const resolved = await this.resolveContextGraphOnChainId(contextGraphId);
+            if (resolved !== null && resolved !== undefined && String(resolved).length > 0) {
+              ctxGraphId = String(resolved);
+              this.log.info(ctx, `Finalization: gossip omitted targetContextGraphId; resolved locally to ${ctxGraphId} (defensive lookup)`);
+            }
+          } catch (err) {
+            this.log.warn(ctx, `Finalization: defensive on-chain CG id lookup failed for ${contextGraphId}: ${err instanceof Error ? err.message : String(err)}`);
+          }
         }
       }
 

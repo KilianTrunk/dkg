@@ -348,10 +348,10 @@ describe('Random Sampling E2E (Hardhat)', () => {
     }
   }, 90_000);
 
-  // Bounty Finding #3 regression — the empty-proof bypass is dead ON-CHAIN.
-  // Uses REC2 (an independent sharded node) so it never disturbs REC1's
-  // honest challenge above.
-  it('reverts the empty-proof bypass on the real RandomSampling.sol (content-binding)', async () => {
+  // Bounty Finding #3 + audit F01 regression — empty-proof AND root-preimage
+  // forgeries are dead ON-CHAIN. Uses REC2 (an independent sharded node) so it
+  // never disturbs REC1's honest challenge above.
+  it('reverts empty-proof + root-preimage forgeries on the real RandomSampling.sol (content-binding + proof-length binding)', async () => {
     const ctx = getSharedContext();
     const attacker = createEVMAdapter(HARDHAT_KEYS.REC2_OP);
     const attackerId = BigInt(ctx.receiverIds[1]!);
@@ -370,6 +370,24 @@ describe('Random Sampling E2E (Hardhat)', () => {
     await expect(
       attacker.submitProof!(ethers.toUtf8Bytes('<urn:x> <urn:y> <urn:z> .'), []),
     ).rejects.toThrow();
+
+    // F01 (root-preimage / proof-length binding): the 32-byte echo above is the
+    // weak variant. The structured root is keccak256(publicRoot ‖ privateDataHash);
+    // this KA is public with NO private data, so privateDataHash is the known
+    // SENTINEL and publicRoot is recomputable from public triples — i.e. the
+    // root's 64-byte PREIMAGE is fully attacker-derivable. Submitting it as
+    // `content` with an EMPTY proof gives keccak256(content) == root, which
+    // pre-fix folded zero times → leaf == root → accepted with ZERO stored data.
+    // The proof-length binding (proof.length == height(leafCount)+1 on the public
+    // path) rejects the empty proof.
+    const { root: rebuilt, publicTree, privateDataHash } = structuredKARootV10(
+      rawLeaves,
+      [],
+    );
+    expect(ethers.hexlify(rebuilt)).toBe(ethers.hexlify(root)); // attacker recomputes R
+    const rootPreimage = ethers.concat([publicTree.root, privateDataHash]); // 64 bytes
+    expect(ethers.keccak256(rootPreimage)).toBe(ethers.hexlify(root)); // valid forgery
+    await expect(attacker.submitProof!(rootPreimage, [])).rejects.toThrow();
 
     // No credit: the challenge stays unsolved after the failed attacks.
     const after = await attacker.getNodeChallenge!(attackerId);

@@ -335,6 +335,25 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
         // public proof folds: leaf -> publicRoot -> hashPair(publicRoot, privateDataHash).
         bytes32 leaf = keccak256(content);
 
+        // SECURITY FIX (F01): bind the proof length to the tree height for the
+        // pinned leaf count. Without this, an empty (or too-short) proof folds
+        // too few times and `_verifyV10MerkleProof` returns `leaf == root`, so an
+        // attacker submits the root's OWN preimage as `content` — e.g. the root's
+        // two children, which are PUBLIC for a curated KA (or a public KA with no
+        // private data) — and passes with ZERO stored data. The earlier
+        // content-binding change closed the 32-byte "echo the root as the leaf"
+        // case but NOT this 64-byte "submit the root's preimage" variant.
+        // Requiring a FULL-height proof means a valid submission needs a genuine
+        // merkle-inclusion path; a forged leaf would require a keccak256
+        // second-preimage. Expected length matches the off-chain builder exactly:
+        //   curated (plain `_catalog` tree):               height(leafCount)
+        //   public  (structured hashPair + private sibling): height(leafCount) + 1
+        // (`buildV10CatalogProofMaterial` vs `buildV10ProofMaterial` in dkg-core).
+        uint256 expectedProofLen = _treeHeight(uint256(leafCount)) + (challenge.isCurated ? 0 : 1);
+        if (merkleProof.length != expectedProofLen) {
+            revert MerkleRootMismatchError(bytes32(0), expectedMerkleRoot);
+        }
+
         if (!_verifyV10MerkleProof(expectedMerkleRoot, leaf, challenge.chunkId, merkleProof)) {
             revert MerkleRootMismatchError(bytes32(0), expectedMerkleRoot);
         }
@@ -401,6 +420,20 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
             }
         }
         return h == root;
+    }
+
+    /**
+     * @dev `ceil(log2(n))` — the V10 Merkle tree height. The off-chain builder
+     *      pads odd levels by duplicating the last node (`duplicate-last-on-odd`),
+     *      which keeps the height at `ceil(log2(leafCount))` and gives every leaf a
+     *      proof of exactly that many siblings. Returns 0 for `n <= 1`.
+     */
+    function _treeHeight(uint256 n) internal pure returns (uint256 h) {
+        while ((uint256(1) << h) < n) {
+            unchecked {
+                ++h;
+            }
+        }
     }
 
     /**
@@ -627,7 +660,15 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
                 uint32 leafCount = cgIsCurated
                     ? knowledgeAssetStorage.getCatalogLeafCount(candidate)
                     : knowledgeAssetStorage.getMerkleLeafCount(candidate);
-                if (leafCount == 0) revert NoEligibleKnowledgeAsset();
+                // SECURITY FIX (F08): a non-curated KA with `merkleLeafCount == 0` (publishable —
+                // the publish path validates a non-zero root but not a non-zero leaf count) must be
+                // SKIPPED like the expired / curated-zero cases above, NOT hard-revert the whole
+                // draw. Reverting let anyone DoS proof-of-storage: a node whose seed landed on such
+                // a KA could never create a challenge for that period. `continue` resamples another
+                // KA; if all MAX_KA_RETRIES attempts miss, the loop returns `found == false` and the
+                // caller excludes this CG and re-draws (eventually `NoEligibleKnowledgeAsset` only if
+                // no eligible KA exists anywhere).
+                if (leafCount == 0) continue;
                 return (candidate, uint256(kaSeed) % uint256(leafCount), true);
             }
         }

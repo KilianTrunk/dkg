@@ -1117,6 +1117,40 @@ describe('@unit RandomSampling', () => {
     });
 
     // -----------------------------------------------------------------------
+    // F08 regression — a non-curated KA with `merkleLeafCount == 0` must be
+    // SKIPPED (like an expired / curated-zero KA), NOT hard-revert the draw.
+    // Before the fix, `_pickKa` did `revert NoEligibleKnowledgeAsset` the
+    // instant the draw landed on a zero-leaf public KA. Such a KA is
+    // publishable (the publish path validates a non-zero root but not a
+    // non-zero leaf count), so a single one could DoS proof-of-storage for any
+    // node whose seed hit it — even when other valid KAs (here, four) exist.
+    // The draw must always resolve to a valid KA and never revert.
+    // -----------------------------------------------------------------------
+    it('F08: skips a zero-merkleLeafCount public KA instead of reverting the draw', async () => {
+      const cgId = await createCG(OPEN_POLICY);
+      const endEpoch = (await Chronos.getCurrentEpoch()) + 5n;
+      const zeroLeafKa = await createKa(cgId, endEpoch, 0n);
+      const validKas = new Set<bigint>();
+      for (let i = 0; i < 4; i++) {
+        validKas.add(await createKa(cgId, endEpoch, 1n));
+      }
+      await seedCGValue(cgId, 10_000n, 20n);
+
+      for (let i = 0; i < 40; i++) {
+        const preview = await RandomSampling.previewChallengeForSeed(testSeed(i));
+        expect(preview.cgId).to.equal(cgId);
+        expect(
+          preview.kaId,
+          `seed ${i} must not draw the zero-leaf KA`,
+        ).to.not.equal(zeroLeafKa);
+        expect(
+          validKas.has(preview.kaId),
+          `seed ${i} must draw a valid KA`,
+        ).to.equal(true);
+      }
+    });
+
+    // -----------------------------------------------------------------------
     // Test 5 — Distribution regression: 3 public CGs weighted 70/20/10 should
     // be picked at those ratios over many draws. Using the read-only preview
     // helper with per-draw seeds makes this both deterministic and fast.

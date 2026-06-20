@@ -2767,8 +2767,18 @@ export class SwmHostModeMethods extends DKGAgentBase {
         if (!ual || !isSafeIri(ual)) continue;
         try {
           await withMaterializationLock(scopedMeta, ual, async () => {
-            const version = await readMaterializedVersion(this.store, legacyMeta, ual);
-            if (version === null) return; // not safely stampable — skip
+            // A KC may carry no `dkg:materializedVersion` stamp in legacy meta:
+            // the publisher's OWN one-shot publish writes the KC into the legacy
+            // label `_meta` but never stamps a version (only the
+            // receiver/finalization path calls writeMaterializedVersion). Such a
+            // KC strands in legacy forever — chain-reconcile skips it
+            // (`isAlreadyConfirmed` sees the legacy `status=confirmed`) and the
+            // heal used to bail here on the null version. Relocate it anyway,
+            // stamping the LOWEST version {0,0}: the GH#842 ordering guard then
+            // lets any real update (block>0) win over this floor and never the
+            // reverse, so it can never clobber a genuine update.
+            const version = (await readMaterializedVersion(this.store, legacyMeta, ual))
+              ?? { blockNumber: 0, txIndex: 0 };
             if (!(await shouldApplyMaterialization(this.store, scopedMeta, ual, version))) return; // idempotent
 
             assertSafeIri(ual);

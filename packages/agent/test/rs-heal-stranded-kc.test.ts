@@ -44,7 +44,7 @@ import {
   contextGraphMetaUri,
 } from '@origintrail-official/dkg-core';
 import { extractV10KCFromStore } from '@origintrail-official/dkg-random-sampling';
-import { writeMaterializedVersion } from '@origintrail-official/dkg-publisher';
+import { writeMaterializedVersion, readMaterializedVersion } from '@origintrail-official/dkg-publisher';
 import { SwmHostModeMethods } from '../src/dkg-agent-swm-host.js';
 
 const DKG = 'http://dkg.io/ontology/';
@@ -156,8 +156,10 @@ describe('healStrandedScopedKCs — content-binding gate', () => {
       ...metaQuads(TEST_UAL, legacyMeta),
       ...publicTriples().map((t) => ({ ...t, graph: legacyData })),
     ]);
-    // A confirmed KC carries a materialized version stamp in legacy meta — the
-    // heal requires it (null version => not safely stampable => skip).
+    // A receiver-finalized KC carries a materialized version stamp in legacy
+    // meta; the heal preserves it when present. (A publisher's OWN one-shot
+    // publish has NO stamp — see the no-stamp test below, which the heal now
+    // relocates with a synthesized {0,0} floor version.)
     await writeMaterializedVersion(store, legacyMeta, TEST_UAL, { blockNumber: 100, txIndex: 0 });
   });
 
@@ -229,6 +231,44 @@ describe('healStrandedScopedKCs — content-binding gate', () => {
     const ctrl = await extractV10KCFromStore(store, BigInt(CTRL_ONCHAIN), KA_ID);
     const healed = await extractV10KCFromStore(store, BigInt(TEST_ONCHAIN), KA_ID);
     expect(new V10MerkleTree(healed.leaves).root).toEqual(new V10MerkleTree(ctrl.leaves).root);
+  });
+
+  it('relocates a stranded KC that has NO materializedVersion stamp (publisher own-KC strand)', async () => {
+    // The publisher's OWN one-shot publish writes the KC into legacy `_meta`
+    // WITHOUT a materializedVersion stamp (only the receiver/finalization path
+    // stamps one). Such a KC must STILL be relocated, otherwise it strands in
+    // legacy forever (kc-not-synced) — chain-reconcile skips it (legacy
+    // status=confirmed) and, pre-fix, so did the heal.
+    const NS_CG = 'nostamp-cg';
+    const NS_ONCHAIN = '13';
+    const NS_UAL = 'did:dkg:hardhat:31337/0xnostamp/42';
+    await seedOntology(store, NS_CG, NS_ONCHAIN);
+    const nsLegacyMeta = contextGraphMetaUri(NS_CG);
+    await store.insert([
+      ...metaQuads(NS_UAL, nsLegacyMeta),
+      ...publicTriples().map((t) => ({ ...t, graph: contextGraphDataUri(NS_CG) })),
+    ]);
+    // Deliberately NO writeMaterializedVersion — the publisher-own-KC case.
+    expect(await readMaterializedVersion(store, nsLegacyMeta, NS_UAL)).toBeNull();
+
+    // Before the heal the prover cannot find it (scoped empty).
+    await expect(extractV10KCFromStore(store, BigInt(NS_ONCHAIN), KA_ID)).rejects.toBeTruthy();
+
+    await runHeal(store, NS_CG, NS_ONCHAIN);
+
+    // Relocated byte-stably: recomputed scoped root equals the control root.
+    const ctrl = await extractV10KCFromStore(store, BigInt(CTRL_ONCHAIN), KA_ID);
+    const healed = await extractV10KCFromStore(store, BigInt(NS_ONCHAIN), KA_ID);
+    expect(new V10MerkleTree(healed.leaves).root).toEqual(new V10MerkleTree(ctrl.leaves).root);
+
+    // The heal stamped scoped with the {0,0} floor so any real update (block>0) wins.
+    const nsScopedMeta = contextGraphMetaUri(NS_CG, NS_ONCHAIN);
+    expect(await readMaterializedVersion(store, nsScopedMeta, NS_UAL)).toEqual({ blockNumber: 0, txIndex: 0 });
+
+    // Idempotent: a second run is a no-op (ASK-guard short-circuits on the now-present batchId).
+    const c1 = await scopedTripleCount(store, NS_CG, NS_ONCHAIN);
+    await runHeal(store, NS_CG, NS_ONCHAIN);
+    expect(await scopedTripleCount(store, NS_CG, NS_ONCHAIN)).toBe(c1);
   });
 
   it('writes NOTHING when the legacy root data is absent (crash-partial guard)', async () => {

@@ -807,10 +807,12 @@ describe('@unit Profile contract', function () {
     });
   });
 
-  // ProfileStorage 10.0.3 — getActiveOperatorFee / getActiveOperatorFeePercentage
-  // used to read operatorFees[length - 2] whenever the latest fee was not yet
-  // effective. With a single fee (length == 1) that is `operatorFees[-1]`, a uint
-  // underflow → out-of-bounds panic → DoS on the active-fee getters.
+  // ProfileStorage 10.0.4 — getActiveOperatorFee / getActiveOperatorFeePercentage
+  // / getActiveOperatorFeeEffectiveDate used to read operatorFees[length - 2]
+  // whenever the latest fee was not yet effective. With a single fee (length == 1)
+  // that is `operatorFees[-1]`, a uint underflow → out-of-bounds panic → DoS on the
+  // active-fee getters. All three now route through one `_activeOperatorFee` helper,
+  // so every public active-fee getter is exercised in each case below.
   describe('getActiveOperatorFee* — single-fee length-2 underflow regression', () => {
     it('returns the sole fee right after createProfile (initial fee effectiveDate == now)', async () => {
       // createProfile seeds operatorFees[0] at effectiveDate == block.timestamp;
@@ -819,6 +821,10 @@ describe('@unit Profile contract', function () {
 
       expect(await ProfileStorage.getActiveOperatorFeePercentage(identityId1)).to.equal(1000);
       expect((await ProfileStorage.getActiveOperatorFee(identityId1)).feePercentage).to.equal(1000);
+      // getActiveOperatorFeeEffectiveDate shares the same helper — must not panic.
+      expect(await ProfileStorage.getActiveOperatorFeeEffectiveDate(identityId1)).to.equal(
+        (await ProfileStorage.getActiveOperatorFee(identityId1)).effectiveDate,
+      );
     });
 
     it('returns the sole fee when the single fee is not yet effective (the exact underflow trigger)', async () => {
@@ -830,9 +836,12 @@ describe('@unit Profile contract', function () {
         { feePercentage: 1500, effectiveDate: future },
       ]);
 
-      // Pre-10.0.3 this reverted (operatorFees[length - 2] = operatorFees[-1]); now returns the sole fee.
+      // Pre-fix this reverted (operatorFees[length - 2] = operatorFees[-1]); now returns the sole fee.
       expect(await ProfileStorage.getActiveOperatorFeePercentage(identityId1)).to.equal(1500);
       expect((await ProfileStorage.getActiveOperatorFee(identityId1)).feePercentage).to.equal(1500);
+      // The effective-date getter ALSO panicked on operatorFees[-1] pre-fix (the #1263 🔴);
+      // it now returns the sole not-yet-effective fee's date.
+      expect(await ProfileStorage.getActiveOperatorFeeEffectiveDate(identityId1)).to.equal(future);
     });
 
     it('still returns the older active fee when a second fee is pending (length >= 2 path intact)', async () => {
@@ -845,6 +854,10 @@ describe('@unit Profile contract', function () {
       // (proves the fix did not regress the genuine length >= 2 else-branch).
       expect(await ProfileStorage.getActiveOperatorFeePercentage(identityId1)).to.equal(1000);
       expect((await ProfileStorage.getActiveOperatorFee(identityId1)).feePercentage).to.equal(1000);
+      // Effective-date getter returns the ACTIVE (older) fee's date, not the pending one.
+      expect(await ProfileStorage.getActiveOperatorFeeEffectiveDate(identityId1)).to.equal(
+        (await ProfileStorage.getActiveOperatorFee(identityId1)).effectiveDate,
+      );
     });
   });
 });

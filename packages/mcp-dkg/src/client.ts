@@ -51,7 +51,16 @@ export interface DkgClientOptions {
 
 const CONTEXT_GRAPH_URI_PREFIX = 'did:dkg:context-graph:';
 
-function normalizeContextGraphId(contextGraphIdOrUri: string): string {
+export function normalizeContextGraphId(contextGraphIdOrUri: string): string {
+  // Strip EXACTLY ONE leading DID prefix and trim whitespace — matching the
+  // daemon-side normalizer. Deliberately NOT canonicalising further: the
+  // daemon allows `/` and `:` in context-graph ids, so trailing slashes or a
+  // repeated DID prefix denote DISTINCT valid ids. Collapsing them here (this
+  // helper backs ~all client requests) would silently route reads/writes to a
+  // different project. Consumers needing the daemon's resolved id should call
+  // this once and reuse the result for both the wire scope and any downstream
+  // use (see dkg_get_entity_sources); a malformed id then fails closed rather
+  // than aliasing.
   const trimmed = contextGraphIdOrUri.trim();
   return trimmed.startsWith(CONTEXT_GRAPH_URI_PREFIX)
     ? trimmed.slice(CONTEXT_GRAPH_URI_PREFIX.length)

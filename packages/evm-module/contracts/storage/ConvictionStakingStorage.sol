@@ -159,6 +159,16 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     uint256 internal constant SCALE18 = 1e18;
     uint40 public constant EXPIRY_BUCKET_SECONDS = 12 hours;
     uint256 public constant MAX_NODE_PENDING_EXPIRIES = 1024;
+    /// @notice Maximum boosted lock-tier duration. A single tier's expiry window
+    ///         must fit within `MAX_NODE_PENDING_EXPIRIES` 12h buckets
+    ///         (`1024 * 12h = 512 days`). With this cap enforced in `addTier`, the
+    ///         distinct future buckets a node can ever hold is <= the slot cap, so
+    ///         `MAX_NODE_PENDING_EXPIRIES` can never be reached by valid stakes —
+    ///         it stays a pure backstop and never blocks a legitimate stake/relock
+    ///         (and the tombstone-vs-live slot distinction can never bite). The
+    ///         baseline ladder tops out at 366 days, well under this.
+    uint256 public constant MAX_TIER_DURATION =
+        MAX_NODE_PENDING_EXPIRIES * uint256(EXPIRY_BUCKET_SECONDS);
 
     // ============================================================
     //                 D20 — Mutable tier ladder
@@ -557,6 +567,10 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
             require(duration == 0 && multiplier18 == uint64(SCALE18), "Tier 0 must be rest");
         } else {
             require(duration > 0, "Non-zero tier needs duration");
+            // Keep MAX_NODE_PENDING_EXPIRIES an unreachable backstop: a single
+            // tier's expiry window must fit within that many 12h buckets, so the
+            // per-node slot cap can never block a legitimate stake/relock.
+            require(duration <= MAX_TIER_DURATION, "Tier duration too long");
             require(multiplier18 > uint64(SCALE18), "Non-zero tier needs boost");
         }
         _addTierInternal(lockTier, duration, multiplier18);

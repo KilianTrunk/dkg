@@ -920,6 +920,19 @@
     "type": "function"
   },
   {
+    "inputs": [],
+    "name": "MAX_TIER_DURATION",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
     "inputs": [
       {
         "internalType": "uint256",

@@ -290,49 +290,27 @@ describe('@unit ConvictionStakingStorage', () => {
         await ConvictionStakingStorage.getNodeExpiryDrop(ALICE_ID, expectedExpiry),
       ).to.equal(boostDrop(300n, SIX_X));
     });
-    it('Coalesces same-bucket expiries and caps distinct pending expiry slots per node', async function () {
-      this.timeout(120_000);
-
-      const longTier = 24;
-      const longDuration = 2000n * DAY;
-      await ConvictionStakingStorage.addTier(longTier, longDuration, TWO_X);
-
+    it('Tier-duration cap keeps the per-node slot cap an unreachable backstop', async () => {
+      // MAX_TIER_DURATION = MAX_NODE_PENDING_EXPIRIES * EXPIRY_BUCKET_SECONDS
+      // (1024 * 12h = 512 days). Capping the tier there means a single tier's
+      // expiry window can never span more than MAX_NODE_PENDING_EXPIRIES distinct
+      // buckets, so a node can never accumulate enough distinct future buckets to
+      // reach the slot cap — `NodeExpiryQueueFull` (and the tombstone-vs-live slot
+      // distinction) can therefore never block a legitimate stake/relock. The
+      // production ladder tops out at 366 days, well under this. (Same-bucket
+      // coalescing is covered by the "Coalesces drops at the same timestamp" test.)
       const maxPending = await ConvictionStakingStorage.MAX_NODE_PENDING_EXPIRIES();
-      const cap = Number(maxPending);
-      const current = await latestTimestamp();
-      const firstTs = ((current / DAY) + 1n) * DAY + 100n;
+      const bucketSecs = await ConvictionStakingStorage.EXPIRY_BUCKET_SECONDS();
+      const maxTier = await ConvictionStakingStorage.MAX_TIER_DURATION();
+      expect(maxTier).to.equal(maxPending * bucketSecs); // 1024 * 12h = 512 days
 
-      for (let i = 0; i < cap; i++) {
-        await time.setNextBlockTimestamp(Number(firstTs + BigInt(i) * DAY));
-        await ConvictionStakingStorage.createPosition(i + 1, ALICE_ID, 1, longTier, 0, 0);
-      }
-
-      expect(await ConvictionStakingStorage.getNodePendingExpiryCount(ALICE_ID)).to.equal(
-        maxPending,
-      );
-
-      const lastCreateTs = firstTs + BigInt(cap - 1) * DAY;
-      const lastExpiryBucket = bucketExpiry(lastCreateTs + longDuration);
-
-      // Same bucket as the final slot: accepted and aggregated even at the cap.
-      await time.setNextBlockTimestamp(Number(lastCreateTs + 1n));
+      // A tier whose expiry window would exceed the slot cap is rejected...
       await expect(
-        ConvictionStakingStorage.createPosition(10_000, ALICE_ID, 1, longTier, 0, 0),
-      ).to.not.be.reverted;
-      expect(await ConvictionStakingStorage.getNodePendingExpiryCount(ALICE_ID)).to.equal(
-        maxPending,
-      );
-      expect(await ConvictionStakingStorage.getNodeExpiryDrop(ALICE_ID, lastExpiryBucket)).to.equal(
-        2n,
-      );
-
-      // Next day creates a new distinct bucket and must be rejected at the cap.
-      await time.setNextBlockTimestamp(Number(firstTs + BigInt(cap) * DAY));
-      await expect(
-        ConvictionStakingStorage.createPosition(10_001, ALICE_ID, 1, longTier, 0, 0),
-      )
-        .to.be.revertedWithCustomError(ConvictionStakingStorage, 'NodeExpiryQueueFull')
-        .withArgs(ALICE_ID, maxPending, maxPending);
+        ConvictionStakingStorage.addTier(24, maxTier + 1n, TWO_X),
+      ).to.be.revertedWith('Tier duration too long');
+      // ...exactly at the cap is accepted.
+      await expect(ConvictionStakingStorage.addTier(24, maxTier, TWO_X)).to.not.be.reverted;
+      expect(await ConvictionStakingStorage.tierDuration(24)).to.equal(maxTier);
     });
 
   });
@@ -625,7 +603,7 @@ describe('@unit ConvictionStakingStorage', () => {
 
     it('HubOwner can append a new tier and createPosition picks it up', async () => {
       const newTier = 24;
-      const newDuration = 2n * 366n * DAY;
+      const newDuration = 500n * DAY; // <= MAX_TIER_DURATION (1024 * 12h = 512 days)
       const newMult = 12n * SCALE18;
       await expect(ConvictionStakingStorage.addTier(newTier, newDuration, newMult))
         .to.emit(ConvictionStakingStorage, 'TierAdded')
@@ -638,7 +616,7 @@ describe('@unit ConvictionStakingStorage', () => {
       const pos = await ConvictionStakingStorage.getPosition(1);
       expect(pos.lockTier).to.equal(newTier);
       expect(pos.multiplier18).to.equal(newMult);
-      // Expected expiry = next half-day bucket after ts + 2 years.
+      // Expected expiry = next half-day bucket after ts + newDuration.
       const tsNow = await latestTimestamp();
       expect(pos.expiryTimestamp).to.equal(bucketExpiry(tsNow + newDuration));
     });
@@ -652,11 +630,11 @@ describe('@unit ConvictionStakingStorage', () => {
       // boost (would make the "big sum" == "raw sum" and break our fast-path
       // shortcuts in StakingV10._delegatorIncrementForEpoch).
       await expect(
-        ConvictionStakingStorage.addTier(24, 2n * 366n * DAY, SCALE18 / 2n),
+        ConvictionStakingStorage.addTier(24, 366n * DAY, SCALE18 / 2n),
       ).to.be.revertedWith('Non-zero tier needs boost');
       // M3/M4 — non-zero tier with exactly 1x is rejected for the same reason.
       await expect(
-        ConvictionStakingStorage.addTier(24, 2n * 366n * DAY, ONE_X),
+        ConvictionStakingStorage.addTier(24, 366n * DAY, ONE_X),
       ).to.be.revertedWith('Non-zero tier needs boost');
       // M3/M4 — non-zero tier with duration == 0 is rejected (would install a
       // position whose expiryTimestamp == block.timestamp, i.e. already expired).

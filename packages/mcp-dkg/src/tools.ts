@@ -376,9 +376,15 @@ SELECT DISTINCT ?s ?p WHERE { ?s ?p <${uri}> } LIMIT 50`,
           .optional()
           .describe('Memory tier to read sources from. Defaults to verifiable-memory (on-chain, citable). working-memory is intentionally not offered: it is private draft state (the engine requires an agent identity to read it) and is not a citable source.'),
         subGraphName: z.string().optional().describe('Limit the read to a single sub-graph'),
+        limit: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe('Max attributed facts to render (default 100). A high-degree or many-publisher entity is truncated deterministically and the remainder disclosed, so the response cannot exhaust agent context.'),
       },
     },
-    async ({ uri, projectId, view, subGraphName }): Promise<ToolResult> => {
+    async ({ uri, projectId, view, subGraphName, limit }): Promise<ToolResult> => {
       const pid = resolveProject(projectId, config);
       if (!pid) return projectErr();
       // The client accepts a full `did:dkg:context-graph:<id>` and normalises it
@@ -433,16 +439,14 @@ SELECT ?p ?o ?g WHERE { GRAPH ?g { <${safeIri}> ?p ?o } }`,
           ka: EntitySource[];
         }
         const facts = new Map<string, Fact>();
-        const kaSources = new Map<string, EntitySource>();
         for (const b of rows) {
           const p = bindingValue(b.p);
           const o = bindingValue(b.o);
           const src = parseEntitySource(bindingValue(b.g), cgId);
           const key = JSON.stringify([p, o]);
           const fact = facts.get(key) ?? { p, o, ka: [] };
-          if (src.author && src.kaNumber) {
-            if (!fact.ka.some((s) => s.sourceGraph === src.sourceGraph)) fact.ka.push(src);
-            kaSources.set(src.sourceGraph, src);
+          if (src.author && src.kaNumber && !fact.ka.some((s) => s.sourceGraph === src.sourceGraph)) {
+            fact.ka.push(src);
           }
           facts.set(key, fact);
         }
@@ -457,7 +461,16 @@ SELECT ?p ?o ?g WHERE { GRAPH ?g { <${safeIri}> ?p ?o } }`,
           );
         }
 
-        const factLines = attributed.map(
+        // Deterministic output cap: render at most `limit` attributed facts and
+        // only the sources THEY cite, so a high-degree / many-publisher entity
+        // cannot dump an unbounded MCP response. Remainder disclosed, not dropped.
+        const cap = limit ?? 100;
+        const shown = attributed.slice(0, cap);
+        const truncated = attributed.length - shown.length;
+        const kaSources = new Map<string, EntitySource>();
+        for (const f of shown) for (const s of f.ka) kaSources.set(s.sourceGraph, s);
+
+        const factLines = shown.map(
           (f) => `- **${prettyTerm(f.p)}**: ${prettyTerm(f.o)}  ←  ${f.ka.map((s) => sourceLabel(s)).join(', ')}`,
         );
         const sourceLines = [...kaSources.values()].map(
@@ -484,6 +497,12 @@ SELECT ?p ?o ?g WHERE { GRAPH ?g { <${safeIri}> ?p ?o } }`,
           sourcesHeader,
           sourceLines.join('\n'),
         ];
+        if (truncated > 0) {
+          parts.push(
+            '',
+            `_${truncated} more attributed fact(s) not shown — raise \`limit\` (currently ${cap})._`,
+          );
+        }
         if (unattributed.length) {
           parts.push(
             '',

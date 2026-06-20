@@ -129,6 +129,25 @@ describe('dkg_get_entity_sources', () => {
     expect(result.content[0].text).toMatch(/No KA-attributable facts/);
   });
 
+  it('caps rendered facts at `limit` and discloses the remainder', async () => {
+    const server = new FakeServer();
+    const client = new FakeClient({
+      query: async () => ({
+        bindings: Array.from({ length: 5 }, (_, i) => ({
+          p: `http://schema.org/p${i}`,
+          o: `"v${i}"`,
+          g: VM('0xaa', String(i)),
+        })),
+      }),
+    });
+    registerReadTools(server.asMcpServer(), client.asDkgClient(), makeConfig());
+    const result = await server.call('dkg_get_entity_sources', { uri: 'urn:x:1', limit: 2 });
+    const text = result.content[0].text;
+    // Exactly 2 fact lines rendered (one `←` arrow each), remainder disclosed.
+    expect((text.match(/←/g) ?? []).length).toBe(2);
+    expect(text).toMatch(/3 more attributed fact\(s\) not shown/);
+  });
+
   it('forwards an explicit shared-working-memory view', async () => {
     const server = new FakeServer();
     const client = new FakeClient();

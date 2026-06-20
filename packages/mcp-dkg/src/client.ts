@@ -52,22 +52,19 @@ export interface DkgClientOptions {
 const CONTEXT_GRAPH_URI_PREFIX = 'did:dkg:context-graph:';
 
 export function normalizeContextGraphId(contextGraphIdOrUri: string): string {
-  // Idempotent: strip EVERY leading DID prefix and any trailing slash(es).
-  // Consumers that re-normalize (e.g. the wire scope AND a downstream
-  // provenance anchor) must converge on the same id even for malformed input
-  // like a double-prefixed or trailing-slash value — otherwise the two derive
-  // different context-graph ids and silently disagree.
-  let s = contextGraphIdOrUri.trim();
-  while (s.startsWith(CONTEXT_GRAPH_URI_PREFIX)) {
-    s = s.slice(CONTEXT_GRAPH_URI_PREFIX.length);
-  }
-  // Trim trailing slash(es) with a linear index walk, NOT `/\/+$/`: that
-  // regex is a polynomial-ReDoS on a string of many '/' (replace scans every
-  // start position and the `\/+` backtracks at each), and this id is
-  // caller/config input — CodeQL js/polynomial-redos flags it.
-  let end = s.length;
-  while (end > 0 && s.charCodeAt(end - 1) === 47 /* '/' */) end -= 1;
-  return s.slice(0, end);
+  // Strip EXACTLY ONE leading DID prefix and trim whitespace — matching the
+  // daemon-side normalizer. Deliberately NOT canonicalising further: the
+  // daemon allows `/` and `:` in context-graph ids, so trailing slashes or a
+  // repeated DID prefix denote DISTINCT valid ids. Collapsing them here (this
+  // helper backs ~all client requests) would silently route reads/writes to a
+  // different project. Consumers needing the daemon's resolved id should call
+  // this once and reuse the result for both the wire scope and any downstream
+  // use (see dkg_get_entity_sources); a malformed id then fails closed rather
+  // than aliasing.
+  const trimmed = contextGraphIdOrUri.trim();
+  return trimmed.startsWith(CONTEXT_GRAPH_URI_PREFIX)
+    ? trimmed.slice(CONTEXT_GRAPH_URI_PREFIX.length)
+    : trimmed;
 }
 
 function optionalContextGraphId(contextGraphIdOrUri: string | undefined): string | undefined {

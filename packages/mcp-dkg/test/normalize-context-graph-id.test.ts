@@ -1,36 +1,27 @@
 /**
- * `normalizeContextGraphId` must be IDEMPOTENT so a consumer that re-normalizes
- * (the wire scope AND a downstream provenance anchor in dkg_get_entity_sources)
- * converges on the same id even for malformed input. The trailing-slash trim is
- * a linear index walk, not `/\/+$/` — that regex is a polynomial-ReDoS on a
- * string of many '/' (CodeQL js/polynomial-redos), and the id is caller input.
+ * `normalizeContextGraphId` strips EXACTLY ONE leading `did:dkg:context-graph:`
+ * prefix and trims whitespace — matching the daemon. It deliberately does NOT
+ * canonicalise trailing slashes or repeated prefixes: the daemon allows `/` and
+ * `:` in context-graph ids, so those denote DISTINCT valid ids, and this helper
+ * backs ~all client requests. Pinning the contract directly (the round-3 attempt
+ * to make it idempotent silently aliased distinct ids and added a ReDoS).
  */
 import { describe, it, expect } from 'vitest';
 import { normalizeContextGraphId } from '../src/client.js';
 
-describe('normalizeContextGraphId', () => {
+describe('normalizeContextGraphId — single DID-prefix strip, no further canonicalisation', () => {
   it.each([
-    ['test-cg', 'test-cg'],
-    ['did:dkg:context-graph:test-cg', 'test-cg'],
-    ['  did:dkg:context-graph:test-cg  ', 'test-cg'],
-    ['test-cg/', 'test-cg'],
-    ['test-cg///', 'test-cg'],
-    ['did:dkg:context-graph:test-cg/', 'test-cg'],
-    // double-prefixed (the round-2 regression class) collapses fully
-    ['did:dkg:context-graph:did:dkg:context-graph:foo', 'foo'],
-    // sub-graph-bearing ids keep their internal slashes, lose only trailing
-    ['0xowner/proj', '0xowner/proj'],
-    ['0xowner/proj/', '0xowner/proj'],
-  ])('normalizes %j -> %j', (input, expected) => {
+    ['bare id', 'test-cg', 'test-cg'],
+    ['single DID form', 'did:dkg:context-graph:test-cg', 'test-cg'],
+    ['whitespace-padded DID', '  did:dkg:context-graph:test-cg  ', 'test-cg'],
+    ['empty', '', ''],
+    ['sub-graph-bearing id (internal slashes kept)', '0xowner/proj', '0xowner/proj'],
+    // The cases below MUST be preserved, not canonicalised — they are distinct
+    // valid ids the daemon may treat differently:
+    ['trailing slash preserved', 'test-cg/', 'test-cg/'],
+    ['DID form with trailing slash', 'did:dkg:context-graph:test-cg/', 'test-cg/'],
+    ['only ONE prefix stripped', 'did:dkg:context-graph:did:dkg:context-graph:foo', 'did:dkg:context-graph:foo'],
+  ])('%s: %j -> %j', (_label, input, expected) => {
     expect(normalizeContextGraphId(input)).toBe(expected);
-    // Idempotent: normalizing the result again is a no-op.
-    expect(normalizeContextGraphId(normalizeContextGraphId(input))).toBe(expected);
-  });
-
-  it('is linear on a long run of trailing slashes (no ReDoS blowup)', () => {
-    const input = 'cg' + '/'.repeat(100_000) + '';
-    const t0 = Date.now();
-    expect(normalizeContextGraphId(input)).toBe('cg');
-    expect(Date.now() - t0).toBeLessThan(1000);
   });
 });

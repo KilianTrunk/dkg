@@ -42,6 +42,10 @@ describe('addressed-read provenance — scoped GRAPH ?g over one entity', () => 
       q(E, 'http://dkg.io/ontology/authorAddress', '"0xAUTH"', 'did:dkg:context-graph:cg-one/_meta'),
       // The same entity in a DIFFERENT context graph — must NOT bleed in.
       q(E, NAME, '"X-OTHER-CG"', 'did:dkg:context-graph:cg-two/_verifiable_memory/0xcc/9'),
+      // PREFIX-COLLISION: a CG whose id shares `cg-one` as a prefix. A naive
+      // `startsWith('…cg-one')` check would let this leak; the CG boundary is
+      // the `/` (or exact root), so it must NOT appear.
+      q(E, NAME, '"X-PREFIX-COLLISION"', 'did:dkg:context-graph:cg-one-extra/_verifiable_memory/0xdd/3'),
     ]);
 
     const r = await engine.query(
@@ -59,10 +63,16 @@ describe('addressed-read provenance — scoped GRAPH ?g over one entity', () => 
     expect(graphs).toContain('did:dkg:context-graph:cg-one');
     expect(graphs).toContain('did:dkg:context-graph:cg-one/context/7');
 
-    // Scoping invariants: no `_meta` seal value, no cross-context bleed.
+    // Scoping invariants: no `_meta` seal value, no cross-context bleed, and no
+    // prefix-collision leak (the CG boundary is the exact root or a `/`).
     expect(objects).not.toContain('"0xAUTH"');
     expect(objects).not.toContain('"X-OTHER-CG"');
-    expect(graphs.every((g) => g.startsWith('did:dkg:context-graph:cg-one'))).toBe(true);
+    expect(objects).not.toContain('"X-PREFIX-COLLISION"');
+    expect(
+      graphs.every(
+        (g) => g === 'did:dkg:context-graph:cg-one' || g.startsWith('did:dkg:context-graph:cg-one/'),
+      ),
+    ).toBe(true);
     expect(graphs.some((g) => g.includes('_meta'))).toBe(false);
   });
 

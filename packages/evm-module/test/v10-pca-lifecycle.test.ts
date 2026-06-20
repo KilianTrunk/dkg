@@ -1186,6 +1186,19 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
       .withArgs(setup.cgId);
   });
 
+  it('publish: a PUBLIC CG with merkleLeafCount == 0 reverts PublicKARequiresMerkleLeafCount (F08)', async () => {
+    // A public KA is sampled against its merkleLeafCount; zero makes it
+    // unchallengeable. Rejecting it at publish stops a griefer from packing a CG
+    // with live zero-leaf KAs that burn the bounded MAX_KA_RETRIES sampling budget.
+    const setup = await setupRegisteredAgentPublish();
+    const p = await buildBasePublishParams(setup, 'public-zero-leaf', {
+      merkleLeafCount: 0,
+    });
+    await expect(KAV10.connect(setup.creator).publish(p))
+      .to.be.revertedWithCustomError(KAV10, 'PublicKARequiresMerkleLeafCount')
+      .withArgs(setup.cgId);
+  });
+
   it('update: a PARTIAL new catalog commitment (one field zero) on a curated KA reverts IncompleteCatalogCommitment', async () => {
     const setup = await setupRegisteredAgentPublish();
     const curatedCgId = await createCuratedContextGraphFor(setup.creator);
@@ -1339,6 +1352,63 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
         KAV10,
         'PublicCGCannotHaveCatalogCommitment',
       )
+      .withArgs(setup.cgId);
+  });
+
+  it('update: a PUBLIC CG update with newMerkleLeafCount == 0 reverts PublicKARequiresMerkleLeafCount (F08)', async () => {
+    // A content update must keep a public KA challengeable — zeroing its leaf
+    // count would strand it from the sampling draw (pure top-ups/extends use a
+    // different path, so they are unaffected).
+    const setup = await setupRegisteredAgentPublish();
+    const storageOperator = accounts[19];
+    await HubContract.setContractAddress(
+      'TestStorageOperator',
+      storageOperator.address,
+    );
+
+    const currentEpoch = await Chronos.getCurrentEpoch();
+    const endEpoch = currentEpoch + BigInt(setup.epochs);
+    const initialTokenAmount = ethers.parseEther('1000');
+    const kaId = packReservedKaId(setup.creator.address, 813);
+    await DKGKnowledgeAssets.connect(storageOperator).createKnowledgeAsset(
+      storageOperator.address,
+      setup.creator.address,
+      kaId,
+      'public-update-zero-op',
+      ethers.keccak256(ethers.toUtf8Bytes('public-update-zero')),
+      1,
+      1000,
+      currentEpoch,
+      endEpoch,
+      initialTokenAmount,
+      false,
+      1,
+    );
+    await CGS.connect(storageOperator).registerKnowledgeAssetToContextGraph(
+      setup.cgId,
+      kaId,
+    );
+
+    const up = await buildUpdateParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes: setup.receivingNodes,
+      publisherIdentityId: setup.publisherIdentityId,
+      receiverIdentityIds: setup.receiverIdentityIds,
+      contextGraphId: setup.cgId,
+      id: kaId,
+      preUpdateMerkleRootCount: 1n,
+      newMerkleRoot: ethers.keccak256(ethers.toUtf8Bytes('public-update-zero-root')),
+      newMerkleLeafCount: 0, // F08: zeroing strands the KA from sampling
+      newByteSize: 1000n,
+      newTokenAmount: initialTokenAmount + ethers.parseEther('1'),
+      mintKnowledgeAssetsAmount: 0n,
+      knowledgeAssetsToBurn: [],
+      updateOperationId: 'public-update-zero-op',
+      author: setup.creator,
+    });
+    await expect(KAV10.connect(setup.creator).update(up))
+      .to.be.revertedWithCustomError(KAV10, 'PublicKARequiresMerkleLeafCount')
       .withArgs(setup.cgId);
   });
 

@@ -89,9 +89,38 @@ const LAYER_SLUG_TO_VIEW: Record<string, EntitySource['memoryLayer']> = {
   _verifiable_memory: 'verifiable-memory',
 };
 
-/** Parse a source named-graph URI into a verifiable handle. */
-export function parseEntitySource(sourceGraph: string): EntitySource {
+/**
+ * Parse a source named-graph URI into a verifiable handle.
+ *
+ * Per-KA partition layout: `…:{cg}[/{sub}]/{_layer}/{addr}/{number}` — TWO
+ * trailing segments after the layer slug. A single-segment VM graph such as the
+ * consensus `…/_verifiable_memory/{vmId}` is keyed by a batch id, not a
+ * per-author UAL, so it intentionally does NOT match — those facts are
+ * disclosed, not attributed.
+ *
+ * When the caller's context-graph id is known, pass it: a CG id may itself
+ * contain `/` and `_` (validateContextGraphId allows them), so an
+ * adversarially-named CG like `evil/_verifiable_memory/0xaa/1` could have a
+ * ROOT graph that a greedy, unanchored parse misreads as a per-KA partition and
+ * fabricates `KA 0xaa/1`. Anchoring on the known `…:{cgId}/` prefix makes the
+ * CG-id portion impossible to reinterpret as layer/addr/number (mirrors
+ * node-ui's useSwmAttributions). With no `cgId`, fall back to the greedy form.
+ */
+export function parseEntitySource(sourceGraph: string, cgId?: string): EntitySource {
   const src: EntitySource = { sourceGraph };
+  const PER_KA_TAIL = /^(?:.+\/)?(_working_memory|_shared_memory|_verifiable_memory)\/([^/]+)\/([^/]+)$/;
+  if (cgId !== undefined) {
+    const prefix = `did:dkg:context-graph:${cgId}/`;
+    if (!sourceGraph.startsWith(prefix)) return src;
+    const m = sourceGraph.slice(prefix.length).match(PER_KA_TAIL);
+    if (m) {
+      src.contextGraphId = cgId;
+      src.memoryLayer = LAYER_SLUG_TO_VIEW[m[1]];
+      src.author = m[2];
+      src.kaNumber = m[3];
+    }
+    return src;
+  }
   const m = sourceGraph.match(
     /^did:dkg:context-graph:(.+)\/(_working_memory|_shared_memory|_verifiable_memory)\/([^/]+)\/([^/]+)$/,
   );
@@ -104,9 +133,16 @@ export function parseEntitySource(sourceGraph: string): EntitySource {
   return src;
 }
 
-/** Short citation label: `KA <author>/<kaNumber>` for a per-KA source, else the graph. */
+/**
+ * Short citation label. A per-KA source renders as `KA <author>/<number>`;
+ * a shared-working-memory source is a PRE-PUBLISH reserved UAL (not yet on
+ * chain, may still change or be discarded), so it is qualified as a draft so a
+ * per-fact label can't be lifted out of context and cited as on-chain.
+ */
 export function sourceLabel(s: EntitySource): string {
-  return s.author && s.kaNumber ? `KA \`${s.author}/${s.kaNumber}\`` : `\`${s.sourceGraph}\``;
+  if (!(s.author && s.kaNumber)) return `\`${s.sourceGraph}\``;
+  const draft = s.memoryLayer === 'shared-working-memory' ? 'draft ' : '';
+  return `${draft}KA \`${s.author}/${s.kaNumber}\``;
 }
 
 /** Markdown table from SPARQL bindings, with pretty-printed terms. */

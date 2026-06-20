@@ -138,7 +138,7 @@ autoShare: true
 
 `.dkg/` is gitignored repo-wide so this file stays local to each operator. The `tokenFile` path is resolved relative to the YAML; default of `~/.dkg/auth.token` matches what `dkg start` writes on first boot.
 
-## Tool surface (30 tools)
+## Tool surface (31 tools)
 
 All tools are available the moment `dkg mcp setup` registers the MCP with your client. They group into seven categories tracking how a session typically uses memory: check health, discover the graph, set it up, drive the knowledge-asset lifecycle (create → write → finalize → share → publish), recall from it, query it, and message other agents.
 
@@ -157,6 +157,7 @@ All tools are available the moment `dkg mcp setup` registers the MCP with your c
 | `dkg_list_context_graphs` | List all context graphs (called "projects" in the DKG node UI) this node knows about. Returns id, display name, role (curator / participant), and layer. The first call most agents make when joining a workspace. |
 | `dkg_sub_graph_list` | List the sub-graphs inside a context graph (e.g. `code`, `github`, `decisions`, `tasks`, `meta`, `chat`) with entity counts. Use to figure out what kind of knowledge a CG exposes before querying. |
 | `dkg_get_entity` | All triples where the given URI is the subject, plus a 1-hop inbound-edges neighbourhood. Equivalent to the entity detail page in the Node UI. Use to understand a specific decision, task, file, or PR end-to-end. |
+| `dkg_get_entity_sources` | An entity's facts, each tagged with the Knowledge Asset (author + KA number) that asserted it, so you can cite/verify provenance. Reads one tier — verifiable-memory by default (published/on-chain), or shared-working-memory (pre-publish draft). Facts in non-per-KA graphs are disclosed by count. |
 | `dkg_list_activity` | Recent activity across all sub-graphs, newest first. Mirrors the "Recent activity" feed on the project overview page: decisions, tasks, PRs, chat turns. Use to catch up at the start of a session. |
 | `dkg_get_agent` | Look up an agent by URI (or display name) and return its profile card: framework, operator, wallet address, joined-at, reputation, plus everything that agent has authored in the project. |
 
@@ -293,8 +294,8 @@ Per-turn state is kept in `~/.cache/dkg-mcp/sessions/*.json`; safe to delete at 
 
 | File | Purpose |
 |---|---|
-| `src/index.ts` | Stdio MCP server entrypoint. Boots `McpServer` and registers the 30 tools. |
-| `src/tools.ts` | Read tools (`dkg_list_context_graphs`, `dkg_sub_graph_list`, `dkg_query`, `dkg_get_entity`, `dkg_list_activity`, `dkg_get_agent`). |
+| `src/index.ts` | Stdio MCP server entrypoint. Boots `McpServer` and registers the 31 tools. |
+| `src/tools.ts` | Read tools (`dkg_list_context_graphs`, `dkg_sub_graph_list`, `dkg_query`, `dkg_get_entity`, `dkg_get_entity_sources`, `dkg_list_activity`, `dkg_get_agent`). |
 | `src/tools/assertions.ts` | Knowledge-asset lifecycle (`dkg_knowledge_asset_*` × 13: create/write/finalize/share/publish/pull_from/discard/query/history/import_file + import_artifact_resolve/read_markdown + semantic_enrichment_write). |
 | `src/tools/health.ts` | `dkg_status`, `dkg_peer_info`, `dkg_wallet_balances`. |
 | `src/tools/memory-search.ts` | `dkg_memory_search` with WM/SWM/VM fan-out and trust-weighted ranking. |

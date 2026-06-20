@@ -290,6 +290,34 @@ describe('@unit ConvictionStakingStorage', () => {
         await ConvictionStakingStorage.getNodeExpiryDrop(ALICE_ID, expectedExpiry),
       ).to.equal(boostDrop(300n, SIX_X));
     });
+
+    it('Dust stakes at distinct seconds coalesce into the same 12h bucket (queue stays bounded)', async () => {
+      // The DoS the bucketing closes: many stakes against a node at DISTINCT block
+      // timestamps. Pre-fix every distinct second was its own queue slot (unbounded
+      // -> settle eventually exceeds block gas). With 12h bucketing, all stakes whose
+      // lock ends in the same half-day share ONE slot, so the queue cannot grow with
+      // the stake count.
+      const N = 50;
+      for (let i = 1; i <= N; i++) {
+        // each createPosition auto-mines a block (timestamp +1s) -> N distinct
+        // seconds, all inside the same 12h bucket.
+        await ConvictionStakingStorage.createPosition(i, ALICE_ID, 1, 12, 0, 0);
+      }
+      // All N expiries fall in at most two adjacent 12h buckets (one, unless the
+      // ~N-second creation window straddles a bucket boundary).
+      const pending = await ConvictionStakingStorage.getNodePendingExpiryCount(ALICE_ID);
+      expect(Number(pending)).to.be.lessThanOrEqual(2);
+
+      // The whole bounded queue drains in one cheap settle past the last expiry.
+      const times = await ConvictionStakingStorage.getNodeExpiryTimes(ALICE_ID);
+      await time.increaseTo(Number(times[times.length - 1]) + 1);
+      await ConvictionStakingStorage.settleNodeTo(ALICE_ID, await latestTimestamp());
+      expect(await ConvictionStakingStorage.getNodeRunningEffectiveStake(ALICE_ID)).to.equal(
+        BigInt(N),
+      );
+      expect(await ConvictionStakingStorage.getNodePendingExpiryCount(ALICE_ID)).to.equal(0);
+    });
+
     it('Tier-duration cap keeps the per-node slot cap an unreachable backstop', async () => {
       // MAX_TIER_DURATION = MAX_NODE_PENDING_EXPIRIES * EXPIRY_BUCKET_SECONDS
       // (1024 * 12h = 512 days). Capping the tier there means a single tier's
@@ -302,7 +330,11 @@ describe('@unit ConvictionStakingStorage', () => {
       const maxPending = await ConvictionStakingStorage.MAX_NODE_PENDING_EXPIRIES();
       const bucketSecs = await ConvictionStakingStorage.EXPIRY_BUCKET_SECONDS();
       const maxTier = await ConvictionStakingStorage.MAX_TIER_DURATION();
-      expect(maxTier).to.equal(maxPending * bucketSecs); // 1024 * 12h = 512 days
+      // (MAX_NODE_PENDING_EXPIRIES - 1) * EXPIRY_BUCKET_SECONDS = 1023 * 12h = 511.5
+      // days. The `- 1` accounts for `_computeExpiryTimestamp` rounding UP: a k-bucket
+      // tier created just after a boundary expires k+1 buckets out, so a node can hold
+      // up to tierBuckets+1 distinct pending slots; capping at MAX-1 keeps that <= MAX.
+      expect(maxTier).to.equal((maxPending - 1n) * bucketSecs);
 
       // A tier whose expiry window would exceed the slot cap is rejected...
       await expect(
@@ -770,6 +802,22 @@ describe('@unit ConvictionStakingStorage', () => {
       expect(await ConvictionStakingStorage.getNodeExpiryDrop(ALICE_ID, expected)).to.equal(
         boostDrop(1000n, SIX_X),
       );
+    });
+
+    it('preserves a non-bucket-aligned credit exactly — no silent re-bucket rounding', async () => {
+      // `convictionCreditSeconds` (passed as expiryShortenedBy) can be arbitrary
+      // seconds. The expiry is `bucketedDefault - credit` with NO re-bucket, so a
+      // credit that is not a multiple of EXPIRY_BUCKET_SECONDS is applied to the
+      // exact second. (Re-bucketing would round it UP to the 12h grid — e.g.
+      // `60d - 1h` -> a full `60d` — quietly shrinking the configured credit.)
+      const credit = SIXTY_DAYS - 3600n; // 60 days minus 1 hour (not a 12h multiple)
+      await ConvictionStakingStorage.createPosition(1, ALICE_ID, 1000, 12, 1, credit);
+      const tsNow = await latestTimestamp();
+      const pos = await ConvictionStakingStorage.getPosition(1);
+      // exact: the bucketed default minus the FULL credit (not rounded back up).
+      expect(pos.expiryTimestamp).to.equal(expectedExpiryFrom(tsNow, 12) - credit);
+      // crucially NOT snapped onto the 12h grid:
+      expect(pos.expiryTimestamp % (12n * 60n * 60n)).to.not.equal(0n);
     });
 
     it('Tier 6 with 60d credit: expiryTimestamp lands 60d before the tier default', async () => {

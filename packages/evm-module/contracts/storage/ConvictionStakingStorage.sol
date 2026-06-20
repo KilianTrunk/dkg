@@ -159,16 +159,20 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     uint256 internal constant SCALE18 = 1e18;
     uint40 public constant EXPIRY_BUCKET_SECONDS = 12 hours;
     uint256 public constant MAX_NODE_PENDING_EXPIRIES = 1024;
-    /// @notice Maximum boosted lock-tier duration. A single tier's expiry window
-    ///         must fit within `MAX_NODE_PENDING_EXPIRIES` 12h buckets
-    ///         (`1024 * 12h = 512 days`). With this cap enforced in `addTier`, the
-    ///         distinct future buckets a node can ever hold is <= the slot cap, so
+    /// @notice Maximum boosted lock-tier duration. Bounded so the distinct future
+    ///         buckets a node can ever hold stays STRICTLY below the slot cap.
+    ///         Because `_computeExpiryTimestamp` rounds UP to the next bucket, a
+    ///         tier of `k` buckets created just after a boundary expires `k + 1`
+    ///         buckets out — so a node staking once per bucket can reach `k + 1`
+    ///         distinct pending slots. To keep that `<= MAX_NODE_PENDING_EXPIRIES`,
+    ///         a tier must be at most `MAX_NODE_PENDING_EXPIRIES - 1` buckets
+    ///         (`1023 * 12h = 511.5 days`). With this enforced in `addTier`,
     ///         `MAX_NODE_PENDING_EXPIRIES` can never be reached by valid stakes —
     ///         it stays a pure backstop and never blocks a legitimate stake/relock
     ///         (and the tombstone-vs-live slot distinction can never bite). The
     ///         baseline ladder tops out at 366 days, well under this.
     uint256 public constant MAX_TIER_DURATION =
-        MAX_NODE_PENDING_EXPIRIES * uint256(EXPIRY_BUCKET_SECONDS);
+        (MAX_NODE_PENDING_EXPIRIES - 1) * uint256(EXPIRY_BUCKET_SECONDS);
 
     // ============================================================
     //                 D20 — Mutable tier ladder
@@ -1009,6 +1013,13 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
             require(lockTier != 0, "Credit requires locked tier");
             uint256 dur = _tierDuration(lockTier);
             require(uint256(expiryShortenedBy) < dur, "Credit >= tier duration");
+            // Subtract the migration credit AFTER bucketing and do NOT re-bucket.
+            // `expiryShortenedBy` (convictionCreditSeconds) is a single global
+            // offset, so `bucketedDefault - credit` still coalesces (same shifted
+            // timestamp per creation bucket) and the queue stays bounded. Re-bucketing
+            // here would silently round a non-bucket-aligned credit UP to the 12h grid
+            // (e.g. `60d - 1h` -> a full `60d`), changing the configured credit. The
+            // exact second is preserved on purpose — do not "tidy" this onto the grid.
             expiryTimestamp = uint40(uint256(expiryTimestamp) - uint256(expiryShortenedBy));
             require(expiryTimestamp > tsNow, "Credit leaves no remaining lock");
         }

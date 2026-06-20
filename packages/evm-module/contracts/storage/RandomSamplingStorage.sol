@@ -37,7 +37,12 @@ contract RandomSamplingStorage is INamed, IVersioned, IInitializable, ContractSt
     // pinned fields (`challengeLeafCount`, `challengeRoot`) so the persisted
     // tuple via `getNodeChallenge`/`setNodeChallenge` is wider; the migration
     // `clearOutstandingChallenges` admin path is added in WS-E.
-    string private constant _VERSION = "10.1.0";
+    // 10.2.0 — Audit G-3: new `nodeChallengeStakeSnapshot` mapping (+ a
+    // `nodeChallengeStakeSnapshotSet` present-flag and setter) records the node's
+    // effective stake at challenge creation so submitProof can score against
+    // min(snapshot, live), defeating within-period flash-stake spikes. The flag
+    // (not snapshot != 0) gates the cap so a zero-stake node is still capped at 0.
+    string private constant _VERSION = "10.2.0";
     uint8 public constant CHUNK_BYTE_SIZE = 32;
     Chronos public chronos;
 
@@ -93,6 +98,19 @@ contract RandomSamplingStorage is INamed, IVersioned, IInitializable, ContractSt
     // cursor into the new EpochIndex.lastScorePerStake36 stream.)
     mapping(uint256 => mapping(uint72 => mapping(bytes32 => uint256)))
         public delegatorLastSettledNodeEpochScorePerStake;
+
+    // ── Audit G-3 (10.2.0) — APPENDED after all pre-existing state so no slot of
+    //    the score/reward mappings above shifts (upgrade-safe layout).
+    // identityId => node effective stake snapshotted at challenge creation.
+    // submitProof scores against min(snapshot, live) so a within-period flash-stake
+    // cannot inflate the (sticky, whole-epoch) score. A value of 0 here is a VALID
+    // snapshot (a node with zero challenge-time stake is still capped at 0, not left
+    // uncapped) — presence is tracked by the explicit flag below, never by the value.
+    mapping(uint72 => uint256) public nodeChallengeStakeSnapshot;
+    // identityId => whether the CURRENT challenge has a stake snapshot recorded.
+    // Set by `setNodeChallengeStakeSnapshot` (only `createChallenge` calls it); an
+    // injected challenge via the privileged `setNodeChallenge` path has no snapshot.
+    mapping(uint72 => bool) public nodeChallengeStakeSnapshotSet;
 
     event W1Set(uint256 oldW1, uint256 newW1);
     event W2Set(uint256 oldW2, uint256 newW2);
@@ -392,6 +410,16 @@ contract RandomSamplingStorage is INamed, IVersioned, IInitializable, ContractSt
     ) external onlyContracts {
         nodesChallenges[identityId] = challenge;
         emit NodeChallengeSet(identityId, challenge);
+    }
+
+    /// @notice G-3 — snapshot the node's effective stake at challenge creation so
+    ///         submitProof can score against min(snapshot, live), defeating a
+    ///         within-period flash-stake spike. `createChallenge` always sets this;
+    ///         a 0 value (only reachable via the privileged setNodeChallenge path)
+    ///         means "no snapshot" and submitProof applies no cap.
+    function setNodeChallengeStakeSnapshot(uint72 identityId, uint256 stake18) external onlyContracts {
+        nodeChallengeStakeSnapshot[identityId] = stake18;
+        nodeChallengeStakeSnapshotSet[identityId] = true;
     }
 
     /// @notice OT-RFC-49 / WS-E migration — clear outstanding (unsolved) random-

@@ -44,7 +44,11 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
     //          with lazy settlement (settle-on-spend/-miss), a backfill-locked
     //          gate (ChallengeDrawPaused), and a per-draw active-CG check. The
     //          selection distribution is unchanged (seed parity preserved).
-    string private constant _VERSION = "10.3.0";
+    // 10.4.0 — Audit G-3: createChallenge snapshots the node's effective stake and
+    //          submitProof scores the node against min(snapshot, live) (numerator
+    //          only; score-per-stake denominator stays live), defeating a
+    //          within-period tier-0 flash-stake score-inflation.
+    string private constant _VERSION = "10.4.0";
     uint256 public constant SCALE18 = 1e18;
 
     /// @notice Maximum number of in-CG resamples when the picker hits an
@@ -244,6 +248,17 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
 
         // Store the new challenge in the storage contract
         randomSamplingStorage.setNodeChallenge(identityId, challenge);
+
+        // G-3: snapshot the node's effective stake at challenge time. submitProof
+        // scores against min(this snapshot, live), so a tier-0 (liquid) position
+        // flash-staked to the cap within the proof period cannot inflate the score
+        // unless it is held across the whole [createChallenge, submitProof] window.
+        uint40 snapshotTs = uint40(block.timestamp);
+        convictionStakingStorage.settleNodeTo(identityId, snapshotTs);
+        randomSamplingStorage.setNodeChallengeStakeSnapshot(
+            identityId,
+            convictionStakingStorage.getNodeRunningEffectiveStake(identityId)
+        );
     }
 
     /**
@@ -373,7 +388,27 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
         uint40 tsNow = uint40(block.timestamp);
         convictionStakingStorage.settleNodeTo(identityId, tsNow);
         uint256 effectiveNodeStake = convictionStakingStorage.getNodeRunningEffectiveStake(identityId);
-        uint256 score18 = _calculateNodeScore(identityId, effectiveNodeStake);
+        // G-3: score the NODE against min(challenge-time snapshot, live) so a
+        // within-period flash-stake spike can't inflate the (sticky, whole-epoch)
+        // node score. A spike held only for the proof block is ignored
+        // (snapshot < live); a genuine mid-period withdrawal still lowers it
+        // (live < snapshot). Presence is gated on the explicit `...Set` flag, NOT
+        // on snapshot != 0 — a node with zero challenge-time stake is still capped
+        // at 0 (cannot flash-bypass). The cap is skipped only for a challenge not
+        // issued via createChallenge (privileged setNodeChallenge injection).
+        // IMPORTANT: this cap applies ONLY to the score numerator. The
+        // score-per-stake DENOMINATOR below stays the LIVE effective stake so that
+        // delegator reward distribution remains exact — Σ(delegatorStake ·
+        // scorePerStake) == nodeScore. Capping the denominator too would inflate
+        // scorePerStake whenever live > snapshot and over-distribute rewards.
+        uint256 scoredStake = effectiveNodeStake;
+        if (randomSamplingStorage.nodeChallengeStakeSnapshotSet(identityId)) {
+            uint256 stakeSnapshot = randomSamplingStorage.nodeChallengeStakeSnapshot(identityId);
+            if (stakeSnapshot < scoredStake) {
+                scoredStake = stakeSnapshot;
+            }
+        }
+        uint256 score18 = _calculateNodeScore(identityId, scoredStake);
         randomSamplingStorage.addToNodeEpochProofPeriodScore(
             epoch,
             activeProofPeriodStartBlock,

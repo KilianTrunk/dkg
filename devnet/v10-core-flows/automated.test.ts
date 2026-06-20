@@ -461,7 +461,11 @@ describe('2. failed publish does not leak triples into verifiable-memory (RC11 /
       );
       lastVmStatus = vmQuery.status;
       lastVmBody = vmQuery.body;
-      lastVmBindings = vmQuery.body?.bindings ?? vmQuery.body?.results?.bindings ?? [];
+      // The daemon wraps results as { result: { bindings } } — read
+      // `body.result.bindings`. (Was `body.bindings`/`body.results.bindings`,
+      // both undefined here, so this leak guard silently saw zero rows and
+      // could never actually catch a verifiable-memory leak.)
+      lastVmBindings = vmQuery.body?.result?.bindings ?? [];
       if (lastVmBindings.length > 0) {
         leakSeen = true;
         break;
@@ -733,4 +737,79 @@ describe('4. operator-fee accrual + withdrawal', () => {
     const queuedAfter = await state.css.getOperatorFeeWithdrawalRequest(identityId);
     expect(queuedAfter.amount).toBe(0n);
   }, 600_000);
+});
+
+// ───────── 5. Addressed-read provenance (dkg_get_entity_sources, PR #1253) ─────────
+//
+// The `dkg_get_entity_sources` MCP tool answers "what is known about entity X,
+// and which Knowledge Asset asserted each fact?" — it reads
+// `SELECT ?p ?o ?g WHERE { GRAPH ?g { <X> ?p ?o } }` scoped to verifiable-memory
+// and parses the per-KA source graph `…/_verifiable_memory/{author}/{number}`
+// into the on-chain UAL identity a consumer cites/verifies against. The tool's
+// parsing/rendering is unit-tested with synthetic graphs; what ONLY a live
+// devnet can prove is that a REAL publish actually materialises that exact
+// per-KA source graph — i.e. the provenance handle the tool hands back resolves
+// to the publish's true on-chain (author, number).
+//
+// This pins that engine-layer contract end-to-end: publish an entity from a
+// core, read it back via the addressed-read shape, and assert the source graph
+// encodes the SAME (author, number) packed into the returned on-chain kaId
+// (reservedKaId = (uint160(author) << 96) | uint96(number) — the derivation the
+// publisher itself uses to build the VM graph URI, see dkg-publisher.ts:1553).
+describe('5. addressed-read provenance resolves to the per-KA verifiable-memory source', () => {
+  it("a published entity's facts carry a _verifiable_memory/{author}/{number} source matching its on-chain kaId", async () => {
+    const name = `core-flows-prov-${Date.now().toString(36)}`;
+    const subject = `urn:test:core-flows:${name}`; // fullPublish writes quads about this subject
+    const pub = await fullPublish(NODE1_API, state.node1Token, name);
+
+    // Reproduce the publisher's kaId → VM-graph derivation (dkg-publisher.ts:1553).
+    const kaId = BigInt(pub.kaId);
+    const author = '0x' + (kaId >> 96n).toString(16).padStart(40, '0');
+    const number = (kaId & ((1n << 96n) - 1n)).toString();
+    const expectedSource = `did:dkg:context-graph:${CONTEXT_GRAPH}/_verifiable_memory/${author}/${number}`;
+
+    // Addressed read: project the source graph per fact — the exact shape the
+    // tool issues. The daemon wraps results as { result: { bindings } }, so read
+    // `body.result.bindings` (NOT top-level `body.bindings`). Poll briefly so
+    // post-confirmation VM materialisation has time to land.
+    const val = (x: unknown): string =>
+      typeof x === 'string' ? x : ((x as { value?: string })?.value ?? '');
+    let bindings: Array<Record<string, unknown>> = [];
+    for (let attempt = 0; attempt < 15; attempt++) {
+      const r = await postJson(
+        NODE1_API,
+        '/api/query',
+        {
+          sparql: `SELECT ?p ?o ?g WHERE { GRAPH ?g { <${subject}> ?p ?o } }`,
+          contextGraphId: CONTEXT_GRAPH,
+          view: 'verifiable-memory',
+        },
+        state.node1Token,
+      );
+      bindings = r.body?.result?.bindings ?? [];
+      if (bindings.length > 0) break;
+      await sleep(1000);
+    }
+    expect(bindings.length, `no verifiable-memory rows for ${subject} after polling`).toBeGreaterThan(0);
+
+    const sources = [...new Set(bindings.map((b) => val(b.g)))];
+
+    // (1) The correct per-KA source IS present — the handle a consumer cites
+    // resolves to THIS publish's on-chain (author, number).
+    expect(
+      sources.map((s) => s.toLowerCase()),
+      `expected per-KA source ${expectedSource}; got [${sources.join(', ')}]`,
+    ).toContain(expectedSource.toLowerCase());
+
+    // (2) No per-KA-shaped source carries a DIFFERENT (author, number) — i.e.
+    // attribution is never fabricated/mismatched against the on-chain identity.
+    // (Root / per-collection graphs that don't match the per-KA shape are the
+    // tool's "disclosed, non-citable" rows and are intentionally skipped here.)
+    for (const s of sources) {
+      const m = s.match(/\/_verifiable_memory\/([^/]+)\/([^/]+)$/);
+      if (!m) continue;
+      expect(m[1].toLowerCase(), `source ${s}: author != on-chain ${author}`).toBe(author.toLowerCase());
+      expect(m[2], `source ${s}: kaNumber != on-chain ${number}`).toBe(number);
+    }
+  }, 120_000);
 });

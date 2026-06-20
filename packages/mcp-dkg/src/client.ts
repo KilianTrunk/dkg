@@ -61,7 +61,13 @@ export function normalizeContextGraphId(contextGraphIdOrUri: string): string {
   while (s.startsWith(CONTEXT_GRAPH_URI_PREFIX)) {
     s = s.slice(CONTEXT_GRAPH_URI_PREFIX.length);
   }
-  return s.replace(/\/+$/, '');
+  // Trim trailing slash(es) with a linear index walk, NOT `/\/+$/`: that
+  // regex is a polynomial-ReDoS on a string of many '/' (replace scans every
+  // start position and the `\/+` backtracks at each), and this id is
+  // caller/config input — CodeQL js/polynomial-redos flags it.
+  let end = s.length;
+  while (end > 0 && s.charCodeAt(end - 1) === 47 /* '/' */) end -= 1;
+  return s.slice(0, end);
 }
 
 function optionalContextGraphId(contextGraphIdOrUri: string | undefined): string | undefined {

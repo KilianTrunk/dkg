@@ -88,8 +88,9 @@ describe('@unit ConvictionStakingStorage', () => {
 
   it('Should have correct name and version', async () => {
     expect(await ConvictionStakingStorage.name()).to.equal('ConvictionStakingStorage');
-    // v10.0.5 — bucketed expiries + bounded per-node pending expiry slots.
-    expect(await ConvictionStakingStorage.version()).to.equal('10.0.5');
+    // v10.0.6 — one-shot delta boost accounting (audit G-6) on top of v10.0.5's
+    // bucketed expiries + bounded per-node pending expiry slots.
+    expect(await ConvictionStakingStorage.version()).to.equal('10.0.6');
   });
 
   // ------------------------------------------------------------
@@ -586,6 +587,66 @@ describe('@unit ConvictionStakingStorage', () => {
       expect(await ConvictionStakingStorage.getNodeRunningEffectiveStake(ALICE_ID)).to.equal(
         runningBefore,
       );
+    });
+
+    // ── Audit G-6 — one-shot delta accounting on the OTHER changed function.
+    //    increaseRaw/decreaseRaw install/remove a position's contribution as the
+    //    one-shot delta floor((oldRaw±amount)*m) - floor(oldRaw*m), so a compounded
+    //    boosted position's slot/running stake always equal the one-shot value and
+    //    the unwind is exact. (redelegate is covered by the integration regression;
+    //    relock/exit are post-expiry-gated and decreaseRaw has no production caller,
+    //    so this exercises the decreaseRaw change directly via the operator.)
+    it('G-6: a reward-compounded boosted position unwinds via decreaseRaw exactly (one-shot delta, no floor over-cancel)', async () => {
+      // Tier 6 = 3.5x (fractional). ODD raw + ODD compound so the per-piece floors
+      // would disagree with the one-shot floor by 1 wei (the audit-G-6 carry case).
+      const R0 = 100000n * 10n ** 18n + 1n; // odd
+      const rew = R0; // odd compound
+      const total = R0 + rew; // even ⇒ floor(total*k) is exact
+      const eff = (x: bigint) => (x * 35n) / 10n; // floor(x*3.5)
+      const boost = (x: bigint) => (x * 25n) / 10n; // floor(x*(3.5-1))
+
+      await ConvictionStakingStorage.createPosition(1, ALICE_ID, R0, 6, 0, 0);
+      const expiry = (await ConvictionStakingStorage.getPosition(1)).expiryTimestamp;
+
+      // Compound: increaseRaw installs the boost as the ONE-SHOT delta, so the slot
+      // and running stake hold floor(total*k) — 1 wei MORE than the pre-fix
+      // sum-of-floors floor(R0*k)+floor(rew*k).
+      await ConvictionStakingStorage.increaseRaw(1, rew);
+      expect(await ConvictionStakingStorage.getNodeRunningEffectiveStake(ALICE_ID)).to.equal(
+        eff(total),
+      );
+      expect(await ConvictionStakingStorage.getNodeExpiryDrop(ALICE_ID, expiry)).to.equal(
+        boost(total),
+      );
+
+      // Full decrease while still boosted: the one-shot delta removes exactly the
+      // installed contribution. Pre-fix decreaseRaw removed floor(total*k), 1 wei
+      // MORE than the sum-of-floors slot ⇒ "Neg running stake" / "Cancel > scheduled".
+      await expect(ConvictionStakingStorage.decreaseRaw(1, total)).to.not.be.reverted;
+      expect(await ConvictionStakingStorage.getNodeRunningEffectiveStake(ALICE_ID)).to.equal(0n);
+      expect(await ConvictionStakingStorage.getNodeExpiryDrop(ALICE_ID, expiry)).to.equal(0n);
+      expect((await ConvictionStakingStorage.getPosition(1)).raw).to.equal(0n);
+    });
+
+    // ── Audit G-6 — the `boostDelta != 0` skip in increaseRaw. On a near-1x tier a
+    //    small compound can floor the one-shot BOOST delta to 0 even though the raw
+    //    grew; _scheduleNodeExpiry rejects a zero drop, so increaseRaw must skip it.
+    it('G-6: increaseRaw skips a zero one-shot boost delta on a near-1x tier (no "Zero drop" revert)', async () => {
+      // Tier 1 = 1.5x ⇒ boost factor 0.5. oldRaw=2, amount=1:
+      //   one-shot boost delta = floor(3*0.5) - floor(2*0.5) = 1 - 1 = 0 ⇒ skip schedule.
+      //   one-shot eff   delta = floor(3*1.5) - floor(2*1.5) = 4 - 3 = 1 ⇒ running grows.
+      await ConvictionStakingStorage.createPosition(1, ALICE_ID, 2, 1, 0, 0);
+      const expiry = (await ConvictionStakingStorage.getPosition(1)).expiryTimestamp;
+      const slotBefore = await ConvictionStakingStorage.getNodeExpiryDrop(ALICE_ID, expiry);
+
+      // Pre-guard this called _scheduleNodeExpiry(.., 0) and reverted "Zero drop".
+      await expect(ConvictionStakingStorage.increaseRaw(1, 1)).to.not.be.reverted;
+
+      expect(await ConvictionStakingStorage.getNodeExpiryDrop(ALICE_ID, expiry)).to.equal(
+        slotBefore, // unchanged — the zero boost delta was skipped
+      );
+      expect(await ConvictionStakingStorage.getNodeRunningEffectiveStake(ALICE_ID)).to.equal(4n);
+      expect((await ConvictionStakingStorage.getPosition(1)).raw).to.equal(3n);
     });
   });
 

@@ -1533,6 +1533,51 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
       .withArgs(kaId, setup.creator.address, nonOwner.address);
   });
 
+  it('G-7: a paid update on a DEACTIVATED CG reverts CannotWriteValueToInactiveContextGraph (the _executeUpdateCore gate)', async () => {
+    // Companion to the extend-path regression in g7-inactive-cg-restrand.regression.test.ts:
+    // the update delta carries the same isContextGraphActive gate.
+    const setup = await setupRegisteredAgentPublish();
+    const p = await buildBasePublishParams(setup, 'g7-update-gate'); // publishes at 1000 TRAC
+    await (await KAV10.connect(setup.creator).publish(p)).wait();
+    const kaId = BigInt(p.reservedKaId);
+
+    // Deactivate the (public) CG — the inactive state sweepContextGraphEscrow
+    // produces — via the storage operator (onlyContracts seeder).
+    const storageOperator = accounts[19];
+    await HubContract.setContractAddress('TestStorageOperator', storageOperator.address);
+    await (await CGS.connect(storageOperator).deactivateContextGraph(setup.cgId)).wait();
+    expect(await CGS.isContextGraphActive(setup.cgId)).to.equal(false);
+
+    // Fund the creator so the paid-update consume can't be the thing that reverts.
+    await Token.mint(setup.creator.address, ethers.parseEther('10'));
+    await Token.connect(setup.creator).approve(await KAV10.getAddress(), ethers.parseEther('10'));
+
+    // A paid update (positive token delta) reaches _executeUpdateCore's value-write
+    // branch, now gated on isContextGraphActive — so it reverts instead of
+    // re-stranding sampling weight onto the retired CG.
+    const up = await buildUpdateParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes: setup.receivingNodes,
+      publisherIdentityId: setup.publisherIdentityId,
+      receiverIdentityIds: setup.receiverIdentityIds,
+      contextGraphId: setup.cgId,
+      id: kaId,
+      preUpdateMerkleRootCount: 1n,
+      newMerkleRoot: ethers.keccak256(ethers.toUtf8Bytes('g7-update-gate-new')),
+      newByteSize: 1000n,
+      newTokenAmount: ethers.parseEther('1001'), // > published 1000 => positive delta
+      mintKnowledgeAssetsAmount: 0n,
+      knowledgeAssetsToBurn: [],
+      updateOperationId: 'g7-update-gate-op',
+      author: setup.creator,
+    });
+    await expect(KAV10.connect(setup.creator).update(up)).to.be.revertedWithCustomError(
+      KAV10,
+      'CannotWriteValueToInactiveContextGraph',
+    );
+  });
+
   // --------------------------------------------------------------------------
   // 5. Protocol treasury fee split on the direct-spend path (v10.0.2)
   // --------------------------------------------------------------------------

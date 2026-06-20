@@ -58,6 +58,26 @@ const decoyMerkleRoot = ethers.keccak256(
 const catalogContent = ethers.toUtf8Bytes('r3-seam-catalog-content');
 const catalogRoot = ethers.keccak256(catalogContent);
 
+// ── CURATED catalog MULTI-leaf KA (Test G — F01 length binding) ──
+// Two PUBLIC catalog leaves ⇒ a 2-leaf V10MerkleTree (height 1). The honest
+// curated proof is NON-empty (length == height == 1, no private sibling), so this
+// exercises the `isCurated ? height : height+1` branch on the real contract — and
+// proves an empty/too-long proof now reverts. V10MerkleTree sorts leaves ascending
+// before pairing, so root = keccak256(sortedLow ‖ sortedHigh).
+const catalogLeaf0 = ethers.toUtf8Bytes('r3-seam-catalog-2leaf-0');
+const catalogLeaf1 = ethers.toUtf8Bytes('r3-seam-catalog-2leaf-1');
+const _ch0 = ethers.keccak256(catalogLeaf0);
+const _ch1 = ethers.keccak256(catalogLeaf1);
+const catalog2Sorted: [string, string] =
+  BigInt(_ch0) < BigInt(_ch1) ? [_ch0, _ch1] : [_ch1, _ch0];
+const catalog2ContentByHash: Record<string, Uint8Array> = {
+  [_ch0]: catalogLeaf0,
+  [_ch1]: catalogLeaf1,
+};
+const catalog2Root = ethers.keccak256(
+  ethers.concat([catalog2Sorted[0], catalog2Sorted[1]]),
+);
+
 // OT-RFC-49 / WS-B Trap 1 (proof-race, Test C2): a NEW catalog the curated KA
 // rotates to AFTER its challenge is issued. An honest proof built against the
 // PINNED issuance-time catalog (`catalogContent`) must still verify; a proof
@@ -353,6 +373,58 @@ describe('@integration RandomSampling submitProof + multi-store seam (R3)', () =
     return kaId;
   }
 
+  // Like seedCuratedKa but commits a 2-LEAF catalog (count=2) for the multi-leaf
+  // curated proof regression (Test G).
+  async function seedCuratedKaMultiLeaf(cgId: bigint): Promise<bigint> {
+    const currentEpoch = await Chronos.getCurrentEpoch();
+    const endEpoch = currentEpoch + 5n;
+    const receipt = await (
+      await DKGKnowledgeAssets.connect(opSigner).createKnowledgeAsset(
+        opSigner.address,
+        opSigner.address,
+        nextKaId(),
+        'seam-test-curated-2leaf',
+        decoyMerkleRoot,
+        1,
+        TEST_KA_BYTE_SIZE,
+        currentEpoch,
+        endEpoch,
+        0,
+        false,
+        1, // merkleLeafCount (decoy public count; curated path uses the catalog)
+      )
+    ).wait();
+    const iface = DKGKnowledgeAssets.interface;
+    const topic = iface.getEvent('KnowledgeAssetCreated')!.topicHash;
+    const log = receipt!.logs.find((l) => l.topics[0] === topic)!;
+    const kaId = iface.parseLog(
+      log as unknown as { topics: string[]; data: string },
+    )!.args[0] as bigint;
+
+    await (
+      await DKGKnowledgeAssets.connect(opSigner).setCatalogCommitment(
+        kaId,
+        catalog2Root,
+        2, // 2-leaf catalog ⇒ chunkId ∈ {0,1}, honest proof length == height == 1
+      )
+    ).wait();
+    await (
+      await ContextGraphStorage.connect(
+        opSigner,
+      ).registerKnowledgeAssetToContextGraph(cgId, kaId)
+    ).wait();
+    await (
+      await ContextGraphValueStorage.connect(opSigner).addCGValueForEpochRange(
+        cgId,
+        currentEpoch,
+        5n,
+        1_000n,
+      )
+    ).wait();
+    await (await CGWeightTreeStorage.connect(opSigner).settle(cgId)).wait();
+    return kaId;
+  }
+
   async function setupChallengingNode() {
     const node = { operational: accounts[2], admin: accounts[1] };
     const { identityId } = await createProfile(Profile, node);
@@ -631,5 +703,54 @@ describe('@integration RandomSampling submitProof + multi-store seam (R3)', () =
       node.identityId,
     );
     expect(solved.solved).to.equal(true);
+  });
+
+  it('Test G — curated multi-leaf: honest catalog proof verifies; empty/too-long proofs revert (F01 length binding)', async () => {
+    // The existing curated tests use a 1-leaf catalog (height 0 ⇒ empty proof is
+    // legitimately valid). This exercises the multi-leaf curated path on the REAL
+    // contract: a 2-leaf catalog (height 1) where the honest proof is NON-empty,
+    // so the `isCurated ? height : height+1` length split is verified and the
+    // root-preimage / empty-proof forgery surface is closed for curated too.
+    const cgId = await createCuratedCG();
+    await seedCuratedKaMultiLeaf(cgId);
+    const node = await setupChallengingNode();
+
+    await RandomSampling.updateAndGetActiveProofPeriodStartBlock();
+    await RandomSampling.connect(node.operational).createChallenge();
+    const challenge = await RandomSamplingStorage.getNodeChallenge(
+      node.identityId,
+    );
+    expect(challenge.isCurated).to.equal(true);
+    expect(challenge.challengeLeafCount).to.equal(2n);
+    expect(challenge.challengeRoot).to.equal(catalog2Root);
+
+    const chunkId = Number(challenge.chunkId); // 0 or 1
+    const leafHash = catalog2Sorted[chunkId];
+    const content = catalog2ContentByHash[leafHash];
+    const sibling = catalog2Sorted[1 - chunkId];
+
+    // Empty proof: length 0 != expected height(2) == 1 → revert.
+    await expect(
+      RandomSampling.connect(node.operational).submitProof(content, []),
+    ).to.be.reverted;
+    // Too-long proof: length 2 != 1 → revert.
+    await expect(
+      RandomSampling.connect(node.operational).submitProof(content, [
+        sibling,
+        ethers.ZeroHash,
+      ]),
+    ).to.be.reverted;
+    // Still unsolved after the failed attempts.
+    expect(
+      (await RandomSamplingStorage.getNodeChallenge(node.identityId)).solved,
+    ).to.equal(false);
+
+    // Honest curated proof (correct length == 1) verifies and marks solved.
+    await RandomSampling.connect(node.operational).submitProof(content, [
+      sibling,
+    ]);
+    expect(
+      (await RandomSamplingStorage.getNodeChallenge(node.identityId)).solved,
+    ).to.equal(true);
   });
 });

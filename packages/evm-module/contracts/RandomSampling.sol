@@ -627,7 +627,15 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
                 uint32 leafCount = cgIsCurated
                     ? knowledgeAssetStorage.getCatalogLeafCount(candidate)
                     : knowledgeAssetStorage.getMerkleLeafCount(candidate);
-                if (leafCount == 0) revert NoEligibleKnowledgeAsset();
+                // SECURITY FIX (F08): a non-curated KA with `merkleLeafCount == 0` (publishable —
+                // the publish path validates a non-zero root but not a non-zero leaf count) must be
+                // SKIPPED like the expired / curated-zero cases above, NOT hard-revert the whole
+                // draw. Reverting let anyone DoS proof-of-storage: a node whose seed landed on such
+                // a KA could never create a challenge for that period. `continue` resamples another
+                // KA; if all MAX_KA_RETRIES attempts miss, the loop returns `found == false` and the
+                // caller excludes this CG and re-draws (eventually `NoEligibleKnowledgeAsset` only if
+                // no eligible KA exists anywhere).
+                if (leafCount == 0) continue;
                 return (candidate, uint256(kaSeed) % uint256(leafCount), true);
             }
         }

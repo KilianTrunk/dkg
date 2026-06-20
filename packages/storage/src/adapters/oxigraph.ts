@@ -301,6 +301,16 @@ export class OxigraphStore implements TripleStore {
     return removed;
   }
 
+  /**
+   * Server-side SPARQL UPDATE — runs inside the embedded oxigraph engine, so
+   * graph-to-graph `INSERT…WHERE` copies keep terms byte-identical (no JS
+   * termToString→parseTerm round-trip). See {@link TripleStore.update}.
+   */
+  async update(sparql: string): Promise<void> {
+    this.store.update(sparql);
+    this.scheduleFlush();
+  }
+
   async countQuads(graphUri?: string): Promise<number> {
     if (graphUri) {
       return this.store.match(

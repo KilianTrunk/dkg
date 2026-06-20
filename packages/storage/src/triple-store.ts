@@ -73,6 +73,20 @@ export interface TripleStore {
 
   deleteBySubjectPrefix(graphUri: string, prefix: string): Promise<number>;
 
+  /**
+   * Run a SPARQL UPDATE (e.g. a server-side `INSERT { GRAPH dst {…} } WHERE
+   * { GRAPH src {…} }` graph-to-graph copy) entirely inside the backend, so
+   * terms NEVER get serialized to JS and re-parsed. This is required for any
+   * byte-stable copy: the `insert(quads)` path round-trips object terms through
+   * `termToString`→`parseTerm`, which doubles backslashes for literals bearing
+   * `\`/newline/quote/CR/tab and therefore changes the bytes a content-bound
+   * hash (e.g. RS proof leaves) is computed over. Optional: only the embedded
+   * `oxigraph` and the `oxigraph-server`/`sparql-http` adapters implement it;
+   * callers needing a byte-stable copy MUST guard on its presence and never
+   * fall back to `insert(quads)` for already-stored terms.
+   */
+  update?(sparql: string): Promise<void>;
+
   countQuads(graphUri?: string): Promise<number>;
 
   /**

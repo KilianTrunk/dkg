@@ -26,7 +26,7 @@ const CG_URI_PREFIX = 'did:dkg:context-graph:';
  * The publisher already refuses user-authored trustLevel triples via
  * `assertNoUserAuthoredTrustLevelQuads`, so excluding them here is safe.
  */
-const POST_PUBLISH_PREDICATES_TO_SKIP: ReadonlySet<string> = new Set([
+export const POST_PUBLISH_PREDICATES_TO_SKIP: ReadonlySet<string> = new Set([
   TRUST_LEVEL_PREDICATE,
   LEGACY_TRUST_LEVEL_PREDICATE,
 ]);

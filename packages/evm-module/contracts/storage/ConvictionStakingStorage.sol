@@ -1673,10 +1673,17 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     ///      and delegator-favorable. `0` (tier-0 / no expiry) passes through
     ///      unchanged so it is never queued.
     function _bucketExpiry(uint40 ts) internal pure returns (uint40) {
+        // slither-disable-start divide-before-multiply,incorrect-equality,timestamp
+        // Pure integer ceil-to-multiple. False positives: `ts == 0` is the
+        // tier-0 / no-expiry SENTINEL (not a time-dependent branch); the
+        // divide-then-multiply IS the round-up idiom (exact for integers — no
+        // precision loss, since the division floor is immediately re-scaled);
+        // and `ts` is an expiry VALUE, not `block.timestamp` (this fn is `pure`).
         if (ts == 0) return 0;
         uint256 bucketed = ((uint256(ts) + EXPIRY_BUCKET_SECONDS - 1) / EXPIRY_BUCKET_SECONDS) *
             EXPIRY_BUCKET_SECONDS;
         require(bucketed <= type(uint40).max, "Expiry overflow");
+        // slither-disable-end divide-before-multiply,incorrect-equality,timestamp
         return uint40(bucketed);
     }
 

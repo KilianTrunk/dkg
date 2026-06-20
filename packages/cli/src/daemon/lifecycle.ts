@@ -101,6 +101,7 @@ import {
   ensureDkgDir,
   TELEMETRY_ENDPOINTS,
   type DkgConfig,
+  type NetworkConfig,
   type AutoUpdateConfig,
   type LocalAgentIntegrationCapabilities,
   type LocalAgentIntegrationConfig,
@@ -124,6 +125,7 @@ import {
   slotEntryPoint,
   CLI_NPM_PACKAGE,
   exitOnStoreConfigErrors,
+  validateNetworkConfigReadiness,
 } from '../config.js';
 import { createPublicSnapshotStore, createPublisherControlFromStore, startPublisherRuntimeIfEnabled, type PublisherRuntime } from '../publisher-runner.js';
 import { createCatchupRunner, type CatchupJobResult, type CatchupRunner } from '../catchup-runner.js';
@@ -239,6 +241,7 @@ import {
   corsHeaders,
   HttpRateLimiter,
   InFlightLimiter,
+  type AdmissionStatsView,
   admitRequest,
   resolveIntSetting,
   applyServerLimits,
@@ -727,6 +730,30 @@ export function startPromoteWorkerDaemonLifecycle(input: {
   };
 }
 
+type StartupGenesisValidation =
+  | { ok: true; networkId: string }
+  | { ok: false; networkId: string; messages: string[] };
+
+type StartupGenesisValidationInput = Partial<Pick<NetworkConfig, '_status' | 'genesisId' | 'networkId' | 'networkName' | 'relays'>>;
+
+export async function validateStartupGenesis(
+  network: StartupGenesisValidationInput | null | undefined,
+): Promise<StartupGenesisValidation> {
+  const networkId = await computeNetworkId(network?.genesisId);
+  const readiness = validateNetworkConfigReadiness(network);
+  const messages = readiness.ok ? [] : [...readiness.messages];
+  if (network?.networkId && network.networkId !== networkId) {
+    messages.push(
+      `FATAL: genesis mismatch! Expected networkId ${network.networkId.slice(0, 16)}... but computed ${networkId.slice(0, 16)}...`,
+    );
+    messages.push(
+      `This node's genesis does not match ${network.networkName}. Rebuild or update the selected network config.`,
+    );
+  }
+  if (messages.length > 0) return { ok: false, networkId, messages };
+  return { ok: true, networkId };
+}
+
 export async function runDaemon(foreground: boolean): Promise<void> {
   await ensureDkgDir();
   const config = await loadConfig();
@@ -869,6 +896,12 @@ export async function runDaemonInner(
   }
 
   const network = await loadNetworkConfig();
+  const genesisValidation = await validateStartupGenesis(network);
+  const networkId = genesisValidation.networkId;
+  if (!genesisValidation.ok) {
+    for (const message of genesisValidation.messages) log(message);
+    process.exit(1);
+  }
   const syncContextGraphs = [
     ...new Set([
       ...resolveContextGraphs(config),
@@ -1225,6 +1258,7 @@ export async function runDaemonInner(
   const agent = await DKGAgent.create({
     kaNumberAllocator,
     name: config.name,
+    genesisId: network?.genesisId,
     framework: "DKG",
     listenPort: config.listenPort,
     dataDir: dkgDir(),
@@ -1390,21 +1424,11 @@ export async function runDaemonInner(
   let promoteWorkerLifecycle: PromoteWorkerDaemonLifecycle | null = null;
   let shuttingDown = false;
 
-  const networkId = await computeNetworkId();
   const publisherControl = createPublisherControlFromStore(
     agent.store,
     createPublicSnapshotStore(dkgDir(), config),
   );
   log(`Network: ${networkId.slice(0, 16)}...`);
-  if (network?.networkId && network.networkId !== networkId) {
-    log(
-      `FATAL: genesis mismatch! Expected networkId ${network.networkId.slice(0, 16)}... but computed ${networkId.slice(0, 16)}...`,
-    );
-    log(
-      `This node's genesis does not match network/testnet.json. Rebuild or update the repo.`,
-    );
-    process.exit(1);
-  }
   if (network) {
     log(
       `Network config: ${network.networkName} (genesis v${network.genesisVersion})`,
@@ -2711,6 +2735,22 @@ export async function runDaemonInner(
     { allowNonPositive: true },
   );
   const inFlightLimiter = new InFlightLimiter(maxInFlight);
+  // Read-only live view of the limiter's counters for the plugin-facing
+  // RequestContext / /api/status: only the three getters, never the mutating
+  // tryAcquire()/release(). The enforcement path (admitRequest, below) keeps the
+  // real limiter; route/plugin code can read shed stats but can't reach — even
+  // via a runtime cast — the methods that corrupt slot accounting.
+  const admissionStats: AdmissionStatsView = {
+    get inFlight() {
+      return inFlightLimiter.inFlight;
+    },
+    get max() {
+      return inFlightLimiter.max;
+    },
+    get rejectedTotal() {
+      return inFlightLimiter.rejectedTotal;
+    },
+  };
   // Throttle the "shedding" warning so a sustained burst can't spam the log,
   // while still letting operators see the limiter is active (per review).
   let lastShedLogAt = 0;
@@ -2917,6 +2957,7 @@ export async function runDaemonInner(
         apiHost,
         apiPortRef,
         routePlugins,
+        admissionStats,
         emitMemoryGraphChanged,
         emitNotification,
       );

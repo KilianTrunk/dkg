@@ -68,7 +68,10 @@ export function buildAssertionTools(ctx: DkgToolHost): OpenClawTool[] {
         'root and signs the EIP-712 AuthorAttestation. Finalize always seals the WHOLE draft (there is no ' +
         'subset parameter). A FULL share (dkg_knowledge_asset_share with entities omitted or "all") ' +
         'auto-seals for you, so you only need to call this explicitly before sharing a SELECTIVE subset of ' +
-        'entities, or to re-seal after editing a previously-sealed draft. (External-signer / pre-signed ' +
+        'entities, or to re-seal after editing a previously-sealed draft. Sealing works even if the context ' +
+        'graph is NOT yet registered on-chain (registration happens at publish). Pass layer:"swm" to seal an ' +
+        'asset already shared to SWM (e.g. shared with skip_seal) — it recovers and seals the SWM content ' +
+        'without a delete-and-recreate. (External-signer / pre-signed ' +
         'attestation is a tracked follow-up and is not exposed by this tool — author with author_agent_address.)',
       parameters: {
         type: 'object',
@@ -82,6 +85,14 @@ export function buildAssertionTools(ctx: DkgToolHost): OpenClawTool[] {
               'request token\'s agent.',
           },
           scheme_version: { type: 'integer', description: 'Optional attestation scheme version.' },
+          layer: {
+            type: 'string',
+            enum: ['wm', 'swm'],
+            description:
+              'Which layer holds the content to seal. Default "wm" seals the open Working Memory draft. ' +
+              'Pass "swm" to seal an asset already shared to SWM (recovers + seals the SWM content without ' +
+              'delete-and-recreate).',
+          },
           sub_graph_name: { type: 'string', description: 'Must match the one used at write time.' },
         },
         required: ['context_graph_id', 'name'],
@@ -92,16 +103,16 @@ export function buildAssertionTools(ctx: DkgToolHost): OpenClawTool[] {
       name: 'dkg_knowledge_asset_share',
       description:
         'Step 4 of the canonical flow. Share a knowledge asset (or selected root entities) from Working ' +
-        'Memory into Shared Working Memory. A FULL share (omit `entities` or pass "all") attempts a ' +
-        'best-effort auto-seal: when the seal SUCCEEDS the asset is publish-ready — follow it with ' +
-        'dkg_knowledge_asset_publish to mint the asset on-chain (Verifiable Memory). But on a ' +
-        'capability/signing gap (no local signing key / non-V10 adapter / unregistered CG) the auto-seal ' +
-        'is skipped and the asset is shared UNSEALED — a later dkg_knowledge_asset_publish then 409s ' +
-        'requiring an explicit finalize. For predictable publishing, call dkg_knowledge_asset_finalize ' +
-        'EXPLICITLY first (this is also required to carry custom finalize/attestation options — ' +
-        'author_agent_address / scheme_version — which the auto-seal cannot). A SELECTIVE subset ' +
+        'Memory into Shared Working Memory. A FULL share (omit `entities` or pass "all") SEALS BY DEFAULT ' +
+        'and is then publish-ready — follow it with dkg_knowledge_asset_publish to mint the asset on-chain ' +
+        '(Verifiable Memory). Pass skip_seal:true to share WITHOUT sealing (an unsealed SWM share — seal it ' +
+        'later with dkg_knowledge_asset_finalize, where layer:"swm" works after sharing). If a default ' +
+        '(sealing) share cannot seal it fails CLOSED (409, Working Memory preserved) and returns a recovery ' +
+        'hint. For custom finalize/attestation options — ' +
+        'author_agent_address / scheme_version — call dkg_knowledge_asset_finalize EXPLICITLY first (the ' +
+        'default seal cannot carry them). A SELECTIVE subset ' +
         '(`entities` set to a proper subset) shares ' +
-        'to SWM only for peer visibility, is NOT auto-sealed, and is NOT publishable to Verifiable Memory: ' +
+        'to SWM ONLY for peer visibility, is NOT sealed, and is NOT publishable to Verifiable Memory: ' +
         'dkg_knowledge_asset_publish reconstructs the seal\'s full root set and rejects a truncated SWM with ' +
         'a merkleRoot mismatch. To publish on-chain, share the full asset (or model the subset as its own ' +
         'knowledge asset).',
@@ -115,9 +126,15 @@ export function buildAssertionTools(ctx: DkgToolHost): OpenClawTool[] {
             items: { type: 'string', description: 'Root entity URI.' },
             description:
               'Root entities to share. Omit (or pass the string "all") to share every root entity (full share, ' +
-              'auto-seals + publish-ready). Provide a non-empty array of URIs that already exist in the asset to ' +
+              'seals by default + publish-ready). Provide a non-empty array of URIs that already exist in the asset to ' +
               'share a subset — a subset shares to SWM only and is NOT publishable to Verifiable Memory. The only ' +
               'accepted string value is "all".',
+          },
+          skip_seal: {
+            type: 'boolean',
+            description:
+              'Set true to share to SWM WITHOUT sealing (not publish-ready). Default (false) seals a full ' +
+              'share so it is immediately publish-ready. Ignored for a subset share, which is never sealed.',
           },
           sub_graph_name: { type: 'string', description: 'Must match the one used at write time.' },
         },
@@ -137,8 +154,9 @@ export function buildAssertionTools(ctx: DkgToolHost): OpenClawTool[] {
         'overrides. Prefer this over dkg_shared_memory_publish when publishing a single named asset; it is ' +
         'multi-root-safe and avoids the legacy single-root SWM constraint. Fails 409 if the asset is not yet ' +
         'finalized + shared (run dkg_knowledge_asset_finalize / dkg_knowledge_asset_share first). vm/publish ' +
-        'requires the context graph to be registered on-chain — set `register_if_needed: true` to register it ' +
-        'first (idempotent) before publishing.',
+        'AUTO-registers an unregistered context graph on-chain at gas/TRAC cost regardless of ' +
+        '`register_if_needed` (no explicit register step is needed). `register_if_needed: true` only lets you ' +
+        'choose the registration\'s access_policy first.',
       parameters: {
         type: 'object',
         properties: {
@@ -152,14 +170,16 @@ export function buildAssertionTools(ctx: DkgToolHost): OpenClawTool[] {
           register_if_needed: {
             type: 'boolean',
             description:
-              'If the context graph is not yet registered on-chain, register it first (idempotent), then publish. ' +
-              'Registration may spend gas/TRAC; it is opt-in. Default false — when false and the CG is ' +
-              'unregistered, publish fails with the daemon\'s not-registered error. CAVEAT: this uses the ' +
-              'explicit register route, which registers with the daemon\'s DEFAULT publishPolicy (derived from ' +
-              'access_policy) and does NOT preserve a context graph\'s stored custom publishPolicy / ' +
-              'contribution governance. For a CG created with a non-default publishPolicy/PCA, register it ' +
-              'explicitly with the desired policy first rather than relying on register_if_needed. (Read access ' +
-              'is unaffected; daemon-side rehydration tracked in OriginTrail/dkg#1085.)',
+              'Run an EXPLICIT on-chain registration before publishing, which lets you set access_policy on ' +
+              'that registration. NOTE: this does NOT gate whether registration happens — vm/publish ' +
+              'AUTO-registers an unregistered context graph at gas/TRAC cost regardless of this flag. Set it ' +
+              'only to choose the registration\'s access_policy (the implicit auto-register on publish ' +
+              'otherwise defaults the policy). CAVEAT: this explicit register route registers with the ' +
+              'daemon\'s DEFAULT publishPolicy (derived from access_policy) and does NOT preserve a context ' +
+              'graph\'s stored custom publishPolicy / contribution governance. For a CG created with a ' +
+              'non-default publishPolicy/PCA, register it explicitly with the desired policy first rather than ' +
+              'relying on register_if_needed. (Read access is unaffected; daemon-side rehydration tracked in ' +
+              'OriginTrail/dkg#1085.)',
           },
           access_policy: {
             type: 'number',

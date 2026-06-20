@@ -43,7 +43,9 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
     string private constant _NAME = "ContextGraphStorage";
     // 10.0.3 — KC→KA terminology: public getters renamed getContextGraphKCCount/At/List →
     //          getContextGraphKaCount/At/List (ABI selector change; no behavior change).
-    string private constant _VERSION = "10.0.3";
+    // 10.0.4 — OT-RFC-53: per-CG registration-escrow accounting (get/set/decrease/
+    //          clear) consumed by the deposit pull + admin sweep. ABI surface addition.
+    string private constant _VERSION = "10.0.4";
 
     // -----------------------------------------------------------------------
     // Bounds on participant list — anti-griefing cap.
@@ -98,6 +100,13 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
 
     // CG -> [KA IDs] forward list for uniform random KA selection within a CG.
     mapping(uint256 contextGraphId => uint256[]) private _contextGraphKAList;
+
+    // OT-RFC-53 — per-CG registration-deposit escrow (anti-spam). Accounting
+    // only: the TRAC itself is custodied in the CSS vault (mirrors
+    // PublishingConviction's committed-TRAC model). Set at on-chain CG
+    // creation, decremented as the owner spends it on publishing into the CG,
+    // cleared on an admin sweep to the staker reward pool.
+    mapping(uint256 contextGraphId => uint96) private _cgRegistrationEscrow;
 
     // -----------------------------------------------------------------------
     // Events
@@ -368,6 +377,41 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
         _requireExists(contextGraphId);
         _contextGraphs[contextGraphId].active = false;
         emit ContextGraphDeactivated(contextGraphId);
+    }
+
+    // -----------------------------------------------------------------------
+    // OT-RFC-53 — registration-deposit escrow accounting (onlyContracts).
+    //
+    // `ContextGraphs` writes the balance at on-chain creation and clears it on
+    // an admin sweep; `KnowledgeAssetsLifecycle` decrements it as the CG owner
+    // funds publishing from the escrow. The underlying TRAC lives in the CSS
+    // vault throughout — these functions only move the per-CG accounting.
+    // -----------------------------------------------------------------------
+
+    function getRegistrationEscrow(uint256 contextGraphId) external view returns (uint96) {
+        return _cgRegistrationEscrow[contextGraphId];
+    }
+
+    function setRegistrationEscrow(uint256 contextGraphId, uint96 amount) external onlyContracts {
+        _requireExists(contextGraphId);
+        _cgRegistrationEscrow[contextGraphId] = amount;
+    }
+
+    function decreaseRegistrationEscrow(uint256 contextGraphId, uint96 amount) external onlyContracts {
+        _requireExists(contextGraphId);
+        uint96 current = _cgRegistrationEscrow[contextGraphId];
+        if (amount > current) {
+            revert KnowledgeAssetsLib.InvalidContextGraphConfig("escrow underflow");
+        }
+        _cgRegistrationEscrow[contextGraphId] = current - amount;
+    }
+
+    function clearRegistrationEscrow(uint256 contextGraphId) external onlyContracts returns (uint96 cleared) {
+        _requireExists(contextGraphId);
+        cleared = _cgRegistrationEscrow[contextGraphId];
+        if (cleared != 0) {
+            _cgRegistrationEscrow[contextGraphId] = 0;
+        }
     }
 
     // -----------------------------------------------------------------------

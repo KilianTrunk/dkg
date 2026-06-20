@@ -114,6 +114,7 @@ export {
   computeNetworkId,
   getGenesisRaw,
   SYSTEM_CONTEXT_GRAPHS,
+  isAgentRegistryContextGraph,
   DKG_ONTOLOGY,
   type GenesisQuad,
 } from './genesis.js';

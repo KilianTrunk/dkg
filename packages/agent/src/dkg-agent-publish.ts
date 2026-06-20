@@ -393,6 +393,19 @@ import {
 import { DKGAgentBase } from './dkg-agent-base.js';
 import type { DKGAgent } from './dkg-agent.js';
 
+/**
+ * #1116 (round 11) — stable code tagged on the `assertionFinalize` throws that are
+ * recoverable SIGNING/CHAIN CAPABILITY GAPS (no local signing key, non-V10 chain
+ * adapter, KA-number reconcile read failure, no KaNumberAllocator) as opposed to
+ * VALIDATION/INTEGRITY errors (empty draft, reserved-only/unsafe content, preSigned
+ * mismatch, author-change, stale/corrupt seal). The seal-by-default `promote()`
+ * classifies on this code: a capability gap is wrapped as UNSEALED_SHARE_BLOCKED
+ * (with a "retry, or skipSeal:true" recovery hint); a validation error is rethrown
+ * with its original message so the caller sees the real input problem and bad
+ * content is NEVER pushed into SWM via skipSeal.
+ */
+export const SEAL_CAPABILITY_GAP_CODE = 'SEAL_CAPABILITY_GAP';
+
 export class PublishMethods extends DKGAgentBase {
   async publishWorkspaceGossip(this: DKGAgent,
     contextGraphId: string,
@@ -1219,7 +1232,6 @@ export class PublishMethods extends DKGAgentBase {
     const typedData = buildAuthorAttestationTypedData({
       chainId,
       kav10Address,
-      contextGraphId: BigInt(onChainId),
       merkleRoot: canonical.kcMerkleRoot,
       authorAddress,
       reservedKaId,
@@ -1275,12 +1287,15 @@ export class PublishMethods extends DKGAgentBase {
     // mints one here at the publish boundary using the publisher
     // fallback signer (legacy `agent.publish(quads)` callers don't
     // carry author identity hints — mode (a) of Phase 4: daemon signs
-    // as itself). The seal binds (chainId, kav10Address,
-    // contextGraphId, merkleRoot, authorAddress); any drift between
-    // the agent-computed merkleRoot and the publisher's recompute
-    // surfaces as the publisher's `expectedMerkleRoot mismatch`
-    // guard. Skip when the chain isn't V10-capable or the CG isn't
-    // on-chain — the publisher will go tentative anyway.
+    // as itself). The seal binds (chainId, kav10Address, merkleRoot,
+    // authorAddress, reservedKaId) — it is CG-independent (#1116); the
+    // CG is bound at publish via PublishParams.contextGraphId + the
+    // separate ACK digest, and the author-namespaced one-shot
+    // reservedKaId is the replay defense. Any drift between the
+    // agent-computed merkleRoot and the publisher's recompute surfaces
+    // as the publisher's `expectedMerkleRoot mismatch` guard. Skip when
+    // the chain isn't V10-capable or the CG isn't on-chain — the
+    // publisher will go tentative anyway.
     let precomputedAttestation: PublishOptions['precomputedAttestation'];
     if (
       onChainId != null &&
@@ -2114,7 +2129,6 @@ export class PublishMethods extends DKGAgentBase {
       const typedData = buildAuthorAttestationTypedData({
         chainId: existingSeal.chainId,
         kav10Address: existingSeal.kav10Address,
-        contextGraphId: await this.requireOnChainContextGraphId(contextGraphId),
         merkleRoot: existingSeal.merkleRoot,
         authorAddress: existingSeal.authorAddress,
         reservedKaId: reReservedKaId,
@@ -2141,16 +2155,26 @@ export class PublishMethods extends DKGAgentBase {
       typeof this.chain.getEvmChainId !== 'function' ||
       typeof this.chain.getKnowledgeAssetsLifecycleAddress !== 'function'
     ) {
-      throw new Error(
-        'assertionFinalize requires a V10-capable chain adapter that exposes ' +
-          'getEvmChainId() and getKnowledgeAssetsLifecycleAddress(); the current adapter does not.',
+      // #1116 (round 11) — CAPABILITY GAP (non-V10 chain adapter). Tagged with a
+      // stable code so the seal-by-default promote() can distinguish a recoverable
+      // capability gap (→ UNSEALED_SHARE_BLOCKED + skipSeal hint) from a validation
+      // error (which must propagate). See SEAL_CAPABILITY_GAP_CODE.
+      throw Object.assign(
+        new Error(
+          'assertionFinalize requires a V10-capable chain adapter that exposes ' +
+            'getEvmChainId() and getKnowledgeAssetsLifecycleAddress(); the current adapter does not.',
+        ),
+        { code: SEAL_CAPABILITY_GAP_CODE },
       );
     }
     const chainId = await this.chain.getEvmChainId();
     const kav10Address = await this.chain.getKnowledgeAssetsLifecycleAddress();
 
-    // 6. Resolve the on-chain CG id — the EIP-712 digest binds to it.
-    const onChainCgId = await this.requireOnChainContextGraphId(contextGraphId);
+    // 6. (removed, #1116) The seal is now context-graph-independent: the
+    //    EIP-712 AuthorAttestation no longer binds the on-chain CG id, so
+    //    finalize works on an UNREGISTERED CG and performs no chain write /
+    //    registration. CG binding happens at publish time (the contract's
+    //    PublishParams.contextGraphId + the separate ACK digest).
 
     // 7. Resolve author. preSigned > custodial agent > publisher fallback.
     const schemeVersion = opts?.schemeVersion ?? AUTHOR_SCHEME_VERSION_V1;
@@ -2175,8 +2199,12 @@ export class PublishMethods extends DKGAgentBase {
       }
       signerPrivateKey = this.getCustodialAgentPrivateKey(opts.authorAgentAddress);
       if (!signerPrivateKey) {
-        throw new Error(
-          `assertionFinalize: custodial agent ${opts.authorAgentAddress} has no private key on file`,
+        // #1116 (round 11) — CAPABILITY GAP (no local signing key for this agent).
+        throw Object.assign(
+          new Error(
+            `assertionFinalize: custodial agent ${opts.authorAgentAddress} has no private key on file`,
+          ),
+          { code: SEAL_CAPABILITY_GAP_CODE },
         );
       }
       authorAddress = opts.authorAgentAddress;
@@ -2186,9 +2214,13 @@ export class PublishMethods extends DKGAgentBase {
       // signs on its own behalf when no agent attribution is supplied.
       const fallbackAddress = await this.publisher.publisherFallbackAuthorAddress();
       if (!fallbackAddress) {
-        throw new Error(
-          'assertionFinalize: no agent override supplied and no publisher signer is available. ' +
-            'Either supply authorAgentAddress / preSignedAuthorAttestation, or configure a publisher private key on the daemon.',
+        // #1116 (round 11) — CAPABILITY GAP (no publisher signer configured).
+        throw Object.assign(
+          new Error(
+            'assertionFinalize: no agent override supplied and no publisher signer is available. ' +
+              'Either supply authorAgentAddress / preSignedAuthorAttestation, or configure a publisher private key on the daemon.',
+          ),
+          { code: SEAL_CAPABILITY_GAP_CODE },
         );
       }
       authorAddress = fallbackAddress;
@@ -2302,9 +2334,14 @@ export class PublishMethods extends DKGAgentBase {
           try {
             chainMax = await this.chain.getMaxKaNumberForAuthor(authorAddress);
           } catch (err) {
-            throw new Error(
-              `OT-RFC-43 A2: failed to reconcile KA-number floor for author ${authorAddress} at finalize: ` +
-                (err instanceof Error ? err.message : String(err)),
+            // #1116 (round 11) — CAPABILITY GAP (the chain read to reconcile the
+            // KA-number floor failed — a transient/RPC capability problem, not bad input).
+            throw Object.assign(
+              new Error(
+                `OT-RFC-43 A2: failed to reconcile KA-number floor for author ${authorAddress} at finalize: ` +
+                  (err instanceof Error ? err.message : String(err)),
+              ),
+              { code: SEAL_CAPABILITY_GAP_CODE },
             );
           }
         }
@@ -2325,14 +2362,20 @@ export class PublishMethods extends DKGAgentBase {
       // on-chain mint rejects it with KaIdNamespaceMismatch — the seal would be
       // signed and persisted but permanently unpublishable. Fail fast rather than
       // bind an unusable placeholder into the AuthorAttestation digest.
-      throw new Error(
-        `assertionFinalize: cannot reserve a kaId for author ${authorAddress} — ` +
-          `no preSignedAuthorAttestation (which would carry its own slot) and no ` +
-          `kaNumberAllocator is configured on this daemon (OT-RFC-43 §F2). The packed ` +
-          `kaId must be (uint160(author) << 96) | number; a 0n placeholder is rejected ` +
-          `on-chain (KaIdNamespaceMismatch), leaving the seal unpublishable. Configure a ` +
-          `KaNumberAllocator on the agent (daemon lifecycle) or supply a ` +
-          `preSignedAuthorAttestation whose reservedKaId lives in the author's namespace.`,
+      // #1116 (round 11) — CAPABILITY GAP (no kaNumberAllocator configured on this
+      // daemon — a node-config capability gap, resolvable by configuring one or
+      // supplying a preSigned slot; not a bad-input/validation error).
+      throw Object.assign(
+        new Error(
+          `assertionFinalize: cannot reserve a kaId for author ${authorAddress} — ` +
+            `no preSignedAuthorAttestation (which would carry its own slot) and no ` +
+            `kaNumberAllocator is configured on this daemon (OT-RFC-43 §F2). The packed ` +
+            `kaId must be (uint160(author) << 96) | number; a 0n placeholder is rejected ` +
+            `on-chain (KaIdNamespaceMismatch), leaving the seal unpublishable. Configure a ` +
+            `KaNumberAllocator on the agent (daemon lifecycle) or supply a ` +
+            `preSignedAuthorAttestation whose reservedKaId lives in the author's namespace.`,
+        ),
+        { code: SEAL_CAPABILITY_GAP_CODE },
       );
     }
 
@@ -2340,7 +2383,6 @@ export class PublishMethods extends DKGAgentBase {
     const typedData = buildAuthorAttestationTypedData({
       chainId,
       kav10Address,
-      contextGraphId: onChainCgId,
       merkleRoot,
       authorAddress,
       reservedKaId,
@@ -2472,30 +2514,6 @@ export class PublishMethods extends DKGAgentBase {
   }
 
   /**
-   * Helper: resolve the on-chain context graph id used by the EIP-712
-   * AuthorAttestation domain. Throws when the CG is not yet
-   * registered on-chain — finalize cannot bind a sig to a missing CG.
-   */
-  async requireOnChainContextGraphId(this: DKGAgent, contextGraphId: string): Promise<bigint> {
-    const onChainId = await this.getContextGraphOnChainId(contextGraphId);
-    if (onChainId == null) {
-      throw new Error(
-        `Context graph "${contextGraphId}" is not registered on-chain. ` +
-          `Run 'dkg context-graph register ${contextGraphId}' before finalizing an assertion ` +
-          `targeted at it; finalize binds the author signature to the on-chain CG id.`,
-      );
-    }
-    try {
-      return BigInt(onChainId);
-    } catch {
-      throw new Error(
-        `Context graph "${contextGraphId}" has a non-numeric on-chain id ("${onChainId}") — ` +
-          `the EIP-712 binding requires a uint256.`,
-      );
-    }
-  }
-
-  /**
    * RFC-001 §9.x — selection-based publish bridge.
    *
    * Mints a `precomputedAttestation` inline for a given quads bag,
@@ -2594,10 +2612,9 @@ export class PublishMethods extends DKGAgentBase {
 
     const chainId = await this.chain.getEvmChainId();
     const kav10Address = await this.chain.getKnowledgeAssetsLifecycleAddress();
-    const onChainCgId =
-      opts?.targetOnChainCgId !== undefined
-        ? BigInt(opts.targetOnChainCgId)
-        : await this.requireOnChainContextGraphId(contextGraphId);
+    // #1116: the AuthorAttestation no longer binds the on-chain CG id, so the
+    // selection-publish seal is also CG-independent. The CG the publisher mints
+    // into is resolved separately at publish time (targetOnChainCgId/v10CgId).
 
     const schemeVersion = opts?.schemeVersion ?? AUTHOR_SCHEME_VERSION_V1;
     let authorAddress: string;
@@ -2694,7 +2711,6 @@ export class PublishMethods extends DKGAgentBase {
     const typedData = buildAuthorAttestationTypedData({
       chainId,
       kav10Address,
-      contextGraphId: onChainCgId,
       merkleRoot,
       authorAddress,
       reservedKaId: selReservedKaId,
@@ -3222,6 +3238,57 @@ export class PublishMethods extends DKGAgentBase {
   }
 
   /**
+   * #1116 — transparent register-then-publish (OT-RFC-38 LU-6).
+   *
+   * The seal is now context-graph-independent, so `finalize` no longer
+   * registers the CG on-chain. Registration is therefore deferred to publish
+   * time: the FIRST VM publish of a CG implicitly registers it (the moment the
+   * user accepts the chain cost). Idempotent — `registerContextGraph`
+   * short-circuits when an on-chain id already exists, so re-publishes don't
+   * double-mint. Preserves create-time `publishPolicy`/PCA via the stored
+   * registration options. Throws on registration failure (insufficient TRAC /
+   * no signer) so the route can surface a clear 4xx.
+   *
+   * Mirrors the legacy bridge's auto-register block
+   * (`daemon/routes/memory.ts`); the canonical `/vm/publish` route calls this
+   * before `publishFromFinalizedAssertion`.
+   */
+  async ensureRegisteredForPublish(
+    this: DKGAgent,
+    contextGraphId: string,
+    opts?: { callerAgentAddress?: string },
+  ): Promise<void> {
+    const existingOnChainId = await this.getContextGraphOnChainId(contextGraphId);
+    if (existingOnChainId) return;
+    const storedOpts = await this.getStoredContextGraphRegistrationOptions(contextGraphId);
+    try {
+      await this.registerContextGraph(contextGraphId, {
+        ...(opts?.callerAgentAddress != null ? { callerAgentAddress: opts.callerAgentAddress } : {}),
+        ...(storedOpts.publishPolicy !== undefined ? { publishPolicy: storedOpts.publishPolicy } : {}),
+        ...(storedOpts.publishAuthorityAccountId !== undefined
+          ? { publishAuthorityAccountId: storedOpts.publishAuthorityAccountId }
+          : {}),
+      });
+    } catch (err: any) {
+      // #1116 (round 5) — check-then-act race. Two first-publishers of the same
+      // CG can both pass the `existingOnChainId` check, then one's
+      // registerContextGraph lands first; the loser throws "already registered
+      // on-chain". That's success, not failure — the CG IS registered. Confirm
+      // an on-chain id now exists (the winner's) and return; rethrow anything
+      // else (a genuine registration failure: insufficient TRAC / no signer).
+      // No double-mint: registerContextGraph itself short-circuits on a present
+      // id; this only swallows the benign concurrent-winner rejection.
+      if (
+        /already registered on-chain/i.test(err?.message ?? String(err)) &&
+        (await this.getContextGraphOnChainId(contextGraphId))
+      ) {
+        return;
+      }
+      throw err;
+    }
+  }
+
+  /**
    * RFC-001 §9.x — publish a previously-finalized assertion to the
    * verifiable-memory chain.
    *
@@ -3296,6 +3363,30 @@ export class PublishMethods extends DKGAgentBase {
             `is configured for KAv10=${liveKav10}. The signature is not valid against this deployment.`,
         );
       }
+    }
+
+    // #1116 (round 9, reviewer 🔴 #1/#2) — MARKER GATE. A valid seal is no longer
+    // SUFFICIENT to publish: it must be backed by a LIVE complete full share
+    // resident in SWM (the swmShareComplete marker). This closes the whole
+    // seal-staleness class at the consumer: a stale full seal that survived a
+    // subset re-share (subset never re-seals) or an already-consumed share
+    // (confirmed publish drains SWM + clears the marker, round 9 step 3) would
+    // otherwise be publishable via the merkle-still-matches path under the KA
+    // name. Placed AFTER the seal-read (so a genuinely-unfinalized asset still
+    // throws "is not finalized" — preserving that precondition) and BEFORE the
+    // create-vs-update routing + SWM gather, so it covers BOTH the MINT and UPDATE
+    // paths. A legitimate full-share publish has the marker (assertionPromote set
+    // it on the full share); an UPDATE re-publish re-sets it via the required
+    // re-promote (a confirmed publish drained SWM, so a re-publish MUST re-share).
+    if (!(await this.publisher.hasSwmShareComplete(contextGraphId, name, agentAddress, opts?.subGraphName))) {
+      throw Object.assign(
+        new Error(
+          `Cannot publish "${name}" in context graph "${contextGraphId}": it is not a complete full share ` +
+            `resident in Shared Memory (a subset/partial share, an explicitly-unsealed share, or an ` +
+            `already-consumed/published share). Seal and share the full asset (entities:"all") before publishing.`,
+        ),
+        { code: 'PUBLISH_NOT_FULL_SHARE' },
+      );
     }
 
     // Merge note (PR #1107 ← main): #1097's "auto-promote a sealed-but-unstaged
@@ -3462,6 +3553,26 @@ export class PublishMethods extends DKGAgentBase {
             `0n placeholder id would revert on-chain with KaIdNamespaceMismatch. ` +
             `Re-finalize the assertion (POST /api/knowledge-assets/${name}/wm/finalize) ` +
             `so the AuthorAttestation binds a valid packed kaId before publishing.`,
+        );
+      }
+      // #1116 (round 5) — no-data preflight BEFORE the inner publisher's
+      // CG-not-registered guard. `publishFromSharedMemory` checks registration
+      // (throws CG_NOT_REGISTERED) BEFORE its own no-quads check, so an
+      // UNregistered CG + valid seal + EMPTY sealed SWM would surface
+      // CG_NOT_REGISTERED first — the /vm/publish route then auto-registers
+      // (burning mint gas) and only the retry hits the no-quads 409. The legacy
+      // memory.ts publish path had a SWM preflight to avoid exactly this; mirror
+      // it here so the no-data precondition fires for ALL callers regardless of
+      // registration. Match the publisher's wording so the route's existing 409
+      // mapping (/No quads in shared memory/) still applies.
+      const sealedSwmQuads = await this._loadSelectedSWMQuads(
+        contextGraphId,
+        { rootEntities: seal.rootEntities },
+        opts?.subGraphName,
+      );
+      if (sealedSwmQuads.length === 0) {
+        throw new Error(
+          `No quads in shared memory for context graph ${contextGraphId} matching selection`,
         );
       }
       result = await this.publishFromSharedMemory(
@@ -3631,6 +3742,26 @@ export class PublishMethods extends DKGAgentBase {
         this.log.warn(
           opts?.operationCtx ?? createOperationContext('publishFromSWM'),
           `Failed to stamp VM lifecycle marker for <${lifecycleUri}>: ` +
+            (err instanceof Error ? err.message : String(err)),
+        );
+      }
+    }
+
+    // #1116 (round 9, reviewer 🔴 #2) — a CONFIRMED publish CONSUMES the SWM full
+    // share: the mint path (publishFromSharedMemory) and the update path both
+    // DRAIN the published roots from SWM after on-chain confirmation. The
+    // swmShareComplete marker asserts "a complete full share is resident in SWM",
+    // which no longer holds once SWM is drained. Clear it (best-effort, after the
+    // chain commit) so a post-publish finalize(layer:"swm") can't pass the gate
+    // against an empty SWM, and the next publish requires a fresh full share (which
+    // re-sets the marker via assertionPromote). Covers BOTH MINT and UPDATE.
+    if (result.status === 'confirmed') {
+      try {
+        await this.publisher.clearSwmShareComplete(contextGraphId, name, agentAddress, opts?.subGraphName);
+      } catch (err) {
+        this.log.warn(
+          opts?.operationCtx ?? createOperationContext('publishFromSWM'),
+          `Failed to clear swmShareComplete after confirmed publish of <${lifecycleUri}>: ` +
             (err instanceof Error ? err.message : String(err)),
         );
       }
@@ -3841,6 +3972,13 @@ export class PublishMethods extends DKGAgentBase {
    * Publish shared memory content: read from SWM graph and publish with full finality (data graph + chain).
    * After on-chain confirmation, broadcasts a lightweight FinalizationMessage so peers with matching
    * SWM state can promote it to canonical without re-downloading the full payload.
+   *
+   * #1116 (round 9) — INTENTIONALLY NOT marker-gated. This is the
+   * "publish an arbitrary caller-selected SWM slice" escape hatch (the legacy
+   * /api/shared-memory/publish path, #1087): it mints a FRESH inline seal over the
+   * selected slice rather than consuming a finalized named lifecycle, so the
+   * swmShareComplete full-share invariant does not apply. The marker gate lives on
+   * `publishFromFinalizedAssertion` (the named-lifecycle /vm/publish path) only.
    */
   async publishFromSharedMemory(this: DKGAgent,
     contextGraphId: string,

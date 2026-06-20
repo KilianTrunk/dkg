@@ -7,7 +7,7 @@ import { GraphManager, PrivateContentStore } from '@origintrail-official/dkg-sto
 import { DEFAULT_PUBLISH_EPOCHS, MAX_PUBLISH_EPOCHS, type Publisher, type PublishOptions, type PublishResult, type KAManifestEntry, type PhaseCallback, type V10CoreNodeACK } from './publisher.js';
 import { skolemizeByEntity } from './auto-partition.js';
 import { canonicalPublishPayload } from './canonical-publish-payload.js';
-import { partitionCatalogQuads, catalogCommittedLeaves, computeCatalogRoot, contextGraphCatalogUri } from '@origintrail-official/dkg-core';
+import { partitionCatalogQuads, catalogCommittedLeaves, computeCatalogRoot, contextGraphCatalogUri, isAgentRegistryContextGraph } from '@origintrail-official/dkg-core';
 import { RESERVED_SUBJECT_PREFIXES, findReservedSubjectPrefix, isReservedSubject } from './reserved-subjects.js';
 import { skolemize } from './skolemize.js';
 import {
@@ -27,6 +27,8 @@ import {
   generateAssertionPromotedMetadata,
   generateAssertionDiscardedMetadata,
   generateTentativeMetadata,
+  WM_CURRENT_ASSERTION_PRED,
+  SWM_CURRENT_ASSERTION_PRED,
   VM_CURRENT_ASSERTION_PRED,
   toHex,
   resolveUalByBatchId,
@@ -69,6 +71,12 @@ export {
 };
 
 const WORKSPACE_OWNER_PREDICATE = 'http://dkg.io/ontology/workspaceOwner';
+
+// #1116 (review A1) — marker predicate stamped on the lifecycle URN when a KA
+// has been FULLY shared to SWM (entities:"all", all roots landed). It gates
+// finalize(layer:"swm") so a subset share — which also stamps dkg:rootEntity
+// member rows — cannot be sealed-in-SWM and published as a partial asset.
+const SWM_SHARE_COMPLETE_PRED = 'http://dkg.io/ontology/swmShareComplete';
 
 async function listGraphFamily(store: TripleStore, rootGraph: string): Promise<string[]> {
   const graphs = await listGraphsByPrefix(store, `${rootGraph}/`);
@@ -1303,9 +1311,16 @@ export class DKGPublisher implements Publisher {
         const hasOnChainId = onChainResult.type === 'bindings' && onChainResult.bindings.length > 0;
 
         if (!hasOnChainId) {
-          throw new Error(
-            `Context graph "${contextGraphId}" is not registered on-chain. ` +
-            `Run 'dkg context-graph register ${contextGraphId}' first to enable Verifiable Memory publishing.`,
+          // #1116 (review B): carry a stable `code` so route matchers no longer
+          // have to key on the message text. The MESSAGE stays verbatim — the
+          // e2e test (rejects.toThrow(/not registered on-chain/i)) and back-compat
+          // route fallbacks still rely on it.
+          throw Object.assign(
+            new Error(
+              `Context graph "${contextGraphId}" is not registered on-chain. ` +
+              `Run 'dkg context-graph register ${contextGraphId}' first to enable Verifiable Memory publishing.`,
+            ),
+            { code: 'CG_NOT_REGISTERED' },
           );
         }
       }
@@ -2588,7 +2603,13 @@ export class DKGPublisher implements Publisher {
       // GH #1078 — persist private slices on this intentional-local terminal
       // branch too (a chainless / ownerOnly publish still finalizes here).
       await persistFinalizedPrivateSlices();
-      await this.store.insert(tentativeMeta);
+      // #1233 — the agents registry CG never confirms on-chain and its
+      // per-publish tentative `_meta` record has no consumer (agent facts are
+      // served from the DATA graph); persisting one per heartbeat would grow
+      // `agents/_meta` without bound and stall offset-0 sync. Skip it there.
+      if (!isAgentRegistryContextGraph(contextGraphId)) {
+        await this.store.insert(tentativeMeta);
+      }
       // B3: only now that the local publish has persisted do we refresh the
       // public catalog entry (CLEAR/REPLACE — see persistCatalogEntry).
       await persistCatalogEntry();
@@ -2670,10 +2691,12 @@ export class DKGPublisher implements Publisher {
       ) {
         const effectiveAuthorAddress = options.precomputedAttestation.authorAddress;
         const effectiveSchemeVersion = options.precomputedAttestation.schemeVersion;
+        // #1116: the seal is CG-independent — the AuthorAttestation no longer
+        // binds the on-chain CG id. v10CgId is still submitted to the contract
+        // (createKnowledgeAssets below) as the mint target / publisher-auth gate.
         const authorTypedData = buildAuthorAttestationTypedData({
           chainId: v10ChainId,
           kav10Address: v10KavAddress,
-          contextGraphId: v10CgId,
           merkleRoot: kcMerkleRoot,
           authorAddress: effectiveAuthorAddress,
           reservedKaId: options.precomputedAttestation.reservedKaId,
@@ -2773,10 +2796,12 @@ export class DKGPublisher implements Publisher {
         }
         const effectiveAuthorAddress = options.precomputedAttestation.authorAddress;
         const effectiveSchemeVersion = options.precomputedAttestation.schemeVersion;
+        // #1116: the seal is CG-independent — the AuthorAttestation no longer
+        // binds the on-chain CG id. v10CgId is still submitted to the contract
+        // (createKnowledgeAssets below) as the mint target / publisher-auth gate.
         const authorTypedData = buildAuthorAttestationTypedData({
           chainId: v10ChainId,
           kav10Address: v10KavAddress,
-          contextGraphId: v10CgId,
           merkleRoot: kcMerkleRoot,
           authorAddress: effectiveAuthorAddress,
           reservedKaId: options.precomputedAttestation.reservedKaId,
@@ -4532,6 +4557,147 @@ export class DKGPublisher implements Publisher {
     }
   }
 
+  /**
+   * #1116 — read an assertion's member root entities from the lifecycle URN,
+   * independent of any seal. `generateAssertionPromotedMetadata` stamps these
+   * (predicate dkg:rootEntity / dkg:entity) on EVERY promote — sealed or not —
+   * so this is the seal-independent source `pull-from swm` uses to reconstruct
+   * a WM draft for an asset that was shared unsealed (seal-in-SWM / recovery).
+   */
+  private async readPromotedRootEntities(
+    contextGraphId: string,
+    agentAddress: string,
+    name: string,
+    subGraphName?: string,
+  ): Promise<string[]> {
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    const lifecycleUri = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
+    const res = await this.store.query(
+      `SELECT DISTINCT ?root WHERE { GRAPH <${metaGraph}> { <${lifecycleUri}> ${ENTITY_PRED_ALT} ?root } }`,
+    );
+    if (res.type !== 'bindings') return [];
+    const roots: string[] = [];
+    for (const row of res.bindings) {
+      const root = row['root'];
+      if (typeof root === 'string' && root.length > 0) roots.push(root);
+    }
+    return roots;
+  }
+
+  /**
+   * #1116 (review A1) — SWM-share-complete marker.
+   *
+   * A FULL share (entities:"all", all roots actually landed in SWM) stamps a
+   * single boolean marker on the lifecycle URN. `finalize(layer:"swm")` gates
+   * on it so a SUBSET share — which also stamps `dkg:rootEntity` member rows,
+   * the source `readPromotedRootEntities` reads — can NOT be sealed-in-SWM and
+   * published as a partial asset under the KA name. Subset shares are SWM-only,
+   * never publishable; only a complete full share sets this marker, and a later
+   * subset / reduced-scope share CLEARS it (`clearSwmShareComplete`), so the marker
+   * always reflects whether the CURRENT shared state is a complete full share.
+   * Modelled on `readPromotedRootEntities` /
+   * `_stampSwmPointer`: same meta graph (`contextGraphMetaUri(cg)`) and subject
+   * (`assertionLifecycleUri(...)`).
+   */
+  async markSwmShareComplete(
+    contextGraphId: string,
+    name: string,
+    agentAddress: string,
+    subGraphName?: string,
+  ): Promise<void> {
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    const lifecycleUri = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
+    // Idempotent: drop any prior marker first, then insert exactly one.
+    await this.store.deleteByPattern({
+      graph: metaGraph,
+      subject: lifecycleUri,
+      predicate: SWM_SHARE_COMPLETE_PRED,
+    });
+    await this.store.insert([{
+      subject: lifecycleUri,
+      predicate: SWM_SHARE_COMPLETE_PRED,
+      object: '"true"',
+      graph: metaGraph,
+    }]);
+  }
+
+  /**
+   * #1116 (review A1, round 5) — CLEAR the SWM-share-complete marker.
+   *
+   * `markSwmShareComplete` only ever SET the marker (so a benign full-share
+   * recreate-retry never lost it), but that left two holes: a marked
+   * full-share that was later DISCARDED, or RE-shared as a strict SUBSET, kept
+   * a stale marker — letting `finalize(layer:"swm")` (and the seal-less
+   * pull-from source) publish a partial asset under the KA name. We now clear
+   * the marker at exactly the two moments scope is genuinely reduced: on
+   * `assertionDiscard`, and on a subset share (promote's non-full branch). It
+   * survives a full-share recreate-retry because A2_PRESERVE re-arms it and the
+   * full-share path re-stamps it — it is only cleared when scope actually drops.
+   */
+  async clearSwmShareComplete(
+    contextGraphId: string,
+    name: string,
+    agentAddress: string,
+    subGraphName?: string,
+  ): Promise<void> {
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    const lifecycleUri = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
+    await this.store.deleteByPattern({
+      graph: metaGraph,
+      subject: lifecycleUri,
+      predicate: SWM_SHARE_COMPLETE_PRED,
+    });
+  }
+
+  /** #1116 (review A1) — ASK whether the SWM-share-complete marker is present. */
+  async hasSwmShareComplete(
+    contextGraphId: string,
+    name: string,
+    agentAddress: string,
+    subGraphName?: string,
+  ): Promise<boolean> {
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    const lifecycleUri = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
+    const res = await this.store.query(
+      `ASK { GRAPH <${metaGraph}> { <${lifecycleUri}> <${SWM_SHARE_COMPLETE_PRED}> ?o } }`,
+    );
+    return res.type === 'boolean' && res.value;
+  }
+
+  /**
+   * #1116 (round 7) — delete the assertion SEAL (all ASSERTION_SEAL_PREDICATES)
+   * for this KA, under BOTH the name-keyed assertion URI and the numbered WM
+   * graph URI (the seal lives under one or the other, pre/post-mint). The seal
+   * lives on a DIFFERENT subject than the lifecycle URN, so the create/discard
+   * clean-slates that key on the lifecycle URN don't reach it.
+   *
+   * Callers: `assertionDiscard` (drops the seal when a non-published draft is
+   * discarded) and `assertionPullFrom` (re-opens a draft for editing, so the
+   * stale seal must go — it is rebuilt at the next finalize with the same
+   * reservedKaId via assertionCreate's A2 carry-over).
+   *
+   * NOTE (#1116 round 8+): finalize(layer="swm") does NOT pre-clear the seal.
+   * The SWM pull resolves scope from the marker-gated promoted member rows —
+   * never `seal.rootEntities` — and `assertionPullFrom` does its own seal
+   * teardown only AFTER validating a non-empty source, which keeps the operation
+   * atomic-on-failure (a failed pull no longer strands a previously-valid seal).
+   */
+  async clearAssertionSeal(
+    contextGraphId: string,
+    name: string,
+    agentAddress: string,
+    subGraphName?: string,
+  ): Promise<void> {
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    const nameKeyed = contextGraphAssertionUri(contextGraphId, agentAddress, name, subGraphName);
+    const wmGraph = await this.wmGraphUri(contextGraphId, agentAddress, name, subGraphName);
+    for (const sealSubj of new Set([nameKeyed, wmGraph])) {
+      for (const pred of Object.values(ASSERTION_SEAL_PREDICATES)) {
+        await this.store.deleteByPattern({ graph: metaGraph, subject: sealSubj, predicate: pred });
+      }
+    }
+  }
+
   // ── Working Memory Assertion Operations (spec §6) ───────────────────
 
   private static validateOptionalSubGraph(subGraphName: string | undefined): void {
@@ -4734,6 +4900,22 @@ export class DKGPublisher implements Publisher {
       `${A2_DKG}swmCurrentAssertion`,
       `${A2_DKG}vmCurrentAssertion`,
       'http://www.w3.org/ns/prov#wasRevisionOf',
+      // #1116: the promote-stamped member rows (dkg:rootEntity / dkg:entity) are
+      // the SEAL-INDEPENDENT recovery source readPromotedRootEntities uses. Pull-from
+      // (the seal-in-SWM reconstruction path) MUST preserve them across this
+      // clean-slate, otherwise a finalize that fails AFTER the re-seed would leave
+      // the asset with neither a seal nor the member rows — stranding the very asset
+      // seal-in-SWM exists to rescue (a non-atomic recovery). Keeping them makes
+      // finalize layer=swm safely retryable.
+      `${A2_DKG}rootEntity`,
+      `${A2_DKG}entity`,
+      // #1116 (review A1): the full-SWM-share marker that gates finalize(layer:"swm").
+      // pull-from's clean-slate (the seal-in-SWM reconstruction) MUST preserve it,
+      // or a finalize that fails after the re-seed would strip the marker and make
+      // the already-fully-shared asset un-sealable — the inverse of the bug it guards.
+      // Round 6 — use the shared SWM_SHARE_COMPLETE_PRED constant (the same one
+      // mark/clear/has use) so a future rename can't silently break preservation.
+      SWM_SHARE_COMPLETE_PRED,
     ]);
     const lifecycleSubject = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
     const metaGraph = contextGraphMetaUri(contextGraphId);
@@ -4921,16 +5103,56 @@ export class DKGPublisher implements Publisher {
       );
       seal = parseAssertionSealQuads(sealRes.type === 'quads' ? sealRes.quads : [], wmGraph);
     }
-    if (!seal) {
-      throw new Error(
-        `No sealed entity list for "${name}" in context graph "${contextGraphId}" — pull-from `
-        + `requires a finalized assertion (its seal records the member entities).`,
-      );
+    // #1116: a seal is no longer required to pull from SWM. When the asset was
+    // shared UNSEALED (a `skipSeal` share, or an asset stuck unsealed under the
+    // old auto-finalize-swallow behavior), fall back to the member entities
+    // stamped on the lifecycle URN by every promote
+    // (`generateAssertionPromotedMetadata`, predicate dkg:rootEntity) — recorded
+    // independent of any seal. This is what lets seal-in-SWM (finalize
+    // layer=swm) and recovery reconstruct the WM draft without first finalizing.
+    // VM pulls still require the seal (VM content is keyed by the published
+    // roots, which only the seal records).
+    // #1116 (review A1, rounds 5/7/8) — the SWM reconstruction is the ROOT of the
+    // subset-publishability bypass, and the guard MUST live here at the single
+    // publisher chokepoint so EVERY caller is covered (the finalize(layer:"swm")
+    // wrapper AND the direct wm/pull-from route + a plain finalize).
+    //
+    // Crucially, an SWM pull must NEVER trust the seal's rootEntities for scope:
+    // a stale FULL seal survives a SUBSET re-share (a subset share never
+    // re-seals, and `create` without a discard does not clear the seal — it lives
+    // on the name-keyed assertion URI, outside the lifecycle-URN clean-slate). If
+    // we read that stale seal it would short-circuit the subset gate below and let
+    // the direct route reconstruct + publish a superseded/partial asset under the
+    // KA name (round-8 live repro). So for SWM we ALWAYS resolve from the
+    // promote-stamped member rows, gated on the full-share completeness marker —
+    // the seal is rebuilt at the next finalize anyway (and torn down below). VM
+    // pulls still use the seal (VM content is keyed by the published roots, which
+    // only the seal records).
+    let entities: string[];
+    if (sourceLayer === 'swm') {
+      const promotedRoots = await this.readPromotedRootEntities(contextGraphId, agentAddress, name, subGraphName);
+      if (promotedRoots.length > 0) {
+        const fullyShared = await this.hasSwmShareComplete(contextGraphId, name, agentAddress, subGraphName);
+        if (!fullyShared) {
+          throw Object.assign(
+            new Error(
+              `"${name}" in context graph "${contextGraphId}" was only shared to SWM as a SUBSET — `
+              + `reconstructing or sealing it would publish a partial asset under the KA name. `
+              + `Share the full asset (entities:"all") before sealing in SWM.`,
+            ),
+            { code: 'SWM_SUBSET_NOT_SEALABLE' },
+          );
+        }
+      }
+      entities = promotedRoots;
+    } else {
+      entities = seal?.rootEntities ?? [];
     }
-    const entities = seal.rootEntities;
     if (entities.length === 0) {
       throw new Error(
-        `Sealed assertion "${name}" in context graph "${contextGraphId}" records no member entities; nothing to pull.`,
+        `No member entities for "${name}" in context graph "${contextGraphId}" — pull-from `
+        + `requires either a finalized assertion (its seal records the members) or a prior `
+        + `promote to SWM (which stamps the members on the lifecycle record). Found neither.`,
       );
     }
 
@@ -4991,12 +5213,11 @@ export class DKGPublisher implements Publisher {
     // "already finalized with a different merkleRoot" and the edit loop was
     // permanently wedged. Pull-from re-opens the draft for editing, so the
     // stale seal MUST go (it is rebuilt — same reservedKaId, preserved by
-    // assertionCreate's A2 carry-over — at the next finalize).
-    for (const sealSubj of new Set([sealSubject, wmGraph])) {
-      for (const pred of Object.values(ASSERTION_SEAL_PREDICATES)) {
-        await this.store.deleteByPattern({ graph: metaGraph, subject: sealSubj, predicate: pred });
-      }
-    }
+    // assertionCreate's A2 carry-over — at the next finalize). Reuse the single
+    // clearAssertionSeal helper so the seal subject/predicate set has one source
+    // of truth (sealSubject == the helper's name-keyed assertion URI; wmGraph is
+    // re-resolved identically).
+    await this.clearAssertionSeal(contextGraphId, name, agentAddress, subGraphName);
     await this.assertionWrite(contextGraphId, name, agentAddress, gathered, subGraphName);
     return { seeded: gathered.length, fromLayer: sourceLayer, entities: entities.length };
   }
@@ -5018,10 +5239,29 @@ export class DKGPublisher implements Publisher {
        */
       confirmBeforeCommit?: (message: Uint8Array) => Promise<{ applied: boolean; rejected?: boolean }>;
     },
-  ): Promise<{ promotedCount: number; gossipMessage?: Uint8Array }> {
+  ): Promise<{ promotedCount: number; gossipMessage?: Uint8Array; promotedAllRoots: boolean }> {
     await this.ensureSubGraphRegistered(contextGraphId, opts?.subGraphName);
     const graphUri = await this.wmGraphUri(contextGraphId, agentAddress, name, opts?.subGraphName);
     const swmGraphUri = await this.swmGraphUri(contextGraphId, agentAddress, name, opts?.subGraphName);
+
+    // #1116 (round 10) — the swmShareComplete marker MUST be maintained on EVERY
+    // return path of assertionPromote, not just the success tail. A non-full share
+    // (subset/partial/foreign-skipped) that filters to ZERO promotable quads (the
+    // early returns below) would otherwise leave a STALE marker from a prior full
+    // share, letting finalize(layer:"swm")/publish pass their gate against the OLD
+    // SWM contents. `promotingAllEntities` is hoisted here so every exit can
+    // compute the correct scope; `maintainMarker(isFull)` is called before each
+    // return with `isFull = promotingAllEntities && promotedAllRoots` for that path.
+    // (Member-row REPLACE stays at the success path — it only matters when quads
+    // are actually promoted; the MARKER is the cross-cutting invariant.)
+    const promotingAllEntities = !opts?.entities || opts.entities === 'all';
+    const maintainMarker = async (isFullCompletePromote: boolean): Promise<void> => {
+      if (isFullCompletePromote) {
+        await this.markSwmShareComplete(contextGraphId, name, agentAddress, opts?.subGraphName);
+      } else {
+        await this.clearSwmShareComplete(contextGraphId, name, agentAddress, opts?.subGraphName);
+      }
+    };
 
     const result = await this.store.query(
       `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <${graphUri}> { ?s ?p ?o } }`,
@@ -5049,7 +5289,12 @@ export class DKGPublisher implements Publisher {
       // `assertionCreate` are not consulted: they fire for empty-write
       // flows where promoting nothing is legitimate.
       await this.assertAssertionDataPersisted(contextGraphId, graphUri);
-      return { promotedCount: 0 };
+      // No roots to promote ⇒ none were foreign-skipped. promotedAllRoots:true ⇒
+      // isFull == promotingAllEntities (a subset of an empty draft still CLEARS a
+      // stale marker; a full empty share SETS it — harmless, finalize finds no
+      // members). Maintain the marker before returning (round 10).
+      await maintainMarker(promotingAllEntities);
+      return { promotedCount: 0, promotedAllRoots: true };
     }
 
     let quadsToPromote = result.quads;
@@ -5126,7 +5371,16 @@ export class DKGPublisher implements Publisher {
       );
     }
 
-    if (quadsToPromote.length === 0) return { promotedCount: 0 };
+    // Nothing left after the reserved-subject / selective-entity filters ⇒
+    // no roots were foreign-skipped. round 10 (reviewer 🔴): a SUBSET share whose
+    // selection matched ZERO current quads reaches here — it MUST clear a stale
+    // full-share marker (isFull == promotingAllEntities, which is false for a
+    // subset) before returning, else finalize(layer:"swm") passes its gate against
+    // the OLD SWM contents.
+    if (quadsToPromote.length === 0) {
+      await maintainMarker(promotingAllEntities);
+      return { promotedCount: 0, promotedAllRoots: true };
+    }
 
     const operationId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -5263,8 +5517,22 @@ export class DKGPublisher implements Publisher {
       ? normalizedQuads.filter(q => !skippedRoots.has(q.subject) && !skippedRoots.has(q.subject.split('/.well-known/genid/')[0]))
       : normalizedQuads;
 
+    // #1116 FIX 1 — did this promote cover the FULL requested/sealed root set?
+    // A FULL share seals ALL of `rootEntities`, but the advisory ownership skip
+    // above can promote only `effectiveRoots`. When any root is foreign-skipped
+    // the SWM copy is missing part of the sealed set, so the seal exists but the
+    // asset is NOT publish-ready (publishFromFinalizedAssertion would recompute a
+    // different merkleRoot over the partial SWM slice and fail the seal guard).
+    // The agent's promote() threads this into `publishReady`.
+    const promotedAllRoots = skippedRoots.size === 0;
+
     if (effectiveRoots.length === 0) {
-      return { promotedCount: 0 };
+      // Every requested root was foreign-skipped — nothing promoted, and the
+      // sealed set is definitively not fully present in SWM. promotedAllRoots is
+      // false here (skippedRoots.size > 0), so isFull is false ⇒ CLEAR the marker
+      // (round 10): a fully-foreign-skipped share is never a complete full share.
+      await maintainMarker(promotingAllEntities && promotedAllRoots);
+      return { promotedCount: 0, promotedAllRoots };
     }
 
     // Delete-then-insert for existing SWM entities (upsert), matching
@@ -5310,6 +5578,32 @@ export class DKGPublisher implements Publisher {
     // carried by the seal's `dkg:assertionRootEntity`/`dkg:assertionEntity`
     // rows and the lifecycle record's member-entity stamps.
 
+    // #1116 (round 7) — REPLACE (not append) the lifecycle-URN member rows on a
+    // FULL-COMPLETE share. `generateAssertionPromotedMetadata` only INSERTs the
+    // member rows (its delete set never removes prior ones — metadata.ts), so a
+    // full {A,C} → discard → recreate → full {A,B} cycle (or a no-discard full
+    // re-share) accumulates the stale UNION {A,B,C}. The seal-less SWM
+    // reconstruction (readPromotedRootEntities) then seals a stale SUPERSET. When
+    // this promote is the AUTHORITATIVE current full set (entities:"all" AND no
+    // foreign root skipped — exactly the markSwmShareComplete condition), the rows
+    // must end up as EXACTLY the just-promoted roots. Clear the prior member rows
+    // for the lifecycle URN here, then stamp the current ones below.
+    //
+    // A SUBSET / partial promote is intentionally NOT replaced: it shares only some
+    // roots, the marker is cleared (round 6) so readPromotedRootEntities output is
+    // gated-out, and over-deleting could drop a still-valid member. The audit
+    // confirmed no reader needs the cumulative historical union; all read the
+    // CURRENT set, so REPLACE-on-full is strictly more correct.
+    // `promotingAllEntities` is hoisted to the top of the method (round 10) so the
+    // early-return marker maintenance can use it; reuse it here.
+    const isFullCompletePromote = promotingAllEntities && promotedAllRoots;
+    if (isFullCompletePromote) {
+      const lifecycleSubject = assertionLifecycleUri(contextGraphId, agentAddress, name, opts?.subGraphName);
+      const promoteMetaGraph = contextGraphMetaUri(contextGraphId);
+      await this.store.deleteByPattern({ graph: promoteMetaGraph, subject: lifecycleSubject, predicate: DKG_ROOT_ENTITY_LEGACY });
+      await this.store.deleteByPattern({ graph: promoteMetaGraph, subject: lifecycleSubject, predicate: DKG_ENTITY });
+    }
+
     // Update assertion lifecycle record in _meta: created → promoted
     const promotedKaNumber = await this.resolveKaNumber(contextGraphId, agentAddress, name, opts?.subGraphName);
     const promoted = generateAssertionPromotedMetadata({
@@ -5324,6 +5618,16 @@ export class DKGPublisher implements Publisher {
     }, { provenanceEvents: this.provenanceEvents });
     await this.store.delete(promoted.delete);
     await this.store.insert(promoted.insert);
+
+    // #1116 (round 9/10) — CO-LOCATE the swmShareComplete marker with the
+    // member-row REPLACE above, at the single publisher chokepoint, via the same
+    // `maintainMarker` helper every early-return uses. The marker and the member
+    // rows MUST stay in lockstep: the marker says "the member rows describe a
+    // complete full share". A FULL-COMPLETE promote (entities:"all" + no foreign
+    // root skipped) SETS it; any other promote (subset/foreign-skipped) CLEARS it.
+    // Doing it in the publisher (not the agent wrapper) keeps the invariant for
+    // EVERY caller of the public assertionPromote — no desync on a direct caller.
+    await maintainMarker(isFullCompletePromote);
 
     // Write WorkspaceOperation metadata + ownership quads, mirroring what
     // _shareImpl and the remote SharedMemoryHandler both produce, so the
@@ -5367,7 +5671,7 @@ export class DKGPublisher implements Publisher {
       }
     }
 
-    return { promotedCount: swmQuads.length, gossipMessage };
+    return { promotedCount: swmQuads.length, gossipMessage, promotedAllRoots };
   }
 
   async assertionDiscard(contextGraphId: string, name: string, agentAddress: string, subGraphName?: string): Promise<void> {
@@ -5433,7 +5737,105 @@ export class DKGPublisher implements Publisher {
 
     const metaGraph = contextGraphMetaUri(contextGraphId);
     await this.store.deleteByPattern({ subject: graphUri, graph: metaGraph });
+    // #1116 (review A1, round 5) — drop the SWM-share-complete marker too. A
+    // marker survives discard via A2_PRESERVE on recreate, so a full-share →
+    // discard → recreate → subset-share cycle would otherwise leave a stale
+    // marker and let finalize(layer:"swm") publish the subset as the full KA.
+    // Clearing on discard re-arms the gate: the next share must re-prove
+    // completeness (a full share re-stamps it; a subset never sets it).
+    //
+    // #1116 (round 9) — ASYMMETRY (verified sound): the marker is cleared
+    // UNconditionally here, but the seal + member rows only when !hasVmVersion
+    // below. This is consistent: a confirmed publish already cleared the marker
+    // (round 9 step 3), so a published KA (hasVmVersion) has NO marker at discard
+    // and the unconditional clear is a no-op for it; its seal + rows are preserved
+    // (they back the on-chain state / receipt lookups). There is no state where the
+    // marker's absence misleads a consumer about a surviving seal: the marker gates
+    // "publishable full share", and a published KA is correctly NOT re-publishable
+    // as a fresh full share (its seal is the published one, used only for VM ops).
+    await this.store.deleteByPattern({
+      graph: metaGraph,
+      subject: lifecycleSubject,
+      predicate: SWM_SHARE_COMPLETE_PRED,
+    });
+    // #1116 (round 7) — CLEAR the lifecycle-URN member rows (dkg:rootEntity /
+    // dkg:entity) too. They are the seal-less SWM-reconstruction source and they
+    // SURVIVE a discard+recreate via A2_PRESERVE; without clearing them, a
+    // discarded asset's stale members are carried into the recreated draft and a
+    // later full skipSeal re-share would seal the stale UNION (the round-7 bug).
+    // ONLY clear when the KA has no confirmed VM version: a draft-discard of an
+    // already-PUBLISHED KA (hasVmVersion) preserves the on-chain state, and its
+    // members back the receipt lookups — leave them (the next full publish
+    // REPLACEs them with the current set anyway). A SWM-only / never-published
+    // asset has no membership once discarded.
+    if (!hasVmVersion) {
+      await this.store.deleteByPattern({ graph: metaGraph, subject: lifecycleSubject, predicate: DKG_ROOT_ENTITY_LEGACY });
+      await this.store.deleteByPattern({ graph: metaGraph, subject: lifecycleSubject, predicate: DKG_ENTITY });
+      // #1116 (round 7) — CLEAR the assertion SEAL too, via the single
+      // `clearAssertionSeal` helper (one source of truth for the seal
+      // subject/predicate set — a critical lifecycle invariant). The seal is keyed
+      // by the name-keyed assertion URI / numbered WM URI, a DIFFERENT subject than
+      // the lifecycle URN the `_meta` cleanup above deletes — so a seal from a prior
+      // FULL share would SURVIVE discard and, since pull-from reads
+      // `seal.rootEntities` first, drive a discard → recreate → re-share →
+      // seal-in-SWM reconstruction from the STALE roots. A discarded
+      // (non-published) asset must leave NO seal.
+      await this.clearAssertionSeal(contextGraphId, name, agentAddress, subGraphName);
+    }
     await this.store.dropGraph(graphUri);
+  }
+
+  /**
+   * #1116 — clear the Working-Memory draft DATA graph for an assertion plus the
+   * now-stale WM lifecycle pointer, leaving the seal + SWM/VM state intact. Used
+   * by the seal-in-SWM flow (finalize layer=swm) to drop the transient WM draft
+   * it reconstructed from SWM, so the asset ends up resident PURELY in SWM (with
+   * its fresh seal) instead of duplicated across WM+SWM. This mirrors
+   * `assertionDiscard`'s data-graph teardown but does NOT stamp a "discarded"
+   * lifecycle event.
+   *
+   * Two `_meta` clean-ups happen here:
+   *   1. Rows keyed by the WM DATA-graph URI (the memoryLayer pointer etc.).
+   *   2. #1116 FIX 2 — the `dkg:wmCurrentAssertion` pointer on the LIFECYCLE URN.
+   *      `assertionFinalize` stamped it when it sealed the reconstructed WM draft,
+   *      but once that draft is dropped the WM data no longer exists; without
+   *      removing the pointer `agent.assertion.history()` / status APIs keep
+   *      reporting a sealed WM draft ("wm-sealed") that is gone. We only clear it
+   *      when `dkg:swmCurrentAssertion` IS present on the lifecycle URN — i.e. the
+   *      content is genuinely SWM-resident — so the status flips to "swm-shared"
+   *      (SWM-resident), consistent with the dropped WM data.
+   *
+   * Deliberately UNtouched: the seal (keyed by the assertion URI), `dkg:rootEntity`,
+   * `dkg:kaId`, and `dkg:swmCurrentAssertion`/`dkg:vmCurrentAssertion`.
+   */
+  async clearWmDraftDataGraph(
+    contextGraphId: string,
+    name: string,
+    agentAddress: string,
+    subGraphName?: string,
+  ): Promise<void> {
+    DKGPublisher.validateOptionalSubGraph(subGraphName);
+    const graphUri = await this.wmGraphUri(contextGraphId, agentAddress, name, subGraphName);
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    await this.store.deleteByPattern({ subject: graphUri, graph: metaGraph });
+    await this.store.dropGraph(graphUri);
+
+    // #1116 FIX 2 — retire the stale WM lifecycle pointer once the WM draft is
+    // gone, but only for SWM-resident content (swmCurrentAssertion set). The WM
+    // pointer lives on the lifecycle URN, a DIFFERENT subject than the WM data
+    // graph cleared above, so the deleteByPattern there never reaches it.
+    const lifecycleUri = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
+    const swmPointerRes = await this.store.query(
+      `ASK { GRAPH <${metaGraph}> { <${lifecycleUri}> <${SWM_CURRENT_ASSERTION_PRED}> ?swm } }`,
+    );
+    const isSwmResident = swmPointerRes.type === 'boolean' && swmPointerRes.value === true;
+    if (isSwmResident) {
+      await this.store.deleteByPattern({
+        subject: lifecycleUri,
+        predicate: WM_CURRENT_ASSERTION_PRED,
+        graph: metaGraph,
+      });
+    }
   }
 
   private async resolveKaUal(kaId: bigint): Promise<string> {

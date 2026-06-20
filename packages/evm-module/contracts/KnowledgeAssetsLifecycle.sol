@@ -128,9 +128,12 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     // underfunded-active case.
     // 2.0.0 → 2.0.1 (PATCH): protocol treasury fee skimmed inside
     // `_addTokens` (publisher pays the same gross amount; the fee is taken
-    // out of the staker-bound net). Patch-level on purpose — the EIP-712
-    // author-attestation domain version (`_EIP712_VERSION_HASH`) MUST stay
-    // pinned at "2.0.0" so previously signed attestations keep verifying.
+    // out of the staker-bound net). Patch-level on purpose.
+    // #1116: the EIP-712 author-attestation domain version
+    // (`_EIP712_VERSION_HASH`) is bumped "2.0.0" → "3.0.0" — a DELIBERATE
+    // breaking change for the context-graph-independent author attestation
+    // (the `contextGraphId` struct field was removed). Pre-cutover
+    // attestations no longer verify (acceptable pre-mainnet, no backcompat).
     // 10.1.0 — OT-RFC-49 catalog model + ACK domain separation (see
     //          `ACK_DIGEST_VERSION` below).
     // 10.1.1 — OT-RFC-51 "Publishing Allocation": realized publishing no
@@ -145,7 +148,16 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     //          CGWeightTreeStorage so the value-weighted challenge draw sees fresh
     //          weights. No ACK / attestation change — PATCH bump keeps the EIP-712
     //          domain (major.minor "10.1") stable.
-    string private constant _VERSION = "10.1.2";
+    // 10.1.3 — OT-RFC-53: CG registration-deposit consume wired into
+    //          publish / update / extend (escrow-funded portion drawn from the CSS
+    //          vault; wallet/PCA covers the remainder). PATCH bump — no ACK /
+    //          EIP-712 domain change.
+    // 10.1.4 — OT-RFC-53: the escrow-funded portion now pays the protocol treasury
+    //          fee at consume, at parity with the wallet path's `_addTokens` — net
+    //          distributed to stakers, fee routed out of the CSS vault to the
+    //          treasury via `_chargeEscrowTreasuryFee`. Supersedes 10.1.3's
+    //          gross-for-gross distribution. PATCH bump — no ACK / EIP-712 change.
+    string private constant _VERSION = "10.1.4";
 
     /// @notice OT-RFC-49 / WS-B Trap 3: domain-separation version prepended to the
     ///         RAW publish/update ACK preimage (`abi.encodePacked`, later wrapped by
@@ -359,7 +371,14 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     error InvalidAuthorSignature1271();
 
     /// @dev RFC-001 §3.2 — EIP-712 type hash for `AuthorAttestation`.
-    /// `keccak256("AuthorAttestation(uint256 contextGraphId,bytes32 merkleRoot,address authorAddress,uint8 schemeVersion,uint256 reservedKaId)")`.
+    /// `keccak256("AuthorAttestation(bytes32 merkleRoot,address authorAddress,uint8 schemeVersion,uint256 reservedKaId)")`.
+    /// @dev #1116: the seal is now CONTEXT-GRAPH-INDEPENDENT — `contextGraphId`
+    ///      was removed from the author attestation so an assertion can be
+    ///      finalized (sealed) BEFORE its CG is registered on-chain. The CG is
+    ///      still bound to the publication via `PublishParams.contextGraphId`
+    ///      (mint target / `isAuthorizedPublisher` / KA→CG registration) and the
+    ///      separate ACK digest — just not by the author signature. The domain
+    ///      version (`_EIP712_VERSION_HASH`) is bumped to 3.0.0 for the cutover.
     /// @dev OT-RFC-43 Option-1 (variant 1a): `reservedKaId` is bound into the
     ///      author attestation so the author signs the *slot* (the packed
     ///      `(author << 96) | number`) as well as the content. Without it a
@@ -370,7 +389,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     ///      which already binds `kaId`.
     bytes32 private constant _AUTHOR_ATTESTATION_TYPEHASH =
         keccak256(
-            "AuthorAttestation(uint256 contextGraphId,bytes32 merkleRoot,address authorAddress,uint8 schemeVersion,uint256 reservedKaId)"
+            "AuthorAttestation(bytes32 merkleRoot,address authorAddress,uint8 schemeVersion,uint256 reservedKaId)"
         );
 
     bytes32 private constant _UPDATE_AUTHOR_ATTESTATION_TYPEHASH =
@@ -390,11 +409,13 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     ///      the digest and must update both sites.
     bytes32 private constant _EIP712_NAME_HASH = keccak256(bytes("KnowledgeAssetsLifecycle"));
 
-    /// @dev `version` hash for the EIP-712 domain. Bound to the major.minor
-    ///      portion of `_VERSION` ("10.1") so off-chain signers can pin the
-    ///      attestation to the contract semantic version. Patch bumps do not
-    ///      change this — only major.minor changes do.
-    bytes32 private constant _EIP712_VERSION_HASH = keccak256(bytes("2.0.0"));
+    /// @dev `version` hash for the EIP-712 domain — must match the off-chain
+    ///      attestation builder (`AUTHOR_ATTESTATION_DOMAIN_VERSION`). #1116:
+    ///      bumped 2.0.0 → 3.0.0 for the CONTEXT-GRAPH-INDEPENDENT author
+    ///      attestation cutover (the `contextGraphId` struct field was removed),
+    ///      which deliberately invalidates any pre-cutover attestation. Patch
+    ///      bumps do not change this — only a deliberate breaking change does.
+    bytes32 private constant _EIP712_VERSION_HASH = keccak256(bytes("3.0.0"));
 
     /// @dev Magic value returned by EIP-1271-compliant smart wallets on a
     ///      successful signature check. `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
@@ -421,6 +442,9 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     ///      invariant was violated. Update cannot proceed without knowing
     ///      the CG because the CG value ledger needs the target cgId.
     error MissingContextGraphBinding(uint256 kaId);
+
+    /// @notice OT-RFC-53: CG registration escrow spent to fund publishing.
+    event RegistrationEscrowConsumed(uint256 indexed contextGraphId, uint96 amount);
 
     constructor(address hubAddress) ContractStatus(hubAddress) {}
 
@@ -529,6 +553,18 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         uint40 currentEpoch;
         (currentEpoch, kaId) = _executePublishCore(p);
 
+        // OT-RFC-53: spend the CG owner's prepaid registration escrow first
+        // (no-op for third-party publishers into an open CG, or when the CG has no
+        // escrow). The net (after the treasury fee) is distributed here over the
+        // publish window; the wallet covers the remainder below.
+        (uint96 netEscrow, uint96 walletCost) = _consumeEscrowNet(p.contextGraphId, p.tokenAmount);
+        if (netEscrow > 0) {
+            _distributeTokens(netEscrow, p.epochs, currentEpoch);
+        }
+        if (walletCost == 0) {
+            return kaId;
+        }
+
         // PCA branch eligibility:
         //   (1) `msg.sender` is registered as an agent on a PCA,
         //   (2) the PCA is NOT past its expiry timestamp,
@@ -562,7 +598,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         // through here instead of reverting. See {_coverViaConvictionOrFallThrough}.
         if (useConviction) {
             useConviction = _coverViaConvictionOrFallThrough(
-                p.tokenAmount,
+                walletCost,
                 currentEpoch,
                 uint40(p.epochs)
             );
@@ -580,7 +616,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
             // `publisherNodeIdentityId` is still recorded on the publish
             // struct as a self-claimed attribution field, but it is no
             // longer crediting any node's K_n.
-            uint96 netTokenAmount = _addTokens(p.tokenAmount);
+            uint96 netTokenAmount = _addTokens(walletCost);
             _distributeTokens(netTokenAmount, p.epochs, currentEpoch);
         }
 
@@ -877,38 +913,41 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         kas.setTokenAmount(id, oldTokenAmount + tokenAmount);
 
         _validateTokenAmount(byteSize, epochs, tokenAmount, false);
-        // Pull gross from the publisher first, then distribute only the net
-        // (post-treasury-fee) amount into the staker reward pool. The CG-value
-        // write below stays on the gross `tokenAmount` so random-sampling
-        // weight tracks the publisher's full committed value.
-        uint96 netTokenAmount = _addTokens(tokenAmount);
-        epochStorage.addTokensToEpochRange(1, endEpoch, endEpoch + epochs, netTokenAmount);
 
-        // Phase 1+8 cross-phase fix: extending a KA's lifetime adds value to
-        // the CG it belongs to, so the CG's value-weighted random-sampling
-        // contribution must grow accordingly. Without this write the CG would
-        // undercount extended KAs at challenge selection time.
-        //
-        // V10 KAs always have a CG binding (Phase 7 invariant). Legacy V8 KAs
-        // — created before atomic CG bind landed — return cgId == 0; in that
-        // case we skip the CG value write so the V8 lifetime-extension path
-        // keeps working unchanged.
-        if (epochs > 0 && tokenAmount > 0) {
-            uint256 cgId = contextGraphStorage.kaToContextGraph(id);
-            if (cgId != 0) {
-                // Pin the diff over the EXTENSION window only, starting at
-                // the (old) endEpoch — the original publish window already
-                // wrote its own diff at publish time and that contribution
-                // retracts at the original endEpoch as designed.
-                contextGraphValueStorage.addCGValueForEpochRange(
-                    cgId,
-                    uint256(endEpoch),
-                    uint256(epochs),
-                    uint256(tokenAmount)
-                );
-                // settle-on-spend: reconcile the BIT weight leaf to the new ledger truth.
-                cgWeightTreeStorage.settle(cgId);
-            }
+        // V10 KCs always have a CG binding (Phase 7 invariant); legacy V8 KCs
+        // return cgId == 0 and skip both the escrow draw and the CG-value write.
+        uint256 cgId = contextGraphStorage.kaToContextGraph(id);
+
+        // OT-RFC-53: spend the CG owner's prepaid registration escrow first. The net
+        // (after the treasury fee) is distributed over the extension window; the
+        // wallet covers the remainder. The CG-value write below stays on the GROSS
+        // `tokenAmount` regardless of payment source, so random-sampling weight
+        // tracks the publisher's full committed value.
+        (uint96 netEscrow, uint96 walletCost) = _consumeEscrowNet(cgId, tokenAmount);
+        if (netEscrow > 0) {
+            epochStorage.addTokensToEpochRange(1, endEpoch, endEpoch + epochs, netEscrow);
+        }
+        if (walletCost > 0) {
+            // Pull gross from the publisher, distribute net into the pool.
+            uint96 netTokenAmount = _addTokens(walletCost);
+            epochStorage.addTokensToEpochRange(1, endEpoch, endEpoch + epochs, netTokenAmount);
+        }
+
+        // Phase 1+8 cross-phase fix: extending a KC's lifetime grows the CG's
+        // value-weighted random-sampling contribution. Pin the diff over the
+        // EXTENSION window only, starting at the (old) endEpoch — the original
+        // publish window already wrote its diff that retracts at the original
+        // endEpoch as designed.
+        if (epochs > 0 && tokenAmount > 0 && cgId != 0) {
+            contextGraphValueStorage.addCGValueForEpochRange(
+                cgId,
+                uint256(endEpoch),
+                uint256(epochs),
+                uint256(tokenAmount)
+            );
+            // settle-on-spend (merged from main): reconcile the BIT weight leaf
+            // to the new ledger truth after the extension value write.
+            cgWeightTreeStorage.settle(cgId);
         }
     }
 
@@ -989,16 +1028,21 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
      *
      * Domain pins (chainId, verifyingContract) to defeat cross-chain and
      * cross-deployment replay. The struct hash binds the publication's
-     * (contextGraphId, merkleRoot) to a specific (authorAddress,
-     * schemeVersion) — leaked signatures cannot be redirected to a different
-     * CG, a different content root, or a different author identity.
+     * `merkleRoot` to a specific (authorAddress, schemeVersion, reservedKaId)
+     * — leaked signatures cannot be redirected to a different content root, a
+     * different author identity, or a different KA id/slot.
      *
-     * One-shot consumption of `(contextGraphId, merkleRoot)` at the
-     * `DKGKnowledgeAssets` layer is the temporal replay defense; no
-     * `signedAtBlock` window is included in the digest (see RFC-001 §3.2).
+     * The seal is intentionally context-graph-independent (#1116): an
+     * assertion can be sealed before its CG is registered on-chain. CG
+     * binding happens at publish via `PublishParams.contextGraphId` plus the
+     * separate ACK digest, not by this author signature.
+     *
+     * Replay defense is the one-shot consumption of the author-namespaced
+     * `reservedKaId` (the packed `(uint160(author) << 96) | uint96(number)`
+     * slot) at the `DKGKnowledgeAssets` layer; no `signedAtBlock` window is
+     * included in the digest (see RFC-001 §3.2).
      */
     function _hashAuthorAttestation(
-        uint256 _contextGraphId,
         bytes32 _merkleRoot,
         address _authorAddress,
         uint8 _schemeVersion,
@@ -1016,7 +1060,6 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         bytes32 structHash = keccak256(
             abi.encode(
                 _AUTHOR_ATTESTATION_TYPEHASH,
-                _contextGraphId,
                 _merkleRoot,
                 _authorAddress,
                 _schemeVersion,
@@ -1110,7 +1153,6 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         if (p.authorSchemeVersion != 1) revert UnsupportedAuthorScheme(p.authorSchemeVersion);
 
         bytes32 digest = _hashAuthorAttestation(
-            p.contextGraphId,
             p.merkleRoot,
             p.authorAddress,
             p.authorSchemeVersion,
@@ -1252,6 +1294,38 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         }
     }
 
+    /// @dev OT-RFC-53: applies the protocol treasury fee to an escrow-funded spend.
+    ///      The registration deposit is escrowed GROSS in the CSS vault, so when
+    ///      escrow funds a publish/update/extend the treasury fee owed on the
+    ///      consumed portion is routed out of the vault to the treasury here —
+    ///      mirroring `_addTokens` for the wallet path, so escrow-funded publishing
+    ///      is NOT a treasury-fee loophole. Returns the net (escrow − fee) for the
+    ///      caller to distribute to the staker pool. No-op (returns `fromEscrow`)
+    ///      while the treasury is unset or the fee is 0 (`_treasuryFee` returns 0).
+    function _chargeEscrowTreasuryFee(uint96 fromEscrow) internal returns (uint96 net) {
+        (uint96 fee, address treasury) = _treasuryFee(fromEscrow);
+        net = fromEscrow - fee;
+        if (fee > 0 && treasury != address(0)) {
+            convictionStakingStorage.transferRegistrationDepositFee(treasury, fee);
+        }
+    }
+
+    /// @dev OT-RFC-53: consume the CG owner's prepaid escrow for `amount` and charge
+    ///      the treasury fee on the consumed portion — the SHARED escrow accounting
+    ///      for publish / extend / update (kept in one place so fee/escrow changes
+    ///      stay in sync). Returns the NET escrow (after fee) for the caller to
+    ///      distribute over its own window, plus the wallet remainder still owed.
+    ///      No-op (0 net, full `walletRemainder`) when the CG has no escrow or the
+    ///      caller isn't the owner (`_useCgEscrow` returns 0).
+    function _consumeEscrowNet(uint256 contextGraphId, uint96 amount)
+        internal
+        returns (uint96 netEscrow, uint96 walletRemainder)
+    {
+        uint96 fromEscrow = _useCgEscrow(contextGraphId, amount);
+        netEscrow = fromEscrow > 0 ? _chargeEscrowTreasuryFee(fromEscrow) : 0;
+        walletRemainder = amount - fromEscrow;
+    }
+
     // ========================================================================
     // V10 Update Entries
     // ========================================================================
@@ -1298,6 +1372,18 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
 
         if (deltaTokenAmount == 0) return;
 
+        // OT-RFC-53: spend the CG owner's prepaid registration escrow first. The net
+        // (after the treasury fee) is distributed over the remaining epochs; the
+        // wallet covers the remainder below.
+        (uint96 netEscrow, uint96 walletDelta) = _consumeEscrowNet(
+            contextGraphStorage.kaToContextGraph(p.id),
+            deltaTokenAmount
+        );
+        if (netEscrow > 0) {
+            _distributeTokens(netEscrow, uint256(remainingEpochs), currentEpoch);
+        }
+        if (walletDelta == 0) return;
+
         // PCA branch eligibility (mirrors `publish()`, with `<=` for the
         // epoch count since `update()` passes the KA's REMAINING lifetime,
         // a delta bounded above by `lockDurationEpochs`):
@@ -1323,14 +1409,14 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         // underfunded account falls through here rather than reverting.
         if (useConviction) {
             useConviction = _coverViaConvictionOrFallThrough(
-                deltaTokenAmount,
+                walletDelta,
                 currentEpoch,
                 remainingEpochs
             );
         }
 
         if (!useConviction) {
-            uint96 netDeltaTokenAmount = _addTokens(deltaTokenAmount);
+            uint96 netDeltaTokenAmount = _addTokens(walletDelta);
             _distributeTokens(netDeltaTokenAmount, uint256(remainingEpochs), currentEpoch);
         }
     }
@@ -1647,6 +1733,37 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     // ========================================================================
     // Internal: Token Distribution
     // ========================================================================
+
+    /// @dev OT-RFC-53: draw down the CG owner's prepaid registration escrow to
+    ///      cover up to `cost`. Returns the escrow-funded `used` amount (already
+    ///      decremented; the underlying TRAC sits in the CSS vault, gross —
+    ///      no fee is skimmed at deposit, so escrow draws are gross-for-gross).
+    ///      The caller distributes `used` over the relevant epoch window and
+    ///      charges only `cost - used` to the wallet. Owner-scoped: a third
+    ///      party publishing into an open CG gets `used == 0` (the escrow is the
+    ///      CG owner's budget). No-op for unbound KCs (`contextGraphId == 0`).
+    function _useCgEscrow(uint256 contextGraphId, uint96 cost) internal returns (uint96 used) {
+        if (contextGraphId == 0 || cost == 0) {
+            return 0;
+        }
+        // Read the per-CG escrow FIRST. While the deposit is dormant (escrow == 0
+        // — always true when the registration deposit param is 0, the default)
+        // this single light read short-circuits BEFORE the heavier
+        // getContextGraphOwner (ERC-721 ownerOf) lookup. PR #1229: doing the owner
+        // lookup first added enough gas to the publish path to tip the off-chain
+        // publisher's gas estimation and shift its tx signer, breaking
+        // publisher[4/4]. Escrow-first keeps the dormant path's footprint minimal.
+        uint96 esc = contextGraphStorage.getRegistrationEscrow(contextGraphId);
+        if (esc == 0) {
+            return 0;
+        }
+        if (msg.sender != contextGraphStorage.getContextGraphOwner(contextGraphId)) {
+            return 0;
+        }
+        used = esc >= cost ? cost : esc;
+        contextGraphStorage.decreaseRegistrationEscrow(contextGraphId, used);
+        emit RegistrationEscrowConsumed(contextGraphId, used);
+    }
 
     function _distributeTokens(uint96 tokenAmount, uint256 epochs, uint40 currentEpoch) internal {
         // `epochs > 0` is guaranteed by every caller:

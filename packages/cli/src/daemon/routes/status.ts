@@ -518,6 +518,7 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
     validTokens,
     apiHost,
     apiPortRef,
+    admission,
     url,
     path,
     requestToken,
@@ -616,7 +617,7 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
     const circuitAddrs = agent.multiaddrs.filter((a) =>
       a.includes("/p2p-circuit/"),
     );
-    const networkId = await computeNetworkId();
+    const networkId = await computeNetworkId(network?.genesisId);
     const chainConf = resolveChainConfig(config, network);
     const rpcEndpointCount = chainConf?.rpcUrl
       ? resolveRpcUrls(chainConf.rpcUrl, chainConf.rpcUrls).length
@@ -694,6 +695,15 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
           ? await getCachedExternalStoreQuads(agent, Date.now())
           : null,
       uptimeMs: Date.now() - startedAt,
+      // Concurrency admission control (PR #1209): inFlight = requests currently
+      // holding a slot, max = the configured cap (0 = disabled), rejectedTotal =
+      // monotonic count of 503-shed requests since boot. Surfaced so operators
+      // can see whether the daemon is shedding load (and read the effective cap).
+      admission: {
+        inFlight: admission.inFlight,
+        max: admission.max,
+        rejectedTotal: admission.rejectedTotal,
+      },
       connectedPeers: uniquePeers.size,
       connections: {
         total: allConns.length,

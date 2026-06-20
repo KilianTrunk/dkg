@@ -524,6 +524,11 @@ export async function resolveImportedArtifact(
      * to mutate someone else's imported assertion.
      */
     relaxOnPublicOpenCg?: boolean;
+    /**
+     * Read routes also allow private/curated CG participants to read imported
+     * artifact metadata. Writes intentionally do not set this.
+     */
+    relaxOnAuthorizedReadCg?: boolean;
   },
   opts?: {
     allowSharedMemoryFallback?: boolean;
@@ -577,6 +582,7 @@ export async function resolveImportedArtifact(
   // someone else's imported assertion just because cross-agent READS
   // are allowed.
   const canRelaxGuard = Boolean(ownerGuard?.relaxOnPublicOpenCg);
+  const canRelaxAuthorizedRead = Boolean(ownerGuard?.relaxOnAuthorizedReadCg);
   // Probing the on-chain policy is a no-op for the write path (which
   // never relaxes). Skip it there to keep the diff scoped and avoid
   // adding chain-cache reads to a code path that doesn't need them.
@@ -627,7 +633,14 @@ export async function resolveImportedArtifact(
     // `assertionAgentAddress === requestAgentAddress` so the guard
     // passes) while non-owner cross-agent reads get the same 404
     // they got pre-PR rather than a misleading 200.
-    if (canRelaxGuard && isPublicOpen && !parsedAssertion.legacy) {
+    const isOwner = isSameAgentAddress(
+      parsedAssertion.assertionAgentAddress,
+      ownerGuard.requestAgentAddress,
+    );
+    const isAuthorizedReadAgent = !isOwner && canRelaxAuthorizedRead && !parsedAssertion.legacy
+      ? await isContextGraphAuthorizedReadAgent(ctx.agent, contextGraphId, ownerGuard.requestAgentAddress)
+      : false;
+    if ((canRelaxGuard && isPublicOpen && !parsedAssertion.legacy) || isAuthorizedReadAgent) {
       ownerGuardRelaxed = !isSameAgentAddress(
         parsedAssertion.assertionAgentAddress,
         ownerGuard.requestAgentAddress,
@@ -669,7 +682,7 @@ export async function resolveImportedArtifact(
       assertionUri,
       ...(parsedAssertion.subGraphName ? { subGraphName: parsedAssertion.subGraphName } : {}),
       ...(requestedFileHash ? { requestedFileHash } : {}),
-      allowSharedMemoryFallback: ownerGuardRelaxed || opts?.allowSharedMemoryFallback,
+      allowSharedMemoryFallback: ownerGuardRelaxed || (opts?.allowSharedMemoryFallback && !parsedAssertion.legacy),
       fallbackDetectedContentType: extractionRecord?.detectedContentType,
       query: (sparql: string) => ctx.agent.store.query(sparql) as Promise<{ type?: string; bindings?: Array<Record<string, unknown>> }>,
     });
@@ -726,4 +739,23 @@ export async function resolveImportedArtifact(
     canReadMarkdown: markdownAvailableLocally,
     ...(ownerGuardRelaxed ? { ownerGuardRelaxed: true } : {}),
   };
+}
+
+export async function isContextGraphAuthorizedReadAgent(
+  agent: {
+    getContextGraphAllowedAgents?: (contextGraphId: string) => Promise<string[]>;
+    getContextGraphParticipantAgentAddresses?: (contextGraphId: string) => Promise<string[]>;
+  },
+  contextGraphId: string,
+  requestAgentAddress: string,
+): Promise<boolean> {
+  const lists = await Promise.all([
+    typeof agent.getContextGraphAllowedAgents === 'function'
+      ? agent.getContextGraphAllowedAgents(contextGraphId).catch(() => [] as string[])
+      : Promise.resolve([] as string[]),
+    typeof agent.getContextGraphParticipantAgentAddresses === 'function'
+      ? agent.getContextGraphParticipantAgentAddresses(contextGraphId).catch(() => [] as string[])
+      : Promise.resolve([] as string[]),
+  ]);
+  return lists.flat().some((agentAddress) => isSameAgentAddress(agentAddress, requestAgentAddress));
 }

@@ -389,11 +389,16 @@ export const AUTHOR_ATTESTATION_DOMAIN_NAME = 'KnowledgeAssetsLifecycle';
 
 /**
  * EIP-712 domain version. Bound to the major.minor portion of the
- * contract's `_VERSION` literal ("10.1"). Patch bumps do NOT change
- * this; only major.minor changes do. See
- * `KnowledgeAssetsV10._EIP712_VERSION_HASH`.
+ * contract's `_VERSION` literal. Patch bumps do NOT change this; only
+ * major.minor changes do. See `KnowledgeAssetsV10._EIP712_VERSION_HASH`.
+ *
+ * BUMPED for the CG-independent `AuthorAttestation` (the `contextGraphId`
+ * struct field was removed — see below). This MUST match the matching
+ * smart-contract PR's new `_EIP712_VERSION` exactly, or every on-chain
+ * `_verifyAuthorAttestation` reverts with `InvalidAuthorSignature`.
+ * CROSS-PR COORDINATION POINT — reconcile the literal with the contract PR.
  */
-export const AUTHOR_ATTESTATION_DOMAIN_VERSION = '2.0.0';
+export const AUTHOR_ATTESTATION_DOMAIN_VERSION = '3.0.0';
 
 /**
  * Currently-supported `authorSchemeVersion` value. v1 is single-key
@@ -409,9 +414,14 @@ export const AUTHOR_SCHEME_VERSION_V1 = 1;
  * `_AUTHOR_ATTESTATION_TYPEHASH` literal in
  * `KnowledgeAssetsV10.sol`:
  *
- *   AuthorAttestation(uint256 contextGraphId, bytes32 merkleRoot,
- *                     address authorAddress, uint8 schemeVersion,
- *                     uint256 reservedKaId)
+ *   AuthorAttestation(bytes32 merkleRoot, address authorAddress,
+ *                     uint8 schemeVersion, uint256 reservedKaId)
+ *
+ * The `contextGraphId` field was REMOVED (#1116): the seal is now
+ * context-graph-independent so an assertion can be finalized before its CG
+ * is registered on-chain. The CG is still bound to the publication at
+ * publish time (the contract's `PublishParams.contextGraphId` + the
+ * separate ACK digest) — just not by the author signature.
  *
  * OT-RFC-43 Option-1 (variant 1a): `reservedKaId` — the packed
  * `(uint160(author) << 96) | uint96(number)` slot this publish claims — is
@@ -433,7 +443,6 @@ export interface AuthorAttestationTypedData {
   };
   primaryType: typeof AUTHOR_ATTESTATION_PRIMARY_TYPE;
   message: {
-    contextGraphId: bigint;
     merkleRoot: string;
     authorAddress: string;
     schemeVersion: number;
@@ -445,10 +454,11 @@ export interface AuthorAttestationTypedData {
  * Build the EIP-712 typed-data payload for the V10 author attestation.
  *
  * Domain pins `(chainId, verifyingContract)` to defeat cross-chain and
- * cross-deployment replay. Struct hash binds the publication's
- * `(contextGraphId, merkleRoot)` to a specific
- * `(authorAddress, schemeVersion, reservedKaId)` — leaked signatures cannot
- * be redirected to a different CG, root, author, or KA id/slot.
+ * cross-deployment replay. Struct hash binds the publication's `merkleRoot`
+ * to a specific `(authorAddress, schemeVersion, reservedKaId)` — leaked
+ * signatures cannot be redirected to a different content root, author, or
+ * KA id/slot. The seal is intentionally CG-independent (#1116); CG binding
+ * happens at publish (PublishParams.contextGraphId + the ACK digest).
  *
  * `reservedKaId` is the packed `(uint160(author) << 96) | uint96(number)`
  * the publish will mint; it is REQUIRED under OT-RFC-43 Option-1 variant 1a
@@ -461,7 +471,6 @@ export interface AuthorAttestationTypedData {
 export function buildAuthorAttestationTypedData(args: {
   chainId: bigint;
   kav10Address: string;
-  contextGraphId: bigint;
   merkleRoot: Uint8Array;
   authorAddress: string;
   reservedKaId: bigint;
@@ -487,7 +496,6 @@ export function buildAuthorAttestationTypedData(args: {
     },
     types: {
       AuthorAttestation: [
-        { name: 'contextGraphId', type: 'uint256' },
         { name: 'merkleRoot', type: 'bytes32' },
         { name: 'authorAddress', type: 'address' },
         { name: 'schemeVersion', type: 'uint8' },
@@ -496,7 +504,6 @@ export function buildAuthorAttestationTypedData(args: {
     },
     primaryType: AUTHOR_ATTESTATION_PRIMARY_TYPE,
     message: {
-      contextGraphId: args.contextGraphId,
       merkleRoot: merkleRootHex,
       authorAddress: args.authorAddress,
       schemeVersion,

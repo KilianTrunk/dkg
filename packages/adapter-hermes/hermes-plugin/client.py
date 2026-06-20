@@ -554,8 +554,13 @@ class DKGClient:
 
     def promote_assertion(self, assertion_name: str, context_graph_id: str,
                           entities: Optional[Any] = None,
-                          sub_graph_name: Optional[str] = None) -> Dict[str, Any]:
-        """POST /api/knowledge-assets/{name}/swm/share — promote assertion to SWM."""
+                          sub_graph_name: Optional[str] = None,
+                          skip_seal: Optional[bool] = None) -> Dict[str, Any]:
+        """POST /api/knowledge-assets/{name}/swm/share — promote assertion to SWM.
+
+        A full share SEALS BY DEFAULT (publish-ready). ``skip_seal=True`` opts
+        out into an unsealed SWM share (camelCase ``skipSeal`` on the wire).
+        """
         payload: Dict[str, Any] = {
             "contextGraphId": _normalize_context_graph_id(context_graph_id),
         }
@@ -563,12 +568,15 @@ class DKGClient:
             payload["entities"] = entities
         if sub_graph_name:
             payload["subGraphName"] = sub_graph_name
+        if skip_seal is not None:
+            payload["skipSeal"] = skip_seal
         return self._post(f"/api/knowledge-assets/{quote(assertion_name, safe='')}/swm/share", payload)
 
     def finalize_assertion(self, assertion_name: str, context_graph_id: str,
                            sub_graph_name: Optional[str] = None,
                            author_agent_address: Optional[str] = None,
-                           scheme_version: Optional[int] = None) -> Dict[str, Any]:
+                           scheme_version: Optional[int] = None,
+                           layer: Optional[str] = None) -> Dict[str, Any]:
         """POST /api/knowledge-assets/{name}/wm/finalize — seal the WM draft.
 
         Computes the merkle root and signs the EIP-712 AuthorAttestation
@@ -577,7 +585,9 @@ class DKGClient:
         omit it to let the daemon default the author to the request token's
         agent. The pre-signed attestation path is intentionally NOT exposed —
         Hermes relies on node-side signing, exactly like OpenClaw/MCP (no
-        client-side EIP-712, no raw preSignedAuthorAttestation).
+        client-side EIP-712, no raw preSignedAuthorAttestation). ``layer``
+        selects WHERE the content to seal lives: "wm" (default) seals the open
+        WM draft; "swm" seals an asset already shared to SWM.
         """
         payload: Dict[str, Any] = {"contextGraphId": _normalize_context_graph_id(context_graph_id)}
         if sub_graph_name:
@@ -586,6 +596,8 @@ class DKGClient:
             payload["authorAgentAddress"] = author_agent_address
         if scheme_version is not None:
             payload["schemeVersion"] = scheme_version
+        if layer is not None:
+            payload["layer"] = layer
         return self._post(f"/api/knowledge-assets/{quote(assertion_name, safe='')}/wm/finalize", payload)
 
     def publish_finalized_assertion(self, assertion_name: str, context_graph_id: str,

@@ -63,6 +63,53 @@ describe('Genesis Knowledge', () => {
       await agent.stop().catch(() => {});
     });
 
+    it('loads the selected genesis into store and reports its network id', async () => {
+      const store = new OxigraphStore();
+      const agent = await DKGAgent.create({
+        name: 'SelectedGenesisTest',
+        genesisId: 'gnosis-mainnet',
+        store,
+        chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+      });
+
+      const selectedGenesis = await store.query(
+        `SELECT ?v WHERE { <did:dkg:network:gnosis-mainnet> <https://dkg.network/ontology#genesisVersion> ?v }`,
+      );
+      expect(selectedGenesis.type).toBe('bindings');
+      if (selectedGenesis.type === 'bindings') {
+        expect(selectedGenesis.bindings.length).toBe(1);
+      }
+
+      const defaultGenesis = await store.query(
+        `SELECT ?v WHERE { <did:dkg:network:v9-testnet> <https://dkg.network/ontology#genesisVersion> ?v }`,
+      );
+      expect(defaultGenesis.type).toBe('bindings');
+      if (defaultGenesis.type === 'bindings') {
+        expect(defaultGenesis.bindings.length).toBe(0);
+      }
+
+      expect(await agent.networkId()).toBe(await computeNetworkId('gnosis-mainnet'));
+
+      await agent.stop().catch(() => {});
+    });
+
+    it('rejects switching an existing store to a different genesis', async () => {
+      const store = new OxigraphStore();
+      const defaultAgent = await DKGAgent.create({
+        name: 'DefaultGenesisStore',
+        store,
+        chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+      });
+      await defaultAgent.stop().catch(() => {});
+
+      await expect(DKGAgent.create({
+        name: 'ForeignGenesisStore',
+        genesisId: 'gnosis-mainnet',
+        store,
+        chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+      })).rejects.toThrow(/contains a different genesis/);
+    });
+
 
     it('genesis loading is idempotent', async () => {
       const store = new OxigraphStore();

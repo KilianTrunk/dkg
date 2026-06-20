@@ -143,7 +143,7 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     //             drained by `StakingV10._claim`.
     //           * `createNewPositionFromExisting` migrates carries across
     //             the relock burn-mint; `deletePosition` deletes them.
-    string private constant _VERSION = "10.0.3";
+    string private constant _VERSION = "10.0.4";
 
     // Multiplier scale, matches DKGStakingConvictionNFT._convictionMultiplier
     // (returns 1e18-scaled values so fractional tiers like 1.5x and 3.5x
@@ -423,6 +423,11 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     );
     event OperatorFeeWithdrawalRequestDeleted(uint72 indexed identityId);
     event StakedTokensTransferred(address indexed receiver, uint96 amount);
+    /// @notice OT-RFC-53: emitted when the protocol treasury fee owed on an
+    ///         escrow-funded publish/update/extend is routed out of the vault to
+    ///         the treasury. Distinct from {StakedTokensTransferred} so off-chain
+    ///         accounting never mistakes a treasury-fee outflow for a stake move.
+    event RegistrationDepositFeeTransferred(address indexed treasury, uint96 amount);
 
     constructor(address hubAddress) Guardian(hubAddress) {}
 
@@ -1613,7 +1618,8 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     //
     // The CSS contract address is the V10 TRAC vault (deposits arrive via
     // `transferFrom(staker, address(this), amount)` from publish/staking
-    // callers). `transferStake` is the only outflow path; gated to Hub-
+    // callers). `transferStake` (stake movement) and `transferRegistrationDepositFee`
+    // (OT-RFC-53 escrow treasury fee) are the outflow paths; both gated to Hub-
     // registered contracts, mirroring V8 `StakingStorage.transferStake`.
     // ============================================================
 
@@ -1628,6 +1634,18 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
         // slither-disable-next-line unchecked-transfer
         tokenContract.safeTransfer(receiver, stakeAmount);
         emit StakedTokensTransferred(receiver, stakeAmount);
+    }
+
+    /// @notice OT-RFC-53: routes the protocol treasury fee owed on an escrow-funded
+    ///         publish/update/extend out of the vault to `treasury`. The SECOND
+    ///         vault-outflow path; mirrors {transferStake} (gated to Hub contracts,
+    ///         SafeERC20). The caller (KnowledgeAssetsLifecycle) computes `amount`
+    ///         (bounded by the consumed escrow) and passes the configured
+    ///         `protocolTreasury`; CSS performs only the gated transfer.
+    function transferRegistrationDepositFee(address treasury, uint96 amount) external onlyContracts {
+        // slither-disable-next-line unchecked-transfer
+        tokenContract.safeTransfer(treasury, amount);
+        emit RegistrationDepositFeeTransferred(treasury, amount);
     }
 
     // ============================================================

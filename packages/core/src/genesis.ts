@@ -6,26 +6,45 @@
  * the networkId, ensuring only nodes with identical genesis can peer.
  */
 
-const GENESIS_TRIG = `\
-@prefix dkg:     <https://dkg.network/ontology#> .
-@prefix erc8004: <https://eips.ethereum.org/erc-8004#> .
-@prefix prov:    <http://www.w3.org/ns/prov#> .
-@prefix schema:  <https://schema.org/> .
-@prefix rdfs:    <http://www.w3.org/2000/01/rdf-schema#> .
-@prefix rdf:     <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
-@prefix xsd:     <http://www.w3.org/2001/XMLSchema#> .
-
-<did:dkg:network:v9-testnet>
-    a dkg:Network ;
-    schema:name "DKG V9 Testnet" ;
-    dkg:genesisVersion "1"^^xsd:integer ;
-    dkg:createdAt "2026-02-24T00:00:00Z"^^xsd:dateTime ;
-    dkg:systemContextGraphs <did:dkg:context-graph:agents> ;
-    dkg:systemContextGraphs <did:dkg:context-graph:ontology> .
-`;
-
 const GENESIS_AGENTS_GRAPH = 'did:dkg:context-graph:agents';
 const GENESIS_ONTOLOGY_GRAPH = 'did:dkg:context-graph:ontology';
+const DEFAULT_GENESIS_ID = 'base-testnet';
+
+interface GenesisNetworkDefinition {
+  subject: string;
+  name: string;
+  createdAt: string;
+  systemContextGraphs: readonly string[];
+}
+
+const GENESIS_NETWORKS = {
+  'base-testnet': {
+    subject: 'did:dkg:network:v9-testnet',
+    name: 'DKG V9 Testnet',
+    createdAt: '2026-02-24T00:00:00Z',
+    systemContextGraphs: [GENESIS_AGENTS_GRAPH, GENESIS_ONTOLOGY_GRAPH],
+  },
+  'base-mainnet': {
+    subject: 'did:dkg:network:base-mainnet',
+    name: 'DKG V10 Base Mainnet',
+    createdAt: '2026-06-20T00:00:00Z',
+    systemContextGraphs: [GENESIS_AGENTS_GRAPH, GENESIS_ONTOLOGY_GRAPH],
+  },
+  'gnosis-mainnet': {
+    subject: 'did:dkg:network:gnosis-mainnet',
+    name: 'DKG V10 Gnosis Mainnet',
+    createdAt: '2026-06-20T00:00:00Z',
+    systemContextGraphs: [GENESIS_AGENTS_GRAPH, GENESIS_ONTOLOGY_GRAPH],
+  },
+  'neuroweb-mainnet': {
+    subject: 'did:dkg:network:neuroweb-mainnet',
+    name: 'DKG V10 NeuroWeb Mainnet',
+    createdAt: '2026-06-20T00:00:00Z',
+    systemContextGraphs: [GENESIS_AGENTS_GRAPH, GENESIS_ONTOLOGY_GRAPH],
+  },
+} satisfies Record<string, GenesisNetworkDefinition>;
+
+export type GenesisId = keyof typeof GENESIS_NETWORKS;
 
 export interface GenesisQuad {
   subject: string;
@@ -48,19 +67,29 @@ function q(graph: string, s: string, p: string, o: string): GenesisQuad {
   return { subject: s, predicate: p, object: o, graph };
 }
 
-function buildGenesisQuads(): GenesisQuad[] {
+function getGenesisNetwork(genesisId: string): GenesisNetworkDefinition {
+  const network = GENESIS_NETWORKS[genesisId as GenesisId];
+  if (!network) {
+    throw new Error(`Unknown genesisId: ${genesisId}`);
+  }
+  return network;
+}
+
+function buildGenesisQuads(genesisId: string): GenesisQuad[] {
   const quads: GenesisQuad[] = [];
   const DEFAULT = '';
   const AG = GENESIS_AGENTS_GRAPH;
   const OG = GENESIS_ONTOLOGY_GRAPH;
+  const network = getGenesisNetwork(genesisId);
 
   // --- Default graph: network definition ---
-  quads.push(q(DEFAULT, 'did:dkg:network:v9-testnet', `${RDF}type`, `${DKG}Network`));
-  quads.push(q(DEFAULT, 'did:dkg:network:v9-testnet', `${SCHEMA}name`, '"DKG V9 Testnet"'));
-  quads.push(q(DEFAULT, 'did:dkg:network:v9-testnet', `${DKG}genesisVersion`, '"1"'));
-  quads.push(q(DEFAULT, 'did:dkg:network:v9-testnet', `${DKG}createdAt`, '"2026-02-24T00:00:00Z"'));
-  quads.push(q(DEFAULT, 'did:dkg:network:v9-testnet', `${DKG}systemContextGraphs`, `did:dkg:context-graph:agents`));
-  quads.push(q(DEFAULT, 'did:dkg:network:v9-testnet', `${DKG}systemContextGraphs`, `did:dkg:context-graph:ontology`));
+  quads.push(q(DEFAULT, network.subject, `${RDF}type`, `${DKG}Network`));
+  quads.push(q(DEFAULT, network.subject, `${SCHEMA}name`, `"${network.name}"`));
+  quads.push(q(DEFAULT, network.subject, `${DKG}genesisVersion`, '"1"'));
+  quads.push(q(DEFAULT, network.subject, `${DKG}createdAt`, `"${network.createdAt}"`));
+  for (const graph of network.systemContextGraphs) {
+    quads.push(q(DEFAULT, network.subject, `${DKG}systemContextGraphs`, graph));
+  }
 
   // --- Agents contextGraph definition ---
   quads.push(q(AG, 'did:dkg:context-graph:agents', `${RDF}type`, `${DKG}ContextGraph`));
@@ -107,22 +136,25 @@ function buildGenesisQuads(): GenesisQuad[] {
   return quads;
 }
 
-let _cachedQuads: GenesisQuad[] | null = null;
-let _cachedNetworkId: string | null = null;
+const _cachedQuads = new Map<string, GenesisQuad[]>();
+const _cachedNetworkIds = new Map<string, string>();
 
-export function getGenesisQuads(): GenesisQuad[] {
-  if (!_cachedQuads) {
-    _cachedQuads = buildGenesisQuads();
+export function getGenesisQuads(genesisId: string = DEFAULT_GENESIS_ID): GenesisQuad[] {
+  const cached = _cachedQuads.get(genesisId);
+  if (cached) {
+    return cached;
   }
-  return _cachedQuads;
+  const quads = buildGenesisQuads(genesisId);
+  _cachedQuads.set(genesisId, quads);
+  return quads;
 }
 
 /**
  * Canonical representation of genesis for hashing.
  * Sorted N-Quads lines to ensure deterministic output.
  */
-function canonicalGenesisString(): string {
-  const quads = getGenesisQuads();
+function canonicalGenesisString(genesisId: string): string {
+  const quads = getGenesisQuads(genesisId);
   const lines = quads.map(q => {
     const s = q.subject.startsWith('"') ? q.subject : `<${q.subject}>`;
     const p = `<${q.predicate}>`;
@@ -133,25 +165,70 @@ function canonicalGenesisString(): string {
   return lines.sort().join('\n');
 }
 
-export async function computeNetworkId(): Promise<string> {
-  if (_cachedNetworkId) return _cachedNetworkId;
+export async function computeNetworkId(genesisId: string = DEFAULT_GENESIS_ID): Promise<string> {
+  const cached = _cachedNetworkIds.get(genesisId);
+  if (cached) return cached;
 
-  const data = new TextEncoder().encode(canonicalGenesisString());
+  const data = new TextEncoder().encode(canonicalGenesisString(genesisId));
   const hashBuffer = await globalThis.crypto.subtle.digest('SHA-256', data);
   const hashArray = new Uint8Array(hashBuffer);
   const hex = Array.from(hashArray).map(b => b.toString(16).padStart(2, '0')).join('');
-  _cachedNetworkId = hex;
+  _cachedNetworkIds.set(genesisId, hex);
   return hex;
 }
 
-export function getGenesisRaw(): string {
-  return GENESIS_TRIG;
+function buildGenesisRaw(network: GenesisNetworkDefinition): string {
+  const systemContextGraphLines = network.systemContextGraphs
+    .map((graph, index) => {
+      const terminator = index === network.systemContextGraphs.length - 1 ? '.' : ';';
+      return `    dkg:systemContextGraphs <${graph}> ${terminator}`;
+    })
+    .join('\n');
+
+  return `\
+@prefix dkg:     <https://dkg.network/ontology#> .
+@prefix erc8004: <https://eips.ethereum.org/erc-8004#> .
+@prefix prov:    <http://www.w3.org/ns/prov#> .
+@prefix schema:  <https://schema.org/> .
+@prefix rdfs:    <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix rdf:     <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix xsd:     <http://www.w3.org/2001/XMLSchema#> .
+
+<${network.subject}>
+    a dkg:Network ;
+    schema:name "${network.name}" ;
+    dkg:genesisVersion "1"^^xsd:integer ;
+    dkg:createdAt "${network.createdAt}"^^xsd:dateTime ;
+${systemContextGraphLines}
+`;
+}
+
+export function getGenesisRaw(genesisId: string = DEFAULT_GENESIS_ID): string {
+  return buildGenesisRaw(getGenesisNetwork(genesisId));
 }
 
 export const SYSTEM_CONTEXT_GRAPHS = {
   AGENTS: 'agents',
   ONTOLOGY: 'ontology',
 } as const;
+
+/**
+ * The agent registry (`agents`) system context graph is genesis-seeded and never
+ * registered on-chain, so its profile publishes are always tentative and the
+ * per-publish KC/KA `_meta` tracking record has no consumer — agent facts are
+ * served from the DATA graph. Persisting that `_meta` on every heartbeat
+ * (locally, and once per gossiped peer heartbeat) grows `agents/_meta` without
+ * bound (#1233). The two highest-volume write paths gate on this single
+ * predicate: the local publish terminal and the gossip publish receiver (the
+ * dominant per-peer-heartbeat source). The remaining publisher paths — the
+ * update restatement and the direct-protocol receive handler — are intentionally
+ * deferred to a follow-up that prunes/bounds the record rather than skipping it,
+ * because there the `_meta` is load-bearing (prior-root cleanup + the tentative
+ * lifecycle). See #1233.
+ */
+export function isAgentRegistryContextGraph(contextGraphId: string): boolean {
+  return contextGraphId === SYSTEM_CONTEXT_GRAPHS.AGENTS;
+}
 
 export const DKG_ONTOLOGY = {
   RDF_TYPE: `${RDF}type`,

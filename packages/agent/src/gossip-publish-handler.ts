@@ -1,5 +1,5 @@
 import {
-  decodePublishRequest, SYSTEM_CONTEXT_GRAPHS, DKG_ONTOLOGY,
+  decodePublishRequest, SYSTEM_CONTEXT_GRAPHS, isAgentRegistryContextGraph, DKG_ONTOLOGY,
   Logger, createOperationContext,
   isSafeIri, assertSafeIri, validateSubGraphName, validateContextGraphId,
   contextGraphSubGraphUri,
@@ -383,9 +383,17 @@ export class GossipPublishHandler {
 
         // Always store gossip-received data as tentative first —
         // never trust self-reported on-chain status from gossip messages.
-        const metaQuads = generateTentativeMetadata(kcMeta, kaMetadata);
-        await this.store.insert(metaQuads);
-        this.callbacks.markCgMetaDirtyFromQuads?.(metaQuads);
+        //
+        // #1233: the agents registry CG is the exception — it never confirms
+        // on-chain and its per-publish `_meta` record has no consumer (the
+        // registry is served from the data graph). Persisting one per peer
+        // heartbeat grows `agents/_meta` without bound and stalls offset-0
+        // sync (the agents slice of #1221), so skip the tracking write here.
+        if (!isAgentRegistryContextGraph(request.contextGraphId)) {
+          const metaQuads = generateTentativeMetadata(kcMeta, kaMetadata);
+          await this.store.insert(metaQuads);
+          this.callbacks.markCgMetaDirtyFromQuads?.(metaQuads);
+        }
         phase?.('store', 'end');
 
         // If the gossip message includes on-chain proof (txHash + blockNumber),

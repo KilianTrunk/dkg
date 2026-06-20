@@ -151,7 +151,14 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     //             half-day.
     //           * New distinct expiry slots are capped per node; same-bucket
     //             stakes keep coalescing even when the cap is reached.
-    string private constant _VERSION = "10.0.5";
+    //   10.0.6 — Audit G-6: increaseRaw/decreaseRaw install a position's running-
+    //             stake / boost contribution as the ONE-SHOT delta from its raw
+    //             (floor(newRaw*m) - floor(oldRaw*m)), so a reward-compounded
+    //             position's contribution always equals the one-shot value the
+    //             unwind paths remove. This eliminates the incremental-vs-one-shot
+    //             floor asymmetry that bricked redelegate/relock/exit/decreaseRaw,
+    //             with the strict cancel/stake-delta invariants kept intact.
+    string private constant _VERSION = "10.0.6";
 
     // Multiplier scale, matches DKGStakingConvictionNFT._convictionMultiplier
     // (returns 1e18-scaled values so fractional tiers like 1.5x and 3.5x
@@ -921,6 +928,11 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
             return;
         }
         uint256 existing = nodeExpiryDrop[identityId][ts];
+        // Strict invariant: a cancel can never exceed the scheduled drop. G-6 keeps
+        // this strict (no saturation) because increaseRaw/decreaseRaw now install a
+        // position's boost as the ONE-SHOT delta from its raw, so the scheduled slot
+        // always holds exactly floor(curRaw*(m-S)) for the position and the one-shot
+        // unwind removes exactly that — no incremental-vs-one-shot floor asymmetry.
         require(existing >= drop, "Cancel > scheduled");
         uint256 remaining = existing - drop;
         if (remaining == 0) {
@@ -941,6 +953,11 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
             stake += uint256(delta);
         } else {
             uint256 d = uint256(-delta);
+            // Strict invariant: running stake can never go negative. G-6 keeps this
+            // strict (no saturation) — increaseRaw/decreaseRaw install a position's
+            // running-stake contribution as the ONE-SHOT delta from its raw, so the
+            // aggregate always holds exactly floor(curRaw*m) for the position and the
+            // one-shot unwind removes exactly that.
             require(stake >= d, "Neg running stake");
             stake -= d;
         }
@@ -1380,14 +1397,23 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
 
         _settleNodeTo(identityId, tsNow);
 
-        uint256 effectiveNow = stillBoosted
-            ? (uint256(amount) * uint256(multiplier18)) / SCALE18
+        // G-6: remove the position's contribution as the ONE-SHOT delta from its
+        // current raw — floor(oldRaw*m) - floor(newRaw*m) — so the position's
+        // running-stake / boost contribution always equals floor(curRaw*m), exactly
+        // what the unwind paths (redelegate / relock / exit) later remove. No
+        // incremental-vs-one-shot floor asymmetry, so the strict helper invariants
+        // hold without saturation.
+        uint256 oldRaw = uint256(pos.raw);
+        uint256 newRaw = oldRaw - uint256(amount);
+        uint256 effDelta = stillBoosted
+            ? ((oldRaw * uint256(multiplier18)) / SCALE18) - ((newRaw * uint256(multiplier18)) / SCALE18)
             : uint256(amount);
-        _applyNodeStakeDelta(identityId, -int256(effectiveNow));
+        _applyNodeStakeDelta(identityId, -int256(effDelta));
 
         if (stillBoosted && multiplier18 > SCALE18) {
-            uint256 boostShrink = (uint256(amount) * (uint256(multiplier18) - SCALE18)) / SCALE18;
-            _cancelNodeExpiry(identityId, expiryTs, boostShrink);
+            uint256 boostDelta = ((oldRaw * (uint256(multiplier18) - SCALE18)) / SCALE18) -
+                ((newRaw * (uint256(multiplier18) - SCALE18)) / SCALE18);
+            _cancelNodeExpiry(identityId, expiryTs, boostDelta);
         }
 
         pos.raw = pos.raw - amount;
@@ -1414,14 +1440,29 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
 
         _settleNodeTo(identityId, tsNow);
 
-        uint256 effectiveNow = stillBoosted
-            ? (uint256(amount) * uint256(multiplier18)) / SCALE18
+        // G-6: install the position's contribution as the ONE-SHOT delta from its
+        // current raw — floor(newRaw*m) - floor(oldRaw*m) — so a reward-compounding
+        // claim keeps the position's running-stake / boost contribution equal to
+        // floor(curRaw*m), exactly what the unwind paths later remove. This replaces
+        // the prior floor(amount*m) increment, whose independent floor caused the
+        // incremental-vs-one-shot asymmetry that bricked redelegate/relock (audit
+        // G-6); the strict helper invariants now hold without saturation.
+        uint256 oldRaw = uint256(pos.raw);
+        uint256 newRaw = oldRaw + uint256(amount);
+        uint256 effDelta = stillBoosted
+            ? ((newRaw * uint256(multiplier18)) / SCALE18) - ((oldRaw * uint256(multiplier18)) / SCALE18)
             : uint256(amount);
-        _applyNodeStakeDelta(identityId, int256(effectiveNow));
+        _applyNodeStakeDelta(identityId, int256(effDelta));
 
         if (stillBoosted && multiplier18 > SCALE18) {
-            uint256 boostGrow = (uint256(amount) * (uint256(multiplier18) - SCALE18)) / SCALE18;
-            _scheduleNodeExpiry(identityId, expiryTs, boostGrow);
+            uint256 boostDelta = ((newRaw * (uint256(multiplier18) - SCALE18)) / SCALE18) -
+                ((oldRaw * (uint256(multiplier18) - SCALE18)) / SCALE18);
+            // The one-shot delta can be 0 for a small compound (the floored boost
+            // doesn't tip to the next wei); _scheduleNodeExpiry reverts on a zero
+            // drop, so skip it — the contribution is already exact.
+            if (boostDelta != 0) {
+                _scheduleNodeExpiry(identityId, expiryTs, boostDelta);
+            }
         }
 
         pos.raw = pos.raw + amount;

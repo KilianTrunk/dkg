@@ -195,7 +195,7 @@ program
 
     await ensureDkgDir();
     const existing = await loadConfig();
-    const network = await loadNetworkConfig();
+    const network = await loadNetworkConfig(existing.networkConfig);
     const readiness = validateNetworkConfigReadiness(network);
     if (!readiness.ok) {
       for (const message of readiness.messages) console.error(message);

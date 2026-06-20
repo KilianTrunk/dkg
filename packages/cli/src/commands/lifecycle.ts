@@ -277,6 +277,7 @@ program
       const uptime = formatUptime(s.uptimeMs);
       console.log(`  Node:      ${s.name}`);
       console.log(`  Role:      ${s.nodeRole ?? 'edge'}`);
+      if (s.networkConfig) console.log(`  Config:    ${s.networkConfig}`);
       console.log(`  Network:   ${s.networkId ?? '—'}`);
       console.log(`  PeerId:    ${s.peerId}`);
       console.log(`  Uptime:    ${uptime}`);

@@ -114,6 +114,7 @@ describe('/api/status selected overlay details', () => {
         network,
         config: {
           name: 'status-selected-overlay-test',
+          networkConfig: 'mainnet-gnosis',
           nodeRole: 'edge',
           chain: { type: 'mock' },
         },
@@ -144,7 +145,8 @@ describe('/api/status selected overlay details', () => {
       const body: any = await res.json();
       const selectedNetworkId = await computeNetworkId('gnosis-mainnet');
 
-      expect(body.networkId).toBe(selectedNetworkId.slice(0, 16));
+      expect(body.networkConfig).toBe('mainnet-gnosis');
+      expect(body.networkId).toBe(selectedNetworkId);
       expect(body.networkName).toBe('DKG V10 Gnosis Mainnet');
     } finally {
       await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));

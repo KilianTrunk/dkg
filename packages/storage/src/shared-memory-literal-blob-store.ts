@@ -78,6 +78,19 @@ export class SharedMemoryLiteralBlobStore implements TripleStore {
     return removed;
   }
 
+  async update(sparql: string): Promise<void> {
+    if (typeof this.inner.update !== 'function') {
+      throw new Error('SharedMemoryLiteralBlobStore: inner store does not support update()');
+    }
+    // Forward verbatim. A server-side INSERT…WHERE copies whatever terms are
+    // already stored — including any externalized blob-ref placeholders — so
+    // there is nothing to externalize (the blob is shared by content hash and
+    // a copied placeholder rehydrates identically through `query`). Re-running
+    // externalization here is impossible anyway: an arbitrary UPDATE string
+    // carries no quad objects to inspect.
+    return this.inner.update(sparql);
+  }
+
   async query(sparql: string, options?: QueryOptions): Promise<QueryResult> {
     const rewritten = this.rewriteLargeLiteralConstants(sparql);
     if (!rewritten) {

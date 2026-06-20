@@ -450,7 +450,15 @@ SELECT ?p ?o ?g WHERE { GRAPH ?g { <${safeIri}> ?p ?o } }`,
           }
           facts.set(key, fact);
         }
-        const attributed = [...facts.values()].filter((f) => f.ka.length > 0);
+        // Stable ordering BEFORE the cap so truncation is genuinely deterministic
+        // — the SPARQL query has no ORDER BY, so raw row order is backend/
+        // discovery-dependent. Facts sort by (predicate, object); each fact's KA
+        // sources by sourceGraph.
+        const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+        const attributed = [...facts.values()]
+          .filter((f) => f.ka.length > 0)
+          .map((f) => ({ ...f, ka: [...f.ka].sort((x, y) => cmp(x.sourceGraph, y.sourceGraph)) }))
+          .sort((a, b) => cmp(a.p, b.p) || cmp(a.o, b.o));
         const unattributed = [...facts.values()].filter((f) => f.ka.length === 0);
 
         if (!attributed.length) {
@@ -473,9 +481,9 @@ SELECT ?p ?o ?g WHERE { GRAPH ?g { <${safeIri}> ?p ?o } }`,
         const factLines = shown.map(
           (f) => `- **${prettyTerm(f.p)}**: ${prettyTerm(f.o)}  ←  ${f.ka.map((s) => sourceLabel(s)).join(', ')}`,
         );
-        const sourceLines = [...kaSources.values()].map(
-          (s) => `- ${sourceLabel(s)} (${s.memoryLayer}) — \`${s.sourceGraph}\``,
-        );
+        const sourceLines = [...kaSources.values()]
+          .sort((a, b) => cmp(a.sourceGraph, b.sourceGraph))
+          .map((s) => `- ${sourceLabel(s)} (${s.memoryLayer}) — \`${s.sourceGraph}\``);
         // Verifiable-memory sources are published/on-chain; shared-working-memory
         // sources are pre-publish DRAFT (reserved, not-yet-on-chain) handles —
         // condition the framing so a per-fact line can't be cited as on-chain.

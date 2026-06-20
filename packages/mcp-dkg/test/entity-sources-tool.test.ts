@@ -129,15 +129,16 @@ describe('dkg_get_entity_sources', () => {
     expect(result.content[0].text).toMatch(/No KA-attributable facts/);
   });
 
-  it('caps rendered facts at `limit` and discloses the remainder', async () => {
+  it('caps rendered facts at `limit`, discloses the remainder, and truncates deterministically', async () => {
     const server = new FakeServer();
     const client = new FakeClient({
+      // Rows returned in REVERSE order (p4..p0) to prove the cap selects by a
+      // stable sort, not backend row order.
       query: async () => ({
-        bindings: Array.from({ length: 5 }, (_, i) => ({
-          p: `http://schema.org/p${i}`,
-          o: `"v${i}"`,
-          g: VM('0xaa', String(i)),
-        })),
+        bindings: Array.from({ length: 5 }, (_, i) => {
+          const n = 4 - i;
+          return { p: `http://schema.org/p${n}`, o: `"v${n}"`, g: VM('0xaa', String(n)) };
+        }),
       }),
     });
     registerReadTools(server.asMcpServer(), client.asDkgClient(), makeConfig());
@@ -146,6 +147,13 @@ describe('dkg_get_entity_sources', () => {
     // Exactly 2 fact lines rendered (one `←` arrow each), remainder disclosed.
     expect((text.match(/←/g) ?? []).length).toBe(2);
     expect(text).toMatch(/3 more attributed fact\(s\) not shown/);
+    // Deterministic: the two LOWEST by (predicate, object) are shown regardless
+    // of input order — p0/p1, never the late-sorting p2..p4. (prettyTerm strips
+    // the literal quotes, so match the bare value.)
+    expect(text).toContain('schema:p0');
+    expect(text).toContain('schema:p1');
+    expect(text).not.toContain('schema:p2');
+    expect(text).not.toContain('schema:p4');
   });
 
   it('forwards an explicit shared-working-memory view', async () => {

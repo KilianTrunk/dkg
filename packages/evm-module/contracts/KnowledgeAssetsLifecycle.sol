@@ -157,7 +157,12 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     //          distributed to stakers, fee routed out of the CSS vault to the
     //          treasury via `_chargeEscrowTreasuryFee`. Supersedes 10.1.3's
     //          gross-for-gross distribution. PATCH bump — no ACK / EIP-712 change.
-    string private constant _VERSION = "10.1.4";
+    // 10.1.5 — Audit G-7: the CG value-write paths (extendKnowledgeAssetLifetime
+    //          and the _executeUpdateCore delta) revert with
+    //          CannotWriteValueToInactiveContextGraph on a deactivated CG, so a
+    //          swept CG can no longer be re-stranded with sampling weight. PATCH
+    //          bump — no ACK / EIP-712 change.
+    string private constant _VERSION = "10.1.5";
 
     /// @notice OT-RFC-49 / WS-B Trap 3: domain-separation version prepended to the
     ///         RAW publish/update ACK preimage (`abi.encodePacked`, later wrapped by
@@ -451,6 +456,14 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     ///      invariant was violated. Update cannot proceed without knowing
     ///      the CG because the CG value ledger needs the target cgId.
     error MissingContextGraphBinding(uint256 kaId);
+
+    /// @dev G-7: a CG value-write (extend / update delta) targeted a context graph
+    ///      that has been deactivated (e.g. swept via `sweepContextGraphEscrow`).
+    ///      Writing value to it would re-strand sampling weight onto an inactive CG
+    ///      — which `RandomSampling._pickWeightedChallengeFull` treats as a draw
+    ///      miss that burns a retry — and would brick the admin re-sweep. A retired
+    ///      CG must stay retired.
+    error CannotWriteValueToInactiveContextGraph(uint256 contextGraphId);
 
     /// @notice OT-RFC-53: CG registration escrow spent to fund publishing.
     event RegistrationEscrowConsumed(uint256 indexed contextGraphId, uint96 amount);
@@ -956,6 +969,10 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         // publish window already wrote its diff that retracts at the original
         // endEpoch as designed.
         if (epochs > 0 && tokenAmount > 0 && cgId != 0) {
+            // G-7: never re-strand sampling weight onto a deactivated CG.
+            if (!contextGraphStorage.isContextGraphActive(cgId)) {
+                revert CannotWriteValueToInactiveContextGraph(cgId);
+            }
             contextGraphValueStorage.addCGValueForEpochRange(
                 cgId,
                 uint256(endEpoch),
@@ -1734,6 +1751,10 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         // when delta > 0, so by here either delta > 0 AND remainingEpochs > 0,
         // or delta == 0 and we short-circuit).
         if (deltaTokenAmount > 0) {
+            // G-7: never re-strand sampling weight onto a deactivated CG.
+            if (!contextGraphStorage.isContextGraphActive(contextGraphId)) {
+                revert CannotWriteValueToInactiveContextGraph(contextGraphId);
+            }
             // Write the delta CG value over the REMAINING lifetime so the
             // per-epoch contribution crystallizes into the CG value cumulative
             // the same way a fresh publish does. Retraction diff lands at

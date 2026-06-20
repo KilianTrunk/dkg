@@ -634,13 +634,14 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
     ) internal view returns (uint256 kaId, uint256 chunkId, bool found) {
         // Eligibility check on the DRAWN CG only (1 SLOAD, not the legacy O(N) scan): a CG
         // whose `active` flag is false must never be challenged. Treated as a miss so the
-        // caller excludes it and re-draws. Defense-in-depth for Invariant 2 — a deactivated
-        // CG's leaf can stay nonzero until the (deferred) deactivation hook zeros it, and
-        // `deactivateContextGraph` has no production callers today, so this is the gate.
-        // NB: if deactivation is ever wired up, leaf-zeroing becomes MANDATORY, not a backstop —
-        // >MAX_CG_RETRIES deactivated-but-weighted CGs would each consume a retry and could
-        // exhaust the budget, reverting the draw even while active CGs exist (the legacy
-        // pre-filter scan could not starve this way). See RFC Invariant 2.
+        // caller excludes it and re-draws. Defense-in-depth for Invariant 2, kept as a
+        // BACKSTOP rather than the primary guard. Deactivation is now wired
+        // (`ContextGraphs.sweepContextGraphEscrow`), but it only fires at `value == 0`, where
+        // settle has already driven the leaf to 0; and the CG value-write paths
+        // (`KnowledgeAssetsLifecycle.extendKnowledgeAssetLifetime` / `update`) are gated on
+        // `isContextGraphActive` (audit G-7), so a deactivated CG can no longer be re-stranded
+        // with weight. The >MAX_CG_RETRIES deactivated-but-weighted starvation this miss path
+        // would otherwise allow is therefore unreachable in production. See RFC Invariant 2.
         if (!contextGraphStorage.isContextGraphActive(chosenCg)) return (0, 0, false);
 
         // Step 2 — pick a challengeable KA inside `chosenCg` (bounded resampling), then a leaf.

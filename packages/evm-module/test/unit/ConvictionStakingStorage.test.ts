@@ -24,6 +24,7 @@ const THREE_AND_HALF_X = (35n * SCALE18) / 10n;
 const SIX_X = 6n * SCALE18;
 
 const DAY = 24n * 60n * 60n;
+const HALF_DAY = 12n * 60n * 60n;
 const TIER_DURATIONS: Record<number, bigint> = {
   0: 0n,
   1: 30n * DAY,
@@ -32,10 +33,10 @@ const TIER_DURATIONS: Record<number, bigint> = {
   12: 366n * DAY,
 };
 
-const EXPIRY_BUCKET_SECONDS = DAY;
+const EXPIRY_BUCKET_SECONDS = HALF_DAY;
 
 // D26 — timestamp accounting: no BLOCK_DRIFT_BUFFER padding, no epoch rounding.
-// Boost expiries are rounded up to daily buckets for queue DoS hardening.
+// Boost expiries are rounded up to half-day buckets for queue DoS hardening.
 
 async function latestTimestamp(): Promise<bigint> {
   return BigInt(await time.latest());
@@ -141,7 +142,7 @@ describe('@unit ConvictionStakingStorage', () => {
       expect(pos.migrationEpoch).to.equal(0);
     });
 
-    it('Tier-12 position: expiryTimestamp = next daily bucket after block.ts + 366d, full boost in running stake, drop at expiry', async () => {
+    it('Tier-12 position: expiryTimestamp = next half-day bucket after block.ts + 366d, full boost in running stake, drop at expiry', async () => {
       const tx = await ConvictionStakingStorage.createPosition(1, ALICE_ID, 1000, 12, 0, 0);
       await tx.wait();
       const tsNow = await latestTimestamp();
@@ -182,7 +183,7 @@ describe('@unit ConvictionStakingStorage', () => {
       ).to.equal(1000n);
     });
 
-    it('Fractional tier 1.5x (lock=1): raw 2000 → boost 1000, drop at the daily bucket after +30d', async () => {
+    it('Fractional tier 1.5x (lock=1): raw 2000 → boost 1000, drop at the half-day bucket after +30d', async () => {
       await ConvictionStakingStorage.createPosition(1, ALICE_ID, 2000, 1, 0, 0);
       const tsNow = await latestTimestamp();
       const expectedExpiry = expectedExpiryFrom(tsNow, 1);
@@ -208,7 +209,7 @@ describe('@unit ConvictionStakingStorage', () => {
       ).to.equal(2000n);
     });
 
-    it('Fractional tier 3.5x (lock=6): raw 2000 → boost 5000, drop at the daily bucket after +180d', async () => {
+    it('Fractional tier 3.5x (lock=6): raw 2000 → boost 5000, drop at the half-day bucket after +180d', async () => {
       await ConvictionStakingStorage.createPosition(1, ALICE_ID, 2000, 6, 0, 0);
       const tsNow = await latestTimestamp();
       const expectedExpiry = expectedExpiryFrom(tsNow, 6);
@@ -289,11 +290,11 @@ describe('@unit ConvictionStakingStorage', () => {
         await ConvictionStakingStorage.getNodeExpiryDrop(ALICE_ID, expectedExpiry),
       ).to.equal(boostDrop(300n, SIX_X));
     });
-    it('Coalesces same-day expiries and caps distinct pending expiry slots per node', async function () {
+    it('Coalesces same-bucket expiries and caps distinct pending expiry slots per node', async function () {
       this.timeout(120_000);
 
       const longTier = 24;
-      const longDuration = 1000n * DAY;
+      const longDuration = 2000n * DAY;
       await ConvictionStakingStorage.addTier(longTier, longDuration, TWO_X);
 
       const maxPending = await ConvictionStakingStorage.MAX_NODE_PENDING_EXPIRIES();
@@ -637,7 +638,7 @@ describe('@unit ConvictionStakingStorage', () => {
       const pos = await ConvictionStakingStorage.getPosition(1);
       expect(pos.lockTier).to.equal(newTier);
       expect(pos.multiplier18).to.equal(newMult);
-      // Expected expiry = next daily bucket after ts + 2 years.
+      // Expected expiry = next half-day bucket after ts + 2 years.
       const tsNow = await latestTimestamp();
       expect(pos.expiryTimestamp).to.equal(bucketExpiry(tsNow + newDuration));
     });

@@ -31,9 +31,13 @@ const TWO_X = 2n * SCALE18;
 const THREE_AND_HALF_X = (35n * SCALE18) / 10n;
 const SIX_X = 6n * SCALE18;
 const DAY = 24n * 60n * 60n;
+const EXPIRY_BUCKET_SECONDS = 12n * 60n * 60n;
 
 function bucketExpiry(rawExpiry: bigint): bigint {
-  return ((rawExpiry + DAY - 1n) / DAY) * DAY;
+  return (
+    ((rawExpiry + EXPIRY_BUCKET_SECONDS - 1n) / EXPIRY_BUCKET_SECONDS) *
+    EXPIRY_BUCKET_SECONDS
+  );
 }
 
 type Fixture = {
@@ -554,7 +558,7 @@ describe('@unit DKGStakingConvictionNFT', () => {
       const txReceipt = await tx.wait();
       const txBlock = await hre.ethers.provider.getBlock(txReceipt!.blockHash);
       const relockTs = BigInt(txBlock!.timestamp);
-      // Tier 12 boost expires on the next daily bucket after 366 days.
+      // Tier 12 boost expires on the next half-day bucket after 366 days.
       const expectedExpiryTs = bucketExpiry(relockTs + 366n * DAY);
 
       await expect(tx).to.emit(NFT, 'PositionRelocked').withArgs(1n, newTokenId, 12);
@@ -615,7 +619,7 @@ describe('@unit DKGStakingConvictionNFT', () => {
       const receipt = await tx.wait();
       const txBlock = await hre.ethers.provider.getBlock(receipt!.blockHash);
       const relockTs = BigInt(txBlock!.timestamp);
-      // D26: tier 6 commits at least 180 days of boost, rounded to the next daily bucket.
+      // D26: tier 6 commits at least 180 days of boost, rounded to the next half-day bucket.
       const expectedExpiryTs = bucketExpiry(relockTs + 180n * DAY);
       const pos = await ConvictionStakingStorageContract.getPosition(newTokenId);
       expect(pos.expiryTimestamp).to.equal(expectedExpiryTs);

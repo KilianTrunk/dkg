@@ -38,11 +38,15 @@ import {
 const SCALE18 = 10n ** 18n;
 const SIX_X = 6n * SCALE18;
 const DAY = 24n * 60n * 60n;
+const EXPIRY_BUCKET_SECONDS = 12n * 60n * 60n;
 const TIER12_DURATION = 366n * DAY;
 const CREDIT_SECONDS = 70n * DAY; // configurable, < tier-6 (180d) cap
 
 function bucketExpiry(rawExpiry: bigint): bigint {
-  return ((rawExpiry + DAY - 1n) / DAY) * DAY;
+  return (
+    ((rawExpiry + EXPIRY_BUCKET_SECONDS - 1n) / EXPIRY_BUCKET_SECONDS) *
+    EXPIRY_BUCKET_SECONDS
+  );
 }
 
 type Fixture = {

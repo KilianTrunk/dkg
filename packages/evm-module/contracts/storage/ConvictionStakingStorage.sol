@@ -49,9 +49,9 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
  *     `lockTier` id). The baseline ladder seeded at `initialize()` is
  *     {0→(0s, 1x), 1→(30d, 1.5x), 3→(90d, 2x), 6→(180d, 3.5x), 12→(366d, 6x)}.
  *   - `expiryTimestamp = block.timestamp + duration`, rounded UP to the
- *     next daily expiry bucket. The upward rounding keeps the promised
+ *     next 12-hour expiry bucket. The upward rounding keeps the promised
  *     minimum lock duration while coalescing per-block dust stakes into
- *     one queue slot per day.
+ *     one queue slot per half-day.
  *   - New tiers can be appended via `addTier` (HubOwner or multisig owner).
  *     Existing tiers can be deactivated via `deactivateTier` to stop
  *     accepting NEW fresh stakes, but relock / migration paths still
@@ -146,8 +146,9 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     //           * `createNewPositionFromExisting` migrates carries across
     //             the relock burn-mint; `deletePosition` deletes them.
     //   10.0.5 — Expiry-queue DoS hardening:
-    //           * Boost expiries are rounded up to daily buckets so per-block
-    //             dust stakes coalesce into one queue slot per day.
+    //           * Boost expiries are rounded up to 12-hour buckets so
+    //             per-block dust stakes coalesce into one queue slot per
+    //             half-day.
     //           * New distinct expiry slots are capped per node; same-bucket
     //             stakes keep coalescing even when the cap is reached.
     string private constant _VERSION = "10.0.5";
@@ -156,8 +157,8 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     // (returns 1e18-scaled values so fractional tiers like 1.5x and 3.5x
     // are representable).
     uint256 internal constant SCALE18 = 1e18;
-    uint40 public constant EXPIRY_BUCKET_SECONDS = 1 days;
-    uint256 public constant MAX_NODE_PENDING_EXPIRIES = 512;
+    uint40 public constant EXPIRY_BUCKET_SECONDS = 12 hours;
+    uint256 public constant MAX_NODE_PENDING_EXPIRIES = 1024;
 
     // ============================================================
     //                 D20 — Mutable tier ladder
@@ -723,9 +724,9 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     /// --------------------------------------------------------
     /// The `while` terminates as soon as `t > ts` or `head == len`.
     /// Entries are only added through `_scheduleNodeExpiry`, and fresh
-    /// lock expiries are rounded UP to daily buckets before they reach
+    /// lock expiries are rounded UP to 12-hour buckets before they reach
     /// the queue. A per-block dust-stake stream therefore coalesces into
-    /// one slot per day, not one slot per block.
+    /// one slot per half-day, not one slot per block.
     ///
     /// `_scheduleNodeExpiry` also refuses to create a new distinct slot
     /// once `MAX_NODE_PENDING_EXPIRIES` pending slots are live for a node.
@@ -736,7 +737,7 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     /// Work is amortized once: each array slot is visited by exactly one
     /// `_settleNodeTo` call across the contract's lifetime. In steady state
     /// `submitProof` drains the queue continuously; after dormancy, the
-    /// daily bucket + pending-slot cap keeps the catch-up loop bounded.
+    /// 12-hour bucket + pending-slot cap keeps the catch-up loop bounded.
     ///
     /// INVARIANTS MAINTAINED ON EXIT
     /// -----------------------------
@@ -1632,7 +1633,7 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
 
     /**
      * @dev Wall-clock expiry computation (D26). Boosts last at least the tier
-     *      duration and expire on the next daily bucket. Returns 0 for tier-0
+     *      duration and expire on the next 12-hour bucket. Returns 0 for tier-0
      *      (permanent rest state).
      */
     function _computeExpiryTimestamp(uint40 lockTier) internal view returns (uint40) {

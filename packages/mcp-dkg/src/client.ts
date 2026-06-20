@@ -51,11 +51,17 @@ export interface DkgClientOptions {
 
 const CONTEXT_GRAPH_URI_PREFIX = 'did:dkg:context-graph:';
 
-function normalizeContextGraphId(contextGraphIdOrUri: string): string {
-  const trimmed = contextGraphIdOrUri.trim();
-  return trimmed.startsWith(CONTEXT_GRAPH_URI_PREFIX)
-    ? trimmed.slice(CONTEXT_GRAPH_URI_PREFIX.length)
-    : trimmed;
+export function normalizeContextGraphId(contextGraphIdOrUri: string): string {
+  // Idempotent: strip EVERY leading DID prefix and any trailing slash(es).
+  // Consumers that re-normalize (e.g. the wire scope AND a downstream
+  // provenance anchor) must converge on the same id even for malformed input
+  // like a double-prefixed or trailing-slash value — otherwise the two derive
+  // different context-graph ids and silently disagree.
+  let s = contextGraphIdOrUri.trim();
+  while (s.startsWith(CONTEXT_GRAPH_URI_PREFIX)) {
+    s = s.slice(CONTEXT_GRAPH_URI_PREFIX.length);
+  }
+  return s.replace(/\/+$/, '');
 }
 
 function optionalContextGraphId(contextGraphIdOrUri: string | undefined): string | undefined {

@@ -33,10 +33,29 @@ describe('dkg_get_entity_sources', () => {
     const result = await server.call('dkg_get_entity_sources', { uri: 'urn:x:1' });
     expect(result.isError).toBeFalsy();
     const call = client.queryCalls.at(-1)!;
-    expect(String(call.sparql)).toContain('GRAPH ?g');
+    // Assert the FULL addressed-read shape, not just a `GRAPH ?g` substring —
+    // one entity, projects p/o/g, no widening or extra patterns.
+    expect(String(call.sparql)).toContain('SELECT ?p ?o ?g WHERE { GRAPH ?g { <urn:x:1> ?p ?o } }');
     expect(call.view).toBe('verifiable-memory');
+    expect(call.contextGraphId).toBe('test-cg');
     // Never the WM∪SWM union path (that would duplicate every sourced row).
     expect(call.includeSharedMemory).toBeUndefined();
+  });
+
+  it('normalizes a full-DID project id so per-KA graphs still attribute', async () => {
+    // The client accepts/normalizes `did:dkg:context-graph:<id>`; the anchor
+    // must use the same normalized id or every per-KA graph reads unattributed.
+    const server = new FakeServer();
+    const client = new FakeClient({
+      query: async () => ({ bindings: [{ p: 'http://schema.org/name', o: '"X"', g: VM('0xaa', '7') }] }),
+    });
+    registerReadTools(server.asMcpServer(), client.asDkgClient(), makeConfig());
+    const result = await server.call('dkg_get_entity_sources', {
+      uri: 'urn:x:1',
+      projectId: 'did:dkg:context-graph:test-cg',
+    });
+    expect(result.content[0].text).toContain('0xaa/7'); // attributed despite DID-form id
+    expect(client.queryCalls.at(-1)!.contextGraphId).toBe('test-cg');
   });
 
   it('attributes facts to KA sources, collapses the root duplicate, and discloses unattributed facts', async () => {
@@ -153,6 +172,20 @@ describe('dkg_get_entity_sources', () => {
     const text = result.content[0].text;
     expect(text).not.toContain('KA `0xaa/1`');
     expect(text).toMatch(/No KA-attributable facts/);
+  });
+
+  it('forwards subGraphName and attributes a sub-graph-scoped per-KA source', async () => {
+    const server = new FakeServer();
+    const client = new FakeClient({
+      query: async () => ({
+        bindings: [{ p: 'http://schema.org/name', o: '"sub-name"', g: `did:dkg:context-graph:${CG}/decisions/_verifiable_memory/0xaa/7` }],
+      }),
+    });
+    registerReadTools(server.asMcpServer(), client.asDkgClient(), makeConfig());
+    const result = await server.call('dkg_get_entity_sources', { uri: 'urn:x:1', subGraphName: 'decisions' });
+    expect(client.queryCalls.at(-1)!.subGraphName).toBe('decisions');
+    // The sub-graph segment between cgId and the layer slug still attributes.
+    expect(result.content[0].text).toContain('0xaa/7');
   });
 
   it('rejects an injection-shaped entity URI before querying', async () => {

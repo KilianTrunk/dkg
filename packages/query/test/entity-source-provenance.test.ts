@@ -65,4 +65,25 @@ describe('addressed-read provenance — scoped GRAPH ?g over one entity', () => 
     expect(graphs.every((g) => g.startsWith('did:dkg:context-graph:cg-one'))).toBe(true);
     expect(graphs.some((g) => g.includes('_meta'))).toBe(false);
   });
+
+  it('a shared-working-memory read binds only SWM partitions — no _verifiable_memory or root', async () => {
+    // The tool frames SWM sources as DRAFT (not on-chain). That is only safe
+    // because a SWM-view read cannot bleed in published VM / root rows; pin it.
+    const store = new OxigraphStore();
+    const engine = new DKGQueryEngine(store);
+    await store.insert([
+      q(E, NAME, '"swm-draft"', 'did:dkg:context-graph:cg-one/_shared_memory/0xaa/1'),
+      q(E, COLOR, '"vm-published"', 'did:dkg:context-graph:cg-one/_verifiable_memory/0xbb/2'),
+      q(E, 'http://schema.org/shape', '"rooted"', 'did:dkg:context-graph:cg-one'),
+    ]);
+    const r = await engine.query(
+      `SELECT ?o ?g WHERE { GRAPH ?g { <${E}> ?p ?o } }`,
+      { contextGraphId: 'cg-one', view: 'shared-working-memory' },
+    );
+    const objects = r.bindings.map((b) => b['o']);
+    expect(objects).toContain('"swm-draft"');
+    expect(objects).not.toContain('"vm-published"');
+    expect(objects).not.toContain('"rooted"');
+    expect(r.bindings.every((b) => b['g'].includes('/_shared_memory/'))).toBe(true);
+  });
 });

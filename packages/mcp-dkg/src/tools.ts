@@ -16,6 +16,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { DkgClient, ProjectRow } from './client.js';
+import { normalizeContextGraphId } from './client.js';
 import type { DkgConfig } from './config.js';
 import {
   NS,
@@ -380,6 +381,12 @@ SELECT DISTINCT ?s ?p WHERE { ?s ?p <${uri}> } LIMIT 50`,
     async ({ uri, projectId, view, subGraphName }): Promise<ToolResult> => {
       const pid = resolveProject(projectId, config);
       if (!pid) return projectErr();
+      // The client accepts a full `did:dkg:context-graph:<id>` and normalises it
+      // for the wire query, so the returned graphs are keyed by the bare id.
+      // Anchor parseEntitySource on the SAME normalised id (and scope the query
+      // with it), or a DID-form pid would double-prefix and mark every per-KA
+      // graph unattributed.
+      const cgId = normalizeContextGraphId(pid);
       const safeIri = uri.replace(/^<|>$/g, '');
       // Guard the IRI interpolation: reject anything that could break out of
       // the `<…>` term. (A SPARQL injection here would let a caller widen the
@@ -398,13 +405,13 @@ SELECT DISTINCT ?s ?p WHERE { ?s ?p <${uri}> } LIMIT 50`,
         const result = await client.query({
           sparql: `${PREFIXES}
 SELECT ?p ?o ?g WHERE { GRAPH ?g { <${safeIri}> ?p ?o } }`,
-          contextGraphId: pid,
+          contextGraphId: cgId,
           subGraphName,
           view: scopeView,
         });
         const rows = result.bindings ?? [];
         if (!rows.length) {
-          return ok(`No facts found for <${safeIri}> in '${pid}' (view=${scopeView}).`);
+          return ok(`No facts found for <${safeIri}> in '${cgId}' (view=${scopeView}).`);
         }
         // A VM/SWM read binds MORE than per-KA partitions: the root context
         // graph, per-collection `/context/{id}` graphs, and the SWM bucket also
@@ -426,8 +433,8 @@ SELECT ?p ?o ?g WHERE { GRAPH ?g { <${safeIri}> ?p ?o } }`,
         for (const b of rows) {
           const p = bindingValue(b.p);
           const o = bindingValue(b.o);
-          const src = parseEntitySource(bindingValue(b.g), pid);
-          const key = `${p} ${o}`;
+          const src = parseEntitySource(bindingValue(b.g), cgId);
+          const key = JSON.stringify([p, o]);
           const fact = facts.get(key) ?? { p, o, ka: [] };
           if (src.author && src.kaNumber) {
             if (!fact.ka.some((s) => s.sourceGraph === src.sourceGraph)) fact.ka.push(src);
@@ -440,7 +447,7 @@ SELECT ?p ?o ?g WHERE { GRAPH ?g { <${safeIri}> ?p ?o } }`,
 
         if (!attributed.length) {
           return ok(
-            `No KA-attributable facts for <${safeIri}> in '${pid}' (view=${scopeView}). ` +
+            `No KA-attributable facts for <${safeIri}> in '${cgId}' (view=${scopeView}). ` +
               `${unattributed.length} fact(s) are present only in non-per-KA graphs ` +
               `(root / reconcile / bucket), which do not encode a citable KA identity.`,
           );

@@ -14,6 +14,7 @@ import {
   ConvictionStakingStorage,
   ContextGraphs,
   ContextGraphStorage,
+  ContextGraphValueStorage,
   DKGPublishingConvictionNFT,
   DKGStakingConvictionNFT,
   EpochStorage,
@@ -1533,16 +1534,25 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
       .withArgs(kaId, setup.creator.address, nonOwner.address);
   });
 
-  it('G-7: a paid update on a DEACTIVATED CG reverts CannotWriteValueToInactiveContextGraph (the _executeUpdateCore gate)', async () => {
-    // Companion to the extend-path regression in g7-inactive-cg-restrand.regression.test.ts:
-    // the update delta carries the same isContextGraphActive gate.
+  it('G-7 (guard invariant): the _executeUpdateCore value-write gate rejects a paid update to an inactive CG (inactive state seeded directly)', async () => {
+    // GUARD INVARIANT (low-level). The _executeUpdateCore value-write branch is
+    // gated on isContextGraphActive, so a paid update to an INACTIVE CG reverts
+    // regardless of HOW the CG became inactive. Here the inactive state is seeded
+    // DIRECTLY via the storage operator — a unit/corruption construction, NOT the
+    // production sweep state: sweepContextGraphEscrow REFUSES a CG with live value
+    // (see the OT-RFC-53 refusal test above), so it can never produce
+    // inactive-WITH-live-value. On the update path the inactive-CG gate is in fact
+    // defense-in-depth: the only reachable way to a sweep-inactive CG also expires
+    // every KA in it, so a real paid update is stopped by KnowledgeAssetExpired
+    // first (proven by the companion test below). Seeding the inactive state
+    // directly is therefore the only way to exercise the gate itself in isolation,
+    // which is what this test does.
     const setup = await setupRegisteredAgentPublish();
     const p = await buildBasePublishParams(setup, 'g7-update-gate'); // publishes at 1000 TRAC
     await (await KAV10.connect(setup.creator).publish(p)).wait();
     const kaId = BigInt(p.reservedKaId);
 
-    // Deactivate the (public) CG — the inactive state sweepContextGraphEscrow
-    // produces — via the storage operator (onlyContracts seeder).
+    // Seed the inactive state directly via the storage operator (onlyContracts seeder).
     const storageOperator = accounts[19];
     await HubContract.setContractAddress('TestStorageOperator', storageOperator.address);
     await (await CGS.connect(storageOperator).deactivateContextGraph(setup.cgId)).wait();
@@ -1575,6 +1585,87 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     await expect(KAV10.connect(setup.creator).update(up)).to.be.revertedWithCustomError(
       KAV10,
       'CannotWriteValueToInactiveContextGraph',
+    );
+  });
+
+  it('G-7 (reachable path): a paid update onto a sweep-retired CG is independently blocked by KnowledgeAssetExpired — the inactive-CG gate is defense-in-depth behind it', async () => {
+    // The REACHABLE retirement, and what it actually does on the UPDATE path.
+    // sweepContextGraphEscrow deactivates a CG ONLY after its published value has
+    // decayed to zero (it settles the sampling leaf and REFUSES while
+    // getCurrentCGValue != 0 — the OT-RFC-53 refusal above). But "CG value == 0"
+    // means EVERY KA in the CG has expired, so on the update path a paid update is
+    // independently rejected by KnowledgeAssetExpired BEFORE _executeUpdateCore's
+    // value-write branch (hence the inactive-CG gate) is ever reached. That gate is
+    // therefore defense-in-depth on the update path — exercised in isolation by the
+    // guard-invariant test above, and reachably exercised on the EXTEND path (which
+    // CAN revive an expired KA) by g7-inactive-cg-restrand.regression.test.ts. This
+    // test pins the real, reachable sequence end-to-end: publish -> live-value sweep
+    // refused -> value expiry -> sweep retires the CG -> paid update reverts
+    // KnowledgeAssetExpired.
+    const Params = await hre.ethers.getContract<ParametersStorage>('ParametersStorage');
+    const CGVS = await hre.ethers.getContract<ContextGraphValueStorage>(
+      'ContextGraphValueStorage',
+    );
+    const deposit = ethers.parseEther('2000');
+    await Params.connect(accounts[0]).setContextGraphRegistrationDeposit(deposit);
+
+    const creator = getDefaultKACreator(accounts);
+    await Token.mint(creator.address, deposit);
+    await Token.connect(creator).approve(await CGFacade.getAddress(), deposit);
+
+    const setup = await setupRegisteredAgentPublish();
+    const p = await buildBasePublishParams(setup, 'g7-sweep-reachable'); // 1000 TRAC, setup.epochs lifetime
+    await (await KAV10.connect(setup.creator).publish(p)).wait();
+    const kaId = BigInt(p.reservedKaId);
+    expect(await CGS.getRegistrationEscrow(setup.cgId)).to.equal(
+      deposit - ethers.parseEther('1000'),
+    );
+
+    // While the published value is live, sweep is REFUSED — this is exactly why
+    // the direct-deactivation state in the guard-invariant test is unreachable.
+    await expect(
+      CGFacade.connect(accounts[0]).sweepContextGraphEscrow(setup.cgId),
+    ).to.be.revertedWithCustomError(CGFacade, 'InvalidContextGraphConfig');
+    expect(await CGS.isContextGraphActive(setup.cgId)).to.equal(true);
+
+    // Let the published value expire so the CG becomes genuinely sweepable.
+    const epochLength = await Chronos.epochLength();
+    await time.increase(Number(epochLength) * (setup.epochs + 1));
+    expect(await CGVS.getCurrentCGValue(setup.cgId)).to.equal(0n);
+
+    // The REAL retirement path now succeeds: sweep settles the (zero) leaf and
+    // deactivates the CG, leaving exactly the inactive state production produces.
+    await (await CGFacade.connect(accounts[0]).sweepContextGraphEscrow(setup.cgId)).wait();
+    expect(await CGS.isContextGraphActive(setup.cgId)).to.equal(false);
+
+    // Fund a direct-spend paid update (post-expiry the PCA discount is gone), so
+    // the revert can only be the inactive-CG gate, not a funding shortfall.
+    await Token.mint(setup.creator.address, ethers.parseEther('2000'));
+    await Token.connect(setup.creator).approve(
+      await KAV10.getAddress(),
+      ethers.parseEther('2000'),
+    );
+
+    const up = await buildUpdateParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes: setup.receivingNodes,
+      publisherIdentityId: setup.publisherIdentityId,
+      receiverIdentityIds: setup.receiverIdentityIds,
+      contextGraphId: setup.cgId,
+      id: kaId,
+      preUpdateMerkleRootCount: 1n,
+      newMerkleRoot: ethers.keccak256(ethers.toUtf8Bytes('g7-sweep-reachable-new')),
+      newByteSize: 1000n,
+      newTokenAmount: ethers.parseEther('1001'), // positive delta => value-write branch
+      mintKnowledgeAssetsAmount: 0n,
+      knowledgeAssetsToBurn: [],
+      updateOperationId: 'g7-sweep-reachable-op',
+      author: setup.creator,
+    });
+    await expect(KAV10.connect(setup.creator).update(up)).to.be.revertedWithCustomError(
+      KAV10,
+      'KnowledgeAssetExpired',
     );
   });
 

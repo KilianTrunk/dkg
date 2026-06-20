@@ -34,8 +34,8 @@ log() { echo "[agents-meta] $*"; }
 ok()  { echo "[agents-meta]   PASS: $*"; PASS=$((PASS+1)); }
 bad() { echo "[agents-meta]   FAIL: $*" >&2; FAIL=$((FAIL+1)); }
 
-node_token() { grep -v '^#' "$DEVNET_DIR/node$1/auth.token" 2>/dev/null | tr -d '[:space:]'; }
-node_port()  { echo $((API_PORT_BASE + $1 - 1)); }
+# shared node auth / HTTP / JSON helpers (node_token, node_port, api, field, …)
+. "$REPO_ROOT/scripts/devnet-lib.sh" || { echo "[agents-meta] FATAL: cannot source devnet-lib.sh" >&2; exit 2; }
 
 qcount() { # node graph -> integer count ("" on error)
   local n="$1" g="$2" port token

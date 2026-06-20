@@ -39,24 +39,11 @@ ok()   { echo "[seal-decouple]   PASS: $*"; PASS=$((PASS+1)); }
 bad()  { echo "[seal-decouple]   FAIL: $*" >&2; FAIL=$((FAIL+1)); }
 act()  { echo; echo "[seal-decouple] === $* ==="; }
 
-node_token() { grep -v '^#' "$DEVNET_DIR/node$1/auth.token" 2>/dev/null | tr -d '[:space:]'; }
-node_port()  { echo $((API_PORT_BASE + $1 - 1)); }
-
-# field <json> <dot.path>  -> value (objects/arrays stringified), "" if missing
-field() { J="$2" node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>{let j;try{j=JSON.parse(d)}catch(e){process.stdout.write("");return}let v=j;for(const k of process.env.J.split("."))v=(v==null?undefined:v[k]);process.stdout.write(v==null?"":(typeof v==="object"?JSON.stringify(v):String(v)))})' <<<"$1"; }
-
-# api <node> <METHOD> <path> [body]  -> stdout: "<httpcode>\n<body>"
-api() {
-  local n="$1" m="$2" p="$3" b="${4:-}" port token tmp code
-  port=$(node_port "$n"); token=$(node_token "$n"); tmp="$(mktemp "$TMPDIR/seal-dc-XXXXXX")"
-  local -a a=(-sS --max-time 180 --connect-timeout 5 -o "$tmp" -w '%{http_code}' -X "$m"
-    -H "Authorization: Bearer $token" -H 'Content-Type: application/json')
-  [ -n "$b" ] && a+=(--data "$b")
-  code=$(curl "${a[@]}" "http://127.0.0.1:${port}${p}" 2>/dev/null || echo 000)
-  printf '%s\n' "$code"; cat "$tmp"; rm -f "$tmp"
-}
-code_of() { printf '%s' "$1" | head -1; }
-body_of() { printf '%s' "$1" | tail -n +2; }
+# Shared node auth / HTTP / JSON helpers: node_token, node_port, api, code_of,
+# body_of, field. Keep this suite's 180s api timeout (publish/finalize can be slow).
+# shellcheck disable=SC2034  # consumed by api() inside the sourced devnet-lib.sh
+DKG_API_MAXTIME=180
+. "$REPO_ROOT/scripts/devnet-lib.sh" || { echo "[seal-decouple] FATAL: cannot source devnet-lib.sh" >&2; exit 2; }
 # req_ok <label> <node> <METHOD> <path> [body] — api + assert HTTP 200, else bad()
 # with the failing operation's label/body (so a broken setup step surfaces HERE,
 # not later as a misleading share/finalize failure).

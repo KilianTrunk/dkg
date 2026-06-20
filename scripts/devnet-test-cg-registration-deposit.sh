@@ -45,7 +45,8 @@ bad() { echo "[cg-deposit]   FAIL: $*" >&2; FAIL=$((FAIL+1)); }
 act() { echo; echo "[cg-deposit] === $* ==="; }
 
 call() { node "$CHAIN_CALL" "$@" 2>&1; }
-field() { J="$2" node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>{let j;try{j=JSON.parse(d)}catch(e){process.stdout.write("");return}let v=j;for(const k of process.env.J.split("."))v=(v==null?undefined:v[k]);process.stdout.write(v==null?"":String(v))})' <<<"$1"; }
+# shared field() (+ node auth / HTTP helpers, unused here) from the devnet lib
+. "$REPO_ROOT/scripts/devnet-lib.sh" || { echo "[cg-deposit] FATAL: cannot source devnet-lib.sh" >&2; exit 2; }
 
 # create + on-chain register a CG via the node's daemon; echoes the numeric on-chain id
 create_register_cg() {

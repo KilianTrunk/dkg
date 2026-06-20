@@ -52,22 +52,12 @@ END_EPOCH=$(( START_EPOCH + DURATION_SECONDS ))
 
 log() { local m="[$(date '+%H:%M:%S')] $*"; echo "$m"; echo "$m" >> "$LOG"; }
 
-node_token() { grep -v '^#' "$DEVNET_DIR/node$1/auth.token" 2>/dev/null | tr -d '[:space:]'; }
-node_port()  { echo $((API_PORT_BASE + $1 - 1)); }
-
-# api <node> <METHOD> <path> [body] -> stdout "<httpcode>\n<body>"
-api() {
-  local n="$1" m="$2" p="$3" b="${4:-}" port token tmp code
-  port=$(node_port "$n"); token=$(node_token "$n"); tmp="$(mktemp "${TMPDIR:-/tmp}/soak-XXXXXX")"
-  local -a a=(-sS --max-time 90 --connect-timeout 5 -o "$tmp" -w '%{http_code}' -X "$m"
-    -H "Authorization: Bearer $token" -H 'Content-Type: application/json')
-  [ -n "$b" ] && a+=(--data "$b")
-  code=$(curl "${a[@]}" "http://127.0.0.1:${port}${p}" 2>/dev/null || echo 000)
-  printf '%s\n' "$code"; cat "$tmp" 2>/dev/null; rm -f "$tmp"
-}
-code_of() { printf '%s' "$1" | head -1; }
-body_of() { printf '%s' "$1" | tail -n +2; }
-jget() { J="$2" node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>{let j;try{j=JSON.parse(d)}catch(e){process.stdout.write("");return}let v=j;for(const k of process.env.J.split("."))v=(v==null?undefined:v[k]);process.stdout.write(v==null?"":String(v))})' <<<"$1"; }
+# Shared node auth / HTTP / JSON helpers (node_token, node_port, api, code_of,
+# body_of, field). Keep the soak's lighter 90s api timeout.
+# shellcheck disable=SC2034  # consumed by api() inside the sourced devnet-lib.sh
+DKG_API_MAXTIME=90
+. "$REPO_ROOT/scripts/devnet-lib.sh" || { echo "FATAL: cannot source devnet-lib.sh" >&2; exit 2; }
+jget() { field "$@"; }   # back-compat alias for this script's existing call sites
 
 # free system memory %, macOS (memory_pressure) then Linux (/proc/meminfo), with
 # a safe constant only as a last resort. Without the Linux branch the governor is

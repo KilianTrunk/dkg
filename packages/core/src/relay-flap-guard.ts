@@ -139,7 +139,10 @@ export class RelayFlapGuard {
     const key = pairKey(input.relayPeerId, input.remotePeerId);
     const existing = this.pairs.get(key);
     if (input.durationMs >= this.options.shortCloseMs) {
-      if (existing) this.prune(existing, now);
+      if (existing) {
+        this.prune(existing, now);
+        this.evictIfIdle(key, existing, now);
+      }
       return {
         shortClose: false,
         shortCloseCount: existing?.shortCloseTimes.length ?? 0,
@@ -205,11 +208,15 @@ export class RelayFlapGuard {
     now?: number;
   }): RelayFlapDenyResult {
     const now = input.now ?? Date.now();
-    const state = this.pairs.get(pairKey(input.relayPeerId, input.remotePeerId));
+    const key = pairKey(input.relayPeerId, input.remotePeerId);
+    const state = this.pairs.get(key);
     if (!state) return { deny: false, shouldLog: false };
 
     if (state.quarantineUntil <= now) {
+      // Quarantine lapsed — prune stale closes, and if the pair now carries no
+      // useful state, evict it so the map stays bounded on long-lived nodes.
       this.prune(state, now);
+      this.evictIfIdle(key, state, now);
       return { deny: false, shouldLog: false };
     }
 
@@ -266,4 +273,77 @@ export class RelayFlapGuard {
     const cutoff = now - this.options.windowMs;
     state.shortCloseTimes = state.shortCloseTimes.filter((ts) => ts >= cutoff);
   }
+
+  /**
+   * Drop a pair from the tracking map once it carries no useful state — no
+   * in-window short closes AND no active quarantine. Without this the map grows
+   * without bound on long-lived nodes that see many transient relayed peers,
+   * and stale `strikes` would inflate future quarantines via the exponential
+   * backoff. Returns true if the entry was evicted.
+   */
+  private evictIfIdle(key: string, state: RelayFlapPairState, now: number): boolean {
+    if (state.shortCloseTimes.length === 0 && state.quarantineUntil <= now) {
+      this.pairs.delete(key);
+      return true;
+    }
+    return false;
+  }
+}
+
+/**
+ * Minimal structural shape of the libp2p ConnectionGater hooks this guard
+ * implements. Kept structural (`{ toString(): string }`) so the gater can be
+ * unit-tested without importing libp2p's PeerId/Multiaddr types — the module
+ * stays a dependency-free, pure state machine.
+ */
+export interface RelayFlapConnectionGater {
+  denyInboundRelayedConnection(relay: { toString(): string }, remotePeer: { toString(): string }): boolean;
+  denyDialMultiaddr(multiaddr: { toString(): string }): boolean;
+}
+
+/**
+ * Build the libp2p connection-gater hooks that enforce a `RelayFlapGuard`.
+ * Extracted as a pure function so the WIRING (not just the guard) is testable:
+ * a regression in the hook arg-shapes or guard plumbing fails a unit test
+ * rather than silently leaving the guard inert in production.
+ *
+ * NOTE on `denyDialMultiaddr`: libp2p (>=3.x / @libp2p/interface 3.x) invokes
+ * this hook with a SINGLE argument — the multiaddr. The remote peer id, when
+ * known, is encoded in that multiaddr as `/p2p/<id>`; `parseCircuitRelayPeerIds`
+ * pulls both the relay and remote ids out of a `/p2p-circuit` address. (Older
+ * libp2p passed `(peerId, multiaddr)` — we are NOT on that shape.)
+ */
+export function buildRelayFlapConnectionGater(
+  guard: RelayFlapGuard,
+  log: (message: string) => void = () => {},
+): RelayFlapConnectionGater {
+  const short = (id: string): string => id.slice(-8);
+  const denyRelayedPath = (
+    direction: 'inbound' | 'outbound',
+    relayPeerId: string,
+    remotePeerId: string,
+    addr?: string,
+  ): boolean => {
+    const result = guard.checkRelayedConnection({ relayPeerId, remotePeerId });
+    if (!result.deny) return false;
+    if (result.shouldLog) {
+      const remainingSeconds = Math.ceil((result.quarantineMsRemaining ?? 0) / 1000);
+      log(
+        `Relay flap guard: denying ${direction} relayed connection ` +
+        `remote=${short(remotePeerId)} relay=${short(relayPeerId)} ` +
+        `quarantineRemaining=${remainingSeconds}s${addr ? ` addr=${addr}` : ''}`,
+      );
+    }
+    return true;
+  };
+  return {
+    denyInboundRelayedConnection: (relay, remotePeer) =>
+      denyRelayedPath('inbound', relay.toString(), remotePeer.toString()),
+    denyDialMultiaddr: (multiaddr) => {
+      const addr = multiaddr.toString();
+      const parsed = parseCircuitRelayPeerIds(addr);
+      if (!parsed?.remotePeerId) return false;
+      return denyRelayedPath('outbound', parsed.relayPeerId, parsed.remotePeerId, addr);
+    },
+  };
 }

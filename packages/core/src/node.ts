@@ -21,7 +21,7 @@ import type { ConnectionTransport, DKGNodeConfig } from './types.js';
 import { DHT_PROTOCOL, DKG_GOSSIP_MAX_RPC_BYTES } from './constants.js';
 import { RelayMetricsAdapter, RELAY_V2_STOP_CODEC } from './libp2p-metrics-adapter.js';
 import { readRelayReservations, readConnectionStreams } from './relay-internal-shapes.js';
-import { RelayFlapGuard, parseCircuitRelayPeerIds } from './relay-flap-guard.js';
+import { RelayFlapGuard, parseCircuitRelayPeerIds, buildRelayFlapConnectionGater } from './relay-flap-guard.js';
 
 export interface DKGServices extends Record<string, unknown> {
   dht: KadDHT;
@@ -1416,41 +1416,14 @@ export class DKGNode {
   }
 
   private createRelayFlapConnectionGater(): ConnectionGater {
-    const short = (id: string) => id.slice(-8);
     const ts = () => new Date().toISOString();
-    const denyRelayedPath = (
-      direction: 'inbound' | 'outbound',
-      relayPeerId: string,
-      remotePeerId: string,
-      addr?: string,
-    ): boolean => {
-      const result = this.relayFlapGuard.checkRelayedConnection({
-        relayPeerId,
-        remotePeerId,
-      });
-      if (!result.deny) return false;
-
-      if (result.shouldLog) {
-        const remainingSeconds = Math.ceil((result.quarantineMsRemaining ?? 0) / 1000);
-        console.warn(
-          `[${ts()}] Relay flap guard: denying ${direction} relayed connection ` +
-          `remote=${short(remotePeerId)} relay=${short(relayPeerId)} ` +
-          `quarantineRemaining=${remainingSeconds}s${addr ? ` addr=${addr}` : ''}`,
-        );
-      }
-      return true;
-    };
-
-    return {
-      denyInboundRelayedConnection: (relay, remotePeer) =>
-        denyRelayedPath('inbound', relay.toString(), remotePeer.toString()),
-      denyDialMultiaddr: (multiaddr) => {
-        const addr = multiaddr.toString();
-        const parsed = parseCircuitRelayPeerIds(addr);
-        if (!parsed?.remotePeerId) return false;
-        return denyRelayedPath('outbound', parsed.relayPeerId, parsed.remotePeerId, addr);
-      },
-    };
+    // The gater hooks live in a pure builder (relay-flap-guard.ts) so the wiring
+    // is unit-tested (relay-flap-guard.test.ts) — a hook arg-shape or plumbing
+    // regression fails a test instead of silently leaving the guard inert.
+    return buildRelayFlapConnectionGater(
+      this.relayFlapGuard,
+      (message) => console.warn(`[${ts()}] ${message}`),
+    ) as ConnectionGater;
   }
 
   /**

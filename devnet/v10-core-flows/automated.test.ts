@@ -14,17 +14,20 @@
  *      depend on. (Caught a real bug during devnet validation: standalone
  *      `/finalize` was missing the emit. See FINDINGS.md.)
  *
- *   2. Failed-publish honesty (RC11 / PR2) — runs create+write+finalize
- *      +promote+publish from an edge daemon (no on-chain identity) so the
- *      publisher's chain-submit branch necessarily fails. Asserts the
- *      INVERSE of the old "tentative VM" contract: the publish reports
- *      failure to the caller AND `/api/query?view=verifiable-memory` returns
- *      zero rows for the just-published triples. Pre-RC11 a failed publish
- *      silently wrote its quads into the root data graph and the VM view
- *      aliased that graph into VM, so an external app would observe
- *      "verified" data that the chain had never anchored. PR2 deletes
- *      `generateTentativeMetadata` from the on-chain catch and limits VM
- *      to `_verifiable_memory/*` graphs; this test pins both halves.
+ *   2. Publish/VM honesty (RC11 / PR2) — runs create+write+finalize
+ *      +promote+publish from an edge daemon (no on-chain identity). Post-RFC-38
+ *      that edge publish has TWO legitimate outcomes: it may CONFIRM when peer
+ *      cores supply storage ACKs (attributionId=0 is valid on chain), or it may
+ *      NOT confirm. The honesty rule this test pins: a publish's triples appear
+ *      in `/api/query?view=verifiable-memory` IFF it confirmed on-chain — a
+ *      confirmed publish carries a positive kaId (asserted) and may legitimately
+ *      show in VM, while a non-confirmed publish MUST NOT leak any rows into VM,
+ *      and the caller must never see the silent `tentative` downgrade. Pre-RC11 a
+ *      non-confirmed publish silently wrote its quads into the root data graph
+ *      and the VM view aliased that graph into VM, so an external app would
+ *      observe "verified" data that the chain had never anchored. PR2 deletes
+ *      `generateTentativeMetadata` from the on-chain catch and limits VM to
+ *      `_verifiable_memory/*` graphs; this test pins all three halves.
  *
  *   3. NFT staking withdraw — `DKGStakingConvictionNFT.withdraw(tokenId)`
  *      on an unlocked tier-0 position. Verifies: TRAC delta to staker EOA
@@ -419,9 +422,9 @@ describe('1. chained sign-at-creation assertion lifecycle', () => {
   }, 60_000);
 });
 
-// ─────────────────── 2. Failed-publish honesty (RC11 / PR2) ───────────────────
-describe('2. failed publish does not leak triples into verifiable-memory (RC11 / PR2)', () => {
-  it('edge-node publish fails AND /api/query?view=verifiable-memory returns zero rows for its triples', async () => {
+// ──────────────── 2. Publish/VM honesty (RC11 / PR2) ────────────────
+describe('2. edge publish appears in verifiable-memory iff it confirmed on-chain (RC11 / PR2)', () => {
+  it('a non-confirmed edge publish leaks zero VM rows; a confirmed one carries a positive on-chain kaId', async () => {
     const assertionName = `core-flows-edge-${Date.now().toString(36)}`;
     const subject = `urn:test:edge:rc11:${Date.now().toString(36)}`;
     const witnessLiteral = `"PR2 failed-publish witness ${Date.now().toString(36)}"`;
@@ -457,16 +460,16 @@ describe('2. failed publish does not leak triples into verifiable-memory (RC11 /
       `(would re-enable verifiable-memory leak via tentative graph aliasing)`,
     ).not.toBe('tentative');
     const edgePublishStatus = r.body?.status;
+    const edgePublishKaId = r.body?.kaId;
 
-    // CORE ASSERTION (RC11 / PR2): regardless of on-chain outcome, the
-    // edge publish's triples MUST NOT appear in the
-    // verifiable-memory view on ANY node. Poll node1 (a core) over a few
-    // seconds so any in-flight gossip from the edge has time to land
-    // in the wrong graph — a leak that materialises 1-2s after the
-    // publish call returns would be missed by a single immediate
-    // query. The retry exits early on success (zero rows seen at any
-    // poll); the loop only runs to completion when the query keeps
-    // succeeding with zero rows, which is what we want.
+    // CORE ASSERTION (RC11 / PR2): a NON-confirmed edge publish's triples MUST
+    // NOT appear in the verifiable-memory view on ANY node (the confirmed case
+    // is asserted separately below — those rows are the correct on-chain result).
+    // Poll node1 (a core) over a few seconds so any in-flight gossip from the
+    // edge has time to land in the wrong graph — a leak that materialises 1-2s
+    // after the publish call returns would be missed by a single immediate
+    // query. The retry exits early once rows are seen (a leak in the
+    // non-confirmed case; the expected result in the confirmed case).
     const VM_POLL_ATTEMPTS = 6;
     const VM_POLL_INTERVAL_MS = 500;
     let lastVmStatus = 0;
@@ -516,6 +519,18 @@ describe('2. failed publish does not leak triples into verifiable-memory (RC11 /
         `Re-check dkg-publisher.ts catch block and dkg-query-engine.ts ` +
         `verifiable-memory branch.`,
       ).toBe(false);
+    } else {
+      // CONFIRMED branch: rather than leave this case a no-op (which would only
+      // prove the response was not `tentative` + the query returned 200), assert
+      // POSITIVE on-chain evidence — a real confirmation carries a positive kaId
+      // anchoring it on chain. This is synchronous (read from the publish
+      // response), so it adds no devnet-timing flakiness. A "confirmed" status
+      // with a zero/absent kaId (a fake confirm) fails here.
+      expect(
+        BigInt(edgePublishKaId ?? '0'),
+        `edge publish reported status='confirmed' but kaId='${edgePublishKaId}' is not a positive ` +
+        `on-chain id: ${JSON.stringify(r.body)}`,
+      ).toBeGreaterThan(0n);
     }
   }, 90_000);
 });

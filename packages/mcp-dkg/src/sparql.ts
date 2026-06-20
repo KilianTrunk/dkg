@@ -68,6 +68,47 @@ export function escapeSparqlLiteral(s: string): string {
     .replace(/\t/g, '\\t');
 }
 
+/**
+ * A verifiable source handle parsed from a result row's named graph. The raw
+ * `sourceGraph` is always set; for the uniform per-KA layout
+ * `did:dkg:context-graph:{cg}[/{sub}]/{_layer}/{addr}/{number}` the remaining
+ * fields decode the on-chain UAL identity `(author, kaNumber)` a consumer
+ * cites/verifies against. For any other content graph only `sourceGraph` is set.
+ */
+export interface EntitySource {
+  sourceGraph: string;
+  contextGraphId?: string;
+  memoryLayer?: 'working-memory' | 'shared-working-memory' | 'verifiable-memory';
+  author?: string;
+  kaNumber?: string;
+}
+
+const LAYER_SLUG_TO_VIEW: Record<string, EntitySource['memoryLayer']> = {
+  _working_memory: 'working-memory',
+  _shared_memory: 'shared-working-memory',
+  _verifiable_memory: 'verifiable-memory',
+};
+
+/** Parse a source named-graph URI into a verifiable handle. */
+export function parseEntitySource(sourceGraph: string): EntitySource {
+  const src: EntitySource = { sourceGraph };
+  const m = sourceGraph.match(
+    /^did:dkg:context-graph:(.+)\/(_working_memory|_shared_memory|_verifiable_memory)\/([^/]+)\/([^/]+)$/,
+  );
+  if (m) {
+    src.contextGraphId = m[1];
+    src.memoryLayer = LAYER_SLUG_TO_VIEW[m[2]];
+    src.author = m[3];
+    src.kaNumber = m[4];
+  }
+  return src;
+}
+
+/** Short citation label: `KA <author>/<kaNumber>` for a per-KA source, else the graph. */
+export function sourceLabel(s: EntitySource): string {
+  return s.author && s.kaNumber ? `KA \`${s.author}/${s.kaNumber}\`` : `\`${s.sourceGraph}\``;
+}
+
 /** Markdown table from SPARQL bindings, with pretty-printed terms. */
 export function bindingsToTable(bindings: SparqlBinding[], columns?: string[]): string {
   if (!bindings.length) return '(no results)';

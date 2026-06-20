@@ -25,6 +25,9 @@ import {
   bindingsToParagraphs,
   escapeSparqlLiteral,
   prettyTerm,
+  parseEntitySource,
+  sourceLabel,
+  type EntitySource,
 } from './sparql.js';
 import { EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION } from './tools/context-graph-description.js';
 
@@ -336,6 +339,88 @@ SELECT DISTINCT ?s ?p WHERE { ?s ?p <${uri}> } LIMIT 50`,
         return ok(parts.join('\n'));
       } catch (e) {
         return err(`Failed to describe entity: ${formatError(e)}`);
+      }
+    },
+  );
+
+  // ── dkg_get_entity_sources ──────────────────────────────────────
+  // Verifiable grounding: return an entity's facts each tagged with the
+  // source it came from. This is an ADDRESSED read — the tool owns the query
+  // shape (one entity, a single view, no user solution modifiers), so the
+  // source named graph binds unambiguously and stays scoped to the CG. That
+  // is why provenance is sound here but not for arbitrary `dkg_query` SELECTs
+  // (DISTINCT/LIMIT/UNION/SWM-union all perturb a rewrite of a user query).
+  server.registerTool(
+    'dkg_get_entity_sources',
+    {
+      title: 'Describe Entity with Verifiable Sources',
+      description:
+        'Fetch the facts asserted about an entity, each tagged with the verifiable source it came from — the Knowledge Asset (author + KA number = on-chain UAL identity) you cite or verify against. Use when you need provenance, not just values: "what is known about X, and who asserted each fact?". Reads ONE memory tier (default verifiable-memory — published/on-chain, the citable tier); pass `view` for shared- or working-memory.',
+      inputSchema: {
+        uri: z.string().describe('Entity URI (e.g. urn:dkg:decision:shacl-on-vm-promotion)'),
+        projectId: z
+          .string()
+          .optional()
+          .describe(`${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION} Defaults to .dkg/config.yaml.`),
+        view: z
+          .enum(['working-memory', 'shared-working-memory', 'verifiable-memory'])
+          .optional()
+          .describe('Memory tier to read sources from. Defaults to verifiable-memory (on-chain, citable). A single tier is read — provenance is per-tier, so the WM∪SWM union is intentionally not offered here.'),
+        subGraphName: z.string().optional().describe('Limit the read to a single sub-graph'),
+      },
+    },
+    async ({ uri, projectId, view, subGraphName }): Promise<ToolResult> => {
+      const pid = resolveProject(projectId, config);
+      if (!pid) return projectErr();
+      const safeIri = uri.replace(/^<|>$/g, '');
+      // Guard the IRI interpolation: reject anything that could break out of
+      // the `<…>` term. (A SPARQL injection here would let a caller widen the
+      // query beyond the single entity.)
+      if (!safeIri || /[\s<>"{}\\|^`]/.test(safeIri)) {
+        return err(`Unsafe entity URI: ${uri}`);
+      }
+      const scopeView = view ?? 'verifiable-memory';
+      try {
+        // Tool-owned shape: one entity, GRAPH ?g to bind the source, a single
+        // view (NOT includeSharedMemory — the union path would duplicate), no
+        // DISTINCT/LIMIT/ORDER. The engine constrains ?g to this CG's content
+        // graphs, so no `_meta`/`_private` and no cross-context bleed.
+        const result = await client.query({
+          sparql: `${PREFIXES}
+SELECT ?p ?o ?g WHERE { GRAPH ?g { <${safeIri}> ?p ?o } }`,
+          contextGraphId: pid,
+          subGraphName,
+          view: scopeView,
+        });
+        const rows = result.bindings ?? [];
+        if (!rows.length) {
+          return ok(`No facts found for <${safeIri}> in '${pid}' (view=${scopeView}).`);
+        }
+        const sources = new Map<string, EntitySource>();
+        const factLines = rows.map((b) => {
+          const p = prettyTerm(bindingValue(b.p));
+          const o = prettyTerm(bindingValue(b.o));
+          const src = parseEntitySource(bindingValue(b.g));
+          if (!sources.has(src.sourceGraph)) sources.set(src.sourceGraph, src);
+          return `- **${p}**: ${o}  ←  ${sourceLabel(src)}`;
+        });
+        const sourceLines = [...sources.values()].map(
+          (s) => `- ${sourceLabel(s)}${s.memoryLayer ? ` (${s.memoryLayer})` : ''} — \`${s.sourceGraph}\``,
+        );
+        return ok(
+          [
+            `# ${prettyTerm(safeIri)}`,
+            `<${safeIri}>  ·  view=${scopeView}`,
+            '',
+            '## Facts (with sources)',
+            factLines.join('\n'),
+            '',
+            `## Sources (${sources.size} verifiable)`,
+            sourceLines.join('\n'),
+          ].join('\n'),
+        );
+      } catch (e) {
+        return err(`Failed to describe entity sources: ${formatError(e)}`);
       }
     },
   );

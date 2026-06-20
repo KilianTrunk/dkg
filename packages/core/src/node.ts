@@ -13,6 +13,7 @@ import { circuitRelayTransport } from '@libp2p/circuit-relay-v2';
 import { circuitRelayServer } from '@libp2p/circuit-relay-v2';
 import { dcutr } from '@libp2p/dcutr';
 import { autoNAT } from '@libp2p/autonat';
+import type { ConnectionGater } from '@libp2p/interface';
 import { generateKeyPair, privateKeyFromRaw } from '@libp2p/crypto/keys';
 import { peerIdFromString, peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { ed25519GetPublicKey } from './crypto/ed25519.js';
@@ -20,6 +21,7 @@ import type { ConnectionTransport, DKGNodeConfig } from './types.js';
 import { DHT_PROTOCOL, DKG_GOSSIP_MAX_RPC_BYTES } from './constants.js';
 import { RelayMetricsAdapter, RELAY_V2_STOP_CODEC } from './libp2p-metrics-adapter.js';
 import { readRelayReservations, readConnectionStreams } from './relay-internal-shapes.js';
+import { RelayFlapGuard, parseCircuitRelayPeerIds, buildRelayFlapConnectionGater } from './relay-flap-guard.js';
 
 export interface DKGServices extends Record<string, unknown> {
   dht: KadDHT;
@@ -482,6 +484,7 @@ export class DKGNode {
   private readonly config: DKGNodeConfig;
   /** Peers currently connected only via relay (candidates for DCUtR upgrade). */
   private readonly relayedPeers = new Set<string>();
+  private readonly relayFlapGuard = new RelayFlapGuard();
   private relayWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
   private relayTargets: RelayTarget[] = [];
   private relayWatchdogConsecutiveFailures = 0;
@@ -1070,6 +1073,7 @@ export class DKGNode {
       streamMuxers: [yamux()],
       peerDiscovery,
       services,
+      connectionGater: this.createRelayFlapConnectionGater(),
       connectionManager: {
         minConnections: 0,
         // Core Nodes scale this with relayServerCapacity (default
@@ -1411,6 +1415,17 @@ export class DKGNode {
     }
   }
 
+  private createRelayFlapConnectionGater(): ConnectionGater {
+    const ts = () => new Date().toISOString();
+    // The gater hooks live in a pure builder (relay-flap-guard.ts) so the wiring
+    // is unit-tested (relay-flap-guard.test.ts) — a hook arg-shape or plumbing
+    // regression fails a test instead of silently leaving the guard inert.
+    return buildRelayFlapConnectionGater(
+      this.relayFlapGuard,
+      (message) => console.warn(`[${ts()}] ${message}`),
+    ) as ConnectionGater;
+  }
+
   /**
    * Wire up connection:open / connection:close listeners that track transport
    * type (direct vs relayed) and detect DCUtR upgrades from relay to direct.
@@ -1437,6 +1452,7 @@ export class DKGNode {
         const upgraded = this.relayedPeers.has(pid);
         if (upgraded) {
           this.relayedPeers.delete(pid);
+          this.relayFlapGuard.clearRemotePeer(pid);
           console.log(
             `[${ts()}] DCUtR upgrade: ${short(pid)} relayed -> direct ` +
             `dir=${dir} addr=${addr}`,
@@ -1457,7 +1473,7 @@ export class DKGNode {
       const transport: ConnectionTransport = addr.includes('/p2p-circuit') ? 'relayed' : 'direct';
       const durationMs = conn.timeline.close
         ? conn.timeline.close - conn.timeline.open
-        : '?';
+        : null;
 
       // If this was the last connection to the peer, clean up tracking state.
       const remaining = node.getConnections(conn.remotePeer);
@@ -1465,9 +1481,30 @@ export class DKGNode {
         this.relayedPeers.delete(pid);
       }
 
+      if (transport === 'relayed' && durationMs != null) {
+        const relayPath = parseCircuitRelayPeerIds(addr);
+        if (relayPath) {
+          const result = this.relayFlapGuard.recordRelayedClose({
+            relayPeerId: relayPath.relayPeerId,
+            remotePeerId: pid,
+            durationMs,
+          });
+          if (result.enteredQuarantine) {
+            console.warn(
+              `[${ts()}] Relay flap guard: quarantined relayed path ` +
+              `remote=${short(pid)} relay=${short(relayPath.relayPeerId)} ` +
+              `shortCloses=${result.shortCloseCount} ` +
+              `ttl=${Math.ceil((result.quarantineTtlMs ?? 0) / 1000)}s`,
+            );
+          }
+        }
+      } else if (transport === 'direct' && durationMs != null) {
+        this.relayFlapGuard.recordDirectClose({ remotePeerId: pid, durationMs });
+      }
+
       console.log(
         `[${ts()}] Connection closed: ${short(pid)} transport=${transport} ` +
-        `duration=${durationMs}ms addr=${addr}`,
+        `duration=${durationMs ?? '?'}ms addr=${addr}`,
       );
     });
 

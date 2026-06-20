@@ -18,7 +18,7 @@
  * registered.
  */
 
-export const RANDOM_SAMPLING_PACKAGE_VERSION = '10.0.0-rc.2';
+export const RANDOM_SAMPLING_PACKAGE_VERSION = '10.0.0-rc.19';
 
 export {
   extractV10KCFromStore,

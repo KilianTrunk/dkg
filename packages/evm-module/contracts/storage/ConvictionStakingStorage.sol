@@ -48,8 +48,10 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
  *   - Tier durations and multipliers are stored in `_tiers` (keyed by
  *     `lockTier` id). The baseline ladder seeded at `initialize()` is
  *     {0→(0s, 1x), 1→(30d, 1.5x), 3→(90d, 2x), 6→(180d, 3.5x), 12→(366d, 6x)}.
- *   - `expiryTimestamp = block.timestamp + duration` (timestamp-accurate;
- *     no epoch rounding, no drift buffer).
+ *   - `expiryTimestamp = block.timestamp + duration`, rounded UP to the
+ *     next 12-hour expiry bucket. The upward rounding keeps the promised
+ *     minimum lock duration while coalescing per-block dust stakes into
+ *     one queue slot per half-day.
  *   - New tiers can be appended via `addTier` (HubOwner or multisig owner).
  *     Existing tiers can be deactivated via `deactivateTier` to stop
  *     accepting NEW fresh stakes, but relock / migration paths still
@@ -143,12 +145,34 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     //             drained by `StakingV10._claim`.
     //           * `createNewPositionFromExisting` migrates carries across
     //             the relock burn-mint; `deletePosition` deletes them.
-    string private constant _VERSION = "10.0.4";
+    //   10.0.5 — Expiry-queue DoS hardening:
+    //           * Boost expiries are rounded up to 12-hour buckets so
+    //             per-block dust stakes coalesce into one queue slot per
+    //             half-day.
+    //           * New distinct expiry slots are capped per node; same-bucket
+    //             stakes keep coalescing even when the cap is reached.
+    string private constant _VERSION = "10.0.5";
 
     // Multiplier scale, matches DKGStakingConvictionNFT._convictionMultiplier
     // (returns 1e18-scaled values so fractional tiers like 1.5x and 3.5x
     // are representable).
     uint256 internal constant SCALE18 = 1e18;
+    uint40 public constant EXPIRY_BUCKET_SECONDS = 12 hours;
+    uint256 public constant MAX_NODE_PENDING_EXPIRIES = 1024;
+    /// @notice Maximum boosted lock-tier duration. Bounded so the distinct future
+    ///         buckets a node can ever hold stays STRICTLY below the slot cap.
+    ///         Because `_computeExpiryTimestamp` rounds UP to the next bucket, a
+    ///         tier of `k` buckets created just after a boundary expires `k + 1`
+    ///         buckets out — so a node staking once per bucket can reach `k + 1`
+    ///         distinct pending slots. To keep that `<= MAX_NODE_PENDING_EXPIRIES`,
+    ///         a tier must be at most `MAX_NODE_PENDING_EXPIRIES - 1` buckets
+    ///         (`1023 * 12h = 511.5 days`). With this enforced in `addTier`,
+    ///         `MAX_NODE_PENDING_EXPIRIES` can never be reached by valid stakes —
+    ///         it stays a pure backstop and never blocks a legitimate stake/relock
+    ///         (and the tombstone-vs-live slot distinction can never bite). The
+    ///         baseline ladder tops out at 366 days, well under this.
+    uint256 public constant MAX_TIER_DURATION =
+        (MAX_NODE_PENDING_EXPIRIES - 1) * uint256(EXPIRY_BUCKET_SECONDS);
 
     // ============================================================
     //                 D20 — Mutable tier ladder
@@ -251,6 +275,7 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     event NodeEffectiveStakeDelta(uint72 indexed identityId, int256 delta, uint256 newRunningEffectiveStake);
     event NodeExpiryScheduled(uint72 indexed identityId, uint40 timestamp, uint256 dropAdded, uint256 newTotalDrop);
     event NodeExpiryCancelled(uint72 indexed identityId, uint40 timestamp, uint256 dropRemoved, uint256 newTotalDrop);
+    error NodeExpiryQueueFull(uint72 identityId, uint256 pending, uint256 maxPending);
     // D15 — V10 stake aggregate events.
     event NodeStakeV10Increased(uint72 indexed identityId, uint256 amount, uint256 newNodeStake, uint256 newTotal);
     event NodeStakeV10Decreased(uint72 indexed identityId, uint256 amount, uint256 newNodeStake, uint256 newTotal);
@@ -546,10 +571,9 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
             require(duration == 0 && multiplier18 == uint64(SCALE18), "Tier 0 must be rest");
         } else {
             require(duration > 0, "Non-zero tier needs duration");
-            // F02: bound the lock duration so the per-node expiry queue (and thus
-            // the `_settleNodeTo` drain loop) can never exceed
-            // `MAX_TIER_DURATION / EXPIRY_BUCKET_SECONDS` buckets — a future 10-year
-            // tier would otherwise re-open the settlement-brick gas DoS.
+            // Keep MAX_NODE_PENDING_EXPIRIES an unreachable backstop: a single
+            // tier's expiry window must fit within that many 12h buckets, so the
+            // per-node slot cap can never block a legitimate stake/relock.
             require(duration <= MAX_TIER_DURATION, "Tier duration too long");
             require(multiplier18 > uint64(SCALE18), "Non-zero tier needs boost");
         }
@@ -716,59 +740,22 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     ///
     /// LOOP BOUND (why this cannot explode the block gas limit)
     /// --------------------------------------------------------
-    /// The `while` terminates as soon as `t > ts` (1) or `head == len`
-    /// (2). What could make it iterate "many" times?
+    /// The `while` terminates as soon as `t > ts` or `head == len`.
+    /// Entries are only added through `_scheduleNodeExpiry`, and fresh
+    /// lock expiries are rounded UP to 12-hour buckets before they reach
+    /// the queue. A per-block dust-stake stream therefore coalesces into
+    /// one slot per half-day, not one slot per block.
     ///
-    ///   (a) Entries are only added by `_scheduleNodeExpiry`, which is
-    ///       itself only reachable from `onlyContracts` mutators above.
-    ///       There is no external path for an attacker to spam the
-    ///       queue — fresh entries cost someone real TRAC to lock.
+    /// `_scheduleNodeExpiry` also refuses to create a new distinct slot
+    /// once `MAX_NODE_PENDING_EXPIRIES` pending slots are live for a node.
+    /// Same-bucket stakes keep accumulating into the existing slot, so the
+    /// cap bounds replay work without blocking aggregation inside an
+    /// already-reserved bucket.
     ///
-    ///   (b) Entries with the same `ts` are coalesced into ONE array
-    ///       slot (see `_scheduleNodeExpiry`: `if (existing != 0) return`).
-    ///       So the queue length is bounded by the number of *distinct*
-    ///       active expiry timestamps the node has ever been scheduled
-    ///       against — NOT by the delegator count.
-    ///
-    ///   (c) Work is strictly amortized once: each array slot is
-    ///       visited by exactly one `_settleNodeTo` call across the
-    ///       contract's lifetime (we only ever advance `head`). In the
-    ///       steady state where settle is called from every CSS mutator
-    ///       and every `submitProof` (~ every epoch), the number of
-    ///       entries matured between two consecutive settles is
-    ///       bounded by (new expiries scheduled during that window that
-    ///       also matured within it) — in practice 0 on a healthy,
-    ///       proof-active node.
-    ///
-    /// The only scenario that produces a large iteration count in one
-    /// call is long-duration node DORMANCY: the node produces no proofs
-    /// AND receives no CSS mutations while many distinct-ts expiries
-    /// mature. Concrete napkin math: on a chain with ~12s block times a node
-    /// that accumulates ONE brand-new distinct expiry timestamp per
-    /// block for 30 days and then stops settling for 30 more days sees
-    /// ~216k matured entries on resume — at ~5k gas per iteration that
-    /// is ~1.1B gas, well above any block limit. That tail is tolerable
-    /// because:
-    ///
-    ///   * To reach it, the node has to have been completely silent
-    ///     (no proofs, no stake/unstake, no relock, no redelegate in or
-    ///     out) for longer than its longest outstanding tier duration.
-    ///     In practice `submitProof` settles on every proof, so any
-    ///     proof-producing node drains continuously.
-    ///   * Same-block same-tier stakes coalesce, so realistic distinct-
-    ///     ts counts are far below the worst case.
-    ///   * The invariant is recoverable: any single `settleNodeTo` that
-    ///     OOMs blocks only the caller's tx; the queue state is
-    ///     unchanged, so later calls can still make progress once gas
-    ///     budgets allow.
-    ///
-    /// If operational telemetry later shows real-world queues
-    /// approaching danger, the escape hatch is a bounded variant
-    /// (`settleNodeToMax(id, ts, maxEntries)`) that advances `head` by
-    /// at most `maxEntries` and lets the protocol drain a dormant queue
-    /// across several txs. Not shipped now because the "who even calls
-    /// this" analysis (a) + steady-state (c) make it dead code for any
-    /// node that ever submits a proof.
+    /// Work is amortized once: each array slot is visited by exactly one
+    /// `_settleNodeTo` call across the contract's lifetime. In steady state
+    /// `submitProof` drains the queue continuously; after dormancy, the
+    /// 12-hour bucket + pending-slot cap keeps the catch-up loop bounded.
     ///
     /// INVARIANTS MAINTAINED ON EXIT
     /// -----------------------------
@@ -892,12 +879,17 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
             // ts already has a slot in the queue; just bumped the drop.
             return;
         }
-        nodeExpiryPresent[identityId][ts] = true;
 
         // Insert `ts` into the sorted queue.
         uint40[] storage arr = nodeExpiryTimes[identityId];
         uint256 head = nodeExpiryHead[identityId];
         uint256 len = arr.length;
+        uint256 pending = len - head;
+        if (pending >= MAX_NODE_PENDING_EXPIRIES) {
+            revert NodeExpiryQueueFull(identityId, pending, MAX_NODE_PENDING_EXPIRIES);
+        }
+        nodeExpiryPresent[identityId][ts] = true;
+
         arr.push(ts); // temporarily at tail
         // Bubble left while the left neighbor is strictly greater AND we
         // haven't crossed the drain head.
@@ -1021,16 +1013,15 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
             require(lockTier != 0, "Credit requires locked tier");
             uint256 dur = _tierDuration(lockTier);
             require(uint256(expiryShortenedBy) < dur, "Credit >= tier duration");
+            // Subtract the migration credit AFTER bucketing and do NOT re-bucket.
+            // `expiryShortenedBy` (convictionCreditSeconds) is a single global
+            // offset, so `bucketedDefault - credit` still coalesces (same shifted
+            // timestamp per creation bucket) and the queue stays bounded. Re-bucketing
+            // here would silently round a non-bucket-aligned credit UP to the 12h grid
+            // (e.g. `60d - 1h` -> a full `60d`), changing the configured credit. The
+            // exact second is preserved on purpose — do not "tidy" this onto the grid.
             expiryTimestamp = uint40(uint256(expiryTimestamp) - uint256(expiryShortenedBy));
             require(expiryTimestamp > tsNow, "Credit leaves no remaining lock");
-            // NOTE (F02): do NOT re-bucket after the credit subtraction.
-            // `expiryShortenedBy` is a single global offset (convictionCreditSeconds),
-            // so `bucketedDefault - credit` still COALESCES — every migration position
-            // of this tier created in the same day-bucket lands on the same shifted
-            // timestamp, so the queue stays bounded (at most one extra slot per bucket
-            // for the migration cohort). Re-bucketing here would instead silently round
-            // a non-day-aligned credit UP to the day grid, distorting the configured
-            // migration credit (e.g. `60d - 1h` would become a full `60d`).
         }
 
         positions[tokenId] = Position({
@@ -1665,58 +1656,23 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     //                       Internal helpers
     // ============================================================
 
-    /// @notice F02 — expiry bucket granularity. Wall-clock expiries are rounded
-    ///         UP to the next multiple of this, so the per-node expiry queue
-    ///         (`nodeExpiryTimes[id]`) can hold at most
-    ///         `maxLockDuration / EXPIRY_BUCKET_SECONDS` DISTINCT timestamps
-    ///         regardless of how many (dust) positions are opened against a node.
-    ///         This structurally bounds the `_settleNodeTo` drain loop and makes
-    ///         the dust-spam settlement-brick DoS impossible (a node could
-    ///         previously be frozen — and its delegators' funds locked — by
-    ///         opening thousands of distinct-second expiries against it).
-    uint256 internal constant EXPIRY_BUCKET_SECONDS = 1 days;
-
-    /// @notice F02 — maximum lock-tier duration. The per-node boost-expiry queue
-    ///         holds at most `duration / EXPIRY_BUCKET_SECONDS` distinct day-buckets,
-    ///         so the structural bound on `_settleNodeTo` only holds if the longest
-    ///         tier is itself bounded. Cap it so the worst case (a dormant node with
-    ///         the whole lock window pending) stays well within block gas even for
-    ///         future governance-added tiers. 1095 days (~3y) covers the 366-day
-    ///         baseline ladder and the 732-day (2y) custom-tier test with headroom,
-    ///         while bounding the worst-case drain to ~1095 iterations.
-    uint256 internal constant MAX_TIER_DURATION = 1095 days;
-
-    /// @dev Round a wall-clock expiry UP to the next `EXPIRY_BUCKET_SECONDS`
-    ///      boundary. Rounding UP never shortens a lock — a boost lasts at most
-    ///      one bucket (< 1 day) longer than its exact duration, which is uniform
-    ///      and delegator-favorable. `0` (tier-0 / no expiry) passes through
-    ///      unchanged so it is never queued.
-    function _bucketExpiry(uint40 ts) internal pure returns (uint40) {
-        // slither-disable-start divide-before-multiply,incorrect-equality,timestamp
-        // Pure integer ceil-to-multiple. False positives: `ts == 0` is the
-        // tier-0 / no-expiry SENTINEL (not a time-dependent branch); the
-        // divide-then-multiply IS the round-up idiom (exact for integers — no
-        // precision loss, since the division floor is immediately re-scaled);
-        // and `ts` is an expiry VALUE, not `block.timestamp` (this fn is `pure`).
-        if (ts == 0) return 0;
-        uint256 bucketed = ((uint256(ts) + EXPIRY_BUCKET_SECONDS - 1) / EXPIRY_BUCKET_SECONDS) *
-            EXPIRY_BUCKET_SECONDS;
-        require(bucketed <= type(uint40).max, "Expiry overflow");
-        // slither-disable-end divide-before-multiply,incorrect-equality,timestamp
-        return uint40(bucketed);
-    }
-
     /**
-     * @dev Wall-clock expiry computation (D26), bucketed (F02). The boost ends
-     *      at the `EXPIRY_BUCKET_SECONDS` boundary at or after
-     *      `block.timestamp + duration`. Returns 0 for tier-0 (permanent rest).
+     * @dev Wall-clock expiry computation (D26). Boosts last at least the tier
+     *      duration and expire on the next 12-hour bucket. Returns 0 for tier-0
+     *      (permanent rest state).
      */
     function _computeExpiryTimestamp(uint40 lockTier) internal view returns (uint40) {
         if (lockTier == 0) return 0;
         uint256 duration = _tierDuration(lockTier);
         uint256 exp = block.timestamp + duration;
-        require(exp <= type(uint40).max, "Expiry overflow");
-        return _bucketExpiry(uint40(exp));
+        return _bucketExpiryTimestamp(exp);
+    }
+
+    function _bucketExpiryTimestamp(uint256 rawExpiry) internal pure returns (uint40) {
+        uint256 bucket = uint256(EXPIRY_BUCKET_SECONDS);
+        uint256 bucketed = ((rawExpiry + bucket - 1) / bucket) * bucket;
+        require(bucketed <= type(uint40).max, "Expiry overflow");
+        return uint40(bucketed);
     }
 
     function _pushNodeToken(uint72 identityId, uint256 tokenId) internal {

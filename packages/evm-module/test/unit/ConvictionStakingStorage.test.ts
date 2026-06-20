@@ -24,10 +24,7 @@ const THREE_AND_HALF_X = (35n * SCALE18) / 10n;
 const SIX_X = 6n * SCALE18;
 
 const DAY = 24n * 60n * 60n;
-// F02 — a position's boost-expiry timestamp is bucketed UP to the next whole
-// DAY boundary. Since every tier duration is an exact day-multiple, the bucketed
-// expiry equals bucketUp(createBlockTimestamp) + duration.
-const bucketUp = (t: bigint): bigint => ((t + DAY - 1n) / DAY) * DAY;
+const HALF_DAY = 12n * 60n * 60n;
 const TIER_DURATIONS: Record<number, bigint> = {
   0: 0n,
   1: 30n * DAY,
@@ -36,8 +33,10 @@ const TIER_DURATIONS: Record<number, bigint> = {
   12: 366n * DAY,
 };
 
-// D26 — timestamp-accurate accounting: no BLOCK_DRIFT_BUFFER padding, no
-// epoch rounding. Lock wall-clock durations are exact.
+const EXPIRY_BUCKET_SECONDS = HALF_DAY;
+
+// D26 — timestamp accounting: no BLOCK_DRIFT_BUFFER padding, no epoch rounding.
+// Boost expiries are rounded up to half-day buckets for queue DoS hardening.
 
 async function latestTimestamp(): Promise<bigint> {
   return BigInt(await time.latest());
@@ -52,6 +51,15 @@ function effNow(raw: bigint, mult18: bigint): bigint {
 }
 function boostDrop(raw: bigint, mult18: bigint): bigint {
   return (raw * (mult18 - SCALE18)) / SCALE18;
+}
+function bucketExpiry(rawExpiry: bigint): bigint {
+  return (
+    ((rawExpiry + EXPIRY_BUCKET_SECONDS - 1n) / EXPIRY_BUCKET_SECONDS) *
+    EXPIRY_BUCKET_SECONDS
+  );
+}
+function expectedExpiryFrom(baseTs: bigint, tier: number): bigint {
+  return bucketExpiry(baseTs + TIER_DURATIONS[tier]);
 }
 
 describe('@unit ConvictionStakingStorage', () => {
@@ -80,9 +88,8 @@ describe('@unit ConvictionStakingStorage', () => {
 
   it('Should have correct name and version', async () => {
     expect(await ConvictionStakingStorage.name()).to.equal('ConvictionStakingStorage');
-    // v4.1.0 — `createPosition` accepts the `expiryShortenedBy` arg used
-    // by `StakingV10._convertToNFT` for the V8→V10 conviction credit.
-    expect(await ConvictionStakingStorage.version()).to.equal('10.0.4');
+    // v10.0.5 — bucketed expiries + bounded per-node pending expiry slots.
+    expect(await ConvictionStakingStorage.version()).to.equal('10.0.5');
   });
 
   // ------------------------------------------------------------
@@ -135,11 +142,11 @@ describe('@unit ConvictionStakingStorage', () => {
       expect(pos.migrationEpoch).to.equal(0);
     });
 
-    it('Tier-12 position: expiryTimestamp = block.ts + 366d, full boost in running stake, drop at expiry', async () => {
+    it('Tier-12 position: expiryTimestamp = next half-day bucket after block.ts + 366d, full boost in running stake, drop at expiry', async () => {
       const tx = await ConvictionStakingStorage.createPosition(1, ALICE_ID, 1000, 12, 0, 0);
       await tx.wait();
       const tsNow = await latestTimestamp();
-      const expectedExpiry = bucketUp(tsNow + TIER_DURATIONS[12]);
+      const expectedExpiry = expectedExpiryFrom(tsNow, 12);
 
       const pos = await ConvictionStakingStorage.getPosition(1);
       expect(pos.expiryTimestamp).to.equal(expectedExpiry);
@@ -176,10 +183,10 @@ describe('@unit ConvictionStakingStorage', () => {
       ).to.equal(1000n);
     });
 
-    it('Fractional tier 1.5x (lock=1): raw 2000 → boost 1000, drop at +30d', async () => {
+    it('Fractional tier 1.5x (lock=1): raw 2000 → boost 1000, drop at the half-day bucket after +30d', async () => {
       await ConvictionStakingStorage.createPosition(1, ALICE_ID, 2000, 1, 0, 0);
       const tsNow = await latestTimestamp();
-      const expectedExpiry = bucketUp(tsNow + TIER_DURATIONS[1]);
+      const expectedExpiry = expectedExpiryFrom(tsNow, 1);
 
       const pos = await ConvictionStakingStorage.getPosition(1);
       expect(pos.expiryTimestamp).to.equal(expectedExpiry);
@@ -202,10 +209,10 @@ describe('@unit ConvictionStakingStorage', () => {
       ).to.equal(2000n);
     });
 
-    it('Fractional tier 3.5x (lock=6): raw 2000 → boost 5000, drop at +180d', async () => {
+    it('Fractional tier 3.5x (lock=6): raw 2000 → boost 5000, drop at the half-day bucket after +180d', async () => {
       await ConvictionStakingStorage.createPosition(1, ALICE_ID, 2000, 6, 0, 0);
       const tsNow = await latestTimestamp();
-      const expectedExpiry = bucketUp(tsNow + TIER_DURATIONS[6]);
+      const expectedExpiry = expectedExpiryFrom(tsNow, 6);
 
       expect(await ConvictionStakingStorage.getNodeRunningEffectiveStake(ALICE_ID)).to.equal(7000n);
       expect(await ConvictionStakingStorage.getNodeExpiryDrop(ALICE_ID, expectedExpiry)).to.equal(
@@ -245,13 +252,13 @@ describe('@unit ConvictionStakingStorage', () => {
       // Create tier-12 first (furthest expiry), then tier-1 (soonest), then tier-6.
       // Expected final order in the queue: [+30d, +180d, +366d].
       await ConvictionStakingStorage.createPosition(1, ALICE_ID, 100, 12, 0, 0);
-      const ts12 = bucketUp((await latestTimestamp()) + TIER_DURATIONS[12]);
+      const ts12 = expectedExpiryFrom(await latestTimestamp(), 12);
 
       await ConvictionStakingStorage.createPosition(2, ALICE_ID, 100, 1, 0, 0);
-      const ts1 = bucketUp((await latestTimestamp()) + TIER_DURATIONS[1]);
+      const ts1 = expectedExpiryFrom(await latestTimestamp(), 1);
 
       await ConvictionStakingStorage.createPosition(3, ALICE_ID, 100, 6, 0, 0);
-      const ts6 = bucketUp((await latestTimestamp()) + TIER_DURATIONS[6]);
+      const ts6 = expectedExpiryFrom(await latestTimestamp(), 6);
 
       const times = await ConvictionStakingStorage.getNodeExpiryTimes(ALICE_ID);
       expect(times.length).to.equal(3);
@@ -274,7 +281,7 @@ describe('@unit ConvictionStakingStorage', () => {
       }
 
       const tsNow = await latestTimestamp();
-      const expectedExpiry = bucketUp(tsNow + TIER_DURATIONS[12]);
+      const expectedExpiry = expectedExpiryFrom(tsNow, 12);
 
       const times = await ConvictionStakingStorage.getNodeExpiryTimes(ALICE_ID);
       expect(times.length).to.equal(1);
@@ -283,6 +290,61 @@ describe('@unit ConvictionStakingStorage', () => {
         await ConvictionStakingStorage.getNodeExpiryDrop(ALICE_ID, expectedExpiry),
       ).to.equal(boostDrop(300n, SIX_X));
     });
+
+    it('Dust stakes at distinct seconds coalesce into the same 12h bucket (queue stays bounded)', async () => {
+      // The DoS the bucketing closes: many stakes against a node at DISTINCT block
+      // timestamps. Pre-fix every distinct second was its own queue slot (unbounded
+      // -> settle eventually exceeds block gas). With 12h bucketing, all stakes whose
+      // lock ends in the same half-day share ONE slot, so the queue cannot grow with
+      // the stake count.
+      const N = 50;
+      for (let i = 1; i <= N; i++) {
+        // each createPosition auto-mines a block (timestamp +1s) -> N distinct
+        // seconds, all inside the same 12h bucket.
+        await ConvictionStakingStorage.createPosition(i, ALICE_ID, 1, 12, 0, 0);
+      }
+      // All N expiries fall in at most two adjacent 12h buckets (one, unless the
+      // ~N-second creation window straddles a bucket boundary).
+      const pending = await ConvictionStakingStorage.getNodePendingExpiryCount(ALICE_ID);
+      expect(Number(pending)).to.be.lessThanOrEqual(2);
+
+      // The whole bounded queue drains in one cheap settle past the last expiry.
+      const times = await ConvictionStakingStorage.getNodeExpiryTimes(ALICE_ID);
+      await time.increaseTo(Number(times[times.length - 1]) + 1);
+      await ConvictionStakingStorage.settleNodeTo(ALICE_ID, await latestTimestamp());
+      expect(await ConvictionStakingStorage.getNodeRunningEffectiveStake(ALICE_ID)).to.equal(
+        BigInt(N),
+      );
+      expect(await ConvictionStakingStorage.getNodePendingExpiryCount(ALICE_ID)).to.equal(0);
+    });
+
+    it('Tier-duration cap keeps the per-node slot cap an unreachable backstop', async () => {
+      // MAX_TIER_DURATION = MAX_NODE_PENDING_EXPIRIES * EXPIRY_BUCKET_SECONDS
+      // (1024 * 12h = 512 days). Capping the tier there means a single tier's
+      // expiry window can never span more than MAX_NODE_PENDING_EXPIRIES distinct
+      // buckets, so a node can never accumulate enough distinct future buckets to
+      // reach the slot cap — `NodeExpiryQueueFull` (and the tombstone-vs-live slot
+      // distinction) can therefore never block a legitimate stake/relock. The
+      // production ladder tops out at 366 days, well under this. (Same-bucket
+      // coalescing is covered by the "Coalesces drops at the same timestamp" test.)
+      const maxPending = await ConvictionStakingStorage.MAX_NODE_PENDING_EXPIRIES();
+      const bucketSecs = await ConvictionStakingStorage.EXPIRY_BUCKET_SECONDS();
+      const maxTier = await ConvictionStakingStorage.MAX_TIER_DURATION();
+      // (MAX_NODE_PENDING_EXPIRIES - 1) * EXPIRY_BUCKET_SECONDS = 1023 * 12h = 511.5
+      // days. The `- 1` accounts for `_computeExpiryTimestamp` rounding UP: a k-bucket
+      // tier created just after a boundary expires k+1 buckets out, so a node can hold
+      // up to tierBuckets+1 distinct pending slots; capping at MAX-1 keeps that <= MAX.
+      expect(maxTier).to.equal((maxPending - 1n) * bucketSecs);
+
+      // A tier whose expiry window would exceed the slot cap is rejected...
+      await expect(
+        ConvictionStakingStorage.addTier(24, maxTier + 1n, TWO_X),
+      ).to.be.revertedWith('Tier duration too long');
+      // ...exactly at the cap is accepted.
+      await expect(ConvictionStakingStorage.addTier(24, maxTier, TWO_X)).to.not.be.reverted;
+      expect(await ConvictionStakingStorage.tierDuration(24)).to.equal(maxTier);
+    });
+
   });
 
   // ------------------------------------------------------------
@@ -293,11 +355,11 @@ describe('@unit ConvictionStakingStorage', () => {
     it('Two NFTs under same identityId sum their effective stake and decay independently', async () => {
       await ConvictionStakingStorage.createPosition(1, ALICE_ID, 500, 12, 0, 0);
       const tsAtCreate1 = await latestTimestamp();
-      const expiry12 = bucketUp(tsAtCreate1 + TIER_DURATIONS[12]);
+      const expiry12 = expectedExpiryFrom(tsAtCreate1, 12);
 
       await ConvictionStakingStorage.createPosition(2, ALICE_ID, 200, 3, 0, 0);
       const tsAtCreate2 = await latestTimestamp();
-      const expiry3 = bucketUp(tsAtCreate2 + TIER_DURATIONS[3]);
+      const expiry3 = expectedExpiryFrom(tsAtCreate2, 3);
 
       // Before any expiry: 500*6 + 200*2 = 3400.
       expect(await ConvictionStakingStorage.getNodeRunningEffectiveStake(ALICE_ID)).to.equal(3400n);
@@ -330,7 +392,7 @@ describe('@unit ConvictionStakingStorage', () => {
     it('Drains a single expiry, zeroes the drop, bumps the head cursor', async () => {
       await ConvictionStakingStorage.createPosition(1, ALICE_ID, 1000, 12, 0, 0);
       const tsAtCreate = await latestTimestamp();
-      const expiry = bucketUp(tsAtCreate + TIER_DURATIONS[12]);
+      const expiry = expectedExpiryFrom(tsAtCreate, 12);
 
       // Advance past the expiry.
       await time.increaseTo(Number(expiry) + 1);
@@ -347,9 +409,9 @@ describe('@unit ConvictionStakingStorage', () => {
       await ConvictionStakingStorage.createPosition(2, ALICE_ID, 100, 3, 0, 0);
       await ConvictionStakingStorage.createPosition(3, ALICE_ID, 100, 12, 0, 0);
 
-      const tsBase = await latestTimestamp();
+      const times = await ConvictionStakingStorage.getNodeExpiryTimes(ALICE_ID);
       // Jump well past all three expiries in one go.
-      await time.increaseTo(Number(bucketUp(tsBase + TIER_DURATIONS[12]) + 10n));
+      await time.increaseTo(Number(times[2] + 10n));
       await ConvictionStakingStorage.settleNodeTo(ALICE_ID, await latestTimestamp());
 
       // After full drain: raw-tail only = 100 + 100 + 100 = 300.
@@ -370,45 +432,6 @@ describe('@unit ConvictionStakingStorage', () => {
   });
 
   // ------------------------------------------------------------
-  // F02 — dust-spam settlement-brick DoS is structurally impossible
-  // ------------------------------------------------------------
-
-  describe('F02 — expiry-queue bound (settlement-brick DoS)', () => {
-    it('Coalesces dust positions opened at distinct seconds into day-buckets', async () => {
-      // The attack: open many tiny locked positions against a victim node at
-      // distinct block timestamps. Pre-fix, every distinct second appended a new
-      // entry to `nodeExpiryTimes`, so the queue grew unbounded until
-      // `_settleNodeTo` exceeded the block gas limit — permanently freezing the
-      // node (every submitProof / stake / claim / withdraw reverts) and locking
-      // its delegators' principal. With daily expiry bucketing, all positions
-      // whose lock ends on the same day share ONE queue slot, so the queue can
-      // never exceed `maxLockDuration / 1 day` entries no matter how many
-      // positions are opened.
-      const N = 60;
-      for (let i = 1; i <= N; i++) {
-        // each createPosition auto-mines a block (timestamp +1s) → N positions
-        // at N distinct seconds. Pre-fix this would be N distinct queue entries.
-        await ConvictionStakingStorage.createPosition(i, ALICE_ID, 1, 12, 0, 0);
-      }
-      // All N expiries fall in at most two adjacent day-buckets (one, unless the
-      // ~60s creation window straddles a midnight boundary).
-      const pending = await ConvictionStakingStorage.getNodePendingExpiryCount(ALICE_ID);
-      expect(Number(pending)).to.be.lessThanOrEqual(2);
-
-      // A single settle drains the whole bounded queue in one cheap pass.
-      await time.increaseTo(
-        Number(bucketUp((await latestTimestamp()) + TIER_DURATIONS[12])) + 1,
-      );
-      await ConvictionStakingStorage.settleNodeTo(ALICE_ID, await latestTimestamp());
-      // Boosts all dropped → raw tail only (1 each).
-      expect(await ConvictionStakingStorage.getNodeRunningEffectiveStake(ALICE_ID)).to.equal(
-        BigInt(N),
-      );
-      expect(await ConvictionStakingStorage.getNodePendingExpiryCount(ALICE_ID)).to.equal(0);
-    });
-  });
-
-  // ------------------------------------------------------------
   // Mutators — running-state maintenance
   // ------------------------------------------------------------
 
@@ -421,7 +444,7 @@ describe('@unit ConvictionStakingStorage', () => {
   describe('updateOnRedelegate', () => {
     it('Moves full effective contribution from old node to new node; cancels + reschedules the boost drop', async () => {
       await ConvictionStakingStorage.createPosition(1, ALICE_ID, 1000, 12, 0, 0);
-      const expiry = bucketUp((await latestTimestamp()) + TIER_DURATIONS[12]);
+      const expiry = expectedExpiryFrom(await latestTimestamp(), 12);
 
       await ConvictionStakingStorage.updateOnRedelegate(1, BOB_ID);
 
@@ -436,7 +459,8 @@ describe('@unit ConvictionStakingStorage', () => {
 
     it('Redelegating a post-expiry position moves only the raw tail (no boost to cancel)', async () => {
       await ConvictionStakingStorage.createPosition(1, ALICE_ID, 1000, 3, 0, 0);
-      await time.increase(Number(TIER_DURATIONS[3]) + Number(DAY) + 1);
+      const expiry = expectedExpiryFrom(await latestTimestamp(), 3);
+      await time.increaseTo(Number(expiry) + 1);
       await ConvictionStakingStorage.settleNodeTo(ALICE_ID, await latestTimestamp());
 
       await ConvictionStakingStorage.updateOnRedelegate(1, BOB_ID);
@@ -459,7 +483,7 @@ describe('@unit ConvictionStakingStorage', () => {
   describe('deletePosition', () => {
     it('Wipes a pre-expiry position and cancels its pending boost drop', async () => {
       await ConvictionStakingStorage.createPosition(1, ALICE_ID, 1000, 12, 0, 0);
-      const expiry = bucketUp((await latestTimestamp()) + TIER_DURATIONS[12]);
+      const expiry = expectedExpiryFrom(await latestTimestamp(), 12);
 
       await ConvictionStakingStorage.deletePosition(1);
       const pos = await ConvictionStakingStorage.getPosition(1);
@@ -472,7 +496,8 @@ describe('@unit ConvictionStakingStorage', () => {
 
     it('Post-expiry delete: boost was already drained, only raw tail is unwound', async () => {
       await ConvictionStakingStorage.createPosition(1, ALICE_ID, 1000, 3, 0, 0);
-      await time.increase(Number(TIER_DURATIONS[3]) + Number(DAY) + 1);
+      const expiry = expectedExpiryFrom(await latestTimestamp(), 3);
+      await time.increaseTo(Number(expiry) + 1);
       await ConvictionStakingStorage.settleNodeTo(ALICE_ID, await latestTimestamp());
 
       await ConvictionStakingStorage.deletePosition(1);
@@ -496,7 +521,7 @@ describe('@unit ConvictionStakingStorage', () => {
   describe('decreaseRaw / increaseRaw', () => {
     it('Pre-expiry decreaseRaw shrinks running stake by amount*mult and cancels proportional boost drop', async () => {
       await ConvictionStakingStorage.createPosition(1, ALICE_ID, 1000, 12, 0, 0);
-      const expiry = bucketUp((await latestTimestamp()) + TIER_DURATIONS[12]);
+      const expiry = expectedExpiryFrom(await latestTimestamp(), 12);
 
       await ConvictionStakingStorage.decreaseRaw(1, 400);
       const pos = await ConvictionStakingStorage.getPosition(1);
@@ -510,7 +535,8 @@ describe('@unit ConvictionStakingStorage', () => {
 
     it('Post-expiry decreaseRaw removes a flat `amount` (boost already drained)', async () => {
       await ConvictionStakingStorage.createPosition(1, ALICE_ID, 1000, 3, 0, 0);
-      await time.increase(Number(TIER_DURATIONS[3]) + Number(DAY) + 1);
+      const expiry = expectedExpiryFrom(await latestTimestamp(), 3);
+      await time.increaseTo(Number(expiry) + 1);
       await ConvictionStakingStorage.settleNodeTo(ALICE_ID, await latestTimestamp());
 
       await ConvictionStakingStorage.decreaseRaw(1, 300);
@@ -519,7 +545,7 @@ describe('@unit ConvictionStakingStorage', () => {
 
     it('increaseRaw pre-expiry grows running stake by amount*mult and adds to the same expiry bucket', async () => {
       await ConvictionStakingStorage.createPosition(1, ALICE_ID, 600, 12, 0, 0);
-      const expiry = bucketUp((await latestTimestamp()) + TIER_DURATIONS[12]);
+      const expiry = expectedExpiryFrom(await latestTimestamp(), 12);
 
       await ConvictionStakingStorage.increaseRaw(1, 200);
       expect(await ConvictionStakingStorage.getNodeRunningEffectiveStake(ALICE_ID)).to.equal(4800n);
@@ -529,7 +555,7 @@ describe('@unit ConvictionStakingStorage', () => {
 
     it('Round-trip: decreaseRaw then increaseRaw restores running stake exactly (pre-expiry)', async () => {
       await ConvictionStakingStorage.createPosition(1, ALICE_ID, 1000, 12, 0, 0);
-      const expiry = bucketUp((await latestTimestamp()) + TIER_DURATIONS[12]);
+      const expiry = expectedExpiryFrom(await latestTimestamp(), 12);
       const runningBefore = await ConvictionStakingStorage.getNodeRunningEffectiveStake(ALICE_ID);
       const dropBefore = await ConvictionStakingStorage.getNodeExpiryDrop(ALICE_ID, expiry);
 
@@ -571,7 +597,7 @@ describe('@unit ConvictionStakingStorage', () => {
   describe('boost-drop cancellation leaves queue entry intact', () => {
     it('Deletes the only pending position: queue entry remains but drop is 0', async () => {
       await ConvictionStakingStorage.createPosition(1, ALICE_ID, 1000, 12, 0, 0);
-      const expiry = bucketUp((await latestTimestamp()) + TIER_DURATIONS[12]);
+      const expiry = expectedExpiryFrom(await latestTimestamp(), 12);
       await ConvictionStakingStorage.deletePosition(1);
 
       // Entry is still present in the array (drained later as a no-op).
@@ -609,7 +635,7 @@ describe('@unit ConvictionStakingStorage', () => {
 
     it('HubOwner can append a new tier and createPosition picks it up', async () => {
       const newTier = 24;
-      const newDuration = 2n * 366n * DAY;
+      const newDuration = 500n * DAY; // <= MAX_TIER_DURATION (1024 * 12h = 512 days)
       const newMult = 12n * SCALE18;
       await expect(ConvictionStakingStorage.addTier(newTier, newDuration, newMult))
         .to.emit(ConvictionStakingStorage, 'TierAdded')
@@ -622,9 +648,9 @@ describe('@unit ConvictionStakingStorage', () => {
       const pos = await ConvictionStakingStorage.getPosition(1);
       expect(pos.lockTier).to.equal(newTier);
       expect(pos.multiplier18).to.equal(newMult);
-      // Expected expiry = ts + 2 years, bucketed up to the next day (F02).
+      // Expected expiry = next half-day bucket after ts + newDuration.
       const tsNow = await latestTimestamp();
-      expect(pos.expiryTimestamp).to.equal(bucketUp(tsNow + newDuration));
+      expect(pos.expiryTimestamp).to.equal(bucketExpiry(tsNow + newDuration));
     });
 
     it('addTier rejects duplicates, degenerate tier-0 configs, and boost-less non-zero tiers', async () => {
@@ -636,11 +662,11 @@ describe('@unit ConvictionStakingStorage', () => {
       // boost (would make the "big sum" == "raw sum" and break our fast-path
       // shortcuts in StakingV10._delegatorIncrementForEpoch).
       await expect(
-        ConvictionStakingStorage.addTier(24, 2n * 366n * DAY, SCALE18 / 2n),
+        ConvictionStakingStorage.addTier(24, 366n * DAY, SCALE18 / 2n),
       ).to.be.revertedWith('Non-zero tier needs boost');
       // M3/M4 — non-zero tier with exactly 1x is rejected for the same reason.
       await expect(
-        ConvictionStakingStorage.addTier(24, 2n * 366n * DAY, ONE_X),
+        ConvictionStakingStorage.addTier(24, 366n * DAY, ONE_X),
       ).to.be.revertedWith('Non-zero tier needs boost');
       // M3/M4 — non-zero tier with duration == 0 is rejected (would install a
       // position whose expiryTimestamp == block.timestamp, i.e. already expired).
@@ -654,19 +680,6 @@ describe('@unit ConvictionStakingStorage', () => {
       ).to.be.revertedWith('Tier exists');
     });
 
-    it('addTier caps the lock duration so the expiry queue stays bounded (F02)', async () => {
-      const MAX = 1095n * DAY; // MAX_TIER_DURATION (~3y)
-      // Just over the cap: rejected. An unbounded tier (e.g. a 10-year lock) would
-      // leave thousands of pending day-buckets on a dormant node, re-opening the
-      // settlement-brick gas DoS the bucketing is meant to close.
-      await expect(
-        ConvictionStakingStorage.addTier(25, MAX + 1n, TWO_X),
-      ).to.be.revertedWith('Tier duration too long');
-      // Exactly at the cap with a valid boost: accepted.
-      await expect(ConvictionStakingStorage.addTier(25, MAX, TWO_X)).to.not.be.reverted;
-      expect(await ConvictionStakingStorage.tierDuration(25)).to.equal(MAX);
-    });
-
     it('Non-owner cannot addTier / deactivateTier', async () => {
       await expect(
         ConvictionStakingStorage.connect(accounts[1]).addTier(24, 100n, ONE_AND_HALF_X),
@@ -676,7 +689,8 @@ describe('@unit ConvictionStakingStorage', () => {
 
     it('deactivateTier rejects fresh stakes but relock still honors original commitment', async () => {
       await ConvictionStakingStorage.createPosition(1, ALICE_ID, 1000, 3, 0, 0);
-      await time.increase(Number(TIER_DURATIONS[3]) + Number(DAY) + 1);
+      const expiry = expectedExpiryFrom(await latestTimestamp(), 3);
+      await time.increaseTo(Number(expiry) + 1);
       await ConvictionStakingStorage.settleNodeTo(ALICE_ID, await latestTimestamp());
 
       await ConvictionStakingStorage.deactivateTier(3);
@@ -714,7 +728,7 @@ describe('@unit ConvictionStakingStorage', () => {
       }
 
       const tsNow = await latestTimestamp();
-      const expectedExpiry = bucketUp(tsNow + TIER_DURATIONS[12]);
+      const expectedExpiry = expectedExpiryFrom(tsNow, 12);
 
       // There must be exactly one live entry — the delete+recreate MUST NOT
       // append a second slot at the same ts.
@@ -728,7 +742,7 @@ describe('@unit ConvictionStakingStorage', () => {
 
     it('L5 — cancelling the entire drop zeroes `nodeExpiryDrop` for a gas refund', async () => {
       await ConvictionStakingStorage.createPosition(1, ALICE_ID, 1000, 12, 0, 0);
-      const expiry = bucketUp((await latestTimestamp()) + TIER_DURATIONS[12]);
+      const expiry = expectedExpiryFrom(await latestTimestamp(), 12);
       expect(await ConvictionStakingStorage.getNodeExpiryDrop(ALICE_ID, expiry)).to.equal(
         boostDrop(1000n, SIX_X),
       );
@@ -773,7 +787,7 @@ describe('@unit ConvictionStakingStorage', () => {
       // active-tier check); the credit is otherwise identical.
       await ConvictionStakingStorage.createPosition(1, ALICE_ID, 1000, 12, 1, SIXTY_DAYS);
       const tsNow = await latestTimestamp();
-      const tierDefault = bucketUp(tsNow + TIER_DURATIONS[12]);
+      const tierDefault = expectedExpiryFrom(tsNow, 12);
       const expected = tierDefault - SIXTY_DAYS;
 
       const pos = await ConvictionStakingStorage.getPosition(1);
@@ -790,10 +804,26 @@ describe('@unit ConvictionStakingStorage', () => {
       );
     });
 
+    it('preserves a non-bucket-aligned credit exactly — no silent re-bucket rounding', async () => {
+      // `convictionCreditSeconds` (passed as expiryShortenedBy) can be arbitrary
+      // seconds. The expiry is `bucketedDefault - credit` with NO re-bucket, so a
+      // credit that is not a multiple of EXPIRY_BUCKET_SECONDS is applied to the
+      // exact second. (Re-bucketing would round it UP to the 12h grid — e.g.
+      // `60d - 1h` -> a full `60d` — quietly shrinking the configured credit.)
+      const credit = SIXTY_DAYS - 3600n; // 60 days minus 1 hour (not a 12h multiple)
+      await ConvictionStakingStorage.createPosition(1, ALICE_ID, 1000, 12, 1, credit);
+      const tsNow = await latestTimestamp();
+      const pos = await ConvictionStakingStorage.getPosition(1);
+      // exact: the bucketed default minus the FULL credit (not rounded back up).
+      expect(pos.expiryTimestamp).to.equal(expectedExpiryFrom(tsNow, 12) - credit);
+      // crucially NOT snapped onto the 12h grid:
+      expect(pos.expiryTimestamp % (12n * 60n * 60n)).to.not.equal(0n);
+    });
+
     it('Tier 6 with 60d credit: expiryTimestamp lands 60d before the tier default', async () => {
       await ConvictionStakingStorage.createPosition(1, ALICE_ID, 2000, 6, 1, SIXTY_DAYS);
       const tsNow = await latestTimestamp();
-      const expected = bucketUp(tsNow + TIER_DURATIONS[6]) - SIXTY_DAYS;
+      const expected = expectedExpiryFrom(tsNow, 6) - SIXTY_DAYS;
 
       const pos = await ConvictionStakingStorage.getPosition(1);
       expect(pos.expiryTimestamp).to.equal(expected);
@@ -831,7 +861,7 @@ describe('@unit ConvictionStakingStorage', () => {
       await ConvictionStakingStorage.createPosition(1, ALICE_ID, 1000, 12, 1, 0);
       const tsNow = await latestTimestamp();
       const pos = await ConvictionStakingStorage.getPosition(1);
-      expect(pos.expiryTimestamp).to.equal(bucketUp(tsNow + TIER_DURATIONS[12]));
+      expect(pos.expiryTimestamp).to.equal(expectedExpiryFrom(tsNow, 12));
     });
 
     it('Reverts when a non-zero credit is passed with migrationEpoch == 0 (fresh-stake guard)', async () => {
@@ -843,22 +873,6 @@ describe('@unit ConvictionStakingStorage', () => {
       await expect(
         ConvictionStakingStorage.createPosition(1, ALICE_ID, 1000, 12, 0, SIXTY_DAYS),
       ).to.be.revertedWith('Credit requires migrationEpoch');
-    });
-
-    it('preserves a non-day-aligned credit exactly — no silent re-bucket rounding (F02)', async () => {
-      // `convictionCreditSeconds` (passed as `expiryShortenedBy`) can be arbitrary
-      // seconds. The migration expiry is `bucketedDefault - credit` with NO second
-      // re-bucket, so a non-day-aligned credit is applied to the exact second. (A
-      // re-bucket would silently round it UP to the day grid — e.g. `60d - 1h` would
-      // become a full `60d`, quietly shrinking the configured credit.)
-      const credit = SIXTY_DAYS - 3600n; // 60 days minus 1 hour (not day-aligned)
-      await ConvictionStakingStorage.createPosition(1, ALICE_ID, 1000, 12, 1, credit);
-      const tsNow = await latestTimestamp();
-      const pos = await ConvictionStakingStorage.getPosition(1);
-      // exact: the bucketed default minus the FULL credit (not rounded back up).
-      expect(pos.expiryTimestamp).to.equal(bucketUp(tsNow + TIER_DURATIONS[12]) - credit);
-      // crucially NOT snapped back to the day grid:
-      expect(pos.expiryTimestamp % DAY).to.not.equal(0n);
     });
   });
 });

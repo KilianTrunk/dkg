@@ -30,6 +30,11 @@ const ONE_AND_HALF_X = (15n * SCALE18) / 10n;
 const TWO_X = 2n * SCALE18;
 const THREE_AND_HALF_X = (35n * SCALE18) / 10n;
 const SIX_X = 6n * SCALE18;
+const DAY = 24n * 60n * 60n;
+
+function bucketExpiry(rawExpiry: bigint): bigint {
+  return ((rawExpiry + DAY - 1n) / DAY) * DAY;
+}
 
 type Fixture = {
   accounts: SignerWithAddress[];
@@ -549,9 +554,8 @@ describe('@unit DKGStakingConvictionNFT', () => {
       const txReceipt = await tx.wait();
       const txBlock = await hre.ethers.provider.getBlock(txReceipt!.blockHash);
       const relockTs = BigInt(txBlock!.timestamp);
-      // Tier 12 wall-clock duration = 366 days.
-      const DAY = 24n * 60n * 60n;
-      const expectedExpiryTs = relockTs + 366n * DAY;
+      // Tier 12 boost expires on the next daily bucket after 366 days.
+      const expectedExpiryTs = bucketExpiry(relockTs + 366n * DAY);
 
       await expect(tx).to.emit(NFT, 'PositionRelocked').withArgs(1n, newTokenId, 12);
       await expect(tx)
@@ -611,9 +615,8 @@ describe('@unit DKGStakingConvictionNFT', () => {
       const receipt = await tx.wait();
       const txBlock = await hre.ethers.provider.getBlock(receipt!.blockHash);
       const relockTs = BigInt(txBlock!.timestamp);
-      // D26: tier 6 commits 180 days of boost exactly.
-      const DAY = 24n * 60n * 60n;
-      const expectedExpiryTs = relockTs + 180n * DAY;
+      // D26: tier 6 commits at least 180 days of boost, rounded to the next daily bucket.
+      const expectedExpiryTs = bucketExpiry(relockTs + 180n * DAY);
       const pos = await ConvictionStakingStorageContract.getPosition(newTokenId);
       expect(pos.expiryTimestamp).to.equal(expectedExpiryTs);
       expect(pos.multiplier18).to.equal(THREE_AND_HALF_X);
@@ -633,19 +636,24 @@ describe('@unit DKGStakingConvictionNFT', () => {
       ).to.be.revertedWithCustomError(StakingV10Contract, 'OnlyConvictionNFT');
     });
 
-    it('boundary: relock succeeds at exactly currentEpoch == pos.expiryTimestamp', async () => {
+    it('boundary: relock succeeds at exactly the bucketed expiry timestamp', async () => {
       const { identityId } = await createProfile();
       const amount = hre.ethers.parseEther('1000');
       await mintAndApprove(accounts[0], amount);
       await NFT.connect(accounts[0]).createConviction(identityId, amount, 1);
-      // 1-epoch lock at creation epoch C → expiryTimestamp = C + 1. Advance
-      // exactly 1 epoch so currentEpoch == expiryTimestamp — under the old
-      // `<=` check this would still revert as LockStillActive.
-      await advanceEpochs(1);
+
+      const expiryTimestamp = (await ConvictionStakingStorageContract.getPosition(1))
+        .expiryTimestamp;
+      // Claim just before the lock boundary so the relock transaction itself can
+      // land exactly at `expiryTimestamp`.
+      await time.setNextBlockTimestamp(Number(expiryTimestamp - 1n));
       await NFT.connect(accounts[0]).claim(1); // satisfy UnclaimedEpochs guard
 
-      const newTokenId = await NFT.connect(accounts[0]).relock.staticCall(1, 6);
-      await NFT.connect(accounts[0]).relock(1, 6);
+      await time.setNextBlockTimestamp(Number(expiryTimestamp));
+      const newTokenId = (await NFT.nextTokenId()) + 1n;
+      await expect(NFT.connect(accounts[0]).relock(1, 6))
+        .to.emit(NFT, 'PositionRelocked')
+        .withArgs(1n, newTokenId, 6);
       const pos = await ConvictionStakingStorageContract.getPosition(newTokenId);
       expect(pos.lockTier).to.equal(6);
       expect(pos.multiplier18).to.equal(THREE_AND_HALF_X);
@@ -987,17 +995,16 @@ describe('@unit DKGStakingConvictionNFT', () => {
       );
     });
 
-    it('boundary: withdraw succeeds at exactly currentEpoch == pos.expiryTimestamp', async () => {
+    it('boundary: withdraw succeeds at exactly the bucketed expiry timestamp', async () => {
       const { identityId } = await createProfile();
       const amount = hre.ethers.parseEther('1000');
       await mintAndApprove(accounts[0], amount);
       await NFT.connect(accounts[0]).createConviction(identityId, amount, 1);
-      // 1-tier lock at creation epoch C → expiryTimestamp ~ C + 1. Advance
-      // exactly 1 epoch so currentEpoch == expiryTimestamp (the unlock
-      // boundary). Under `currentEpoch >= expiryTimestamp` this must pass.
-      await advanceEpochs(1);
+      const expiryTimestamp = (await ConvictionStakingStorageContract.getPosition(1))
+        .expiryTimestamp;
 
       // `withdraw` auto-claims internally — no separate claim() required.
+      await time.setNextBlockTimestamp(Number(expiryTimestamp));
       await NFT.connect(accounts[0]).withdraw(1);
 
       expect(

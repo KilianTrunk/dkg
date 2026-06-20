@@ -48,8 +48,10 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
  *   - Tier durations and multipliers are stored in `_tiers` (keyed by
  *     `lockTier` id). The baseline ladder seeded at `initialize()` is
  *     {0→(0s, 1x), 1→(30d, 1.5x), 3→(90d, 2x), 6→(180d, 3.5x), 12→(366d, 6x)}.
- *   - `expiryTimestamp = block.timestamp + duration` (timestamp-accurate;
- *     no epoch rounding, no drift buffer).
+ *   - `expiryTimestamp = block.timestamp + duration`, rounded UP to the
+ *     next daily expiry bucket. The upward rounding keeps the promised
+ *     minimum lock duration while coalescing per-block dust stakes into
+ *     one queue slot per day.
  *   - New tiers can be appended via `addTier` (HubOwner or multisig owner).
  *     Existing tiers can be deactivated via `deactivateTier` to stop
  *     accepting NEW fresh stakes, but relock / migration paths still
@@ -143,12 +145,19 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     //             drained by `StakingV10._claim`.
     //           * `createNewPositionFromExisting` migrates carries across
     //             the relock burn-mint; `deletePosition` deletes them.
-    string private constant _VERSION = "10.0.4";
+    //   10.0.5 — Expiry-queue DoS hardening:
+    //           * Boost expiries are rounded up to daily buckets so per-block
+    //             dust stakes coalesce into one queue slot per day.
+    //           * New distinct expiry slots are capped per node; same-bucket
+    //             stakes keep coalescing even when the cap is reached.
+    string private constant _VERSION = "10.0.5";
 
     // Multiplier scale, matches DKGStakingConvictionNFT._convictionMultiplier
     // (returns 1e18-scaled values so fractional tiers like 1.5x and 3.5x
     // are representable).
     uint256 internal constant SCALE18 = 1e18;
+    uint40 public constant EXPIRY_BUCKET_SECONDS = 1 days;
+    uint256 public constant MAX_NODE_PENDING_EXPIRIES = 512;
 
     // ============================================================
     //                 D20 — Mutable tier ladder
@@ -251,6 +260,7 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     event NodeEffectiveStakeDelta(uint72 indexed identityId, int256 delta, uint256 newRunningEffectiveStake);
     event NodeExpiryScheduled(uint72 indexed identityId, uint40 timestamp, uint256 dropAdded, uint256 newTotalDrop);
     event NodeExpiryCancelled(uint72 indexed identityId, uint40 timestamp, uint256 dropRemoved, uint256 newTotalDrop);
+    error NodeExpiryQueueFull(uint72 identityId, uint256 pending, uint256 maxPending);
     // D15 — V10 stake aggregate events.
     event NodeStakeV10Increased(uint72 indexed identityId, uint256 amount, uint256 newNodeStake, uint256 newTotal);
     event NodeStakeV10Decreased(uint72 indexed identityId, uint256 amount, uint256 newNodeStake, uint256 newTotal);
@@ -711,59 +721,22 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     ///
     /// LOOP BOUND (why this cannot explode the block gas limit)
     /// --------------------------------------------------------
-    /// The `while` terminates as soon as `t > ts` (1) or `head == len`
-    /// (2). What could make it iterate "many" times?
+    /// The `while` terminates as soon as `t > ts` or `head == len`.
+    /// Entries are only added through `_scheduleNodeExpiry`, and fresh
+    /// lock expiries are rounded UP to daily buckets before they reach
+    /// the queue. A per-block dust-stake stream therefore coalesces into
+    /// one slot per day, not one slot per block.
     ///
-    ///   (a) Entries are only added by `_scheduleNodeExpiry`, which is
-    ///       itself only reachable from `onlyContracts` mutators above.
-    ///       There is no external path for an attacker to spam the
-    ///       queue — fresh entries cost someone real TRAC to lock.
+    /// `_scheduleNodeExpiry` also refuses to create a new distinct slot
+    /// once `MAX_NODE_PENDING_EXPIRIES` pending slots are live for a node.
+    /// Same-bucket stakes keep accumulating into the existing slot, so the
+    /// cap bounds replay work without blocking aggregation inside an
+    /// already-reserved bucket.
     ///
-    ///   (b) Entries with the same `ts` are coalesced into ONE array
-    ///       slot (see `_scheduleNodeExpiry`: `if (existing != 0) return`).
-    ///       So the queue length is bounded by the number of *distinct*
-    ///       active expiry timestamps the node has ever been scheduled
-    ///       against — NOT by the delegator count.
-    ///
-    ///   (c) Work is strictly amortized once: each array slot is
-    ///       visited by exactly one `_settleNodeTo` call across the
-    ///       contract's lifetime (we only ever advance `head`). In the
-    ///       steady state where settle is called from every CSS mutator
-    ///       and every `submitProof` (~ every epoch), the number of
-    ///       entries matured between two consecutive settles is
-    ///       bounded by (new expiries scheduled during that window that
-    ///       also matured within it) — in practice 0 on a healthy,
-    ///       proof-active node.
-    ///
-    /// The only scenario that produces a large iteration count in one
-    /// call is long-duration node DORMANCY: the node produces no proofs
-    /// AND receives no CSS mutations while many distinct-ts expiries
-    /// mature. Concrete napkin math: on a chain with ~12s block times a node
-    /// that accumulates ONE brand-new distinct expiry timestamp per
-    /// block for 30 days and then stops settling for 30 more days sees
-    /// ~216k matured entries on resume — at ~5k gas per iteration that
-    /// is ~1.1B gas, well above any block limit. That tail is tolerable
-    /// because:
-    ///
-    ///   * To reach it, the node has to have been completely silent
-    ///     (no proofs, no stake/unstake, no relock, no redelegate in or
-    ///     out) for longer than its longest outstanding tier duration.
-    ///     In practice `submitProof` settles on every proof, so any
-    ///     proof-producing node drains continuously.
-    ///   * Same-block same-tier stakes coalesce, so realistic distinct-
-    ///     ts counts are far below the worst case.
-    ///   * The invariant is recoverable: any single `settleNodeTo` that
-    ///     OOMs blocks only the caller's tx; the queue state is
-    ///     unchanged, so later calls can still make progress once gas
-    ///     budgets allow.
-    ///
-    /// If operational telemetry later shows real-world queues
-    /// approaching danger, the escape hatch is a bounded variant
-    /// (`settleNodeToMax(id, ts, maxEntries)`) that advances `head` by
-    /// at most `maxEntries` and lets the protocol drain a dormant queue
-    /// across several txs. Not shipped now because the "who even calls
-    /// this" analysis (a) + steady-state (c) make it dead code for any
-    /// node that ever submits a proof.
+    /// Work is amortized once: each array slot is visited by exactly one
+    /// `_settleNodeTo` call across the contract's lifetime. In steady state
+    /// `submitProof` drains the queue continuously; after dormancy, the
+    /// daily bucket + pending-slot cap keeps the catch-up loop bounded.
     ///
     /// INVARIANTS MAINTAINED ON EXIT
     /// -----------------------------
@@ -887,12 +860,17 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
             // ts already has a slot in the queue; just bumped the drop.
             return;
         }
-        nodeExpiryPresent[identityId][ts] = true;
 
         // Insert `ts` into the sorted queue.
         uint40[] storage arr = nodeExpiryTimes[identityId];
         uint256 head = nodeExpiryHead[identityId];
         uint256 len = arr.length;
+        uint256 pending = len - head;
+        if (pending >= MAX_NODE_PENDING_EXPIRIES) {
+            revert NodeExpiryQueueFull(identityId, pending, MAX_NODE_PENDING_EXPIRIES);
+        }
+        nodeExpiryPresent[identityId][ts] = true;
+
         arr.push(ts); // temporarily at tail
         // Bubble left while the left neighbor is strictly greater AND we
         // haven't crossed the drain head.
@@ -1653,16 +1631,22 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     // ============================================================
 
     /**
-     * @dev Wall-clock expiry computation (D26). Timestamp-accurate:
-     *      the boost ends exactly at `block.timestamp + duration`.
-     *      Returns 0 for tier-0 (permanent rest state).
+     * @dev Wall-clock expiry computation (D26). Boosts last at least the tier
+     *      duration and expire on the next daily bucket. Returns 0 for tier-0
+     *      (permanent rest state).
      */
     function _computeExpiryTimestamp(uint40 lockTier) internal view returns (uint40) {
         if (lockTier == 0) return 0;
         uint256 duration = _tierDuration(lockTier);
         uint256 exp = block.timestamp + duration;
-        require(exp <= type(uint40).max, "Expiry overflow");
-        return uint40(exp);
+        return _bucketExpiryTimestamp(exp);
+    }
+
+    function _bucketExpiryTimestamp(uint256 rawExpiry) internal pure returns (uint40) {
+        uint256 bucket = uint256(EXPIRY_BUCKET_SECONDS);
+        uint256 bucketed = ((rawExpiry + bucket - 1) / bucket) * bucket;
+        require(bucketed <= type(uint40).max, "Expiry overflow");
+        return uint40(bucketed);
     }
 
     function _pushNodeToken(uint72 identityId, uint256 tokenId) internal {

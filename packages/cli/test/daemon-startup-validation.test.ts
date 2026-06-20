@@ -90,13 +90,48 @@ describe('daemon startup network validation', () => {
 
     await expect(runDaemonInner(true, {
       name: 'predeployment-startup-test',
+      networkConfig: 'mainnet-base',
       listenPort: 0,
       nodeRole: 'edge',
     } as any, Date.now())).rejects.toThrow('process.exit:1');
 
+    expect(mocks.loadNetworkConfig).toHaveBeenCalledWith('mainnet-base');
     expect(mocks.agentCreate).not.toHaveBeenCalled();
     expect(stdoutSpy.mock.calls.map(call => String(call[0])).join('')).toContain(
       'FATAL: network config DKG V10 Base Mainnet is marked pre-deployment',
+    );
+  });
+
+  it('exits before agent creation when config.networkConfig does not resolve', async () => {
+    tempHome = await mkdtemp(join(tmpdir(), 'dkg-missing-network-startup-'));
+    originalDkgHome = process.env.DKG_HOME;
+    process.env.DKG_HOME = tempHome;
+    stdoutWrite = process.stdout.write;
+    stderrWrite = process.stderr.write;
+    uncaughtExceptionListeners = process.listeners('uncaughtException') as NodeJS.UncaughtExceptionListener[];
+    unhandledRejectionListeners = process.listeners('unhandledRejection') as NodeJS.UnhandledRejectionListener[];
+
+    mocks.loadNetworkConfig.mockResolvedValue(null);
+    const stdoutSpy = vi
+      .spyOn(process.stdout, 'write')
+      .mockImplementation(() => true);
+    vi
+      .spyOn(process, 'exit')
+      .mockImplementation(((code?: string | number | null) => {
+        throw new Error(`process.exit:${code}`);
+      }) as never);
+
+    await expect(runDaemonInner(true, {
+      name: 'missing-network-startup-test',
+      networkConfig: 'missing-mainnet',
+      listenPort: 0,
+      nodeRole: 'edge',
+    } as any, Date.now())).rejects.toThrow('process.exit:1');
+
+    expect(mocks.loadNetworkConfig).toHaveBeenCalledWith('missing-mainnet');
+    expect(mocks.agentCreate).not.toHaveBeenCalled();
+    expect(stdoutSpy.mock.calls.map(call => String(call[0])).join('')).toContain(
+      'FATAL: network config "missing-mainnet" was not found',
     );
   });
 
@@ -109,13 +144,11 @@ describe('daemon startup network validation', () => {
     uncaughtExceptionListeners = process.listeners('uncaughtException') as NodeJS.UncaughtExceptionListener[];
     unhandledRejectionListeners = process.listeners('unhandledRejection') as NodeJS.UnhandledRejectionListener[];
 
-    const networkId = await computeNetworkId('gnosis-mainnet');
     mocks.loadNetworkConfig.mockResolvedValue({
       networkName: 'DKG V10 Gnosis Mainnet',
       genesisId: 'gnosis-mainnet',
-      networkId,
       genesisVersion: 1,
-      relays: [],
+      relays: ['/ip4/178.104.54.178/tcp/9090/p2p/12D3KooWSmU3owJvB9sFw8uApDgKrv2VBMecsGGvgAc4Gq6hB57M'],
       defaultNodeRole: 'edge',
     });
     mocks.loadOpWallets.mockResolvedValue({ adminWallet: undefined, wallets: [] });
@@ -124,10 +157,12 @@ describe('daemon startup network validation', () => {
 
     await expect(runDaemonInner(true, {
       name: 'genesis-startup-test',
+      networkConfig: 'mainnet-gnosis',
       listenPort: 0,
       nodeRole: 'edge',
     } as any, Date.now())).rejects.toThrow('after-agent-create');
 
+    expect(mocks.loadNetworkConfig).toHaveBeenCalledWith('mainnet-gnosis');
     expect(mocks.agentCreate).toHaveBeenCalledTimes(1);
     expect(mocks.agentCreate.mock.calls[0]?.[0]).toMatchObject({
       genesisId: 'gnosis-mainnet',

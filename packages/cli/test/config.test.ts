@@ -24,6 +24,7 @@ import {
   classifyMonorepoInit,
   sharedHomeInitGate,
   repoDir,
+  resolveNetworkConfigName,
   resolveAutoUpdateSource,
   resolveApprovalPolicy,
   resolveChainConfig,
@@ -403,6 +404,25 @@ describe('localAgentIntegrations config round-trip', () => {
     await writeFile(join(tempDir, 'config.yaml'), 'nodeRole: core\n', 'utf8');
 
     expect(readNodeRoleFromConfigSync()).toBe('edge');
+  });
+
+  it('round-trips networkConfig through saveConfig/loadConfig (network selector)', async () => {
+    await saveConfig({
+      name: 'test-node',
+      networkConfig: 'mainnet-base',
+      apiPort: 9200,
+      listenPort: 0,
+      nodeRole: 'core',
+    });
+
+    const loaded = await loadConfig();
+    expect(loaded.networkConfig).toBe('mainnet-base');
+    expect(resolveNetworkConfigName(loaded)).toBe('mainnet-base');
+  });
+
+  it('falls back to project default network when networkConfig is unset or blank', () => {
+    expect(resolveNetworkConfigName({})).toBe('testnet');
+    expect(resolveNetworkConfigName({ networkConfig: '   ' })).toBe('testnet');
   });
 
   it('round-trips relayServerCapacity through saveConfig/loadConfig (operator override)', async () => {

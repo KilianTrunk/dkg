@@ -137,7 +137,9 @@ export interface DaemonStatusResponse {
   name: string;
   peerId: string;
   nodeRole?: string;
+  networkConfig?: string;
   networkId?: string;
+  networkName?: string | null;
   uptimeMs: number;
   connectedPeers: number;
   relayConnected: boolean;

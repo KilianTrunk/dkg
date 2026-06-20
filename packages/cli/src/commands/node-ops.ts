@@ -132,7 +132,7 @@ program
   .action(async () => {
     try {
       const config = await loadConfig();
-      const network = await loadNetworkConfig();
+      const network = await loadNetworkConfig(config.networkConfig);
       const { loadOpWallets } = await import('@origintrail-official/dkg-agent');
       const opWallets = await loadOpWallets(dkgDir());
 
@@ -227,7 +227,7 @@ program
   .action(async (amount: string, opts: ActionOpts) => {
     try {
       const config = await loadConfig();
-      const network = await loadNetworkConfig();
+      const network = await loadNetworkConfig(config.networkConfig);
       const { loadOpWallets } = await import('@origintrail-official/dkg-agent');
       const opWallets = await loadOpWallets(dkgDir());
 

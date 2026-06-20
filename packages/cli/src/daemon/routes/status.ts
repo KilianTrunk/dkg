@@ -94,6 +94,7 @@ import {
   type LocalAgentIntegrationTransport,
   resolveContextGraphs,
   resolveNetworkDefaultContextGraphs,
+  resolveNetworkConfigName,
   resolveSharedMemoryTtlMs,
   repoDir,
   releasesDir,
@@ -617,7 +618,7 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
     const circuitAddrs = agent.multiaddrs.filter((a) =>
       a.includes("/p2p-circuit/"),
     );
-    const networkId = await computeNetworkId(network?.genesisId);
+    const networkId = network?.networkId ?? await computeNetworkId(network?.genesisId);
     const chainConf = resolveChainConfig(config, network);
     const rpcEndpointCount = chainConf?.rpcUrl
       ? resolveRpcUrls(chainConf.rpcUrl, chainConf.rpcUrls).length
@@ -660,7 +661,8 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
       installMode: detectInstallMode(),
       peerId: agent.peerId,
       nodeRole: config.nodeRole ?? "edge",
-      networkId: networkId.slice(0, 16),
+      networkConfig: resolveNetworkConfigName(config),
+      networkId,
       networkName: network?.networkName ?? null,
       storeBackend: config.store?.backend ?? "oxigraph-worker",
       // External backend visibility (RFC 120 / plan PR 1 item 3). For

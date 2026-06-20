@@ -377,6 +377,11 @@ export interface GraphSetIndexConfig {
 
 export interface DkgConfig {
   name: string;
+  /**
+   * Selects which bundled network/<name>.json overlay this node should use.
+   * When omitted, runtime falls back to project.json#defaultNetwork.
+   */
+  networkConfig?: string;
   relay?: string;
   apiPort: number;
   /** Host to bind the API server (default '127.0.0.1', use '0.0.0.0' for external access). */
@@ -1123,7 +1128,7 @@ export function resolveReadyChainConfig(
 /**
  * Load a network config from network/<name>.json.
  *
- * @param network - Network name (e.g. 'testnet', 'mainnet'). Defaults to
+ * @param network - Network name (e.g. 'testnet', 'mainnet-base'). Defaults to
  *   the `defaultNetwork` value from project.json.
  *
  * Candidate paths (tried in order):
@@ -1136,7 +1141,7 @@ export function resolveReadyChainConfig(
  * without requiring a rebuild of the CLI package.
  */
 export async function loadNetworkConfig(network?: string): Promise<NetworkConfig | null> {
-  const name = network ?? loadProjectConfig().defaultNetwork;
+  const name = network?.trim() || loadProjectConfig().defaultNetwork;
   if (_networkConfig && _networkConfigName === name) return _networkConfig;
   try {
     const file = `${name}.json`;
@@ -1153,6 +1158,10 @@ export async function loadNetworkConfig(network?: string): Promise<NetworkConfig
   } catch {
     return null;
   }
+}
+
+export function resolveNetworkConfigName(config?: Pick<DkgConfig, 'networkConfig'> | null): string {
+  return config?.networkConfig?.trim() || loadProjectConfig().defaultNetwork;
 }
 
 export function dkgDir(): string {

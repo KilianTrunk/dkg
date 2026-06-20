@@ -112,7 +112,7 @@ export async function createPublisherRuntime(args: {
     throw new Error('No publisher wallets configured. Use `dkg publisher wallet add <privateKey>` first.');
   }
 
-  const network = await loadNetworkConfig();
+  const network = await loadNetworkConfig(args.config.networkConfig);
   const keypair = await loadOrCreateAgentWallet(args.dataDir);
   const store = await createPublisherStore(args.dataDir, args.config);
   const publicSnapshotStore = createPublicSnapshotStore(args.dataDir, args.config);

@@ -895,7 +895,12 @@ export async function runDaemonInner(
     log(`[dkg-build-info] WARNING: failed to emit startup telemetry: ${String(err)}`);
   }
 
-  const network = await loadNetworkConfig();
+  const selectedNetworkConfig = config.networkConfig?.trim();
+  const network = await loadNetworkConfig(selectedNetworkConfig);
+  if (selectedNetworkConfig && !network) {
+    log(`FATAL: network config "${selectedNetworkConfig}" was not found (expected network/${selectedNetworkConfig}.json).`);
+    process.exit(1);
+  }
   const genesisValidation = await validateStartupGenesis(network);
   const networkId = genesisValidation.networkId;
   if (!genesisValidation.ok) {

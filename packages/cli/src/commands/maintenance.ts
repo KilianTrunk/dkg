@@ -123,7 +123,7 @@ program
   .option('--no-verify-tag', 'Skip signed-tag verification for version/tag updates')
   .action(async (versionOrRef: string | undefined, opts: ActionOpts) => {
     const config = await loadConfig();
-    const net = await loadNetworkConfig();
+    const net = await loadNetworkConfig(config.networkConfig);
     // Resolve field-by-field across local/network/project so defaults flow
     // through even when the local config omits repo/branch.
     const au = resolveAutoUpdateConfig(config, net) ?? (() => {

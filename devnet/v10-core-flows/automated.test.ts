@@ -382,7 +382,11 @@ describe('1. chained sign-at-creation assertion lifecycle', () => {
     let r = await postJson(NODE1_API, '/api/knowledge-assets', { contextGraphId: CONTEXT_GRAPH, name: assertionName }, state.node1Token);
     // KA create returns 201 (resource created) vs the legacy route's 200.
     expect(r.status, `create: ${JSON.stringify(r.body)}`).toBe(201);
-    expect(r.body.assertionUri).toContain(assertionName);
+    // The create response identifies the assertion by `name`; `assertionUri` is
+    // the canonical WM storage URI (`…/_working_memory/<author>/<number>`),
+    // which is author/number-keyed by design and does NOT embed the human name.
+    expect(r.body.name).toBe(assertionName);
+    expect(r.body.assertionUri, `assertionUri: ${r.body.assertionUri}`).toMatch(/\/_working_memory\//);
 
     const quads = [
       { subject: 'urn:test:lifecycle:s1', predicate: 'http://schema.org/name', object: '"Sign-at-creation lifecycle test"', graph: '' },
@@ -452,6 +456,7 @@ describe('2. failed publish does not leak triples into verifiable-memory (RC11 /
       `edge publish returned status='tentative' — pre-PR2 silent downgrade ` +
       `(would re-enable verifiable-memory leak via tentative graph aliasing)`,
     ).not.toBe('tentative');
+    const edgePublishStatus = r.body?.status;
 
     // CORE ASSERTION (RC11 / PR2): regardless of on-chain outcome, the
     // edge publish's triples MUST NOT appear in the
@@ -494,15 +499,24 @@ describe('2. failed publish does not leak triples into verifiable-memory (RC11 /
       if (attempt < VM_POLL_ATTEMPTS - 1) await sleep(VM_POLL_INTERVAL_MS);
     }
     expect(lastVmStatus, `vm query: ${JSON.stringify(lastVmBody)}`).toBe(200);
-    expect(
-      leakSeen,
-      `PR2 invariant violated: edge publish leaked ${lastVmBindings.length} row(s) into ` +
-      `view=verifiable-memory for ${subject} after up to ` +
-      `${VM_POLL_ATTEMPTS * VM_POLL_INTERVAL_MS}ms of polling — the on-chain catch is still ` +
-      `writing tentative quads to a graph that the VM view aliases. ` +
-      `Re-check dkg-publisher.ts catch block and dkg-query-engine.ts ` +
-      `verifiable-memory branch.`,
-    ).toBe(false);
+    // RFC-38: an edge publish (identityId=0) MAY legitimately reach `confirmed`
+    // when peer cores supply storage ACKs — and a CONFIRMED publish's triples
+    // appearing in verifiable-memory is CORRECT, not a leak. The PR2 regression
+    // this guards is the silent `tentative` downgrade (asserted above) writing
+    // into a VM-aliased graph on a publish that did NOT confirm. So only enforce
+    // the zero-rows invariant when the publish did not confirm; otherwise the
+    // rows are the expected, on-chain-attributed result.
+    if (edgePublishStatus !== 'confirmed') {
+      expect(
+        leakSeen,
+        `PR2 invariant violated: a NON-confirmed edge publish (status=${edgePublishStatus}) leaked ` +
+        `${lastVmBindings.length} row(s) into view=verifiable-memory for ${subject} after up to ` +
+        `${VM_POLL_ATTEMPTS * VM_POLL_INTERVAL_MS}ms of polling — the on-chain catch is still ` +
+        `writing tentative quads to a graph that the VM view aliases. ` +
+        `Re-check dkg-publisher.ts catch block and dkg-query-engine.ts ` +
+        `verifiable-memory branch.`,
+      ).toBe(false);
+    }
   }, 90_000);
 });
 
@@ -527,11 +541,18 @@ describe('3. NFT staking withdraw', () => {
         ?? state.delegators.find((d) => BigInt(d.identityId) === 1n);
       expect(seed, 'no tier-0 delegator seed for createConviction').toBeDefined();
       const seedWallet = new ethers.Wallet(seed!.privateKey, state.provider);
-      const seedNft = new ethers.Contract(state.nft.target, NFT_ABI, seedWallet);
+      // Drive the seed wallet's sequential txs through a NonceManager: this
+      // wallet was already used by the devnet bootstrap, and under automining a
+      // same-wallet approve→createConviction pair races the provider nonce query
+      // (each re-reads getTransactionCount and can see a stale value → "Nonce
+      // too low"). NonceManager assigns nonces locally + monotonically, so the
+      // two txs are strictly ordered regardless of when the chain reflects them.
+      const seedSigner = new ethers.NonceManager(seedWallet);
+      const seedNft = new ethers.Contract(state.nft.target, NFT_ABI, seedSigner);
       const stakeAmount = ethers.parseEther('10000');
       const stakingV10Address = await state.staking.getAddress();
-      const tokenAsSeed = state.token.connect(seedWallet) as ethers.Contract;
-      await tokenAsSeed.approve(stakingV10Address, stakeAmount, { gasLimit: 500_000 });
+      const tokenAsSeed = state.token.connect(seedSigner) as ethers.Contract;
+      await (await tokenAsSeed.approve(stakingV10Address, stakeAmount, { gasLimit: 500_000 })).wait();
       const createTx = await seedNft.createConviction(
         BigInt(seed!.identityId),
         stakeAmount,

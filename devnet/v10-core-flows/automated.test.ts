@@ -204,6 +204,27 @@ function postJson(api: string, path: string, body: unknown, token: string): Prom
   });
 }
 
+/**
+ * Parse SPARQL SELECT bindings out of a daemon /api/query response, accepting the
+ * known wrapper shapes and THROWING on an unrecognised 200 — so a future wrapper
+ * regression can never masquerade as "zero rows". Callers must only pass a 200
+ * body; a non-200 (still warming up) has no bindings to read. (otReviewAgent #1258.)
+ */
+function queryBindings(body: any): Array<Record<string, unknown>> {
+  const b =
+    body?.result?.bindings ??   // current daemon shape: { result: { bindings } }
+    body?.results?.bindings ??  // SPARQL 1.1 JSON results shape
+    body?.bindings;             // legacy flat shape
+  if (!Array.isArray(b)) {
+    throw new Error(
+      `unrecognised /api/query response shape (no result.bindings / results.bindings / bindings array): ${
+        typeof body === 'string' ? body.slice(0, 300) : JSON.stringify(body).slice(0, 300)
+      }`,
+    );
+  }
+  return b as Array<Record<string, unknown>>;
+}
+
 function openSseAndCollect(
   api: string,
   token: string,
@@ -461,7 +482,11 @@ describe('2. failed publish does not leak triples into verifiable-memory (RC11 /
       );
       lastVmStatus = vmQuery.status;
       lastVmBody = vmQuery.body;
-      lastVmBindings = vmQuery.body?.bindings ?? vmQuery.body?.results?.bindings ?? [];
+      // Parse via the shared helper, which THROWS on an unrecognised 200 shape
+      // rather than coercing to [] — otherwise a wrapper regression silently
+      // re-becomes "zero rows" and this leak guard passes open. A non-200 (still
+      // warming up) legitimately has no bindings to read. (otReviewAgent #1258.)
+      lastVmBindings = vmQuery.status === 200 ? queryBindings(vmQuery.body) : [];
       if (lastVmBindings.length > 0) {
         leakSeen = true;
         break;
@@ -733,4 +758,100 @@ describe('4. operator-fee accrual + withdrawal', () => {
     const queuedAfter = await state.css.getOperatorFeeWithdrawalRequest(identityId);
     expect(queuedAfter.amount).toBe(0n);
   }, 600_000);
+});
+
+// ───────── 5. Addressed-read provenance (dkg_get_entity_sources, PR #1253) ─────────
+//
+// The `dkg_get_entity_sources` MCP tool answers "what is known about entity X,
+// and which Knowledge Asset asserted each fact?" — it reads
+// `SELECT ?p ?o ?g WHERE { GRAPH ?g { <X> ?p ?o } }` scoped to verifiable-memory
+// and parses the per-KA source graph `…/_verifiable_memory/{author}/{number}`
+// into the on-chain UAL identity a consumer cites/verifies against. The tool's
+// parsing/rendering is unit-tested with synthetic graphs; what ONLY a live
+// devnet can prove is that a REAL publish actually materialises that exact
+// per-KA source graph — i.e. the provenance handle the tool hands back resolves
+// to the publish's true on-chain (author, number).
+//
+// This pins that engine-layer contract end-to-end: publish an entity from a
+// core, read it back via the addressed-read shape, and assert the source graph
+// encodes the SAME (author, number) packed into the returned on-chain kaId
+// (reservedKaId = (uint160(author) << 96) | uint96(number) — the derivation the
+// publisher itself uses to build the VM graph URI, see dkg-publisher.ts:1553).
+describe('5. addressed-read provenance resolves to the per-KA verifiable-memory source', () => {
+  it("a published entity's facts carry a _verifiable_memory/{author}/{number} source matching its on-chain kaId", async () => {
+    const name = `core-flows-prov-${Date.now().toString(36)}`;
+    const subject = `urn:test:core-flows:${name}`; // fullPublish writes quads about this subject
+    const pub = await fullPublish(NODE1_API, state.node1Token, name);
+
+    // Reproduce the publisher's kaId → VM-graph derivation (dkg-publisher.ts:1553).
+    const kaId = BigInt(pub.kaId);
+    const author = '0x' + (kaId >> 96n).toString(16).padStart(40, '0');
+    const number = (kaId & ((1n << 96n) - 1n)).toString();
+
+    // Break the circularity (otReviewAgent #1258): pub.kaId comes from the daemon's
+    // own publish response, and the VM graph is materialised from that same value —
+    // so a publisher bug that returned AND materialised the same WRONG id would slip
+    // past a check that only compares the graph to pub.kaId. Anchor to chain truth:
+    // the KA-storage NFT's ownerOf(kaId) REVERTS for a non-existent token and
+    // otherwise returns the address packed into the id (OT-RFC-43:
+    // kaId = (uint160(author) << 96) | uint96(number)). So a forged id either
+    // reverts here or fails owner == author — independently of what the daemon said.
+    const dkgKaAddr: string = await state.hub.getAssetStorageAddress('DKGKnowledgeAssets');
+    const dkgKa = new ethers.Contract(
+      dkgKaAddr,
+      ['function ownerOf(uint256) view returns (address)'],
+      state.provider,
+    );
+    const onChainOwner: string = await dkgKa.ownerOf(kaId); // reverts if kaId is not a real minted KA
+    expect(
+      onChainOwner.toLowerCase(),
+      `kaId ${pub.kaId}: on-chain owner ${onChainOwner} != author packed into the id (${author}) — daemon reported an id that does not match chain truth`,
+    ).toBe(author.toLowerCase());
+
+    const expectedSource = `did:dkg:context-graph:${CONTEXT_GRAPH}/_verifiable_memory/${author}/${number}`;
+
+    // Addressed read: project the source graph per fact — the exact shape the
+    // tool issues. Parse via the shared queryBindings helper (throws on an
+    // unrecognised 200 shape). Poll briefly so post-confirmation VM
+    // materialisation has time to land.
+    const val = (x: unknown): string =>
+      typeof x === 'string' ? x : ((x as { value?: string })?.value ?? '');
+    let bindings: Array<Record<string, unknown>> = [];
+    for (let attempt = 0; attempt < 15; attempt++) {
+      const r = await postJson(
+        NODE1_API,
+        '/api/query',
+        {
+          sparql: `SELECT ?p ?o ?g WHERE { GRAPH ?g { <${subject}> ?p ?o } }`,
+          contextGraphId: CONTEXT_GRAPH,
+          view: 'verifiable-memory',
+        },
+        state.node1Token,
+      );
+      bindings = r.status === 200 ? queryBindings(r.body) : [];
+      if (bindings.length > 0) break;
+      await sleep(1000);
+    }
+    expect(bindings.length, `no verifiable-memory rows for ${subject} after polling`).toBeGreaterThan(0);
+
+    const sources = [...new Set(bindings.map((b) => val(b.g)))];
+
+    // (1) The correct per-KA source IS present — the handle a consumer cites
+    // resolves to THIS publish's on-chain (author, number).
+    expect(
+      sources.map((s) => s.toLowerCase()),
+      `expected per-KA source ${expectedSource}; got [${sources.join(', ')}]`,
+    ).toContain(expectedSource.toLowerCase());
+
+    // (2) No per-KA-shaped source carries a DIFFERENT (author, number) — i.e.
+    // attribution is never fabricated/mismatched against the on-chain identity.
+    // (Root / per-collection graphs that don't match the per-KA shape are the
+    // tool's "disclosed, non-citable" rows and are intentionally skipped here.)
+    for (const s of sources) {
+      const m = s.match(/\/_verifiable_memory\/([^/]+)\/([^/]+)$/);
+      if (!m) continue;
+      expect(m[1].toLowerCase(), `source ${s}: author != on-chain ${author}`).toBe(author.toLowerCase());
+      expect(m[2], `source ${s}: kaNumber != on-chain ${number}`).toBe(number);
+    }
+  }, 120_000);
 });

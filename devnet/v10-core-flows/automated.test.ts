@@ -204,6 +204,27 @@ function postJson(api: string, path: string, body: unknown, token: string): Prom
   });
 }
 
+/**
+ * Parse SPARQL SELECT bindings out of a daemon /api/query response, accepting the
+ * known wrapper shapes and THROWING on an unrecognised 200 — so a future wrapper
+ * regression can never masquerade as "zero rows". Callers must only pass a 200
+ * body; a non-200 (still warming up) has no bindings to read. (otReviewAgent #1258.)
+ */
+function queryBindings(body: any): Array<Record<string, unknown>> {
+  const b =
+    body?.result?.bindings ??   // current daemon shape: { result: { bindings } }
+    body?.results?.bindings ??  // SPARQL 1.1 JSON results shape
+    body?.bindings;             // legacy flat shape
+  if (!Array.isArray(b)) {
+    throw new Error(
+      `unrecognised /api/query response shape (no result.bindings / results.bindings / bindings array): ${
+        typeof body === 'string' ? body.slice(0, 300) : JSON.stringify(body).slice(0, 300)
+      }`,
+    );
+  }
+  return b as Array<Record<string, unknown>>;
+}
+
 function openSseAndCollect(
   api: string,
   token: string,
@@ -461,11 +482,11 @@ describe('2. failed publish does not leak triples into verifiable-memory (RC11 /
       );
       lastVmStatus = vmQuery.status;
       lastVmBody = vmQuery.body;
-      // The daemon wraps results as { result: { bindings } } — read
-      // `body.result.bindings`. (Was `body.bindings`/`body.results.bindings`,
-      // both undefined here, so this leak guard silently saw zero rows and
-      // could never actually catch a verifiable-memory leak.)
-      lastVmBindings = vmQuery.body?.result?.bindings ?? [];
+      // Parse via the shared helper, which THROWS on an unrecognised 200 shape
+      // rather than coercing to [] — otherwise a wrapper regression silently
+      // re-becomes "zero rows" and this leak guard passes open. A non-200 (still
+      // warming up) legitimately has no bindings to read. (otReviewAgent #1258.)
+      lastVmBindings = vmQuery.status === 200 ? queryBindings(vmQuery.body) : [];
       if (lastVmBindings.length > 0) {
         leakSeen = true;
         break;
@@ -766,12 +787,33 @@ describe('5. addressed-read provenance resolves to the per-KA verifiable-memory 
     const kaId = BigInt(pub.kaId);
     const author = '0x' + (kaId >> 96n).toString(16).padStart(40, '0');
     const number = (kaId & ((1n << 96n) - 1n)).toString();
+
+    // Break the circularity (otReviewAgent #1258): pub.kaId comes from the daemon's
+    // own publish response, and the VM graph is materialised from that same value —
+    // so a publisher bug that returned AND materialised the same WRONG id would slip
+    // past a check that only compares the graph to pub.kaId. Anchor to chain truth:
+    // the KA-storage NFT's ownerOf(kaId) REVERTS for a non-existent token and
+    // otherwise returns the address packed into the id (OT-RFC-43:
+    // kaId = (uint160(author) << 96) | uint96(number)). So a forged id either
+    // reverts here or fails owner == author — independently of what the daemon said.
+    const dkgKaAddr: string = await state.hub.getAssetStorageAddress('DKGKnowledgeAssets');
+    const dkgKa = new ethers.Contract(
+      dkgKaAddr,
+      ['function ownerOf(uint256) view returns (address)'],
+      state.provider,
+    );
+    const onChainOwner: string = await dkgKa.ownerOf(kaId); // reverts if kaId is not a real minted KA
+    expect(
+      onChainOwner.toLowerCase(),
+      `kaId ${pub.kaId}: on-chain owner ${onChainOwner} != author packed into the id (${author}) — daemon reported an id that does not match chain truth`,
+    ).toBe(author.toLowerCase());
+
     const expectedSource = `did:dkg:context-graph:${CONTEXT_GRAPH}/_verifiable_memory/${author}/${number}`;
 
     // Addressed read: project the source graph per fact — the exact shape the
-    // tool issues. The daemon wraps results as { result: { bindings } }, so read
-    // `body.result.bindings` (NOT top-level `body.bindings`). Poll briefly so
-    // post-confirmation VM materialisation has time to land.
+    // tool issues. Parse via the shared queryBindings helper (throws on an
+    // unrecognised 200 shape). Poll briefly so post-confirmation VM
+    // materialisation has time to land.
     const val = (x: unknown): string =>
       typeof x === 'string' ? x : ((x as { value?: string })?.value ?? '');
     let bindings: Array<Record<string, unknown>> = [];
@@ -786,7 +828,7 @@ describe('5. addressed-read provenance resolves to the per-KA verifiable-memory 
         },
         state.node1Token,
       );
-      bindings = r.body?.result?.bindings ?? [];
+      bindings = r.status === 200 ? queryBindings(r.body) : [];
       if (bindings.length > 0) break;
       await sleep(1000);
     }

@@ -83,6 +83,10 @@ describe('addressed-read provenance — scoped GRAPH ?g over one entity', () => 
     const engine = new DKGQueryEngine(store);
     await store.insert([
       q(E, NAME, '"swm-draft"', 'did:dkg:context-graph:cg-one/_shared_memory/0xaa/1'),
+      // The bare SWM BUCKET graph (no per-KA segment) — the engine resolves it
+      // too, and the tool discloses such rows as non-per-KA. Cover it so this
+      // test fails if the bucket stops being bound.
+      q(E, 'http://schema.org/note', '"swm-bucket"', 'did:dkg:context-graph:cg-one/_shared_memory'),
       q(E, COLOR, '"vm-published"', 'did:dkg:context-graph:cg-one/_verifiable_memory/0xbb/2'),
       q(E, 'http://schema.org/shape', '"rooted"', 'did:dkg:context-graph:cg-one'),
     ]);
@@ -91,9 +95,20 @@ describe('addressed-read provenance — scoped GRAPH ?g over one entity', () => 
       { contextGraphId: 'cg-one', view: 'shared-working-memory' },
     );
     const objects = r.bindings.map((b) => b['o']);
-    expect(objects).toContain('"swm-draft"');
+    expect(objects).toContain('"swm-draft"'); // per-KA SWM
+    expect(objects).toContain('"swm-bucket"'); // bare bucket (disclosure path)
     expect(objects).not.toContain('"vm-published"');
     expect(objects).not.toContain('"rooted"');
-    expect(r.bindings.every((b) => b['g'].includes('/_shared_memory/'))).toBe(true);
+    // Every source is within the SWM tier — a per-KA partition OR the bare
+    // bucket — never _verifiable_memory or root.
+    expect(
+      r.bindings.every((b) => {
+        const g = b['g'];
+        return (
+          g === 'did:dkg:context-graph:cg-one/_shared_memory' ||
+          g.startsWith('did:dkg:context-graph:cg-one/_shared_memory/')
+        );
+      }),
+    ).toBe(true);
   });
 });

@@ -387,7 +387,11 @@ SELECT DISTINCT ?s ?p WHERE { ?s ?p <${uri}> } LIMIT 50`,
       // with it), or a DID-form pid would double-prefix and mark every per-KA
       // graph unattributed.
       const cgId = normalizeContextGraphId(pid);
-      const safeIri = uri.replace(/^<|>$/g, '');
+      // Unwrap only a MATCHED `<…>` pair. Stripping `<` and `>` independently
+      // would rewrite a mismatched input like `<urn:x` to a different, valid
+      // entity (`urn:x`) and silently query it; leaving the stray delimiter in
+      // place lets the unsafe-char guard below reject it (fail closed).
+      const safeIri = uri.startsWith('<') && uri.endsWith('>') ? uri.slice(1, -1) : uri;
       // Guard the IRI interpolation: reject anything that could break out of
       // the `<…>` term. (A SPARQL injection here would let a caller widen the
       // query beyond the single entity.) Mirrors core's UNSAFE_IRI_CHARS — the

@@ -33,9 +33,12 @@ describe('dkg_get_entity_sources', () => {
     const result = await server.call('dkg_get_entity_sources', { uri: 'urn:x:1' });
     expect(result.isError).toBeFalsy();
     const call = client.queryCalls.at(-1)!;
-    // Assert the FULL addressed-read shape, not just a `GRAPH ?g` substring —
-    // one entity, projects p/o/g, no widening or extra patterns.
-    expect(String(call.sparql)).toContain('SELECT ?p ?o ?g WHERE { GRAPH ?g { <urn:x:1> ?p ?o } }');
+    // Assert the FULL addressed-read shape, anchored at the END so nothing can
+    // be appended (a `toContain` would still pass with a trailing LIMIT/ORDER
+    // BY, which would silently break the no-modifiers provenance contract).
+    const sparql = String(call.sparql).trim();
+    expect(sparql.endsWith('SELECT ?p ?o ?g WHERE { GRAPH ?g { <urn:x:1> ?p ?o } }')).toBe(true);
+    expect(sparql).not.toMatch(/\b(LIMIT|OFFSET|ORDER\s+BY|DISTINCT|REDUCED)\b/i);
     expect(call.view).toBe('verifiable-memory');
     expect(call.contextGraphId).toBe('test-cg');
     // Never the WM∪SWM union path (that would duplicate every sourced row).
@@ -194,6 +197,18 @@ describe('dkg_get_entity_sources', () => {
     registerReadTools(server.asMcpServer(), client.asDkgClient(), makeConfig());
     const before = client.queryCalls.length;
     const result = await server.call('dkg_get_entity_sources', { uri: 'urn:x> } UNION { ?s ?p ?o' });
+    expect(result.isError).toBe(true);
+    expect(client.queryCalls.length).toBe(before);
+  });
+
+  it('fails closed on a mismatched angle bracket instead of silently re-targeting', async () => {
+    // `<urn:x` must NOT be unwrapped to `urn:x` (a different, valid entity);
+    // only a matched `<…>` pair is stripped, so the stray `<` is rejected.
+    const server = new FakeServer();
+    const client = new FakeClient();
+    registerReadTools(server.asMcpServer(), client.asDkgClient(), makeConfig());
+    const before = client.queryCalls.length;
+    const result = await server.call('dkg_get_entity_sources', { uri: '<urn:x' });
     expect(result.isError).toBe(true);
     expect(client.queryCalls.length).toBe(before);
   });

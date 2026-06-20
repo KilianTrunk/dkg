@@ -19,6 +19,11 @@
 # Requires a running devnet (./scripts/devnet.sh start 6). Creates its OWN fresh
 # CG each run; does NOT mutate global chain params, so it is safe alongside the
 # other suites. Self-contained (bash 3.2).
+#
+# Standalone MANUAL proof — run directly; intentionally NOT wired into
+# devnet-comprehensive.sh / _devnet-full-sweep.sh (these gap proofs are kept out
+# of the shared orchestrated run; see PR #1244).
+#   Run:  ./scripts/devnet-test-seal-decouple.sh
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -52,6 +57,15 @@ api() {
 }
 code_of() { printf '%s' "$1" | head -1; }
 body_of() { printf '%s' "$1" | tail -n +2; }
+# req_ok <label> <node> <METHOD> <path> [body] — api + assert HTTP 200, else bad()
+# with the failing operation's label/body (so a broken setup step surfaces HERE,
+# not later as a misleading share/finalize failure).
+req_ok() {
+  local label="$1"; shift
+  local R; R=$(api "$@")
+  if [ "$(code_of "$R")" != "200" ]; then bad "$label failed (HTTP $(code_of "$R")): $(body_of "$R")"; return 1; fi
+  return 0
+}
 
 # preflight
 curl -sf --max-time 5 -H "Authorization: Bearer $(node_token "$NODE")" \
@@ -107,13 +121,18 @@ act "B. skipSeal:true -> UNSEALED SWM share (sealed=false, publishReady=false)"
 # ============================================================================
 NAME_B="seal-dc-b-$STAMP"
 SUBJ_B="urn:seal-dc-b:$STAMP"
-api "$NODE" POST /api/knowledge-assets "{\"contextGraphId\":\"$CG\",\"name\":\"$NAME_B\"}" >/dev/null
-api "$NODE" POST "/api/knowledge-assets/$NAME_B/wm/write" \
-  "{\"contextGraphId\":\"$CG\",\"quads\":[{\"subject\":\"$SUBJ_B\",\"predicate\":\"http://schema.org/name\",\"object\":\"\\\"unsealed $STAMP\\\"\",\"graph\":\"\"}]}" >/dev/null
+req_ok "B-setup create" "$NODE" POST /api/knowledge-assets "{\"contextGraphId\":\"$CG\",\"name\":\"$NAME_B\"}"
+req_ok "B-setup write" "$NODE" POST "/api/knowledge-assets/$NAME_B/wm/write" \
+  "{\"contextGraphId\":\"$CG\",\"quads\":[{\"subject\":\"$SUBJ_B\",\"predicate\":\"http://schema.org/name\",\"object\":\"\\\"unsealed $STAMP\\\"\",\"graph\":\"\"}]}"
 R=$(api "$NODE" POST "/api/knowledge-assets/$NAME_B/swm/share" "{\"contextGraphId\":\"$CG\",\"skipSeal\":true}")
 SEALED_B=$(field "$(body_of "$R")" sealed); READY_B=$(field "$(body_of "$R")" publishReady)
-[ "$SEALED_B" = "false" ] && ok "skipSeal share is unsealed (sealed=false, publishReady=$READY_B)" \
-  || bad "skipSeal did not yield an unsealed share (sealed=$SEALED_B HTTP $(code_of "$R")): $(body_of "$R")"
+# The documented contract is {sealed:false, publishReady:false}: assert BOTH, so
+# a regression that leaves an unsealed share publish-ready is caught here.
+if [ "$SEALED_B" = "false" ] && [ "$READY_B" = "false" ]; then
+  ok "skipSeal share is unsealed AND not publish-ready (sealed=false, publishReady=false)"
+else
+  bad "skipSeal contract violated (sealed=$SEALED_B publishReady=$READY_B; want false/false; HTTP $(code_of "$R")): $(body_of "$R")"
+fi
 # strict-boolean guard: a string "true" must 400
 R=$(api "$NODE" POST "/api/knowledge-assets/$NAME_B/swm/share" "{\"contextGraphId\":\"$CG\",\"skipSeal\":\"true\"}")
 [ "$(code_of "$R")" = "400" ] && ok "non-boolean skipSeal rejected with 400" \

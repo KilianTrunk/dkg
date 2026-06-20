@@ -120,6 +120,19 @@ log "all 6 nodes reachable"
 
 log "configuring baseline core $BASELINE_CORE with swmHostMode.stripCiphertext=false (discriminator)…"
 CFG="$(node_dir "$BASELINE_CORE")/config.json"
+# Back up the baseline core's config and restore it (with a restart) on ANY exit.
+# This suite is now run inside the shared comprehensive sweep, so leaving the core
+# on stripCiphertext=false would silently change SWM behavior for every later
+# suite (and leave the devnet mutated after a passing run).
+CFG_BAK="$(mktemp "${TMPDIR:-/tmp}/rfc49-cfg-XXXXXX")"
+cp "$CFG" "$CFG_BAK"
+restore_baseline_core() {
+  [ -f "$CFG_BAK" ] || return 0
+  cp "$CFG_BAK" "$CFG" 2>/dev/null || true
+  "$SCRIPT_DIR/devnet.sh" restart-node "$BASELINE_CORE" >/dev/null 2>&1 || true
+  rm -f "$CFG_BAK"
+}
+trap restore_baseline_core EXIT INT TERM
 node -e '
 const fs=require("fs");const f=process.argv[1];const c=JSON.parse(fs.readFileSync(f,"utf8"));
 c.swmHostMode=Object.assign({},c.swmHostMode,{enabled:true,stripCiphertext:false});

@@ -373,7 +373,16 @@ stop_oxigraph_servers() {
   # in use" and those nodes silently fail to boot. Sweep any belonging to THIS
   # devnet (path-scoped — unrelated oxigraph processes are untouched). Runs
   # regardless of docker availability (the local binaries are not docker).
-  pkill -f "$DEVNET_DIR/node.*oxigraph/oxigraph" 2>/dev/null || true
+  #
+  # DEVNET_DIR is user-configurable and may contain regex/glob metacharacters, so
+  # we do NOT feed it to `pkill -f` as a raw regex (where `.`/`[`/`+`/spaces would
+  # change the match and could over-match). Instead match the dir as a LITERAL
+  # substring of each process's command line via a quoted `case` glob.
+  ps axww -o pid=,command= 2>/dev/null | while read -r _pid _cmd; do
+    case "$_cmd" in
+      *"$DEVNET_DIR/node"*"oxigraph/oxigraph"*) kill "$_pid" 2>/dev/null || true ;;
+    esac
+  done
   if ! docker_responsive 3; then return 0; fi
   for name in $OXIGRAPH_CONTAINER_5 $OXIGRAPH_CONTAINER_6; do
     if docker inspect "$name" > /dev/null 2>&1; then

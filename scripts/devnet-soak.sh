@@ -69,12 +69,24 @@ code_of() { printf '%s' "$1" | head -1; }
 body_of() { printf '%s' "$1" | tail -n +2; }
 jget() { J="$2" node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>{let j;try{j=JSON.parse(d)}catch(e){process.stdout.write("");return}let v=j;for(const k of process.env.J.split("."))v=(v==null?undefined:v[k]);process.stdout.write(v==null?"":String(v))})' <<<"$1"; }
 
-# free system memory %, macOS (memory_pressure) with a safe fallback
+# free system memory %, macOS (memory_pressure) then Linux (/proc/meminfo), with
+# a safe constant only as a last resort. Without the Linux branch the governor is
+# inert on CI/devnet hosts (always 50% ⇒ never backs off below MEM_FLOOR).
 mem_free_pct() {
   local p
   p=$(memory_pressure 2>/dev/null | awk -F': ' '/free percentage/{gsub(/[^0-9]/,"",$2); print $2; exit}')
   [ -n "$p" ] && { echo "$p"; return; }
+  if [ -r /proc/meminfo ]; then
+    p=$(awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{ if (t>0) printf "%d", (a*100)/t }' /proc/meminfo)
+    [ -n "$p" ] && { echo "$p"; return; }
+  fi
   echo 50
+}
+# run_timed <seconds> <cmd...> — best-effort timeout: use `timeout` when present,
+# else run directly (hosts without GNU coreutils still work, no dead fallback).
+run_timed() {
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"; else "$@"; fi
 }
 nodes_up() {
   local up=0 n
@@ -148,15 +160,24 @@ while [ "$(node -e 'process.stdout.write(String(Math.floor(Date.now()/1000)))')"
   r=$(api 1 POST /api/query "{\"sparql\":\"SELECT (COUNT(*) AS ?c) WHERE { GRAPH <did:dkg:context-graph:$cg> { ?s ?p ?o } }\"}")
   [ "$(code_of "$r")" = "200" ] && QUERIED=$((QUERIED+1)) || ERRORS=$((ERRORS+1))
 
-  # every 3rd tick: update a fresh KA (write a 2nd quad then re-finalize/publish)
+  # every 3rd tick: a REAL update — publish a KA (mint), then modify the now-
+  # published asset on-chain via POST /api/update (the daemon's update primitive,
+  # the same call devnet-rs-validation.sh uses), NOT another first-time publish.
   if [ $((TICKN % 3)) -eq 0 ]; then
     un="soak-upd-${TS}-${TICKN}"; us="urn:soak-upd:${TS}-${TICKN}"
     api "$node" POST /api/knowledge-assets "{\"contextGraphId\":\"$cg\",\"name\":\"$un\"}" >/dev/null
     api "$node" POST "/api/knowledge-assets/$un/wm/write" "{\"contextGraphId\":\"$cg\",\"quads\":[{\"subject\":\"$us\",\"predicate\":\"http://schema.org/version\",\"object\":\"\\\"1\\\"\",\"graph\":\"\"}]}" >/dev/null
     api "$node" POST "/api/knowledge-assets/$un/wm/finalize" "{\"contextGraphId\":\"$cg\"}" >/dev/null
     api "$node" POST "/api/knowledge-assets/$un/swm/share" "{\"contextGraphId\":\"$cg\"}" >/dev/null
-    r=$(api "$node" POST "/api/knowledge-assets/$un/vm/publish" "{\"contextGraphId\":\"$cg\"}")
-    [ "$(code_of "$r")" = "200" ] && UPDATED=$((UPDATED+1)) || ERRORS=$((ERRORS+1))
+    pubr=$(api "$node" POST "/api/knowledge-assets/$un/vm/publish" "{\"contextGraphId\":\"$cg\"}")
+    kaid=$(jget "$(body_of "$pubr")" kaId)
+    if [ -n "$kaid" ]; then
+      uq="[{\"subject\":\"$us\",\"predicate\":\"http://schema.org/version\",\"object\":\"\\\"2\\\"\",\"graph\":\"\"}]"
+      r=$(api "$node" POST /api/update "{\"contextGraphId\":\"$cg\",\"kaId\":\"$kaid\",\"quads\":$uq}")
+      [ "$(code_of "$r")" = "200" ] && UPDATED=$((UPDATED+1)) || ERRORS=$((ERRORS+1))
+    else
+      ERRORS=$((ERRORS+1))   # no kaId from publish ⇒ nothing to update
+    fi
   fi
 
   # every 5th tick: inter-node message node1 -> node2
@@ -172,8 +193,7 @@ while [ "$(node -e 'process.stdout.write(String(Math.floor(Date.now()/1000)))')"
   if [ $((TICKN % PERIODIC)) -eq 0 ]; then
     if [ -z "${SOAK_NO_INVITE:-}" ]; then
       log "periodic: invite flow (devnet-test-cli-invite.sh)"
-      if timeout 240 "$REPO_ROOT/scripts/devnet-test-cli-invite.sh" >>"$LOG" 2>&1; then INVITED=$((INVITED+1)); else log "  invite flow failed (isolated)"; ERRORS=$((ERRORS+1)); fi 2>/dev/null \
-        || { "$REPO_ROOT/scripts/devnet-test-cli-invite.sh" >>"$LOG" 2>&1 && INVITED=$((INVITED+1)) || { log "  invite flow failed (isolated)"; ERRORS=$((ERRORS+1)); }; }
+      if run_timed 240 "$REPO_ROOT/scripts/devnet-test-cli-invite.sh" >>"$LOG" 2>&1; then INVITED=$((INVITED+1)); else log "  invite flow failed (isolated)"; ERRORS=$((ERRORS+1)); fi
     fi
     if [ -z "${SOAK_NO_STAKE:-}" ]; then
       log "periodic: staking lifecycle (conviction-lazy-settle)"

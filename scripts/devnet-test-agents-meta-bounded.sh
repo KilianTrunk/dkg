@@ -16,6 +16,11 @@
 # zero growth across N heartbeats.
 #
 # Requires a running devnet (./scripts/devnet.sh start 6). Self-contained.
+#
+# Standalone MANUAL proof — run directly; intentionally NOT wired into
+# devnet-comprehensive.sh / _devnet-full-sweep.sh (these gap proofs are kept out
+# of the shared orchestrated run; see PR #1244).
+#   Run:  ./scripts/devnet-test-agents-meta-bounded.sh
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -44,16 +49,32 @@ qcount() { # node graph -> integer count ("" on error)
 AG='did:dkg:context-graph:agents'
 META='did:dkg:context-graph:agents/_meta'
 
+# A devnet that is down / under-provisioned must FAIL, not silently pass: every
+# expected fleet member is required. Missing token, unreachable node, or an
+# unreadable _meta count are all failures (not skips), and the run fails if it
+# checked fewer than NUM_NODES. NB an empty _meta graph returns COUNT "0" (a
+# value), so a healthy-but-quiet fleet still passes — only a query *failure*
+# yields "" and trips the unreadable guard.
+CHECKED=0
 for n in $(seq 1 "$NUM_NODES"); do
-  [ -f "$DEVNET_DIR/node$n/auth.token" ] || continue
+  if [ ! -f "$DEVNET_DIR/node$n/auth.token" ]; then
+    bad "node$n: no auth.token — expected fleet member not provisioned (is './scripts/devnet.sh start $NUM_NODES' up?)"
+    continue
+  fi
   DATA=$(qcount "$n" "$AG"); MT=$(qcount "$n" "$META")
-  [ -z "$DATA" ] && { log "node$n unreachable — skipping"; continue; }
-  if [ "${DATA:-0}" -gt 0 ] 2>/dev/null; then
+  if [ -z "$DATA" ]; then
+    bad "node$n unreachable — agent-registry DATA query failed (node down?)"
+    continue
+  fi
+  CHECKED=$((CHECKED+1))
+  if [ "$DATA" -gt 0 ] 2>/dev/null; then
     ok "node$n agent-registry DATA populated ($DATA quads)"
   else
     bad "node$n agent-registry DATA empty (expected profiles) — phonebook not replicating?"
   fi
-  if [ "${MT:-0}" -le "$META_MAX" ] 2>/dev/null; then
+  if [ -z "$MT" ]; then
+    bad "node$n agents/_meta count unreadable (query failed) — cannot prove bounded"
+  elif [ "$MT" -le "$META_MAX" ] 2>/dev/null; then
     ok "node$n agents/_meta BOUNDED ($MT <= $META_MAX; #1234 suppression holding)"
   else
     bad "node$n agents/_meta UNBOUNDED ($MT > $META_MAX) — #1234 regression"
@@ -62,5 +83,12 @@ done
 
 echo
 log "──────── SUMMARY ────────"
-log "PASS=$PASS  FAIL=$FAIL  (META_MAX=$META_MAX)"
-[ "$FAIL" -eq 0 ] && { log "ALL AGENTS-META CHECKS PASSED"; exit 0; } || { log "SOME CHECKS FAILED"; exit 1; }
+log "CHECKED=$CHECKED/$NUM_NODES  PASS=$PASS  FAIL=$FAIL  (META_MAX=$META_MAX)"
+if [ "$CHECKED" -eq 0 ]; then
+  log "NO NODES CHECKED — devnet not running or DEVNET_DIR wrong (expected $NUM_NODES nodes at $DEVNET_DIR)"
+  log "SOME CHECKS FAILED"; exit 1
+fi
+if [ "$CHECKED" -lt "$NUM_NODES" ]; then
+  bad "only $CHECKED/$NUM_NODES expected nodes were checked (missing/unreachable members above)"
+fi
+[ "$FAIL" -eq 0 ] && { log "ALL AGENTS-META CHECKS PASSED ($CHECKED/$NUM_NODES nodes)"; exit 0; } || { log "SOME CHECKS FAILED"; exit 1; }

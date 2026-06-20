@@ -19,6 +19,12 @@
 # 31337 devnet chain. It is NOT a real deployer key.
 #
 # Requires a running devnet (./scripts/devnet.sh start 6). Self-contained.
+#
+# Standalone MANUAL proof — run directly; intentionally NOT wired into
+# devnet-comprehensive.sh / _devnet-full-sweep.sh. This one arms a GLOBAL chain
+# param (and restores it via trap), so it is deliberately kept out of the shared
+# orchestrated run; see PR #1244.
+#   Run:  ./scripts/devnet-test-cg-registration-deposit.sh
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -60,6 +66,19 @@ act "0. baseline — deposit param is DORMANT (0) on the devnet"
 P0=$(field "$(call ParametersStorage contextGraphRegistrationDeposit)" result)
 [ "$P0" = "0" ] && ok "deposit param dormant at baseline (0)" || bad "expected param 0 at baseline, got '$P0'"
 
+# Restore the baseline deposit on ANY exit path (crash, timeout, Ctrl-C) so an
+# interrupted run can't leave the GLOBAL param live for later suites. Armed only
+# after we actually set it; disarmed once the verified teardown has reset it, so
+# on the happy path the EXIT trap is a no-op. Restores the captured baseline P0
+# (asserted 0 above), not a hard-coded 0.
+DEPOSIT_ARMED=0
+cleanup() {
+  [ "$DEPOSIT_ARMED" = "1" ] || return 0
+  echo "[cg-deposit] cleanup: restoring deposit param to baseline ($P0)" >&2
+  call ParametersStorage setContextGraphRegistrationDeposit --key "$GOV_KEY" --json "[\"$P0\"]" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
 # ============================================================================
 act "1. DORMANT path — register a CG, escrow must be 0"
 # ============================================================================
@@ -75,6 +94,7 @@ fi
 act "2. ARM the param (governance) then register a CG — deposit must escrow"
 # ============================================================================
 SET=$(call ParametersStorage setContextGraphRegistrationDeposit --key "$GOV_KEY" --json "[\"$DEPOSIT\"]")
+DEPOSIT_ARMED=1   # from here on, cleanup() must restore the baseline on any exit
 TXH=$(field "$SET" txHash)
 [ -n "$TXH" ] && ok "armed deposit param via governance (tx=$TXH)" || bad "setContextGraphRegistrationDeposit failed: $SET"
 P1=$(field "$(call ParametersStorage contextGraphRegistrationDeposit)" result)
@@ -98,7 +118,7 @@ act "3. TEARDOWN — reset param to 0 (dormant-regression safe)"
 RST=$(call ParametersStorage setContextGraphRegistrationDeposit --key "$GOV_KEY" --json "[\"0\"]")
 [ -n "$(field "$RST" txHash)" ] && log "param reset tx=$(field "$RST" txHash)"
 P2=$(field "$(call ParametersStorage contextGraphRegistrationDeposit)" result)
-[ "$P2" = "0" ] && ok "param reset to dormant (0)" || bad "param NOT reset (still $P2) — other suites may break!"
+if [ "$P2" = "0" ]; then ok "param reset to dormant (0)"; DEPOSIT_ARMED=0; else bad "param NOT reset (still $P2) — other suites may break!"; fi
 
 echo
 log "──────── SUMMARY ────────"

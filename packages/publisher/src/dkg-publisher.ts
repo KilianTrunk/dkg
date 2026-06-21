@@ -3102,6 +3102,30 @@ export class DKGPublisher implements Publisher {
         this.ownedEntities.get(confirmOwnershipKey)!.add(e.rootEntity);
       }
       this.knownBatchContextGraphs.set(String(onChainResult.batchId), contextGraphId);
+      // RS prevention (GH #1264): self-promote the confirmed KC into the SCOPED
+      // context-graph graphs the Random Sampling prover reads. The one-shot
+      // `dkg publish --file` path otherwise leaves the KC only in the legacy
+      // label graphs, so every prover tick reports `kc-not-synced` and no proof
+      // ever lands. Best-effort — the KC is already on-chain, so a promote error
+      // must NOT fail the publish (the layer-3 heal backstop is the fallback).
+      // Skipped for sub-graph publishes (RS samples root CGs; sub-graph KCs use a
+      // different layout); remap is not applicable on this one-shot path.
+      if (!options.subGraphName) {
+        try {
+          await this.promoteConfirmedKCToScopedGraph(
+            contextGraphId,
+            onChainResult,
+            ual,
+            kcMerkleRoot,
+            manifestEntries,
+            allSkolemizedQuads,
+            publisherContextGraphId,
+            ctx,
+          );
+        } catch (err) {
+          this.log.warn(ctx, `RS scoped-promote failed for ${ual} (heal backstop will retry): ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
       onPhase?.('chain:metadata', 'end');
     }
 
@@ -3127,6 +3151,145 @@ export class DKGPublisher implements Publisher {
       tripleCount: allSkolemizedQuads.length,
     });
     return result;
+  }
+
+  /**
+   * RS prevention (GH #1264) — self-promote a confirmed one-shot `publish()`
+   * into the SCOPED context-graph graphs the Random Sampling prover reads
+   * (`<NAME>/context/<cgId>/_meta` + `/data`, see `ka-extractor.ts`
+   * `extractV10KCFromStore`).
+   *
+   * The one-shot `dkg publish --file` path writes the KC only to the LEGACY
+   * label graphs (`<NAME>/_meta` + the per-KA verifiable-memory data graph) and
+   * used to rely on chain-reconcile to promote it to scoped. That promotion
+   * never reliably fired for the publisher's OWN KC, so every prover tick
+   * reported `kc-not-synced` and no proof landed (#1264; #1259 covered only the
+   * gossip-receiver strand). We resolve the cgId from CHAIN TRUTH
+   * (`getKAContextGraphId`, the exact call the prover uses) right after the
+   * publish tx confirms — when the KA→CG binding is already committed on-chain,
+   * so it is immune to the local cgId-resolver lag that caused the strand — and
+   * write the scoped graphs here so the KC is provable on the first prover tick.
+   *
+   * Mirrors the same-graph promotion in `publishFromSharedMemory` (the SWM path
+   * that already self-promotes). KEEP THE MINIMAL-META SHAPE IN SYNC with that
+   * block and with what `extractV10KCFromStore` reads.
+   */
+  private async promoteConfirmedKCToScopedGraph(
+    contextGraphId: string,
+    onChainResult: OnChainPublishResult,
+    ual: string,
+    merkleRoot: Uint8Array,
+    manifestEntries: ReadonlyArray<KAManifestEntry>,
+    publicQuads: Quad[],
+    fallbackCgId: bigint | undefined,
+    ctx: OperationContext,
+  ): Promise<void> {
+    // The packed kaId (author<<96 | number) keys ContextGraphStorage.kaToContextGraph
+    // and is the prover's `challenge.knowledgeAssetId` / `dkg:batchId` lookup value.
+    const partitionKaId = onChainResult.kaId ?? onChainResult.batchId;
+
+    // 1. Resolve the on-chain cgId from chain truth. Post-confirmation the
+    //    KA→CG binding is committed, so this is lag-free (unlike the agent's
+    //    local resolver that caused the strand). Fall back to the cgId domain
+    //    the confirmed publish tx itself used.
+    let scopedCgId: bigint | undefined;
+    if (typeof this.chain.getKAContextGraphId === 'function') {
+      try {
+        const resolved = await this.chain.getKAContextGraphId(partitionKaId);
+        if (resolved > 0n) scopedCgId = resolved;
+      } catch (err) {
+        this.log.info(ctx, `RS scoped-promote: getKAContextGraphId(${partitionKaId}) failed (RPC lag?): ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (scopedCgId === undefined && fallbackCgId !== undefined && fallbackCgId > 0n) {
+      scopedCgId = fallbackCgId;
+    }
+    if (scopedCgId === undefined) {
+      this.log.info(ctx, `RS scoped-promote: no on-chain cgId for ${ual} (kaId=${partitionKaId}); heal backstop will relocate`);
+      return;
+    }
+
+    const targetCgId = scopedCgId.toString();
+    const ctxDataGraph = contextGraphDataUri(contextGraphId, targetCgId);
+    const ctxMetaGraph = contextGraphMetaUri(contextGraphId, targetCgId);
+    const publishVersion: MaterializedVersion = {
+      blockNumber: onChainResult.blockNumber ?? 0,
+      txIndex: onChainResult.txIndex ?? 0,
+    };
+
+    // GH#842 last-writer-wins: serialise the gate + promotion + version stamp
+    // under the per-KA lock so a concurrent update's restate can't be clobbered
+    // by this (possibly already-stale) publish promotion.
+    await withMaterializationLock(ctxMetaGraph, ual, async () => {
+      if (!(await shouldApplyMaterialization(this.store, ctxMetaGraph, ual, publishVersion))) {
+        this.log.info(ctx, `RS scoped-promote: skipped ${ual} — a newer materialisation is present`);
+        return;
+      }
+
+      // Data: copy the public quads into the scoped data graph — the prover
+      // pulls triples per root entity from here.
+      if (publicQuads.length > 0) {
+        const scopedData = publicQuads.map((q) => ({ ...q, graph: ctxDataGraph }));
+        await this.store.insert(scopedData);
+        await stampTrustLevel(
+          this.store,
+          ctxDataGraph,
+          collectTrustSubjectsForRoots(scopedData, manifestEntries.map((m) => m.rootEntity)),
+          TrustLevel.SelfAttested,
+        );
+      }
+
+      // Meta: the minimal shape downstream readers need — `dkg:batchId`
+      // (UAL resolution), `dkg:merkleRoot`, and the collapsed `dkg:rootEntity`
+      // (+ `dkg:privateMerkleRoot`) member rows on the UAL subject. The RS
+      // extractor's read-both UNION resolves all roots from the collapsed shape,
+      // but MULTI-root publishes ALSO re-emit the legacy `<ual>/<tokenId>` token
+      // rows so the root↔privateMerkleRoot pairing stays joinable on the shared
+      // token subject — the AccessHandler keys private bags per member root and
+      // a collapse-only multi-root KC makes non-first bags unreachable. Single
+      // root keeps the full collapse (no pairing needed). Mirrors the SWM block
+      // in `publishFromSharedMemory` and the canonical `generateKCMetadata`
+      // writer; see test/multi-root-token-rows.test.ts for the exact contract.
+      const DKG_ONT = 'http://dkg.io/ontology/';
+      const XSD_INT = 'http://www.w3.org/2001/XMLSchema#integer';
+      const minimalMeta: Quad[] = [
+        { subject: ual, predicate: `${DKG_ONT}batchId`, object: `"${partitionKaId}"^^<${XSD_INT}>`, graph: ctxMetaGraph },
+        { subject: ual, predicate: `${DKG_ONT}merkleRoot`, object: `"${toHex(merkleRoot)}"`, graph: ctxMetaGraph },
+      ];
+      const partitionMultiRoot =
+        new Set(manifestEntries.map((ka) => ka.rootEntity)).size > 1;
+      const seenRoots = new Set<string>();
+      const seenPrivRoots = new Set<string>();
+      for (const ka of manifestEntries) {
+        if (!seenRoots.has(ka.rootEntity)) {
+          seenRoots.add(ka.rootEntity);
+          minimalMeta.push({ subject: ual, predicate: DKG_ROOT_ENTITY_LEGACY, object: ka.rootEntity, graph: ctxMetaGraph });
+        }
+        if (ka.privateMerkleRoot && ka.privateMerkleRoot.length > 0) {
+          const privHex = toHex(ka.privateMerkleRoot);
+          if (!seenPrivRoots.has(privHex)) {
+            seenPrivRoots.add(privHex);
+            minimalMeta.push({ subject: ual, predicate: `${DKG_ONT}privateMerkleRoot`, object: `"${privHex}"`, graph: ctxMetaGraph });
+          }
+        }
+        // MULTI-root only: re-emit the `<ual>/<tokenId>` token rows so each member
+        // root carries its OWN privateMerkleRoot on a shared subject (recoverable
+        // pairing). Not deduped — every token keeps its pairing row.
+        if (partitionMultiRoot) {
+          const kaUri = `${ual}/${ka.tokenId}`;
+          minimalMeta.push(
+            { subject: kaUri, predicate: DKG_ROOT_ENTITY_LEGACY, object: ka.rootEntity, graph: ctxMetaGraph },
+            { subject: kaUri, predicate: `${DKG_ONT}partOf`, object: ual, graph: ctxMetaGraph },
+          );
+          if (ka.privateMerkleRoot && ka.privateMerkleRoot.length > 0) {
+            minimalMeta.push({ subject: kaUri, predicate: `${DKG_ONT}privateMerkleRoot`, object: `"${toHex(ka.privateMerkleRoot)}"`, graph: ctxMetaGraph });
+          }
+        }
+      }
+      await this.store.insert(minimalMeta);
+      await writeMaterializedVersion(this.store, ctxMetaGraph, ual, publishVersion);
+      this.log.info(ctx, `RS scoped-promote: promoted ${ual} → context graph ${targetCgId} (kaId=${partitionKaId})`);
+    });
   }
 
   async update(kaId: bigint, options: PublishOptions): Promise<PublishResult> {

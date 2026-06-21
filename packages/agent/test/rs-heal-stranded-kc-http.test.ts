@@ -21,7 +21,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { SparqlHttpStore, type Quad } from '@origintrail-official/dkg-storage';
-import { V10MerkleTree, contextGraphDataUri, contextGraphMetaUri } from '@origintrail-official/dkg-core';
+import { V10MerkleTree, contextGraphDataUri, contextGraphMetaUri, contextGraphLayerUri, MemoryLayer } from '@origintrail-official/dkg-core';
 import { extractV10KCFromStore } from '@origintrail-official/dkg-random-sampling';
 import { writeMaterializedVersion } from '@origintrail-official/dkg-publisher';
 import { SwmHostModeMethods } from '../src/dkg-agent-swm-host.js';
@@ -160,5 +160,31 @@ describe('healStrandedScopedKCs — content-binding gate over SPARQL-HTTP', () =
 
     const ctrl = await extractV10KCFromStore(store, BigInt(CTRL_ONCHAIN), KA_ID);
     expect(firstRoot).toEqual(new V10MerkleTree(ctrl.leaves).root);
+  });
+
+  it('relocates a VM-graph-only one-shot strand over HTTP (read-both server-side UPDATE)', async () => {
+    // The publisher's OWN one-shot publish() lands confirmed PUBLIC data in the
+    // per-KA verifiable-memory graph, NOT the legacy root data graph. The heal's
+    // data reads are now `rootData UNION <per-KA VM graph>` — this exercises that
+    // UNION-in-UPDATE over the real SPARQL-HTTP backend (the devnet path).
+    const VM_CG = 'vmstrand-cg';
+    const VM_ONCHAIN = '17';
+    const VM_UAL = 'did:dkg:hardhat:31337/0xvm/42';
+    await seedOntology(VM_CG, VM_ONCHAIN);
+    await store.insert(metaQuads(VM_UAL, contextGraphMetaUri(VM_CG)));
+    const vmNumber = KA_ID & ((1n << 96n) - 1n);
+    const vmAuthor = '0x' + (KA_ID >> 96n).toString(16).padStart(40, '0');
+    const vmGraph = contextGraphLayerUri(VM_CG, MemoryLayer.VerifiableMemory, vmAuthor, vmNumber);
+    await store.insert(publicTriples().map((t) => ({ ...t, graph: vmGraph })));
+
+    await expect(extractV10KCFromStore(store, BigInt(VM_ONCHAIN), KA_ID)).rejects.toBeTruthy();
+    const rootEmpty = await store.query(`ASK { GRAPH <${contextGraphDataUri(VM_CG)}> { ?s ?p ?o } }`);
+    expect(rootEmpty.type === 'boolean' && rootEmpty.value).toBe(false);
+
+    await runHeal(VM_CG, VM_ONCHAIN);
+
+    const ctrl = await extractV10KCFromStore(store, BigInt(CTRL_ONCHAIN), KA_ID);
+    const healed = await extractV10KCFromStore(store, BigInt(VM_ONCHAIN), KA_ID);
+    expect(new V10MerkleTree(healed.leaves).root).toEqual(new V10MerkleTree(ctrl.leaves).root);
   });
 });

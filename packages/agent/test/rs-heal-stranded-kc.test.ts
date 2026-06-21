@@ -42,9 +42,11 @@ import {
   V10MerkleTree,
   contextGraphDataUri,
   contextGraphMetaUri,
+  contextGraphLayerUri,
+  MemoryLayer,
 } from '@origintrail-official/dkg-core';
 import { extractV10KCFromStore } from '@origintrail-official/dkg-random-sampling';
-import { writeMaterializedVersion } from '@origintrail-official/dkg-publisher';
+import { writeMaterializedVersion, readMaterializedVersion } from '@origintrail-official/dkg-publisher';
 import { SwmHostModeMethods } from '../src/dkg-agent-swm-host.js';
 
 const DKG = 'http://dkg.io/ontology/';
@@ -156,8 +158,10 @@ describe('healStrandedScopedKCs — content-binding gate', () => {
       ...metaQuads(TEST_UAL, legacyMeta),
       ...publicTriples().map((t) => ({ ...t, graph: legacyData })),
     ]);
-    // A confirmed KC carries a materialized version stamp in legacy meta — the
-    // heal requires it (null version => not safely stampable => skip).
+    // A receiver-finalized KC carries a materialized version stamp in legacy
+    // meta; the heal preserves it when present. (A publisher's OWN one-shot
+    // publish has NO stamp — see the no-stamp test below, which the heal now
+    // relocates with a synthesized {0,0} floor version.)
     await writeMaterializedVersion(store, legacyMeta, TEST_UAL, { blockNumber: 100, txIndex: 0 });
   });
 
@@ -229,6 +233,125 @@ describe('healStrandedScopedKCs — content-binding gate', () => {
     const ctrl = await extractV10KCFromStore(store, BigInt(CTRL_ONCHAIN), KA_ID);
     const healed = await extractV10KCFromStore(store, BigInt(TEST_ONCHAIN), KA_ID);
     expect(new V10MerkleTree(healed.leaves).root).toEqual(new V10MerkleTree(ctrl.leaves).root);
+  });
+
+  it('relocates a stranded KC that has NO materializedVersion stamp (publisher own-KC strand)', async () => {
+    // The publisher's OWN one-shot publish writes the KC into legacy `_meta`
+    // WITHOUT a materializedVersion stamp (only the receiver/finalization path
+    // stamps one). Such a KC must STILL be relocated, otherwise it strands in
+    // legacy forever (kc-not-synced) — chain-reconcile skips it (legacy
+    // status=confirmed) and, pre-fix, so did the heal.
+    const NS_CG = 'nostamp-cg';
+    const NS_ONCHAIN = '13';
+    const NS_UAL = 'did:dkg:hardhat:31337/0xnostamp/42';
+    await seedOntology(store, NS_CG, NS_ONCHAIN);
+    const nsLegacyMeta = contextGraphMetaUri(NS_CG);
+    await store.insert([
+      ...metaQuads(NS_UAL, nsLegacyMeta),
+      ...publicTriples().map((t) => ({ ...t, graph: contextGraphDataUri(NS_CG) })),
+    ]);
+    // Deliberately NO writeMaterializedVersion — the publisher-own-KC case.
+    expect(await readMaterializedVersion(store, nsLegacyMeta, NS_UAL)).toBeNull();
+
+    // Before the heal the prover cannot find it (scoped empty).
+    await expect(extractV10KCFromStore(store, BigInt(NS_ONCHAIN), KA_ID)).rejects.toBeTruthy();
+
+    await runHeal(store, NS_CG, NS_ONCHAIN);
+
+    // Relocated byte-stably: recomputed scoped root equals the control root.
+    const ctrl = await extractV10KCFromStore(store, BigInt(CTRL_ONCHAIN), KA_ID);
+    const healed = await extractV10KCFromStore(store, BigInt(NS_ONCHAIN), KA_ID);
+    expect(new V10MerkleTree(healed.leaves).root).toEqual(new V10MerkleTree(ctrl.leaves).root);
+
+    // The heal stamped scoped with the {0,0} floor so any real update (block>0) wins.
+    const nsScopedMeta = contextGraphMetaUri(NS_CG, NS_ONCHAIN);
+    expect(await readMaterializedVersion(store, nsScopedMeta, NS_UAL)).toEqual({ blockNumber: 0, txIndex: 0 });
+
+    // Idempotent: a second run is a no-op (ASK-guard short-circuits on the now-present batchId).
+    const c1 = await scopedTripleCount(store, NS_CG, NS_ONCHAIN);
+    await runHeal(store, NS_CG, NS_ONCHAIN);
+    expect(await scopedTripleCount(store, NS_CG, NS_ONCHAIN)).toBe(c1);
+  });
+
+  it('relocates a publisher one-shot strand whose public data is in the VM graph only (read-both)', async () => {
+    // The publisher's OWN one-shot publish() writes confirmed PUBLIC data to the
+    // per-KA verifiable-memory graph `<cg>/_verifiable_memory/<author>/<number>`,
+    // NOT the legacy root data graph (the receiver/#1259 strand fills root data).
+    // If scoped promotion fails, the heal is the stated backstop — but a
+    // root-data-only data read finds nothing here and bails at the crash-partial
+    // guard, leaving the KC invisible to RS forever. The heal now reads
+    // root data UNION the per-KA VM graph, so this strand is recovered too.
+    const VM_CG = 'vmstrand-cg';
+    const VM_ONCHAIN = '17';
+    const VM_UAL = 'did:dkg:hardhat:31337/0xvm/42';
+    await seedOntology(store, VM_CG, VM_ONCHAIN);
+    // Legacy META present (strand detected + root resolvable) ...
+    await store.insert(metaQuads(VM_UAL, contextGraphMetaUri(VM_CG)));
+    // ... but the public DATA lives ONLY in the per-KA VM graph (derived from the
+    // packed kaId exactly as the publisher does), NOT the legacy root data graph.
+    const vmNumber = KA_ID & ((1n << 96n) - 1n);
+    const vmAuthor = '0x' + (KA_ID >> 96n).toString(16).padStart(40, '0');
+    const vmGraph = contextGraphLayerUri(VM_CG, MemoryLayer.VerifiableMemory, vmAuthor, vmNumber);
+    await store.insert([
+      ...publicTriples().map((t) => ({ ...t, graph: vmGraph })),
+      // Production VM graphs carry a post-confirmation SelfAttested trust stamp
+      // (dkg-publisher.ts). The heal's VM-branch trust-predicate exclusion must
+      // drop it so the recomputed leaf set stays byte-identical with the chain root.
+      { subject: ROOT, predicate: `${DKG}trustLevel`, object: '"SelfAttested"', graph: vmGraph },
+    ]);
+    // Publisher own-KC strand carries NO materializedVersion stamp.
+
+    // Precondition: scoped empty AND legacy root data genuinely empty — the
+    // exact state where a root-data-only heal would bail and write nothing.
+    await expect(extractV10KCFromStore(store, BigInt(VM_ONCHAIN), KA_ID)).rejects.toBeTruthy();
+    const rootEmpty = await store.query(`ASK { GRAPH <${contextGraphDataUri(VM_CG)}> { ?s ?p ?o } }`);
+    expect(rootEmpty.type === 'boolean' && rootEmpty.value).toBe(false);
+
+    await runHeal(store, VM_CG, VM_ONCHAIN);
+
+    // Relocated byte-stably FROM THE VM GRAPH: recomputed scoped leaf-root equals
+    // the control root (same leaves, independent direct-to-scoped seed).
+    const ctrl = await extractV10KCFromStore(store, BigInt(CTRL_ONCHAIN), KA_ID);
+    const healed = await extractV10KCFromStore(store, BigInt(VM_ONCHAIN), KA_ID);
+    expect(new V10MerkleTree(healed.leaves).root).toEqual(new V10MerkleTree(ctrl.leaves).root);
+
+    // The VM-branch trust-predicate exclusion dropped the SelfAttested stamp from
+    // the scoped copy (root equality above already implies it; assert explicitly).
+    const vmScopedData = contextGraphDataUri(VM_CG, VM_ONCHAIN);
+    const stampLeak = await store.query(`ASK { GRAPH <${vmScopedData}> { ?s <${DKG}trustLevel> ?o } }`);
+    expect(stampLeak.type === 'boolean' && stampLeak.value).toBe(false);
+  });
+
+  it('VM read is bound to the stranded KC kaId — never copies a different KA sharing the root IRI', async () => {
+    // Two KAs in the same CG can share a root entity IRI (e.g. an entity
+    // republished under a new kaId). The stranded KC is kaId 42; a DIFFERENT
+    // kaId 99 also holds a VM graph carrying the SAME root with a different value.
+    // The heal must copy ONLY kaId 42's VM graph (derived from its batchId) — a
+    // prefix scan would mix in kaId 99's triples and make RS prove a wrong leaf set.
+    const C_CG = 'vm-contamination-cg';
+    const C_ONCHAIN = '19';
+    const C_UAL = 'did:dkg:hardhat:31337/0xvmc/42';
+    const OTHER_KA_ID = 99n;
+    const vmOf = (kaId: bigint): string => contextGraphLayerUri(
+      C_CG, MemoryLayer.VerifiableMemory,
+      '0x' + (kaId >> 96n).toString(16).padStart(40, '0'),
+      kaId & ((1n << 96n) - 1n),
+    );
+    await seedOntology(store, C_CG, C_ONCHAIN);
+    await store.insert(metaQuads(C_UAL, contextGraphMetaUri(C_CG))); // batchId == KA_ID (42) in legacy meta
+    // kaId 42 (the stranded KC) — the value RS must prove.
+    await store.insert([{ subject: ROOT, predicate: 'urn:p:name', object: '"value-A"', graph: vmOf(KA_ID) }]);
+    // kaId 99 — a DIFFERENT KA sharing the same root IRI, different value.
+    await store.insert([{ subject: ROOT, predicate: 'urn:p:name', object: '"value-B"', graph: vmOf(OTHER_KA_ID) }]);
+
+    await runHeal(store, C_CG, C_ONCHAIN);
+
+    // The scoped copy must contain ONLY kaId 42's value, never kaId 99's.
+    const scopedData = contextGraphDataUri(C_CG, C_ONCHAIN);
+    const got = await store.query(`SELECT ?o WHERE { GRAPH <${scopedData}> { <${ROOT}> <urn:p:name> ?o } }`);
+    const values = got.type === 'bindings' ? got.bindings.map((b) => b['o'] ?? '') : [];
+    expect(values.some((v) => v.includes('value-A')), 'must copy the stranded kaId 42 VM data').toBe(true);
+    expect(values.some((v) => v.includes('value-B')), 'must NOT copy a different kaId sharing the root').toBe(false);
   });
 
   it('writes NOTHING when the legacy root data is absent (crash-partial guard)', async () => {

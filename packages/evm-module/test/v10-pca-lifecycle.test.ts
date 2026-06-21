@@ -548,6 +548,179 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
   });
 
   // --------------------------------------------------------------------------
+  // #1264-batch — extend funds the staker pool over [endEpoch+1, endEpoch+epochs]
+  // (NOT [endEpoch, endEpoch+epochs]). The prior range double-funded `endEpoch`
+  // (already funded by the original publish THROUGH endEpoch inclusive) and paid
+  // one epoch past the purchased lifetime. Deltas isolate the extension from any
+  // other shard-1 funding present in the fixture.
+  // --------------------------------------------------------------------------
+  it('extend funds [endEpoch+1, endEpoch+epochs] and does NOT double-fund endEpoch', async () => {
+    const Params = await hre.ethers.getContract<ParametersStorage>('ParametersStorage');
+    const ES = await hre.ethers.getContract<EpochStorage>('EpochStorageV8');
+    const KAS = await hre.ethers.getContract<DKGKnowledgeAssets>('DKGKnowledgeAssets');
+    const deposit = ethers.parseEther('2000');
+    await Params.connect(accounts[0]).setContextGraphRegistrationDeposit(deposit);
+
+    const creator = getDefaultKACreator(accounts);
+    await Token.mint(creator.address, deposit);
+    await Token.connect(creator).approve(await CGFacade.getAddress(), deposit);
+
+    const { cgId, epochs, receivingNodes, publisherIdentityId, receiverIdentityIds } =
+      await setupRegisteredAgentPublish();
+
+    const pubAmount = ethers.parseEther('1000');
+    const reservedKaId = packReservedKaId(creator.address, 1);
+    const p = await buildPublishParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes,
+      publisherIdentityId,
+      receiverIdentityIds,
+      author: creator,
+      contextGraphId: cgId,
+      merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('extend-epoch-range')),
+      knowledgeAssetsAmount: 1,
+      byteSize: 1000,
+      epochs,
+      tokenAmount: pubAmount,
+      isImmutable: false,
+      publishOperationId: 'extend-epoch-range-pub',
+      reservedKaId,
+    });
+    await KAV10.connect(creator).publish(p);
+
+    // endEpoch as stored by publish (= currentEpoch + epochs). Tuple index 5:
+    // (, , , byteSize, , endEpoch, tokenAmount, ).
+    const meta = await KAS.getKnowledgeAssetMetadata(reservedKaId);
+    const endEpoch = BigInt(meta[5]);
+    const last = endEpoch + BigInt(epochs); // the NEW endEpoch after the extension
+
+    // Snapshot the per-epoch staker pool (shard 1) BEFORE the extend, so deltas
+    // isolate the extension's contribution from any other fixture funding.
+    const before = {
+      end: await ES.getEpochPool(1, endEpoch),
+      endPlus1: await ES.getEpochPool(1, endEpoch + 1n),
+      last: await ES.getEpochPool(1, last),
+      lastPlus1: await ES.getEpochPool(1, last + 1n),
+    };
+
+    const extendAmount = ethers.parseEther('1000');
+    await KAV10.connect(creator).extendKnowledgeAssetLifetime(reservedKaId, epochs, extendAmount);
+
+    // DECISIVE: endEpoch is NOT re-funded by the extension (no double-fund).
+    expect(await ES.getEpochPool(1, endEpoch)).to.equal(
+      before.end,
+      'extend must not double-fund endEpoch',
+    );
+    // The extension funds its window start (endEpoch+1) ...
+    expect(await ES.getEpochPool(1, endEpoch + 1n)).to.be.gt(
+      before.endPlus1,
+      'extend must fund endEpoch+1',
+    );
+    // ... through the new endEpoch (endEpoch+epochs) ...
+    expect(await ES.getEpochPool(1, last)).to.be.gt(
+      before.last,
+      'extend must fund through endEpoch+epochs',
+    );
+    // ... and NOT one epoch past the purchased lifetime.
+    expect(await ES.getEpochPool(1, last + 1n)).to.equal(
+      before.lastPlus1,
+      'extend must not fund past endEpoch+epochs',
+    );
+  });
+
+  it('extend (WALLET-funded, escrow drained) funds [endEpoch+1, endEpoch+epochs] too', async () => {
+    // Sets the deposit == pubAmount so the PUBLISH drains the escrow to 0; the
+    // EXTENSION is then fully wallet-funded, exercising the `walletCost`
+    // addTokensToEpochRange branch (the test above only covers `netEscrow`).
+    const Params = await hre.ethers.getContract<ParametersStorage>('ParametersStorage');
+    const ES = await hre.ethers.getContract<EpochStorage>('EpochStorageV8');
+    const KAS = await hre.ethers.getContract<DKGKnowledgeAssets>('DKGKnowledgeAssets');
+    const pubAmount = ethers.parseEther('1000');
+    const extendAmount = ethers.parseEther('1000');
+    await Params.connect(accounts[0]).setContextGraphRegistrationDeposit(pubAmount);
+
+    const creator = getDefaultKACreator(accounts);
+    await Token.mint(creator.address, pubAmount + extendAmount);
+    await Token.connect(creator).approve(await CGFacade.getAddress(), pubAmount); // escrow pull at create
+    await Token.connect(creator).approve(await KAV10.getAddress(), extendAmount); // wallet pull at extend
+
+    const { cgId, epochs, receivingNodes, publisherIdentityId, receiverIdentityIds } =
+      await setupRegisteredAgentPublish();
+
+    const reservedKaId = packReservedKaId(creator.address, 1);
+    const p = await buildPublishParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes,
+      publisherIdentityId,
+      receiverIdentityIds,
+      author: creator,
+      contextGraphId: cgId,
+      merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('extend-wallet-range')),
+      knowledgeAssetsAmount: 1,
+      byteSize: 1000,
+      epochs,
+      tokenAmount: pubAmount,
+      isImmutable: false,
+      publishOperationId: 'extend-wallet-range-pub',
+      reservedKaId,
+    });
+    await KAV10.connect(creator).publish(p);
+    expect(await CGS.getRegistrationEscrow(cgId)).to.equal(0n); // publish drained escrow → extend is wallet-funded
+
+    const meta = await KAS.getKnowledgeAssetMetadata(reservedKaId);
+    const endEpoch = BigInt(meta[5]);
+    const last = endEpoch + BigInt(epochs);
+    const before = {
+      end: await ES.getEpochPool(1, endEpoch),
+      endPlus1: await ES.getEpochPool(1, endEpoch + 1n),
+      lastPlus1: await ES.getEpochPool(1, last + 1n),
+    };
+
+    await KAV10.connect(creator).extendKnowledgeAssetLifetime(reservedKaId, epochs, extendAmount);
+
+    expect(await ES.getEpochPool(1, endEpoch)).to.equal(before.end, 'wallet extend must not double-fund endEpoch');
+    expect(await ES.getEpochPool(1, endEpoch + 1n)).to.be.gt(before.endPlus1, 'wallet extend must fund endEpoch+1');
+    expect(await ES.getEpochPool(1, last + 1n)).to.equal(before.lastPlus1, 'wallet extend must not fund past endEpoch+epochs');
+  });
+
+  it('extend reverts ZeroEpochs on a zero-epoch extension (no arithmetic panic)', async () => {
+    const Params = await hre.ethers.getContract<ParametersStorage>('ParametersStorage');
+    const deposit = ethers.parseEther('2000');
+    await Params.connect(accounts[0]).setContextGraphRegistrationDeposit(deposit);
+    const creator = getDefaultKACreator(accounts);
+    await Token.mint(creator.address, deposit);
+    await Token.connect(creator).approve(await CGFacade.getAddress(), deposit);
+
+    const { cgId, epochs, receivingNodes, publisherIdentityId, receiverIdentityIds } =
+      await setupRegisteredAgentPublish();
+    const reservedKaId = packReservedKaId(creator.address, 1);
+    const p = await buildPublishParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes,
+      publisherIdentityId,
+      receiverIdentityIds,
+      author: creator,
+      contextGraphId: cgId,
+      merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('extend-zero-epochs')),
+      knowledgeAssetsAmount: 1,
+      byteSize: 1000,
+      epochs,
+      tokenAmount: ethers.parseEther('1000'),
+      isImmutable: false,
+      publishOperationId: 'extend-zero-epochs-pub',
+      reservedKaId,
+    });
+    await KAV10.connect(creator).publish(p);
+
+    await expect(
+      KAV10.connect(creator).extendKnowledgeAssetLifetime(reservedKaId, 0, ethers.parseEther('100')),
+    ).to.be.revertedWithCustomError(KAV10, 'ZeroEpochs');
+  });
+
+  // --------------------------------------------------------------------------
   // OT-RFC-53 — update draws the registration escrow for the delta + pays its fee
   // --------------------------------------------------------------------------
   it('OT-RFC-53: updating a KA in an owner-funded CG draws the escrow for the delta and pays its treasury fee', async () => {

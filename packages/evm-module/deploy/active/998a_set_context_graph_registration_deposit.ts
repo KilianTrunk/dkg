@@ -78,7 +78,20 @@ export default func;
 // or a fixture explicitly listing this tag activates the deposit, so v10-group
 // test fixtures stay at 0.
 func.tags = ['SetContextGraphRegistrationDeposit'];
-// ContextGraphs is a dependency so it is deployed + initialized (caching its
-// deposit stack) BEFORE this script activates the deposit — see the readiness
-// check above.
+// This script reads ContextGraphs' CACHED deposit stack (parametersStorage),
+// which on a FRESH live deploy is only populated when `998_initialize_contracts`
+// runs `Hub.setAndReinitializeContracts` (it registers ParametersStorage, THEN
+// reinitializes ContextGraphs — see Hub.sol). The per-contract deploy step only
+// COLLECTS contracts for that batch; it does not register/initialize them. So
+// this MUST run AFTER 998.
+//
+// hardhat-deploy runs all `runAtTheEnd` scripts in FILENAME order
+// (DeploymentsManager: alphabetical sort, runAtTheEnd bucket appended). 057, 998
+// and 999 are all runAtTheEnd, so to land AFTER 998_initialize this file is
+// named `998a_…` (998_ < 998a_ < 999_) AND keeps runAtTheEnd = true. Drop the
+// flag and it falls into the normal group, which runs before the ENTIRE end-group
+// (998 included) and trips the readiness guard again; a numeric prefix < 998
+// (e.g. the original 054_) runs first in the end-group, also before 998, and
+// fails identically. Incremental deploys are unaffected (already cached).
+func.runAtTheEnd = true;
 func.dependencies = ['ParametersStorage', 'ContextGraphs'];

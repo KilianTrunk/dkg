@@ -58,7 +58,16 @@ const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
 
   // finishBackfill is onlyContracts (Hub owner bypasses). Only call if the deployer is the owner;
   // otherwise leave it locked and print the manual go-live step (e.g. multisig-owned Hub).
-  const hub = await ethers.getContractAt('Hub', (await deployments.get('Hub')).address);
+  //
+  // Read the Hub from the CUSTOM registry (hre.helpers), not deployments.get('Hub'): on a
+  // redeploy that KEEPS the Hub, 001_deploy_hub short-circuits on isDeployed and never calls
+  // hre.deployments.deploy('Hub'), so the kept Hub is absent from hardhat-deploy's (in-session)
+  // standard registry → deployments.get('Hub') throws "No deployment found for: Hub". The custom
+  // registry always holds it (deployed:true). Matches the unguarded pattern at 002/005/100/998.
+  const hub = await ethers.getContractAt(
+    'Hub',
+    hre.helpers.contractDeployments.contracts['Hub'].evmAddress,
+  );
   const owner: string = await hub.owner();
   if (owner.toLowerCase() !== deployer.toLowerCase()) {
     console.log(

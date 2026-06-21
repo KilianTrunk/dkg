@@ -29,6 +29,7 @@ import {
   generateKCMetadata,
   restateKaPartition,
   restateLabelGraphForUpdate,
+  buildScopedMinimalMeta,
   toHex,
   type KAMetadata,
 } from '../src/metadata.js';
@@ -232,5 +233,60 @@ describe('restate writers — conditional collapse', () => {
     rows = await metaQuadsOf(store, META);
     expect(tokenRows(rows)).toEqual([]);
     expect(rows).toContainEqual({ subject: UAL, predicate: `${DKG_NS}rootEntity`, object: ROOT_A, graph: META });
+  });
+});
+
+describe('buildScopedMinimalMeta — shared scoped-meta builder for the two publish paths', () => {
+  const KA_ID = 42n;
+  const MR = new Uint8Array(32).fill(7);
+  const XSD_INT = 'http://www.w3.org/2001/XMLSchema#integer';
+  const SCOPED = `did:dkg:context-graph:${CG}/context/9/_meta`;
+
+  it('single-root: resolution edges + collapsed member rows, NO token subjects', () => {
+    const q = buildScopedMinimalMeta(
+      UAL, KA_ID, MR,
+      [{ rootEntity: ROOT_A, tokenId: 1n, privateMerkleRoot: PRIV_A }],
+      SCOPED,
+    );
+    expect(q).toContainEqual({ subject: UAL, predicate: `${DKG_NS}batchId`, object: `"42"^^<${XSD_INT}>`, graph: SCOPED });
+    expect(q).toContainEqual({ subject: UAL, predicate: `${DKG_NS}merkleRoot`, object: `"${toHex(MR)}"`, graph: SCOPED });
+    expect(q).toContainEqual({ subject: UAL, predicate: `${DKG_NS}rootEntity`, object: ROOT_A, graph: SCOPED });
+    expect(q).toContainEqual({ subject: UAL, predicate: `${DKG_NS}privateMerkleRoot`, object: `"${toHex(PRIV_A)}"`, graph: SCOPED });
+    // single-root keeps the full collapse — no `<ual>/<tokenId>` subjects.
+    expect(q.filter((x) => x.subject.startsWith(`${UAL}/`))).toEqual([]);
+  });
+
+  it('multi-root: collapsed rows for both + per-token root↔private pairing rows', () => {
+    const q = buildScopedMinimalMeta(
+      UAL, KA_ID, MR,
+      [
+        { rootEntity: ROOT_A, tokenId: 1n, privateMerkleRoot: PRIV_A },
+        { rootEntity: ROOT_B, tokenId: 2n, privateMerkleRoot: PRIV_B },
+      ],
+      SCOPED,
+    );
+    expect(q).toContainEqual({ subject: UAL, predicate: `${DKG_NS}rootEntity`, object: ROOT_A, graph: SCOPED });
+    expect(q).toContainEqual({ subject: UAL, predicate: `${DKG_NS}rootEntity`, object: ROOT_B, graph: SCOPED });
+    for (const [n, root, priv] of [['1', ROOT_A, PRIV_A], ['2', ROOT_B, PRIV_B]] as const) {
+      expect(q).toContainEqual({ subject: `${UAL}/${n}`, predicate: `${DKG_NS}rootEntity`, object: root, graph: SCOPED });
+      expect(q).toContainEqual({ subject: `${UAL}/${n}`, predicate: `${DKG_NS}partOf`, object: UAL, graph: SCOPED });
+      expect(q).toContainEqual({ subject: `${UAL}/${n}`, predicate: `${DKG_NS}privateMerkleRoot`, object: `"${toHex(priv)}"`, graph: SCOPED });
+    }
+  });
+
+  it('dedupes the collapsed privateMerkleRoot but keeps each token pairing row', () => {
+    // two DISTINCT roots sharing ONE private root: collapsed `<ual>` priv row is
+    // deduped to one; each `<ual>/<tokenId>` keeps its own (so the pairing holds).
+    const q = buildScopedMinimalMeta(
+      UAL, KA_ID, MR,
+      [
+        { rootEntity: ROOT_A, tokenId: 1n, privateMerkleRoot: PRIV_A },
+        { rootEntity: ROOT_B, tokenId: 2n, privateMerkleRoot: PRIV_A },
+      ],
+      SCOPED,
+    );
+    expect(q.filter((x) => x.subject === UAL && x.predicate === `${DKG_NS}privateMerkleRoot`)).toHaveLength(1);
+    expect(q).toContainEqual({ subject: `${UAL}/1`, predicate: `${DKG_NS}privateMerkleRoot`, object: `"${toHex(PRIV_A)}"`, graph: SCOPED });
+    expect(q).toContainEqual({ subject: `${UAL}/2`, predicate: `${DKG_NS}privateMerkleRoot`, object: `"${toHex(PRIV_A)}"`, graph: SCOPED });
   });
 });

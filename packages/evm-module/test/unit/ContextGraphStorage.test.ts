@@ -322,6 +322,21 @@ describe('@unit ContextGraphStorage', () => {
       expect(await StorageContract.getContextGraphKaCount(1)).to.equal(3);
     });
 
+    it('dual-writes both lists: the sampling list mirrors the append-only list on registration', async () => {
+      await StorageContract.connect(opSigner).registerKnowledgeAssetToContextGraph(1, 100);
+      await StorageContract.connect(opSigner).registerKnowledgeAssetToContextGraph(1, 200);
+      await StorageContract.connect(opSigner).registerKnowledgeAssetToContextGraph(1, 300);
+      // Before any prune the two lists are identical (the keeper later diverges
+      // them by swap-popping expired entries from the sampling list only).
+      const count = await StorageContract.getContextGraphKaCount(1);
+      expect(await StorageContract.getSamplingKaCount(1)).to.equal(count);
+      for (let i = 0n; i < count; i++) {
+        expect(await StorageContract.getSamplingKaAt(1, i)).to.equal(
+          await StorageContract.getContextGraphKaAt(1, i),
+        );
+      }
+    });
+
     it('reverts on double registration (KnowledgeAssetAlreadyRegisteredToContextGraph)', async () => {
       await StorageContract.connect(opSigner).registerKnowledgeAssetToContextGraph(1, 100);
       // Create a second CG and try to register the same KA there

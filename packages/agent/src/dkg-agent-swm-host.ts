@@ -18,7 +18,7 @@ import {
   contextGraphDataGraphUri, contextGraphMetaGraphUri, contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
   contextGraphSharedMemoryUri,
   contextGraphVerifiableMemoryUri, contextGraphVerifiableMemoryMetaUri,
-  contextGraphDataUri, contextGraphMetaUri, assertionLifecycleUri, contextGraphAssertionUri,
+  contextGraphDataUri, contextGraphMetaUri, contextGraphLayerUri, assertionLifecycleUri, contextGraphAssertionUri,
   deriveCuratorDidFromCgId,
   MemoryLayer,
   computeACKDigest,
@@ -2738,13 +2738,13 @@ export class SwmHostModeMethods extends DKGAgentBase {
       const scopedMeta = contextGraphMetaUri(localCgId, sub.onChainId);
       const rootData = contextGraphDataUri(localCgId);
       const scopedData = contextGraphDataUri(localCgId, sub.onChainId);
-      // The publisher's OWN one-shot publish() writes confirmed PUBLIC data to
-      // the per-KA verifiable-memory (VM) graphs `<rootData>/_verifiable_memory/
-      // <author>/<number>` — NOT the legacy root data graph (the receiver/#1259
-      // strand is what fills root data). So the data reads below must look in
-      // BOTH: legacy root data UNION any VM graph under this CG, each scoped by
-      // the per-root filter. Reading VM-only would regress the receiver heal.
-      const vmGraphPrefix = `${rootData}/_verifiable_memory/`;
+      // The publisher's OWN one-shot publish() writes confirmed PUBLIC data to a
+      // per-KA verifiable-memory (VM) graph — NOT the legacy root data graph (the
+      // receiver/#1259 strand fills root data). So the data reads below look in
+      // BOTH: legacy root data UNION the stranded KC's EXACT VM graph (derived
+      // per-KC from its batchId inside the loop). Reading VM-only would regress
+      // the receiver heal; prefix-scanning every VM graph could pull a DIFFERENT
+      // KA's triples for a root IRI that recurs across per-KA VM graphs.
 
       // 2a ASK-guard: is there at least one legacy-only KC (batchId present in
       // legacy meta, absent in scoped meta)? In steady state this is one ASK per
@@ -2772,6 +2772,22 @@ export class SwmHostModeMethods extends DKGAgentBase {
         // exactly as the extractor does for its `ual`.
         const ual = stripBindingQuotes(row['ual'] ?? '');
         if (!ual || !isSafeIri(ual)) continue;
+        // Derive the stranded KC's EXACT per-KA VM graph from its batchId. The
+        // chain adapter sets batchId === kaId for the createKnowledgeAssets
+        // publish path (evm-adapter-publish.ts / evm-adapter-base.ts), so ?b is
+        // the minted kaId; author/number unpack from it exactly as publish() does.
+        // Binding the exact graph (vs scanning `_verifiable_memory/*`) prevents
+        // copying another KA's triples for a root IRI that recurs across per-KA
+        // VM graphs (e.g. an updated entity republished under a new kaId).
+        const bMatch = /^"?(\d+)/.exec(String(row['b'] ?? ''));
+        if (!bMatch) continue;
+        const kaId = BigInt(bMatch[1]);
+        const vmGraph = contextGraphLayerUri(
+          localCgId,
+          MemoryLayer.VerifiableMemory,
+          '0x' + (kaId >> 96n).toString(16).padStart(40, '0'),
+          kaId & ((1n << 96n) - 1n),
+        );
         try {
           await withMaterializationLock(scopedMeta, ual, async () => {
             // A KC may carry no `dkg:materializedVersion` stamp in legacy meta:
@@ -2826,9 +2842,8 @@ export class SwmHostModeMethods extends DKGAgentBase {
                        FILTER(?s = <${root}> || STRSTARTS(STR(?s), "${root}/.well-known/genid/"))
                      }
                    } UNION {
-                     GRAPH ?vmg {
+                     GRAPH <${vmGraph}> {
                        ?s ?p ?o .
-                       FILTER(STRSTARTS(STR(?vmg), "${vmGraphPrefix}"))
                        FILTER(?s = <${root}> || STRSTARTS(STR(?s), "${root}/.well-known/genid/"))
                      }
                    }
@@ -2851,9 +2866,8 @@ export class SwmHostModeMethods extends DKGAgentBase {
                        FILTER(?p != <${TRUST_LEVEL_PREDICATE}> && ?p != <${LEGACY_TRUST_LEVEL_PREDICATE}>)
                      }
                    } UNION {
-                     GRAPH ?vmg {
+                     GRAPH <${vmGraph}> {
                        ?s ?p ?o .
-                       FILTER(STRSTARTS(STR(?vmg), "${vmGraphPrefix}"))
                        FILTER(?s = <${root}> || STRSTARTS(STR(?s), "${root}/.well-known/genid/"))
                        FILTER(?p != <${TRUST_LEVEL_PREDICATE}> && ?p != <${LEGACY_TRUST_LEVEL_PREDICATE}>)
                      }

@@ -322,6 +322,38 @@ describe('healStrandedScopedKCs — content-binding gate', () => {
     expect(stampLeak.type === 'boolean' && stampLeak.value).toBe(false);
   });
 
+  it('VM read is bound to the stranded KC kaId — never copies a different KA sharing the root IRI', async () => {
+    // Two KAs in the same CG can share a root entity IRI (e.g. an entity
+    // republished under a new kaId). The stranded KC is kaId 42; a DIFFERENT
+    // kaId 99 also holds a VM graph carrying the SAME root with a different value.
+    // The heal must copy ONLY kaId 42's VM graph (derived from its batchId) — a
+    // prefix scan would mix in kaId 99's triples and make RS prove a wrong leaf set.
+    const C_CG = 'vm-contamination-cg';
+    const C_ONCHAIN = '19';
+    const C_UAL = 'did:dkg:hardhat:31337/0xvmc/42';
+    const OTHER_KA_ID = 99n;
+    const vmOf = (kaId: bigint): string => contextGraphLayerUri(
+      C_CG, MemoryLayer.VerifiableMemory,
+      '0x' + (kaId >> 96n).toString(16).padStart(40, '0'),
+      kaId & ((1n << 96n) - 1n),
+    );
+    await seedOntology(store, C_CG, C_ONCHAIN);
+    await store.insert(metaQuads(C_UAL, contextGraphMetaUri(C_CG))); // batchId == KA_ID (42) in legacy meta
+    // kaId 42 (the stranded KC) — the value RS must prove.
+    await store.insert([{ subject: ROOT, predicate: 'urn:p:name', object: '"value-A"', graph: vmOf(KA_ID) }]);
+    // kaId 99 — a DIFFERENT KA sharing the same root IRI, different value.
+    await store.insert([{ subject: ROOT, predicate: 'urn:p:name', object: '"value-B"', graph: vmOf(OTHER_KA_ID) }]);
+
+    await runHeal(store, C_CG, C_ONCHAIN);
+
+    // The scoped copy must contain ONLY kaId 42's value, never kaId 99's.
+    const scopedData = contextGraphDataUri(C_CG, C_ONCHAIN);
+    const got = await store.query(`SELECT ?o WHERE { GRAPH <${scopedData}> { <${ROOT}> <urn:p:name> ?o } }`);
+    const values = got.type === 'bindings' ? got.bindings.map((b) => b['o'] ?? '') : [];
+    expect(values.some((v) => v.includes('value-A')), 'must copy the stranded kaId 42 VM data').toBe(true);
+    expect(values.some((v) => v.includes('value-B')), 'must NOT copy a different kaId sharing the root').toBe(false);
+  });
+
   it('writes NOTHING when the legacy root data is absent (crash-partial guard)', async () => {
     // Re-seed a CG whose LEGACY META resolves a root but whose LEGACY ROOT DATA
     // has NO triples under that root — a Factor-B sync gap, NOT a relocation.

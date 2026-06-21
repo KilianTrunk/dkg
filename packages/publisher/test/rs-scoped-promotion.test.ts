@@ -67,9 +67,13 @@ class AdapterSigningChain extends MockChainAdapter {
   ): Promise<string> {
     return this.wallet.signTypedData(domain, types, value);
   }
-  override async getKAContextGraphId(kaId: bigint): Promise<bigint> {
+  // The on-chain cgId the promotion MUST scope by — deliberately DIFFERENT from
+  // the local context-graph label / fallback so a test proves the promotion uses
+  // this chain-truth value, not the local id (the exact failure mode #1264 fixes).
+  chainTruthCgId = 7n;
+  override async getKAContextGraphId(_kaId: bigint): Promise<bigint> {
     this.getKAContextGraphIdCalls++;
-    return super.getKAContextGraphId(kaId);
+    return this.chainTruthCgId;
   }
 }
 
@@ -100,9 +104,12 @@ describe('GH #1264 — publish() self-promotes a confirmed KC to the scoped grap
     const wallet = new ethers.Wallet(TEST_KEY);
     const chain = new AdapterSigningChain(wallet);
     const store = new OxigraphStore();
-    // Numeric label → the mock binds on-chain cgId == 5. The scoped graphs the
-    // prover reads are `did:dkg:context-graph:5/context/5/{_meta,}`.
+    // Local context-graph label is '5', but the mock chain returns a DIFFERENT
+    // on-chain cgId (chainTruthCgId = 7) from getKAContextGraphId. The promotion
+    // MUST scope by chain-truth → `did:dkg:context-graph:5/context/7/{_meta,}` —
+    // proving it uses the chain-truth value and not the local label/fallback.
     const CG = '5';
+    const CHAIN_TRUTH = chain.chainTruthCgId.toString(); // '7' — what the RS prover reads
     const publisher = await sealForWallet(
       new DKGPublisher({
         store,
@@ -141,8 +148,16 @@ describe('GH #1264 — publish() self-promotes a confirmed KC to the scoped grap
     // the same call the prover uses) rather than the laggy local resolver.
     expect(chain.getKAContextGraphIdCalls).toBeGreaterThan(0);
 
-    const scopedMeta = contextGraphMetaUri(CG, '5'); // …/context/5/_meta
-    const scopedData = contextGraphDataUri(CG, '5'); // …/context/5
+    const scopedMeta = contextGraphMetaUri(CG, CHAIN_TRUTH); // …/context/7/_meta
+    const scopedData = contextGraphDataUri(CG, CHAIN_TRUTH); // …/context/7
+
+    // Discriminator: NOTHING lands under the local/fallback cgId (5). A regression
+    // that ignored getKAContextGraphId's return and used the local fallback would
+    // populate context/5 instead — this fails closed on that.
+    expect(
+      (await quadsIn(store, contextGraphMetaUri(CG, CG))).length,
+      'scoped graphs must be under the chain-truth cgId (7), not the local fallback (5)',
+    ).toBe(0);
 
     // ── Scoped META ────────────────────────────────────────────────────────
     const metaQuads = await quadsIn(store, scopedMeta);
@@ -225,7 +240,7 @@ describe('GH #1264 — publish() self-promotes a confirmed KC to the scoped grap
     });
     expect(result.status).toBe('confirmed');
 
-    const scopedMeta = contextGraphMetaUri(CG, '5');
+    const scopedMeta = contextGraphMetaUri(CG, chain.chainTruthCgId.toString()); // chain-truth cgId (7)
     const metaQuads = await quadsIn(store, scopedMeta);
 
     // Collapsed aggregate rows survive on the UAL subject for BOTH roots

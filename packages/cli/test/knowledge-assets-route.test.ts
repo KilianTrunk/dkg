@@ -275,6 +275,82 @@ describe('/api/knowledge-assets routes (real daemon, real chain)', () => {
       expect(res.status).toBe(400);
       expect(String(res.body.error)).toContain('preSignedAuthorAttestation.reservedKaId');
     });
+
+    // F1 regression — a custodial agent's bearer token must attribute the seal's
+    // author to that agent (not the node's publisher signer). The on-chain
+    // getLatestMerkleRootAuthor derives from this seal author, so before the fix
+    // a custodial publish recorded the node's operational wallet as author.
+    // (Admin-token "publisher signs as itself" is covered in the unit test
+    // finalize-author-token-attribution.test.ts; here we prove the agent path
+    // end-to-end through the real daemon + real seal.)
+    it('attributes the seal author to the agent-scoped token (F1)', async () => {
+      const reg = await postJson(daemon, '/api/agent/register', {
+        name: `ka-author-agent-${Date.now().toString(36)}`,
+        framework: 'test',
+      });
+      expect(reg.status, `agent register: ${JSON.stringify(reg.body)}`).toBeLessThan(300);
+      const agentAddress = String(reg.body.agentAddress);
+      const agentToken = String(reg.body.authToken);
+      expect(agentAddress).toMatch(/^0x[0-9a-fA-F]{40}$/);
+      expect(agentToken.length).toBeGreaterThan(0);
+
+      // All requests run AS the custodial agent (raw fetch — postJson uses the
+      // node-admin token). The agent authors into its own CG.
+      const agentPost = async (path: string, body: unknown) => {
+        const r = await fetch(`${daemon.base}${path}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${agentToken}` },
+          body: JSON.stringify(body),
+        });
+        return { status: r.status, body: (await r.json().catch(() => ({}))) as Record<string, any> };
+      };
+
+      const cg = `ka-agent-cg-${Date.now().toString(36)}`;
+      const created = await agentPost('/api/context-graph/create', { id: cg, name: 'Agent CG', accessPolicy: 1 });
+      expect(created.status, `agent CG create: ${JSON.stringify(created.body)}`).toBeLessThan(300);
+      const onchain = await agentPost('/api/context-graph/register', { id: cg, accessPolicy: 1 });
+      expect(onchain.status, `agent CG register: ${JSON.stringify(onchain.body)}`).toBe(200);
+
+      // Create draft → write → finalize, all as the agent. The kaId is stamped
+      // (at create) AND the seal is signed (at finalize) in the SAME agent
+      // namespace, so finalize doesn't throw KaIdNamespaceMismatch and the seal
+      // author is the agent. The finalize route returns the sealed authorAddress.
+      const created2 = await agentPost('/api/knowledge-assets', { contextGraphId: cg, name: 'agent-authored' });
+      expect(created2.status, `agent KA create: ${JSON.stringify(created2.body)}`).toBeLessThan(300);
+      await agentPost('/api/knowledge-assets/agent-authored/wm/write', {
+        contextGraphId: cg,
+        quads: [{ subject: 'ex:A', predicate: 'ex:p', object: '"x"' }],
+      });
+      const fin = await agentPost('/api/knowledge-assets/agent-authored/wm/finalize', { contextGraphId: cg });
+      expect(fin.status, `agent finalize: ${JSON.stringify(fin.body)}`).toBe(200);
+      // The fix: stamp + seal are both in the agent's namespace → seal author is
+      // the agent, not the node's publisher signer.
+      expect(String(fin.body.authorAddress).toLowerCase()).toBe(agentAddress.toLowerCase());
+
+      // ATOMIC path (the create-route callsite this PR changes): create + write +
+      // auto-finalize + share + publish in ONE call, as the agent. This proves
+      // write/finalize/promote/publish all stay in the AGENT's namespace, not just
+      // create — the returned author is the agent, and (when it mints) the kaId is
+      // packed (uint160(author)<<96)|number, so its high 160 bits MUST be the agent.
+      const atomic = await agentPost('/api/knowledge-assets', {
+        contextGraphId: cg,
+        name: 'agent-atomic',
+        quads: [{ subject: 'ex:B', predicate: 'ex:p', object: '"y"' }],
+        finalize: true,
+        alsoShareSwm: true,
+        alsoPublishVm: true,
+      });
+      // authorAddress is stamped at finalize (before any publish tail-error), so
+      // it is always present and must be the agent.
+      expect(String(atomic.body.authorAddress).toLowerCase(), `agent atomic: ${JSON.stringify(atomic.body)}`).toBe(
+        agentAddress.toLowerCase(),
+      );
+      // If it minted on-chain, the minted kaId proves the publish path stayed
+      // agent-scoped (high 160 bits == author == agent).
+      if (atomic.body.kaId != null) {
+        expect(BigInt(atomic.body.kaId) >> 96n).toBe(BigInt(agentAddress));
+      }
+    });
   });
 
   // ── swm/share ─────────────────────────────────────────────────────

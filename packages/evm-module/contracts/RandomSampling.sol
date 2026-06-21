@@ -48,7 +48,12 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
     //          submitProof scores the node against min(snapshot, live) (numerator
     //          only; score-per-stake denominator stays live), defeating a
     //          within-period tier-0 flash-stake score-inflation.
-    string private constant _VERSION = "10.5.0";
+    // 10.5.0 — Within-CG draw reads a decoupled compacted sampling list; the
+    //          permissionless keeper `pruneExpiredKnowledgeAssets` compacts it.
+    // 10.6.0 — Sampling reads/keeper retargeted to ContextGraphStorage's
+    //          `_samplingKAList` (getSamplingKaCount/At) so pruning no longer
+    //          mutates the append-only registration ordinal the reconciler reads.
+    string private constant _VERSION = "10.6.0";
     uint256 public constant SCALE18 = 1e18;
 
     /// @notice Maximum number of in-CG resamples when the picker hits an
@@ -682,14 +687,18 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
         // Step 2 — pick a challengeable KA inside `chosenCg` (bounded resampling), then a leaf.
         // OT-RFC-49: curated KAs gate on the PUBLIC `_catalog` commitment; a curated KA with
         // `catalogLeafCount == 0` is skipped like an expired KA (cores prove the catalog).
-        uint256 kaCount = contextGraphStorage.getContextGraphKaCount(chosenCg);
+        // Draw from the COMPACTED sampling list, not the append-only registration
+        // list — the keeper prunes expired KAs out of the former, so dead slots
+        // don't accumulate and starve the bounded resample. The `endEpoch` skip
+        // below still guards any expired KA not yet pruned.
+        uint256 kaCount = contextGraphStorage.getSamplingKaCount(chosenCg);
         bool cgIsCurated = contextGraphStorage.getIsCurated(chosenCg);
         bytes32 kaSeed = cgSeed;
         if (kaCount > 0) {
             for (uint8 attempt = 0; attempt < MAX_KA_RETRIES; attempt++) {
                 kaSeed = keccak256(abi.encodePacked(kaSeed, attempt));
                 uint256 idx = uint256(kaSeed) % kaCount;
-                uint256 candidate = contextGraphStorage.getContextGraphKaAt(chosenCg, idx);
+                uint256 candidate = contextGraphStorage.getSamplingKaAt(chosenCg, idx);
                 if (knowledgeAssetStorage.getEndEpoch(candidate) < currentEpoch) continue;
                 if (cgIsCurated && knowledgeAssetStorage.getCatalogLeafCount(candidate) == 0) continue;
                 // Step 3 — leaf draw (curated -> public `_catalog` leaves; public -> flat-KA leaves).
@@ -793,11 +802,12 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
     }
 
     /// @notice Permissionless keeper: prune EXPIRED Knowledge Assets from a CG's
-    ///         sampling list. The per-CG list (`_contextGraphKAList`) is
-    ///         append-only with no removal, so expired KAs accumulate as permanent
-    ///         dead slots and can starve the bounded within-CG draw
+    ///         COMPACTED sampling list (`_samplingKAList`). New entries are
+    ///         appended on registration but never removed there, so expired KAs
+    ///         accumulate as dead slots and can starve the bounded within-CG draw
     ///         (`MAX_KA_RETRIES`). Scans up to `maxScan` positions and swap-pops
-    ///         every entry whose `endEpoch < currentEpoch`.
+    ///         every entry whose `endEpoch < currentEpoch`. The append-only
+    ///         registration list the reconciler reads is left untouched.
     /// @dev Commits in its OWN transaction, independently of `createChallenge`
     ///      (whose settle/prune work rolls back on an all-miss revert), so a
     ///      clogged CG is always recoverable. Safe to be permissionless: it can
@@ -823,9 +833,9 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
         uint256 currentEpoch = chronos.getCurrentEpoch();
         uint256 i = startIndex;
         for (uint256 scanned; scanned < maxScan; scanned++) {
-            uint256 len = contextGraphStorage.getContextGraphKaCount(cgId);
+            uint256 len = contextGraphStorage.getSamplingKaCount(cgId);
             if (i >= len) break;
-            uint256 ka = contextGraphStorage.getContextGraphKaAt(cgId, i);
+            uint256 ka = contextGraphStorage.getSamplingKaAt(cgId, i);
             if (knowledgeAssetStorage.getEndEpoch(ka) < currentEpoch) {
                 // swap-pops the last element into i, so re-check i (do not advance).
                 contextGraphStorage.swapRemoveKnowledgeAssetAt(cgId, i, ka);

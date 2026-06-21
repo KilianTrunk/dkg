@@ -48,7 +48,7 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
     //          submitProof scores the node against min(snapshot, live) (numerator
     //          only; score-per-stake denominator stays live), defeating a
     //          within-period tier-0 flash-stake score-inflation.
-    string private constant _VERSION = "10.4.0";
+    string private constant _VERSION = "10.5.0";
     uint256 public constant SCALE18 = 1e18;
 
     /// @notice Maximum number of in-CG resamples when the picker hits an
@@ -57,6 +57,15 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
     ///         so the node skips the current proof period and retries on the
     ///         next one (see {_pickKa}).
     uint8 public constant MAX_KA_RETRIES = 10;
+
+    /// @notice Bound on the lazy self-heal sweep: on a CG miss the production
+    ///         draw probes up to this many random positions in the CG's KA list
+    ///         and swap-pops any EXPIRED entries (see {_pruneExpiredKas}). The
+    ///         append-only KA list otherwise has no removal, so a flood of cheap
+    ///         1-epoch KAs that later expire would be permanent dead slots that
+    ///         exhaust MAX_KA_RETRIES and make the CG's live KAs un-challengeable.
+    ///         Bounded so the extra work on a miss can never blow the gas budget.
+    uint8 public constant MAX_KA_PRUNE = 10;
 
     /// @notice RFC-39 Phase A.5 — bounded retries at the CG selection layer
     ///         when the picked CG has no challengeable KA (all legacy /
@@ -785,11 +794,42 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
                 revert NoEligibleKnowledgeAsset();
             }
             if (found) return (cg, ka, chunk);
+            // Self-heal: prune EXPIRED KAs from the missed (clogged) CG so a
+            // one-time flood of cheap 1-epoch KAs that later expire can never be
+            // a PERMANENT sampling DoS — the append-only list converges back to
+            // mostly-live over a few draws. Bounded + derived-seed, so it never
+            // changes the draw above (view/full parity holds — only the list
+            // shrinks for future challenges). The missed CG is excluded below,
+            // so pruning it cannot affect any later attempt in this same call.
+            _pruneExpiredKas(cg, keccak256(abi.encodePacked(cgSeed, "kaPrune")), currentEpoch);
             cgWeightTreeStorage.settle(cg); // settle-on-miss (persists only if this call commits)
             exhausted[exhaustedCount++] = cg;
             cgSeed = keccak256(abi.encodePacked(cgSeed, "cgRetry", cgAttempt));
         }
         revert NoEligibleKnowledgeAsset();
+    }
+
+    /// @dev Lazy self-heal sweep for a missed CG: probe up to MAX_KA_PRUNE
+    ///      random positions in its KA list and swap-pop any EXPIRED entries —
+    ///      the removal the append-only `_contextGraphKAList` otherwise lacks.
+    ///      Probing on a MISS targets exactly the clogged CGs and cleans them
+    ///      proportionally to the dead-slot density, so a one-time flood of cheap
+    ///      1-epoch KAs that later expire can never be a PERMANENT sampling DoS.
+    ///      Bounded by MAX_KA_PRUNE; the derived seed keeps it independent of the
+    ///      actual draw (no view/full parity impact — the list only shrinks for
+    ///      FUTURE challenges). `swapRemoveKnowledgeAssetAt` is a no-op on a stale
+    ///      index, and the length is re-read each iteration as the list shrinks.
+    function _pruneExpiredKas(uint256 cg, bytes32 seed, uint256 currentEpoch) internal {
+        for (uint8 i = 0; i < MAX_KA_PRUNE; i++) {
+            uint256 len = contextGraphStorage.getContextGraphKaCount(cg);
+            if (len == 0) break;
+            seed = keccak256(abi.encodePacked(seed, i));
+            uint256 idx = uint256(seed) % len;
+            uint256 ka = contextGraphStorage.getContextGraphKaAt(cg, idx);
+            if (knowledgeAssetStorage.getEndEpoch(ka) < currentEpoch) {
+                contextGraphStorage.swapRemoveKnowledgeAssetAt(cg, idx, ka);
+            }
+        }
     }
 
     // slither-disable-end weak-prng,uninitialized-local,cyclomatic-complexity,incorrect-equality,calls-loop,timestamp

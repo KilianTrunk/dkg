@@ -354,6 +354,58 @@ describe('@unit ContextGraphStorage', () => {
     });
   });
 
+  describe('swapRemoveKnowledgeAssetAt (lazy expired-KA prune)', () => {
+    beforeEach(async () => {
+      await StorageContract.connect(opSigner).createContextGraph(
+        accounts[0].address, [], 0, 0, 1, ethers.ZeroAddress, 0,
+        ethers.ZeroHash,
+      );
+      await StorageContract.connect(opSigner).registerKnowledgeAssetToContextGraph(1, 100);
+      await StorageContract.connect(opSigner).registerKnowledgeAssetToContextGraph(1, 200);
+      await StorageContract.connect(opSigner).registerKnowledgeAssetToContextGraph(1, 300);
+    });
+
+    it('swap-pops the entry (moves last into the slot) and emits the unlist event', async () => {
+      await expect(
+        StorageContract.connect(opSigner).swapRemoveKnowledgeAssetAt(1, 0, 100),
+      ).to.emit(StorageContract, 'KnowledgeAssetUnlistedFromContextGraph').withArgs(1, 100);
+      // last (300) swapped into index 0; 100 removed.
+      expect(await StorageContract.getContextGraphKaList(1)).to.deep.equal([300n, 200n]);
+      expect(await StorageContract.getContextGraphKaCount(1)).to.equal(2);
+    });
+
+    it('removing the last element just pops it (no swap)', async () => {
+      await StorageContract.connect(opSigner).swapRemoveKnowledgeAssetAt(1, 2, 300);
+      expect(await StorageContract.getContextGraphKaList(1)).to.deep.equal([100n, 200n]);
+    });
+
+    it('PRESERVES the kaToContextGraph binding + dedup after removal from the list', async () => {
+      await StorageContract.connect(opSigner).swapRemoveKnowledgeAssetAt(1, 0, 100);
+      // Reverse binding intact: readers (getKAContextGraphId) still resolve it...
+      expect(await StorageContract.kaToContextGraph(100)).to.equal(1);
+      // ...and the double-registration guard still rejects re-adding it.
+      await expect(
+        StorageContract.connect(opSigner).registerKnowledgeAssetToContextGraph(1, 100),
+      ).to.be.revertedWithCustomError(StorageContract, 'KnowledgeAssetAlreadyRegisteredToContextGraph');
+    });
+
+    it('is a no-op when the slot no longer holds expectedKaId (stale-index guard)', async () => {
+      await StorageContract.connect(opSigner).swapRemoveKnowledgeAssetAt(1, 0, 999);
+      expect(await StorageContract.getContextGraphKaList(1)).to.deep.equal([100n, 200n, 300n]);
+    });
+
+    it('is a no-op on an out-of-bounds index', async () => {
+      await StorageContract.connect(opSigner).swapRemoveKnowledgeAssetAt(1, 99, 100);
+      expect(await StorageContract.getContextGraphKaCount(1)).to.equal(3);
+    });
+
+    it('reverts when caller is not a Hub contract', async () => {
+      await expect(
+        StorageContract.connect(accounts[5]).swapRemoveKnowledgeAssetAt(1, 0, 100),
+      ).to.be.revertedWithCustomError(HubContract, 'UnauthorizedAccess');
+    });
+  });
+
   // -------------------------------------------------------------------------
   // getContextGraphKaAt — indexed accessor for on-chain consumers
   // -------------------------------------------------------------------------

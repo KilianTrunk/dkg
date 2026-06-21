@@ -126,6 +126,19 @@
   },
   {
     "inputs": [],
+    "name": "MAX_KA_PRUNE",
+    "outputs": [
+      {
+        "internalType": "uint8",
+        "name": "",
+        "type": "uint8"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
     "name": "MAX_KA_RETRIES",
     "outputs": [
       {

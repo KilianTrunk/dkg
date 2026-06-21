@@ -45,7 +45,7 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
     //          getContextGraphKaCount/At/List (ABI selector change; no behavior change).
     // 10.0.4 — OT-RFC-53: per-CG registration-escrow accounting (get/set/decrease/
     //          clear) consumed by the deposit pull + admin sweep. ABI surface addition.
-    string private constant _VERSION = "10.0.4";
+    string private constant _VERSION = "10.0.5";
 
     // -----------------------------------------------------------------------
     // Bounds on participant list — anti-griefing cap.
@@ -326,6 +326,41 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
         kaToContextGraph[kaId] = contextGraphId;
         _contextGraphKAList[contextGraphId].push(kaId);
         emit KnowledgeAssetRegisteredToContextGraph(contextGraphId, kaId);
+    }
+
+    event KnowledgeAssetUnlistedFromContextGraph(uint256 indexed contextGraphId, uint256 indexed kaId);
+
+    /**
+     * @notice Remove a Knowledge Asset from a Context Graph's SAMPLING list by
+     *         swap-and-pop.
+     * @dev Used by RandomSampling to lazily prune EXPIRED KAs it encounters
+     *      during a challenge draw, so the otherwise append-only list cannot be
+     *      flooded with permanent dead entries into a sampling DoS. Removes ONLY
+     *      from `_contextGraphKAList` (the sampling enumeration) — the
+     *      `kaToContextGraph[kaId]` reverse binding is INTENTIONALLY left intact:
+     *      readers (`getKAContextGraphId`) must still resolve the KA, and an
+     *      expired KA can never be re-registered (it cannot be re-published with
+     *      the same id), so the double-registration guard stays correct.
+     *      `expectedKaId` makes the call a no-op when the slot no longer holds it
+     *      (a prior swap-pop in the same tx moved a different KA into `index`) —
+     *      robust to stale indices; the entry is simply pruned on a later draw.
+     */
+    function swapRemoveKnowledgeAssetAt(
+        uint256 contextGraphId,
+        uint256 index,
+        uint256 expectedKaId
+    ) external onlyContracts {
+        uint256[] storage list = _contextGraphKAList[contextGraphId];
+        uint256 len = list.length;
+        if (index >= len || list[index] != expectedKaId) {
+            return; // stale / already moved — skip; pruned on a later draw
+        }
+        uint256 last = len - 1;
+        if (index != last) {
+            list[index] = list[last];
+        }
+        list.pop();
+        emit KnowledgeAssetUnlistedFromContextGraph(contextGraphId, expectedKaId);
     }
 
     /**

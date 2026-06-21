@@ -168,6 +168,45 @@ describe('StorageACKHandler', () => {
     expect(isStorageACKDecline(decoded)).toBe(false);
   });
 
+  it('byteSize floor is UTF-8 bytes — a UTF-16 code-unit count is rejected for non-ASCII content', async () => {
+    // `publicByteSize` is a UTF-8 byte count; the floor must be too. With a
+    // non-ASCII IRI, UTF-8 byte length > UTF-16 code-unit length, so a claim at
+    // the (smaller) code-unit sum — which a JS `.length` floor would have wrongly
+    // ACCEPTED — must be declined.
+    const naQuads: Quad[] = [makeQuad('urn:s:日本', 'urn:p', 'urn:o:語')];
+    const naRoot = computeFlatKCRoot(naQuads, []);
+    const naLeafCount = computeFlatKCMerkleLeafCountV10(naQuads, []);
+    const utf8Floor =
+      Buffer.byteLength('urn:s:日本', 'utf8') +
+      Buffer.byteLength('urn:p', 'utf8') +
+      Buffer.byteLength('urn:o:語', 'utf8');
+    const utf16Sum = 'urn:s:日本'.length + 'urn:p'.length + 'urn:o:語'.length;
+    expect(utf8Floor).to.be.greaterThan(utf16Sum); // sanity: non-ASCII makes UTF-8 > UTF-16
+
+    const handler = await createHandler(naQuads);
+    const mk = (publicByteSize: number) =>
+      encodePublishIntent({
+        merkleRoot: naRoot,
+        contextGraphId,
+        publisherPeerId: 'publisher-0',
+        publicByteSize,
+        isPrivate: false,
+        kaCount: 1,
+        rootEntities: ['urn:s:日本'],
+        epochs: 1,
+        tokenAmountStr: '1000',
+        merkleLeafCount: naLeafCount,
+      });
+
+    // Claim at the UTF-16 code-unit sum (< UTF-8 floor) → declined under-claim.
+    const declined = decodeStorageACK(await handler.handler(mk(utf16Sum), fakePeerId));
+    expect(isStorageACKDecline(declined)).toBe(true);
+    expect(declined.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.BYTESIZE_UNDERCLAIM);
+    // Claim at the UTF-8 floor → accepted.
+    const accepted = decodeStorageACK(await handler.handler(mk(utf8Floor), fakePeerId));
+    expect(isStorageACKDecline(accepted)).toBe(false);
+  });
+
   it('declines (SIGNER_NOT_REGISTERED) when the signer is no longer confirmed registered', async () => {
     // PR #557: this used to throw, which the publisher saw as a libp2p
     // stream reset; now the handler returns a typed decline so the

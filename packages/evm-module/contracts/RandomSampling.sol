@@ -806,16 +806,22 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
     ///      gas cleaning dead slots. `swapRemoveKnowledgeAssetAt` preserves
     ///      `kaToContextGraph`, so readers (`getKAContextGraphId`) and the
     ///      double-registration guard stay intact. Gas is bounded by `maxScan`;
-    ///      a large flood is cleared across several calls.
-    /// @param cgId    context graph to clean.
-    /// @param maxScan max list positions to examine this call.
+    ///      a large flood is cleared across several calls. `startIndex` lets a
+    ///      caller target any region — e.g. the expired TAIL of a CG with a long
+    ///      live prefix, which a fixed from-0 scan with a small `maxScan` would
+    ///      never reach. (Reading the list to choose `startIndex` is an off-chain
+    ///      `eth_call`; this on-chain method just acts on the window.)
+    /// @param cgId       context graph to clean.
+    /// @param startIndex first list position to examine (0 = from the head).
+    /// @param maxScan    max list positions to examine this call.
     /// @return removed number of expired KAs swap-popped.
     function pruneExpiredKnowledgeAssets(
         uint256 cgId,
+        uint256 startIndex,
         uint256 maxScan
     ) external returns (uint256 removed) {
         uint256 currentEpoch = chronos.getCurrentEpoch();
-        uint256 i;
+        uint256 i = startIndex;
         for (uint256 scanned; scanned < maxScan; scanned++) {
             uint256 len = contextGraphStorage.getContextGraphKaCount(cgId);
             if (i >= len) break;

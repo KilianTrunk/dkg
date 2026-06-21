@@ -1177,9 +1177,9 @@ describe('@unit RandomSampling', () => {
         await time.increase(Number(epochLength) * 5);
         expect(await Chronos.getCurrentEpoch()).to.be.greaterThan(expiredEnd);
 
-        const removed = await RandomSampling.pruneExpiredKnowledgeAssets.staticCall(cgId, 100n);
+        const removed = await RandomSampling.pruneExpiredKnowledgeAssets.staticCall(cgId, 0n, 100n);
         expect(removed).to.equal(3n);
-        await RandomSampling.pruneExpiredKnowledgeAssets(cgId, 100n);
+        await RandomSampling.pruneExpiredKnowledgeAssets(cgId, 0n, 100n);
 
         // Only the 2 live KAs remain.
         expect(await ContextGraphStorage.getContextGraphKaCount(cgId)).to.equal(2n);
@@ -1202,12 +1202,31 @@ describe('@unit RandomSampling', () => {
         await time.increase(Number(epochLength) * 5);
 
         // maxScan=3 → at most 3 removed this call.
-        expect(await RandomSampling.pruneExpiredKnowledgeAssets.staticCall(cgId, 3n)).to.equal(3n);
-        await RandomSampling.pruneExpiredKnowledgeAssets(cgId, 3n);
+        expect(await RandomSampling.pruneExpiredKnowledgeAssets.staticCall(cgId, 0n, 3n)).to.equal(3n);
+        await RandomSampling.pruneExpiredKnowledgeAssets(cgId, 0n, 3n);
         expect(await ContextGraphStorage.getContextGraphKaCount(cgId)).to.equal(5n);
         // Follow-up clears the rest.
-        await RandomSampling.pruneExpiredKnowledgeAssets(cgId, 100n);
+        await RandomSampling.pruneExpiredKnowledgeAssets(cgId, 0n, 100n);
         expect(await ContextGraphStorage.getContextGraphKaCount(cgId)).to.equal(0n);
+      });
+
+      it('startIndex reaches the expired tail past a live prefix (live-prefix recoverability)', async () => {
+        const cgId = await createCG(OPEN_POLICY);
+        const currentEpoch = await Chronos.getCurrentEpoch();
+        const liveEnd = currentEpoch + 100n;
+        const expiredEnd = currentEpoch + 1n;
+        for (let i = 0; i < 4; i++) await createKa(cgId, liveEnd); // live prefix
+        for (let i = 0; i < 3; i++) await createKa(cgId, expiredEnd); // expired tail
+        const epochLength = await Chronos.epochLength();
+        await time.increase(Number(epochLength) * 5);
+
+        // A from-0 scan with maxScan below the 4-live prefix removes nothing...
+        await RandomSampling.pruneExpiredKnowledgeAssets(cgId, 0n, 3n);
+        expect(await ContextGraphStorage.getContextGraphKaCount(cgId)).to.equal(7n);
+        // ...but starting at the tail clears the expired entries.
+        expect(await RandomSampling.pruneExpiredKnowledgeAssets.staticCall(cgId, 4n, 10n)).to.equal(3n);
+        await RandomSampling.pruneExpiredKnowledgeAssets(cgId, 4n, 10n);
+        expect(await ContextGraphStorage.getContextGraphKaCount(cgId)).to.equal(4n);
       });
 
       it('the swap-pop primitive is gated to the RandomSampling contract', async () => {

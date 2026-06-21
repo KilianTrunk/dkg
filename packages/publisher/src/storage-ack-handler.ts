@@ -649,13 +649,19 @@ export class StorageACKHandler {
     // can see the content, so without this an under-claim (e.g. `byteSize = 1`
     // for real content) drives the cost toward zero regardless of the ask.
     // Refuse to sign when the claim is below the serialization-INDEPENDENT lower
-    // bound Σ(|s|+|p|+|o|): every valid N-Quads serialization is strictly longer
-    // than the bare term lengths (it adds `<>`, spaces, ` .`, newlines), so an
-    // honest publisher whose `publicByteSize == nquads.length` never trips this,
-    // while a grossly under-stated footprint is rejected before signing.
+    // bound Σ(UTF-8 byteLength(s,p,o)). `publicByteSize` is a UTF-8 BYTE count
+    // (the publisher computes `TextEncoder().encode(nquads).length`), so the
+    // floor MUST be UTF-8 bytes too — JS string `.length` (UTF-16 code units)
+    // would under-count non-ASCII IRIs/literals and let them slip through. Every
+    // valid N-Quads serialization is strictly longer than the bare term bytes (it
+    // adds `<>`, spaces, ` .`, newlines), so an honest publisher
+    // (`publicByteSize == utf8(nquads).length`) never trips this.
     let byteSizeFloor = 0;
     for (const q of swmQuads) {
-      byteSizeFloor += q.subject.length + q.predicate.length + q.object.length;
+      byteSizeFloor +=
+        Buffer.byteLength(q.subject, 'utf8') +
+        Buffer.byteLength(q.predicate, 'utf8') +
+        Buffer.byteLength(q.object, 'utf8');
     }
     const claimedPublicByteSize = typeof intent.publicByteSize === 'number'
       ? intent.publicByteSize
@@ -665,8 +671,8 @@ export class StorageACKHandler {
         cgId,
         STORAGE_ACK_DECLINE_CODES.BYTESIZE_UNDERCLAIM,
         `public ACK byteSize under-claim: publisher claims publicByteSize=${claimedPublicByteSize} ` +
-        `but the ${swmQuads.length} attested triples require at least ${byteSizeFloor} bytes ` +
-        `(Σ term lengths; the N-Quads serialization is strictly larger). Refusing to sign an under-priced footprint.`,
+        `but the ${swmQuads.length} attested triples require at least ${byteSizeFloor} UTF-8 bytes ` +
+        `(Σ term bytes; the N-Quads serialization is strictly larger). Refusing to sign an under-priced footprint.`,
       );
     }
     const verifiedByteSize = BigInt(claimedPublicByteSize);

@@ -251,9 +251,10 @@ function layerStatus(hist: Record<string, unknown>, layer: "wm" | "swm" | "vm"):
   );
 }
 
-function resolveFinalizeOptions(
+export function resolveFinalizeOptions(
   raw: Record<string, any>,
   res: RequestContext["res"],
+  tokenAgentAddress?: string,
 ): Record<string, unknown> | null {
   const {
     subGraphName,
@@ -300,9 +301,24 @@ function resolveFinalizeOptions(
     jsonResponse(res, 400, { error: '"schemeVersion" must be a positive integer when supplied' });
     return null;
   }
+  // Token attribution — parity with /api/shared-memory/publish (memory.ts).
+  // An agent-scoped bearer token attributes authorship to that agent when the
+  // body specified neither an explicit `authorAgentAddress` nor a pre-signed
+  // attestation. Callers pass `agent.resolveAgentByToken(requestToken)`, which
+  // returns `undefined` for node-level / admin tokens — so those do NOT
+  // auto-attribute, preserving the "publisher signs as itself" default.
+  // Without this, the create + finalize routes ignored the token and a custodial
+  // agent's publish was sealed under the node's own signer instead of the agent
+  // (the on-chain author came out as the node's operational wallet).
+  const effectiveAuthorAgentAddress =
+    typeof authorAgentAddress === "string"
+      ? authorAgentAddress
+      : resolvedPreSignedAttestation == null
+        ? tokenAgentAddress
+        : undefined;
   return {
     ...(subGraphName ? { subGraphName } : {}),
-    ...(typeof authorAgentAddress === "string" ? { authorAgentAddress } : {}),
+    ...(typeof effectiveAuthorAgentAddress === "string" ? { authorAgentAddress: effectiveAuthorAgentAddress } : {}),
     ...(resolvedPreSignedAttestation ? { preSignedAuthorAttestation: resolvedPreSignedAttestation } : {}),
     ...(schemeVersion != null ? { schemeVersion } : {}),
     ...(layer === "swm" ? { layer } : {}),
@@ -726,7 +742,11 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       });
     }
     const finalizeOptions = shouldFinalize
-      ? resolveFinalizeOptions({ subGraphName, authorAgentAddress, preSignedAuthorAttestation, schemeVersion }, res)
+      ? resolveFinalizeOptions(
+          { subGraphName, authorAgentAddress, preSignedAuthorAttestation, schemeVersion },
+          res,
+          writePreflightCallerAgentAddress,
+        )
       : {};
     if (finalizeOptions === null) return;
     const resolvedAuthorAgentAddress =
@@ -744,7 +764,16 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       } catch {
         /* treat a failed lookup as "does not exist yet" */
       }
-      const assertionUri = await agent.assertion.create(resolvedContextGraphId, name, { subGraphName });
+      // OT-RFC-43 §F2 — the kaId is stamped (in the author's namespace) at
+      // create. It MUST match the author the seal is later finalized under, or
+      // finalize throws KaIdNamespaceMismatch. So stamp under the same resolved
+      // author the finalize uses: the body author, else the token's agent (else
+      // undefined → the daemon's default agent for node/admin tokens).
+      const createAuthorAgentAddress = resolvedAuthorAgentAddress ?? writePreflightCallerAgentAddress;
+      const assertionUri = await agent.assertion.create(resolvedContextGraphId, name, {
+        subGraphName,
+        ...(createAuthorAgentAddress ? { agentAddress: createAuthorAgentAddress } : {}),
+      });
       const result: Record<string, unknown> = { name, assertionUri, alreadyExists, status: "draft-open" };
       emitMemoryGraphChanged?.({ contextGraphId: resolvedContextGraphId, layers: ["wm"], subGraphName, operation: "assertion_created", source: "api", counts: { triples: 0 } });
       recordActivityAndNotify(ctx, { contextGraphId: resolvedContextGraphId, kind: "created", actorAgentAddress: resolvedAuthorAgentAddress ?? requestAgentAddress, subGraphName });
@@ -980,14 +1009,19 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         // brand-new or discarded names get created; existing drafts stay append-only.
         const existing = await agent.assertion.history(contextGraphId, name, { subGraphName });
         if (!existing || existing.state === "discarded") {
-          await agent.assertion.create(contextGraphId, name, { subGraphName });
+          // Stamp the kaId under the request token's agent (OT-RFC-43 §F2) so a
+          // later finalize as that agent doesn't hit KaIdNamespaceMismatch.
+          await agent.assertion.create(contextGraphId, name, {
+            subGraphName,
+            ...(writePreflightCallerAgentAddress ? { agentAddress: writePreflightCallerAgentAddress } : {}),
+          });
         }
         await agent.assertion.write(contextGraphId, name, parsed.quads, { subGraphName });
         emitMemoryGraphChanged?.({ contextGraphId, layers: ["wm"], subGraphName, operation: "assertion_written", source: "api", counts: { triples: parsed.quads.length } });
         return jsonResponse(res, 200, { written: parsed.quads.length });
       }
       if (verb === "finalize") {
-        const finalizeOptions = resolveFinalizeOptions(parsed, res);
+        const finalizeOptions = resolveFinalizeOptions(parsed, res, writePreflightCallerAgentAddress);
         if (finalizeOptions === null) return;
         let seal;
         try {

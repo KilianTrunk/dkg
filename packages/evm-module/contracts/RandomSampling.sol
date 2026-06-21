@@ -58,15 +58,6 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
     ///         next one (see {_pickKa}).
     uint8 public constant MAX_KA_RETRIES = 10;
 
-    /// @notice Bound on the lazy self-heal sweep: on a CG miss the production
-    ///         draw probes up to this many random positions in the CG's KA list
-    ///         and swap-pops any EXPIRED entries (see {_pruneExpiredKas}). The
-    ///         append-only KA list otherwise has no removal, so a flood of cheap
-    ///         1-epoch KAs that later expire would be permanent dead slots that
-    ///         exhaust MAX_KA_RETRIES and make the CG's live KAs un-challengeable.
-    ///         Bounded so the extra work on a miss can never blow the gas budget.
-    uint8 public constant MAX_KA_PRUNE = 10;
-
     /// @notice RFC-39 Phase A.5 — bounded retries at the CG selection layer
     ///         when the picked CG has no challengeable KA (all legacy /
     ///         uncommitted curated KAs, or every retry hit an expired KA).
@@ -794,14 +785,6 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
                 revert NoEligibleKnowledgeAsset();
             }
             if (found) return (cg, ka, chunk);
-            // Self-heal: prune EXPIRED KAs from the missed (clogged) CG so a
-            // one-time flood of cheap 1-epoch KAs that later expire can never be
-            // a PERMANENT sampling DoS — the append-only list converges back to
-            // mostly-live over a few draws. Bounded + derived-seed, so it never
-            // changes the draw above (view/full parity holds — only the list
-            // shrinks for future challenges). The missed CG is excluded below,
-            // so pruning it cannot affect any later attempt in this same call.
-            _pruneExpiredKas(cg, keccak256(abi.encodePacked(cgSeed, "kaPrune")), currentEpoch);
             cgWeightTreeStorage.settle(cg); // settle-on-miss (persists only if this call commits)
             exhausted[exhaustedCount++] = cg;
             cgSeed = keccak256(abi.encodePacked(cgSeed, "cgRetry", cgAttempt));
@@ -809,25 +792,40 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
         revert NoEligibleKnowledgeAsset();
     }
 
-    /// @dev Lazy self-heal sweep for a missed CG: probe up to MAX_KA_PRUNE
-    ///      random positions in its KA list and swap-pop any EXPIRED entries —
-    ///      the removal the append-only `_contextGraphKAList` otherwise lacks.
-    ///      Probing on a MISS targets exactly the clogged CGs and cleans them
-    ///      proportionally to the dead-slot density, so a one-time flood of cheap
-    ///      1-epoch KAs that later expire can never be a PERMANENT sampling DoS.
-    ///      Bounded by MAX_KA_PRUNE; the derived seed keeps it independent of the
-    ///      actual draw (no view/full parity impact — the list only shrinks for
-    ///      FUTURE challenges). `swapRemoveKnowledgeAssetAt` is a no-op on a stale
-    ///      index, and the length is re-read each iteration as the list shrinks.
-    function _pruneExpiredKas(uint256 cg, bytes32 seed, uint256 currentEpoch) internal {
-        for (uint8 i = 0; i < MAX_KA_PRUNE; i++) {
-            uint256 len = contextGraphStorage.getContextGraphKaCount(cg);
-            if (len == 0) break;
-            seed = keccak256(abi.encodePacked(seed, i));
-            uint256 idx = uint256(seed) % len;
-            uint256 ka = contextGraphStorage.getContextGraphKaAt(cg, idx);
+    /// @notice Permissionless keeper: prune EXPIRED Knowledge Assets from a CG's
+    ///         sampling list. The per-CG list (`_contextGraphKAList`) is
+    ///         append-only with no removal, so expired KAs accumulate as permanent
+    ///         dead slots and can starve the bounded within-CG draw
+    ///         (`MAX_KA_RETRIES`). Scans up to `maxScan` positions and swap-pops
+    ///         every entry whose `endEpoch < currentEpoch`.
+    /// @dev Commits in its OWN transaction, independently of `createChallenge`
+    ///      (whose settle/prune work rolls back on an all-miss revert), so a
+    ///      clogged CG is always recoverable. Safe to be permissionless: it can
+    ///      ONLY remove already-expired (sampling-ineligible) KAs — never a live
+    ///      one — so there is no griefing vector; a caller merely spends its own
+    ///      gas cleaning dead slots. `swapRemoveKnowledgeAssetAt` preserves
+    ///      `kaToContextGraph`, so readers (`getKAContextGraphId`) and the
+    ///      double-registration guard stay intact. Gas is bounded by `maxScan`;
+    ///      a large flood is cleared across several calls.
+    /// @param cgId    context graph to clean.
+    /// @param maxScan max list positions to examine this call.
+    /// @return removed number of expired KAs swap-popped.
+    function pruneExpiredKnowledgeAssets(
+        uint256 cgId,
+        uint256 maxScan
+    ) external returns (uint256 removed) {
+        uint256 currentEpoch = chronos.getCurrentEpoch();
+        uint256 i;
+        for (uint256 scanned; scanned < maxScan; scanned++) {
+            uint256 len = contextGraphStorage.getContextGraphKaCount(cgId);
+            if (i >= len) break;
+            uint256 ka = contextGraphStorage.getContextGraphKaAt(cgId, i);
             if (knowledgeAssetStorage.getEndEpoch(ka) < currentEpoch) {
-                contextGraphStorage.swapRemoveKnowledgeAssetAt(cg, idx, ka);
+                // swap-pops the last element into i, so re-check i (do not advance).
+                contextGraphStorage.swapRemoveKnowledgeAssetAt(cgId, i, ka);
+                removed++;
+            } else {
+                i++;
             }
         }
     }

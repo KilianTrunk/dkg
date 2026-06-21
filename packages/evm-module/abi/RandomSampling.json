@@ -126,19 +126,6 @@
   },
   {
     "inputs": [],
-    "name": "MAX_KA_PRUNE",
-    "outputs": [
-      {
-        "internalType": "uint8",
-        "name": "",
-        "type": "uint8"
-      }
-    ],
-    "stateMutability": "view",
-    "type": "function"
-  },
-  {
-    "inputs": [],
     "name": "MAX_KA_RETRIES",
     "outputs": [
       {
@@ -467,6 +454,30 @@
       }
     ],
     "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "cgId",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "maxScan",
+        "type": "uint256"
+      }
+    ],
+    "name": "pruneExpiredKnowledgeAssets",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "removed",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
     "type": "function"
   },
   {

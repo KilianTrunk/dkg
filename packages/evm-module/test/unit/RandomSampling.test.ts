@@ -1151,6 +1151,76 @@ describe('@unit RandomSampling', () => {
     });
 
     // -----------------------------------------------------------------------
+    // Permissionless keeper — prune expired KAs from a CG's sampling list. This
+    // is the committed, non-reverting cleanup path: `createChallenge`'s in-draw
+    // settle work rolls back on an all-miss revert, so a CG clogged with expired
+    // entries needs this keeper (its own tx) to recover. Deterministic — no
+    // internal-seed/createChallenge dependency.
+    // -----------------------------------------------------------------------
+    describe('pruneExpiredKnowledgeAssets (keeper)', () => {
+      it('removes expired KAs, preserves live KAs + the kaToContextGraph binding', async () => {
+        const cgId = await createCG(OPEN_POLICY);
+        const currentEpoch = await Chronos.getCurrentEpoch();
+        const liveEnd = currentEpoch + 100n;
+        const expiredEnd = currentEpoch + 1n;
+
+        // Interleave live/expired: [live1, exp1, live2, exp2, exp3].
+        const live1 = await createKa(cgId, liveEnd);
+        const exp1 = await createKa(cgId, expiredEnd);
+        const live2 = await createKa(cgId, liveEnd);
+        const exp2 = await createKa(cgId, expiredEnd);
+        await createKa(cgId, expiredEnd);
+        expect(await ContextGraphStorage.getContextGraphKaCount(cgId)).to.equal(5n);
+
+        // Advance past the expired endEpoch (live KAs stay live).
+        const epochLength = await Chronos.epochLength();
+        await time.increase(Number(epochLength) * 5);
+        expect(await Chronos.getCurrentEpoch()).to.be.greaterThan(expiredEnd);
+
+        const removed = await RandomSampling.pruneExpiredKnowledgeAssets.staticCall(cgId, 100n);
+        expect(removed).to.equal(3n);
+        await RandomSampling.pruneExpiredKnowledgeAssets(cgId, 100n);
+
+        // Only the 2 live KAs remain.
+        expect(await ContextGraphStorage.getContextGraphKaCount(cgId)).to.equal(2n);
+        const remaining = new Set<bigint>([
+          await ContextGraphStorage.getContextGraphKaAt(cgId, 0),
+          await ContextGraphStorage.getContextGraphKaAt(cgId, 1),
+        ]);
+        expect(remaining.has(live1)).to.equal(true);
+        expect(remaining.has(live2)).to.equal(true);
+        expect(remaining.has(exp1)).to.equal(false);
+        // Reverse binding for a pruned (expired) KA survives — readers/dedup intact.
+        expect(await ContextGraphStorage.kaToContextGraph(exp2)).to.equal(cgId);
+      });
+
+      it('is bounded by maxScan and clears a large flood across calls', async () => {
+        const cgId = await createCG(OPEN_POLICY);
+        const expiredEnd = (await Chronos.getCurrentEpoch()) + 1n;
+        for (let i = 0; i < 8; i++) await createKa(cgId, expiredEnd);
+        const epochLength = await Chronos.epochLength();
+        await time.increase(Number(epochLength) * 5);
+
+        // maxScan=3 → at most 3 removed this call.
+        expect(await RandomSampling.pruneExpiredKnowledgeAssets.staticCall(cgId, 3n)).to.equal(3n);
+        await RandomSampling.pruneExpiredKnowledgeAssets(cgId, 3n);
+        expect(await ContextGraphStorage.getContextGraphKaCount(cgId)).to.equal(5n);
+        // Follow-up clears the rest.
+        await RandomSampling.pruneExpiredKnowledgeAssets(cgId, 100n);
+        expect(await ContextGraphStorage.getContextGraphKaCount(cgId)).to.equal(0n);
+      });
+
+      it('the swap-pop primitive is gated to the RandomSampling contract', async () => {
+        const cgId = await createCG(OPEN_POLICY);
+        const ka = await createKa(cgId, (await Chronos.getCurrentEpoch()) + 5n);
+        // opSigner is a Hub-registered sentinel but NOT the RandomSampling contract.
+        await expect(
+          ContextGraphStorage.connect(opSigner).swapRemoveKnowledgeAssetAt(cgId, 0, ka),
+        ).to.be.revertedWithCustomError(ContextGraphStorage, 'OnlyRandomSampling');
+      });
+    });
+
+    // -----------------------------------------------------------------------
     // Test 5 — Distribution regression: 3 public CGs weighted 70/20/10 should
     // be picked at those ratios over many draws. Using the read-only preview
     // helper with per-draw seeds makes this both deterministic and fast.

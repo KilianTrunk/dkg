@@ -45,7 +45,15 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
     //          getContextGraphKaCount/At/List (ABI selector change; no behavior change).
     // 10.0.4 — OT-RFC-53: per-CG registration-escrow accounting (get/set/decrease/
     //          clear) consumed by the deposit pull + admin sweep. ABI surface addition.
-    string private constant _VERSION = "10.0.4";
+    // 10.0.6 — Decoupled sampling list: a SECOND per-CG array (`_samplingKAList`)
+    //          drives random sampling and is the one the keeper compacts, while
+    //          `_contextGraphKAList` stays strictly append-only as the
+    //          registration-ordinal source the off-chain chain-reconciler reads
+    //          (`getContextGraphKaCount/At`). Pruning expired KAs from sampling no
+    //          longer mutates that ordinal, so the reconciler's [watermark, head)
+    //          cursor can never skip a later publish. Adds getSamplingKaCount/At;
+    //          swapRemoveSamplingKnowledgeAssetAt now targets the sampling list.
+    string private constant _VERSION = "10.0.6";
 
     // -----------------------------------------------------------------------
     // Bounds on participant list — anti-griefing cap.
@@ -98,8 +106,30 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
     // Public for convenience; zero means "not registered".
     mapping(uint256 kaId => uint256 contextGraphId) public kaToContextGraph;
 
-    // CG -> [KA IDs] forward list for uniform random KA selection within a CG.
+    // CG -> [KA IDs] APPEND-ONLY registration list. This is the per-CG
+    // registration-ordinal source the off-chain chain-reconciler walks as
+    // `[watermark, head)` (head = getContextGraphKaCount) — so it MUST stay
+    // append-only: never reorder, never shrink. Sampling pruning happens on
+    // `_samplingKAList` below, never here.
     mapping(uint256 contextGraphId => uint256[]) private _contextGraphKAList;
+
+    // CG -> [live KA IDs] COMPACTED list that drives within-CG random sampling.
+    // Written alongside `_contextGraphKAList` on registration, but the keeper
+    // (`RandomSampling.pruneExpiredKnowledgeAssets` → `swapRemoveSamplingKnowledgeAssetAt`)
+    // swap-pops EXPIRED KAs out of THIS list only. Decoupling the sampling
+    // enumeration from the append-only registration ordinal lets the draw shed
+    // dead slots without corrupting the reconciler cursor. Read via
+    // getSamplingKaCount/At; the two lists diverge over time by design.
+    //
+    // POPULATION INVARIANT: `registerKnowledgeAssetToContextGraph` is the SOLE
+    // writer of both arrays and always appends to them together — there is no
+    // setter or migration that writes `_contextGraphKAList` alone. So a CG can
+    // never hold registrations in the append-only list without the matching
+    // sampling entries (the "pre-existing KAs invisible to sampling" state is
+    // unreachable). This is a fresh-design, non-proxy contract deployed empty for
+    // V10 (both lists populate from genesis); should a future deployment ever
+    // need to preserve CG state, the migration MUST seed both arrays together.
+    mapping(uint256 contextGraphId => uint256[]) private _samplingKAList;
 
     // OT-RFC-53 — per-CG registration-deposit escrow (anti-spam). Accounting
     // only: the TRAC itself is custodied in the CSS vault (mirrors
@@ -305,8 +335,11 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
 
     /**
      * @notice Bind a Knowledge Asset to a Context Graph.
-     * @dev Records both the reverse lookup (`kaToContextGraph[kaId] = cgId`)
-     *      and the forward list (`_contextGraphKAList[cgId].push(kaId)`).
+     * @dev Records the reverse lookup (`kaToContextGraph[kaId] = cgId`) and
+     *      appends to BOTH per-CG lists: `_contextGraphKAList` (the append-only
+     *      registration ordinal the reconciler reads) and `_samplingKAList` (the
+     *      compactable sampling enumeration). They start identical; the keeper
+     *      later prunes expired entries from the sampling list only.
      *      Reverts on double registration.
      */
     function registerKnowledgeAssetToContextGraph(
@@ -325,7 +358,56 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
         }
         kaToContextGraph[kaId] = contextGraphId;
         _contextGraphKAList[contextGraphId].push(kaId);
+        _samplingKAList[contextGraphId].push(kaId);
         emit KnowledgeAssetRegisteredToContextGraph(contextGraphId, kaId);
+    }
+
+    event KnowledgeAssetPrunedFromSamplingList(uint256 indexed contextGraphId, uint256 indexed kaId);
+
+    /// @dev The generic swap-pop below can desync the sampling list from
+    ///      `kaToContextGraph`, so it is restricted to the RandomSampling
+    ///      contract (the sole component that prunes the list, and only for
+    ///      EXPIRED KAs — it checks `endEpoch` before calling). This is stricter
+    ///      than `onlyContracts`: it stops a future/buggy Hub contract from
+    ///      removing a LIVE KA from sampling while it still reports as registered.
+    error OnlyRandomSampling(address caller);
+
+    /**
+     * @notice Remove a Knowledge Asset from a Context Graph's SAMPLING list by
+     *         swap-and-pop.
+     * @dev Called only by `RandomSampling.pruneExpiredKnowledgeAssets` (the
+     *      permissionless keeper) to prune EXPIRED KAs, so the sampling
+     *      enumeration cannot accumulate dead slots into a within-CG sampling DoS.
+     *      Removes ONLY from `_samplingKAList` — the append-only
+     *      `_contextGraphKAList` (the reconciler's registration ordinal) is NOT
+     *      touched, so a later publish can never be skipped by the reconciler's
+     *      cursor. The `kaToContextGraph[kaId]` reverse binding is also left
+     *      intact: readers (`getKAContextGraphId`) must still resolve the KA, and
+     *      an expired KA can never be re-registered (it cannot be re-published
+     *      with the same id), so the double-registration guard stays correct.
+     *      `expectedKaId` makes the call a no-op when the slot no longer holds it
+     *      (a prior swap-pop moved a different KA into `index`) — robust to stale
+     *      indices.
+     */
+    function swapRemoveSamplingKnowledgeAssetAt(
+        uint256 contextGraphId,
+        uint256 index,
+        uint256 expectedKaId
+    ) external {
+        if (msg.sender != hub.getContractAddress("RandomSampling")) {
+            revert OnlyRandomSampling(msg.sender);
+        }
+        uint256[] storage list = _samplingKAList[contextGraphId];
+        uint256 len = list.length;
+        if (index >= len || list[index] != expectedKaId) {
+            return; // stale / already moved — skip; pruned on a later draw
+        }
+        uint256 last = len - 1;
+        if (index != last) {
+            list[index] = list[last];
+        }
+        list.pop();
+        emit KnowledgeAssetPrunedFromSamplingList(contextGraphId, expectedKaId);
     }
 
     /**
@@ -363,6 +445,35 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
         uint256[] storage list = _contextGraphKAList[contextGraphId];
         if (index >= list.length) {
             revert KnowledgeAssetsLib.InvalidContextGraphConfig("kaIndex oob");
+        }
+        return list[index];
+    }
+
+    /**
+     * @notice Length of the COMPACTED sampling list (live + not-yet-pruned KAs).
+     * @dev This is the count the within-CG random-sampling draw bounds against
+     *      (`RandomSampling._pickKa`) and the keeper scans. It shrinks as the
+     *      keeper prunes expired KAs — unlike `getContextGraphKaCount`, which is
+     *      the monotonic append-only registration count.
+     */
+    function getSamplingKaCount(
+        uint256 contextGraphId
+    ) external view returns (uint256) {
+        return _samplingKAList[contextGraphId].length;
+    }
+
+    /**
+     * @notice Single KA id at an index within a CG's compacted sampling list.
+     * @dev O(1) accessor for the within-CG draw + the keeper. Reverts
+     *      `InvalidContextGraphConfig("samplingIndex oob")` out of bounds.
+     */
+    function getSamplingKaAt(
+        uint256 contextGraphId,
+        uint256 index
+    ) external view returns (uint256 kaId) {
+        uint256[] storage list = _samplingKAList[contextGraphId];
+        if (index >= list.length) {
+            revert KnowledgeAssetsLib.InvalidContextGraphConfig("samplingIndex oob");
         }
         return list[index];
     }

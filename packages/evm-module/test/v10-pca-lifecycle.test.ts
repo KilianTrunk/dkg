@@ -720,6 +720,52 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     ).to.be.revertedWithCustomError(KAV10, 'ZeroEpochs');
   });
 
+  it('extend reverts KnowledgeAssetExpired on an already-expired KA (keeps sampling-prune safe)', async () => {
+    // Safety invariant for RandomSampling's decoupled sampling list: the keeper
+    // prunes a KA once `endEpoch < currentEpoch`, and a pruned KA can never
+    // re-enter the sampling list (the double-registration guard blocks it). If
+    // extend could revive an EXPIRED KA, that KA would be live + paid yet
+    // permanently unsampleable. extend's expiry guard uses the SAME threshold
+    // (`currentEpoch > endEpoch`), so the two are mutually exclusive and the
+    // revive-into-unsampleable path is unreachable. This test pins that guard.
+    const Params = await hre.ethers.getContract<ParametersStorage>('ParametersStorage');
+    const deposit = ethers.parseEther('2000');
+    await Params.connect(accounts[0]).setContextGraphRegistrationDeposit(deposit);
+    const creator = getDefaultKACreator(accounts);
+    await Token.mint(creator.address, deposit);
+    await Token.connect(creator).approve(await CGFacade.getAddress(), deposit);
+
+    const { cgId, epochs, receivingNodes, publisherIdentityId, receiverIdentityIds } =
+      await setupRegisteredAgentPublish();
+    const reservedKaId = packReservedKaId(creator.address, 1);
+    const p = await buildPublishParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes,
+      publisherIdentityId,
+      receiverIdentityIds,
+      author: creator,
+      contextGraphId: cgId,
+      merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('extend-expired')),
+      knowledgeAssetsAmount: 1,
+      byteSize: 1000,
+      epochs,
+      tokenAmount: ethers.parseEther('1000'),
+      isImmutable: false,
+      publishOperationId: 'extend-expired-pub',
+      reservedKaId,
+    });
+    await KAV10.connect(creator).publish(p);
+
+    // Advance past the KA's lifetime so it is expired (and prune-eligible).
+    const epochLength = await Chronos.epochLength();
+    await time.increase(Number(epochLength) * (Number(epochs) + 1));
+
+    await expect(
+      KAV10.connect(creator).extendKnowledgeAssetLifetime(reservedKaId, 1, ethers.parseEther('100')),
+    ).to.be.revertedWithCustomError(KAV10, 'KnowledgeAssetExpired');
+  });
+
   // --------------------------------------------------------------------------
   // OT-RFC-53 — update draws the registration escrow for the delta + pays its fee
   // --------------------------------------------------------------------------

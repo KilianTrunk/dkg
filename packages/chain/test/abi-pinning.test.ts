@@ -189,7 +189,17 @@ const PINNED_DIGESTS: Record<string, string> = {
   // rename (getContextGraphKCCount/At/List → getContextGraphKaCount/At/List).
   // Digests recomputed post-merge from the combined ABI.
   ContextGraphs:                '54583e20167c37f4356247cb6bc657b0dccf6f17f99a3267427674a35a151bcf',
-  ContextGraphStorage:          '29f1746bf6d82dfea40eb0365c9a664994c56b63c4a98d99962cd9b61c1df37a',
+  // Repinned: decoupled sampling list (10.0.6). Adds getSamplingKaCount/At
+  // (the compacted per-CG list the within-CG draw + keeper use) alongside the
+  // RandomSampling-gated `swapRemoveSamplingKnowledgeAssetAt` pruning primitive
+  // (targets that sampling list) + its `KnowledgeAssetPrunedFromSamplingList`
+  // event and `OnlyRandomSampling` error. `_contextGraphKAList` stays append-only
+  // as the reconciler's registration ordinal; `kaToContextGraph` is left intact.
+  ContextGraphStorage:          '7d106670764438acd8d54875b77a279b3fb73484933e3bc76124730a008a0c96',
+  // RandomSampling — resolved by the chain adapter (challenge creation + runtime
+  // error decoding), so its ABI surface is pinned too. Carries the permissionless
+  // keeper `pruneExpiredKnowledgeAssets` added in #1268.
+  RandomSampling:               '22b0f5b837e03f061826026abbd09a747acdc2c269b32eb43d354ae06c719b43',
   // Identity / staking — consulted on every publish.
   Hub:                          '36976cc71bb87963b8b715791b32e4eb6b7bb85c712998afd6184221289a506b',
   Identity:                     'ca39efe9bd9ec4fd8ae67dccdf9eb888bf91232341c3a56216624477620ff4d8',

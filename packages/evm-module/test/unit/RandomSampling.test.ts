@@ -265,7 +265,7 @@ describe('@unit RandomSampling', () => {
 
   describe('version()', () => {
     it('Should return correct version', async () => {
-      expect(await RandomSampling.version()).to.equal('10.4.0');
+      expect(await RandomSampling.version()).to.equal('10.6.0');
     });
   });
 
@@ -1151,6 +1151,169 @@ describe('@unit RandomSampling', () => {
     });
 
     // -----------------------------------------------------------------------
+    // Permissionless keeper — prune expired KAs from a CG's sampling list. This
+    // is the committed, non-reverting cleanup path: `createChallenge`'s in-draw
+    // settle work rolls back on an all-miss revert, so a CG clogged with expired
+    // entries needs this keeper (its own tx) to recover. Deterministic — no
+    // internal-seed/createChallenge dependency.
+    // -----------------------------------------------------------------------
+    describe('pruneExpiredKnowledgeAssets (keeper)', () => {
+      it('removes expired KAs, preserves live KAs + the kaToContextGraph binding', async () => {
+        const cgId = await createCG(OPEN_POLICY);
+        const currentEpoch = await Chronos.getCurrentEpoch();
+        const liveEnd = currentEpoch + 100n;
+        const expiredEnd = currentEpoch + 1n;
+
+        // Interleave live/expired: [live1, exp1, live2, exp2, exp3].
+        const live1 = await createKa(cgId, liveEnd);
+        const exp1 = await createKa(cgId, expiredEnd);
+        const live2 = await createKa(cgId, liveEnd);
+        const exp2 = await createKa(cgId, expiredEnd);
+        await createKa(cgId, expiredEnd);
+        expect(await ContextGraphStorage.getContextGraphKaCount(cgId)).to.equal(5n);
+
+        // Advance past the expired endEpoch (live KAs stay live).
+        const epochLength = await Chronos.epochLength();
+        await time.increase(Number(epochLength) * 5);
+        expect(await Chronos.getCurrentEpoch()).to.be.greaterThan(expiredEnd);
+
+        const removed = await RandomSampling.pruneExpiredKnowledgeAssets.staticCall(cgId, 0n, 100n);
+        expect(removed).to.equal(3n);
+        await RandomSampling.pruneExpiredKnowledgeAssets(cgId, 0n, 100n);
+
+        // Only the 2 live KAs remain IN THE SAMPLING LIST.
+        expect(await ContextGraphStorage.getSamplingKaCount(cgId)).to.equal(2n);
+        const remaining = new Set<bigint>([
+          await ContextGraphStorage.getSamplingKaAt(cgId, 0),
+          await ContextGraphStorage.getSamplingKaAt(cgId, 1),
+        ]);
+        expect(remaining.has(live1)).to.equal(true);
+        expect(remaining.has(live2)).to.equal(true);
+        expect(remaining.has(exp1)).to.equal(false);
+        // Reverse binding for a pruned (expired) KA survives — readers/dedup intact.
+        expect(await ContextGraphStorage.kaToContextGraph(exp2)).to.equal(cgId);
+        // Reconciler-safety invariant: the append-only registration list is NOT
+        // mutated by sampling pruning — its count stays at all 5 registered.
+        expect(await ContextGraphStorage.getContextGraphKaCount(cgId)).to.equal(5n);
+      });
+
+      it('is bounded by maxScan and clears a large flood across calls', async () => {
+        const cgId = await createCG(OPEN_POLICY);
+        const expiredEnd = (await Chronos.getCurrentEpoch()) + 1n;
+        for (let i = 0; i < 8; i++) await createKa(cgId, expiredEnd);
+        const epochLength = await Chronos.epochLength();
+        await time.increase(Number(epochLength) * 5);
+
+        // maxScan=3 → at most 3 removed this call.
+        expect(await RandomSampling.pruneExpiredKnowledgeAssets.staticCall(cgId, 0n, 3n)).to.equal(3n);
+        await RandomSampling.pruneExpiredKnowledgeAssets(cgId, 0n, 3n);
+        expect(await ContextGraphStorage.getSamplingKaCount(cgId)).to.equal(5n);
+        // Follow-up clears the rest of the SAMPLING list.
+        await RandomSampling.pruneExpiredKnowledgeAssets(cgId, 0n, 100n);
+        expect(await ContextGraphStorage.getSamplingKaCount(cgId)).to.equal(0n);
+        // The append-only registration list still holds all 8.
+        expect(await ContextGraphStorage.getContextGraphKaCount(cgId)).to.equal(8n);
+      });
+
+      it('startIndex reaches the expired tail past a live prefix (live-prefix recoverability)', async () => {
+        const cgId = await createCG(OPEN_POLICY);
+        const currentEpoch = await Chronos.getCurrentEpoch();
+        const liveEnd = currentEpoch + 100n;
+        const expiredEnd = currentEpoch + 1n;
+        for (let i = 0; i < 4; i++) await createKa(cgId, liveEnd); // live prefix
+        for (let i = 0; i < 3; i++) await createKa(cgId, expiredEnd); // expired tail
+        const epochLength = await Chronos.epochLength();
+        await time.increase(Number(epochLength) * 5);
+
+        // A from-0 scan with maxScan below the 4-live prefix removes nothing...
+        await RandomSampling.pruneExpiredKnowledgeAssets(cgId, 0n, 3n);
+        expect(await ContextGraphStorage.getSamplingKaCount(cgId)).to.equal(7n);
+        // ...but starting at the tail clears the expired entries.
+        expect(await RandomSampling.pruneExpiredKnowledgeAssets.staticCall(cgId, 4n, 10n)).to.equal(3n);
+        await RandomSampling.pruneExpiredKnowledgeAssets(cgId, 4n, 10n);
+        expect(await ContextGraphStorage.getSamplingKaCount(cgId)).to.equal(4n);
+      });
+
+      it('recovery path: a clogged CG starves previewChallengeForSeed before pruning, succeeds after', async () => {
+        // The bug this keeper fixes: a bounded within-CG draw starved by expired
+        // dead slots. Prove the actual draw path — not just list mutation.
+        const cgId = await createCG(OPEN_POLICY);
+        const currentEpoch = await Chronos.getCurrentEpoch();
+        const liveKa = await createKa(cgId, currentEpoch + 100n);
+        for (let i = 0; i < 20; i++) await createKa(cgId, currentEpoch + 1n); // expired flood
+        await seedCGValue(cgId, 10_000n, 20n); // keep the single CG weighted across the advance
+        const epochLength = await Chronos.epochLength();
+        await time.increase(Number(epochLength) * 5); // expire the 20 fillers
+
+        // Find a seed whose draw starves on the expired slots (reverts). With
+        // 1 live / 20 expired, P(starve) per seed ≈ (20/21)^10 ≈ 0.61, so a
+        // reverting seed within 50 is a near-certainty (P(miss) ≈ 1e-21).
+        let cloggedSeed: number | undefined;
+        for (let i = 0; i < 50; i++) {
+          try {
+            await RandomSampling.previewChallengeForSeed(testSeed(i));
+          } catch {
+            cloggedSeed = i;
+            break;
+          }
+        }
+        expect(cloggedSeed, 'expected a seed that starves on the expired flood').to.not.equal(undefined);
+        // BEFORE: that seed reverts — the draw is clogged.
+        await expect(
+          RandomSampling.previewChallengeForSeed(testSeed(cloggedSeed!)),
+        ).to.be.revertedWithCustomError(RandomSampling, 'NoEligibleKnowledgeAsset');
+
+        // Prune the expired KAs via the keeper (its own committed tx).
+        await RandomSampling.pruneExpiredKnowledgeAssets(cgId, 0n, 100n);
+        expect(await ContextGraphStorage.getSamplingKaCount(cgId)).to.equal(1n);
+
+        // AFTER: the SAME seed now resolves to the live KA — the draw recovered.
+        const after = await RandomSampling.previewChallengeForSeed(testSeed(cloggedSeed!));
+        expect(after.cgId).to.equal(cgId);
+        expect(after.kaId).to.equal(liveKa);
+      });
+
+      it('reconciler-safety: pruning never rewinds the append-only ordinal, so a later publish is always appended (round-4 regression)', async () => {
+        // The exact failure mode the decoupled sampling list prevents: pruning
+        // must NOT shrink the registration list, or the off-chain reconciler's
+        // [watermark, head) cursor could skip a later publish forever.
+        const cgId = await createCG(OPEN_POLICY);
+        const currentEpoch = await Chronos.getCurrentEpoch();
+        await createKa(cgId, currentEpoch + 1n);
+        await createKa(cgId, currentEpoch + 1n);
+        await createKa(cgId, currentEpoch + 1n);
+        const headBeforePrune = await ContextGraphStorage.getContextGraphKaCount(cgId);
+        expect(headBeforePrune).to.equal(3n);
+
+        const epochLength = await Chronos.epochLength();
+        await time.increase(Number(epochLength) * 5);
+        await RandomSampling.pruneExpiredKnowledgeAssets(cgId, 0n, 100n);
+
+        // Sampling list emptied, but the registration head is UNCHANGED — the
+        // reconciler cursor is not rewound.
+        expect(await ContextGraphStorage.getSamplingKaCount(cgId)).to.equal(0n);
+        expect(await ContextGraphStorage.getContextGraphKaCount(cgId)).to.equal(headBeforePrune);
+
+        // A later publish appends at the NEXT ordinal (head grows monotonically),
+        // so the reconciler can never skip it — and it is sampling-eligible.
+        const laterKa = await createKa(cgId, currentEpoch + 100n);
+        expect(await ContextGraphStorage.getContextGraphKaCount(cgId)).to.equal(headBeforePrune + 1n);
+        expect(await ContextGraphStorage.getContextGraphKaAt(cgId, headBeforePrune)).to.equal(laterKa);
+        expect(await ContextGraphStorage.getSamplingKaCount(cgId)).to.equal(1n);
+        expect(await ContextGraphStorage.getSamplingKaAt(cgId, 0n)).to.equal(laterKa);
+      });
+
+      it('the swap-pop primitive is gated to the RandomSampling contract', async () => {
+        const cgId = await createCG(OPEN_POLICY);
+        const ka = await createKa(cgId, (await Chronos.getCurrentEpoch()) + 5n);
+        // opSigner is a Hub-registered sentinel but NOT the RandomSampling contract.
+        await expect(
+          ContextGraphStorage.connect(opSigner).swapRemoveSamplingKnowledgeAssetAt(cgId, 0, ka),
+        ).to.be.revertedWithCustomError(ContextGraphStorage, 'OnlyRandomSampling');
+      });
+    });
+
+    // -----------------------------------------------------------------------
     // Test 5 — Distribution regression: 3 public CGs weighted 70/20/10 should
     // be picked at those ratios over many draws. Using the read-only preview
     // helper with per-draw seeds makes this both deterministic and fast.
@@ -1354,10 +1517,11 @@ describe('@unit RandomSampling', () => {
           cg,
           currentEpoch,
         );
-        const n = Number(await ContextGraphStorage.getContextGraphKaCount(cg));
+        // The draw reads the SAMPLING list, so the oracle must mirror it.
+        const n = Number(await ContextGraphStorage.getSamplingKaCount(cg));
         const list: bigint[] = [];
         for (let i = 0; i < n; i++) {
-          list.push(await ContextGraphStorage.getContextGraphKaAt(cg, BigInt(i)));
+          list.push(await ContextGraphStorage.getSamplingKaAt(cg, BigInt(i)));
         }
         kaList[cg.toString()] = list;
       }

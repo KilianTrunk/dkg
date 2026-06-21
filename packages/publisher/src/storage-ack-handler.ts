@@ -641,9 +641,62 @@ export class StorageACKHandler {
     // The data integrity that recompute was protecting is already guaranteed
     // by the merkle-root check above (computeFlatKCRoot over the SWM quads).
     const verifiedKACount = 1;
-    const verifiedByteSize = typeof intent.publicByteSize === 'number'
-      ? BigInt(intent.publicByteSize)
-      : BigInt(Number(intent.publicByteSize));
+
+    // byteSize pin: `publicByteSize` is signed into the ACK digest and prices the
+    // publish on-chain (`ask · byteSize · epochs`); nothing on-chain can see the
+    // content, so without this an under-claim (e.g. `byteSize = 1` for real
+    // content) drives the cost toward zero regardless of the ask. The publisher
+    // computes it as the UTF-8 byte length of the N-Quads serialization
+    // (`TextEncoder().encode(nquads).length`), so the floor is in UTF-8 bytes:
+    //   - INLINE path (`stagingQuads` present): the core received the EXACT
+    //     serialized payload, so require the claim to cover its full byte length
+    //     — anything less omits real serialized bytes (`<>`, separators, graph
+    //     terms, escapes, newlines) the cores must store. This is the tight,
+    //     exact floor (an honest direct publish sets `publicByteSize ==
+    //     stagingQuads.length`; both derive from the same `nquadsStr`).
+    //   - SWM-fallback path: the original serialization isn't reconstructable
+    //     byte-exactly, so fall back to the serialization-INDEPENDENT lower bound
+    //     Σ(UTF-8 byteLength(s,p,o)) (always ≤ the real serialization, so no
+    //     false positives; JS string `.length` would under-count non-ASCII).
+    // `publicByteSize` is a protobuf `uint64` (number | Long on the wire). Parse
+    // it to `bigint` ONCE and keep the floor, the compare, AND the signed ACK
+    // digest value in `bigint` across the full uint64 range — a `Number()` round
+    // would corrupt a value above 2^53 before it is priced/signed.
+    let byteSizeFloor: bigint;
+    let floorBasis: string;
+    if (intent.stagingQuads && intent.stagingQuads.length > 0) {
+      byteSizeFloor = BigInt(intent.stagingQuads.length);
+      floorBasis = 'exact inline payload bytes';
+    } else {
+      byteSizeFloor = 0n;
+      for (const q of swmQuads) {
+        byteSizeFloor +=
+          BigInt(Buffer.byteLength(q.subject, 'utf8')) +
+          BigInt(Buffer.byteLength(q.predicate, 'utf8')) +
+          BigInt(Buffer.byteLength(q.object, 'utf8'));
+      }
+      floorBasis = 'Σ UTF-8 term bytes (lower bound)';
+    }
+    let claimedPublicByteSize: bigint;
+    try {
+      claimedPublicByteSize = BigInt(
+        typeof intent.publicByteSize === 'number'
+          ? intent.publicByteSize
+          : intent.publicByteSize.toString(),
+      );
+    } catch {
+      claimedPublicByteSize = -1n; // non-integer / unparseable → fails the wire-validity gate
+    }
+    if (claimedPublicByteSize < 0n || claimedPublicByteSize < byteSizeFloor) {
+      return this.encodeDecline(
+        cgId,
+        STORAGE_ACK_DECLINE_CODES.BYTESIZE_UNDERCLAIM,
+        `public ACK byteSize under-claim: publisher claims publicByteSize=${claimedPublicByteSize} ` +
+        `but the attested content requires at least ${byteSizeFloor} UTF-8 bytes ` +
+        `(${floorBasis}). Refusing to sign an under-priced footprint.`,
+      );
+    }
+    const verifiedByteSize = claimedPublicByteSize;
 
     // Derive numeric CG ID the same way the publisher does. Fail loud on
     // non-numeric or non-positive ids — the V10 contract rejects

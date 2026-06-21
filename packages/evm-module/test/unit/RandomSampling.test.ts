@@ -1308,7 +1308,7 @@ describe('@unit RandomSampling', () => {
         const ka = await createKa(cgId, (await Chronos.getCurrentEpoch()) + 5n);
         // opSigner is a Hub-registered sentinel but NOT the RandomSampling contract.
         await expect(
-          ContextGraphStorage.connect(opSigner).swapRemoveKnowledgeAssetAt(cgId, 0, ka),
+          ContextGraphStorage.connect(opSigner).swapRemoveSamplingKnowledgeAssetAt(cgId, 0, ka),
         ).to.be.revertedWithCustomError(ContextGraphStorage, 'OnlyRandomSampling');
       });
     });

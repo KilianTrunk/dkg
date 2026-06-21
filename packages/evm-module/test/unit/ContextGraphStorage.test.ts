@@ -369,7 +369,7 @@ describe('@unit ContextGraphStorage', () => {
     });
   });
 
-  // swapRemoveKnowledgeAssetAt is gated to the RandomSampling contract and is
+  // swapRemoveSamplingKnowledgeAssetAt is gated to the RandomSampling contract and is
   // exercised end-to-end (swap-pop mechanics, dedup/binding preservation, the
   // RandomSampling-only gate) via the RandomSampling keeper test
   // `pruneExpiredKnowledgeAssets`, where the RandomSampling contract is deployed.

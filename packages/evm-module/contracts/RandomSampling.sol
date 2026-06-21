@@ -813,7 +813,7 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
     ///      clogged CG is always recoverable. Safe to be permissionless: it can
     ///      ONLY remove already-expired (sampling-ineligible) KAs — never a live
     ///      one — so there is no griefing vector; a caller merely spends its own
-    ///      gas cleaning dead slots. `swapRemoveKnowledgeAssetAt` preserves
+    ///      gas cleaning dead slots. `swapRemoveSamplingKnowledgeAssetAt` preserves
     ///      `kaToContextGraph`, so readers (`getKAContextGraphId`) and the
     ///      double-registration guard stay intact. Gas is bounded by `maxScan`;
     ///      a large flood is cleared across several calls. `startIndex` lets a
@@ -838,7 +838,7 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
             uint256 ka = contextGraphStorage.getSamplingKaAt(cgId, i);
             if (knowledgeAssetStorage.getEndEpoch(ka) < currentEpoch) {
                 // swap-pops the last element into i, so re-check i (do not advance).
-                contextGraphStorage.swapRemoveKnowledgeAssetAt(cgId, i, ka);
+                contextGraphStorage.swapRemoveSamplingKnowledgeAssetAt(cgId, i, ka);
                 removed++;
             } else {
                 i++;

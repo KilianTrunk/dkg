@@ -52,7 +52,7 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
     //          (`getContextGraphKaCount/At`). Pruning expired KAs from sampling no
     //          longer mutates that ordinal, so the reconciler's [watermark, head)
     //          cursor can never skip a later publish. Adds getSamplingKaCount/At;
-    //          swapRemoveKnowledgeAssetAt now targets the sampling list.
+    //          swapRemoveSamplingKnowledgeAssetAt now targets the sampling list.
     string private constant _VERSION = "10.0.6";
 
     // -----------------------------------------------------------------------
@@ -115,11 +115,20 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
 
     // CG -> [live KA IDs] COMPACTED list that drives within-CG random sampling.
     // Written alongside `_contextGraphKAList` on registration, but the keeper
-    // (`RandomSampling.pruneExpiredKnowledgeAssets` → `swapRemoveKnowledgeAssetAt`)
+    // (`RandomSampling.pruneExpiredKnowledgeAssets` → `swapRemoveSamplingKnowledgeAssetAt`)
     // swap-pops EXPIRED KAs out of THIS list only. Decoupling the sampling
     // enumeration from the append-only registration ordinal lets the draw shed
     // dead slots without corrupting the reconciler cursor. Read via
     // getSamplingKaCount/At; the two lists diverge over time by design.
+    //
+    // POPULATION INVARIANT: `registerKnowledgeAssetToContextGraph` is the SOLE
+    // writer of both arrays and always appends to them together — there is no
+    // setter or migration that writes `_contextGraphKAList` alone. So a CG can
+    // never hold registrations in the append-only list without the matching
+    // sampling entries (the "pre-existing KAs invisible to sampling" state is
+    // unreachable). This is a fresh-design, non-proxy contract deployed empty for
+    // V10 (both lists populate from genesis); should a future deployment ever
+    // need to preserve CG state, the migration MUST seed both arrays together.
     mapping(uint256 contextGraphId => uint256[]) private _samplingKAList;
 
     // OT-RFC-53 — per-CG registration-deposit escrow (anti-spam). Accounting
@@ -353,7 +362,7 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
         emit KnowledgeAssetRegisteredToContextGraph(contextGraphId, kaId);
     }
 
-    event KnowledgeAssetUnlistedFromContextGraph(uint256 indexed contextGraphId, uint256 indexed kaId);
+    event KnowledgeAssetPrunedFromSamplingList(uint256 indexed contextGraphId, uint256 indexed kaId);
 
     /// @dev The generic swap-pop below can desync the sampling list from
     ///      `kaToContextGraph`, so it is restricted to the RandomSampling
@@ -380,7 +389,7 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
      *      (a prior swap-pop moved a different KA into `index`) — robust to stale
      *      indices.
      */
-    function swapRemoveKnowledgeAssetAt(
+    function swapRemoveSamplingKnowledgeAssetAt(
         uint256 contextGraphId,
         uint256 index,
         uint256 expectedKaId
@@ -398,7 +407,7 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
             list[index] = list[last];
         }
         list.pop();
-        emit KnowledgeAssetUnlistedFromContextGraph(contextGraphId, expectedKaId);
+        emit KnowledgeAssetPrunedFromSamplingList(contextGraphId, expectedKaId);
     }
 
     /**

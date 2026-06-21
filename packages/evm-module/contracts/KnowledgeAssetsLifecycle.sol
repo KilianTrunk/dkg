@@ -162,7 +162,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     //          CannotWriteValueToInactiveContextGraph on a deactivated CG, so a
     //          swept CG can no longer be re-stranded with sampling weight. PATCH
     //          bump — no ACK / EIP-712 change.
-    string private constant _VERSION = "10.1.5";
+    string private constant _VERSION = "10.1.6";
 
     /// @notice OT-RFC-49 / WS-B Trap 3: domain-separation version prepended to the
     ///         RAW publish/update ACK preimage (`abi.encodePacked`, later wrapped by
@@ -953,14 +953,25 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         // wallet covers the remainder. The CG-value write below stays on the GROSS
         // `tokenAmount` regardless of payment source, so random-sampling weight
         // tracks the publisher's full committed value.
+        //
+        // Reward epoch-range: the ORIGINAL publish funds the staker pool THROUGH
+        // `endEpoch` inclusive — `_distributeTokens` lands its final allocation on
+        // `currentEpoch + epochs == endEpoch`. The extension must therefore begin
+        // at `endEpoch + 1` and span exactly `epochs` buckets
+        // `[endEpoch + 1, endEpoch + epochs]` (`addTokensToEpochRange` is
+        // inclusive). Starting at `endEpoch` (the prior behaviour) double-funded
+        // that epoch and paid one epoch past the purchased lifetime. NOTE: the
+        // CG-value write below legitimately starts at `endEpoch` — on that side the
+        // publish contribution retracts AT `endEpoch`, so the two seams differ by
+        // one by construction; each abuts its own publish window with no overlap.
         (uint96 netEscrow, uint96 walletCost) = _consumeEscrowNet(cgId, tokenAmount);
         if (netEscrow > 0) {
-            epochStorage.addTokensToEpochRange(1, endEpoch, endEpoch + epochs, netEscrow);
+            epochStorage.addTokensToEpochRange(1, endEpoch + 1, endEpoch + epochs, netEscrow);
         }
         if (walletCost > 0) {
             // Pull gross from the publisher, distribute net into the pool.
             uint96 netTokenAmount = _addTokens(walletCost);
-            epochStorage.addTokensToEpochRange(1, endEpoch, endEpoch + epochs, netTokenAmount);
+            epochStorage.addTokensToEpochRange(1, endEpoch + 1, endEpoch + epochs, netTokenAmount);
         }
 
         // Phase 1+8 cross-phase fix: extending a KC's lifetime grows the CG's

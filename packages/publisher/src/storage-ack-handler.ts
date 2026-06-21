@@ -658,25 +658,36 @@ export class StorageACKHandler {
     //     byte-exactly, so fall back to the serialization-INDEPENDENT lower bound
     //     Σ(UTF-8 byteLength(s,p,o)) (always ≤ the real serialization, so no
     //     false positives; JS string `.length` would under-count non-ASCII).
-    let byteSizeFloor: number;
+    // `publicByteSize` is a protobuf `uint64` (number | Long on the wire). Parse
+    // it to `bigint` ONCE and keep the floor, the compare, AND the signed ACK
+    // digest value in `bigint` across the full uint64 range — a `Number()` round
+    // would corrupt a value above 2^53 before it is priced/signed.
+    let byteSizeFloor: bigint;
     let floorBasis: string;
     if (intent.stagingQuads && intent.stagingQuads.length > 0) {
-      byteSizeFloor = intent.stagingQuads.length;
+      byteSizeFloor = BigInt(intent.stagingQuads.length);
       floorBasis = 'exact inline payload bytes';
     } else {
-      byteSizeFloor = 0;
+      byteSizeFloor = 0n;
       for (const q of swmQuads) {
         byteSizeFloor +=
-          Buffer.byteLength(q.subject, 'utf8') +
-          Buffer.byteLength(q.predicate, 'utf8') +
-          Buffer.byteLength(q.object, 'utf8');
+          BigInt(Buffer.byteLength(q.subject, 'utf8')) +
+          BigInt(Buffer.byteLength(q.predicate, 'utf8')) +
+          BigInt(Buffer.byteLength(q.object, 'utf8'));
       }
       floorBasis = 'Σ UTF-8 term bytes (lower bound)';
     }
-    const claimedPublicByteSize = typeof intent.publicByteSize === 'number'
-      ? intent.publicByteSize
-      : Number(intent.publicByteSize);
-    if (!Number.isFinite(claimedPublicByteSize) || claimedPublicByteSize < byteSizeFloor) {
+    let claimedPublicByteSize: bigint;
+    try {
+      claimedPublicByteSize = BigInt(
+        typeof intent.publicByteSize === 'number'
+          ? intent.publicByteSize
+          : intent.publicByteSize.toString(),
+      );
+    } catch {
+      claimedPublicByteSize = -1n; // non-integer / unparseable → fails the wire-validity gate
+    }
+    if (claimedPublicByteSize < 0n || claimedPublicByteSize < byteSizeFloor) {
       return this.encodeDecline(
         cgId,
         STORAGE_ACK_DECLINE_CODES.BYTESIZE_UNDERCLAIM,
@@ -685,7 +696,7 @@ export class StorageACKHandler {
         `(${floorBasis}). Refusing to sign an under-priced footprint.`,
       );
     }
-    const verifiedByteSize = BigInt(claimedPublicByteSize);
+    const verifiedByteSize = claimedPublicByteSize;
 
     // Derive numeric CG ID the same way the publisher does. Fail loud on
     // non-numeric or non-positive ids — the V10 contract rejects

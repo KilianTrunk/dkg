@@ -97,6 +97,17 @@ export const STORAGE_ACK_DECLINE_CODES = {
    * with a corrected commitment.
    */
   CATALOG_ROOT_MISMATCH: 'CATALOG_ROOT_MISMATCH',
+  /**
+   * The publisher claimed a `publicByteSize` below the lower bound the core
+   * derives from the actual public quads it would attest to. `byteSize` is
+   * signed into the ACK digest and prices the publish on-chain
+   * (`ask · byteSize · epochs`); the contract can't see the content, so a core
+   * MUST refuse to sign an under-stated footprint — otherwise the on-chain cost
+   * can be driven toward zero (e.g. `byteSize = 1` for real content) regardless
+   * of the ask. Permanent (a content/economic-shape lie); the publisher MUST
+   * republish with a `byteSize` that reflects the real content.
+   */
+  BYTESIZE_UNDERCLAIM: 'BYTESIZE_UNDERCLAIM',
 } as const;
 
 export type StorageACKDeclineCode =

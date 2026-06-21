@@ -641,9 +641,35 @@ export class StorageACKHandler {
     // The data integrity that recompute was protecting is already guaranteed
     // by the merkle-root check above (computeFlatKCRoot over the SWM quads).
     const verifiedKACount = 1;
-    const verifiedByteSize = typeof intent.publicByteSize === 'number'
-      ? BigInt(intent.publicByteSize)
-      : BigInt(Number(intent.publicByteSize));
+
+    // byteSize pin: the core just recomputed the public merkle root over
+    // `swmQuads`, so it knows the exact triples it is attesting to. The
+    // publisher's claimed `publicByteSize` is signed into the ACK digest and
+    // prices the publish on-chain (`ask · byteSize · epochs`); nothing on-chain
+    // can see the content, so without this an under-claim (e.g. `byteSize = 1`
+    // for real content) drives the cost toward zero regardless of the ask.
+    // Refuse to sign when the claim is below the serialization-INDEPENDENT lower
+    // bound Σ(|s|+|p|+|o|): every valid N-Quads serialization is strictly longer
+    // than the bare term lengths (it adds `<>`, spaces, ` .`, newlines), so an
+    // honest publisher whose `publicByteSize == nquads.length` never trips this,
+    // while a grossly under-stated footprint is rejected before signing.
+    let byteSizeFloor = 0;
+    for (const q of swmQuads) {
+      byteSizeFloor += q.subject.length + q.predicate.length + q.object.length;
+    }
+    const claimedPublicByteSize = typeof intent.publicByteSize === 'number'
+      ? intent.publicByteSize
+      : Number(intent.publicByteSize);
+    if (!Number.isFinite(claimedPublicByteSize) || claimedPublicByteSize < byteSizeFloor) {
+      return this.encodeDecline(
+        cgId,
+        STORAGE_ACK_DECLINE_CODES.BYTESIZE_UNDERCLAIM,
+        `public ACK byteSize under-claim: publisher claims publicByteSize=${claimedPublicByteSize} ` +
+        `but the ${swmQuads.length} attested triples require at least ${byteSizeFloor} bytes ` +
+        `(Σ term lengths; the N-Quads serialization is strictly larger). Refusing to sign an under-priced footprint.`,
+      );
+    }
+    const verifiedByteSize = BigInt(claimedPublicByteSize);
 
     // Derive numeric CG ID the same way the publisher does. Fail loud on
     // non-numeric or non-positive ids — the V10 contract rejects

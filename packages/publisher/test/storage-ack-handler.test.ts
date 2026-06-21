@@ -120,6 +120,54 @@ describe('StorageACKHandler', () => {
     expect(recovered.toLowerCase()).toBe(coreWallet.address.toLowerCase());
   });
 
+  it('declines (BYTESIZE_UNDERCLAIM) when publicByteSize is below the real content lower bound', async () => {
+    // The 3 fixture triples have Σ(|s|+|p|+|o|) = 69, a strict lower bound on
+    // any valid N-Quads serialization. A claim of 1 (the byteSize=1 cost dodge)
+    // must be refused so the on-chain ask actually prices the real footprint.
+    const handler = await createHandler(swmQuads);
+    const intent = encodePublishIntent({
+      merkleRoot,
+      contextGraphId,
+      publisherPeerId: 'publisher-0',
+      publicByteSize: 1,
+      isPrivate: false,
+      kaCount: 1,
+      rootEntities: ['urn:entity:1', 'urn:entity:2'],
+      epochs: 1,
+      tokenAmountStr: '1000',
+      merkleLeafCount: swmMerkleLeafCount,
+    });
+
+    const response = await handler.handler(intent, fakePeerId);
+    const decoded = decodeStorageACK(response);
+
+    expect(isStorageACKDecline(decoded)).toBe(true);
+    expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.BYTESIZE_UNDERCLAIM);
+    expect(decoded.declineMessage).toContain('under-claim');
+  });
+
+  it('signs a public ACK when publicByteSize meets the real content lower bound (boundary)', async () => {
+    // Exactly the Σ term-length floor (69) is accepted — an honest publisher's
+    // `publicByteSize == nquads.length` is always strictly above it.
+    const handler = await createHandler(swmQuads);
+    const intent = encodePublishIntent({
+      merkleRoot,
+      contextGraphId,
+      publisherPeerId: 'publisher-0',
+      publicByteSize: 69,
+      isPrivate: false,
+      kaCount: 1,
+      rootEntities: ['urn:entity:1', 'urn:entity:2'],
+      epochs: 1,
+      tokenAmountStr: '1000',
+      merkleLeafCount: swmMerkleLeafCount,
+    });
+
+    const response = await handler.handler(intent, fakePeerId);
+    const decoded = decodeStorageACK(response);
+    expect(isStorageACKDecline(decoded)).toBe(false);
+  });
+
   it('declines (SIGNER_NOT_REGISTERED) when the signer is no longer confirmed registered', async () => {
     // PR #557: this used to throw, which the publisher saw as a libp2p
     // stream reset; now the handler returns a typed decline so the

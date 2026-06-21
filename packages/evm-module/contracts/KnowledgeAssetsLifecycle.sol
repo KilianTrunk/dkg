@@ -162,6 +162,13 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     //          CannotWriteValueToInactiveContextGraph on a deactivated CG, so a
     //          swept CG can no longer be re-stranded with sampling weight. PATCH
     //          bump — no ACK / EIP-712 change.
+    // 10.1.6 — extendKnowledgeAssetLifetime reward epoch-range correction: the
+    //          extension now funds [endEpoch + 1, endEpoch + epochs] (exactly
+    //          `epochs` buckets) instead of [endEpoch, endEpoch + epochs], which
+    //          double-funded endEpoch (already funded by publish through endEpoch)
+    //          and paid one epoch past the purchased lifetime. Also rejects
+    //          epochs == 0 (ZeroEpochs) before mutating/paying. PATCH bump — no
+    //          ACK / EIP-712 change.
     string private constant _VERSION = "10.1.6";
 
     /// @notice OT-RFC-49 / WS-B Trap 3: domain-separation version prepended to the
@@ -937,6 +944,16 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         uint256 currentEpoch = chronos.getCurrentEpoch();
         if (currentEpoch > endEpoch) {
             revert KnowledgeAssetLib.KnowledgeAssetExpired(id, currentEpoch, endEpoch);
+        }
+
+        // Reject a zero-epoch extension BEFORE any metadata mutation or payment:
+        // it is semantically a no-op, and the reward range below
+        // ([endEpoch + 1, endEpoch + epochs]) would otherwise invert to
+        // [endEpoch + 1, endEpoch] and underflow inside EpochStorage (an internal
+        // arithmetic panic instead of a stable API error). Matches publish's
+        // ZeroEpochs guard.
+        if (epochs == 0) {
+            revert ZeroEpochs();
         }
 
         kas.setEndEpoch(id, endEpoch + epochs);

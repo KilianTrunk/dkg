@@ -326,6 +326,30 @@ describe('/api/knowledge-assets routes (real daemon, real chain)', () => {
       // The fix: stamp + seal are both in the agent's namespace → seal author is
       // the agent, not the node's publisher signer.
       expect(String(fin.body.authorAddress).toLowerCase()).toBe(agentAddress.toLowerCase());
+
+      // ATOMIC path (the create-route callsite this PR changes): create + write +
+      // auto-finalize + share + publish in ONE call, as the agent. This proves
+      // write/finalize/promote/publish all stay in the AGENT's namespace, not just
+      // create — the returned author is the agent, and (when it mints) the kaId is
+      // packed (uint160(author)<<96)|number, so its high 160 bits MUST be the agent.
+      const atomic = await agentPost('/api/knowledge-assets', {
+        contextGraphId: cg,
+        name: 'agent-atomic',
+        quads: [{ subject: 'ex:B', predicate: 'ex:p', object: '"y"' }],
+        finalize: true,
+        alsoShareSwm: true,
+        alsoPublishVm: true,
+      });
+      // authorAddress is stamped at finalize (before any publish tail-error), so
+      // it is always present and must be the agent.
+      expect(String(atomic.body.authorAddress).toLowerCase(), `agent atomic: ${JSON.stringify(atomic.body)}`).toBe(
+        agentAddress.toLowerCase(),
+      );
+      // If it minted on-chain, the minted kaId proves the publish path stayed
+      // agent-scoped (high 160 bits == author == agent).
+      if (atomic.body.kaId != null) {
+        expect(BigInt(atomic.body.kaId) >> 96n).toBe(BigInt(agentAddress));
+      }
     });
   });
 

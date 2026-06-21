@@ -789,6 +789,10 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       if (shouldFinalize) {
         const seal = await agent.assertion.finalize(resolvedContextGraphId, name, finalizeOptions);
         result.merkleRoot = hex(seal.merkleRoot);
+        // Surface the sealed author so clients (and tests) can confirm custodial
+        // attribution on the atomic create+finalize path, mirroring the dedicated
+        // wm/finalize route's response.
+        result.authorAddress = seal.authorAddress;
         result.status = "wm-sealed";
         emitMemoryGraphChanged?.({ contextGraphId: resolvedContextGraphId, layers: ["wm"], subGraphName, operation: "assertion_finalized", source: "api" });
       }
@@ -796,7 +800,14 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       const errors: Array<{ phase: string; error: string }> = [];
       if (alsoShareSwm === true) {
         try {
-          const share = await agent.assertion.promote(resolvedContextGraphId, name, { subGraphName });
+          // Carry the same resolved author into the share. The asset is already
+          // sealed (finalize above), so promote shares the existing seal verbatim
+          // — passing the author keeps the whole atomic flow in one namespace and
+          // covers the seal-on-share path too.
+          const share = await agent.assertion.promote(resolvedContextGraphId, name, {
+            subGraphName,
+            ...(resolvedAuthorAgentAddress ? { authorAgentAddress: resolvedAuthorAgentAddress } : {}),
+          });
           result.swmShared = true;
           result.promotedCount = share.promotedCount;
           result.sealed = share.sealed;

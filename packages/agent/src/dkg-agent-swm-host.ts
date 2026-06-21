@@ -2738,6 +2738,13 @@ export class SwmHostModeMethods extends DKGAgentBase {
       const scopedMeta = contextGraphMetaUri(localCgId, sub.onChainId);
       const rootData = contextGraphDataUri(localCgId);
       const scopedData = contextGraphDataUri(localCgId, sub.onChainId);
+      // The publisher's OWN one-shot publish() writes confirmed PUBLIC data to
+      // the per-KA verifiable-memory (VM) graphs `<rootData>/_verifiable_memory/
+      // <author>/<number>` — NOT the legacy root data graph (the receiver/#1259
+      // strand is what fills root data). So the data reads below must look in
+      // BOTH: legacy root data UNION any VM graph under this CG, each scoped by
+      // the per-root filter. Reading VM-only would regress the receiver heal.
+      const vmGraphPrefix = `${rootData}/_verifiable_memory/`;
 
       // 2a ASK-guard: is there at least one legacy-only KC (batchId present in
       // legacy meta, absent in scoped meta)? In steady state this is one ASK per
@@ -2813,25 +2820,43 @@ export class SwmHostModeMethods extends DKGAgentBase {
             for (const root of roots) {
               const present = await this.store.query(
                 `ASK {
-                   GRAPH <${rootData}> {
-                     ?s ?p ?o .
-                     FILTER(?s = <${root}> || STRSTARTS(STR(?s), "${root}/.well-known/genid/"))
+                   {
+                     GRAPH <${rootData}> {
+                       ?s ?p ?o .
+                       FILTER(?s = <${root}> || STRSTARTS(STR(?s), "${root}/.well-known/genid/"))
+                     }
+                   } UNION {
+                     GRAPH ?vmg {
+                       ?s ?p ?o .
+                       FILTER(STRSTARTS(STR(?vmg), "${vmGraphPrefix}"))
+                       FILTER(?s = <${root}> || STRSTARTS(STR(?s), "${root}/.well-known/genid/"))
+                     }
                    }
                  }`,
               );
               if (present.type !== 'boolean' || !present.value) return;
             }
 
-            // DATA copy (per root) — MANDATORY server-side, byte-safe. Skip the
-            // post-publish trustLevel stamps so the recomputed leaf set stays
+            // DATA copy (per root) — MANDATORY server-side, byte-safe, read-both
+            // (legacy root data UNION per-KA VM graph). Skip the post-publish
+            // trustLevel stamps in BOTH branches so the recomputed leaf set stays
             // bit-identical with the on-chain merkleLeafCount.
             for (const root of roots) {
               await update(
                 `INSERT { GRAPH <${scopedData}> { ?s ?p ?o } } WHERE {
-                   GRAPH <${rootData}> {
-                     ?s ?p ?o .
-                     FILTER(?s = <${root}> || STRSTARTS(STR(?s), "${root}/.well-known/genid/"))
-                     FILTER(?p != <${TRUST_LEVEL_PREDICATE}> && ?p != <${LEGACY_TRUST_LEVEL_PREDICATE}>)
+                   {
+                     GRAPH <${rootData}> {
+                       ?s ?p ?o .
+                       FILTER(?s = <${root}> || STRSTARTS(STR(?s), "${root}/.well-known/genid/"))
+                       FILTER(?p != <${TRUST_LEVEL_PREDICATE}> && ?p != <${LEGACY_TRUST_LEVEL_PREDICATE}>)
+                     }
+                   } UNION {
+                     GRAPH ?vmg {
+                       ?s ?p ?o .
+                       FILTER(STRSTARTS(STR(?vmg), "${vmGraphPrefix}"))
+                       FILTER(?s = <${root}> || STRSTARTS(STR(?s), "${root}/.well-known/genid/"))
+                       FILTER(?p != <${TRUST_LEVEL_PREDICATE}> && ?p != <${LEGACY_TRUST_LEVEL_PREDICATE}>)
+                     }
                    }
                  }`,
               );

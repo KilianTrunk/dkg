@@ -3179,7 +3179,7 @@ export class DKGPublisher implements Publisher {
     onChainResult: OnChainPublishResult,
     ual: string,
     merkleRoot: Uint8Array,
-    manifestEntries: ReadonlyArray<{ rootEntity: string; privateMerkleRoot?: Uint8Array }>,
+    manifestEntries: ReadonlyArray<KAManifestEntry>,
     publicQuads: Quad[],
     fallbackCgId: bigint | undefined,
     ctx: OperationContext,
@@ -3239,18 +3239,25 @@ export class DKGPublisher implements Publisher {
         );
       }
 
-      // Meta: the documented minimal shape the prover needs — `dkg:batchId`
+      // Meta: the minimal shape downstream readers need — `dkg:batchId`
       // (UAL resolution), `dkg:merkleRoot`, and the collapsed `dkg:rootEntity`
-      // (+ `dkg:privateMerkleRoot`) member rows on the UAL subject. The
+      // (+ `dkg:privateMerkleRoot`) member rows on the UAL subject. The RS
       // extractor's read-both UNION resolves all roots from the collapsed shape,
-      // so single- and multi-root KCs are both provable without `<ual>/<n>`
-      // token rows.
+      // but MULTI-root publishes ALSO re-emit the legacy `<ual>/<tokenId>` token
+      // rows so the root↔privateMerkleRoot pairing stays joinable on the shared
+      // token subject — the AccessHandler keys private bags per member root and
+      // a collapse-only multi-root KC makes non-first bags unreachable. Single
+      // root keeps the full collapse (no pairing needed). Mirrors the SWM block
+      // in `publishFromSharedMemory` and the canonical `generateKCMetadata`
+      // writer; see test/multi-root-token-rows.test.ts for the exact contract.
       const DKG_ONT = 'http://dkg.io/ontology/';
       const XSD_INT = 'http://www.w3.org/2001/XMLSchema#integer';
       const minimalMeta: Quad[] = [
         { subject: ual, predicate: `${DKG_ONT}batchId`, object: `"${partitionKaId}"^^<${XSD_INT}>`, graph: ctxMetaGraph },
         { subject: ual, predicate: `${DKG_ONT}merkleRoot`, object: `"${toHex(merkleRoot)}"`, graph: ctxMetaGraph },
       ];
+      const partitionMultiRoot =
+        new Set(manifestEntries.map((ka) => ka.rootEntity)).size > 1;
       const seenRoots = new Set<string>();
       const seenPrivRoots = new Set<string>();
       for (const ka of manifestEntries) {
@@ -3263,6 +3270,19 @@ export class DKGPublisher implements Publisher {
           if (!seenPrivRoots.has(privHex)) {
             seenPrivRoots.add(privHex);
             minimalMeta.push({ subject: ual, predicate: `${DKG_ONT}privateMerkleRoot`, object: `"${privHex}"`, graph: ctxMetaGraph });
+          }
+        }
+        // MULTI-root only: re-emit the `<ual>/<tokenId>` token rows so each member
+        // root carries its OWN privateMerkleRoot on a shared subject (recoverable
+        // pairing). Not deduped — every token keeps its pairing row.
+        if (partitionMultiRoot) {
+          const kaUri = `${ual}/${ka.tokenId}`;
+          minimalMeta.push(
+            { subject: kaUri, predicate: DKG_ROOT_ENTITY_LEGACY, object: ka.rootEntity, graph: ctxMetaGraph },
+            { subject: kaUri, predicate: `${DKG_ONT}partOf`, object: ual, graph: ctxMetaGraph },
+          );
+          if (ka.privateMerkleRoot && ka.privateMerkleRoot.length > 0) {
+            minimalMeta.push({ subject: kaUri, predicate: `${DKG_ONT}privateMerkleRoot`, object: `"${toHex(ka.privateMerkleRoot)}"`, graph: ctxMetaGraph });
           }
         }
       }

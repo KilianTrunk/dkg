@@ -31,6 +31,7 @@ import {
   SWM_CURRENT_ASSERTION_PRED,
   VM_CURRENT_ASSERTION_PRED,
   toHex,
+  buildScopedMinimalMeta,
   resolveUalByBatchId,
   promoteUpdatedKaToPerCgId,
   restateLabelGraphForUpdate,
@@ -1609,50 +1610,10 @@ export class DKGPublisher implements Publisher {
           //   - `dkg:materializedVersion` is stamped below.
           // The RS prover and the backfill route are read-both, so old
           // wholesale-copied partitions keep working.
-          const DKG_ONT = 'http://dkg.io/ontology/';
-          const XSD_INT = 'http://www.w3.org/2001/XMLSchema#integer';
           const partitionKaId = publishResult.onChainResult!.kaId ?? publishResult.onChainResult!.batchId;
-          const minimalMeta: Quad[] = [
-            { subject: ual, predicate: `${DKG_ONT}batchId`, object: `"${partitionKaId}"^^<${XSD_INT}>`, graph: ctxMetaGraph },
-            { subject: ual, predicate: `${DKG_ONT}merkleRoot`, object: `"${toHex(publishResult.merkleRoot)}"`, graph: ctxMetaGraph },
-          ];
-          const seenPartitionRoots = new Set<string>();
-          const seenPartitionPrivRoots = new Set<string>();
-          // Codex review "multi-root-access" (restateKaPartition parity):
-          // MULTI-root publishes additionally re-emit the legacy
-          // `<ual>/<tokenId>` token rows so the root↔privateMerkleRoot
-          // pairing stays recoverable; single-root keeps the full collapse.
-          const partitionMultiRoot =
-            new Set(publishResult.kaManifest.map((ka) => ka.rootEntity)).size > 1;
-          for (const ka of publishResult.kaManifest) {
-            if (!seenPartitionRoots.has(ka.rootEntity)) {
-              seenPartitionRoots.add(ka.rootEntity);
-              // RFC ka-metadata-trim Phase 2: single member row (the §10.1
-              // dual-write was collapsed back to `dkg:rootEntity`; readers
-              // stay read-both for dual-written replica rows).
-              minimalMeta.push(
-                { subject: ual, predicate: DKG_ROOT_ENTITY_LEGACY, object: ka.rootEntity, graph: ctxMetaGraph },
-              );
-            }
-            if (ka.privateMerkleRoot && ka.privateMerkleRoot.length > 0) {
-              const privHex = toHex(ka.privateMerkleRoot);
-              if (!seenPartitionPrivRoots.has(privHex)) {
-                seenPartitionPrivRoots.add(privHex);
-                minimalMeta.push({ subject: ual, predicate: `${DKG_ONT}privateMerkleRoot`, object: `"${privHex}"`, graph: ctxMetaGraph });
-              }
-            }
-            if (partitionMultiRoot) {
-              const kaUri = `${ual}/${ka.tokenId}`;
-              minimalMeta.push(
-                { subject: kaUri, predicate: DKG_ROOT_ENTITY_LEGACY, object: ka.rootEntity, graph: ctxMetaGraph },
-                { subject: kaUri, predicate: `${DKG_ONT}partOf`, object: ual, graph: ctxMetaGraph },
-              );
-              if (ka.privateMerkleRoot && ka.privateMerkleRoot.length > 0) {
-                minimalMeta.push({ subject: kaUri, predicate: `${DKG_ONT}privateMerkleRoot`, object: `"${toHex(ka.privateMerkleRoot)}"`, graph: ctxMetaGraph });
-              }
-            }
-          }
-          await this.store.insert(minimalMeta);
+          await this.store.insert(
+            buildScopedMinimalMeta(ual, partitionKaId, publishResult.merkleRoot, publishResult.kaManifest, ctxMetaGraph),
+          );
         }
 
         // Stamp the publish version so a later update can compare against it
@@ -3239,54 +3200,13 @@ export class DKGPublisher implements Publisher {
         );
       }
 
-      // Meta: the minimal shape downstream readers need — `dkg:batchId`
-      // (UAL resolution), `dkg:merkleRoot`, and the collapsed `dkg:rootEntity`
-      // (+ `dkg:privateMerkleRoot`) member rows on the UAL subject. The RS
-      // extractor's read-both UNION resolves all roots from the collapsed shape,
-      // but MULTI-root publishes ALSO re-emit the legacy `<ual>/<tokenId>` token
-      // rows so the root↔privateMerkleRoot pairing stays joinable on the shared
-      // token subject — the AccessHandler keys private bags per member root and
-      // a collapse-only multi-root KC makes non-first bags unreachable. Single
-      // root keeps the full collapse (no pairing needed). Mirrors the SWM block
-      // in `publishFromSharedMemory` and the canonical `generateKCMetadata`
-      // writer; see test/multi-root-token-rows.test.ts for the exact contract.
-      const DKG_ONT = 'http://dkg.io/ontology/';
-      const XSD_INT = 'http://www.w3.org/2001/XMLSchema#integer';
-      const minimalMeta: Quad[] = [
-        { subject: ual, predicate: `${DKG_ONT}batchId`, object: `"${partitionKaId}"^^<${XSD_INT}>`, graph: ctxMetaGraph },
-        { subject: ual, predicate: `${DKG_ONT}merkleRoot`, object: `"${toHex(merkleRoot)}"`, graph: ctxMetaGraph },
-      ];
-      const partitionMultiRoot =
-        new Set(manifestEntries.map((ka) => ka.rootEntity)).size > 1;
-      const seenRoots = new Set<string>();
-      const seenPrivRoots = new Set<string>();
-      for (const ka of manifestEntries) {
-        if (!seenRoots.has(ka.rootEntity)) {
-          seenRoots.add(ka.rootEntity);
-          minimalMeta.push({ subject: ual, predicate: DKG_ROOT_ENTITY_LEGACY, object: ka.rootEntity, graph: ctxMetaGraph });
-        }
-        if (ka.privateMerkleRoot && ka.privateMerkleRoot.length > 0) {
-          const privHex = toHex(ka.privateMerkleRoot);
-          if (!seenPrivRoots.has(privHex)) {
-            seenPrivRoots.add(privHex);
-            minimalMeta.push({ subject: ual, predicate: `${DKG_ONT}privateMerkleRoot`, object: `"${privHex}"`, graph: ctxMetaGraph });
-          }
-        }
-        // MULTI-root only: re-emit the `<ual>/<tokenId>` token rows so each member
-        // root carries its OWN privateMerkleRoot on a shared subject (recoverable
-        // pairing). Not deduped — every token keeps its pairing row.
-        if (partitionMultiRoot) {
-          const kaUri = `${ual}/${ka.tokenId}`;
-          minimalMeta.push(
-            { subject: kaUri, predicate: DKG_ROOT_ENTITY_LEGACY, object: ka.rootEntity, graph: ctxMetaGraph },
-            { subject: kaUri, predicate: `${DKG_ONT}partOf`, object: ual, graph: ctxMetaGraph },
-          );
-          if (ka.privateMerkleRoot && ka.privateMerkleRoot.length > 0) {
-            minimalMeta.push({ subject: kaUri, predicate: `${DKG_ONT}privateMerkleRoot`, object: `"${toHex(ka.privateMerkleRoot)}"`, graph: ctxMetaGraph });
-          }
-        }
-      }
-      await this.store.insert(minimalMeta);
+      // Promote the minimal scoped-meta rows the RS prover + access handler read.
+      // Single source of truth across both publish paths — see
+      // `buildScopedMinimalMeta` (it documents the collapsed shape + the
+      // multi-root `<ual>/<tokenId>` pairing rows the AccessHandler needs).
+      await this.store.insert(
+        buildScopedMinimalMeta(ual, partitionKaId, merkleRoot, manifestEntries, ctxMetaGraph),
+      );
       await writeMaterializedVersion(this.store, ctxMetaGraph, ual, publishVersion);
       this.log.info(ctx, `RS scoped-promote: promoted ${ual} → context graph ${targetCgId} (kaId=${partitionKaId})`);
     });

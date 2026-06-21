@@ -1229,6 +1229,45 @@ describe('@unit RandomSampling', () => {
         expect(await ContextGraphStorage.getContextGraphKaCount(cgId)).to.equal(4n);
       });
 
+      it('recovery path: a clogged CG starves previewChallengeForSeed before pruning, succeeds after', async () => {
+        // The bug this keeper fixes: a bounded within-CG draw starved by expired
+        // dead slots. Prove the actual draw path — not just list mutation.
+        const cgId = await createCG(OPEN_POLICY);
+        const currentEpoch = await Chronos.getCurrentEpoch();
+        const liveKa = await createKa(cgId, currentEpoch + 100n);
+        for (let i = 0; i < 20; i++) await createKa(cgId, currentEpoch + 1n); // expired flood
+        await seedCGValue(cgId, 10_000n, 20n); // keep the single CG weighted across the advance
+        const epochLength = await Chronos.epochLength();
+        await time.increase(Number(epochLength) * 5); // expire the 20 fillers
+
+        // Find a seed whose draw starves on the expired slots (reverts). With
+        // 1 live / 20 expired, P(starve) per seed ≈ (20/21)^10 ≈ 0.61, so a
+        // reverting seed within 50 is a near-certainty (P(miss) ≈ 1e-21).
+        let cloggedSeed: number | undefined;
+        for (let i = 0; i < 50; i++) {
+          try {
+            await RandomSampling.previewChallengeForSeed(testSeed(i));
+          } catch {
+            cloggedSeed = i;
+            break;
+          }
+        }
+        expect(cloggedSeed, 'expected a seed that starves on the expired flood').to.not.equal(undefined);
+        // BEFORE: that seed reverts — the draw is clogged.
+        await expect(
+          RandomSampling.previewChallengeForSeed(testSeed(cloggedSeed!)),
+        ).to.be.revertedWithCustomError(RandomSampling, 'NoEligibleKnowledgeAsset');
+
+        // Prune the expired KAs via the keeper (its own committed tx).
+        await RandomSampling.pruneExpiredKnowledgeAssets(cgId, 0n, 100n);
+        expect(await ContextGraphStorage.getContextGraphKaCount(cgId)).to.equal(1n);
+
+        // AFTER: the SAME seed now resolves to the live KA — the draw recovered.
+        const after = await RandomSampling.previewChallengeForSeed(testSeed(cloggedSeed!));
+        expect(after.cgId).to.equal(cgId);
+        expect(after.kaId).to.equal(liveKa);
+      });
+
       it('the swap-pop primitive is gated to the RandomSampling contract', async () => {
         const cgId = await createCG(OPEN_POLICY);
         const ka = await createKa(cgId, (await Chronos.getCurrentEpoch()) + 5n);

@@ -207,6 +207,50 @@ describe('StorageACKHandler', () => {
     expect(isStorageACKDecline(accepted)).toBe(false);
   });
 
+  it('inline path: byteSize floor is the EXACT serialized payload, not just term bytes', async () => {
+    // When the publisher sends the payload inline (stagingQuads), the core has
+    // the exact serialized bytes, so the floor is the full payload length — a
+    // claim at the bare term-byte sum (which the loose lower bound accepted)
+    // under-prices the real serialization (<>, separators, graph term, ` .`).
+    const g = 'did:dkg:context-graph:42';
+    const inlineQuads: Quad[] = [makeQuad('urn:s', 'urn:p', 'urn:o', g)];
+    const nquadsStr = inlineQuads
+      .map((q) => `<${q.subject}> <${q.predicate}> <${q.object}> <${q.graph}> .`)
+      .join('\n');
+    const stagingBytes = new TextEncoder().encode(nquadsStr);
+    const inlineRoot = computeFlatKCRoot(inlineQuads, []);
+    const inlineLeaf = computeFlatKCMerkleLeafCountV10(inlineQuads, []);
+    const termSum =
+      Buffer.byteLength('urn:s', 'utf8') +
+      Buffer.byteLength('urn:p', 'utf8') +
+      Buffer.byteLength('urn:o', 'utf8');
+    expect(stagingBytes.length).to.be.greaterThan(termSum); // serialization overhead exists
+
+    const handler = await createHandler([]); // no SWM data; the payload is inline
+    const mk = (publicByteSize: number) =>
+      encodePublishIntent({
+        merkleRoot: inlineRoot,
+        contextGraphId,
+        publisherPeerId: 'publisher-0',
+        publicByteSize,
+        isPrivate: false,
+        kaCount: 1,
+        rootEntities: ['urn:s'],
+        epochs: 1,
+        tokenAmountStr: '1000',
+        merkleLeafCount: inlineLeaf,
+        stagingQuads: stagingBytes,
+      });
+
+    // Claim at the term-byte sum (omits serialization overhead) → declined.
+    const declined = decodeStorageACK(await handler.handler(mk(termSum), fakePeerId));
+    expect(isStorageACKDecline(declined)).toBe(true);
+    expect(declined.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.BYTESIZE_UNDERCLAIM);
+    // Claim at the exact serialized byte length → accepted.
+    const ok = decodeStorageACK(await handler.handler(mk(stagingBytes.length), fakePeerId));
+    expect(isStorageACKDecline(ok)).toBe(false);
+  });
+
   it('declines (SIGNER_NOT_REGISTERED) when the signer is no longer confirmed registered', async () => {
     // PR #557: this used to throw, which the publisher saw as a libp2p
     // stream reset; now the handler returns a typed decline so the

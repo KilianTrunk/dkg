@@ -189,7 +189,11 @@ const PINNED_DIGESTS: Record<string, string> = {
   // rename (getContextGraphKCCount/At/List → getContextGraphKaCount/At/List).
   // Digests recomputed post-merge from the combined ABI.
   ContextGraphs:                '54583e20167c37f4356247cb6bc657b0dccf6f17f99a3267427674a35a151bcf',
-  ContextGraphStorage:          '29f1746bf6d82dfea40eb0365c9a664994c56b63c4a98d99962cd9b61c1df37a',
+  // Repinned: added the RandomSampling-gated `swapRemoveKnowledgeAssetAt`
+  // pruning primitive + its `KnowledgeAssetUnlistedFromContextGraph` event and
+  // `OnlyRandomSampling` error (lets the keeper drop expired KAs from the
+  // per-CG sampling list; `kaToContextGraph` is left intact). Contract → 10.0.5.
+  ContextGraphStorage:          'b5630c6bb97e533d8b725084c2d48e50f25ae955f36f476589e76bb5c96a1470',
   // Identity / staking — consulted on every publish.
   Hub:                          '36976cc71bb87963b8b715791b32e4eb6b7bb85c712998afd6184221289a506b',
   Identity:                     'ca39efe9bd9ec4fd8ae67dccdf9eb888bf91232341c3a56216624477620ff4d8',

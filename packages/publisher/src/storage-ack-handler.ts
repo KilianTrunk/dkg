@@ -642,26 +642,36 @@ export class StorageACKHandler {
     // by the merkle-root check above (computeFlatKCRoot over the SWM quads).
     const verifiedKACount = 1;
 
-    // byteSize pin: the core just recomputed the public merkle root over
-    // `swmQuads`, so it knows the exact triples it is attesting to. The
-    // publisher's claimed `publicByteSize` is signed into the ACK digest and
-    // prices the publish on-chain (`ask · byteSize · epochs`); nothing on-chain
-    // can see the content, so without this an under-claim (e.g. `byteSize = 1`
-    // for real content) drives the cost toward zero regardless of the ask.
-    // Refuse to sign when the claim is below the serialization-INDEPENDENT lower
-    // bound Σ(UTF-8 byteLength(s,p,o)). `publicByteSize` is a UTF-8 BYTE count
-    // (the publisher computes `TextEncoder().encode(nquads).length`), so the
-    // floor MUST be UTF-8 bytes too — JS string `.length` (UTF-16 code units)
-    // would under-count non-ASCII IRIs/literals and let them slip through. Every
-    // valid N-Quads serialization is strictly longer than the bare term bytes (it
-    // adds `<>`, spaces, ` .`, newlines), so an honest publisher
-    // (`publicByteSize == utf8(nquads).length`) never trips this.
-    let byteSizeFloor = 0;
-    for (const q of swmQuads) {
-      byteSizeFloor +=
-        Buffer.byteLength(q.subject, 'utf8') +
-        Buffer.byteLength(q.predicate, 'utf8') +
-        Buffer.byteLength(q.object, 'utf8');
+    // byteSize pin: `publicByteSize` is signed into the ACK digest and prices the
+    // publish on-chain (`ask · byteSize · epochs`); nothing on-chain can see the
+    // content, so without this an under-claim (e.g. `byteSize = 1` for real
+    // content) drives the cost toward zero regardless of the ask. The publisher
+    // computes it as the UTF-8 byte length of the N-Quads serialization
+    // (`TextEncoder().encode(nquads).length`), so the floor is in UTF-8 bytes:
+    //   - INLINE path (`stagingQuads` present): the core received the EXACT
+    //     serialized payload, so require the claim to cover its full byte length
+    //     — anything less omits real serialized bytes (`<>`, separators, graph
+    //     terms, escapes, newlines) the cores must store. This is the tight,
+    //     exact floor (an honest direct publish sets `publicByteSize ==
+    //     stagingQuads.length`; both derive from the same `nquadsStr`).
+    //   - SWM-fallback path: the original serialization isn't reconstructable
+    //     byte-exactly, so fall back to the serialization-INDEPENDENT lower bound
+    //     Σ(UTF-8 byteLength(s,p,o)) (always ≤ the real serialization, so no
+    //     false positives; JS string `.length` would under-count non-ASCII).
+    let byteSizeFloor: number;
+    let floorBasis: string;
+    if (intent.stagingQuads && intent.stagingQuads.length > 0) {
+      byteSizeFloor = intent.stagingQuads.length;
+      floorBasis = 'exact inline payload bytes';
+    } else {
+      byteSizeFloor = 0;
+      for (const q of swmQuads) {
+        byteSizeFloor +=
+          Buffer.byteLength(q.subject, 'utf8') +
+          Buffer.byteLength(q.predicate, 'utf8') +
+          Buffer.byteLength(q.object, 'utf8');
+      }
+      floorBasis = 'Σ UTF-8 term bytes (lower bound)';
     }
     const claimedPublicByteSize = typeof intent.publicByteSize === 'number'
       ? intent.publicByteSize
@@ -671,8 +681,8 @@ export class StorageACKHandler {
         cgId,
         STORAGE_ACK_DECLINE_CODES.BYTESIZE_UNDERCLAIM,
         `public ACK byteSize under-claim: publisher claims publicByteSize=${claimedPublicByteSize} ` +
-        `but the ${swmQuads.length} attested triples require at least ${byteSizeFloor} UTF-8 bytes ` +
-        `(Σ term bytes; the N-Quads serialization is strictly larger). Refusing to sign an under-priced footprint.`,
+        `but the attested content requires at least ${byteSizeFloor} UTF-8 bytes ` +
+        `(${floorBasis}). Refusing to sign an under-priced footprint.`,
       );
     }
     const verifiedByteSize = BigInt(claimedPublicByteSize);

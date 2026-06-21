@@ -457,6 +457,35 @@
     "type": "function"
   },
   {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "cgId",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "startIndex",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "maxScan",
+        "type": "uint256"
+      }
+    ],
+    "name": "pruneExpiredKnowledgeAssets",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "removed",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
     "inputs": [],
     "name": "randomSamplingStorage",
     "outputs": [

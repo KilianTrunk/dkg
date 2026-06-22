@@ -2,6 +2,7 @@ import { afterEach, beforeAll, afterAll, beforeEach, describe, expect, it } from
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, realpathSync } from 'node:fs';
 import { tmpdir, homedir, platform } from 'node:os';
 import { join } from 'node:path';
+import { createServer } from 'node:net';
 import TOML from '@iarna/toml';
 import { mcpSetupAction, type McpSetupActionDeps } from '../src/mcp-setup.js';
 import {
@@ -379,12 +380,24 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
     const deps = makeDeps();
 
-    // No fetch stub: with no `--port`, effectivePort is the CLI default
-    // 9200 — nothing is listening there in CI (the shared Hardhat node
-    // is on 9548, live daemons on 21000+), so the production probe
-    // hits a real closed port and ECONNREFUSEs. That is the genuine
-    // "daemon not reachable" condition, exercised for real.
-    await mcpSetupAction({ start: false, verify: false }, deps);
+    // No fetch stub: the production probe does a real `/api/status`
+    // round-trip. Point it at a GUARANTEED-unused port (bind an ephemeral
+    // port → capture → close) so the connect() ECONNREFUSEs deterministically.
+    // The CLI default 9200 is racy here: under full-suite parallelism a
+    // different test file's daemon can occupy 9200 the instant this probe
+    // runs, making the daemon look "reachable" and firing the faucet. An
+    // ephemeral port (32768+) never collides with test daemons (9200 default
+    // / 21000+ live), so this exercises the genuine "not reachable" path.
+    const closedPort = await new Promise<number>((resolve, reject) => {
+      const srv = createServer();
+      srv.once('error', reject);
+      srv.listen(0, '127.0.0.1', () => {
+        const addr = srv.address();
+        const port = typeof addr === 'object' && addr ? addr.port : 0;
+        srv.close(() => (port ? resolve(port) : reject(new Error('no free port'))));
+      });
+    });
+    await mcpSetupAction({ start: false, verify: false, port: String(closedPort) }, deps);
 
     expect((deps.startDaemon as any).calls).toEqual([]);
     expect((deps.requestFaucetFunding as any).calls).toEqual([]);
@@ -393,7 +406,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     // And the new explicit log line fired (replacing the pre-F14
     // silent omission).
     const logged = (logSpy.calls as any[]).map((c) => c.join(' ')).join('\n');
-    expect(logged).toMatch(/Skipping wallet funding \(daemon not reachable on port 9200\)/);
+    expect(logged).toMatch(new RegExp(`Skipping wallet funding \\(daemon not reachable on port ${closedPort}\\)`));
   });
 
   // F14 (qa-review-round-2): the canonical decoupled-flow test.

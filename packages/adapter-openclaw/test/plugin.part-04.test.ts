@@ -79,10 +79,10 @@ describe("DkgNodePlugin", () => {
 
 
     it('dkg_knowledge_asset_share description points to dkg_knowledge_asset_publish as the next step', () => {
-      // rc.17 (CONTRACT §2 promote→share, §1 Stage5): after a FULL share the
-      // draft auto-seals best-effort and the publish-ready finalizer is the
-      // per-KA dkg_knowledge_asset_publish. The share description must steer the
-      // agent to it and explain the subset-is-not-publishable rule (§5).
+      // rc.17 (CONTRACT §2 promote→share, §1 Stage5) + #1116: a FULL share now
+      // SEALS BY DEFAULT and is publish-ready via the per-KA
+      // dkg_knowledge_asset_publish. The share description must steer the agent
+      // to it and explain the subset-is-not-publishable rule (§5).
       const plugin = new DkgNodePlugin();
       const tools: OpenClawTool[] = [];
       plugin.register({
@@ -94,7 +94,8 @@ describe("DkgNodePlugin", () => {
       });
       const share = tools.find((t) => t.name === 'dkg_knowledge_asset_share')!;
       expect(share.description).toContain('dkg_knowledge_asset_publish');
-      expect(share.description).toMatch(/auto-seal/i);
+      // #1116: a full share now SEALS BY DEFAULT (was "auto-seal best-effort").
+      expect(share.description).toMatch(/seals by default/i);
       // §5 subset-vs-full language must be present.
       expect(share.description).toMatch(/NOT publishable to Verifiable Memory/i);
     });

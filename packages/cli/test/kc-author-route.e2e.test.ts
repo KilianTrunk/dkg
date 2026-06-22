@@ -146,7 +146,7 @@ async function publishWithSignedAttestation(args: {
   const typedData = buildAuthorAttestationTypedData({
     chainId,
     kav10Address: TEST_KAV10_ADDR,
-    contextGraphId: args.contextGraphId,
+    // #1116: AuthorAttestation no longer binds contextGraphId.
     merkleRoot: args.merkleRoot,
     authorAddress: args.signer.address,
     reservedKaId,

@@ -14,6 +14,7 @@ import {
   ConvictionStakingStorage,
   ContextGraphs,
   ContextGraphStorage,
+  ContextGraphValueStorage,
   DKGPublishingConvictionNFT,
   DKGStakingConvictionNFT,
   EpochStorage,
@@ -28,7 +29,7 @@ import {
 } from '../typechain';
 import { createProfile, createProfiles } from './helpers/profile-helpers';
 import {
-  getDefaultKCCreator,
+  getDefaultKACreator,
   getDefaultPublishingNode,
   getDefaultReceivingNodes,
 } from './helpers/setup-helpers';
@@ -37,7 +38,7 @@ import {
   buildUpdateParams,
   packReservedKaId,
   DEFAULT_CHAIN_ID,
-} from './helpers/v10-kc-helpers';
+} from './helpers/v10-ka-helpers';
 
 const COMMITTED_TRAC = ethers.parseEther('50000'); // 20% discount tier
 const EXPECTED_DISCOUNT_BPS = 2000n;
@@ -167,7 +168,10 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
   ): Promise<bigint> => {
     await Token.mint(owner.address, COMMITTED_TRAC);
     await Token.connect(owner).approve(await NFT.getAddress(), COMMITTED_TRAC);
-    await NFT.connect(owner).createAccount(COMMITTED_TRAC);
+    // RFC-51: createAccount(committedTRAC, primaryNode). These lifecycle
+    // assertions don't exercise publishing-allocation seeding, so pass an
+    // inert primaryNode = 0 (no designated node, no allocation seeded).
+    await NFT.connect(owner).createAccount(COMMITTED_TRAC, 0);
     return NFT.totalSupply();
   };
 
@@ -175,7 +179,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
   // 1. create → topUp → registerAgent → deregisterAgent → settle
   // --------------------------------------------------------------------------
   it('asserts on-chain state across create/topUp/registerAgent/deregisterAgent/settle', async () => {
-    const creator = getDefaultKCCreator(accounts);
+    const creator = getDefaultKACreator(accounts);
     const agent = accounts[8];
     const stranger = accounts[7];
 
@@ -287,7 +291,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
       );
     }
 
-    const creator = getDefaultKCCreator(accounts);
+    const creator = getDefaultKACreator(accounts);
     const accountId = await createAccountFor(creator);
     await NFT.connect(creator).registerAgent(accountId, creator.address);
     expect(await NFT.agentToAccountId(creator.address)).to.equal(accountId);
@@ -336,6 +340,598 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
       .true;
     return cgId;
   };
+
+  // --------------------------------------------------------------------------
+  // OT-RFC-53 — publishing into a funded CG spends the registration escrow first
+  // --------------------------------------------------------------------------
+  it('OT-RFC-53: a publish into the owner-funded CG draws the registration escrow before the wallet/PCA', async () => {
+    const Params = await hre.ethers.getContract<ParametersStorage>(
+      'ParametersStorage',
+    );
+    const deposit = ethers.parseEther('100');
+    await Params.connect(accounts[0]).setContextGraphRegistrationDeposit(deposit);
+
+    // Fund the creator's deposit allowance to the CG facade BEFORE setup —
+    // `setupRegisteredAgentPublish` creates the CG as the creator, which now
+    // pulls the deposit.
+    const creator = getDefaultKACreator(accounts);
+    await Token.mint(creator.address, deposit);
+    await Token.connect(creator).approve(await CGFacade.getAddress(), deposit);
+
+    const { cgId, epochs, receivingNodes, publisherIdentityId, receiverIdentityIds } =
+      await setupRegisteredAgentPublish();
+
+    // The deposit became the CG's prepaid escrow.
+    expect(await CGS.getRegistrationEscrow(cgId)).to.equal(deposit);
+
+    const tokenAmount = ethers.parseEther('1000');
+    const p = await buildPublishParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes,
+      publisherIdentityId,
+      receiverIdentityIds,
+      author: creator,
+      contextGraphId: cgId,
+      merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('rfc53-consume')),
+      knowledgeAssetsAmount: 1,
+      byteSize: 1000,
+      epochs,
+      tokenAmount,
+      isImmutable: false,
+      publishOperationId: 'rfc53-consume-op',
+      reservedKaId: packReservedKaId(creator.address, 1),
+    });
+
+    // Escrow (100) is drawn first; the 900 remainder flows through the PCA
+    // discount branch. Assert BOTH the consume event AND that the staker pool
+    // received only escrow-gross(100) + discounted-remainder(720) = 820 — NOT
+    // the discounted FULL amount (800 → pool 900) a "consume-but-still-charge-
+    // full-tokenAmount" regression would produce.
+    const tx = await KAV10.connect(creator).publish(p);
+    const receipt = await tx.wait();
+    await expect(tx).to.emit(KAV10, 'RegistrationEscrowConsumed').withArgs(cgId, deposit);
+
+    const remainder = tokenAmount - deposit; // 900
+    const discountedRemainder = (remainder * (10_000n - EXPECTED_DISCOUNT_BPS)) / 10_000n; // 720
+    const expectedPool = deposit + discountedRemainder; // gross escrow 100 + 720 = 820
+    const epochStorageAddr = (await EpochStorageContract.getAddress()).toLowerCase();
+    let poolSum = 0n;
+    for (const log of receipt!.logs) {
+      if (log.address.toLowerCase() !== epochStorageAddr) continue;
+      try {
+        const parsed = EpochStorageContract.interface.parseLog({
+          topics: [...log.topics],
+          data: log.data,
+        });
+        if (parsed?.name === 'TokensAddedToEpochRange' && BigInt(parsed.args.shardId) === STAKER_SHARD_ID) {
+          poolSum += BigInt(parsed.args.tokenAmount);
+        }
+      } catch {
+        /* not the event we're after */
+      }
+    }
+    expect(poolSum).to.equal(expectedPool);
+
+    // Escrow fully consumed (1000 > 100).
+    expect(await CGS.getRegistrationEscrow(cgId)).to.equal(0n);
+  });
+
+  // --------------------------------------------------------------------------
+  // OT-RFC-53 — escrow-funded publishing pays the protocol treasury fee at CONSUME
+  // (parity with the wallet path; no fee-bypass loophole when treasury is live)
+  // --------------------------------------------------------------------------
+  it('OT-RFC-53: an escrow-funded publish pays the treasury fee at consume (net→stakers, fee→treasury)', async () => {
+    const Params = await hre.ethers.getContract<ParametersStorage>('ParametersStorage');
+    const CSS = await hre.ethers.getContract<ConvictionStakingStorage>('ConvictionStakingStorage');
+    const deposit = ethers.parseEther('100');
+    await Params.connect(accounts[0]).setContextGraphRegistrationDeposit(deposit);
+
+    // Switch the treasury fee from dormant → live by wiring a recipient (the 3%
+    // rate is the constructor default; `_treasuryFee` is a no-op until this is set).
+    const treasury = accounts[9].address;
+    await Params.connect(accounts[0]).setProtocolTreasury(treasury);
+    const feeBps = await Params.protocolTreasuryFee(); // 300 = 3%
+    expect(feeBps).to.be.greaterThan(0n);
+
+    const creator = getDefaultKACreator(accounts);
+    await Token.mint(creator.address, deposit);
+    await Token.connect(creator).approve(await CGFacade.getAddress(), deposit);
+
+    const { cgId, epochs, receivingNodes, publisherIdentityId, receiverIdentityIds } =
+      await setupRegisteredAgentPublish();
+    expect(await CGS.getRegistrationEscrow(cgId)).to.equal(deposit);
+
+    // tokenAmount == deposit: escrow covers the WHOLE publish (walletCost 0), so the
+    // publish early-returns before the wallet/PCA branch — isolating the escrow fee.
+    const tokenAmount = deposit;
+    const expectedFee = (tokenAmount * feeBps) / 10_000n; // 3 TRAC
+    const expectedNet = tokenAmount - expectedFee; // 97 TRAC
+    const treasuryBefore = await Token.balanceOf(treasury);
+
+    const p = await buildPublishParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes,
+      publisherIdentityId,
+      receiverIdentityIds,
+      author: creator,
+      contextGraphId: cgId,
+      merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('rfc53-escrow-fee')),
+      knowledgeAssetsAmount: 1,
+      byteSize: 1000,
+      epochs,
+      tokenAmount,
+      isImmutable: false,
+      publishOperationId: 'rfc53-escrow-fee-op',
+      reservedKaId: packReservedKaId(creator.address, 1),
+    });
+
+    const tx = await KAV10.connect(creator).publish(p);
+    const receipt = await tx.wait();
+
+    // Escrow consumed in full; its treasury fee routed out of the vault.
+    await expect(tx).to.emit(KAV10, 'RegistrationEscrowConsumed').withArgs(cgId, deposit);
+    await expect(tx).to.emit(CSS, 'RegistrationDepositFeeTransferred').withArgs(treasury, expectedFee);
+
+    // Treasury received exactly the fee; staker pool received only the NET (not gross).
+    expect((await Token.balanceOf(treasury)) - treasuryBefore).to.equal(expectedFee);
+
+    const epochStorageAddr = (await EpochStorageContract.getAddress()).toLowerCase();
+    let poolSum = 0n;
+    for (const log of receipt!.logs) {
+      if (log.address.toLowerCase() !== epochStorageAddr) continue;
+      try {
+        const parsed = EpochStorageContract.interface.parseLog({
+          topics: [...log.topics],
+          data: log.data,
+        });
+        if (parsed?.name === 'TokensAddedToEpochRange' && BigInt(parsed.args.shardId) === STAKER_SHARD_ID) {
+          poolSum += BigInt(parsed.args.tokenAmount);
+        }
+      } catch {
+        /* not the event we're after */
+      }
+    }
+    expect(poolSum).to.equal(expectedNet);
+    expect(await CGS.getRegistrationEscrow(cgId)).to.equal(0n);
+  });
+
+  // --------------------------------------------------------------------------
+  // OT-RFC-53 — lifetime extension also draws the registration escrow
+  // --------------------------------------------------------------------------
+  it('OT-RFC-53: extending a KA in an owner-funded CG draws the escrow (extension path)', async () => {
+    const Params = await hre.ethers.getContract<ParametersStorage>('ParametersStorage');
+    const deposit = ethers.parseEther('2000'); // large enough to survive a publish + cover the extend
+    await Params.connect(accounts[0]).setContextGraphRegistrationDeposit(deposit);
+
+    const creator = getDefaultKACreator(accounts);
+    await Token.mint(creator.address, deposit);
+    await Token.connect(creator).approve(await CGFacade.getAddress(), deposit);
+
+    const { cgId, epochs, receivingNodes, publisherIdentityId, receiverIdentityIds } =
+      await setupRegisteredAgentPublish();
+    expect(await CGS.getRegistrationEscrow(cgId)).to.equal(deposit);
+
+    // Publish a KA (escrow covers it: 2000 → 1000).
+    const pubAmount = ethers.parseEther('1000');
+    const reservedKaId = packReservedKaId(creator.address, 1);
+    const p = await buildPublishParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes,
+      publisherIdentityId,
+      receiverIdentityIds,
+      author: creator,
+      contextGraphId: cgId,
+      merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('rfc53-extend')),
+      knowledgeAssetsAmount: 1,
+      byteSize: 1000,
+      epochs,
+      tokenAmount: pubAmount,
+      isImmutable: false,
+      publishOperationId: 'rfc53-extend-pub',
+      reservedKaId,
+    });
+    await KAV10.connect(creator).publish(p);
+    expect(await CGS.getRegistrationEscrow(cgId)).to.equal(deposit - pubAmount); // 1000 left
+
+    // Owner extends the KA — a DIFFERENT consume path (extension window
+    // endEpoch..endEpoch+epochs, direct distribution). Escrow covers it: 1000 → 0.
+    const extendAmount = ethers.parseEther('1000');
+    await expect(
+      KAV10.connect(creator).extendKnowledgeAssetLifetime(reservedKaId, epochs, extendAmount),
+    )
+      .to.emit(KAV10, 'RegistrationEscrowConsumed')
+      .withArgs(cgId, extendAmount);
+    expect(await CGS.getRegistrationEscrow(cgId)).to.equal(deposit - pubAmount - extendAmount); // 0
+  });
+
+  // --------------------------------------------------------------------------
+  // #1264-batch — extend funds the staker pool over [endEpoch+1, endEpoch+epochs]
+  // (NOT [endEpoch, endEpoch+epochs]). The prior range double-funded `endEpoch`
+  // (already funded by the original publish THROUGH endEpoch inclusive) and paid
+  // one epoch past the purchased lifetime. Deltas isolate the extension from any
+  // other shard-1 funding present in the fixture.
+  // --------------------------------------------------------------------------
+  it('extend funds [endEpoch+1, endEpoch+epochs] and does NOT double-fund endEpoch', async () => {
+    const Params = await hre.ethers.getContract<ParametersStorage>('ParametersStorage');
+    const ES = await hre.ethers.getContract<EpochStorage>('EpochStorageV8');
+    const KAS = await hre.ethers.getContract<DKGKnowledgeAssets>('DKGKnowledgeAssets');
+    const deposit = ethers.parseEther('2000');
+    await Params.connect(accounts[0]).setContextGraphRegistrationDeposit(deposit);
+
+    const creator = getDefaultKACreator(accounts);
+    await Token.mint(creator.address, deposit);
+    await Token.connect(creator).approve(await CGFacade.getAddress(), deposit);
+
+    const { cgId, epochs, receivingNodes, publisherIdentityId, receiverIdentityIds } =
+      await setupRegisteredAgentPublish();
+
+    const pubAmount = ethers.parseEther('1000');
+    const reservedKaId = packReservedKaId(creator.address, 1);
+    const p = await buildPublishParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes,
+      publisherIdentityId,
+      receiverIdentityIds,
+      author: creator,
+      contextGraphId: cgId,
+      merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('extend-epoch-range')),
+      knowledgeAssetsAmount: 1,
+      byteSize: 1000,
+      epochs,
+      tokenAmount: pubAmount,
+      isImmutable: false,
+      publishOperationId: 'extend-epoch-range-pub',
+      reservedKaId,
+    });
+    await KAV10.connect(creator).publish(p);
+
+    // endEpoch as stored by publish (= currentEpoch + epochs). Tuple index 5:
+    // (, , , byteSize, , endEpoch, tokenAmount, ).
+    const meta = await KAS.getKnowledgeAssetMetadata(reservedKaId);
+    const endEpoch = BigInt(meta[5]);
+    const last = endEpoch + BigInt(epochs); // the NEW endEpoch after the extension
+
+    // Snapshot the per-epoch staker pool (shard 1) BEFORE the extend, so deltas
+    // isolate the extension's contribution from any other fixture funding.
+    const before = {
+      end: await ES.getEpochPool(1, endEpoch),
+      endPlus1: await ES.getEpochPool(1, endEpoch + 1n),
+      last: await ES.getEpochPool(1, last),
+      lastPlus1: await ES.getEpochPool(1, last + 1n),
+    };
+
+    const extendAmount = ethers.parseEther('1000');
+    await KAV10.connect(creator).extendKnowledgeAssetLifetime(reservedKaId, epochs, extendAmount);
+
+    // DECISIVE: endEpoch is NOT re-funded by the extension (no double-fund).
+    expect(await ES.getEpochPool(1, endEpoch)).to.equal(
+      before.end,
+      'extend must not double-fund endEpoch',
+    );
+    // The extension funds its window start (endEpoch+1) ...
+    expect(await ES.getEpochPool(1, endEpoch + 1n)).to.be.gt(
+      before.endPlus1,
+      'extend must fund endEpoch+1',
+    );
+    // ... through the new endEpoch (endEpoch+epochs) ...
+    expect(await ES.getEpochPool(1, last)).to.be.gt(
+      before.last,
+      'extend must fund through endEpoch+epochs',
+    );
+    // ... and NOT one epoch past the purchased lifetime.
+    expect(await ES.getEpochPool(1, last + 1n)).to.equal(
+      before.lastPlus1,
+      'extend must not fund past endEpoch+epochs',
+    );
+  });
+
+  it('extend (WALLET-funded, escrow drained) funds [endEpoch+1, endEpoch+epochs] too', async () => {
+    // Sets the deposit == pubAmount so the PUBLISH drains the escrow to 0; the
+    // EXTENSION is then fully wallet-funded, exercising the `walletCost`
+    // addTokensToEpochRange branch (the test above only covers `netEscrow`).
+    const Params = await hre.ethers.getContract<ParametersStorage>('ParametersStorage');
+    const ES = await hre.ethers.getContract<EpochStorage>('EpochStorageV8');
+    const KAS = await hre.ethers.getContract<DKGKnowledgeAssets>('DKGKnowledgeAssets');
+    const pubAmount = ethers.parseEther('1000');
+    const extendAmount = ethers.parseEther('1000');
+    await Params.connect(accounts[0]).setContextGraphRegistrationDeposit(pubAmount);
+
+    const creator = getDefaultKACreator(accounts);
+    await Token.mint(creator.address, pubAmount + extendAmount);
+    await Token.connect(creator).approve(await CGFacade.getAddress(), pubAmount); // escrow pull at create
+    await Token.connect(creator).approve(await KAV10.getAddress(), extendAmount); // wallet pull at extend
+
+    const { cgId, epochs, receivingNodes, publisherIdentityId, receiverIdentityIds } =
+      await setupRegisteredAgentPublish();
+
+    const reservedKaId = packReservedKaId(creator.address, 1);
+    const p = await buildPublishParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes,
+      publisherIdentityId,
+      receiverIdentityIds,
+      author: creator,
+      contextGraphId: cgId,
+      merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('extend-wallet-range')),
+      knowledgeAssetsAmount: 1,
+      byteSize: 1000,
+      epochs,
+      tokenAmount: pubAmount,
+      isImmutable: false,
+      publishOperationId: 'extend-wallet-range-pub',
+      reservedKaId,
+    });
+    await KAV10.connect(creator).publish(p);
+    expect(await CGS.getRegistrationEscrow(cgId)).to.equal(0n); // publish drained escrow → extend is wallet-funded
+
+    const meta = await KAS.getKnowledgeAssetMetadata(reservedKaId);
+    const endEpoch = BigInt(meta[5]);
+    const last = endEpoch + BigInt(epochs);
+    const before = {
+      end: await ES.getEpochPool(1, endEpoch),
+      endPlus1: await ES.getEpochPool(1, endEpoch + 1n),
+      lastPlus1: await ES.getEpochPool(1, last + 1n),
+    };
+
+    await KAV10.connect(creator).extendKnowledgeAssetLifetime(reservedKaId, epochs, extendAmount);
+
+    expect(await ES.getEpochPool(1, endEpoch)).to.equal(before.end, 'wallet extend must not double-fund endEpoch');
+    expect(await ES.getEpochPool(1, endEpoch + 1n)).to.be.gt(before.endPlus1, 'wallet extend must fund endEpoch+1');
+    expect(await ES.getEpochPool(1, last + 1n)).to.equal(before.lastPlus1, 'wallet extend must not fund past endEpoch+epochs');
+  });
+
+  it('extend reverts ZeroEpochs on a zero-epoch extension (no arithmetic panic)', async () => {
+    const Params = await hre.ethers.getContract<ParametersStorage>('ParametersStorage');
+    const deposit = ethers.parseEther('2000');
+    await Params.connect(accounts[0]).setContextGraphRegistrationDeposit(deposit);
+    const creator = getDefaultKACreator(accounts);
+    await Token.mint(creator.address, deposit);
+    await Token.connect(creator).approve(await CGFacade.getAddress(), deposit);
+
+    const { cgId, epochs, receivingNodes, publisherIdentityId, receiverIdentityIds } =
+      await setupRegisteredAgentPublish();
+    const reservedKaId = packReservedKaId(creator.address, 1);
+    const p = await buildPublishParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes,
+      publisherIdentityId,
+      receiverIdentityIds,
+      author: creator,
+      contextGraphId: cgId,
+      merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('extend-zero-epochs')),
+      knowledgeAssetsAmount: 1,
+      byteSize: 1000,
+      epochs,
+      tokenAmount: ethers.parseEther('1000'),
+      isImmutable: false,
+      publishOperationId: 'extend-zero-epochs-pub',
+      reservedKaId,
+    });
+    await KAV10.connect(creator).publish(p);
+
+    await expect(
+      KAV10.connect(creator).extendKnowledgeAssetLifetime(reservedKaId, 0, ethers.parseEther('100')),
+    ).to.be.revertedWithCustomError(KAV10, 'ZeroEpochs');
+  });
+
+  it('extend reverts KnowledgeAssetExpired on an already-expired KA (keeps sampling-prune safe)', async () => {
+    // Safety invariant for RandomSampling's decoupled sampling list: the keeper
+    // prunes a KA once `endEpoch < currentEpoch`, and a pruned KA can never
+    // re-enter the sampling list (the double-registration guard blocks it). If
+    // extend could revive an EXPIRED KA, that KA would be live + paid yet
+    // permanently unsampleable. extend's expiry guard uses the SAME threshold
+    // (`currentEpoch > endEpoch`), so the two are mutually exclusive and the
+    // revive-into-unsampleable path is unreachable. This test pins that guard.
+    const Params = await hre.ethers.getContract<ParametersStorage>('ParametersStorage');
+    const deposit = ethers.parseEther('2000');
+    await Params.connect(accounts[0]).setContextGraphRegistrationDeposit(deposit);
+    const creator = getDefaultKACreator(accounts);
+    await Token.mint(creator.address, deposit);
+    await Token.connect(creator).approve(await CGFacade.getAddress(), deposit);
+
+    const { cgId, epochs, receivingNodes, publisherIdentityId, receiverIdentityIds } =
+      await setupRegisteredAgentPublish();
+    const reservedKaId = packReservedKaId(creator.address, 1);
+    const p = await buildPublishParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes,
+      publisherIdentityId,
+      receiverIdentityIds,
+      author: creator,
+      contextGraphId: cgId,
+      merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('extend-expired')),
+      knowledgeAssetsAmount: 1,
+      byteSize: 1000,
+      epochs,
+      tokenAmount: ethers.parseEther('1000'),
+      isImmutable: false,
+      publishOperationId: 'extend-expired-pub',
+      reservedKaId,
+    });
+    await KAV10.connect(creator).publish(p);
+
+    // Advance past the KA's lifetime so it is expired (and prune-eligible).
+    const epochLength = await Chronos.epochLength();
+    await time.increase(Number(epochLength) * (Number(epochs) + 1));
+
+    await expect(
+      KAV10.connect(creator).extendKnowledgeAssetLifetime(reservedKaId, 1, ethers.parseEther('100')),
+    ).to.be.revertedWithCustomError(KAV10, 'KnowledgeAssetExpired');
+  });
+
+  // --------------------------------------------------------------------------
+  // OT-RFC-53 — update draws the registration escrow for the delta + pays its fee
+  // --------------------------------------------------------------------------
+  it('OT-RFC-53: updating a KA in an owner-funded CG draws the escrow for the delta and pays its treasury fee', async () => {
+    const Params = await hre.ethers.getContract<ParametersStorage>('ParametersStorage');
+    const CSS = await hre.ethers.getContract<ConvictionStakingStorage>('ConvictionStakingStorage');
+    const deposit = ethers.parseEther('2000');
+    await Params.connect(accounts[0]).setContextGraphRegistrationDeposit(deposit);
+
+    const creator = getDefaultKACreator(accounts);
+    await Token.mint(creator.address, deposit);
+    await Token.connect(creator).approve(await CGFacade.getAddress(), deposit);
+
+    const { cgId, epochs, receivingNodes, publisherIdentityId, receiverIdentityIds } =
+      await setupRegisteredAgentPublish();
+
+    // Publish with the treasury still dormant (no fee), so the draw + fee under test
+    // are isolated to the UPDATE below. Escrow: 2000 → 1000.
+    const pubAmount = ethers.parseEther('1000');
+    const reservedKaId = packReservedKaId(creator.address, 1);
+    await KAV10.connect(creator).publish(
+      await buildPublishParams({
+        chainId: DEFAULT_CHAIN_ID,
+        kav10Address: await KAV10.getAddress(),
+        receivingNodes,
+        publisherIdentityId,
+        receiverIdentityIds,
+        author: creator,
+        contextGraphId: cgId,
+        merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('rfc53-update-pub')),
+        knowledgeAssetsAmount: 1,
+        byteSize: 1000,
+        epochs,
+        tokenAmount: pubAmount,
+        isImmutable: false,
+        publishOperationId: 'rfc53-update-pub-op',
+        reservedKaId,
+      }),
+    );
+    expect(await CGS.getRegistrationEscrow(cgId)).to.equal(deposit - pubAmount); // 1000
+
+    // Enable the treasury, then update: the DELTA is drawn from the remaining
+    // escrow via the update consume path (distinct epoch window: remainingEpochs)
+    // and its treasury fee is routed out of the vault.
+    const treasury = accounts[9].address;
+    await Params.connect(accounts[0]).setProtocolTreasury(treasury);
+    const feeBps = await Params.protocolTreasuryFee();
+    const delta = ethers.parseEther('500');
+    const expectedFee = (delta * feeBps) / 10_000n; // 15
+    const treasuryBefore = await Token.balanceOf(treasury);
+
+    const up = await buildUpdateParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes,
+      publisherIdentityId,
+      receiverIdentityIds,
+      contextGraphId: cgId,
+      id: reservedKaId,
+      preUpdateMerkleRootCount: 1n,
+      newMerkleRoot: ethers.keccak256(ethers.toUtf8Bytes('rfc53-update-new')),
+      newByteSize: 1000n,
+      newTokenAmount: pubAmount + delta,
+      mintKnowledgeAssetsAmount: 0n,
+      knowledgeAssetsToBurn: [],
+      updateOperationId: 'rfc53-update-escrow-op',
+      author: creator,
+    });
+    const tx = KAV10.connect(creator).update(up);
+    await expect(tx).to.emit(KAV10, 'RegistrationEscrowConsumed').withArgs(cgId, delta);
+    await expect(tx).to.emit(CSS, 'RegistrationDepositFeeTransferred').withArgs(treasury, expectedFee);
+    expect((await Token.balanceOf(treasury)) - treasuryBefore).to.equal(expectedFee);
+    expect(await CGS.getRegistrationEscrow(cgId)).to.equal(deposit - pubAmount - delta); // 500
+  });
+
+  // --------------------------------------------------------------------------
+  // OT-RFC-53 — PARTIAL escrow: escrow covers part, wallet covers the rest; the
+  // treasury fee is charged on BOTH portions independently (no double-fee/underflow)
+  // --------------------------------------------------------------------------
+  it('OT-RFC-53: a partial-escrow publish fees the escrow AND the wallet remainder independently', async () => {
+    const Params = await hre.ethers.getContract<ParametersStorage>('ParametersStorage');
+    const CSS = await hre.ethers.getContract<ConvictionStakingStorage>('ConvictionStakingStorage');
+    const deposit = ethers.parseEther('100'); // escrow covers only PART of the 1000 publish
+    await Params.connect(accounts[0]).setContextGraphRegistrationDeposit(deposit);
+
+    const treasury = accounts[6];
+    const feeBps = 500n; // 5%
+    await Params.connect(accounts[0]).setProtocolTreasury(treasury.address);
+    await Params.connect(accounts[0]).setProtocolTreasuryFee(feeBps);
+
+    const creator = getDefaultKACreator(accounts);
+    await Token.mint(creator.address, deposit);
+    await Token.connect(creator).approve(await CGFacade.getAddress(), deposit);
+
+    const setup = await setupRegisteredAgentPublish();
+    expect(await CGS.getRegistrationEscrow(setup.cgId)).to.equal(deposit);
+
+    const tokenAmount = ethers.parseEther('1000');
+    const walletCost = tokenAmount - deposit; // 900
+    const feeEscrow = (deposit * feeBps) / 10_000n; // 5
+    const feeWallet = (walletCost * feeBps) / 10_000n; // 45
+
+    // Fund + approve the wallet remainder (direct-spend via _addTokens).
+    await Token.mint(creator.address, walletCost);
+    await Token.connect(creator).approve(await KAV10.getAddress(), walletCost);
+
+    const treasuryBefore = await Token.balanceOf(treasury.address);
+    const p = await buildBasePublishParams(setup, 'rfc53-partial-fee', {
+      epochs: setup.epochs + 1, // break PCA discount eligibility → remainder via _addTokens
+      tokenAmount,
+    });
+    const tx = KAV10.connect(creator).publish(p);
+    // Escrow (100) drawn + its fee (5) routed out; wallet remainder (900) charged
+    // its own fee (45) via _addTokens. Each portion fee'd exactly once.
+    await expect(tx).to.emit(KAV10, 'RegistrationEscrowConsumed').withArgs(setup.cgId, deposit);
+    await expect(tx).to.emit(CSS, 'RegistrationDepositFeeTransferred').withArgs(treasury.address, feeEscrow);
+    expect((await Token.balanceOf(treasury.address)) - treasuryBefore).to.equal(feeEscrow + feeWallet);
+    expect(await CGS.getRegistrationEscrow(setup.cgId)).to.equal(0n);
+  });
+
+  // --------------------------------------------------------------------------
+  // OT-RFC-53 — sweep refuses a CG that still holds live value (RS leaf-zeroing
+  // mandate: retiring a weighted CG would strand its RandomSampling leaf)
+  // --------------------------------------------------------------------------
+  it('OT-RFC-53: sweepContextGraphEscrow refuses a CG with live published value', async () => {
+    const Params = await hre.ethers.getContract<ParametersStorage>('ParametersStorage');
+    const deposit = ethers.parseEther('2000');
+    await Params.connect(accounts[0]).setContextGraphRegistrationDeposit(deposit);
+
+    const creator = getDefaultKACreator(accounts);
+    await Token.mint(creator.address, deposit);
+    await Token.connect(creator).approve(await CGFacade.getAddress(), deposit);
+
+    const { cgId, epochs, receivingNodes, publisherIdentityId, receiverIdentityIds } =
+      await setupRegisteredAgentPublish();
+
+    // Publish a KA → the CG now carries live sampling value/weight.
+    const pubAmount = ethers.parseEther('1000');
+    await KAV10.connect(creator).publish(
+      await buildPublishParams({
+        chainId: DEFAULT_CHAIN_ID,
+        kav10Address: await KAV10.getAddress(),
+        receivingNodes,
+        publisherIdentityId,
+        receiverIdentityIds,
+        author: creator,
+        contextGraphId: cgId,
+        merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('rfc53-sweep-live')),
+        knowledgeAssetsAmount: 1,
+        byteSize: 1000,
+        epochs,
+        tokenAmount: pubAmount,
+        isImmutable: false,
+        publishOperationId: 'rfc53-sweep-live-op',
+        reservedKaId: packReservedKaId(creator.address, 1),
+      }),
+    );
+
+    // Sweep is REFUSED while the CG holds live value — deactivating it would strand
+    // its RandomSampling weight. The CG stays active and its escrow intact.
+    await expect(
+      CGFacade.connect(accounts[0]).sweepContextGraphEscrow(cgId),
+    ).to.be.revertedWithCustomError(CGFacade, 'InvalidContextGraphConfig');
+    expect(await CGS.isContextGraphActive(cgId)).to.equal(true);
+    expect(await CGS.getRegistrationEscrow(cgId)).to.equal(deposit - pubAmount);
+  });
 
   // --------------------------------------------------------------------------
   // 2. registered agent publishes via real KnowledgeAssetsLifecycle.publish()
@@ -411,7 +1007,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     }
     expect(activeSinkSum).to.equal(expectedDiscounted);
 
-    // KC records the FULL tokenAmount; only the staker-pool distribution is
+    // KA records the FULL tokenAmount; only the staker-pool distribution is
     // discounted — the on-chain proof the discount branch (not direct
     // spend) executed. OT-RFC-43 Option 1 (1a): the minted kaId equals the
     // packed reservedKaId we supplied (ids are no longer globally sequential).
@@ -433,11 +1029,11 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
   // agent. The registered agent here was only ever funded for the up-front
   // `committedTRAC` (consumed by createAccount) and never approved KAV10
   // for a direct spend, so the post-expiry publish reverts with
-  // `TooLowAllowance` and no KC is created (atomic rollback). The same
+  // `TooLowAllowance` and no KA is created (atomic rollback). The same
   // agent publishing the SAME unfunded params BEFORE expiry succeeds via
   // the NFT-funded discount branch (asserted in test 2) — the revert is
   // expiry-driven, not a missing-approval artifact.
-  it('expired account: real publish() drops the discount, reverts TooLowAllowance, creates no KC', async () => {
+  it('expired account: real publish() drops the discount, reverts TooLowAllowance, creates no KA', async () => {
     const {
       creator,
       accountId,
@@ -481,7 +1077,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
       KAV10.connect(creator).publish(p),
     ).to.be.revertedWithCustomError(KAV10, 'TooLowAllowance');
 
-    // Atomic rollback: the expired publish minted no knowledge collection.
+    // Atomic rollback: the expired publish minted no knowledge asset.
     // OT-RFC-43 Option 1 (1a): `getLatestKnowledgeAssetId` is deprecated (it
     // reverts), so we assert the reserved id was never minted — `ownerOf`
     // reverts on a non-existent token.
@@ -491,11 +1087,11 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
   });
 
   // --------------------------------------------------------------------------
-  // 4. Greenfield KA invariants (KC→KA rename / PR #815)
+  // 4. Greenfield KA invariants (KA→KA rename / PR #815)
   // --------------------------------------------------------------------------
   //
   // These guard the core economic + ownership invariants of the greenfield
-  // Knowledge Asset model that the KC→KA rename re-plumbed. Before this
+  // Knowledge Asset model that the KA→KA rename re-plumbed. Before this
   // block the `KnowledgeAssetsLifecycle.publish` negatives (one-KA-per-tx,
   // strict-positive token floor) and the owner-sealed update gate had no
   // direct on-chain coverage — only happy-path publishes were exercised, so
@@ -810,6 +1406,19 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
       .withArgs(setup.cgId);
   });
 
+  it('publish: a PUBLIC CG with merkleLeafCount == 0 reverts PublicKARequiresMerkleLeafCount (F08)', async () => {
+    // A public KA is sampled against its merkleLeafCount; zero makes it
+    // unchallengeable. Rejecting it at publish stops a griefer from packing a CG
+    // with live zero-leaf KAs that burn the bounded MAX_KA_RETRIES sampling budget.
+    const setup = await setupRegisteredAgentPublish();
+    const p = await buildBasePublishParams(setup, 'public-zero-leaf', {
+      merkleLeafCount: 0,
+    });
+    await expect(KAV10.connect(setup.creator).publish(p))
+      .to.be.revertedWithCustomError(KAV10, 'PublicKARequiresMerkleLeafCount')
+      .withArgs(setup.cgId);
+  });
+
   it('update: a PARTIAL new catalog commitment (one field zero) on a curated KA reverts IncompleteCatalogCommitment', async () => {
     const setup = await setupRegisteredAgentPublish();
     const curatedCgId = await createCuratedContextGraphFor(setup.creator);
@@ -966,6 +1575,63 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
       .withArgs(setup.cgId);
   });
 
+  it('update: a PUBLIC CG update with newMerkleLeafCount == 0 reverts PublicKARequiresMerkleLeafCount (F08)', async () => {
+    // A content update must keep a public KA challengeable — zeroing its leaf
+    // count would strand it from the sampling draw (pure top-ups/extends use a
+    // different path, so they are unaffected).
+    const setup = await setupRegisteredAgentPublish();
+    const storageOperator = accounts[19];
+    await HubContract.setContractAddress(
+      'TestStorageOperator',
+      storageOperator.address,
+    );
+
+    const currentEpoch = await Chronos.getCurrentEpoch();
+    const endEpoch = currentEpoch + BigInt(setup.epochs);
+    const initialTokenAmount = ethers.parseEther('1000');
+    const kaId = packReservedKaId(setup.creator.address, 813);
+    await DKGKnowledgeAssets.connect(storageOperator).createKnowledgeAsset(
+      storageOperator.address,
+      setup.creator.address,
+      kaId,
+      'public-update-zero-op',
+      ethers.keccak256(ethers.toUtf8Bytes('public-update-zero')),
+      1,
+      1000,
+      currentEpoch,
+      endEpoch,
+      initialTokenAmount,
+      false,
+      1,
+    );
+    await CGS.connect(storageOperator).registerKnowledgeAssetToContextGraph(
+      setup.cgId,
+      kaId,
+    );
+
+    const up = await buildUpdateParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes: setup.receivingNodes,
+      publisherIdentityId: setup.publisherIdentityId,
+      receiverIdentityIds: setup.receiverIdentityIds,
+      contextGraphId: setup.cgId,
+      id: kaId,
+      preUpdateMerkleRootCount: 1n,
+      newMerkleRoot: ethers.keccak256(ethers.toUtf8Bytes('public-update-zero-root')),
+      newMerkleLeafCount: 0, // F08: zeroing strands the KA from sampling
+      newByteSize: 1000n,
+      newTokenAmount: initialTokenAmount + ethers.parseEther('1'),
+      mintKnowledgeAssetsAmount: 0n,
+      knowledgeAssetsToBurn: [],
+      updateOperationId: 'public-update-zero-op',
+      author: setup.creator,
+    });
+    await expect(KAV10.connect(setup.creator).update(up))
+      .to.be.revertedWithCustomError(KAV10, 'PublicKARequiresMerkleLeafCount')
+      .withArgs(setup.cgId);
+  });
+
   it('update: metadata-only maintenance of a legacy uncommitted curated KA stays allowed without a commitment', async () => {
     const setup = await setupRegisteredAgentPublish();
     const curatedCgId = await createCuratedContextGraphFor(setup.creator);
@@ -1085,6 +1751,141 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     await expect(KAV10.connect(setup.creator).update(up))
       .to.be.revertedWithCustomError(KAV10, 'NotKnowledgeAssetOwner')
       .withArgs(kaId, setup.creator.address, nonOwner.address);
+  });
+
+  it('G-7 (guard invariant): the _executeUpdateCore value-write gate rejects a paid update to an inactive CG (inactive state seeded directly)', async () => {
+    // GUARD INVARIANT (low-level). The _executeUpdateCore value-write branch is
+    // gated on isContextGraphActive, so a paid update to an INACTIVE CG reverts
+    // regardless of HOW the CG became inactive. Here the inactive state is seeded
+    // DIRECTLY via the storage operator — a unit/corruption construction, NOT the
+    // production sweep state: sweepContextGraphEscrow REFUSES a CG with live value
+    // (see the OT-RFC-53 refusal test above), so it can never produce
+    // inactive-WITH-live-value. On the update path the inactive-CG gate is in fact
+    // defense-in-depth: the only reachable way to a sweep-inactive CG also expires
+    // every KA in it, so a real paid update is stopped by KnowledgeAssetExpired
+    // first (proven by the companion test below). Seeding the inactive state
+    // directly is therefore the only way to exercise the gate itself in isolation,
+    // which is what this test does.
+    const setup = await setupRegisteredAgentPublish();
+    const p = await buildBasePublishParams(setup, 'g7-update-gate'); // publishes at 1000 TRAC
+    await (await KAV10.connect(setup.creator).publish(p)).wait();
+    const kaId = BigInt(p.reservedKaId);
+
+    // Seed the inactive state directly via the storage operator (onlyContracts seeder).
+    const storageOperator = accounts[19];
+    await HubContract.setContractAddress('TestStorageOperator', storageOperator.address);
+    await (await CGS.connect(storageOperator).deactivateContextGraph(setup.cgId)).wait();
+    expect(await CGS.isContextGraphActive(setup.cgId)).to.equal(false);
+
+    // Fund the creator so the paid-update consume can't be the thing that reverts.
+    await Token.mint(setup.creator.address, ethers.parseEther('10'));
+    await Token.connect(setup.creator).approve(await KAV10.getAddress(), ethers.parseEther('10'));
+
+    // A paid update (positive token delta) reaches _executeUpdateCore's value-write
+    // branch, now gated on isContextGraphActive — so it reverts instead of
+    // re-stranding sampling weight onto the retired CG.
+    const up = await buildUpdateParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes: setup.receivingNodes,
+      publisherIdentityId: setup.publisherIdentityId,
+      receiverIdentityIds: setup.receiverIdentityIds,
+      contextGraphId: setup.cgId,
+      id: kaId,
+      preUpdateMerkleRootCount: 1n,
+      newMerkleRoot: ethers.keccak256(ethers.toUtf8Bytes('g7-update-gate-new')),
+      newByteSize: 1000n,
+      newTokenAmount: ethers.parseEther('1001'), // > published 1000 => positive delta
+      mintKnowledgeAssetsAmount: 0n,
+      knowledgeAssetsToBurn: [],
+      updateOperationId: 'g7-update-gate-op',
+      author: setup.creator,
+    });
+    await expect(KAV10.connect(setup.creator).update(up)).to.be.revertedWithCustomError(
+      KAV10,
+      'CannotWriteValueToInactiveContextGraph',
+    );
+  });
+
+  it('G-7 (reachable path): a paid update onto a sweep-retired CG is independently blocked by KnowledgeAssetExpired — the inactive-CG gate is defense-in-depth behind it', async () => {
+    // The REACHABLE retirement, and what it actually does on the UPDATE path.
+    // sweepContextGraphEscrow deactivates a CG ONLY after its published value has
+    // decayed to zero (it settles the sampling leaf and REFUSES while
+    // getCurrentCGValue != 0 — the OT-RFC-53 refusal above). But "CG value == 0"
+    // means EVERY KA in the CG has expired, so on the update path a paid update is
+    // independently rejected by KnowledgeAssetExpired BEFORE _executeUpdateCore's
+    // value-write branch (hence the inactive-CG gate) is ever reached. That gate is
+    // therefore defense-in-depth on the update path — exercised in isolation by the
+    // guard-invariant test above, and reachably exercised on the EXTEND path (which
+    // CAN revive an expired KA) by g7-inactive-cg-restrand.regression.test.ts. This
+    // test pins the real, reachable sequence end-to-end: publish -> live-value sweep
+    // refused -> value expiry -> sweep retires the CG -> paid update reverts
+    // KnowledgeAssetExpired.
+    const Params = await hre.ethers.getContract<ParametersStorage>('ParametersStorage');
+    const CGVS = await hre.ethers.getContract<ContextGraphValueStorage>(
+      'ContextGraphValueStorage',
+    );
+    const deposit = ethers.parseEther('2000');
+    await Params.connect(accounts[0]).setContextGraphRegistrationDeposit(deposit);
+
+    const creator = getDefaultKACreator(accounts);
+    await Token.mint(creator.address, deposit);
+    await Token.connect(creator).approve(await CGFacade.getAddress(), deposit);
+
+    const setup = await setupRegisteredAgentPublish();
+    const p = await buildBasePublishParams(setup, 'g7-sweep-reachable'); // 1000 TRAC, setup.epochs lifetime
+    await (await KAV10.connect(setup.creator).publish(p)).wait();
+    const kaId = BigInt(p.reservedKaId);
+    expect(await CGS.getRegistrationEscrow(setup.cgId)).to.equal(
+      deposit - ethers.parseEther('1000'),
+    );
+
+    // While the published value is live, sweep is REFUSED — this is exactly why
+    // the direct-deactivation state in the guard-invariant test is unreachable.
+    await expect(
+      CGFacade.connect(accounts[0]).sweepContextGraphEscrow(setup.cgId),
+    ).to.be.revertedWithCustomError(CGFacade, 'InvalidContextGraphConfig');
+    expect(await CGS.isContextGraphActive(setup.cgId)).to.equal(true);
+
+    // Let the published value expire so the CG becomes genuinely sweepable.
+    const epochLength = await Chronos.epochLength();
+    await time.increase(Number(epochLength) * (setup.epochs + 1));
+    expect(await CGVS.getCurrentCGValue(setup.cgId)).to.equal(0n);
+
+    // The REAL retirement path now succeeds: sweep settles the (zero) leaf and
+    // deactivates the CG, leaving exactly the inactive state production produces.
+    await (await CGFacade.connect(accounts[0]).sweepContextGraphEscrow(setup.cgId)).wait();
+    expect(await CGS.isContextGraphActive(setup.cgId)).to.equal(false);
+
+    // Fund a direct-spend paid update (post-expiry the PCA discount is gone), so
+    // the revert can only be the inactive-CG gate, not a funding shortfall.
+    await Token.mint(setup.creator.address, ethers.parseEther('2000'));
+    await Token.connect(setup.creator).approve(
+      await KAV10.getAddress(),
+      ethers.parseEther('2000'),
+    );
+
+    const up = await buildUpdateParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes: setup.receivingNodes,
+      publisherIdentityId: setup.publisherIdentityId,
+      receiverIdentityIds: setup.receiverIdentityIds,
+      contextGraphId: setup.cgId,
+      id: kaId,
+      preUpdateMerkleRootCount: 1n,
+      newMerkleRoot: ethers.keccak256(ethers.toUtf8Bytes('g7-sweep-reachable-new')),
+      newByteSize: 1000n,
+      newTokenAmount: ethers.parseEther('1001'), // positive delta => value-write branch
+      mintKnowledgeAssetsAmount: 0n,
+      knowledgeAssetsToBurn: [],
+      updateOperationId: 'g7-sweep-reachable-op',
+      author: setup.creator,
+    });
+    await expect(KAV10.connect(setup.creator).update(up)).to.be.revertedWithCustomError(
+      KAV10,
+      'KnowledgeAssetExpired',
+    );
   });
 
   // --------------------------------------------------------------------------
@@ -1268,7 +2069,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
   // --------------------------------------------------------------------------
   // 7. OT-RFC-43 Option 1 (variant 1a) — caller-supplied, author-namespaced
   //    KA ids (§B5). The KA id is now a deterministic packed value
-  //    `(uint160(author) << 96) | uint96(number)` chosen off-chain. KCS
+  //    `(uint160(author) << 96) | uint96(number)` chosen off-chain. KAS
   //    enforces `(reservedKaId >> 96) == author` (the EIP-712 attestation
   //    signer / NFT mint recipient, NOT msg.sender) so a wallet can only mint
   //    in its own namespace; a re-used id reverts (no silent clobber); the old

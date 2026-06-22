@@ -1398,6 +1398,14 @@ export class ContextGraphMethods extends DKGAgentBase {
       subject: contextGraphUri,
       predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS,
     });
+    // Single-valued binding guard (RS heal): the on-chain id is immutable, so
+    // clear any prior value before insert — the cgId resolver / heal read this
+    // and must never see a multi-valued (LIMIT-1-nondeterministic) binding.
+    await this.store.deleteByPattern({
+      graph: ontologyGraph,
+      subject: contextGraphUri,
+      predicate: `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId`,
+    });
     await this.store.insert([
       { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS, object: `"registered"`, graph: cgMetaGraph },
       { subject: contextGraphUri, predicate: `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId`, object: `"${onChainId}"`, graph: ontologyGraph },

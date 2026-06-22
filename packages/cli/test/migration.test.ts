@@ -194,6 +194,20 @@ describe('migrateToBlueGreen', () => {
     expect(existsSync(join(dkgHome, 'wallets.json'))).toBe(true);
   });
 
+  it('loads migration network defaults from config.networkConfig', async () => {
+    let selectedNetwork: string | undefined;
+    _migrationIo.loadConfig = async () => ({ networkConfig: 'mainnet-base' });
+    _migrationIo.loadNetworkConfig = async (network?: string) => {
+      selectedNetwork = network;
+      return undefined;
+    };
+
+    const log = makeLog();
+    await migrateToBlueGreen(log.fn);
+
+    expect(selectedNetwork).toBe('mainnet-base');
+  });
+
   it('logs migration progress', async () => {
     const log = makeLog();
     await migrateToBlueGreen(log.fn);

@@ -2,12 +2,12 @@ import type { Quad, TripleStore } from '@origintrail-official/dkg-storage';
 import type { ChainAdapter, OnChainPublishResult, AddBatchToContextGraphParams } from '@origintrail-official/dkg-chain';
 import { enrichEvmError } from '@origintrail-official/dkg-chain';
 import type { EventBus, OperationContext } from '@origintrail-official/dkg-core';
-import { DKGEvent, Logger, createOperationContext, sha256, encodeWorkspacePublishRequest, encodeEncryptedWorkspacePayload, encryptWorkspacePayload, contextGraphDataUri, contextGraphDataGraphUri, contextGraphMetaUri, contextGraphAssertionUri, contextGraphLayerUri, MemoryLayer, assertionLifecycleUri, contextGraphSubGraphUri, contextGraphSubGraphMetaUri, SYSTEM_CONTEXT_GRAPHS, validateSubGraphName, isSafeIri, assertSafeIri, assertSafeRdfTerm, DKG_GOSSIP_MAX_MESSAGE_BYTES, SwmGossipPayloadTooLargeError, type Ed25519Keypair, buildAuthorAttestationTypedData, buildUpdateAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1, TrustLevel, TRUST_LEVEL_PREDICATE, assertNoUserAuthoredTrustLevelQuads, buildTrustLevelQuads, isTrustLevelQuad, DKG_ENTITY, DKG_ROOT_ENTITY_LEGACY, ENTITY_PRED_ALT, parseAssertionSealQuads, sharedMemoryReadBothFilter } from '@origintrail-official/dkg-core';
+import { DKGEvent, Logger, createOperationContext, sha256, encodeWorkspacePublishRequest, encodeEncryptedWorkspacePayload, encryptWorkspacePayload, contextGraphDataUri, contextGraphDataGraphUri, contextGraphMetaUri, contextGraphAssertionUri, contextGraphLayerUri, MemoryLayer, assertionLifecycleUri, contextGraphSubGraphUri, contextGraphSubGraphMetaUri, SYSTEM_CONTEXT_GRAPHS, validateSubGraphName, isSafeIri, assertSafeIri, assertSafeRdfTerm, DKG_GOSSIP_MAX_MESSAGE_BYTES, SwmGossipPayloadTooLargeError, type Ed25519Keypair, buildAuthorAttestationTypedData, buildUpdateAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1, TrustLevel, TRUST_LEVEL_PREDICATE, assertNoUserAuthoredTrustLevelQuads, buildTrustLevelQuads, isTrustLevelQuad, DKG_ENTITY, DKG_ROOT_ENTITY_LEGACY, ENTITY_PRED_ALT, parseAssertionSealQuads, ASSERTION_SEAL_PREDICATES, sharedMemoryReadBothFilter } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore } from '@origintrail-official/dkg-storage';
 import { DEFAULT_PUBLISH_EPOCHS, MAX_PUBLISH_EPOCHS, type Publisher, type PublishOptions, type PublishResult, type KAManifestEntry, type PhaseCallback, type V10CoreNodeACK } from './publisher.js';
 import { skolemizeByEntity } from './auto-partition.js';
 import { canonicalPublishPayload } from './canonical-publish-payload.js';
-import { partitionCatalogQuads, catalogCommittedLeaves, computeCatalogRoot, contextGraphCatalogUri } from '@origintrail-official/dkg-core';
+import { partitionCatalogQuads, catalogCommittedLeaves, computeCatalogRoot, contextGraphCatalogUri, isAgentRegistryContextGraph } from '@origintrail-official/dkg-core';
 import { RESERVED_SUBJECT_PREFIXES, findReservedSubjectPrefix, isReservedSubject } from './reserved-subjects.js';
 import { skolemize } from './skolemize.js';
 import {
@@ -17,14 +17,21 @@ import {
   computeFlatKCMerkleLeafCountV10,
 } from './merkle.js';
 import { validatePublishRequest } from './validation.js';
+import { isFailClosedInlineEncrypt } from './async-lift-publish-options.js';
 import {
   generateConfirmedFullMetadata,
+  buildDeterministicTokenRows,
+  compareRootIris,
   generateOwnershipQuads,
   generateAssertionCreatedMetadata,
   generateAssertionPromotedMetadata,
   generateAssertionDiscardedMetadata,
   generateTentativeMetadata,
+  WM_CURRENT_ASSERTION_PRED,
+  SWM_CURRENT_ASSERTION_PRED,
+  VM_CURRENT_ASSERTION_PRED,
   toHex,
+  buildScopedMinimalMeta,
   resolveUalByBatchId,
   promoteUpdatedKaToPerCgId,
   restateLabelGraphForUpdate,
@@ -65,6 +72,12 @@ export {
 };
 
 const WORKSPACE_OWNER_PREDICATE = 'http://dkg.io/ontology/workspaceOwner';
+
+// #1116 (review A1) — marker predicate stamped on the lifecycle URN when a KA
+// has been FULLY shared to SWM (entities:"all", all roots landed). It gates
+// finalize(layer:"swm") so a subset share — which also stamps dkg:rootEntity
+// member rows — cannot be sealed-in-SWM and published as a partial asset.
+const SWM_SHARE_COMPLETE_PRED = 'http://dkg.io/ontology/swmShareComplete';
 
 async function listGraphFamily(store: TripleStore, rootGraph: string): Promise<string[]> {
   const graphs = await listGraphsByPrefix(store, `${rootGraph}/`);
@@ -1299,9 +1312,16 @@ export class DKGPublisher implements Publisher {
         const hasOnChainId = onChainResult.type === 'bindings' && onChainResult.bindings.length > 0;
 
         if (!hasOnChainId) {
-          throw new Error(
-            `Context graph "${contextGraphId}" is not registered on-chain. ` +
-            `Run 'dkg context-graph register ${contextGraphId}' first to enable Verifiable Memory publishing.`,
+          // #1116 (review B): carry a stable `code` so route matchers no longer
+          // have to key on the message text. The MESSAGE stays verbatim — the
+          // e2e test (rejects.toThrow(/not registered on-chain/i)) and back-compat
+          // route fallbacks still rely on it.
+          throw Object.assign(
+            new Error(
+              `Context graph "${contextGraphId}" is not registered on-chain. ` +
+              `Run 'dkg context-graph register ${contextGraphId}' first to enable Verifiable Memory publishing.`,
+            ),
+            { code: 'CG_NOT_REGISTERED' },
           );
         }
       }
@@ -1590,50 +1610,10 @@ export class DKGPublisher implements Publisher {
           //   - `dkg:materializedVersion` is stamped below.
           // The RS prover and the backfill route are read-both, so old
           // wholesale-copied partitions keep working.
-          const DKG_ONT = 'http://dkg.io/ontology/';
-          const XSD_INT = 'http://www.w3.org/2001/XMLSchema#integer';
           const partitionKaId = publishResult.onChainResult!.kaId ?? publishResult.onChainResult!.batchId;
-          const minimalMeta: Quad[] = [
-            { subject: ual, predicate: `${DKG_ONT}batchId`, object: `"${partitionKaId}"^^<${XSD_INT}>`, graph: ctxMetaGraph },
-            { subject: ual, predicate: `${DKG_ONT}merkleRoot`, object: `"${toHex(publishResult.merkleRoot)}"`, graph: ctxMetaGraph },
-          ];
-          const seenPartitionRoots = new Set<string>();
-          const seenPartitionPrivRoots = new Set<string>();
-          // Codex review "multi-root-access" (restateKaPartition parity):
-          // MULTI-root publishes additionally re-emit the legacy
-          // `<ual>/<tokenId>` token rows so the root↔privateMerkleRoot
-          // pairing stays recoverable; single-root keeps the full collapse.
-          const partitionMultiRoot =
-            new Set(publishResult.kaManifest.map((ka) => ka.rootEntity)).size > 1;
-          for (const ka of publishResult.kaManifest) {
-            if (!seenPartitionRoots.has(ka.rootEntity)) {
-              seenPartitionRoots.add(ka.rootEntity);
-              // RFC ka-metadata-trim Phase 2: single member row (the §10.1
-              // dual-write was collapsed back to `dkg:rootEntity`; readers
-              // stay read-both for dual-written replica rows).
-              minimalMeta.push(
-                { subject: ual, predicate: DKG_ROOT_ENTITY_LEGACY, object: ka.rootEntity, graph: ctxMetaGraph },
-              );
-            }
-            if (ka.privateMerkleRoot && ka.privateMerkleRoot.length > 0) {
-              const privHex = toHex(ka.privateMerkleRoot);
-              if (!seenPartitionPrivRoots.has(privHex)) {
-                seenPartitionPrivRoots.add(privHex);
-                minimalMeta.push({ subject: ual, predicate: `${DKG_ONT}privateMerkleRoot`, object: `"${privHex}"`, graph: ctxMetaGraph });
-              }
-            }
-            if (partitionMultiRoot) {
-              const kaUri = `${ual}/${ka.tokenId}`;
-              minimalMeta.push(
-                { subject: kaUri, predicate: DKG_ROOT_ENTITY_LEGACY, object: ka.rootEntity, graph: ctxMetaGraph },
-                { subject: kaUri, predicate: `${DKG_ONT}partOf`, object: ual, graph: ctxMetaGraph },
-              );
-              if (ka.privateMerkleRoot && ka.privateMerkleRoot.length > 0) {
-                minimalMeta.push({ subject: kaUri, predicate: `${DKG_ONT}privateMerkleRoot`, object: `"${toHex(ka.privateMerkleRoot)}"`, graph: ctxMetaGraph });
-              }
-            }
-          }
-          await this.store.insert(minimalMeta);
+          await this.store.insert(
+            buildScopedMinimalMeta(ual, partitionKaId, publishResult.merkleRoot, publishResult.kaManifest, ctxMetaGraph),
+          );
         }
 
         // Stamp the publish version so a later update can compare against it
@@ -1650,34 +1630,13 @@ export class DKGPublisher implements Publisher {
     // Published triples must not linger in SWM — they live in LTM now.
     // clearSharedMemoryAfter controls only whether the REMAINING unpublished triples are also cleared.
     if (publishResult.status === 'confirmed') {
-      const swmMetaGraph = this.graphManager.sharedMemoryMetaUri(contextGraphId, options?.subGraphName);
       const swmOwnershipKey = options?.subGraphName ? `${contextGraphId}\0${options.subGraphName}` : contextGraphId;
       const kaMap = skolemizeByEntity(quads);
-      let ownerDeletedTotal = 0;
-      // Uniform layout: published data lives in per-KA …/_shared_memory/{addr}/{number}
-      // graphs, so the cleanup must span all of them (+ the legacy bucket).
-      const swmGraphsForClear = await this.swmGraphsUnder(swmGraph);
-      for (const rootEntity of kaMap.keys()) {
-        for (const g of swmGraphsForClear) {
-          await this.store.deleteByPattern({ graph: g, subject: rootEntity });
-          await this.store.deleteBySubjectPrefix(g, rootEntity + '/.well-known/genid/');
-          await this.store.deleteByPattern({
-            graph: g, subject: rootEntity, predicate: WORKSPACE_OWNER_PREDICATE,
-          });
-        }
-        const ownerDeleted = await this.store.deleteByPattern({
-          graph: swmMetaGraph, subject: rootEntity, predicate: WORKSPACE_OWNER_PREDICATE,
-        });
-        ownerDeletedTotal += ownerDeleted;
-        await this.deleteMetaForRoot(swmMetaGraph, rootEntity);
-        this.sharedMemoryOwnedEntities.get(swmOwnershipKey)?.delete(rootEntity);
-      }
-      if (ownerDeletedTotal > 0) {
-        this.log.info(ctx, `Cleared ${ownerDeletedTotal} published SWM triple(s) after confirmed publish`);
-      }
+      await this.clearPublishedSwmRoots(contextGraphId, [...kaMap.keys()], options?.subGraphName, ctx);
       // If clearSharedMemoryAfter is explicitly true, also clear any remaining unpublished content.
       // Default is false: unpublished entities stay in SWM for future publishes.
       if (options?.clearSharedMemoryAfter === true) {
+        const swmMetaGraph = this.graphManager.sharedMemoryMetaUri(contextGraphId, options?.subGraphName);
         let remainingCount = 0;
         for (const g of await this.swmGraphsUnder(swmGraph)) {
           remainingCount += await this.store.deleteByPattern({ graph: g });
@@ -1918,8 +1877,19 @@ export class DKGPublisher implements Publisher {
     // many entities it contains. The on-chain KA count and ACK digest stay at
     // one below, while these token IDs remain compatibility labels for
     // per-root response/meta subjects (`<ual>/1`, `<ual>/2`, ...).
+    // GH #936 — mint the compatibility tokenIds over a CANONICAL (lexicographic
+    // by rootEntity) order, the SAME order the replica reconcile/gossip path
+    // uses in `FinalizationHandler.promoteSharedMemoryToCanonical`. Without this,
+    // the ORIGINATOR would label `<ual>/<tokenId>` by input-quad order while
+    // replicas label by sorted order, so a multi-root KC could resolve a
+    // different root for the same token label depending on which node a client
+    // queries. These tokenIds are non-on-chain compatibility labels (the
+    // on-chain KA count is 1), so a content-derived sort is safe.
+    const orderedEntries = [...canonical.manifestEntries].sort((a, b) =>
+      compareRootIris(a.rootEntity, b.rootEntity),
+    );
     let compatibilityTokenId = 1n;
-    for (const entry of canonical.manifestEntries) {
+    for (const entry of orderedEntries) {
       const tokenId = compatibilityTokenId++;
       manifestEntries.push({
         tokenId,
@@ -1957,7 +1927,7 @@ export class DKGPublisher implements Publisher {
     if (kcMerkleLeafCount > 0xffffffff) {
       throw new Error(`V10 merkleLeafCount exceeds uint32: ${kcMerkleLeafCount}`);
     }
-    this.log.info(ctx, `Computed kcMerkleRoot (flat) over ${allSkolemizedQuads.length} triple hashes + ${privateRoots.length} private root(s), leafCount=${kcMerkleLeafCount}`);
+    this.log.info(ctx, `Computed kcMerkleRoot (structured: hashPair(publicRoot, privateDataHash)) over ${allSkolemizedQuads.length} public triple hashes + ${privateRoots.length} private root(s), public leafCount=${kcMerkleLeafCount}`);
     // Design B: a publish mints exactly ONE KA regardless of entity count.
     // `entityCount` is informational; `kaCount` is what goes on chain as
     // `knowledgeAssetsAmount` (the contract requires == 1) and into the ACK
@@ -1998,14 +1968,31 @@ export class DKGPublisher implements Publisher {
     // to ACK / chain digests — moving it past the chain-success branch
     // would risk a race where the publisher returns 'confirmed' before
     // its own private store has the data.
-    for (const entry of canonical.manifestEntries) {
-      const entityPrivateQuads = privateQuads.filter(
-        (q) => q.subject === entry.rootEntity || q.subject.startsWith(entry.rootEntity + '/.well-known/genid/'),
-      );
-      if (entityPrivateQuads.length > 0) {
-        await this.privateStore.storePrivateTriples(contextGraphId, entry.rootEntity, entityPrivateQuads, options.subGraphName);
+    // GH #1078 — persist the finalized private slices. DEFERRED to the terminal
+    // branches (post-chain-confirmation, or the intentional-local finalize) and
+    // NEVER run on the chain-failure path. Because `storePrivateTriples(…,
+    // commitmentId)` now SUPERSEDES a root's prior private slice when the
+    // commitment differs, running it pre-chain would let a failed/rejected
+    // re-publish delete the private data of the still-current KA while the chain
+    // still points at the old version. Gating it on confirmation keeps the
+    // private store consistent with the committed `privateMerkleRoot`, and
+    // invoking it BEFORE the publish returns 'confirmed' preserves the
+    // no-"confirmed-before-data" guarantee the pre-chain insert used to give.
+    const persistFinalizedPrivateSlices = async (): Promise<void> => {
+      for (const entry of canonical.manifestEntries) {
+        const entityPrivateQuads = privateQuads.filter(
+          (q) => q.subject === entry.rootEntity || q.subject.startsWith(entry.rootEntity + '/.well-known/genid/'),
+        );
+        if (entityPrivateQuads.length > 0) {
+          // Tag the stored slice with the commitment this root committed (its
+          // privateMerkleRoot) so a later re-publish supersedes the stale slice.
+          const commitmentId = entry.privateMerkleRoot
+            ? Buffer.from(entry.privateMerkleRoot).toString('hex')
+            : undefined;
+          await this.privateStore.storePrivateTriples(contextGraphId, entry.rootEntity, entityPrivateQuads, options.subGraphName, commitmentId);
+        }
       }
-    }
+    };
 
     onPhase?.('store', 'end');
 
@@ -2122,7 +2109,19 @@ export class DKGPublisher implements Publisher {
     // with NO_DATA_IN_SWM — the exact bug §1.1 surfaces. Public CGs keep
     // the existing behaviour: `fromSharedMemory` → cores look up SWM
     // locally; otherwise plaintext inline.
-    const useEncryptedInline = typeof options.encryptInlinePayload === 'function';
+    // GH #1121 — take the encrypted-inline path whenever a REAL encryption
+    // callback is wired. The ONE exception: skip the async-lift mapper's
+    // fail-closed DEFAULT on a chainless / local-only publish (ownerOnly KA on
+    // an unregistered CG, chain-not-ready node, …). Such a publish ships nothing
+    // to other nodes, so there is no plaintext-to-cores leak to guard — and the
+    // default (which exists only to prevent that leak) cannot resolve a real
+    // chain-key off-chain, so invoking it would needlessly fail a legitimate
+    // local publish. For an actual on-chain publish the default still fires
+    // (fail-closed): a private payload is never shipped to cores in the clear.
+    const inlineEncryptCb = options.encryptInlinePayload;
+    const useEncryptedInline =
+      typeof inlineEncryptCb === 'function'
+      && (canAttemptOnChainPublish || !isFailClosedInlineEncrypt(inlineEncryptCb));
     // OT-RFC-49 / WS-D — a curated publish is now identified by a non-zero
     // catalog commitment. The on-chain commitment + the core ACK verify the
     // PUBLIC `_catalog`; the PRIVATE data stays encrypted for MEMBERS only.
@@ -2562,7 +2561,16 @@ export class DKGPublisher implements Publisher {
       }
       this.log.info(ctx, `Storing ${normalizedQuads.length} triples in local store (${reasonLog})`);
       await this.store.insert(normalizedQuads);
-      await this.store.insert(tentativeMeta);
+      // GH #1078 — persist private slices on this intentional-local terminal
+      // branch too (a chainless / ownerOnly publish still finalizes here).
+      await persistFinalizedPrivateSlices();
+      // #1233 — the agents registry CG never confirms on-chain and its
+      // per-publish tentative `_meta` record has no consumer (agent facts are
+      // served from the DATA graph); persisting one per heartbeat would grow
+      // `agents/_meta` without bound and stall offset-0 sync. Skip it there.
+      if (!isAgentRegistryContextGraph(contextGraphId)) {
+        await this.store.insert(tentativeMeta);
+      }
       // B3: only now that the local publish has persisted do we refresh the
       // public catalog entry (CLEAR/REPLACE — see persistCatalogEntry).
       await persistCatalogEntry();
@@ -2591,11 +2599,17 @@ export class DKGPublisher implements Publisher {
     const noPathToOnChainACKs =
       hasPrivateData && (!v10ACKs || v10ACKs.length === 0);
 
+    // GH #1013 — record WHY a local-only publish skipped chain so the async
+    // lift can tell an honest local finalization (no chain) from a private
+    // publish that failed to reach the chain it should have.
+    let localChainSkipReason: 'no-chain' | 'private-no-acks' | undefined;
     if (publisherContextGraphId === undefined) {
       this.log.warn(ctx, `No positive on-chain context graph id resolved from "${v10CgDomain}" — skipping on-chain publish`);
+      localChainSkipReason = 'no-chain';
       await finalizeIntentionalLocalPublish('no on-chain CG id');
     } else if (!chainV10Ready) {
       this.log.warn(ctx, 'Chain adapter is not V10-ready — skipping on-chain publish');
+      localChainSkipReason = 'no-chain';
       await finalizeIntentionalLocalPublish('chain not V10-ready');
     } else if (noPathToOnChainACKs) {
       const reason = 'private data — no ACKs collectable (peers cannot see private payloads)';
@@ -2603,6 +2617,7 @@ export class DKGPublisher implements Publisher {
         ctx,
         `Skipping on-chain submission: ${reason}. Storing locally as tentative.`,
       );
+      localChainSkipReason = 'private-no-acks';
       await finalizeIntentionalLocalPublish(reason);
     } else {
       const tokenAmount = precomputedTokenAmount;
@@ -2637,10 +2652,12 @@ export class DKGPublisher implements Publisher {
       ) {
         const effectiveAuthorAddress = options.precomputedAttestation.authorAddress;
         const effectiveSchemeVersion = options.precomputedAttestation.schemeVersion;
+        // #1116: the seal is CG-independent — the AuthorAttestation no longer
+        // binds the on-chain CG id. v10CgId is still submitted to the contract
+        // (createKnowledgeAssets below) as the mint target / publisher-auth gate.
         const authorTypedData = buildAuthorAttestationTypedData({
           chainId: v10ChainId,
           kav10Address: v10KavAddress,
-          contextGraphId: v10CgId,
           merkleRoot: kcMerkleRoot,
           authorAddress: effectiveAuthorAddress,
           reservedKaId: options.precomputedAttestation.reservedKaId,
@@ -2740,10 +2757,12 @@ export class DKGPublisher implements Publisher {
         }
         const effectiveAuthorAddress = options.precomputedAttestation.authorAddress;
         const effectiveSchemeVersion = options.precomputedAttestation.schemeVersion;
+        // #1116: the seal is CG-independent — the AuthorAttestation no longer
+        // binds the on-chain CG id. v10CgId is still submitted to the contract
+        // (createKnowledgeAssets below) as the mint target / publisher-auth gate.
         const authorTypedData = buildAuthorAttestationTypedData({
           chainId: v10ChainId,
           kav10Address: v10KavAddress,
-          contextGraphId: v10CgId,
           merkleRoot: kcMerkleRoot,
           authorAddress: effectiveAuthorAddress,
           reservedKaId: options.precomputedAttestation.reservedKaId,
@@ -2942,6 +2961,15 @@ export class DKGPublisher implements Publisher {
             chainId: this.chain.chainId,
           },
         );
+        // GH #936 — append the SHARED deterministic per-root token rows (the
+        // same helper the gossip / chain-reconcile path uses) so the originator
+        // exposes the IDENTICAL `<ual>/<tokenId>` → root map as replicas. kaMetadata
+        // is already in canonical (sorted) tokenId order. graph = default
+        // `<cg>/_meta` so the remap below routes them to the per-cgId `_meta`.
+        confirmedQuads = [
+          ...confirmedQuads,
+          ...buildDeterministicTokenRows(ual, kaMetadata, `did:dkg:context-graph:${contextGraphId}/_meta`),
+        ];
         if (options.targetMetaGraphUri) {
           const defaultMeta = `did:dkg:context-graph:${contextGraphId}/_meta`;
           confirmedQuads = confirmedQuads.map((q) =>
@@ -2967,6 +2995,10 @@ export class DKGPublisher implements Publisher {
         this.log.info(ctx, `Storing ${vmQuads.length} triples in ${vmGraph} (post-confirmation)`);
         await this.store.insert(vmQuads);
         await this.store.insert(confirmedQuads);
+        // GH #1078 — supersede/persist private slices only now that the chain
+        // has confirmed (before returning 'confirmed', so no read sees the KA
+        // confirmed without its private data).
+        await persistFinalizedPrivateSlices();
         await stampTrustLevel(
           this.store,
           vmGraph,
@@ -3031,6 +3063,30 @@ export class DKGPublisher implements Publisher {
         this.ownedEntities.get(confirmOwnershipKey)!.add(e.rootEntity);
       }
       this.knownBatchContextGraphs.set(String(onChainResult.batchId), contextGraphId);
+      // RS prevention (GH #1264): self-promote the confirmed KC into the SCOPED
+      // context-graph graphs the Random Sampling prover reads. The one-shot
+      // `dkg publish --file` path otherwise leaves the KC only in the legacy
+      // label graphs, so every prover tick reports `kc-not-synced` and no proof
+      // ever lands. Best-effort — the KC is already on-chain, so a promote error
+      // must NOT fail the publish (the layer-3 heal backstop is the fallback).
+      // Skipped for sub-graph publishes (RS samples root CGs; sub-graph KCs use a
+      // different layout); remap is not applicable on this one-shot path.
+      if (!options.subGraphName) {
+        try {
+          await this.promoteConfirmedKCToScopedGraph(
+            contextGraphId,
+            onChainResult,
+            ual,
+            kcMerkleRoot,
+            manifestEntries,
+            allSkolemizedQuads,
+            publisherContextGraphId,
+            ctx,
+          );
+        } catch (err) {
+          this.log.warn(ctx, `RS scoped-promote failed for ${ual} (heal backstop will retry): ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
       onPhase?.('chain:metadata', 'end');
     }
 
@@ -3043,6 +3099,7 @@ export class DKGPublisher implements Publisher {
       kaManifest: manifestEntries,
       status,
       onChainResult,
+      localChainSkipReason, // GH #1013
       publicQuads: allSkolemizedQuads,
       v10ACKs,
       v10Origin: usedV10Path,
@@ -3055,6 +3112,104 @@ export class DKGPublisher implements Publisher {
       tripleCount: allSkolemizedQuads.length,
     });
     return result;
+  }
+
+  /**
+   * RS prevention (GH #1264) — self-promote a confirmed one-shot `publish()`
+   * into the SCOPED context-graph graphs the Random Sampling prover reads
+   * (`<NAME>/context/<cgId>/_meta` + `/data`, see `ka-extractor.ts`
+   * `extractV10KCFromStore`).
+   *
+   * The one-shot `dkg publish --file` path writes the KC only to the LEGACY
+   * label graphs (`<NAME>/_meta` + the per-KA verifiable-memory data graph) and
+   * used to rely on chain-reconcile to promote it to scoped. That promotion
+   * never reliably fired for the publisher's OWN KC, so every prover tick
+   * reported `kc-not-synced` and no proof landed (#1264; #1259 covered only the
+   * gossip-receiver strand). We resolve the cgId from CHAIN TRUTH
+   * (`getKAContextGraphId`, the exact call the prover uses) right after the
+   * publish tx confirms — when the KA→CG binding is already committed on-chain,
+   * so it is immune to the local cgId-resolver lag that caused the strand — and
+   * write the scoped graphs here so the KC is provable on the first prover tick.
+   *
+   * Mirrors the same-graph promotion in `publishFromSharedMemory` (the SWM path
+   * that already self-promotes). KEEP THE MINIMAL-META SHAPE IN SYNC with that
+   * block and with what `extractV10KCFromStore` reads.
+   */
+  private async promoteConfirmedKCToScopedGraph(
+    contextGraphId: string,
+    onChainResult: OnChainPublishResult,
+    ual: string,
+    merkleRoot: Uint8Array,
+    manifestEntries: ReadonlyArray<KAManifestEntry>,
+    publicQuads: Quad[],
+    fallbackCgId: bigint | undefined,
+    ctx: OperationContext,
+  ): Promise<void> {
+    // The packed kaId (author<<96 | number) keys ContextGraphStorage.kaToContextGraph
+    // and is the prover's `challenge.knowledgeAssetId` / `dkg:batchId` lookup value.
+    const partitionKaId = onChainResult.kaId ?? onChainResult.batchId;
+
+    // 1. Resolve the on-chain cgId from chain truth. Post-confirmation the
+    //    KA→CG binding is committed, so this is lag-free (unlike the agent's
+    //    local resolver that caused the strand). Fall back to the cgId domain
+    //    the confirmed publish tx itself used.
+    let scopedCgId: bigint | undefined;
+    if (typeof this.chain.getKAContextGraphId === 'function') {
+      try {
+        const resolved = await this.chain.getKAContextGraphId(partitionKaId);
+        if (resolved > 0n) scopedCgId = resolved;
+      } catch (err) {
+        this.log.info(ctx, `RS scoped-promote: getKAContextGraphId(${partitionKaId}) failed (RPC lag?): ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (scopedCgId === undefined && fallbackCgId !== undefined && fallbackCgId > 0n) {
+      scopedCgId = fallbackCgId;
+    }
+    if (scopedCgId === undefined) {
+      this.log.info(ctx, `RS scoped-promote: no on-chain cgId for ${ual} (kaId=${partitionKaId}); heal backstop will relocate`);
+      return;
+    }
+
+    const targetCgId = scopedCgId.toString();
+    const ctxDataGraph = contextGraphDataUri(contextGraphId, targetCgId);
+    const ctxMetaGraph = contextGraphMetaUri(contextGraphId, targetCgId);
+    const publishVersion: MaterializedVersion = {
+      blockNumber: onChainResult.blockNumber ?? 0,
+      txIndex: onChainResult.txIndex ?? 0,
+    };
+
+    // GH#842 last-writer-wins: serialise the gate + promotion + version stamp
+    // under the per-KA lock so a concurrent update's restate can't be clobbered
+    // by this (possibly already-stale) publish promotion.
+    await withMaterializationLock(ctxMetaGraph, ual, async () => {
+      if (!(await shouldApplyMaterialization(this.store, ctxMetaGraph, ual, publishVersion))) {
+        this.log.info(ctx, `RS scoped-promote: skipped ${ual} — a newer materialisation is present`);
+        return;
+      }
+
+      // Data: copy the public quads into the scoped data graph — the prover
+      // pulls triples per root entity from here.
+      if (publicQuads.length > 0) {
+        const scopedData = publicQuads.map((q) => ({ ...q, graph: ctxDataGraph }));
+        await this.store.insert(scopedData);
+        await stampTrustLevel(
+          this.store,
+          ctxDataGraph,
+          collectTrustSubjectsForRoots(scopedData, manifestEntries.map((m) => m.rootEntity)),
+          TrustLevel.SelfAttested,
+        );
+      }
+
+      // Promote the minimal scoped-meta rows the RS prover + access handler read.
+      // Single source of truth across both publish paths — see
+      // `buildScopedMinimalMeta` (it documents the collapsed shape + the
+      // multi-root `<ual>/<tokenId>` pairing rows the AccessHandler needs).
+      await this.store.insert(
+        buildScopedMinimalMeta(ual, partitionKaId, merkleRoot, manifestEntries, ctxMetaGraph),
+      );
+      await writeMaterializedVersion(this.store, ctxMetaGraph, ual, publishVersion);
+      this.log.info(ctx, `RS scoped-promote: promoted ${ual} → context graph ${targetCgId} (kaId=${partitionKaId})`);
+    });
   }
 
   async update(kaId: bigint, options: PublishOptions): Promise<PublishResult> {
@@ -3312,6 +3467,128 @@ export class DKGPublisher implements Publisher {
       .join('\n');
     const updateByteSize = BigInt(new TextEncoder().encode(updateNquadsStr).length);
 
+    // OT-RFC-49 / WS-D (update) — mirror the curated PUBLISH producer
+    // (dkg-publisher.ts:2030-2169). A value-adding curated update commits the
+    // PUBLIC `_catalog` Merkle root (NOT the stripped ciphertext root). Partition
+    // the catalog leaf-set out of the update's skolemized quads, compute the
+    // commitment ONCE from the committed leaves (post-publish stamps stripped via
+    // `catalogCommittedLeaves`), serialize them to the byte-identical plain
+    // N-Triples (no graph term — same expression as the publish path at
+    // 2059-2064), and price the update off that catalog footprint. The PRIVATE
+    // (non-catalog) data stays AEAD-encrypted for CG MEMBERS only; the catalog is
+    // public and rides inline as `stagingQuads` so cores can rebuild/verify it.
+    // Identity-based partition: the only catalog subject is this CG's canonical
+    // DID, so a forged `rdf:type dkg:PrivateContextGraph` cannot route a user
+    // entity into the plaintext `_catalog`.
+    const { catalogQuads: updateCatalogQuads, otherQuads: updateOtherQuads } =
+      partitionCatalogQuads(allSkolemizedQuads, contextGraphDataUri(contextGraphId));
+    // Non-catalog plaintext fed to the MEMBER encryptor (graph term retained,
+    // mirror 2031-2038). No-op for public updates / curated updates with no
+    // catalog entry (then encryptableUpdateNquadsStr === updateNquadsStr).
+    const encryptableUpdateNquadsStr = updateCatalogQuads.length === 0
+      ? updateNquadsStr
+      : updateOtherQuads
+          .map(
+            (q) =>
+              `<${q.subject}> <${q.predicate}> ${q.object.startsWith('"') ? q.object : `<${q.object}>`} <${q.graph}> .`,
+          )
+          .join('\n');
+    // Committed catalog commitment — derived from the SAME source as the
+    // serialized bytes and the on-chain root so byteSize and the commitment
+    // cannot desync across pricing, ACK digest, and chain tx. undefined for
+    // public updates and any curated update with no catalog entry.
+    const committedUpdateCatalogLeaves = catalogCommittedLeaves(updateCatalogQuads);
+    const updateCatalogCommitment = committedUpdateCatalogLeaves.length > 0
+      ? computeCatalogRoot(committedUpdateCatalogLeaves)
+      : undefined;
+    // Plain N-Triples (no graph term — byte-identical to publish 2059-2064) so
+    // the core's `parseSimpleNQuads` → `catalogCommittedLeaves` → `computeCatalogRoot`
+    // rebuild reproduces the identical leaf hashes (`hashTripleV10` excludes graph).
+    const updateCatalogNquadsStr = committedUpdateCatalogLeaves
+      .map(
+        (t) =>
+          `<${t.subject}> <${t.predicate}> ${t.object.startsWith('"') ? t.object : `<${t.object}>`} .`,
+      )
+      .join('\n');
+    const updateCatalogByteSize = BigInt(new TextEncoder().encode(updateCatalogNquadsStr).length);
+    // A curated update is identified by a wired `encryptInlinePayload` hook
+    // (DKGAgent resolves this from accessPolicy === curated — wired in the
+    // agent half) AND a non-zero catalog commitment (mirror 2125/2131). When
+    // the hook is absent this is a PUBLIC update and EVERY new path below is a
+    // no-op: zero catalog, full-quads stagingQuads, newByteSize=updateByteSize.
+    const useEncryptedInlineUpdate = typeof options.encryptInlinePayload === 'function';
+    const useCuratedUpdate = useEncryptedInlineUpdate && updateCatalogCommitment !== undefined;
+    // Select the inline staging payload + the byteSize that gets priced/signed.
+    // Curated update → the PUBLIC catalog N-quads + the catalog footprint
+    // (THE BYTESIZE TRAP, §3: the core's parity check is vs `newByteSize`, which
+    // we therefore set to `updateCatalogByteSize`). Public update → unchanged:
+    // full update quads inline (when no private roots are mixed in) + updateByteSize.
+    let updateStagingQuads: Uint8Array | undefined;
+    let effectiveUpdateByteSize = updateByteSize;
+    if (useEncryptedInlineUpdate) {
+      // MEMBER-SIDE ENCRYPTION STAYS. AEAD-encrypt the private (non-catalog)
+      // data and DISTRIBUTE it to CG members — via the chunked SWM fan-out when
+      // wired (PREFERRED; the single-blob hook is pure and does NOT distribute),
+      // mirroring curated publish (:2134-2155). OT-RFC-49 stripped the ciphertext
+      // from the on-chain commitment, the core ACK, and pricing, so the returned
+      // ciphertext root/bytes are intentionally DISCARDED — the gossip side
+      // effect (members receive the updated payload) is the point.
+      const plaintextBytes = new TextEncoder().encode(encryptableUpdateNquadsStr);
+      if (typeof options.encryptInlineChunked === 'function') {
+        // batchId = V10 KC merkleRoot (member-side per-chunk persistence key);
+        // the op id is the per-operation AEAD nonce domain — the update path has
+        // none of its own, so derive a session-scoped, content-unique one.
+        const updateOperationId = `${this.sessionId}-upd-${ethers.hexlify(kcMerkleRoot).slice(2, 18)}`;
+        await options.encryptInlineChunked({
+          plaintextNquads: plaintextBytes,
+          batchId: kcMerkleRoot,
+          publishOperationId: updateOperationId,
+        });
+      } else {
+        // No chunked emitter (single-blob fallback): the hook is pure and does
+        // NOT distribute, so members rely on SWM convergence in this case.
+        await options.encryptInlinePayload!(plaintextBytes);
+      }
+      if (useCuratedUpdate) {
+        // The ACK wire payload is the PUBLIC catalog N-quads (plaintext —
+        // public by design). Cores rebuild the catalog root from these bytes,
+        // verify == the claimed `newCatalogRoot`, persist to `<cg>/_catalog`,
+        // and sign. byteSize == the catalog footprint, from the SAME leaf-set.
+        updateStagingQuads = new TextEncoder().encode(updateCatalogNquadsStr);
+        effectiveUpdateByteSize = updateCatalogByteSize;
+      } else {
+        // Curated update with no catalog entry — nothing public to commit/serve.
+        // Carry a zero catalog commitment; leave staging empty.
+        updateStagingQuads = undefined;
+        effectiveUpdateByteSize = updateByteSize;
+      }
+    } else {
+      // PUBLIC update — unchanged from the prior behaviour: send the full
+      // update N-quads inline so peers recompute `newMerkleRoot`, unless private
+      // roots are mixed in (then the peer can't recompute and we omit staging).
+      updateStagingQuads = updatePrivateRoots.length === 0
+        ? new TextEncoder().encode(updateNquadsStr)
+        : undefined;
+      effectiveUpdateByteSize = updateByteSize;
+    }
+    // B6 — deferred PUBLIC `_catalog` persist. Structurally identical to the
+    // publish path's `persistCatalogEntry` (2079-2092): CLEAR/REPLACE by subject
+    // so repeated updates never accumulate stale catalog triples. Invoked ONLY
+    // from the confirmed-chain-success branch below — never on local-only,
+    // tentative, early-return/definitive-error, or `!txResult.success` paths, so
+    // a failed update never exposes a public catalog entry whose verifiable
+    // memory never landed. Stricter than publish: also gated on `useCuratedUpdate`
+    // because in `update()` ANY `_catalog` write is new behaviour.
+    const persistUpdateCatalogEntry = async (): Promise<void> => {
+      if (!useCuratedUpdate || updateCatalogQuads.length === 0) return;
+      const catalogGraph = contextGraphCatalogUri(contextGraphId);
+      const catalogSubjects = new Set(updateCatalogQuads.map((q) => q.subject));
+      for (const subject of catalogSubjects) {
+        await this.store.deleteByPattern({ graph: catalogGraph, subject });
+      }
+      await this.store.insert(updateCatalogQuads.map((q) => ({ ...q, graph: catalogGraph })));
+    };
+
     if (!options.precomputedUpdateAttestation) {
       throw new Error(
         'Update rejected: on-chain update requires precomputedUpdateAttestation. ' +
@@ -3438,7 +3715,11 @@ export class DKGPublisher implements Publisher {
         // params below), keeping the signed digest and the tx aligned.
         const digestFields = await getFields.call(this.chain, {
           kaId,
-          newByteSize: updateByteSize,
+          // THE BYTESIZE TRAP (§3): price off the catalog footprint for a curated
+          // update so the floored `newTokenAmount` (pinned into the tx via
+          // `boundUpdateTokenAmount` AND signed into the ACK digest) matches the
+          // catalog-priced ACK. Public updates keep `updateByteSize`.
+          newByteSize: effectiveUpdateByteSize,
           mintAmount: 0n,
           burnTokenIds: [],
         });
@@ -3451,23 +3732,30 @@ export class DKGPublisher implements Publisher {
           contextGraphId: digestFields.contextGraphId.toString(),
           preUpdateMerkleRootCount: digestFields.preUpdateMerkleRootCount,
           newMerkleRoot: kcMerkleRoot,
-          newByteSize: updateByteSize,
+          // THE BYTESIZE TRAP (§3): the core's curated-update parity check is vs
+          // `newByteSize` (no `publicByteSize` on UpdateIntent), so this MUST be
+          // the catalog footprint for a curated update. Public update: unchanged.
+          newByteSize: effectiveUpdateByteSize,
           newTokenAmount: digestFields.newTokenAmount,
           mintAmount: digestFields.mintAmount,
           burnTokenIds: digestFields.burnTokenIds,
           newMerkleLeafCount: kcMerkleLeafCount,
-          // Peers recompute newMerkleRoot from the updated quads. Send the
-          // same serialized public N-Quads the byte-size was computed over
-          // so the peer's `computeFlatKCRoot(parsed, [])` matches the
-          // publisher's. Only valid when there are NO private merkle roots
-          // mixed into `kcMerkleRoot` — otherwise the peer (which can't see
-          // the private roots) would recompute a different root and decline.
-          // In that case we omit stagingQuads and the peer falls back to
-          // verifying against its SWM copy (same limitation as the publish
-          // plaintext-inline path).
-          stagingQuads: updatePrivateRoots.length === 0
-            ? new TextEncoder().encode(updateNquadsStr)
-            : undefined,
+          // OT-RFC-49 / WS-D — curated commitment rides the UpdateIntent so the
+          // core can rebuild/verify the public catalog. Gated on `useCuratedUpdate`
+          // (NOT merely a non-empty commitment) so a PUBLIC update that happens to
+          // carry a CG-DID-subject quad never ships a non-zero root (which would
+          // trip the on-chain `PublicCGCannotHaveCatalogCommitment` gate).
+          newCatalogRoot: useCuratedUpdate ? updateCatalogCommitment!.root : undefined,
+          newCatalogLeafCount: useCuratedUpdate ? updateCatalogCommitment!.leafCount : undefined,
+          // Curated → cores gate the inline-catalog rebuild/verify/persist path
+          // on this flag (mirror the publish closure passing isEncryptedPayload).
+          isEncryptedPayload: useEncryptedInlineUpdate ? true : undefined,
+          // For a curated update the inline ACK payload is the PUBLIC catalog
+          // N-quads (`updateStagingQuads` == the catalog bytes). For a public
+          // update it stays the full update N-quads (when no private roots are
+          // mixed in) so peers can recompute `newMerkleRoot`; otherwise the peer
+          // falls back to verifying against its SWM copy. Selected above.
+          stagingQuads: updateStagingQuads,
           swmGraphId: contextGraphId,
         });
         this.log.info(
@@ -3485,8 +3773,17 @@ export class DKGPublisher implements Publisher {
           txResult = await this.chain.updateKnowledgeCollectionV10({
             kaId,
             newMerkleRoot: kcMerkleRoot,
-            newByteSize: updateByteSize,
+            // THE BYTESIZE TRAP (§3): the tx byteSize MUST equal the value signed
+            // into the ACK digest + priced via getUpdateAckDigestFields — the
+            // catalog footprint for a curated update, `updateByteSize` otherwise.
+            newByteSize: effectiveUpdateByteSize,
             newMerkleLeafCount: kcMerkleLeafCount,
+            // OT-RFC-49 / WS-D — carry the SAME catalog commitment the ACK digest
+            // bound + the on-chain gate expects. Gated on `useCuratedUpdate` so a
+            // public update submits bytes32(0)/0 (the contract's
+            // `PublicCGCannotHaveCatalogCommitment` gate enforces this too).
+            newCatalogRoot: useCuratedUpdate ? updateCatalogCommitment!.root : undefined,
+            newCatalogLeafCount: useCuratedUpdate ? updateCatalogCommitment!.leafCount : undefined,
             mintAmount: 0,
             // Pin the tx's newTokenAmount to the floored value the ACK
             // collector already had the peers sign (resolved via
@@ -3603,6 +3900,13 @@ export class DKGPublisher implements Publisher {
       txIndex: txResult.txIndex ?? 0,
     };
     await storeUpdatedQuads(updateVersion);
+
+    // B6 — the on-chain update has confirmed and the verifiable-memory quads are
+    // committed: REPLACE-persist the rotated PUBLIC `_catalog` here, inside the
+    // confirmed-success branch ONLY (no-op unless `useCuratedUpdate`), so a
+    // failed/tentative update never exposes a public catalog entry. Mirrors the
+    // publish path's deferred `persistCatalogEntry` invocation (2989).
+    await persistUpdateCatalogEntry();
 
     const ual = await this.resolveKaUal(kaId);
 
@@ -4336,6 +4640,147 @@ export class DKGPublisher implements Publisher {
     }
   }
 
+  /**
+   * #1116 — read an assertion's member root entities from the lifecycle URN,
+   * independent of any seal. `generateAssertionPromotedMetadata` stamps these
+   * (predicate dkg:rootEntity / dkg:entity) on EVERY promote — sealed or not —
+   * so this is the seal-independent source `pull-from swm` uses to reconstruct
+   * a WM draft for an asset that was shared unsealed (seal-in-SWM / recovery).
+   */
+  private async readPromotedRootEntities(
+    contextGraphId: string,
+    agentAddress: string,
+    name: string,
+    subGraphName?: string,
+  ): Promise<string[]> {
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    const lifecycleUri = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
+    const res = await this.store.query(
+      `SELECT DISTINCT ?root WHERE { GRAPH <${metaGraph}> { <${lifecycleUri}> ${ENTITY_PRED_ALT} ?root } }`,
+    );
+    if (res.type !== 'bindings') return [];
+    const roots: string[] = [];
+    for (const row of res.bindings) {
+      const root = row['root'];
+      if (typeof root === 'string' && root.length > 0) roots.push(root);
+    }
+    return roots;
+  }
+
+  /**
+   * #1116 (review A1) — SWM-share-complete marker.
+   *
+   * A FULL share (entities:"all", all roots actually landed in SWM) stamps a
+   * single boolean marker on the lifecycle URN. `finalize(layer:"swm")` gates
+   * on it so a SUBSET share — which also stamps `dkg:rootEntity` member rows,
+   * the source `readPromotedRootEntities` reads — can NOT be sealed-in-SWM and
+   * published as a partial asset under the KA name. Subset shares are SWM-only,
+   * never publishable; only a complete full share sets this marker, and a later
+   * subset / reduced-scope share CLEARS it (`clearSwmShareComplete`), so the marker
+   * always reflects whether the CURRENT shared state is a complete full share.
+   * Modelled on `readPromotedRootEntities` /
+   * `_stampSwmPointer`: same meta graph (`contextGraphMetaUri(cg)`) and subject
+   * (`assertionLifecycleUri(...)`).
+   */
+  async markSwmShareComplete(
+    contextGraphId: string,
+    name: string,
+    agentAddress: string,
+    subGraphName?: string,
+  ): Promise<void> {
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    const lifecycleUri = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
+    // Idempotent: drop any prior marker first, then insert exactly one.
+    await this.store.deleteByPattern({
+      graph: metaGraph,
+      subject: lifecycleUri,
+      predicate: SWM_SHARE_COMPLETE_PRED,
+    });
+    await this.store.insert([{
+      subject: lifecycleUri,
+      predicate: SWM_SHARE_COMPLETE_PRED,
+      object: '"true"',
+      graph: metaGraph,
+    }]);
+  }
+
+  /**
+   * #1116 (review A1, round 5) — CLEAR the SWM-share-complete marker.
+   *
+   * `markSwmShareComplete` only ever SET the marker (so a benign full-share
+   * recreate-retry never lost it), but that left two holes: a marked
+   * full-share that was later DISCARDED, or RE-shared as a strict SUBSET, kept
+   * a stale marker — letting `finalize(layer:"swm")` (and the seal-less
+   * pull-from source) publish a partial asset under the KA name. We now clear
+   * the marker at exactly the two moments scope is genuinely reduced: on
+   * `assertionDiscard`, and on a subset share (promote's non-full branch). It
+   * survives a full-share recreate-retry because A2_PRESERVE re-arms it and the
+   * full-share path re-stamps it — it is only cleared when scope actually drops.
+   */
+  async clearSwmShareComplete(
+    contextGraphId: string,
+    name: string,
+    agentAddress: string,
+    subGraphName?: string,
+  ): Promise<void> {
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    const lifecycleUri = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
+    await this.store.deleteByPattern({
+      graph: metaGraph,
+      subject: lifecycleUri,
+      predicate: SWM_SHARE_COMPLETE_PRED,
+    });
+  }
+
+  /** #1116 (review A1) — ASK whether the SWM-share-complete marker is present. */
+  async hasSwmShareComplete(
+    contextGraphId: string,
+    name: string,
+    agentAddress: string,
+    subGraphName?: string,
+  ): Promise<boolean> {
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    const lifecycleUri = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
+    const res = await this.store.query(
+      `ASK { GRAPH <${metaGraph}> { <${lifecycleUri}> <${SWM_SHARE_COMPLETE_PRED}> ?o } }`,
+    );
+    return res.type === 'boolean' && res.value;
+  }
+
+  /**
+   * #1116 (round 7) — delete the assertion SEAL (all ASSERTION_SEAL_PREDICATES)
+   * for this KA, under BOTH the name-keyed assertion URI and the numbered WM
+   * graph URI (the seal lives under one or the other, pre/post-mint). The seal
+   * lives on a DIFFERENT subject than the lifecycle URN, so the create/discard
+   * clean-slates that key on the lifecycle URN don't reach it.
+   *
+   * Callers: `assertionDiscard` (drops the seal when a non-published draft is
+   * discarded) and `assertionPullFrom` (re-opens a draft for editing, so the
+   * stale seal must go — it is rebuilt at the next finalize with the same
+   * reservedKaId via assertionCreate's A2 carry-over).
+   *
+   * NOTE (#1116 round 8+): finalize(layer="swm") does NOT pre-clear the seal.
+   * The SWM pull resolves scope from the marker-gated promoted member rows —
+   * never `seal.rootEntities` — and `assertionPullFrom` does its own seal
+   * teardown only AFTER validating a non-empty source, which keeps the operation
+   * atomic-on-failure (a failed pull no longer strands a previously-valid seal).
+   */
+  async clearAssertionSeal(
+    contextGraphId: string,
+    name: string,
+    agentAddress: string,
+    subGraphName?: string,
+  ): Promise<void> {
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    const nameKeyed = contextGraphAssertionUri(contextGraphId, agentAddress, name, subGraphName);
+    const wmGraph = await this.wmGraphUri(contextGraphId, agentAddress, name, subGraphName);
+    for (const sealSubj of new Set([nameKeyed, wmGraph])) {
+      for (const pred of Object.values(ASSERTION_SEAL_PREDICATES)) {
+        await this.store.deleteByPattern({ graph: metaGraph, subject: sealSubj, predicate: pred });
+      }
+    }
+  }
+
   // ── Working Memory Assertion Operations (spec §6) ───────────────────
 
   private static validateOptionalSubGraph(subGraphName: string | undefined): void {
@@ -4464,6 +4909,50 @@ export class DKGPublisher implements Publisher {
     return listGraphFamily(this.store, bucketGraph);
   }
 
+  /**
+   * Drain the SWM copy of `rootEntities` after their content reached
+   * Verifiable Memory: data + skolem children from every graph under the
+   * SWM bucket (uniform per-KA layout), ownership rows + workspace-op meta
+   * from `_shared_memory_meta`, and the in-memory ownership registry.
+   *
+   * #1099: extracted from `publishFromSharedMemory`'s confirmed-publish
+   * block so the named-lifecycle UPDATE path
+   * (`DKGAgent.publishFromFinalizedAssertion` → `publisher.update`) can run
+   * the SAME cleanup — updates previously left the re-shared SWM copy in
+   * place forever, so SWM and VM permanently disagreed after any edit loop.
+   */
+  async clearPublishedSwmRoots(
+    contextGraphId: string,
+    rootEntities: string[],
+    subGraphName: string | undefined,
+    ctx: OperationContext,
+  ): Promise<void> {
+    if (rootEntities.length === 0) return;
+    const swmGraph = this.graphManager.sharedMemoryUri(contextGraphId, subGraphName);
+    const swmMetaGraph = this.graphManager.sharedMemoryMetaUri(contextGraphId, subGraphName);
+    const swmOwnershipKey = subGraphName ? `${contextGraphId}\0${subGraphName}` : contextGraphId;
+    const swmGraphsForClear = await this.swmGraphsUnder(swmGraph);
+    let ownerDeletedTotal = 0;
+    for (const rootEntity of rootEntities) {
+      for (const g of swmGraphsForClear) {
+        await this.store.deleteByPattern({ graph: g, subject: rootEntity });
+        await this.store.deleteBySubjectPrefix(g, rootEntity + '/.well-known/genid/');
+        await this.store.deleteByPattern({
+          graph: g, subject: rootEntity, predicate: WORKSPACE_OWNER_PREDICATE,
+        });
+      }
+      const ownerDeleted = await this.store.deleteByPattern({
+        graph: swmMetaGraph, subject: rootEntity, predicate: WORKSPACE_OWNER_PREDICATE,
+      });
+      ownerDeletedTotal += ownerDeleted;
+      await this.deleteMetaForRoot(swmMetaGraph, rootEntity);
+      this.sharedMemoryOwnedEntities.get(swmOwnershipKey)?.delete(rootEntity);
+    }
+    if (ownerDeletedTotal > 0) {
+      this.log.info(ctx, `Cleared ${ownerDeletedTotal} published SWM triple(s) after confirmed publish`);
+    }
+  }
+
   async assertionCreate(
     contextGraphId: string,
     name: string,
@@ -4494,6 +4983,22 @@ export class DKGPublisher implements Publisher {
       `${A2_DKG}swmCurrentAssertion`,
       `${A2_DKG}vmCurrentAssertion`,
       'http://www.w3.org/ns/prov#wasRevisionOf',
+      // #1116: the promote-stamped member rows (dkg:rootEntity / dkg:entity) are
+      // the SEAL-INDEPENDENT recovery source readPromotedRootEntities uses. Pull-from
+      // (the seal-in-SWM reconstruction path) MUST preserve them across this
+      // clean-slate, otherwise a finalize that fails AFTER the re-seed would leave
+      // the asset with neither a seal nor the member rows — stranding the very asset
+      // seal-in-SWM exists to rescue (a non-atomic recovery). Keeping them makes
+      // finalize layer=swm safely retryable.
+      `${A2_DKG}rootEntity`,
+      `${A2_DKG}entity`,
+      // #1116 (review A1): the full-SWM-share marker that gates finalize(layer:"swm").
+      // pull-from's clean-slate (the seal-in-SWM reconstruction) MUST preserve it,
+      // or a finalize that fails after the re-seed would strip the marker and make
+      // the already-fully-shared asset un-sealable — the inverse of the bug it guards.
+      // Round 6 — use the shared SWM_SHARE_COMPLETE_PRED constant (the same one
+      // mark/clear/has use) so a future rename can't silently break preservation.
+      SWM_SHARE_COMPLETE_PRED,
     ]);
     const lifecycleSubject = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
     const metaGraph = contextGraphMetaUri(contextGraphId);
@@ -4657,24 +5162,80 @@ export class DKGPublisher implements Publisher {
 
     // Resolve the file's member entities from the SEAL. PR #972/335e8d8: the
     // seal is stamped at finalize under the assertion-graph URI
-    // (`contextGraphAssertionUri`, i.e. wmGraph) in the meta graph — NOT under
-    // the lifecycle URN. The prior code read `assertionLifecycleUri`, a
+    // (`contextGraphAssertionUri`) in the meta graph — NOT under the
+    // lifecycle URN. The prior code read `assertionLifecycleUri`, a
     // different subject, so the lookup found nothing and pull-from failed for
     // EVERY finalized assertion.
-    const sealRes = await this.store.query(
-      `CONSTRUCT { <${wmGraph}> ?p ?o } WHERE { GRAPH <${metaGraph}> { <${wmGraph}> ?p ?o } }`,
+    //
+    // #1094: the same class of bug, second occurrence. `wmGraphUri()` only
+    // equals `contextGraphAssertionUri` BEFORE a kaId is minted; finalize
+    // stamps `dkg:kaId`, after which `wmGraphUri()` resolves to the numbered
+    // per-KA layer URI (`…/_working_memory/<addr>/<n>`). Reading the seal
+    // under `wmGraph` therefore failed for every finalized-AND-minted
+    // assertion — exactly the population pull-from exists for. The seal's
+    // canonical subject is the name-keyed assertion URI; check it first and
+    // keep the wmGraph subject as a legacy fallback (they coincide pre-mint).
+    const sealSubject = contextGraphAssertionUri(contextGraphId, agentAddress, name, subGraphName);
+    let sealRes = await this.store.query(
+      `CONSTRUCT { <${sealSubject}> ?p ?o } WHERE { GRAPH <${metaGraph}> { <${sealSubject}> ?p ?o } }`,
     );
-    const seal = parseAssertionSealQuads(sealRes.type === 'quads' ? sealRes.quads : [], wmGraph);
-    if (!seal) {
-      throw new Error(
-        `No sealed entity list for "${name}" in context graph "${contextGraphId}" — pull-from `
-        + `requires a finalized assertion (its seal records the member entities).`,
+    let seal = parseAssertionSealQuads(sealRes.type === 'quads' ? sealRes.quads : [], sealSubject);
+    if (!seal && wmGraph !== sealSubject) {
+      sealRes = await this.store.query(
+        `CONSTRUCT { <${wmGraph}> ?p ?o } WHERE { GRAPH <${metaGraph}> { <${wmGraph}> ?p ?o } }`,
       );
+      seal = parseAssertionSealQuads(sealRes.type === 'quads' ? sealRes.quads : [], wmGraph);
     }
-    const entities = seal.rootEntities;
+    // #1116: a seal is no longer required to pull from SWM. When the asset was
+    // shared UNSEALED (a `skipSeal` share, or an asset stuck unsealed under the
+    // old auto-finalize-swallow behavior), fall back to the member entities
+    // stamped on the lifecycle URN by every promote
+    // (`generateAssertionPromotedMetadata`, predicate dkg:rootEntity) — recorded
+    // independent of any seal. This is what lets seal-in-SWM (finalize
+    // layer=swm) and recovery reconstruct the WM draft without first finalizing.
+    // VM pulls still require the seal (VM content is keyed by the published
+    // roots, which only the seal records).
+    // #1116 (review A1, rounds 5/7/8) — the SWM reconstruction is the ROOT of the
+    // subset-publishability bypass, and the guard MUST live here at the single
+    // publisher chokepoint so EVERY caller is covered (the finalize(layer:"swm")
+    // wrapper AND the direct wm/pull-from route + a plain finalize).
+    //
+    // Crucially, an SWM pull must NEVER trust the seal's rootEntities for scope:
+    // a stale FULL seal survives a SUBSET re-share (a subset share never
+    // re-seals, and `create` without a discard does not clear the seal — it lives
+    // on the name-keyed assertion URI, outside the lifecycle-URN clean-slate). If
+    // we read that stale seal it would short-circuit the subset gate below and let
+    // the direct route reconstruct + publish a superseded/partial asset under the
+    // KA name (round-8 live repro). So for SWM we ALWAYS resolve from the
+    // promote-stamped member rows, gated on the full-share completeness marker —
+    // the seal is rebuilt at the next finalize anyway (and torn down below). VM
+    // pulls still use the seal (VM content is keyed by the published roots, which
+    // only the seal records).
+    let entities: string[];
+    if (sourceLayer === 'swm') {
+      const promotedRoots = await this.readPromotedRootEntities(contextGraphId, agentAddress, name, subGraphName);
+      if (promotedRoots.length > 0) {
+        const fullyShared = await this.hasSwmShareComplete(contextGraphId, name, agentAddress, subGraphName);
+        if (!fullyShared) {
+          throw Object.assign(
+            new Error(
+              `"${name}" in context graph "${contextGraphId}" was only shared to SWM as a SUBSET — `
+              + `reconstructing or sealing it would publish a partial asset under the KA name. `
+              + `Share the full asset (entities:"all") before sealing in SWM.`,
+            ),
+            { code: 'SWM_SUBSET_NOT_SEALABLE' },
+          );
+        }
+      }
+      entities = promotedRoots;
+    } else {
+      entities = seal?.rootEntities ?? [];
+    }
     if (entities.length === 0) {
       throw new Error(
-        `Sealed assertion "${name}" in context graph "${contextGraphId}" records no member entities; nothing to pull.`,
+        `No member entities for "${name}" in context graph "${contextGraphId}" — pull-from `
+        + `requires either a finalized assertion (its seal records the members) or a prior `
+        + `promote to SWM (which stamps the members on the lifecycle record). Found neither.`,
       );
     }
 
@@ -4682,10 +5243,25 @@ export class DKGPublisher implements Publisher {
     // (same filter the publish gather / RS prover use), minus trust/ownership
     // bookkeeping that never belongs in a working draft.
     const values = entities.map((e) => `<${e}>`).join(' ');
+    // #1094: a per-KA `vm/publish` writes the canonical quads into the
+    // numbered per-KA VM graph `…/_verifiable_memory/{author}/{number}`
+    // (see SUBSTRATE-2 in dkg-agent-publish.ts) and, for on-chain CGs,
+    // into the per-on-chain-id partition `…/context/{ctxGraphId}` — NOT
+    // (only) the bare data graph this branch used to read. Pulling from
+    // "vm" therefore came back empty for exactly the published KAs the
+    // edit loop exists for. Scan the data graph PLUS both VM-side graph
+    // families; CONSTRUCT output is a set, so overlapping copies dedup.
+    const vmBase = subGraphName
+      ? `did:dkg:context-graph:${contextGraphId}/${subGraphName}`
+      : `did:dkg:context-graph:${contextGraphId}`;
+    const vmGraphFilter =
+      `FILTER(STR(?g) = "${sourceGraph}" ` +
+      `|| STRSTARTS(STR(?g), "${vmBase}/_verifiable_memory/") ` +
+      `|| STRSTARTS(STR(?g), "did:dkg:context-graph:${contextGraphId}/context/"))`;
     // Per-KA SWM: when pulling from SWM the source spans the per-KA prefix, not one bucket.
     const sourcePattern = sourceLayer === 'swm'
       ? `GRAPH ?g { VALUES ?root { ${values} } ?s ?p ?o . FILTER(?s = ?root || STRSTARTS(STR(?s), CONCAT(STR(?root), "/.well-known/genid/"))) } ${sharedMemoryReadBothFilter(sourceGraph)}`
-      : `GRAPH <${sourceGraph}> { VALUES ?root { ${values} } ?s ?p ?o . FILTER(?s = ?root || STRSTARTS(STR(?s), CONCAT(STR(?root), "/.well-known/genid/"))) }`;
+      : `GRAPH ?g { VALUES ?root { ${values} } ?s ?p ?o . FILTER(?s = ?root || STRSTARTS(STR(?s), CONCAT(STR(?root), "/.well-known/genid/"))) } ${vmGraphFilter}`;
     const gather = await this.store.query(
       `CONSTRUCT { ?s ?p ?o } WHERE { ${sourcePattern} }`,
     );
@@ -4713,6 +5289,18 @@ export class DKGPublisher implements Publisher {
       await this.store.dropGraph(wmGraph); // 'replace' — git force-checkout, after source validation
     }
     await this.assertionCreate(contextGraphId, name, agentAddress, subGraphName);
+    // #1094: `assertionCreate`'s clean-slate wipe only covers subjects under
+    // the lifecycle URN — the SEAL lives under the name-keyed assertion URI
+    // (and pre-mint legacy seals under the numbered WM URI), so it survived
+    // every pull-from. The next `wm/finalize` of the edited draft then hit
+    // "already finalized with a different merkleRoot" and the edit loop was
+    // permanently wedged. Pull-from re-opens the draft for editing, so the
+    // stale seal MUST go (it is rebuilt — same reservedKaId, preserved by
+    // assertionCreate's A2 carry-over — at the next finalize). Reuse the single
+    // clearAssertionSeal helper so the seal subject/predicate set has one source
+    // of truth (sealSubject == the helper's name-keyed assertion URI; wmGraph is
+    // re-resolved identically).
+    await this.clearAssertionSeal(contextGraphId, name, agentAddress, subGraphName);
     await this.assertionWrite(contextGraphId, name, agentAddress, gathered, subGraphName);
     return { seeded: gathered.length, fromLayer: sourceLayer, entities: entities.length };
   }
@@ -4734,10 +5322,29 @@ export class DKGPublisher implements Publisher {
        */
       confirmBeforeCommit?: (message: Uint8Array) => Promise<{ applied: boolean; rejected?: boolean }>;
     },
-  ): Promise<{ promotedCount: number; gossipMessage?: Uint8Array }> {
+  ): Promise<{ promotedCount: number; gossipMessage?: Uint8Array; promotedAllRoots: boolean }> {
     await this.ensureSubGraphRegistered(contextGraphId, opts?.subGraphName);
     const graphUri = await this.wmGraphUri(contextGraphId, agentAddress, name, opts?.subGraphName);
     const swmGraphUri = await this.swmGraphUri(contextGraphId, agentAddress, name, opts?.subGraphName);
+
+    // #1116 (round 10) — the swmShareComplete marker MUST be maintained on EVERY
+    // return path of assertionPromote, not just the success tail. A non-full share
+    // (subset/partial/foreign-skipped) that filters to ZERO promotable quads (the
+    // early returns below) would otherwise leave a STALE marker from a prior full
+    // share, letting finalize(layer:"swm")/publish pass their gate against the OLD
+    // SWM contents. `promotingAllEntities` is hoisted here so every exit can
+    // compute the correct scope; `maintainMarker(isFull)` is called before each
+    // return with `isFull = promotingAllEntities && promotedAllRoots` for that path.
+    // (Member-row REPLACE stays at the success path — it only matters when quads
+    // are actually promoted; the MARKER is the cross-cutting invariant.)
+    const promotingAllEntities = !opts?.entities || opts.entities === 'all';
+    const maintainMarker = async (isFullCompletePromote: boolean): Promise<void> => {
+      if (isFullCompletePromote) {
+        await this.markSwmShareComplete(contextGraphId, name, agentAddress, opts?.subGraphName);
+      } else {
+        await this.clearSwmShareComplete(contextGraphId, name, agentAddress, opts?.subGraphName);
+      }
+    };
 
     const result = await this.store.query(
       `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <${graphUri}> { ?s ?p ?o } }`,
@@ -4765,7 +5372,12 @@ export class DKGPublisher implements Publisher {
       // `assertionCreate` are not consulted: they fire for empty-write
       // flows where promoting nothing is legitimate.
       await this.assertAssertionDataPersisted(contextGraphId, graphUri);
-      return { promotedCount: 0 };
+      // No roots to promote ⇒ none were foreign-skipped. promotedAllRoots:true ⇒
+      // isFull == promotingAllEntities (a subset of an empty draft still CLEARS a
+      // stale marker; a full empty share SETS it — harmless, finalize finds no
+      // members). Maintain the marker before returning (round 10).
+      await maintainMarker(promotingAllEntities);
+      return { promotedCount: 0, promotedAllRoots: true };
     }
 
     let quadsToPromote = result.quads;
@@ -4842,7 +5454,16 @@ export class DKGPublisher implements Publisher {
       );
     }
 
-    if (quadsToPromote.length === 0) return { promotedCount: 0 };
+    // Nothing left after the reserved-subject / selective-entity filters ⇒
+    // no roots were foreign-skipped. round 10 (reviewer 🔴): a SUBSET share whose
+    // selection matched ZERO current quads reaches here — it MUST clear a stale
+    // full-share marker (isFull == promotingAllEntities, which is false for a
+    // subset) before returning, else finalize(layer:"swm") passes its gate against
+    // the OLD SWM contents.
+    if (quadsToPromote.length === 0) {
+      await maintainMarker(promotingAllEntities);
+      return { promotedCount: 0, promotedAllRoots: true };
+    }
 
     const operationId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -4979,8 +5600,22 @@ export class DKGPublisher implements Publisher {
       ? normalizedQuads.filter(q => !skippedRoots.has(q.subject) && !skippedRoots.has(q.subject.split('/.well-known/genid/')[0]))
       : normalizedQuads;
 
+    // #1116 FIX 1 — did this promote cover the FULL requested/sealed root set?
+    // A FULL share seals ALL of `rootEntities`, but the advisory ownership skip
+    // above can promote only `effectiveRoots`. When any root is foreign-skipped
+    // the SWM copy is missing part of the sealed set, so the seal exists but the
+    // asset is NOT publish-ready (publishFromFinalizedAssertion would recompute a
+    // different merkleRoot over the partial SWM slice and fail the seal guard).
+    // The agent's promote() threads this into `publishReady`.
+    const promotedAllRoots = skippedRoots.size === 0;
+
     if (effectiveRoots.length === 0) {
-      return { promotedCount: 0 };
+      // Every requested root was foreign-skipped — nothing promoted, and the
+      // sealed set is definitively not fully present in SWM. promotedAllRoots is
+      // false here (skippedRoots.size > 0), so isFull is false ⇒ CLEAR the marker
+      // (round 10): a fully-foreign-skipped share is never a complete full share.
+      await maintainMarker(promotingAllEntities && promotedAllRoots);
+      return { promotedCount: 0, promotedAllRoots };
     }
 
     // Delete-then-insert for existing SWM entities (upsert), matching
@@ -5026,6 +5661,32 @@ export class DKGPublisher implements Publisher {
     // carried by the seal's `dkg:assertionRootEntity`/`dkg:assertionEntity`
     // rows and the lifecycle record's member-entity stamps.
 
+    // #1116 (round 7) — REPLACE (not append) the lifecycle-URN member rows on a
+    // FULL-COMPLETE share. `generateAssertionPromotedMetadata` only INSERTs the
+    // member rows (its delete set never removes prior ones — metadata.ts), so a
+    // full {A,C} → discard → recreate → full {A,B} cycle (or a no-discard full
+    // re-share) accumulates the stale UNION {A,B,C}. The seal-less SWM
+    // reconstruction (readPromotedRootEntities) then seals a stale SUPERSET. When
+    // this promote is the AUTHORITATIVE current full set (entities:"all" AND no
+    // foreign root skipped — exactly the markSwmShareComplete condition), the rows
+    // must end up as EXACTLY the just-promoted roots. Clear the prior member rows
+    // for the lifecycle URN here, then stamp the current ones below.
+    //
+    // A SUBSET / partial promote is intentionally NOT replaced: it shares only some
+    // roots, the marker is cleared (round 6) so readPromotedRootEntities output is
+    // gated-out, and over-deleting could drop a still-valid member. The audit
+    // confirmed no reader needs the cumulative historical union; all read the
+    // CURRENT set, so REPLACE-on-full is strictly more correct.
+    // `promotingAllEntities` is hoisted to the top of the method (round 10) so the
+    // early-return marker maintenance can use it; reuse it here.
+    const isFullCompletePromote = promotingAllEntities && promotedAllRoots;
+    if (isFullCompletePromote) {
+      const lifecycleSubject = assertionLifecycleUri(contextGraphId, agentAddress, name, opts?.subGraphName);
+      const promoteMetaGraph = contextGraphMetaUri(contextGraphId);
+      await this.store.deleteByPattern({ graph: promoteMetaGraph, subject: lifecycleSubject, predicate: DKG_ROOT_ENTITY_LEGACY });
+      await this.store.deleteByPattern({ graph: promoteMetaGraph, subject: lifecycleSubject, predicate: DKG_ENTITY });
+    }
+
     // Update assertion lifecycle record in _meta: created → promoted
     const promotedKaNumber = await this.resolveKaNumber(contextGraphId, agentAddress, name, opts?.subGraphName);
     const promoted = generateAssertionPromotedMetadata({
@@ -5040,6 +5701,16 @@ export class DKGPublisher implements Publisher {
     }, { provenanceEvents: this.provenanceEvents });
     await this.store.delete(promoted.delete);
     await this.store.insert(promoted.insert);
+
+    // #1116 (round 9/10) — CO-LOCATE the swmShareComplete marker with the
+    // member-row REPLACE above, at the single publisher chokepoint, via the same
+    // `maintainMarker` helper every early-return uses. The marker and the member
+    // rows MUST stay in lockstep: the marker says "the member rows describe a
+    // complete full share". A FULL-COMPLETE promote (entities:"all" + no foreign
+    // root skipped) SETS it; any other promote (subset/foreign-skipped) CLEARS it.
+    // Doing it in the publisher (not the agent wrapper) keeps the invariant for
+    // EVERY caller of the public assertionPromote — no desync on a direct caller.
+    await maintainMarker(isFullCompletePromote);
 
     // Write WorkspaceOperation metadata + ownership quads, mirroring what
     // _shareImpl and the remote SharedMemoryHandler both produce, so the
@@ -5083,7 +5754,7 @@ export class DKGPublisher implements Publisher {
       }
     }
 
-    return { promotedCount: swmQuads.length, gossipMessage };
+    return { promotedCount: swmQuads.length, gossipMessage, promotedAllRoots };
   }
 
   async assertionDiscard(contextGraphId: string, name: string, agentAddress: string, subGraphName?: string): Promise<void> {
@@ -5123,12 +5794,131 @@ export class DKGPublisher implements Publisher {
       subGraphName,
       timestamp: new Date(),
     }, { provenanceEvents: this.provenanceEvents });
+    // #1095: discarding an open WM DRAFT of a KA that already has a
+    // confirmed VM version must not mark the KA itself "discarded" — the
+    // published assertion is still live on-chain (the descriptor would
+    // otherwise report the contradictory pair state="discarded" +
+    // status="vm-confirmed"). Keep the AssertionDiscarded event (it
+    // accurately records that a draft was thrown away) but preserve the
+    // "published" state and DON'T stamp prov:wasInvalidatedBy on the
+    // lifecycle subject.
+    const lifecycleSubject = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
+    const cgMetaGraphForDiscard = contextGraphMetaUri(contextGraphId);
+    const vmPointerRes = await this.store.query(
+      `ASK { GRAPH <${cgMetaGraphForDiscard}> { <${lifecycleSubject}> <${VM_CURRENT_ASSERTION_PRED}> ?vm } }`,
+    );
+    const hasVmVersion = vmPointerRes.type === 'boolean' && vmPointerRes.value === true;
+    if (hasVmVersion) {
+      const DKG_STATE_PRED = 'http://dkg.io/ontology/state';
+      const PROV_INVALIDATED = 'http://www.w3.org/ns/prov#wasInvalidatedBy';
+      discarded.insert = discarded.insert.filter(
+        (q) => !(q.subject === lifecycleSubject && (q.predicate === DKG_STATE_PRED || q.predicate === PROV_INVALIDATED)),
+      );
+    }
     await this.store.delete(discarded.delete);
     await this.store.insert(discarded.insert);
 
     const metaGraph = contextGraphMetaUri(contextGraphId);
     await this.store.deleteByPattern({ subject: graphUri, graph: metaGraph });
+    // #1116 (review A1, round 5) — drop the SWM-share-complete marker too. A
+    // marker survives discard via A2_PRESERVE on recreate, so a full-share →
+    // discard → recreate → subset-share cycle would otherwise leave a stale
+    // marker and let finalize(layer:"swm") publish the subset as the full KA.
+    // Clearing on discard re-arms the gate: the next share must re-prove
+    // completeness (a full share re-stamps it; a subset never sets it).
+    //
+    // #1116 (round 9) — ASYMMETRY (verified sound): the marker is cleared
+    // UNconditionally here, but the seal + member rows only when !hasVmVersion
+    // below. This is consistent: a confirmed publish already cleared the marker
+    // (round 9 step 3), so a published KA (hasVmVersion) has NO marker at discard
+    // and the unconditional clear is a no-op for it; its seal + rows are preserved
+    // (they back the on-chain state / receipt lookups). There is no state where the
+    // marker's absence misleads a consumer about a surviving seal: the marker gates
+    // "publishable full share", and a published KA is correctly NOT re-publishable
+    // as a fresh full share (its seal is the published one, used only for VM ops).
+    await this.store.deleteByPattern({
+      graph: metaGraph,
+      subject: lifecycleSubject,
+      predicate: SWM_SHARE_COMPLETE_PRED,
+    });
+    // #1116 (round 7) — CLEAR the lifecycle-URN member rows (dkg:rootEntity /
+    // dkg:entity) too. They are the seal-less SWM-reconstruction source and they
+    // SURVIVE a discard+recreate via A2_PRESERVE; without clearing them, a
+    // discarded asset's stale members are carried into the recreated draft and a
+    // later full skipSeal re-share would seal the stale UNION (the round-7 bug).
+    // ONLY clear when the KA has no confirmed VM version: a draft-discard of an
+    // already-PUBLISHED KA (hasVmVersion) preserves the on-chain state, and its
+    // members back the receipt lookups — leave them (the next full publish
+    // REPLACEs them with the current set anyway). A SWM-only / never-published
+    // asset has no membership once discarded.
+    if (!hasVmVersion) {
+      await this.store.deleteByPattern({ graph: metaGraph, subject: lifecycleSubject, predicate: DKG_ROOT_ENTITY_LEGACY });
+      await this.store.deleteByPattern({ graph: metaGraph, subject: lifecycleSubject, predicate: DKG_ENTITY });
+      // #1116 (round 7) — CLEAR the assertion SEAL too, via the single
+      // `clearAssertionSeal` helper (one source of truth for the seal
+      // subject/predicate set — a critical lifecycle invariant). The seal is keyed
+      // by the name-keyed assertion URI / numbered WM URI, a DIFFERENT subject than
+      // the lifecycle URN the `_meta` cleanup above deletes — so a seal from a prior
+      // FULL share would SURVIVE discard and, since pull-from reads
+      // `seal.rootEntities` first, drive a discard → recreate → re-share →
+      // seal-in-SWM reconstruction from the STALE roots. A discarded
+      // (non-published) asset must leave NO seal.
+      await this.clearAssertionSeal(contextGraphId, name, agentAddress, subGraphName);
+    }
     await this.store.dropGraph(graphUri);
+  }
+
+  /**
+   * #1116 — clear the Working-Memory draft DATA graph for an assertion plus the
+   * now-stale WM lifecycle pointer, leaving the seal + SWM/VM state intact. Used
+   * by the seal-in-SWM flow (finalize layer=swm) to drop the transient WM draft
+   * it reconstructed from SWM, so the asset ends up resident PURELY in SWM (with
+   * its fresh seal) instead of duplicated across WM+SWM. This mirrors
+   * `assertionDiscard`'s data-graph teardown but does NOT stamp a "discarded"
+   * lifecycle event.
+   *
+   * Two `_meta` clean-ups happen here:
+   *   1. Rows keyed by the WM DATA-graph URI (the memoryLayer pointer etc.).
+   *   2. #1116 FIX 2 — the `dkg:wmCurrentAssertion` pointer on the LIFECYCLE URN.
+   *      `assertionFinalize` stamped it when it sealed the reconstructed WM draft,
+   *      but once that draft is dropped the WM data no longer exists; without
+   *      removing the pointer `agent.assertion.history()` / status APIs keep
+   *      reporting a sealed WM draft ("wm-sealed") that is gone. We only clear it
+   *      when `dkg:swmCurrentAssertion` IS present on the lifecycle URN — i.e. the
+   *      content is genuinely SWM-resident — so the status flips to "swm-shared"
+   *      (SWM-resident), consistent with the dropped WM data.
+   *
+   * Deliberately UNtouched: the seal (keyed by the assertion URI), `dkg:rootEntity`,
+   * `dkg:kaId`, and `dkg:swmCurrentAssertion`/`dkg:vmCurrentAssertion`.
+   */
+  async clearWmDraftDataGraph(
+    contextGraphId: string,
+    name: string,
+    agentAddress: string,
+    subGraphName?: string,
+  ): Promise<void> {
+    DKGPublisher.validateOptionalSubGraph(subGraphName);
+    const graphUri = await this.wmGraphUri(contextGraphId, agentAddress, name, subGraphName);
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    await this.store.deleteByPattern({ subject: graphUri, graph: metaGraph });
+    await this.store.dropGraph(graphUri);
+
+    // #1116 FIX 2 — retire the stale WM lifecycle pointer once the WM draft is
+    // gone, but only for SWM-resident content (swmCurrentAssertion set). The WM
+    // pointer lives on the lifecycle URN, a DIFFERENT subject than the WM data
+    // graph cleared above, so the deleteByPattern there never reaches it.
+    const lifecycleUri = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
+    const swmPointerRes = await this.store.query(
+      `ASK { GRAPH <${metaGraph}> { <${lifecycleUri}> <${SWM_CURRENT_ASSERTION_PRED}> ?swm } }`,
+    );
+    const isSwmResident = swmPointerRes.type === 'boolean' && swmPointerRes.value === true;
+    if (isSwmResident) {
+      await this.store.deleteByPattern({
+        subject: lifecycleUri,
+        predicate: WM_CURRENT_ASSERTION_PRED,
+        graph: metaGraph,
+      });
+    }
   }
 
   private async resolveKaUal(kaId: bigint): Promise<string> {

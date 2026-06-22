@@ -392,6 +392,25 @@
     "type": "error"
   },
   {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "contextGraphId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint96",
+        "name": "amount",
+        "type": "uint96"
+      }
+    ],
+    "name": "RegistrationEscrowConsumed",
+    "type": "event"
+  },
+  {
     "inputs": [],
     "name": "ACK_DIGEST_VERSION",
     "outputs": [
@@ -410,6 +429,19 @@
     "outputs": [
       {
         "internalType": "contract AskStorage",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "cgWeightTreeStorage",
+    "outputs": [
+      {
+        "internalType": "contract CGWeightTreeStorage",
         "name": "",
         "type": "address"
       }

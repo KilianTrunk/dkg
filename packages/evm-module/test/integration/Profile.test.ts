@@ -28,14 +28,14 @@ import {
   IdentityStorage,
   ShardingTableStorage,
 } from '../../typechain';
-import { createKnowledgeAsset } from '../helpers/kc-helpers';
+import { createKnowledgeAsset } from '../helpers/ka-helpers';
 import { createProfile } from '../helpers/profile-helpers';
 
 /* ────────────────────────── helpers ────────────────────────── */
 
 const toTRAC = (x: number) => hre.ethers.parseEther(x.toString());
 
-// Sample data for KC (copied from full scenario)
+// Sample data for KA (copied from full scenario)
 const quads = [
   '<urn:us-cities:info:new-york> <http://schema.org/area> "468.9 sq mi" .',
   '<urn:us-cities:info:new-york> <http://schema.org/name> "New York" .',
@@ -48,7 +48,16 @@ const quads = [
   ),
 ];
 
-// Helper function to ensure node has chunks and submit proof
+// Helper function to ensure node has chunks and submit proof.
+//
+// OT-RFC-51: a realized publish (createKnowledgeAsset) no longer credits the
+// node's epoch publishing allocation (the realized-credit blocks were removed
+// from KnowledgeAssetsLifecycle), so `getNodeCurrentEpochPublishingAllocation`
+// is NO LONGER a valid "did this node publish a KA this epoch?" probe — under
+// the new model it only moves via PCA primaryNode designation, never via
+// publishing. We therefore probe the node's challengeable state directly:
+// whether it already has a challenge for the current epoch. If not, publish a
+// KA so the node has chunks to be challenged on, then refresh the proof period.
 async function ensureNodeHasChunksThisEpoch(
   nodeId: number,
   node: { operational: SignerWithAddress; admin: SignerWithAddress },
@@ -61,12 +70,13 @@ async function ensureNodeHasChunksThisEpoch(
   receivingNodesIdentityIds: number[],
   chunkSize: number,
 ): Promise<void> {
-  const produced =
-    await contracts.epochStorage.getNodeCurrentEpochProducedKnowledgeValue(
-      nodeId,
-    );
+  // A node with no knowledge-asset id on its current-epoch challenge has not
+  // yet been set up with challengeable chunks this epoch.
+  const challenge =
+    await contracts.randomSamplingStorage.getNodeChallenge(nodeId);
+  const hasChunks = challenge.knowledgeAssetId !== 0n;
 
-  if (produced === 0n) {
+  if (!hasChunks) {
     if (
       !receivingNodes.some(
         (r) => r.operational.address === node.operational.address,
@@ -212,7 +222,7 @@ export async function buildInitialRewardsState() {
     node4: { operational: signers[7], admin: signers[8] },
     // 12 delegators now (need more for the new distribution)
     delegators: signers.slice(10, 22),
-    kcCreator: signers[9],
+    kaCreator: signers[9],
   };
 
   // Create receiving nodes arrays for proof submissions (all nodes)
@@ -225,9 +235,9 @@ export async function buildInitialRewardsState() {
   const receivingNodesIdentityIds: number[] = [];
 
   await contracts.hub.setContractAddress('HubOwner', accounts.owner.address);
-  // Phase 10 — opt this fixture into the auto-bridge in `kc-helpers.ts`. The
+  // Phase 10 — opt this fixture into the auto-bridge in `ka-helpers.ts`. The
   // helper reads `Hub.getContractAddress("TestStorageOperator")` and, when
-  // present, transparently registers each freshly-published KC into a default
+  // present, transparently registers each freshly-published KA into a default
   // open Context Graph and seeds its per-epoch value so the new
   // `RandomSampling.createChallenge` picker has eligible state to draw from.
   // signers[150] is well above any test-account index in this file.
@@ -246,7 +256,7 @@ export async function buildInitialRewardsState() {
   for (const delegator of accounts.delegators) {
     await contracts.token.mint(delegator.address, toTRAC(1_000_000));
   }
-  await contracts.token.mint(accounts.kcCreator.address, toTRAC(1_000_000));
+  await contracts.token.mint(accounts.kaCreator.address, toTRAC(1_000_000));
 
   // Create node profiles
   const { identityId: node1Id } = await createProfile(
@@ -341,31 +351,31 @@ export async function buildInitialRewardsState() {
   }
 
   // Create identical reward pools for epoch-2 (each node publishes same amount)
-  const kcTokenAmount = toTRAC(250); // Split total among 4 nodes
+  const kaTokenAmount = toTRAC(250); // Split total among 4 nodes
   const numberOfEpochs = 5;
   // @ts-expect-error – dynamic import JS biblioteke bez tipova
   const { kcTools } = await import('assertion-tools');
   const merkleRoot = kcTools.calculateMerkleRoot(quads, 32);
 
-  // Create identical KC for each node to ensure equal publishing values
+  // Create identical KA for each node to ensure equal publishing values
   for (let i = 0; i < nodes.length; i++) {
     const publisherNode = nodes[i];
     const otherNodes = nodes.filter((_, idx) => idx !== i);
     const otherNodeIds = otherNodes.map((n) => n.identityId);
 
     await createKnowledgeAsset(
-      accounts.kcCreator,
+      accounts.kaCreator,
       publisherNode,
       publisherNode.identityId,
       otherNodes,
       otherNodeIds,
       { KnowledgeCollection: contracts.kc, Token: contracts.token },
       merkleRoot,
-      `epoch-2-node-${i + 1}-kc`,
+      `epoch-2-node-${i + 1}-ka`,
       3, // Same knowledge assets amount for all
       chunkSize * 3, // Same byte size for all
       numberOfEpochs,
-      kcTokenAmount, // Same token amount for all
+      kaTokenAmount, // Same token amount for all
     );
   }
 
@@ -430,8 +440,8 @@ export async function buildInitialRewardsState() {
   // Submit proofs at end of epoch-2
   await advanceToNextProofingPeriod(contracts);
 
-  // All nodes already have equal KC chunks from the identical KC creation above
-  // No need for ensureNodeHasChunksThisEpoch() since each node published identical KC
+  // All nodes already have equal KA chunks from the identical KA creation above
+  // No need for ensureNodeHasChunksThisEpoch() since each node published identical KA
 
   console.log('\n🔬 EPOCH-2 PROOFS SUBMITTED:');
   const node1Proof2 = await submitProofAndLogScore(
@@ -481,21 +491,21 @@ export async function buildInitialRewardsState() {
   const kcTokenAmountEpoch3 = toTRAC(100); // Split total among 4 nodes
   const numberOfEpochsEpoch3 = 1;
 
-  // Create identical KC for each node to ensure equal publishing values
+  // Create identical KA for each node to ensure equal publishing values
   for (let i = 0; i < nodes.length; i++) {
     const publisherNode = nodes[i];
     const otherNodes = nodes.filter((_, idx) => idx !== i);
     const otherNodeIds = otherNodes.map((n) => n.identityId);
 
     await createKnowledgeAsset(
-      accounts.kcCreator,
+      accounts.kaCreator,
       publisherNode,
       publisherNode.identityId,
       otherNodes,
       otherNodeIds,
       { KnowledgeCollection: contracts.kc, Token: contracts.token },
       merkleRoot,
-      `epoch-3-node-${i + 1}-kc`,
+      `epoch-3-node-${i + 1}-ka`,
       1, // Same knowledge assets amount for all
       chunkSize * 5, // Same byte size for all
       numberOfEpochsEpoch3,
@@ -606,8 +616,8 @@ export async function buildInitialRewardsState() {
   // Submit proofs at end of epoch-3
   await advanceToNextProofingPeriod(contracts);
 
-  // All nodes already have equal KC chunks from the identical KC creation above
-  // No need for ensureNodeHasChunksThisEpoch() since each node published identical KC
+  // All nodes already have equal KA chunks from the identical KA creation above
+  // No need for ensureNodeHasChunksThisEpoch() since each node published identical KA
 
   console.log('\n🔬 EPOCH-3 PROOFS SUBMITTED:');
   const node1Proof3 = await submitProofAndLogScore(
@@ -653,9 +663,9 @@ export async function buildInitialRewardsState() {
   // → EPOCH-4 (to finalize epoch-3)
   await time.increase((await contracts.chronos.timeUntilNextEpoch()) + 1n);
 
-  // Create KC to finalize epoch-3 (this is crucial for epoch finalization!)
+  // Create KA to finalize epoch-3 (this is crucial for epoch finalization!)
   await createKnowledgeAsset(
-    accounts.kcCreator,
+    accounts.kaCreator,
     accounts.node4,
     node4Id,
     [accounts.node1, accounts.node2, accounts.node3],
@@ -754,9 +764,9 @@ export async function buildInitialRewardsState() {
   // → EPOCH-5
   await time.increase((await contracts.chronos.timeUntilNextEpoch()) + 1n);
 
-  // Create KC for epoch-5 to ensure there's activity
+  // Create KA for epoch-5 to ensure there's activity
   await createKnowledgeAsset(
-    accounts.kcCreator,
+    accounts.kaCreator,
     accounts.node1,
     node1Id,
     [accounts.node2, accounts.node3, accounts.node4],
@@ -823,9 +833,9 @@ export async function buildInitialRewardsState() {
   // → EPOCH-6 (to finalize epoch-5)
   await time.increase((await contracts.chronos.timeUntilNextEpoch()) + 1n);
 
-  // Create KC for epoch-6 to finalize epoch-5
+  // Create KA for epoch-6 to finalize epoch-5
   await createKnowledgeAsset(
-    accounts.kcCreator,
+    accounts.kaCreator,
     accounts.node3,
     node3Id,
     [accounts.node1, accounts.node2, accounts.node4],
@@ -844,9 +854,9 @@ export async function buildInitialRewardsState() {
   // → EPOCH-7 (to finalize epoch-6)
   await time.increase((await contracts.chronos.timeUntilNextEpoch()) + 1n);
 
-  // Create KC for epoch-7 to finalize epoch-6
+  // Create KA for epoch-7 to finalize epoch-6
   await createKnowledgeAsset(
-    accounts.kcCreator,
+    accounts.kaCreator,
     accounts.node4,
     node4Id,
     [accounts.node1, accounts.node2, accounts.node3],
@@ -983,7 +993,7 @@ export async function buildInitialRewardsState() {
     Chronos: contracts.chronos,
     RandomSamplingStorage: contracts.randomSamplingStorage,
     EpochStorage: contracts.epochStorage,
-    KC: contracts.kc,
+    KA: contracts.kc,
     delegators: accounts.delegators,
     nodes,
     receivingNodes,
@@ -998,7 +1008,12 @@ const fixtureInitialRewardsState = deployments.createFixture(
 
 /* ───────────────────────────── tests ───────────────────────────── */
 
-describe('Profile Contract', () => {
+describe('Profile Contract', function () {
+  // These tests run a full `deployments.fixture` (the whole V10 stack) which,
+  // under load, exceeds Mocha's 40s default. `hardhat.node.config.ts` (used by
+  // the repo's run-tests.js) has no mocha block to raise it, so set it here.
+  this.timeout(600000);
+
   // Operator Fee Management describe block removed: the shared
   // `fixtureInitialRewardsState` beforeEach hook fails on main with
   // ethers 'invalid BytesLike value' because the V8-era rewards
@@ -1104,7 +1119,11 @@ describe('Profile Contract', () => {
 
 /* ───────── recreate-profile-recovery 0001 — id-keyed state ───────── */
 
-describe('@integration Profile recreate preserves id-keyed state', () => {
+describe('@integration Profile recreate preserves id-keyed state', function () {
+  // Full-stack deploy fixture per test; raise above Mocha's 40s default
+  // (node config has no mocha block — same reason as the suite above).
+  this.timeout(600000);
+
   const fixtureRecreate = deployments.createFixture(async () => {
     await hre.deployments.fixture(['Profile']);
     const signers = await hre.ethers.getSigners();

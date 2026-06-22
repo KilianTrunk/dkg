@@ -255,6 +255,9 @@ export class OxigraphWorkerStore implements TripleStore {
   async insert(quads: Quad[]): Promise<void> { return this.call('insert', quads); }
   async delete(quads: Quad[]): Promise<void> { return this.call('delete', quads); }
   async deleteByPattern(pattern: Partial<Quad>): Promise<number> { return this.call('deleteByPattern', pattern); }
+  // Server-side SPARQL UPDATE forwarded to the worker's OxigraphStore (which
+  // implements `update`); same atomic single-message contract as `insert`.
+  async update(sparql: string): Promise<void> { return this.call('update', sparql); }
   async query(sparql: string, options?: TripleStoreQueryOptions): Promise<QueryResult> {
     return this.callWithTimeout<QueryResult>(this.operationTimeoutMs, options?.signal, 'query', sparql);
   }

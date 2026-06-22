@@ -135,7 +135,6 @@ async function publishOneKCV10(opts: {
   const authorTyped = buildAuthorAttestationTypedData({
     chainId: evmChainId,
     kav10Address,
-    contextGraphId,
     merkleRoot,
     authorAddress: coreOp.address,
     reservedKaId,

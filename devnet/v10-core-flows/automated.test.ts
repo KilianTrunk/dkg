@@ -14,17 +14,20 @@
  *      depend on. (Caught a real bug during devnet validation: standalone
  *      `/finalize` was missing the emit. See FINDINGS.md.)
  *
- *   2. Failed-publish honesty (RC11 / PR2) — runs create+write+finalize
- *      +promote+publish from an edge daemon (no on-chain identity) so the
- *      publisher's chain-submit branch necessarily fails. Asserts the
- *      INVERSE of the old "tentative VM" contract: the publish reports
- *      failure to the caller AND `/api/query?view=verifiable-memory` returns
- *      zero rows for the just-published triples. Pre-RC11 a failed publish
- *      silently wrote its quads into the root data graph and the VM view
- *      aliased that graph into VM, so an external app would observe
- *      "verified" data that the chain had never anchored. PR2 deletes
- *      `generateTentativeMetadata` from the on-chain catch and limits VM
- *      to `_verifiable_memory/*` graphs; this test pins both halves.
+ *   2. Publish/VM honesty (RC11 / PR2) — runs create+write+finalize
+ *      +promote+publish from an edge daemon (no on-chain identity). Post-RFC-38
+ *      that edge publish has TWO legitimate outcomes: it may CONFIRM when peer
+ *      cores supply storage ACKs (attributionId=0 is valid on chain), or it may
+ *      NOT confirm. The honesty rule this test pins: a publish's triples appear
+ *      in `/api/query?view=verifiable-memory` IFF it confirmed on-chain — a
+ *      confirmed publish carries a positive kaId (asserted) and may legitimately
+ *      show in VM, while a non-confirmed publish MUST NOT leak any rows into VM,
+ *      and the caller must never see the silent `tentative` downgrade. Pre-RC11 a
+ *      non-confirmed publish silently wrote its quads into the root data graph
+ *      and the VM view aliased that graph into VM, so an external app would
+ *      observe "verified" data that the chain had never anchored. PR2 deletes
+ *      `generateTentativeMetadata` from the on-chain catch and limits VM to
+ *      `_verifiable_memory/*` graphs; this test pins all three halves.
  *
  *   3. NFT staking withdraw — `DKGStakingConvictionNFT.withdraw(tokenId)`
  *      on an unlocked tier-0 position. Verifies: TRAC delta to staker EOA
@@ -204,6 +207,27 @@ function postJson(api: string, path: string, body: unknown, token: string): Prom
   });
 }
 
+/**
+ * Parse SPARQL SELECT bindings out of a daemon /api/query response, accepting the
+ * known wrapper shapes and THROWING on an unrecognised 200 — so a future wrapper
+ * regression can never masquerade as "zero rows". Callers must only pass a 200
+ * body; a non-200 (still warming up) has no bindings to read. (otReviewAgent #1258.)
+ */
+function queryBindings(body: any): Array<Record<string, unknown>> {
+  const b =
+    body?.result?.bindings ??   // current daemon shape: { result: { bindings } }
+    body?.results?.bindings ??  // SPARQL 1.1 JSON results shape
+    body?.bindings;             // legacy flat shape
+  if (!Array.isArray(b)) {
+    throw new Error(
+      `unrecognised /api/query response shape (no result.bindings / results.bindings / bindings array): ${
+        typeof body === 'string' ? body.slice(0, 300) : JSON.stringify(body).slice(0, 300)
+      }`,
+    );
+  }
+  return b as Array<Record<string, unknown>>;
+}
+
 function openSseAndCollect(
   api: string,
   token: string,
@@ -361,7 +385,11 @@ describe('1. chained sign-at-creation assertion lifecycle', () => {
     let r = await postJson(NODE1_API, '/api/knowledge-assets', { contextGraphId: CONTEXT_GRAPH, name: assertionName }, state.node1Token);
     // KA create returns 201 (resource created) vs the legacy route's 200.
     expect(r.status, `create: ${JSON.stringify(r.body)}`).toBe(201);
-    expect(r.body.assertionUri).toContain(assertionName);
+    // The create response identifies the assertion by `name`; `assertionUri` is
+    // the canonical WM storage URI (`…/_working_memory/<author>/<number>`),
+    // which is author/number-keyed by design and does NOT embed the human name.
+    expect(r.body.name).toBe(assertionName);
+    expect(r.body.assertionUri, `assertionUri: ${r.body.assertionUri}`).toMatch(/\/_working_memory\//);
 
     const quads = [
       { subject: 'urn:test:lifecycle:s1', predicate: 'http://schema.org/name', object: '"Sign-at-creation lifecycle test"', graph: '' },
@@ -394,9 +422,9 @@ describe('1. chained sign-at-creation assertion lifecycle', () => {
   }, 60_000);
 });
 
-// ─────────────────── 2. Failed-publish honesty (RC11 / PR2) ───────────────────
-describe('2. failed publish does not leak triples into verifiable-memory (RC11 / PR2)', () => {
-  it('edge-node publish fails AND /api/query?view=verifiable-memory returns zero rows for its triples', async () => {
+// ──────────────── 2. Publish/VM honesty (RC11 / PR2) ────────────────
+describe('2. edge publish appears in verifiable-memory iff it confirmed on-chain (RC11 / PR2)', () => {
+  it('a non-confirmed edge publish leaks zero VM rows; a confirmed one carries a positive on-chain kaId', async () => {
     const assertionName = `core-flows-edge-${Date.now().toString(36)}`;
     const subject = `urn:test:edge:rc11:${Date.now().toString(36)}`;
     const witnessLiteral = `"PR2 failed-publish witness ${Date.now().toString(36)}"`;
@@ -431,16 +459,17 @@ describe('2. failed publish does not leak triples into verifiable-memory (RC11 /
       `edge publish returned status='tentative' — pre-PR2 silent downgrade ` +
       `(would re-enable verifiable-memory leak via tentative graph aliasing)`,
     ).not.toBe('tentative');
+    const edgePublishStatus = r.body?.status;
+    const edgePublishKaId = r.body?.kaId;
 
-    // CORE ASSERTION (RC11 / PR2): regardless of on-chain outcome, the
-    // edge publish's triples MUST NOT appear in the
-    // verifiable-memory view on ANY node. Poll node1 (a core) over a few
-    // seconds so any in-flight gossip from the edge has time to land
-    // in the wrong graph — a leak that materialises 1-2s after the
-    // publish call returns would be missed by a single immediate
-    // query. The retry exits early on success (zero rows seen at any
-    // poll); the loop only runs to completion when the query keeps
-    // succeeding with zero rows, which is what we want.
+    // CORE ASSERTION (RC11 / PR2): a NON-confirmed edge publish's triples MUST
+    // NOT appear in the verifiable-memory view on ANY node (the confirmed case
+    // is asserted separately below — those rows are the correct on-chain result).
+    // Poll node1 (a core) over a few seconds so any in-flight gossip from the
+    // edge has time to land in the wrong graph — a leak that materialises 1-2s
+    // after the publish call returns would be missed by a single immediate
+    // query. The retry exits early once rows are seen (a leak in the
+    // non-confirmed case; the expected result in the confirmed case).
     const VM_POLL_ATTEMPTS = 6;
     const VM_POLL_INTERVAL_MS = 500;
     let lastVmStatus = 0;
@@ -461,7 +490,11 @@ describe('2. failed publish does not leak triples into verifiable-memory (RC11 /
       );
       lastVmStatus = vmQuery.status;
       lastVmBody = vmQuery.body;
-      lastVmBindings = vmQuery.body?.bindings ?? vmQuery.body?.results?.bindings ?? [];
+      // Parse via the shared helper, which THROWS on an unrecognised 200 shape
+      // rather than coercing to [] — otherwise a wrapper regression silently
+      // re-becomes "zero rows" and this leak guard passes open. A non-200 (still
+      // warming up) legitimately has no bindings to read. (otReviewAgent #1258.)
+      lastVmBindings = vmQuery.status === 200 ? queryBindings(vmQuery.body) : [];
       if (lastVmBindings.length > 0) {
         leakSeen = true;
         break;
@@ -469,15 +502,36 @@ describe('2. failed publish does not leak triples into verifiable-memory (RC11 /
       if (attempt < VM_POLL_ATTEMPTS - 1) await sleep(VM_POLL_INTERVAL_MS);
     }
     expect(lastVmStatus, `vm query: ${JSON.stringify(lastVmBody)}`).toBe(200);
-    expect(
-      leakSeen,
-      `PR2 invariant violated: edge publish leaked ${lastVmBindings.length} row(s) into ` +
-      `view=verifiable-memory for ${subject} after up to ` +
-      `${VM_POLL_ATTEMPTS * VM_POLL_INTERVAL_MS}ms of polling — the on-chain catch is still ` +
-      `writing tentative quads to a graph that the VM view aliases. ` +
-      `Re-check dkg-publisher.ts catch block and dkg-query-engine.ts ` +
-      `verifiable-memory branch.`,
-    ).toBe(false);
+    // RFC-38: an edge publish (identityId=0) MAY legitimately reach `confirmed`
+    // when peer cores supply storage ACKs — and a CONFIRMED publish's triples
+    // appearing in verifiable-memory is CORRECT, not a leak. The PR2 regression
+    // this guards is the silent `tentative` downgrade (asserted above) writing
+    // into a VM-aliased graph on a publish that did NOT confirm. So only enforce
+    // the zero-rows invariant when the publish did not confirm; otherwise the
+    // rows are the expected, on-chain-attributed result.
+    if (edgePublishStatus !== 'confirmed') {
+      expect(
+        leakSeen,
+        `PR2 invariant violated: a NON-confirmed edge publish (status=${edgePublishStatus}) leaked ` +
+        `${lastVmBindings.length} row(s) into view=verifiable-memory for ${subject} after up to ` +
+        `${VM_POLL_ATTEMPTS * VM_POLL_INTERVAL_MS}ms of polling — the on-chain catch is still ` +
+        `writing tentative quads to a graph that the VM view aliases. ` +
+        `Re-check dkg-publisher.ts catch block and dkg-query-engine.ts ` +
+        `verifiable-memory branch.`,
+      ).toBe(false);
+    } else {
+      // CONFIRMED branch: rather than leave this case a no-op (which would only
+      // prove the response was not `tentative` + the query returned 200), assert
+      // POSITIVE on-chain evidence — a real confirmation carries a positive kaId
+      // anchoring it on chain. This is synchronous (read from the publish
+      // response), so it adds no devnet-timing flakiness. A "confirmed" status
+      // with a zero/absent kaId (a fake confirm) fails here.
+      expect(
+        BigInt(edgePublishKaId ?? '0'),
+        `edge publish reported status='confirmed' but kaId='${edgePublishKaId}' is not a positive ` +
+        `on-chain id: ${JSON.stringify(r.body)}`,
+      ).toBeGreaterThan(0n);
+    }
   }, 90_000);
 });
 
@@ -502,11 +556,18 @@ describe('3. NFT staking withdraw', () => {
         ?? state.delegators.find((d) => BigInt(d.identityId) === 1n);
       expect(seed, 'no tier-0 delegator seed for createConviction').toBeDefined();
       const seedWallet = new ethers.Wallet(seed!.privateKey, state.provider);
-      const seedNft = new ethers.Contract(state.nft.target, NFT_ABI, seedWallet);
+      // Drive the seed wallet's sequential txs through a NonceManager: this
+      // wallet was already used by the devnet bootstrap, and under automining a
+      // same-wallet approve→createConviction pair races the provider nonce query
+      // (each re-reads getTransactionCount and can see a stale value → "Nonce
+      // too low"). NonceManager assigns nonces locally + monotonically, so the
+      // two txs are strictly ordered regardless of when the chain reflects them.
+      const seedSigner = new ethers.NonceManager(seedWallet);
+      const seedNft = new ethers.Contract(state.nft.target, NFT_ABI, seedSigner);
       const stakeAmount = ethers.parseEther('10000');
       const stakingV10Address = await state.staking.getAddress();
-      const tokenAsSeed = state.token.connect(seedWallet) as ethers.Contract;
-      await tokenAsSeed.approve(stakingV10Address, stakeAmount, { gasLimit: 500_000 });
+      const tokenAsSeed = state.token.connect(seedSigner) as ethers.Contract;
+      await (await tokenAsSeed.approve(stakingV10Address, stakeAmount, { gasLimit: 500_000 })).wait();
       const createTx = await seedNft.createConviction(
         BigInt(seed!.identityId),
         stakeAmount,
@@ -733,4 +794,100 @@ describe('4. operator-fee accrual + withdrawal', () => {
     const queuedAfter = await state.css.getOperatorFeeWithdrawalRequest(identityId);
     expect(queuedAfter.amount).toBe(0n);
   }, 600_000);
+});
+
+// ───────── 5. Addressed-read provenance (dkg_get_entity_sources, PR #1253) ─────────
+//
+// The `dkg_get_entity_sources` MCP tool answers "what is known about entity X,
+// and which Knowledge Asset asserted each fact?" — it reads
+// `SELECT ?p ?o ?g WHERE { GRAPH ?g { <X> ?p ?o } }` scoped to verifiable-memory
+// and parses the per-KA source graph `…/_verifiable_memory/{author}/{number}`
+// into the on-chain UAL identity a consumer cites/verifies against. The tool's
+// parsing/rendering is unit-tested with synthetic graphs; what ONLY a live
+// devnet can prove is that a REAL publish actually materialises that exact
+// per-KA source graph — i.e. the provenance handle the tool hands back resolves
+// to the publish's true on-chain (author, number).
+//
+// This pins that engine-layer contract end-to-end: publish an entity from a
+// core, read it back via the addressed-read shape, and assert the source graph
+// encodes the SAME (author, number) packed into the returned on-chain kaId
+// (reservedKaId = (uint160(author) << 96) | uint96(number) — the derivation the
+// publisher itself uses to build the VM graph URI, see dkg-publisher.ts:1553).
+describe('5. addressed-read provenance resolves to the per-KA verifiable-memory source', () => {
+  it("a published entity's facts carry a _verifiable_memory/{author}/{number} source matching its on-chain kaId", async () => {
+    const name = `core-flows-prov-${Date.now().toString(36)}`;
+    const subject = `urn:test:core-flows:${name}`; // fullPublish writes quads about this subject
+    const pub = await fullPublish(NODE1_API, state.node1Token, name);
+
+    // Reproduce the publisher's kaId → VM-graph derivation (dkg-publisher.ts:1553).
+    const kaId = BigInt(pub.kaId);
+    const author = '0x' + (kaId >> 96n).toString(16).padStart(40, '0');
+    const number = (kaId & ((1n << 96n) - 1n)).toString();
+
+    // Break the circularity (otReviewAgent #1258): pub.kaId comes from the daemon's
+    // own publish response, and the VM graph is materialised from that same value —
+    // so a publisher bug that returned AND materialised the same WRONG id would slip
+    // past a check that only compares the graph to pub.kaId. Anchor to chain truth:
+    // the KA-storage NFT's ownerOf(kaId) REVERTS for a non-existent token and
+    // otherwise returns the address packed into the id (OT-RFC-43:
+    // kaId = (uint160(author) << 96) | uint96(number)). So a forged id either
+    // reverts here or fails owner == author — independently of what the daemon said.
+    const dkgKaAddr: string = await state.hub.getAssetStorageAddress('DKGKnowledgeAssets');
+    const dkgKa = new ethers.Contract(
+      dkgKaAddr,
+      ['function ownerOf(uint256) view returns (address)'],
+      state.provider,
+    );
+    const onChainOwner: string = await dkgKa.ownerOf(kaId); // reverts if kaId is not a real minted KA
+    expect(
+      onChainOwner.toLowerCase(),
+      `kaId ${pub.kaId}: on-chain owner ${onChainOwner} != author packed into the id (${author}) — daemon reported an id that does not match chain truth`,
+    ).toBe(author.toLowerCase());
+
+    const expectedSource = `did:dkg:context-graph:${CONTEXT_GRAPH}/_verifiable_memory/${author}/${number}`;
+
+    // Addressed read: project the source graph per fact — the exact shape the
+    // tool issues. Parse via the shared queryBindings helper (throws on an
+    // unrecognised 200 shape). Poll briefly so post-confirmation VM
+    // materialisation has time to land.
+    const val = (x: unknown): string =>
+      typeof x === 'string' ? x : ((x as { value?: string })?.value ?? '');
+    let bindings: Array<Record<string, unknown>> = [];
+    for (let attempt = 0; attempt < 15; attempt++) {
+      const r = await postJson(
+        NODE1_API,
+        '/api/query',
+        {
+          sparql: `SELECT ?p ?o ?g WHERE { GRAPH ?g { <${subject}> ?p ?o } }`,
+          contextGraphId: CONTEXT_GRAPH,
+          view: 'verifiable-memory',
+        },
+        state.node1Token,
+      );
+      bindings = r.status === 200 ? queryBindings(r.body) : [];
+      if (bindings.length > 0) break;
+      await sleep(1000);
+    }
+    expect(bindings.length, `no verifiable-memory rows for ${subject} after polling`).toBeGreaterThan(0);
+
+    const sources = [...new Set(bindings.map((b) => val(b.g)))];
+
+    // (1) The correct per-KA source IS present — the handle a consumer cites
+    // resolves to THIS publish's on-chain (author, number).
+    expect(
+      sources.map((s) => s.toLowerCase()),
+      `expected per-KA source ${expectedSource}; got [${sources.join(', ')}]`,
+    ).toContain(expectedSource.toLowerCase());
+
+    // (2) No per-KA-shaped source carries a DIFFERENT (author, number) — i.e.
+    // attribution is never fabricated/mismatched against the on-chain identity.
+    // (Root / per-collection graphs that don't match the per-KA shape are the
+    // tool's "disclosed, non-citable" rows and are intentionally skipped here.)
+    for (const s of sources) {
+      const m = s.match(/\/_verifiable_memory\/([^/]+)\/([^/]+)$/);
+      if (!m) continue;
+      expect(m[1].toLowerCase(), `source ${s}: author != on-chain ${author}`).toBe(author.toLowerCase());
+      expect(m[2], `source ${s}: kaNumber != on-chain ${number}`).toBe(number);
+    }
+  }, 120_000);
 });

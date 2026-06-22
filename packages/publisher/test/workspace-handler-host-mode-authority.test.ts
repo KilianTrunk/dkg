@@ -405,4 +405,61 @@ describe('SharedMemoryHandler.verifyHostModeEnvelopeAuthority (LU-6 host-mode ga
       }
     });
   });
+
+  // GH #1124 (otReviewAgent #1239) — the self-signed OPEN-PUBLISH exception.
+  // The exception is gated on the caller-injected on-chain policy RESOLVER
+  // (accessPolicy===0 && publishPolicy===1), enforced HERE — NOT on a trusted
+  // boolean, and NOT on `agentGateAddresses === null`. So an open-publish CG
+  // that still carries a STALE participant allowlist must take the self-signed
+  // path (the contract's isAuthorizedPublisher ignores participants for open
+  // publish), instead of falling into the curated branch and dropping valid
+  // open publishers.
+  describe('open-publish self-signed path (resolveOpenPublishPolicy)', () => {
+    it('accepts a self-signed open-publish envelope EVEN WHEN a stale agent allowlist survives the open flip', async () => {
+      const staleParticipant = ethers.Wallet.createRandom();
+      await insertAgentGate(DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT, staleParticipant.address);
+      const openPublisher = ethers.Wallet.createRandom(); // NOT in the stale allowlist
+
+      // PLAINTEXT signed envelope (public SWM), publisherPeerId === sender.
+      const wire = await signWorkspaceMessage(openPublisher, workspaceMessage('Open Publish', 'op-open-stale-allowlist'));
+      const handler = makeHandler();
+
+      const verdict = await handler.verifyHostModeEnvelopeAuthority(wire, CONTEXT_GRAPH_ID, PUBLISHER_PEER_ID, {
+        resolveOpenPublishPolicy: async () => ({ accessPolicy: 0, publishPolicy: 1 }),
+      });
+      expect(verdict.accepted).toBe(true);
+    });
+
+    it('still REJECTS the same non-allowlisted signer when the CG is NOT open publish (publishPolicy != 1 → curated branch)', async () => {
+      const staleParticipant = ethers.Wallet.createRandom();
+      await insertAgentGate(DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT, staleParticipant.address);
+      const nonMember = ethers.Wallet.createRandom();
+
+      const wire = await signWorkspaceMessage(nonMember, workspaceMessage('Curated', 'op-curated-nonmember'));
+      const handler = makeHandler();
+
+      // public READ but curated PUBLISH → not self-publishable → curated branch.
+      const verdict = await handler.verifyHostModeEnvelopeAuthority(wire, CONTEXT_GRAPH_ID, PUBLISHER_PEER_ID, {
+        resolveOpenPublishPolicy: async () => ({ accessPolicy: 0, publishPolicy: 0 }),
+      });
+      expect(verdict.accepted).toBe(false);
+      if (!verdict.accepted) expect(verdict.reasonCode).toBe('SIG_VERIFY_FAILED');
+    });
+
+    it('fail-closed: a thrown policy resolver does not grant the self-signed exception', async () => {
+      const staleParticipant = ethers.Wallet.createRandom();
+      await insertAgentGate(DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT, staleParticipant.address);
+      const openPublisher = ethers.Wallet.createRandom();
+
+      const wire = await signWorkspaceMessage(openPublisher, workspaceMessage('Throws', 'op-resolver-throws'));
+      const handler = makeHandler();
+
+      const verdict = await handler.verifyHostModeEnvelopeAuthority(wire, CONTEXT_GRAPH_ID, PUBLISHER_PEER_ID, {
+        resolveOpenPublishPolicy: async () => { throw new Error('rpc down'); },
+      });
+      // Resolver threw → not confirmed open → curated branch → signer not in the
+      // (stale) allowlist → rejected. The exception is never granted on failure.
+      expect(verdict.accepted).toBe(false);
+    });
+  });
 });

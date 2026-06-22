@@ -116,8 +116,11 @@ describe('drop-sweep — none of the 10 W2-dropped tools reappear in tools/list'
   // the README's "30 tools" — so the locked count is the full 30-tool surface
   // (previously this guard registered only 6 modules and locked 28, silently
   // under-covering registerChatTools).
-  it('registered surface contains exactly 30 tools (full production surface, post-PR locked count)', () => {
-    expect(server.tools.size).toBe(30);
+  // addressed-read provenance PR: +1 net-new read tool
+  // (dkg_get_entity_sources) — describes an entity's facts each tagged with
+  // the verifiable KA source — taking the surface from 30 → 31.
+  it('registered surface contains exactly 31 tools (full production surface, post-PR locked count)', () => {
+    expect(server.tools.size).toBe(31);
   });
 });
 

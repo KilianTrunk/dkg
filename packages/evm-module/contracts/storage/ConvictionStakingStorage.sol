@@ -48,8 +48,10 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
  *   - Tier durations and multipliers are stored in `_tiers` (keyed by
  *     `lockTier` id). The baseline ladder seeded at `initialize()` is
  *     {0→(0s, 1x), 1→(30d, 1.5x), 3→(90d, 2x), 6→(180d, 3.5x), 12→(366d, 6x)}.
- *   - `expiryTimestamp = block.timestamp + duration` (timestamp-accurate;
- *     no epoch rounding, no drift buffer).
+ *   - `expiryTimestamp = block.timestamp + duration`, rounded UP to the
+ *     next 12-hour expiry bucket. The upward rounding keeps the promised
+ *     minimum lock duration while coalescing per-block dust stakes into
+ *     one queue slot per half-day.
  *   - New tiers can be appended via `addTier` (HubOwner or multisig owner).
  *     Existing tiers can be deactivated via `deactivateTier` to stop
  *     accepting NEW fresh stakes, but relock / migration paths still
@@ -143,12 +145,41 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     //             drained by `StakingV10._claim`.
     //           * `createNewPositionFromExisting` migrates carries across
     //             the relock burn-mint; `deletePosition` deletes them.
-    string private constant _VERSION = "10.0.3";
+    //   10.0.5 — Expiry-queue DoS hardening:
+    //           * Boost expiries are rounded up to 12-hour buckets so
+    //             per-block dust stakes coalesce into one queue slot per
+    //             half-day.
+    //           * New distinct expiry slots are capped per node; same-bucket
+    //             stakes keep coalescing even when the cap is reached.
+    //   10.0.6 — Audit G-6: increaseRaw/decreaseRaw install a position's running-
+    //             stake / boost contribution as the ONE-SHOT delta from its raw
+    //             (floor(newRaw*m) - floor(oldRaw*m)), so a reward-compounded
+    //             position's contribution always equals the one-shot value the
+    //             unwind paths remove. This eliminates the incremental-vs-one-shot
+    //             floor asymmetry that bricked redelegate/relock/exit/decreaseRaw,
+    //             with the strict cancel/stake-delta invariants kept intact.
+    string private constant _VERSION = "10.0.6";
 
     // Multiplier scale, matches DKGStakingConvictionNFT._convictionMultiplier
     // (returns 1e18-scaled values so fractional tiers like 1.5x and 3.5x
     // are representable).
     uint256 internal constant SCALE18 = 1e18;
+    uint40 public constant EXPIRY_BUCKET_SECONDS = 12 hours;
+    uint256 public constant MAX_NODE_PENDING_EXPIRIES = 1024;
+    /// @notice Maximum boosted lock-tier duration. Bounded so the distinct future
+    ///         buckets a node can ever hold stays STRICTLY below the slot cap.
+    ///         Because `_computeExpiryTimestamp` rounds UP to the next bucket, a
+    ///         tier of `k` buckets created just after a boundary expires `k + 1`
+    ///         buckets out — so a node staking once per bucket can reach `k + 1`
+    ///         distinct pending slots. To keep that `<= MAX_NODE_PENDING_EXPIRIES`,
+    ///         a tier must be at most `MAX_NODE_PENDING_EXPIRIES - 1` buckets
+    ///         (`1023 * 12h = 511.5 days`). With this enforced in `addTier`,
+    ///         `MAX_NODE_PENDING_EXPIRIES` can never be reached by valid stakes —
+    ///         it stays a pure backstop and never blocks a legitimate stake/relock
+    ///         (and the tombstone-vs-live slot distinction can never bite). The
+    ///         baseline ladder tops out at 366 days, well under this.
+    uint256 public constant MAX_TIER_DURATION =
+        (MAX_NODE_PENDING_EXPIRIES - 1) * uint256(EXPIRY_BUCKET_SECONDS);
 
     // ============================================================
     //                 D20 — Mutable tier ladder
@@ -251,6 +282,7 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     event NodeEffectiveStakeDelta(uint72 indexed identityId, int256 delta, uint256 newRunningEffectiveStake);
     event NodeExpiryScheduled(uint72 indexed identityId, uint40 timestamp, uint256 dropAdded, uint256 newTotalDrop);
     event NodeExpiryCancelled(uint72 indexed identityId, uint40 timestamp, uint256 dropRemoved, uint256 newTotalDrop);
+    error NodeExpiryQueueFull(uint72 identityId, uint256 pending, uint256 maxPending);
     // D15 — V10 stake aggregate events.
     event NodeStakeV10Increased(uint72 indexed identityId, uint256 amount, uint256 newNodeStake, uint256 newTotal);
     event NodeStakeV10Decreased(uint72 indexed identityId, uint256 amount, uint256 newNodeStake, uint256 newTotal);
@@ -347,6 +379,24 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     uint256 public v10LaunchEpoch;
 
     // ============================================================
+    //   V8→V10 "pool & allocate" migration credit ledger
+    // ============================================================
+    // Migrated-but-unallocated TRAC, per delegator. Backed 1:1 by TRAC
+    // physically held in THIS contract (moved here by the drain worker via
+    // StakingStorage.transferStake). The only sink is `spendMigrationCredit`
+    // (driven by DKGStakingConvictionNFT.allocate) — credit is NEVER
+    // withdrawable to a wallet. Lives here (durable storage), not on the
+    // wrapper (logic), so a wrapper redeploy mid-migration cannot strand the
+    // already-moved TRAC.
+    mapping(address => uint96) public migrationCredit;
+    // Lock-shortening (seconds) applied to ANY tier-6/12 migration allocation
+    // (universal — no per-staker eligibility distinction). Set
+    // at cutover via `setConvictionCreditSeconds`, capped below the shortest
+    // credited-tier (tier 6) duration so a position's expiry cannot underflow.
+    // 0 until set (no credit).
+    uint40 public convictionCreditSeconds;
+
+    // ============================================================
     //           D20 (v2.1.0) — Mutable tier-ladder storage
     // ============================================================
     mapping(uint40 => TierConfig) internal _tiers;
@@ -391,6 +441,7 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     // ============================================================
     event TierAdded(uint40 indexed lockTier, uint256 duration, uint64 multiplier18);
     event TierDeactivated(uint40 indexed lockTier);
+    event ConvictionCreditSecondsSet(uint40 secondsValue);
 
     // ============================================================
     //   v4.0.0 — Vault + operator-fee events (absorbed from V8 SS)
@@ -404,6 +455,11 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     );
     event OperatorFeeWithdrawalRequestDeleted(uint72 indexed identityId);
     event StakedTokensTransferred(address indexed receiver, uint96 amount);
+    /// @notice OT-RFC-53: emitted when the protocol treasury fee owed on an
+    ///         escrow-funded publish/update/extend is routed out of the vault to
+    ///         the treasury. Distinct from {StakedTokensTransferred} so off-chain
+    ///         accounting never mistakes a treasury-fee outflow for a stake move.
+    event RegistrationDepositFeeTransferred(address indexed treasury, uint96 amount);
 
     constructor(address hubAddress) Guardian(hubAddress) {}
 
@@ -522,6 +578,10 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
             require(duration == 0 && multiplier18 == uint64(SCALE18), "Tier 0 must be rest");
         } else {
             require(duration > 0, "Non-zero tier needs duration");
+            // Keep MAX_NODE_PENDING_EXPIRIES an unreachable backstop: a single
+            // tier's expiry window must fit within that many 12h buckets, so the
+            // per-node slot cap can never block a legitimate stake/relock.
+            require(duration <= MAX_TIER_DURATION, "Tier duration too long");
             require(multiplier18 > uint64(SCALE18), "Non-zero tier needs boost");
         }
         _addTierInternal(lockTier, duration, multiplier18);
@@ -687,59 +747,22 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     ///
     /// LOOP BOUND (why this cannot explode the block gas limit)
     /// --------------------------------------------------------
-    /// The `while` terminates as soon as `t > ts` (1) or `head == len`
-    /// (2). What could make it iterate "many" times?
+    /// The `while` terminates as soon as `t > ts` or `head == len`.
+    /// Entries are only added through `_scheduleNodeExpiry`, and fresh
+    /// lock expiries are rounded UP to 12-hour buckets before they reach
+    /// the queue. A per-block dust-stake stream therefore coalesces into
+    /// one slot per half-day, not one slot per block.
     ///
-    ///   (a) Entries are only added by `_scheduleNodeExpiry`, which is
-    ///       itself only reachable from `onlyContracts` mutators above.
-    ///       There is no external path for an attacker to spam the
-    ///       queue — fresh entries cost someone real TRAC to lock.
+    /// `_scheduleNodeExpiry` also refuses to create a new distinct slot
+    /// once `MAX_NODE_PENDING_EXPIRIES` pending slots are live for a node.
+    /// Same-bucket stakes keep accumulating into the existing slot, so the
+    /// cap bounds replay work without blocking aggregation inside an
+    /// already-reserved bucket.
     ///
-    ///   (b) Entries with the same `ts` are coalesced into ONE array
-    ///       slot (see `_scheduleNodeExpiry`: `if (existing != 0) return`).
-    ///       So the queue length is bounded by the number of *distinct*
-    ///       active expiry timestamps the node has ever been scheduled
-    ///       against — NOT by the delegator count.
-    ///
-    ///   (c) Work is strictly amortized once: each array slot is
-    ///       visited by exactly one `_settleNodeTo` call across the
-    ///       contract's lifetime (we only ever advance `head`). In the
-    ///       steady state where settle is called from every CSS mutator
-    ///       and every `submitProof` (~ every epoch), the number of
-    ///       entries matured between two consecutive settles is
-    ///       bounded by (new expiries scheduled during that window that
-    ///       also matured within it) — in practice 0 on a healthy,
-    ///       proof-active node.
-    ///
-    /// The only scenario that produces a large iteration count in one
-    /// call is long-duration node DORMANCY: the node produces no proofs
-    /// AND receives no CSS mutations while many distinct-ts expiries
-    /// mature. Concrete napkin math: on NeuroWeb (~12s blocks) a node
-    /// that accumulates ONE brand-new distinct expiry timestamp per
-    /// block for 30 days and then stops settling for 30 more days sees
-    /// ~216k matured entries on resume — at ~5k gas per iteration that
-    /// is ~1.1B gas, well above any block limit. That tail is tolerable
-    /// because:
-    ///
-    ///   * To reach it, the node has to have been completely silent
-    ///     (no proofs, no stake/unstake, no relock, no redelegate in or
-    ///     out) for longer than its longest outstanding tier duration.
-    ///     In practice `submitProof` settles on every proof, so any
-    ///     proof-producing node drains continuously.
-    ///   * Same-block same-tier stakes coalesce, so realistic distinct-
-    ///     ts counts are far below the worst case.
-    ///   * The invariant is recoverable: any single `settleNodeTo` that
-    ///     OOMs blocks only the caller's tx; the queue state is
-    ///     unchanged, so later calls can still make progress once gas
-    ///     budgets allow.
-    ///
-    /// If operational telemetry later shows real-world queues
-    /// approaching danger, the escape hatch is a bounded variant
-    /// (`settleNodeToMax(id, ts, maxEntries)`) that advances `head` by
-    /// at most `maxEntries` and lets the protocol drain a dormant queue
-    /// across several txs. Not shipped now because the "who even calls
-    /// this" analysis (a) + steady-state (c) make it dead code for any
-    /// node that ever submits a proof.
+    /// Work is amortized once: each array slot is visited by exactly one
+    /// `_settleNodeTo` call across the contract's lifetime. In steady state
+    /// `submitProof` drains the queue continuously; after dormancy, the
+    /// 12-hour bucket + pending-slot cap keeps the catch-up loop bounded.
     ///
     /// INVARIANTS MAINTAINED ON EXIT
     /// -----------------------------
@@ -863,12 +886,17 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
             // ts already has a slot in the queue; just bumped the drop.
             return;
         }
-        nodeExpiryPresent[identityId][ts] = true;
 
         // Insert `ts` into the sorted queue.
         uint40[] storage arr = nodeExpiryTimes[identityId];
         uint256 head = nodeExpiryHead[identityId];
         uint256 len = arr.length;
+        uint256 pending = len - head;
+        if (pending >= MAX_NODE_PENDING_EXPIRIES) {
+            revert NodeExpiryQueueFull(identityId, pending, MAX_NODE_PENDING_EXPIRIES);
+        }
+        nodeExpiryPresent[identityId][ts] = true;
+
         arr.push(ts); // temporarily at tail
         // Bubble left while the left neighbor is strictly greater AND we
         // haven't crossed the drain head.
@@ -900,6 +928,11 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
             return;
         }
         uint256 existing = nodeExpiryDrop[identityId][ts];
+        // Strict invariant: a cancel can never exceed the scheduled drop. G-6 keeps
+        // this strict (no saturation) because increaseRaw/decreaseRaw now install a
+        // position's boost as the ONE-SHOT delta from its raw, so the scheduled slot
+        // always holds exactly floor(curRaw*(m-S)) for the position and the one-shot
+        // unwind removes exactly that — no incremental-vs-one-shot floor asymmetry.
         require(existing >= drop, "Cancel > scheduled");
         uint256 remaining = existing - drop;
         if (remaining == 0) {
@@ -920,6 +953,11 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
             stake += uint256(delta);
         } else {
             uint256 d = uint256(-delta);
+            // Strict invariant: running stake can never go negative. G-6 keeps this
+            // strict (no saturation) — increaseRaw/decreaseRaw install a position's
+            // running-stake contribution as the ONE-SHOT delta from its raw, so the
+            // aggregate always holds exactly floor(curRaw*m) for the position and the
+            // one-shot unwind removes exactly that.
             require(stake >= d, "Neg running stake");
             stake -= d;
         }
@@ -992,6 +1030,13 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
             require(lockTier != 0, "Credit requires locked tier");
             uint256 dur = _tierDuration(lockTier);
             require(uint256(expiryShortenedBy) < dur, "Credit >= tier duration");
+            // Subtract the migration credit AFTER bucketing and do NOT re-bucket.
+            // `expiryShortenedBy` (convictionCreditSeconds) is a single global
+            // offset, so `bucketedDefault - credit` still coalesces (same shifted
+            // timestamp per creation bucket) and the queue stays bounded. Re-bucketing
+            // here would silently round a non-bucket-aligned credit UP to the 12h grid
+            // (e.g. `60d - 1h` -> a full `60d`), changing the configured credit. The
+            // exact second is preserved on purpose — do not "tidy" this onto the grid.
             expiryTimestamp = uint40(uint256(expiryTimestamp) - uint256(expiryShortenedBy));
             require(expiryTimestamp > tsNow, "Credit leaves no remaining lock");
         }
@@ -1264,6 +1309,38 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
         emit V10LaunchEpochSet(epoch);
     }
 
+    // ============================================================
+    //   Migration credit ledger mutators (onlyContracts)
+    // ============================================================
+
+    /// @notice Credit `delegator` with migrated TRAC. Driven by StakingV10's
+    ///         drain worker after the TRAC has been physically moved into this
+    ///         contract.
+    function addMigrationCredit(address delegator, uint96 total) external onlyContracts {
+        migrationCredit[delegator] += total;
+    }
+
+    /// @notice Spend `amount` of `staker`'s migration credit for one allocation.
+    ///         Whether the tier-6/12 lock-credit applies is decided by the caller
+    ///         (StakingV10's allocate worker) from the chosen tier — there is no
+    ///         per-staker eligibility, so the spend is a plain debit.
+    function spendMigrationCredit(address staker, uint96 amount) external onlyContracts {
+        require(amount > 0, "Zero amount");
+        require(amount <= migrationCredit[staker], "Amount exceeds credit");
+        migrationCredit[staker] -= amount;
+    }
+
+    /// @notice Set the V8→V10 conviction lock-credit (seconds). Capped strictly
+    ///         below the tier-6 lock duration (the shortest credited tier) so
+    ///         `expiryShortenedBy < duration` holds and a tier-6 allocation can
+    ///         never underflow its expiry. The owner gate lives on the
+    ///         DKGStakingConvictionNFT entrypoint that drives this.
+    function setConvictionCreditSeconds(uint40 secondsValue) external onlyContracts {
+        require(uint256(secondsValue) < _tierDuration(6), "credit >= tier-6 lock");
+        convictionCreditSeconds = secondsValue;
+        emit ConvictionCreditSecondsSet(secondsValue);
+    }
+
     function deletePosition(uint256 tokenId) external onlyContracts {
         Position memory pos = positions[tokenId];
         require(pos.identityId != 0, "No position");
@@ -1320,14 +1397,23 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
 
         _settleNodeTo(identityId, tsNow);
 
-        uint256 effectiveNow = stillBoosted
-            ? (uint256(amount) * uint256(multiplier18)) / SCALE18
+        // G-6: remove the position's contribution as the ONE-SHOT delta from its
+        // current raw — floor(oldRaw*m) - floor(newRaw*m) — so the position's
+        // running-stake / boost contribution always equals floor(curRaw*m), exactly
+        // what the unwind paths (redelegate / relock / exit) later remove. No
+        // incremental-vs-one-shot floor asymmetry, so the strict helper invariants
+        // hold without saturation.
+        uint256 oldRaw = uint256(pos.raw);
+        uint256 newRaw = oldRaw - uint256(amount);
+        uint256 effDelta = stillBoosted
+            ? ((oldRaw * uint256(multiplier18)) / SCALE18) - ((newRaw * uint256(multiplier18)) / SCALE18)
             : uint256(amount);
-        _applyNodeStakeDelta(identityId, -int256(effectiveNow));
+        _applyNodeStakeDelta(identityId, -int256(effDelta));
 
         if (stillBoosted && multiplier18 > SCALE18) {
-            uint256 boostShrink = (uint256(amount) * (uint256(multiplier18) - SCALE18)) / SCALE18;
-            _cancelNodeExpiry(identityId, expiryTs, boostShrink);
+            uint256 boostDelta = ((oldRaw * (uint256(multiplier18) - SCALE18)) / SCALE18) -
+                ((newRaw * (uint256(multiplier18) - SCALE18)) / SCALE18);
+            _cancelNodeExpiry(identityId, expiryTs, boostDelta);
         }
 
         pos.raw = pos.raw - amount;
@@ -1354,14 +1440,29 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
 
         _settleNodeTo(identityId, tsNow);
 
-        uint256 effectiveNow = stillBoosted
-            ? (uint256(amount) * uint256(multiplier18)) / SCALE18
+        // G-6: install the position's contribution as the ONE-SHOT delta from its
+        // current raw — floor(newRaw*m) - floor(oldRaw*m) — so a reward-compounding
+        // claim keeps the position's running-stake / boost contribution equal to
+        // floor(curRaw*m), exactly what the unwind paths later remove. This replaces
+        // the prior floor(amount*m) increment, whose independent floor caused the
+        // incremental-vs-one-shot asymmetry that bricked redelegate/relock (audit
+        // G-6); the strict helper invariants now hold without saturation.
+        uint256 oldRaw = uint256(pos.raw);
+        uint256 newRaw = oldRaw + uint256(amount);
+        uint256 effDelta = stillBoosted
+            ? ((newRaw * uint256(multiplier18)) / SCALE18) - ((oldRaw * uint256(multiplier18)) / SCALE18)
             : uint256(amount);
-        _applyNodeStakeDelta(identityId, int256(effectiveNow));
+        _applyNodeStakeDelta(identityId, int256(effDelta));
 
         if (stillBoosted && multiplier18 > SCALE18) {
-            uint256 boostGrow = (uint256(amount) * (uint256(multiplier18) - SCALE18)) / SCALE18;
-            _scheduleNodeExpiry(identityId, expiryTs, boostGrow);
+            uint256 boostDelta = ((newRaw * (uint256(multiplier18) - SCALE18)) / SCALE18) -
+                ((oldRaw * (uint256(multiplier18) - SCALE18)) / SCALE18);
+            // The one-shot delta can be 0 for a small compound (the floored boost
+            // doesn't tip to the next wei); _scheduleNodeExpiry reverts on a zero
+            // drop, so skip it — the contribution is already exact.
+            if (boostDelta != 0) {
+                _scheduleNodeExpiry(identityId, expiryTs, boostDelta);
+            }
         }
 
         pos.raw = pos.raw + amount;
@@ -1562,7 +1663,8 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     //
     // The CSS contract address is the V10 TRAC vault (deposits arrive via
     // `transferFrom(staker, address(this), amount)` from publish/staking
-    // callers). `transferStake` is the only outflow path; gated to Hub-
+    // callers). `transferStake` (stake movement) and `transferRegistrationDepositFee`
+    // (OT-RFC-53 escrow treasury fee) are the outflow paths; both gated to Hub-
     // registered contracts, mirroring V8 `StakingStorage.transferStake`.
     // ============================================================
 
@@ -1579,21 +1681,39 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
         emit StakedTokensTransferred(receiver, stakeAmount);
     }
 
+    /// @notice OT-RFC-53: routes the protocol treasury fee owed on an escrow-funded
+    ///         publish/update/extend out of the vault to `treasury`. The SECOND
+    ///         vault-outflow path; mirrors {transferStake} (gated to Hub contracts,
+    ///         SafeERC20). The caller (KnowledgeAssetsLifecycle) computes `amount`
+    ///         (bounded by the consumed escrow) and passes the configured
+    ///         `protocolTreasury`; CSS performs only the gated transfer.
+    function transferRegistrationDepositFee(address treasury, uint96 amount) external onlyContracts {
+        // slither-disable-next-line unchecked-transfer
+        tokenContract.safeTransfer(treasury, amount);
+        emit RegistrationDepositFeeTransferred(treasury, amount);
+    }
+
     // ============================================================
     //                       Internal helpers
     // ============================================================
 
     /**
-     * @dev Wall-clock expiry computation (D26). Timestamp-accurate:
-     *      the boost ends exactly at `block.timestamp + duration`.
-     *      Returns 0 for tier-0 (permanent rest state).
+     * @dev Wall-clock expiry computation (D26). Boosts last at least the tier
+     *      duration and expire on the next 12-hour bucket. Returns 0 for tier-0
+     *      (permanent rest state).
      */
     function _computeExpiryTimestamp(uint40 lockTier) internal view returns (uint40) {
         if (lockTier == 0) return 0;
         uint256 duration = _tierDuration(lockTier);
         uint256 exp = block.timestamp + duration;
-        require(exp <= type(uint40).max, "Expiry overflow");
-        return uint40(exp);
+        return _bucketExpiryTimestamp(exp);
+    }
+
+    function _bucketExpiryTimestamp(uint256 rawExpiry) internal pure returns (uint40) {
+        uint256 bucket = uint256(EXPIRY_BUCKET_SECONDS);
+        uint256 bucketed = ((rawExpiry + bucket - 1) / bucket) * bucket;
+        require(bucketed <= type(uint40).max, "Expiry overflow");
+        return uint40(bucketed);
     }
 
     function _pushNodeToken(uint72 identityId, uint256 tokenId) internal {

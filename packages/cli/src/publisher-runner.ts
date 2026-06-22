@@ -4,7 +4,7 @@ import { EVMChainAdapter, NoChainAdapter } from '@origintrail-official/dkg-chain
 import { TypedEventBus, type Ed25519Keypair } from '@origintrail-official/dkg-core';
 import { ACKCollector, AsyncLiftRunner, DKGPublisher, FileWorkspacePublicSnapshotStore, TripleStoreAsyncLiftPublisher, wrapAsRpcPreconditionIfApplicable, type AsyncLiftPublishExecutionInput, type AsyncLiftPublisher, type AsyncLiftPublisherRecoveryResult, type LiftJobBroadcast, type LiftJobIncluded, type PublishOptions, type WorkspacePublicSnapshotStore } from '@origintrail-official/dkg-publisher';
 import { createTripleStore, type TripleStore } from '@origintrail-official/dkg-storage';
-import { loadNetworkConfig, resolveChainConfig, type DkgConfig } from './config.js';
+import { loadNetworkConfig, resolveReadyChainConfig, type DkgConfig } from './config.js';
 import { loadPublisherWallets } from './publisher-wallets.js';
 
 export interface PublisherRuntime {
@@ -112,7 +112,7 @@ export async function createPublisherRuntime(args: {
     throw new Error('No publisher wallets configured. Use `dkg publisher wallet add <privateKey>` first.');
   }
 
-  const network = await loadNetworkConfig();
+  const network = await loadNetworkConfig(args.config.networkConfig);
   const keypair = await loadOrCreateAgentWallet(args.dataDir);
   const store = await createPublisherStore(args.dataDir, args.config);
   const publicSnapshotStore = createPublicSnapshotStore(args.dataDir, args.config);
@@ -121,7 +121,7 @@ export async function createPublisherRuntime(args: {
   // expects. If either required field is missing, pass undefined and let
   // the runtime fall back to NoChainAdapter (publisher won't have on-chain
   // finality but still functions).
-  const merged = resolveChainConfig(args.config, network);
+  const merged = resolveReadyChainConfig(args.config, network);
   const chainBase = merged?.rpcUrl && merged?.hubAddress
     ? { rpcUrl: merged.rpcUrl, rpcUrls: merged.rpcUrls, hubAddress: merged.hubAddress, tokenAddress: merged.tokenAddress, chainId: merged.chainId }
     : undefined;
@@ -274,10 +274,17 @@ async function createPublisherRuntimeFromBase(args: PublisherRuntimeBaseArgs): P
         throw new Error(`No publisher configured for wallet ${walletId}`);
       }
       const encryption = await args.publishEncryptionFactory?.(publishOptions);
+      // GH #1121 — the agent-resolved, chainKey-bound AEAD closure MUST win over
+      // any callback already on publishOptions. The async-lift mapper now
+      // pre-populates a fail-closed default `encryptInlinePayload` for non-public
+      // CGs (so plaintext can never silently ship); that default must only apply
+      // when the real factory yields nothing — otherwise it would shadow the
+      // real curated-publish encryption and make every private async publish
+      // throw. Hence: real factory first, mapper default as the fallback.
       const publishOptionsWithEncryption: PublishOptions = {
         ...publishOptions,
-        encryptInlinePayload: publishOptions.encryptInlinePayload ?? encryption?.encryptInlinePayload,
-        encryptInlineChunked: publishOptions.encryptInlineChunked ?? encryption?.encryptInlineChunked,
+        encryptInlinePayload: encryption?.encryptInlinePayload ?? publishOptions.encryptInlinePayload,
+        encryptInlineChunked: encryption?.encryptInlineChunked ?? publishOptions.encryptInlineChunked,
       };
       const v10ACKProvider = publishOptionsWithEncryption.v10ACKProvider
         ?? args.v10ACKProviderFactory?.()

@@ -136,7 +136,7 @@ import { DKGAgentWallet, type AgentWallet } from './agent-wallet.js';
 
 import { ProfileManager } from './profile-manager.js';
 import { DiscoveryClient, type SkillSearchOptions, type DiscoveredAgent, type DiscoveredOffering } from './discovery.js';
-import { MessageHandler, type SkillHandler, type SkillRequest, type SkillResponse, type ChatHandler, type ChatAclCheck } from './messaging.js';
+import { MessageHandler, type SkillHandler, type SkillRequest, type SkillResponse, type ChatHandler, type ChatAclCheck, type SkillAclCheck } from './messaging.js';
 import { ed25519ToX25519Private, ed25519ToX25519Public } from './encryption.js';
 import { AGENT_REGISTRY_CONTEXT_GRAPH, canonicalAgentDidSubject, collectPublishableMultiaddrs, type AgentProfileConfig } from './profile.js';
 import {
@@ -166,6 +166,9 @@ import {
   createSwmAckQuorum,
   type SwmAckQuorum,
 } from './swm/ack-quorum.js';
+import {
+  type SwmFanoutPeerSelector,
+} from './swm/swm-fanout-peer-selection.js';
 import { SwmHostModeStore, type SwmHostModeStoreLimits } from './swm/host-mode-store.js';
 import {
   BEACON_ACCESS_POLICY_CURATED,
@@ -480,6 +483,18 @@ export function createListContextGraphsCacheInvalidatingStore(
     countQuads(graphUri) {
       return innerStore.countQuads(graphUri);
     },
+    // Defined iff the inner store supports it, so the capability propagates
+    // truthfully up the decorator chain (callers gate on `typeof store.update
+    // === 'function'`). A server-side UPDATE can create/drop named graphs and
+    // mutate projected content, so it invalidates the listGraphs cache and
+    // marks the projection dirty just like insert/delete.
+    update: innerStore.update
+      ? (sparql: string) => invalidateAfterMutation(
+        () => innerStore.update!(sparql),
+        () => true,
+        () => markProjectionDirty?.(),
+      )
+      : undefined,
     flush: innerStore.flush ? () => innerStore.flush!() : undefined,
     close() {
       return innerStore.close();
@@ -773,6 +788,12 @@ export class DKGAgentBase {
    */
   protected swmAckQuorum?: SwmAckQuorum;
   protected swmAckQuorumTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * Active SWM sender-side peer outcome cache. Public CG fan-out uses this
+   * to keep stale/flapping subscriber peers out of the short-term
+   * substrate/ACK set without changing private allowlist semantics.
+   */
+  protected swmFanoutPeerSelector?: SwmFanoutPeerSelector;
   /**
    * Period at which `SwmAckQuorum.tick()` runs. Picked to match
    * RFC-003 §5.2 ("watchdog tick: 5s") — a finer cadence buys
@@ -1148,6 +1169,14 @@ export class DKGAgentBase {
   protected readonly onChainParticipantAgentsCache = new Map<string, string[]>();
   protected readonly peerHealth = new Map<string, PeerHealth>();
   protected readonly knownCorePeerIds = new Set<string>();
+  /**
+   * Last chain-reported ACK quorum (ParametersStorage
+   * minimumRequiredSignatures), refreshed by the V10 ACK provider before
+   * each collect. `getACKCandidatePeers` uses it so the confirmed-core
+   * shortcut tracks the REAL runtime quorum instead of the hard-coded
+   * default (Codex review on PR #1107).
+   */
+  protected lastKnownRequiredACKs?: number;
   protected readonly syncingPeers = new Set<string>();
   protected readonly seenPrivateSyncRequestIds = new Map<string, number>();
   protected readonly metaRefreshTimestamps = new Map<string, number>();
@@ -1339,6 +1368,8 @@ export class DKGAgentBase {
   /** Pending chat handler/ACL captured before the messenger is wired (moved here during the mixin split). */
   protected _pendingChatHandler: ChatHandler | null = null;
   protected _pendingChatAcl: ChatAclCheck | null = null;
+  /** GH #462 — pending skill ACL captured before the messenger is wired. */
+  protected _pendingSkillAcl: SkillAclCheck | null = null;
 
   protected constructor(
     config: DKGAgentConfig,

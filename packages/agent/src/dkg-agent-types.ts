@@ -51,9 +51,9 @@ import type { SyncPhase } from './sync/auth/request-build.js';
  * self-sovereign agents whose private key isn't held by the daemon.
  * Compact ECDSA `(r, vs)` over the EIP-712 typed data
  * `buildAuthorAttestationTypedData({ chainId, kav10Address,
- * contextGraphId, merkleRoot, authorAddress: address })`. The agent
- * verifies the recovered signer matches `address` before stamping the
- * seal.
+ * merkleRoot, authorAddress: address, reservedKaId })` (#1116: the
+ * attestation no longer binds `contextGraphId`). The agent verifies the
+ * recovered signer matches `address` before stamping the seal.
  *
  * Lives at the agent layer (rather than as a publisher
  * `PublishOptions` field) since RFC-001 §9.x — Phase C — the
@@ -145,6 +145,8 @@ export interface SyncRequestEnvelope {
   includeSharedMemory: boolean;
   phase?: SyncPhase;
   snapshotRef?: string;
+  authPurpose?: string;
+  authSelector?: string;
   targetPeerId?: string;
   requesterPeerId?: string;
   requestId?: string;
@@ -173,6 +175,15 @@ export interface SyncRequestEnvelope {
    * the duplicate `SyncRequestEnvelope` in `sync/auth/request-build.ts`.
    */
   recovery?: boolean;
+}
+
+export type AssertionArtifactKind = 'source' | 'markdown' | 'original';
+
+export interface ImportedArtifactByteStore {
+  stat(hash: string): Promise<{ size: number } | null>;
+  readRange(hash: string, offset: number, length: number): Promise<Uint8Array | Buffer | null>;
+  has?(hash: string): Promise<boolean>;
+  get?(hash: string): Promise<Uint8Array | Buffer | null>;
 }
 
 // ── Public error classes ────────────────────────────────────────────
@@ -735,6 +746,7 @@ export interface DurableSyncDiagnostics {
   rejectedKcs: number;
   failedPeers: number;
   failedPhases: number;
+  backoffWorthyFailures?: number;
 }
 
 export interface SharedMemorySyncDiagnostics {
@@ -751,6 +763,7 @@ export interface SharedMemorySyncDiagnostics {
   droppedDataTriples: number;
   failedPeers: number;
   failedPhases: number;
+  backoffWorthyFailures?: number;
 }
 
 export interface CatchupSyncDiagnostics {
@@ -813,6 +826,8 @@ export type ReplicationEventSink = (event: ReplicationEvent) => void;
 
 export interface DKGAgentConfig {
   name: string;
+  /** Selected genesis document. Defaults to the compatibility Base testnet genesis. */
+  genesisId?: string;
   /**
    * public-projection enable flag. When set, a private CG's confirmed VM
    * publishes emit/refresh a verifiable public projection (the floor: existence,
@@ -861,6 +876,7 @@ export interface DKGAgentConfig {
   largeLiteralStorage?: LargeLiteralStorageConfig;
   /** Out-of-Oxigraph immutable public SWM operation snapshots. Defaults on when dataDir is set. */
   sharedMemoryPublicSnapshotStorage?: SharedMemoryPublicSnapshotStorageConfig;
+  importedArtifactByteStore?: ImportedArtifactByteStore;
   /** When false, peer-connect sync skips SWM catch-up and relies on gossip for new SWM writes. */
   syncSharedMemoryOnConnect?: boolean;
   /**
@@ -941,7 +957,7 @@ export interface DKGAgentConfig {
    * Cadence at which the daemon re-publishes its own agent profile
    * (PR feat/chain-agents-cg-phonebook). Forwarded straight from
    * `DkgConfig.network.agentProfileHeartbeatMs`. Defaults to
-   * `AGENT_PROFILE_HEARTBEAT_MS` (5 min) when omitted; `0` disables
+   * `AGENT_PROFILE_HEARTBEAT_MS` (20 min) when omitted; `0` disables
    * the timer (the one-shot startup publish still fires).
    */
   agentProfileHeartbeatMs?: number;

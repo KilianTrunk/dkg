@@ -111,6 +111,19 @@
   },
   {
     "inputs": [],
+    "name": "contextGraphRegistrationDeposit",
+    "outputs": [
+      {
+        "internalType": "uint96",
+        "name": "",
+        "type": "uint96"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
     "name": "hub",
     "outputs": [
       {
@@ -287,6 +300,19 @@
       }
     ],
     "name": "setAskUpperBoundFactor",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint96",
+        "name": "amount",
+        "type": "uint96"
+      }
+    ],
+    "name": "setContextGraphRegistrationDeposit",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"

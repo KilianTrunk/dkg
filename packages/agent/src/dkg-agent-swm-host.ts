@@ -18,7 +18,7 @@ import {
   contextGraphDataGraphUri, contextGraphMetaGraphUri, contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
   contextGraphSharedMemoryUri,
   contextGraphVerifiableMemoryUri, contextGraphVerifiableMemoryMetaUri,
-  contextGraphDataUri, contextGraphMetaUri, assertionLifecycleUri, contextGraphAssertionUri,
+  contextGraphDataUri, contextGraphMetaUri, contextGraphLayerUri, assertionLifecycleUri, contextGraphAssertionUri,
   deriveCuratorDidFromCgId,
   MemoryLayer,
   computeACKDigest,
@@ -36,6 +36,7 @@ import {
   Logger, createOperationContext, sparqlString, isSafeIri, assertSafeIri,
   TrustLevel,
   TRUST_LEVEL_PREDICATE,
+  LEGACY_TRUST_LEVEL_PREDICATE,
   buildTrustLevelQuads,
   isTrustLevelQuad,
   buildAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1, type AuthorAttestationTypedData,
@@ -121,6 +122,8 @@ import {
   type WorkspaceAgentRecipientResolverInput,
   type WorkspaceSenderKeyEncryptInput,
   type SharedMemoryPublicSnapshotStorageConfig, type WorkspacePublicSnapshotStore,
+  readMaterializedVersion, shouldApplyMaterialization, writeMaterializedVersion, withMaterializationLock,
+  type MaterializedVersion,
 } from '@origintrail-official/dkg-publisher';
 import { ethers } from 'ethers';
 import { join } from 'node:path';
@@ -388,9 +391,37 @@ import type { DKGAgent } from './dkg-agent.js';
 
 const DEFAULT_HOST_MODE_RECONCILE_BATCH_SIZE = 32;
 
+/**
+ * Max age (ms) of a cached `publishPolicy` value the host-mode self-signed
+ * admission gate (`isConfirmedPublicForHostMode`) will trust. Deliberately
+ * short: it bounds the open→curated downgrade staleness to a few seconds
+ * (vs the general 60s `ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS`) AND rate-caps the
+ * chain RPC to ~1 per window per CG, so spammed public-plaintext gossip can't
+ * amplify into a per-message `eth_call` (Branimir review #1239 follow-on).
+ */
+const HOST_MODE_PUBLISH_POLICY_MAX_CACHE_AGE_MS = 5_000;
+
 function normalizeHostModeReconcileBatchSize(value: number | undefined): number {
   if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_HOST_MODE_RECONCILE_BATCH_SIZE;
   return Math.max(1, Math.floor(value));
+}
+
+/**
+ * Strip surrounding quotes from a SPARQL SELECT binding value — mirrors
+ * `ka-extractor.ts:stripQuotes` verbatim so the RS-heal resolves the SAME
+ * `?ual`/`?root` strings the prover does. IRIs come back bare from both store
+ * adapters (oxigraph/sparql-http), so this is a no-op for them; it only peels
+ * the `"..."` / `"value"^^<dt>` literal wrappers some result formats apply.
+ */
+function stripBindingQuotes(v: string): string {
+  if (v.startsWith('"') && v.endsWith('"')) {
+    return v.slice(1, -1);
+  }
+  const ix = v.indexOf('"^^');
+  if (v.startsWith('"') && ix !== -1) {
+    return v.slice(1, ix);
+  }
+  return v;
 }
 
 export class SwmHostModeMethods extends DKGAgentBase {
@@ -673,6 +704,48 @@ export class SwmHostModeMethods extends DKGAgentBase {
     if (sub?.onChainId && this.onChainAccessPolicyCache.get(sub.onChainId) === 1) return true;
     try {
       return await this.isPrivateContextGraph(contextGraphId);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * GH #1124 — DEFINITIVE "fully-open CG" check gating the self-signed public
+   * host-mode ingest path. "Open" requires BOTH axes, because this codebase
+   * separates READ visibility from WRITE authority:
+   *   - accessPolicy === 0  → publicly READABLE (SWM is plaintext), AND
+   *   - publishPolicy === 1 → OPEN PUBLISH (anyone may write).
+   * A public-readable but curated-publish CG (accessPolicy 0, publishPolicy 0 /
+   * PCA) still restricts WHO may publish, so the self-signed path must NOT apply
+   * — otherwise any key could store plaintext SWM on host-mode cores and bypass
+   * the on-chain publisher authorization (otReviewAgent #1239-r3). Curated OR
+   * unknown on EITHER axis → false: the conservative ciphertext + allowlist gates
+   * stay in force and a chain-event race heals via member catchup, so a curated
+   * (or restricted-publish) CG is never misclassified as self-publishable.
+   */
+  async isConfirmedPublicForHostMode(this: DKGAgent, contextGraphId: string): Promise<boolean> {
+    // Resolve via the SHARED on-chain policy resolver rather than a direct
+    // cleartext `subscribedContextGraphs` lookup. `getContextGraphOnChainPolicy`
+    // re-keys cleartext↔on-chain-id, consults the cache + local `_meta`, AND
+    // falls back to a direct chain RPC — so it resolves BOTH policies even for a
+    // host-only core keyed by the wire HASH with no local `_meta` (the #1124
+    // sharded topology). Both must positively resolve to their open value; any
+    // undefined (unknown) → false (safe).
+    try {
+      // `publishPolicyMaxCacheAgeMs`: publishPolicy is mutable on-chain and the
+      // general cache is ≤60s-TTL'd, so it could be stale-PERMISSIVE for up to
+      // the TTL after an owner downgrades open→curated publish. This is a
+      // security-positive gate (it admits a self-signed plaintext write that host
+      // catchup later applies under trustedReplay), so it accepts only a SHORT
+      // (~5s) cache window — bounding the downgrade staleness to seconds while
+      // rate-capping the chain RPC to ~1 per window per CG (vs an eth_call on
+      // every admitted envelope). An RPC failure/timeout leaves publishPolicy
+      // undefined → we fail CLOSED (drop; the share heals via retry/catchup
+      // once the policy re-resolves).
+      const { accessPolicy, publishPolicy } = await this.getContextGraphOnChainPolicy(
+        contextGraphId, { publishPolicyMaxCacheAgeMs: HOST_MODE_PUBLISH_POLICY_MAX_CACHE_AGE_MS },
+      );
+      return accessPolicy === 0 && publishPolicy === 1;
     } catch {
       return false;
     }
@@ -1009,33 +1082,57 @@ export class SwmHostModeMethods extends DKGAgentBase {
         isCiphertext = skm.type === SWM_SENDER_KEY_MESSAGE_TYPE;
       } catch { /* fall through */ }
     }
-    if (!isCiphertext) return;
-
-    // Authority check: verify the envelope signature against the
-    // curated CG's agent allowlist. Without this, a topic-reachable
-    // peer can fill per-CG storage with valid-looking ciphertext
-    // and evict legitimate history.
+    // GH #1124 — a curated CG MUST carry ciphertext, so a non-ciphertext
+    // envelope there is garbage → drop early. A CONFIRMED-public (open) CG
+    // legitimately gossips PLAINTEXT SWM. Resolve the public flag and reuse it
+    // for both the plaintext gate and the authority check. UNKNOWN CGs stay on
+    // the drop path (safe; member catchup heals once the policy resolves).
     //
-    // Use `storageCgId` (cleartext from the envelope) so the
-    // member-side meta-graph + chain-fallback resolvers in
-    // `verifyHostModeEnvelopeAuthority` work on the canonical id
-    // shape. The hash subscription key is internal bookkeeping;
-    // never crosses an external authorization boundary.
+    // LAZY by design (Branimir review #1239 follow-on): the self-signed public
+    // exception only matters for `!isCiphertext` traffic. So short-circuit on
+    // `!isCiphertext` to skip the (now chain-backed) policy resolution entirely
+    // on the dominant CIPHERTEXT/curated path — otherwise the bulk of host-mode
+    // traffic would pay a synchronous eth_call to compute a value it discards.
+    // Security-preserving: a ciphertext envelope on a public CG just stays in the
+    // curated authority path / opaque append and heals via catchup.
+    const confirmedPublic = !isCiphertext && await this.isConfirmedPublicForHostMode(storageCgId);
+    if (!isCiphertext && !confirmedPublic) return;
+
+    // Authority check. Curated traffic verifies the envelope signature against
+    // the CG's agent allowlist. For a self-publishable (open) CG, inject the
+    // on-chain policy RESOLVER (not a pre-decided flag): the SHARED verifier
+    // re-checks accessPolicy===0 && publishPolicy===1 itself, then validates the
+    // signature + timestamp-freshness AND binds the inner request to THIS CG —
+    // same envelope validation as curated, only the allowlist decision diverges
+    // (see SharedMemoryHandler.verifyHostModeEnvelopeAuthority).
+    //
+    // Use `storageCgId` (cleartext from the envelope) so the meta-graph +
+    // chain-fallback resolvers work on the canonical id shape.
     const handler = this.getOrCreateSharedMemoryHandler();
-    const verdict = await handler.verifyHostModeEnvelopeAuthority(data, storageCgId, fromPeerId);
+    const verdict = await handler.verifyHostModeEnvelopeAuthority(
+      data, storageCgId, fromPeerId,
+      // Inject the on-chain policy RESOLVER (not a pre-decided flag) so the
+      // verifier enforces accessPolicy===0 && publishPolicy===1 itself and can
+      // take the self-signed path even when a STALE participant allowlist
+      // survives an open-publish flip. Lazy: pass it only for non-ciphertext,
+      // so the dominant ciphertext/curated path pays no chain read (the resolver
+      // shares the same ~5s publishPolicy cache window as the confirmedPublic
+      // resolution above, so this is at most a warm cache hit, never a 2nd RPC).
+      isCiphertext
+        ? undefined
+        : {
+          resolveOpenPublishPolicy: () => this.getContextGraphOnChainPolicy(
+            storageCgId, { publishPolicyMaxCacheAgeMs: HOST_MODE_PUBLISH_POLICY_MAX_CACHE_AGE_MS },
+          ),
+        },
+    );
     if (!verdict.accepted) {
-      // "no agent allowlist" is the expected outcome during the brief
-      // chain-event race window (cores see the beacon, auto-engage
-      // host-mode, then receive ciphertext BEFORE the
-      // `ContextGraphCreated` event lands AND before the curator
-      // beacon arrived). The beaconCuratorOracle fallback closes
-      // most of that window; the remaining race (envelope arrives
-      // before the beacon is received & verified) is recoverable
-      // via member catchup and should not spam WARN logs in steady-
-      // state operation. Other rejection reasons (sig mismatch, peer
-      // not in allowlist, decode failure) remain WARN — those are
-      // real authority failures that operators need to see.
-      const isTransientRace = verdict.reason === 'no agent allowlist on context graph';
+      // 'no agent allowlist' on a NON-public CG is the expected brief chain-event
+      // race (curated allowlist not loaded yet) — recoverable via member catchup,
+      // so log at debug. Every other rejection (decode / unsigned / signature-or-
+      // freshness / peer-not-allowed / CG-mismatch) is a real authority failure
+      // operators should see.
+      const isTransientRace = verdict.reasonCode === 'NO_AGENT_ALLOWLIST';
       if (isTransientRace) {
         this.log.debug(
           ctx,
@@ -1110,6 +1207,64 @@ export class SwmHostModeMethods extends DKGAgentBase {
           );
           return;
         }
+      }
+    }
+    // GH #1124 — make a CONFIRMED-PUBLIC host-only (non-member) core ACK-CAPABLE.
+    // The opaque `append` below retains the raw envelope so this host can serve
+    // member host-catchup (LU-6 replay), but the StorageACKHandler a publisher
+    // dials reads `<cg>/_shared_memory` from `this.store` (loadSWMQuads /
+    // sharedMemoryReadBothFilter) — it has NO path into SwmHostModeStore. So
+    // without ALSO applying the plaintext into that triple-store graph, a
+    // non-member host would still DECLINE `NO_DATA_IN_SWM` and a public CG's
+    // storage-ACK quorum stays unreachable on a host-mode (non-member) topology
+    // — the exact bug this PR claims to fix. Reuse the member apply path
+    // (`handle`) on the SAME, already-authority-verified envelope bytes; for a
+    // public CG it routes the plaintext quads to the per-KA SWM layer the ACK
+    // handler reads (graph-agnostic merkle, no re-skolemize), so the recompute
+    // matches and this host signs a quorum-eligible ACK exactly as a member does.
+    //
+    // SECURITY — the `if (confirmedPublic)` wrapper is the SOLE authority gate
+    // for this apply, and it is LOAD-BEARING: on a host-only core `handle()`
+    // CANNOT distinguish curated from public (a non-member holds no local `_meta`
+    // allowlist nor accessPolicy, so a curated AND a public CG both resolve to
+    // `agentGateAddresses === null` && `hasPrivateAccessPolicy === false`, and
+    // `handle()` would apply plaintext for EITHER). What guarantees this CG is
+    // genuinely public is `isConfirmedPublicForHostMode` — accessPolicy === 0
+    // (immutable) AND a FORCED-fresh publishPolicy === 1 (fail-closed on RPC
+    // error). DO NOT hoist this apply out of the `confirmedPublic` branch or
+    // reuse a `confirmedPublic` resolved further from the apply — either silently
+    // re-opens curated-plaintext injection into a non-member's SWM store.
+    // `verifyHostModeEnvelopeAuthority` already bound sig + 5-min freshness + CG +
+    // `publisherPeerId === fromPeerId` on these exact `data` bytes one block up,
+    // so `handle({ trustedReplay: true })` skips only the transport re-checks it
+    // already performed — for a public CG (agentGateAddresses === null) it skips
+    // no cryptography. Mirrors the catchup-replay call (~line 3575).
+    if (confirmedPublic) {
+      try {
+        const apply = await handler.handle(data, fromPeerId, undefined, { trustedReplay: true });
+        if (apply.applied) {
+          this.log.info(
+            ctx,
+            `Host-mode applied confirmed-public SWM plaintext cg=${storageCgId} triples=${apply.insertedTriples ?? 0} (now ACK-capable)`,
+          );
+        } else {
+          // Apply declined (validation / CAS / dedup). Keep going to the opaque
+          // append so member catchup still works; this host just won't ACK this
+          // share (it falls back to the pre-fix NO_DATA_IN_SWM decline). Logged
+          // at WARN so a SYSTEMATIC public-CG apply failure is observable here
+          // rather than only downstream as quorum-unmet.
+          const reason = 'reason' in apply ? apply.reason : 'unknown';
+          this.log.warn(
+            ctx,
+            `Host-mode confirmed-public SWM apply NOT applied cg=${storageCgId}: ${reason} (host keeps opaque copy for catchup but will DECLINE NO_DATA_IN_SWM on ACK)`,
+          );
+        }
+      } catch (err) {
+        // Never let an apply error drop the opaque retention path below.
+        this.log.warn(
+          ctx,
+          `Host-mode confirmed-public SWM apply threw cg=${storageCgId}: ${err instanceof Error ? err.message : String(err)} (opaque retention below unaffected)`,
+        );
       }
     }
 
@@ -2348,10 +2503,119 @@ export class SwmHostModeMethods extends DKGAgentBase {
   async runVmReconcileSweep(this: DKGAgent): Promise<void> {
     if (!this.vmReconcileEnabled() || !this.reconcileCoalescer) return;
     for (const [localCgId, sub] of this.subscribedContextGraphs) {
+      // GH #1098 — self-prime onChainId for a pre-subscribed PUBLIC member CG
+      // (subscribed BEFORE its first publish, so unbound) before the skip-gate
+      // below would pass it over. Shared with the live KACG nudge.
+      if (sub.subscribed && !sub.onChainId) {
+        await this.selfPrimeSubscriptionOnChainId(localCgId, sub);
+      }
       // Member subscriptions AND Phase D core-hosted public CGs get swept.
       if ((!sub.subscribed && !sub.coreHosted) || !sub.onChainId) continue;
       void this.reconcileCoalescer.trigger(localCgId);
+      // RS heal: relocate any legacy-stranded KC into the scoped graphs the
+      // prover reads (the sweep is the safety net for a missed live nudge).
+      void this.healStrandedScopedKCs(localCgId, sub);
     }
+  }
+
+  /**
+   * GH #1098 — bind `sub.onChainId` for a subscribed-but-unbound CG from the
+   * locally-resolvable OnChainId quad (publisher ontology broadcast / durable
+   * _meta sync), then persist. The chain `ContextGraphCreated` handler only
+   * binds CURATED CGs and the ACK-signer hook only fires for cores in a
+   * publish's storage-ACK set, so a pre-subscribed PUBLIC member would otherwise
+   * stay unbound — stranded on the unreliable one-shot finalization gossip.
+   * SHARED by the periodic sweep and the live KACG nudge so the bind / persist /
+   * cursor-reset semantics (in {@link bindSubscriptionOnChainId}) live in ONE
+   * place. `targetOnChainId`: when set (the nudge), bind only if the resolved id
+   * matches THIS event; when omitted (the sweep), bind any non-null id —
+   * `getContextGraphOnChainId` never falls back to `localCgId`, so a
+   * `resolved === localCgId` match is legitimate for a direct CG. Best-effort:
+   * a store/RPC hiccup yields null instead of throwing. Returns the bound id.
+   */
+  async selfPrimeSubscriptionOnChainId(
+    this: DKGAgent,
+    localCgId: string,
+    sub: ContextGraphSub,
+    targetOnChainId?: bigint,
+  ): Promise<string | null> {
+    if (!sub.subscribed || sub.onChainId) return null;
+    let resolved: string | null = null;
+    try {
+      resolved = await this.getContextGraphOnChainId(localCgId);
+    } catch {
+      return null;
+    }
+    if (!resolved) return null;
+    if (targetOnChainId !== undefined) {
+      let resolvedNum: bigint | null = null;
+      try { resolvedNum = BigInt(resolved); } catch { return null; }
+      if (resolvedNum !== targetOnChainId) return null;
+    }
+    this.bindSubscriptionOnChainId(localCgId, sub, resolved);
+    this.persistContextGraphSubscription(localCgId);
+    return resolved;
+  }
+
+  /**
+   * GH #1098 (Phase B) — body of the live `onKARegisteredToContextGraph` nudge,
+   * extracted so the branch is directly testable. A
+   * `KnowledgeAssetRegisteredToContextGraph` event carries only `{ kaId, cgId }`
+   * (no ordinal), so this just triggers a coalesced reconcile for the matching
+   * local CG. Two cases:
+   *
+   *  1. The on-chain id is already bound to a local CG → trigger its reconcile
+   *     (when subscribed or core-hosted).
+   *  2. The id is unbound but a pre-subscribed PUBLIC member CG resolves to it
+   *     (subscribed BEFORE its first publish; only curated CGs bind on the
+   *     ContextGraphCreated event and ACK-signers bind via the storage-ACK hook)
+   *     → self-prime + bind ONLY the CG whose resolved id matches THIS event,
+   *     then reconcile it. Unrelated subscribed-unbound CGs are left untouched.
+   *
+   * Best-effort and idempotent: a missed nudge heals on the periodic sweep.
+   * Returns the local CG id that was reconciled, or null if none matched.
+   */
+  async handleKARegisteredNudge(
+    this: DKGAgent,
+    onChainId: string,
+    kaId: bigint,
+    ctx: OperationContext,
+  ): Promise<string | null> {
+    let targetOnChain: bigint | null = null;
+    try { targetOnChain = BigInt(onChainId); } catch { targetOnChain = null; }
+
+    const localCgId = targetOnChain === null ? null : this.resolveLocalCgIdByOnChainId(targetOnChain);
+    if (!localCgId) {
+      // Find the subscribed-but-unbound CG whose locally-resolved on-chain id
+      // matches THIS event and bind + reconcile only it — targeted, not a global
+      // sweep, so an unrelated KA registration touches nothing. Uses the SAME
+      // self-prime helper as the periodic sweep (single bind/persist/cursor-reset
+      // path); the sweep remains the safety net for a CG whose quad hasn't arrived.
+      if (targetOnChain !== null) {
+        for (const [lcg, sub] of this.subscribedContextGraphs) {
+          const bound = await this.selfPrimeSubscriptionOnChainId(lcg, sub, targetOnChain);
+          if (bound) {
+            this.log.info(ctx, `Phase B: KACG nudge cg=${onChainId} ka=${kaId} -> bound + reconcile pre-subscribed "${lcg}"`);
+            if (this.reconcileCoalescer) void this.reconcileCoalescer.trigger(lcg);
+            // RS heal immediately so a live KARegistered doesn't wait ~60s for
+            // the periodic sweep to relocate the stranded KC.
+            void this.healStrandedScopedKCs(lcg, sub);
+            return lcg;
+          }
+        }
+      }
+      return null; // chain replay hasn't resolved the cleartext CG yet; periodic sweep is the safety net
+    }
+
+    const sub = this.subscribedContextGraphs.get(localCgId);
+    // Populate VM for CGs we member-subscribe to OR (Phase D) public CGs this
+    // Core hosts — a hosted Core fills its own gaps too.
+    if (!sub?.subscribed && !sub?.coreHosted) return null;
+    this.log.info(ctx, `Phase B: KACG nudge cg=${onChainId} ka=${kaId} -> reconcile "${localCgId}"`);
+    if (this.reconcileCoalescer) void this.reconcileCoalescer.trigger(localCgId);
+    // RS heal immediately on the already-bound path too.
+    void this.healStrandedScopedKCs(localCgId, sub);
+    return localCgId;
   }
 
   /**
@@ -2430,6 +2694,219 @@ export class SwmHostModeMethods extends DKGAgentBase {
       this.log.warn(
         createOperationContext('system'),
         `VM reconcile for "${localCgId}" failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * RELOCATE stranded legacy-label KCs into the SCOPED per-onChainId graphs
+   * the Random Sampling prover reads.
+   *
+   * The bug: when a KC is finalized BEFORE its on-chain cgId is locally
+   * resolvable, finalization falls back to writing it into the LEGACY label
+   * graphs (`<cg>/_meta` + `<cg>` root data) instead of the scoped
+   * `<cg>/context/<onChainId>/_meta` + `.../context/<onChainId>` graphs. The
+   * RS prover (`extractV10KCFromStore`) only reads the scoped graphs, so such
+   * a KC reports `kc-not-synced` forever even though the node holds it.
+   *
+   * This COPIES (never moves/deletes) the legacy KC into the scoped graphs so
+   * the prover can find it, while leaving the label-graph view intact.
+   *
+   * CONTENT-BINDING RULE: the data/meta copies go through
+   * `this.store.update(INSERT…WHERE)` so the terms NEVER leave the store. A
+   * `query()`/CONSTRUCT → `insert(quads)` round-trip would double backslashes
+   * in escape-bearing literals and change the leaf bytes the on-chain
+   * `challengeRoot` was committed over, making the proof permanently
+   * unprovable. The projection (root + `.well-known/genid/` descendants,
+   * minus post-publish trustLevel stamps) mirrors `ka-extractor.ts` exactly.
+   *
+   * Idempotent + version-guarded so a re-run is a no-op and a later stale
+   * writer cannot clobber. NEVER calls `isAlreadyConfirmed` — that read-both
+   * guard is the permanence mechanism that made the legacy promotion stick.
+   */
+  async healStrandedScopedKCs(this: DKGAgent, localCgId: string, sub: ContextGraphSub): Promise<void> {
+    try {
+      if (!sub.onChainId) return;
+      // Server-side byte-safe copy is the ONLY safe relocation mechanism; if the
+      // backend can't do SPARQL UPDATE we bail rather than risk a lossy JS round-trip.
+      const storeUpdate = this.store.update;
+      if (typeof storeUpdate !== 'function') return;
+      const update = (sparql: string): Promise<void> => storeUpdate.call(this.store, sparql);
+
+      const DKG = 'http://dkg.io/ontology/';
+      const legacyMeta = contextGraphMetaUri(localCgId);
+      const scopedMeta = contextGraphMetaUri(localCgId, sub.onChainId);
+      const rootData = contextGraphDataUri(localCgId);
+      const scopedData = contextGraphDataUri(localCgId, sub.onChainId);
+      // The publisher's OWN one-shot publish() writes confirmed PUBLIC data to a
+      // per-KA verifiable-memory (VM) graph — NOT the legacy root data graph (the
+      // receiver/#1259 strand fills root data). So the data reads below look in
+      // BOTH: legacy root data UNION the stranded KC's EXACT VM graph (derived
+      // per-KC from its batchId inside the loop). Reading VM-only would regress
+      // the receiver heal; prefix-scanning every VM graph could pull a DIFFERENT
+      // KA's triples for a root IRI that recurs across per-KA VM graphs.
+
+      // 2a ASK-guard: is there at least one legacy-only KC (batchId present in
+      // legacy meta, absent in scoped meta)? In steady state this is one ASK per
+      // bound CG and returns false once healed.
+      const askGuard = await this.store.query(
+        `ASK {
+           GRAPH <${legacyMeta}> { ?ual <${DKG}batchId> ?b }
+           FILTER NOT EXISTS { GRAPH <${scopedMeta}> { ?ual <${DKG}batchId> ?b } }
+         }`,
+      );
+      if (askGuard.type !== 'boolean' || !askGuard.value) return;
+
+      // 2b: enumerate the stranded UALs.
+      const stranded = await this.store.query(
+        `SELECT ?ual ?b WHERE {
+           GRAPH <${legacyMeta}> { ?ual <${DKG}batchId> ?b }
+           FILTER NOT EXISTS { GRAPH <${scopedMeta}> { ?ual <${DKG}batchId> ?b } }
+         }`,
+      );
+      if (stranded.type !== 'bindings') return;
+
+      for (const row of stranded.bindings) {
+        // Bindings come back stripped to bare values by the store adapters
+        // (oxigraph/sparql-http both emit IRIs unwrapped); strip + validate
+        // exactly as the extractor does for its `ual`.
+        const ual = stripBindingQuotes(row['ual'] ?? '');
+        if (!ual || !isSafeIri(ual)) continue;
+        // Derive the stranded KC's EXACT per-KA VM graph from its batchId. The
+        // chain adapter sets batchId === kaId for the createKnowledgeAssets
+        // publish path (evm-adapter-publish.ts / evm-adapter-base.ts), so ?b is
+        // the minted kaId; author/number unpack from it exactly as publish() does.
+        // Binding the exact graph (vs scanning `_verifiable_memory/*`) prevents
+        // copying another KA's triples for a root IRI that recurs across per-KA
+        // VM graphs (e.g. an updated entity republished under a new kaId).
+        const bMatch = /^"?(\d+)/.exec(String(row['b'] ?? ''));
+        if (!bMatch) continue;
+        const kaId = BigInt(bMatch[1]);
+        const vmGraph = contextGraphLayerUri(
+          localCgId,
+          MemoryLayer.VerifiableMemory,
+          '0x' + (kaId >> 96n).toString(16).padStart(40, '0'),
+          kaId & ((1n << 96n) - 1n),
+        );
+        try {
+          await withMaterializationLock(scopedMeta, ual, async () => {
+            // A KC may carry no `dkg:materializedVersion` stamp in legacy meta:
+            // the publisher's OWN one-shot publish writes the KC into the legacy
+            // label `_meta` but never stamps a version (only the
+            // receiver/finalization path calls writeMaterializedVersion). Such a
+            // KC strands in legacy forever — chain-reconcile skips it
+            // (`isAlreadyConfirmed` sees the legacy `status=confirmed`) and the
+            // heal used to bail here on the null version. Relocate it anyway,
+            // stamping the LOWEST version {0,0}: the GH#842 ordering guard then
+            // lets any real update (block>0) win over this floor and never the
+            // reverse, so it can never clobber a genuine update.
+            const version = (await readMaterializedVersion(this.store, legacyMeta, ual))
+              ?? { blockNumber: 0, txIndex: 0 };
+            if (!(await shouldApplyMaterialization(this.store, scopedMeta, ual, version))) return; // idempotent
+
+            assertSafeIri(ual);
+
+            // Resolve roots from legacy meta with the extractor's read-both UNION.
+            const rootsRes = await this.store.query(
+              `SELECT ?root WHERE {
+                 GRAPH <${legacyMeta}> {
+                   { ?ka <${DKG}partOf> <${ual}> ; <${DKG}rootEntity> ?root . }
+                   UNION
+                   { <${ual}> <${DKG}rootEntity> ?root . }
+                 }
+               }`,
+            );
+            if (rootsRes.type !== 'bindings') return;
+            const roots: string[] = [];
+            const seen = new Set<string>();
+            for (const r of rootsRes.bindings) {
+              const root = stripBindingQuotes(r['root'] ?? '');
+              if (root && !seen.has(root) && isSafeIri(root)) {
+                seen.add(root);
+                roots.push(root);
+              }
+            }
+            if (roots.length === 0) return;
+
+            // CRASH-PARTIAL GUARD (all-or-nothing across roots): the extractor
+            // roots a concatenation over EVERY root, so if ANY root's legacy
+            // data is missing locally this is a Factor-B sync gap, not a
+            // relocation. Write NOTHING — must NOT trade kc-not-synced for
+            // KCDataMissingError. ASK each root first.
+            for (const root of roots) {
+              const present = await this.store.query(
+                `ASK {
+                   {
+                     GRAPH <${rootData}> {
+                       ?s ?p ?o .
+                       FILTER(?s = <${root}> || STRSTARTS(STR(?s), "${root}/.well-known/genid/"))
+                     }
+                   } UNION {
+                     GRAPH <${vmGraph}> {
+                       ?s ?p ?o .
+                       FILTER(?s = <${root}> || STRSTARTS(STR(?s), "${root}/.well-known/genid/"))
+                     }
+                   }
+                 }`,
+              );
+              if (present.type !== 'boolean' || !present.value) return;
+            }
+
+            // DATA copy (per root) — MANDATORY server-side, byte-safe, read-both
+            // (legacy root data UNION per-KA VM graph). Skip the post-publish
+            // trustLevel stamps in BOTH branches so the recomputed leaf set stays
+            // bit-identical with the on-chain merkleLeafCount.
+            for (const root of roots) {
+              await update(
+                `INSERT { GRAPH <${scopedData}> { ?s ?p ?o } } WHERE {
+                   {
+                     GRAPH <${rootData}> {
+                       ?s ?p ?o .
+                       FILTER(?s = <${root}> || STRSTARTS(STR(?s), "${root}/.well-known/genid/"))
+                       FILTER(?p != <${TRUST_LEVEL_PREDICATE}> && ?p != <${LEGACY_TRUST_LEVEL_PREDICATE}>)
+                     }
+                   } UNION {
+                     GRAPH <${vmGraph}> {
+                       ?s ?p ?o .
+                       FILTER(?s = <${root}> || STRSTARTS(STR(?s), "${root}/.well-known/genid/"))
+                       FILTER(?p != <${TRUST_LEVEL_PREDICATE}> && ?p != <${LEGACY_TRUST_LEVEL_PREDICATE}>)
+                     }
+                   }
+                 }`,
+              );
+            }
+
+            // META copy — server-side. Carries the `<ual>` subject (batchId
+            // discriminator) + the `<ual>/<tokenId>` token rows
+            // (rootEntity/privateMerkleRoot).
+            await update(
+              `INSERT { GRAPH <${scopedMeta}> { ?s ?p ?o } } WHERE {
+                 GRAPH <${legacyMeta}> {
+                   ?s ?p ?o .
+                   FILTER(?s = <${ual}> || STRSTARTS(STR(?s), "${ual}/"))
+                 }
+               }`,
+            );
+
+            // Stamp so a later stale writer can't clobber.
+            await writeMaterializedVersion(this.store, scopedMeta, ual, version);
+
+            this.log.info(
+              createOperationContext('system'),
+              `RS heal: relocated stranded legacy KC ${ual} -> scoped cg=${sub.onChainId} (${roots.length} root(s))`,
+            );
+          });
+        } catch (err) {
+          this.log.warn(
+            createOperationContext('system'),
+            `RS heal: relocate failed for ${ual} (cg=${sub.onChainId}): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+    } catch (err) {
+      this.log.warn(
+        createOperationContext('system'),
+        `RS heal sweep for "${localCgId}" failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }

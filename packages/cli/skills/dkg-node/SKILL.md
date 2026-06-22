@@ -96,19 +96,21 @@ chain and returns its **UAL** (see §5 VM for the response body). Data must be i
 before VM publishing; the on-chain transaction is a finality signal for data peers
 already received via gossip.
 
-A full `swm/share` (`entities: "all"`) auto-seals best-effort, so you can also share
-without an explicit finalize — but the explicit `wm/finalize` step below is the
-canonical, predictable path (see §5 "Verifiable Memory" for the auto-seal caveats).
+A full `swm/share` (`entities: "all"`) **seals by default** and is then publish-ready, so
+the explicit `wm/finalize` step is optional on the happy path. Pass `"skipSeal": true` to
+share WITHOUT sealing (an unsealed SWM share for local-only collaboration). **Sealing no
+longer needs the CG registered on-chain** — `finalize`/`share` are entirely off-chain (see
+§5 "Verifiable Memory").
 
-> **VM publishing needs an on-chain CG.** A project created with
-> `/api/context-graph/create` is local-only — `vm/publish` fails until the CG is
-> registered on-chain. The quick start registers it explicitly below; alternatively pass
-> `"register_if_needed": true` on the `vm/publish` body to register-then-publish in one
-> call (see §5 "Registering the CG for VM").
+> **Registration happens at publish, automatically.** A project created with
+> `/api/context-graph/create` is local-only; you can create → write → seal → share it
+> entirely off-chain. The FIRST `vm/publish` **transparently registers** the CG on-chain
+> (costs gas/TRAC) and then mints — no separate `register` step is required. (You may still
+> register explicitly via `/api/context-graph/register` if you prefer.)
 
 ```bash
 curl -X POST $BASE_URL/api/context-graph/create -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"id":"my-project","name":"My Project"}'
-curl -X POST $BASE_URL/api/context-graph/register -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"id":"my-project"}'   # register on-chain so VM publishing works (costs gas/TRAC)
+curl -X POST $BASE_URL/api/context-graph/register -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"id":"my-project"}'   # OPTIONAL — vm/publish auto-registers on first publish (costs gas/TRAC). finalize/share work without it.
 curl -X POST $BASE_URL/api/knowledge-assets -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"contextGraphId":"my-project","name":"notes"}'
 curl -X POST $BASE_URL/api/knowledge-assets/notes/wm/write -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"contextGraphId":"my-project","quads":[{"subject":"https://example.org/alice","predicate":"https://schema.org/name","object":"\"Alice\""}]}'
 curl -X POST $BASE_URL/api/knowledge-assets/notes/wm/finalize -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"contextGraphId":"my-project"}'
@@ -178,10 +180,10 @@ Drop to HTTP when the operation isn't in the table — participant self-service 
 | `dkg_join_request_list` | `GET /api/context-graph/{id}/join-requests` | List pending join requests for a context graph |
 | `dkg_join_request_approve` | `POST /api/context-graph/{id}/approve-join` | Approve a pending join request by agent address |
 | `dkg_join_request_reject` | `POST /api/context-graph/{id}/reject-join` | Reject a pending join request by agent address |
-| `dkg_knowledge_asset_create` | `POST /api/knowledge-assets` | Start a WM assertion (knowledge asset). Non-empty `quads` here auto-seals (write+finalize in one call); `promote: true` also shares to SWM |
+| `dkg_knowledge_asset_create` | `POST /api/knowledge-assets` | Start a WM assertion (knowledge asset). Non-empty `quads` here write+seal in one call and **stop at a sealed WM draft**; pass `alsoShareSwm:true` to also share to SWM (the combined client `createKnowledgeAsset` defaults that on when sealing). Sealing needs no on-chain registration |
 | `dkg_knowledge_asset_write` | `POST /api/knowledge-assets/{name}/wm/write` | Append triples (`{subject,predicate,object}` — no per-quad `graph`) to a WM assertion |
 | `dkg_knowledge_asset_finalize` | `POST /api/knowledge-assets/{name}/wm/finalize` | **Seal** the WM draft (the "git commit" — EIP-712 AuthorAttestation over the whole assertion). Returns `merkleRoot`, `authorAddress`, `schemeVersion`, `chainId`, `kav10Address`, `eip712Digest` |
-| `dkg_knowledge_asset_share` | `POST /api/knowledge-assets/{name}/swm/share` | Share a WM assertion's triples to SWM (formerly "promote"). A full share (`entities: "all"` / omitted) auto-seals best-effort; a subset share is SWM-only — see §5 |
+| `dkg_knowledge_asset_share` | `POST /api/knowledge-assets/{name}/swm/share` | Share a WM assertion's triples to SWM (formerly "promote"). A full share (`entities: "all"` / omitted) **seals by default** (publish-ready); `skipSeal:true` opts out; a subset share is SWM-only — see §5 |
 | `dkg_knowledge_asset_publish` | `POST /api/knowledge-assets/{name}/vm/publish` | **Mint / update on chain** (the sealed assertion → VM). Returns the **UAL** + `kaId` + `txHash` — see §5 VM for the full response body |
 | `dkg_knowledge_asset_pull_from` | `POST /api/knowledge-assets/{name}/wm/pull-from` | Seed a fresh WM draft from the current SWM or VM state (the "git checkout" — edit loop). Body `{ contextGraphId, layer: "swm"\|"vm", onConflict?: "reject"\|"replace" }` |
 | `dkg_knowledge_asset_discard` | `POST /api/knowledge-assets/{name}/wm/discard` | Drop a WM assertion |
@@ -196,12 +198,12 @@ Drop to HTTP when the operation isn't in the table — participant self-service 
 | `dkg_share` | `POST /api/shared-memory/write` | Directly write concise team-visible knowledge to SWM without staging a WM assertion. Prefer the WM assertion → promote flow for durable/canonical work. Both Hermes and OpenClaw expose the same tool schema (required `content` and `context_graph_id`, optional `sub_graph_name`), so MCP-discovered call signatures are portable. The OpenClaw implementation additionally validates content as non-whitespace, mints a unique subject per share (returned in the response), and N-Triples-quotes content; Hermes is currently looser on those points — the parallel hardening is tracked in OriginTrail/dkg#414. |
 | `dkg_sub_graph_create` | `POST /api/sub-graph/create` | Register a sub-graph inside a CG |
 | `dkg_sub_graph_list` | `GET /api/sub-graph/list` | List sub-graphs in a CG |
-| `dkg_query` | `POST /api/query` | Read-only SPARQL across assertions in a CG. Pass `view` (`working-memory` / `shared-working-memory` / `verifiable-memory`) to pick the layer — when `view` is set, `context_graph_id` is required; for WM reads, optional `agent_address` targets another agent's WM (defaults to this node). Omit `view` for a legacy cross-graph data-path query. |
+| `dkg_query` | `POST /api/query` | Read-only SPARQL across assertions in a CG. Pass `view` (`working-memory` / `shared-working-memory` / `verifiable-memory`) to pick the layer — when `view` is set, `context_graph_id` is required; for WM reads, optional `agent_address` targets another agent's WM (when omitted it defaults to this node's primary agent wallet, falling back to the peer ID on nodes without a configured default agent). Omit `view` for a legacy cross-graph data-path query. |
 | `dkg_query_catalog_list` | `POST /api/profile/query-catalog/read` | List saved SPARQL queries declared in the project profile query catalog |
 | `dkg_query_catalog_run` | `POST /api/profile/query-catalog/read` + `POST /api/query` | Run a saved catalog query by slug or exact display name |
 | `dkg_query_catalog_save` | `POST /api/profile/query-catalog/write` | Save a read-only SPARQL query into the project profile query catalog |
 | `dkg_find_agents` | `GET /api/agents` | Discover other agents (best-effort P2P) |
-| `dkg_send_message` | `POST /api/chat` | Send a direct message (best-effort P2P) |
+| `dkg_send_message` | `POST /api/chat` | Send a direct message (best-effort P2P). Body: `{ to: "<peerId>", text: "...", contextGraphId? }` (`peerId`/`message` are accepted as aliases for `to`/`text`) |
 | `dkg_read_messages` | `GET /api/messages` | Read inbound messages |
 | `dkg_invoke_skill` | `POST /api/invoke-skill` | Call another agent's skill (best-effort P2P) |
 
@@ -240,13 +242,13 @@ before promoting it to SWM (team) or through to VM (chain-anchored).
   Body: `{ "contextGraphId": "...", "name": "...", "subGraphName"?: "..." }`
 - `POST /api/knowledge-assets/{name}/wm/write` — write triples to an assertion
   Body: `{ "contextGraphId": "...", "quads": [{ "subject": "...", "predicate": "...", "object": "..." }], "subGraphName"?: "..." }`. Do **not** send a per-quad `graph` field — the daemon pins the data to the per-KA WM graph itself.
-- `POST /api/knowledge-assets/{name}/wm/finalize` — **seal** the WM draft (the "git commit"). Computes the canonical `merkleRoot` over the whole assertion, builds + signs an EIP-712 AuthorAttestation, and stamps the seal into `_meta`. After finalize, the content is committed: a later `vm/publish` consumes the seal verbatim (it never re-hashes or re-signs).
-  Body: `{ "contextGraphId": "...", "subGraphName"?: "...", "authorAgentAddress"?: "0x...", "preSignedAuthorAttestation"?: {...}, "schemeVersion"?: 1 }` (`authorAgentAddress` and `preSignedAuthorAttestation` are mutually exclusive). Returns `{ assertionUri, merkleRoot, authorAddress, schemeVersion, chainId, kav10Address, eip712Digest }`. **Finalize always seals the entire draft — there is no subset/`entities` parameter.**
+- `POST /api/knowledge-assets/{name}/wm/finalize` — **seal** the WM draft (the "git commit"). Computes the canonical `merkleRoot` over the whole assertion, builds + signs an EIP-712 AuthorAttestation, and stamps the seal into `_meta`. The seal is **context-graph-independent**: finalize does **not** require the CG to be registered on-chain — it is an off-chain operation (registration happens at publish). After finalize, the content is committed: a later `vm/publish` consumes the seal verbatim (it never re-hashes or re-signs).
+  Body: `{ "contextGraphId": "...", "layer"?: "wm" | "swm", "subGraphName"?: "...", "authorAgentAddress"?: "0x...", "preSignedAuthorAttestation"?: {...}, "schemeVersion"?: 1 }` (`authorAgentAddress` and `preSignedAuthorAttestation` are mutually exclusive). `layer` (default `"wm"`) selects WHERE the content to seal lives: `"swm"` seals an asset whose content is already in Shared Working Memory (e.g. after a `skipSeal` share, or an asset stuck unsealed) — it reconstructs a transient WM draft from SWM and seals it, so the asset becomes publishable **without recreating it**. Returns `{ assertionUri, merkleRoot, authorAddress, schemeVersion, chainId, kav10Address, eip712Digest }`. **Finalize always seals the entire draft — there is no subset/`entities` parameter.**
 - `GET /api/knowledge-assets/{name}/wm/quads?contextGraphId=...&subGraphName=...` — read assertion contents as quads
 - `POST /api/knowledge-assets/{name}/wm/pull-from` — seed a fresh WM draft from the current SWM or VM state (the "git checkout" — start an edit loop on already-shared/published content).
   Body: `{ "contextGraphId": "...", "layer": "swm" | "vm", "onConflict"?: "reject" | "replace", "subGraphName"?: "..." }`. Returns `{ wmDraft: "open", seededFrom: { layer }, ... }`; an existing dirty draft → `409 WM_DRAFT_CONFLICT` unless `onConflict: "replace"`.
-- `POST /api/knowledge-assets/{name}/swm/share` — share assertion triples to SWM (synchronous; returns once SWM insert + gossip complete). Formerly "promote". A **full** share (`entities` omitted or `"all"`) auto-seals best-effort first (see §5 "Verifiable Memory"); a **subset** share (`entities` = a proper subset) is SWM-only and is **not** publishable to VM as a subset.
-  Body: `{ "contextGraphId": "...", "entities"?: [...] | "all", "subGraphName"?: "..." }`
+- `POST /api/knowledge-assets/{name}/swm/share` — share assertion triples to SWM (synchronous; returns once SWM insert + gossip complete). Formerly "promote". A **full** share (`entities` omitted or `"all"`) **seals by default** and is then publish-ready; pass `"skipSeal": true` to share WITHOUT sealing (an unsealed SWM share — you can seal it later in place with `wm/finalize` `layer:"swm"`). A **subset** share (`entities` = a proper subset) is SWM-only, never sealed, and **not** publishable to VM as a subset. If a default (sealing) full share cannot seal — a rare residual capability gap (no local key / non-V10 adapter; an unregistered CG is no longer a gap) — it **fails closed**: `409 { code: "UNSEALED_SHARE_BLOCKED", error, recovery }` with **Working Memory preserved** (no silent unsealed share); resolve the gap or pass `skipSeal:true`.
+  Body: `{ "contextGraphId": "...", "entities"?: [...] | "all", "skipSeal"?: boolean, "subGraphName"?: "..." }`. Returns `{ swmShared: true, promotedCount, sealed, publishReady }` — `sealed`/`publishReady` describe THIS share (a subset or `skipSeal` share is `sealed:false` **by design**, not a failure).
 - `POST /api/knowledge-assets/{name}/swm/share-async` — enqueue the same promote for an in-daemon worker to handle in the background. Returns `202 { jobId, state: "queued" }` immediately. Use this for bulk importers where waiting for the synchronous round-trip is the bottleneck (the Graphify import RFC `docs/specs/SPEC_ASYNC_PROMOTE_QUEUE.md` explains the motivation). See §8 "Async promote queue" for the inspection routes.
 - `POST /api/knowledge-assets/{name}/wm/discard` — drop the assertion graph
   Body: `{ "contextGraphId": "...", "subGraphName"?: "..." }`
@@ -339,37 +341,43 @@ and `kas[].tokenId`.
 
 **Registering the CG for VM.** Verifiable-Memory publishing requires the context graph to
 be **registered on-chain** (the first registration is when you accept the chain cost). A
-project created with `dkg_context_graph_create` is local-only until then. Three ways to
-register:
-- **`register_if_needed` on the publish tools (simplest):** all three publish tools —
+project created with `dkg_context_graph_create` is local-only until then — but you do **not**
+need to register it yourself first. Three things to know:
+- **Automatic at publish (default — #1116):** the per-KA `POST /api/knowledge-assets/{name}/vm/publish`
+  **auto-registers** an unregistered CG on first publish (register-then-publish), so the whole
+  create → write → seal → share → publish flow works on a never-registered CG with **no
+  explicit register step and no flag** (the registration spends gas/TRAC; it is **not**
+  gas-free). The legacy CG-wide `POST /api/shared-memory/publish` auto-registers the same way.
+- **`register_if_needed` on the publish tools (to choose the policy):** all three publish tools —
   `dkg_publish`, `dkg_knowledge_asset_publish`, and `dkg_shared_memory_publish` — accept
   `register_if_needed: true` (`registerIfNeeded` on the MCP runtime) plus an optional
-  `access_policy` (`0` open / `1` private, used only when registering). It registers the CG
-  on-chain (idempotent; a no-op if already registered, may spend gas/TRAC) and then
-  publishes, in one call. Use this to complete `create → write → finalize → share →
-  publish` on a brand-new CG, or to one-shot `dkg_publish` fresh quads to an unregistered
-  CG. Default is `false` (publish a never-registered CG and you'll get the daemon's
-  not-registered error).
-- **Explicit register:** `POST /api/context-graph/register` `{ id, accessPolicy?, publishPolicy? }` (CLI: `dkg context-graph register <id>`), then publish.
-- **Implicit on the CG-wide path:** the legacy `POST /api/shared-memory/publish` /
-  `dkg_shared_memory_publish` auto-registers on first publish (transparent
-  register-then-publish), so publishing a fresh CG's SWM there also registers it.
+  `access_policy` (`0` open / `1` private, used only when registering). For the auto-registering
+  routes (`vm/publish` / `shared-memory/publish`) it does **not** gate whether registration
+  happens — they auto-register regardless; set it only to run an **explicit** registration first
+  so you can choose its `access_policy`/`publishPolicy` (the implicit auto-register otherwise
+  defaults the policy). Default is `false`.
+- **Explicit register (optional):** `POST /api/context-graph/register` `{ id, accessPolicy?, publishPolicy? }` (CLI: `dkg context-graph register <id>`) — only needed to **pre-set** a custom `accessPolicy`/`publishPolicy` before publishing.
 
-**Auto-seal on full share (best-effort).** A full `swm/share` (`entities: "all"` /
-omitted) tries to seal the draft for you before promoting, with three outcomes:
-1. **sealed** — it finalizes then shares (the common case);
-2. **capability gap** — the node can't sign for this author (no local key / non-V10
-   adapter / unregistered CG): it logs a warning and shares **UNSEALED**; a later
-   `vm/publish` then returns `409 VM_PUBLISH_PRECONDITION` ("requires an explicit
-   finalize first") — call `wm/finalize` explicitly and re-share;
-3. **stale / corrupt seal** — the assertion was edited after a prior finalize: the share
+**Seal on share (default — #1116).** A full `swm/share` (`entities: "all"` / omitted)
+**seals the draft by default** before promoting — the asset is then publish-ready. Outcomes:
+1. **sealed** (the default / common case) — it finalizes then shares; the 200 response
+   carries `sealed: true, publishReady: true`.
+2. **`skipSeal: true`** — you opt out of sealing: it shares **UNSEALED** (`sealed: false,
+   publishReady: false`). Seal it later in place with `wm/finalize` `layer:"swm"`, then
+   publish — no need to recreate it.
+3. **capability gap** (rare: no local key / non-V10 adapter — an unregistered CG is **no
+   longer** a gap, since sealing is context-graph-independent) — the share **fails closed**:
+   `409 { code: "UNSEALED_SHARE_BLOCKED", error, recovery }`, **Working Memory preserved**
+   (never a silent unsealed share). Resolve the gap or pass `skipSeal:true`.
+4. **stale / corrupt seal** — the assertion was edited after a prior finalize: the share
    **throws**; re-finalize (or discard) before sharing.
 
-For predictable publishing, call `wm/finalize` explicitly before `swm/share`.
+Subset shares are SWM-only and never sealed (`publishReady: false` by design). To recover an
+asset that is unsealed-in-SWM, `wm/finalize` `layer:"swm"` seals it in place — then publish.
 
 - `POST /api/knowledge-assets/{name}/vm/publish` — per-KA sealed publish → VM (costs TRAC; returns the UAL). Canonical.
 - `POST /api/shared-memory/publish` — SWM-bridge / CG-wide publish → VM (costs TRAC; legacy, retained).
-- `POST /api/update` — update an existing Knowledge Asset (reads new data from SWM; references it by `kaId`)
+- `POST /api/update` — update an existing Knowledge Asset on-chain. Body: `{ kaId, contextGraphId, quads, privateQuads?, precomputedUpdateAttestation? }` — the new data is passed **inline as `quads`** (it is NOT read from SWM). For the name-based edit loop, prefer `wm/pull-from` → edit → `wm/finalize` → `swm/share` → `vm/publish` instead.
 - `POST /api/endorse` — endorse a Knowledge Asset ("I vouch for this")
 - `POST /api/verify` — propose or approve M-of-N consensus verification
 
@@ -629,8 +637,8 @@ Implications:
   > is the recommended surface for agent workflows; raw HTTP is for
   > programmatic clients that want explicit control.
 - `POST /api/context-graph/register` — register a previously-created local CG on-chain (two-phase creation). Body: `{ id, accessPolicy?, publishPolicy? }`, where `accessPolicy` controls public/private discovery and `publishPolicy` controls open/curated publishing. Use this to promote a free CG to an on-chain identity before publishing to Verifiable Memory. `revealOnChain` is deprecated and ignored on the V10 ContextGraphs path.
-- `POST /api/context-graph/rename` — rename a CG (human-readable name only; the ID is immutable). Body: `{ contextGraphId, name }`.
-- `POST /api/context-graph/subscribe` — subscribe to a context graph
+- `POST /api/context-graph/rename` — rename a CG (human-readable name only; the ID is immutable). Body: `{ contextGraphId, name }` (`id` is accepted as an alias for `contextGraphId`; all `/api/context-graph/*` routes accept either).
+- `POST /api/context-graph/subscribe` — subscribe to a context graph. Body: `{ contextGraphId }` (or `{ id }`).
 - `GET /api/context-graph/list` — list known context graphs; tool wrappers default to the caller's created/joined graphs and can expose all known graphs with `scope: "all"`
 - `GET /api/context-graph/exists` — check if a context graph exists
 - `GET /api/sync/catchup-status?contextGraphId=...` — poll CG sync progress after subscribing
@@ -642,7 +650,7 @@ Implications:
 
 A **sub-graph** is a named partition inside a context graph. Use them to organize assertions by topic, source, or any other axis. Sub-graphs are optional — by default assertions live at the CG root. A sub-graph must be registered before any assertion op passes `subGraphName`; otherwise those ops fail with `Sub-graph "{name}" has not been registered in context graph "{id}". Call createSubGraph() first.`
 
-- `POST /api/sub-graph/create` — register a new sub-graph. Body: `{ contextGraphId, subGraphName }`.
+- `POST /api/sub-graph/create` — register a new sub-graph. Body: `{ contextGraphId, subGraphName }`. Sub-graph names **cannot contain `/`** (it is the graph-URI path separator) — use `-` or `.` for hierarchy-flavored names (e.g. `research-alpha`, not `research/alpha`).
 - `GET /api/sub-graph/list?contextGraphId=...` — list all sub-graphs registered in a CG.
 
 To put an assertion in a sub-graph, pass `subGraphName` on `/api/knowledge-assets` (create), `/wm/write`, `/wm/quads`, `/swm/share`, `/wm/discard`, `/wm/import-file`, the `GET /api/knowledge-assets/{name}` descriptor, and on `/api/query` when scoping queries.
@@ -655,11 +663,11 @@ To put an assertion in a sub-graph, pass `subGraphName` on `/api/knowledge-asset
 | `POST` | `/api/context-graph/{id}/add-participant` | `{ agentAddress }` | Directly add a participant by agent address (creator only). |
 | `POST` | `/api/context-graph/{id}/remove-participant` | `{ agentAddress }` | Remove a participant (creator only). |
 | `GET`  | `/api/context-graph/{id}/participants` | — | List current participants. Returns `{ contextGraphId, allowedAgents: [...] }`. |
-| `POST` | `/api/context-graph/{id}/request-join` | `{ agentAddress, signature, timestamp, agentName? }` | Signed request from an invitee to join. If local node is the curator, stored locally; otherwise P2P-forwarded to the curator. |
+| `POST` | `/api/context-graph/{id}/request-join` | `{ delegation, curatorPeerId, agentName? }` | Deliver a signed join request. `delegation` is the full object returned by `sign-join`; `curatorPeerId` is the curator's libp2p peer id (V10 invite codes embed it as `"<cgId>\n<peerId>"`) and is required unless the local node IS the curator. If local node is the curator, stored locally; otherwise P2P-forwarded to the curator. |
 | `GET`  | `/api/context-graph/{id}/join-requests` | — | List pending join requests (curator view). |
 | `POST` | `/api/context-graph/{id}/approve-join` | `{ agentAddress }` | Approve a pending request. |
 | `POST` | `/api/context-graph/{id}/reject-join` | `{ agentAddress }` | Reject a pending request. |
-| `POST` | `/api/context-graph/{id}/sign-join` | — | Sign a join request as the caller and forward to the curator via P2P (multi-sig CGs). Signs `(contextGraphId, agentAddress, timestamp)` with the caller's private key; the bearer token only resolves which local agent is signing — external agents without a locally-stored private key cannot use this route. No body required. |
+| `POST` | `/api/context-graph/{id}/sign-join` | — | **Sign-only**: sign a join-request delegation as the caller and return it — this route does **NOT** forward anything to the curator (the response carries `forwarded: false`). To deliver, POST the returned `delegation` to `/request-join` with the curator's `curatorPeerId`. The bearer token only resolves which local agent is signing — external agents without a locally-stored private key cannot use this route. No body required. |
 
 ## 7. File Ingestion
 
@@ -674,7 +682,7 @@ through the same path as `POST /api/knowledge-assets/{name}/wm/write`.
 | Field | Required | Description |
 |---|---|---|
 | `file` | yes | Document bytes |
-| `contextGraphId` | yes | Exact existing target context graph id, or full `did:dkg:context-graph:<id>` URI |
+| `contextGraphId` | yes | Exact existing target context graph id, or full `did:dkg:context-graph:<id>` URI. Must be a **multipart form field** (`-F "contextGraphId=..."`) — passing it as a URL query parameter returns `400 Missing "contextGraphId"` |
 | `contentType` | no | Override the file part's Content-Type |
 | `ontologyRef` | no | CG `_ontology` URI for guided extraction |
 | `subGraphName` | no | Target sub-graph, already registered |
@@ -840,7 +848,8 @@ This entire surface was empirically driven by [PR #720](https://github.com/Origi
 | 402 | Insufficient TRAC for publication | Check balances, notify node operator |
 | 403 | Forbidden — publishPolicy or allowList violation | Verify CG membership and publish authority |
 | 404 | Resource not found | Verify resource identifiers (assertion name, CG ID, **UAL** = the on-chain Universal Asset Locator `did:dkg:<chainId>/<kasAddress>/<number>` returned by `vm/publish`) |
-| 409 `VM_PUBLISH_PRECONDITION` | `vm/publish` called on an assertion that is not finalized, or has no quads in SWM | Call `wm/finalize` then `swm/share` before publishing |
+| 409 `UNSEALED_SHARE_BLOCKED` | a default (sealing) full `swm/share` could not seal — a rare capability gap (no local key / non-V10 adapter); **Working Memory is preserved** | Resolve the signing capability, or pass `skipSeal:true` to share unsealed (then seal later via `wm/finalize` `layer:"swm"`) |
+| 409 `VM_PUBLISH_PRECONDITION` | `vm/publish` on an assertion that is not finalized (e.g. shared with `skipSeal`), or has no quads in SWM | Seal it — `wm/finalize` (`layer:"swm"` if the content is already in SWM), then publish; or `swm/share` first if it isn't in SWM |
 | 409 `WM_DRAFT_CONFLICT` | `wm/pull-from` onto an existing dirty WM draft | Pass `onConflict: "replace"`, or `wm/discard` the draft first |
 | 409 `MULTI_ROOT_PUBLISH_NOT_ATOMIC` | `/api/shared-memory/publish` resolved >1 root entity | Loop one root per call (`clearAfter: false` on all but the last); or use per-KA `vm/publish` |
 | 409 | Conflict — name collision or concurrent modification | Retry with a different name |
@@ -857,15 +866,15 @@ This entire surface was empirically driven by [PR #720](https://github.com/Origi
 3. **Write** triples to Working Memory (`POST /api/knowledge-assets/{name}/wm/write`)
 4. **Finalize** (seal) the draft (`POST /api/knowledge-assets/{name}/wm/finalize`) — the EIP-712 "git commit" over the whole assertion
 5. **Share** to SWM when ready for peers (`POST /api/knowledge-assets/{name}/swm/share`, `entities: "all"`)
-6. **Publish** the sealed assertion to VM (`POST /api/knowledge-assets/{name}/vm/publish`) — mints on chain and returns the **UAL** in the response body (`{ kaId, ual, txHash, ... }`); store the UAL to reference the asset later. **On a brand-new project**, the CG isn't registered on-chain yet — pass `register_if_needed: true` on `dkg_knowledge_asset_publish` so it registers then publishes in one call (or register first; see §5 "Registering the CG for VM").
+6. **Publish** the sealed assertion to VM (`POST /api/knowledge-assets/{name}/vm/publish`) — mints on chain and returns the **UAL** in the response body (`{ kaId, ual, txHash, ... }`); store the UAL to reference the asset later. **On a brand-new project** the CG isn't registered on-chain yet — `vm/publish` now **auto-registers** it on first publish (no flag needed; see §5 "Registering the CG for VM").
 
-> Shortcut: a full `swm/share` auto-seals best-effort, so steps 4–5 can collapse into a
-> single `swm/share` for the common case (see §5 VM for the auto-seal caveats). The
-> explicit finalize in step 4 is the predictable path. You can also pass `quads` directly
-> to `POST /api/knowledge-assets` (step 2) to auto write+seal in one call, then add
-> `alsoShareSwm`/`alsoPublishVm` to run the whole lifecycle atomically — but `alsoPublishVm`
-> still needs the CG registered on-chain first (register it, or use the explicit
-> `vm/publish` + `register_if_needed` path), since the create route has no register flag.
+> Shortcut: a full `swm/share` **seals by default**, so steps 4–5 collapse into a single
+> `swm/share` for the common case (see §5 VM). The explicit finalize in step 4 is still
+> available when you want custom attestation options. You can also pass `quads` directly to
+> `POST /api/knowledge-assets` (step 2) to write+seal in one call (it stops at a sealed WM
+> draft — add `alsoShareSwm:true` to also share, and `alsoPublishVm` to run the whole
+> lifecycle atomically) — and since `vm/publish` auto-registers, this now works on a
+> never-registered CG too.
 
 **Private project for me alone (the default):**
 

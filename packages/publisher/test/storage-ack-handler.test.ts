@@ -120,6 +120,137 @@ describe('StorageACKHandler', () => {
     expect(recovered.toLowerCase()).toBe(coreWallet.address.toLowerCase());
   });
 
+  it('declines (BYTESIZE_UNDERCLAIM) when publicByteSize is below the real content lower bound', async () => {
+    // The 3 fixture triples have Σ(|s|+|p|+|o|) = 69, a strict lower bound on
+    // any valid N-Quads serialization. A claim of 1 (the byteSize=1 cost dodge)
+    // must be refused so the on-chain ask actually prices the real footprint.
+    const handler = await createHandler(swmQuads);
+    const intent = encodePublishIntent({
+      merkleRoot,
+      contextGraphId,
+      publisherPeerId: 'publisher-0',
+      publicByteSize: 1,
+      isPrivate: false,
+      kaCount: 1,
+      rootEntities: ['urn:entity:1', 'urn:entity:2'],
+      epochs: 1,
+      tokenAmountStr: '1000',
+      merkleLeafCount: swmMerkleLeafCount,
+    });
+
+    const response = await handler.handler(intent, fakePeerId);
+    const decoded = decodeStorageACK(response);
+
+    expect(isStorageACKDecline(decoded)).toBe(true);
+    expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.BYTESIZE_UNDERCLAIM);
+    expect(decoded.declineMessage).toContain('under-claim');
+  });
+
+  it('signs a public ACK when publicByteSize meets the real content lower bound (boundary)', async () => {
+    // Exactly the Σ term-length floor (69) is accepted — an honest publisher's
+    // `publicByteSize == nquads.length` is always strictly above it.
+    const handler = await createHandler(swmQuads);
+    const intent = encodePublishIntent({
+      merkleRoot,
+      contextGraphId,
+      publisherPeerId: 'publisher-0',
+      publicByteSize: 69,
+      isPrivate: false,
+      kaCount: 1,
+      rootEntities: ['urn:entity:1', 'urn:entity:2'],
+      epochs: 1,
+      tokenAmountStr: '1000',
+      merkleLeafCount: swmMerkleLeafCount,
+    });
+
+    const response = await handler.handler(intent, fakePeerId);
+    const decoded = decodeStorageACK(response);
+    expect(isStorageACKDecline(decoded)).toBe(false);
+  });
+
+  it('byteSize floor is UTF-8 bytes — a UTF-16 code-unit count is rejected for non-ASCII content', async () => {
+    // `publicByteSize` is a UTF-8 byte count; the floor must be too. With a
+    // non-ASCII IRI, UTF-8 byte length > UTF-16 code-unit length, so a claim at
+    // the (smaller) code-unit sum — which a JS `.length` floor would have wrongly
+    // ACCEPTED — must be declined.
+    const naQuads: Quad[] = [makeQuad('urn:s:日本', 'urn:p', 'urn:o:語')];
+    const naRoot = computeFlatKCRoot(naQuads, []);
+    const naLeafCount = computeFlatKCMerkleLeafCountV10(naQuads, []);
+    const utf8Floor =
+      Buffer.byteLength('urn:s:日本', 'utf8') +
+      Buffer.byteLength('urn:p', 'utf8') +
+      Buffer.byteLength('urn:o:語', 'utf8');
+    const utf16Sum = 'urn:s:日本'.length + 'urn:p'.length + 'urn:o:語'.length;
+    expect(utf8Floor).to.be.greaterThan(utf16Sum); // sanity: non-ASCII makes UTF-8 > UTF-16
+
+    const handler = await createHandler(naQuads);
+    const mk = (publicByteSize: number) =>
+      encodePublishIntent({
+        merkleRoot: naRoot,
+        contextGraphId,
+        publisherPeerId: 'publisher-0',
+        publicByteSize,
+        isPrivate: false,
+        kaCount: 1,
+        rootEntities: ['urn:s:日本'],
+        epochs: 1,
+        tokenAmountStr: '1000',
+        merkleLeafCount: naLeafCount,
+      });
+
+    // Claim at the UTF-16 code-unit sum (< UTF-8 floor) → declined under-claim.
+    const declined = decodeStorageACK(await handler.handler(mk(utf16Sum), fakePeerId));
+    expect(isStorageACKDecline(declined)).toBe(true);
+    expect(declined.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.BYTESIZE_UNDERCLAIM);
+    // Claim at the UTF-8 floor → accepted.
+    const accepted = decodeStorageACK(await handler.handler(mk(utf8Floor), fakePeerId));
+    expect(isStorageACKDecline(accepted)).toBe(false);
+  });
+
+  it('inline path: byteSize floor is the EXACT serialized payload, not just term bytes', async () => {
+    // When the publisher sends the payload inline (stagingQuads), the core has
+    // the exact serialized bytes, so the floor is the full payload length — a
+    // claim at the bare term-byte sum (which the loose lower bound accepted)
+    // under-prices the real serialization (<>, separators, graph term, ` .`).
+    const g = 'did:dkg:context-graph:42';
+    const inlineQuads: Quad[] = [makeQuad('urn:s', 'urn:p', 'urn:o', g)];
+    const nquadsStr = inlineQuads
+      .map((q) => `<${q.subject}> <${q.predicate}> <${q.object}> <${q.graph}> .`)
+      .join('\n');
+    const stagingBytes = new TextEncoder().encode(nquadsStr);
+    const inlineRoot = computeFlatKCRoot(inlineQuads, []);
+    const inlineLeaf = computeFlatKCMerkleLeafCountV10(inlineQuads, []);
+    const termSum =
+      Buffer.byteLength('urn:s', 'utf8') +
+      Buffer.byteLength('urn:p', 'utf8') +
+      Buffer.byteLength('urn:o', 'utf8');
+    expect(stagingBytes.length).to.be.greaterThan(termSum); // serialization overhead exists
+
+    const handler = await createHandler([]); // no SWM data; the payload is inline
+    const mk = (publicByteSize: number) =>
+      encodePublishIntent({
+        merkleRoot: inlineRoot,
+        contextGraphId,
+        publisherPeerId: 'publisher-0',
+        publicByteSize,
+        isPrivate: false,
+        kaCount: 1,
+        rootEntities: ['urn:s'],
+        epochs: 1,
+        tokenAmountStr: '1000',
+        merkleLeafCount: inlineLeaf,
+        stagingQuads: stagingBytes,
+      });
+
+    // Claim at the term-byte sum (omits serialization overhead) → declined.
+    const declined = decodeStorageACK(await handler.handler(mk(termSum), fakePeerId));
+    expect(isStorageACKDecline(declined)).toBe(true);
+    expect(declined.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.BYTESIZE_UNDERCLAIM);
+    // Claim at the exact serialized byte length → accepted.
+    const ok = decodeStorageACK(await handler.handler(mk(stagingBytes.length), fakePeerId));
+    expect(isStorageACKDecline(ok)).toBe(false);
+  });
+
   it('declines (SIGNER_NOT_REGISTERED) when the signer is no longer confirmed registered', async () => {
     // PR #557: this used to throw, which the publisher saw as a libp2p
     // stream reset; now the handler returns a typed decline so the

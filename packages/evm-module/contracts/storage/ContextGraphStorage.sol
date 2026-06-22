@@ -41,7 +41,19 @@ import {ERC721Enumerable} from "@openzeppelin/contracts/token/ERC721/extensions/
  */
 contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
     string private constant _NAME = "ContextGraphStorage";
-    string private constant _VERSION = "10.0.2";
+    // 10.0.3 — KC→KA terminology: public getters renamed getContextGraphKCCount/At/List →
+    //          getContextGraphKaCount/At/List (ABI selector change; no behavior change).
+    // 10.0.4 — OT-RFC-53: per-CG registration-escrow accounting (get/set/decrease/
+    //          clear) consumed by the deposit pull + admin sweep. ABI surface addition.
+    // 10.0.6 — Decoupled sampling list: a SECOND per-CG array (`_samplingKAList`)
+    //          drives random sampling and is the one the keeper compacts, while
+    //          `_contextGraphKAList` stays strictly append-only as the
+    //          registration-ordinal source the off-chain chain-reconciler reads
+    //          (`getContextGraphKaCount/At`). Pruning expired KAs from sampling no
+    //          longer mutates that ordinal, so the reconciler's [watermark, head)
+    //          cursor can never skip a later publish. Adds getSamplingKaCount/At;
+    //          swapRemoveSamplingKnowledgeAssetAt now targets the sampling list.
+    string private constant _VERSION = "10.0.6";
 
     // -----------------------------------------------------------------------
     // Bounds on participant list — anti-griefing cap.
@@ -90,12 +102,41 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
     // by the discovery beacon path instead.
     mapping(uint256 contextGraphId => bytes32) private _contextGraphNameHash;
 
-    // KC -> CG reverse lookup (Phase 10 random sampling).
+    // KA -> CG reverse lookup (Phase 10 random sampling).
     // Public for convenience; zero means "not registered".
     mapping(uint256 kaId => uint256 contextGraphId) public kaToContextGraph;
 
-    // CG -> [KC IDs] forward list for uniform random KC selection within a CG.
+    // CG -> [KA IDs] APPEND-ONLY registration list. This is the per-CG
+    // registration-ordinal source the off-chain chain-reconciler walks as
+    // `[watermark, head)` (head = getContextGraphKaCount) — so it MUST stay
+    // append-only: never reorder, never shrink. Sampling pruning happens on
+    // `_samplingKAList` below, never here.
     mapping(uint256 contextGraphId => uint256[]) private _contextGraphKAList;
+
+    // CG -> [live KA IDs] COMPACTED list that drives within-CG random sampling.
+    // Written alongside `_contextGraphKAList` on registration, but the keeper
+    // (`RandomSampling.pruneExpiredKnowledgeAssets` → `swapRemoveSamplingKnowledgeAssetAt`)
+    // swap-pops EXPIRED KAs out of THIS list only. Decoupling the sampling
+    // enumeration from the append-only registration ordinal lets the draw shed
+    // dead slots without corrupting the reconciler cursor. Read via
+    // getSamplingKaCount/At; the two lists diverge over time by design.
+    //
+    // POPULATION INVARIANT: `registerKnowledgeAssetToContextGraph` is the SOLE
+    // writer of both arrays and always appends to them together — there is no
+    // setter or migration that writes `_contextGraphKAList` alone. So a CG can
+    // never hold registrations in the append-only list without the matching
+    // sampling entries (the "pre-existing KAs invisible to sampling" state is
+    // unreachable). This is a fresh-design, non-proxy contract deployed empty for
+    // V10 (both lists populate from genesis); should a future deployment ever
+    // need to preserve CG state, the migration MUST seed both arrays together.
+    mapping(uint256 contextGraphId => uint256[]) private _samplingKAList;
+
+    // OT-RFC-53 — per-CG registration-deposit escrow (anti-spam). Accounting
+    // only: the TRAC itself is custodied in the CSS vault (mirrors
+    // PublishingConviction's committed-TRAC model). Set at on-chain CG
+    // creation, decremented as the owner spends it on publishing into the CG,
+    // cleared on an admin sweep to the staker reward pool.
+    mapping(uint256 contextGraphId => uint96) private _cgRegistrationEscrow;
 
     // -----------------------------------------------------------------------
     // Events
@@ -289,13 +330,16 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
     }
 
     // -----------------------------------------------------------------------
-    // KC <-> CG registration (Phase 8 publish flow + Phase 10 sampling)
+    // KA <-> CG registration (Phase 8 publish flow + Phase 10 sampling)
     // -----------------------------------------------------------------------
 
     /**
-     * @notice Bind a Knowledge Collection to a Context Graph.
-     * @dev Records both the reverse lookup (`kaToContextGraph[kaId] = cgId`)
-     *      and the forward list (`_contextGraphKAList[cgId].push(kaId)`).
+     * @notice Bind a Knowledge Asset to a Context Graph.
+     * @dev Records the reverse lookup (`kaToContextGraph[kaId] = cgId`) and
+     *      appends to BOTH per-CG lists: `_contextGraphKAList` (the append-only
+     *      registration ordinal the reconciler reads) and `_samplingKAList` (the
+     *      compactable sampling enumeration). They start identical; the keeper
+     *      later prunes expired entries from the sampling list only.
      *      Reverts on double registration.
      */
     function registerKnowledgeAssetToContextGraph(
@@ -314,44 +358,122 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
         }
         kaToContextGraph[kaId] = contextGraphId;
         _contextGraphKAList[contextGraphId].push(kaId);
+        _samplingKAList[contextGraphId].push(kaId);
         emit KnowledgeAssetRegisteredToContextGraph(contextGraphId, kaId);
     }
 
+    event KnowledgeAssetPrunedFromSamplingList(uint256 indexed contextGraphId, uint256 indexed kaId);
+
+    /// @dev The generic swap-pop below can desync the sampling list from
+    ///      `kaToContextGraph`, so it is restricted to the RandomSampling
+    ///      contract (the sole component that prunes the list, and only for
+    ///      EXPIRED KAs — it checks `endEpoch` before calling). This is stricter
+    ///      than `onlyContracts`: it stops a future/buggy Hub contract from
+    ///      removing a LIVE KA from sampling while it still reports as registered.
+    error OnlyRandomSampling(address caller);
+
     /**
-     * @notice Return the entire KC list for a context graph as a memory array.
+     * @notice Remove a Knowledge Asset from a Context Graph's SAMPLING list by
+     *         swap-and-pop.
+     * @dev Called only by `RandomSampling.pruneExpiredKnowledgeAssets` (the
+     *      permissionless keeper) to prune EXPIRED KAs, so the sampling
+     *      enumeration cannot accumulate dead slots into a within-CG sampling DoS.
+     *      Removes ONLY from `_samplingKAList` — the append-only
+     *      `_contextGraphKAList` (the reconciler's registration ordinal) is NOT
+     *      touched, so a later publish can never be skipped by the reconciler's
+     *      cursor. The `kaToContextGraph[kaId]` reverse binding is also left
+     *      intact: readers (`getKAContextGraphId`) must still resolve the KA, and
+     *      an expired KA can never be re-registered (it cannot be re-published
+     *      with the same id), so the double-registration guard stays correct.
+     *      `expectedKaId` makes the call a no-op when the slot no longer holds it
+     *      (a prior swap-pop moved a different KA into `index`) — robust to stale
+     *      indices.
+     */
+    function swapRemoveSamplingKnowledgeAssetAt(
+        uint256 contextGraphId,
+        uint256 index,
+        uint256 expectedKaId
+    ) external {
+        if (msg.sender != hub.getContractAddress("RandomSampling")) {
+            revert OnlyRandomSampling(msg.sender);
+        }
+        uint256[] storage list = _samplingKAList[contextGraphId];
+        uint256 len = list.length;
+        if (index >= len || list[index] != expectedKaId) {
+            return; // stale / already moved — skip; pruned on a later draw
+        }
+        uint256 last = len - 1;
+        if (index != last) {
+            list[index] = list[last];
+        }
+        list.pop();
+        emit KnowledgeAssetPrunedFromSamplingList(contextGraphId, expectedKaId);
+    }
+
+    /**
+     * @notice Return the entire KA list for a context graph as a memory array.
      * @dev WARNING — ON-CHAIN CALLERS MUST NOT USE THIS GETTER. Gas cost is
      *      O(n) in the list length and the ABI decode copies the full array
      *      into memory. Phase 10 random sampling and any other on-chain
-     *      consumer MUST use `getContextGraphKCAt(cgId, index)` together
-     *      with `getContextGraphKCCount(cgId)` to fetch a single element at
+     *      consumer MUST use `getContextGraphKaAt(cgId, index)` together
+     *      with `getContextGraphKaCount(cgId)` to fetch a single element at
      *      a bounded cost. This full-array getter is retained for off-chain
      *      indexers (eth_call) where the gas cost is not charged.
      */
-    function getContextGraphKCList(
+    function getContextGraphKaList(
         uint256 contextGraphId
     ) external view returns (uint256[] memory) {
         return _contextGraphKAList[contextGraphId];
     }
 
-    function getContextGraphKCCount(
+    function getContextGraphKaCount(
         uint256 contextGraphId
     ) external view returns (uint256) {
         return _contextGraphKAList[contextGraphId].length;
     }
 
     /**
-     * @notice Return a single KC id at a given index within a CG's KC list.
+     * @notice Return a single KA id at a given index within a CG's KA list.
      * @dev O(1) indexed accessor for on-chain consumers (Phase 10 random
-     *      sampling). Reverts with `InvalidContextGraphConfig("kcIndex oob")`
+     *      sampling). Reverts with `InvalidContextGraphConfig("kaIndex oob")`
      *      on out-of-bounds access — empty list rejects all indices.
      */
-    function getContextGraphKCAt(
+    function getContextGraphKaAt(
         uint256 contextGraphId,
         uint256 index
     ) external view returns (uint256 kaId) {
         uint256[] storage list = _contextGraphKAList[contextGraphId];
         if (index >= list.length) {
-            revert KnowledgeAssetsLib.InvalidContextGraphConfig("kcIndex oob");
+            revert KnowledgeAssetsLib.InvalidContextGraphConfig("kaIndex oob");
+        }
+        return list[index];
+    }
+
+    /**
+     * @notice Length of the COMPACTED sampling list (live + not-yet-pruned KAs).
+     * @dev This is the count the within-CG random-sampling draw bounds against
+     *      (`RandomSampling._pickKa`) and the keeper scans. It shrinks as the
+     *      keeper prunes expired KAs — unlike `getContextGraphKaCount`, which is
+     *      the monotonic append-only registration count.
+     */
+    function getSamplingKaCount(
+        uint256 contextGraphId
+    ) external view returns (uint256) {
+        return _samplingKAList[contextGraphId].length;
+    }
+
+    /**
+     * @notice Single KA id at an index within a CG's compacted sampling list.
+     * @dev O(1) accessor for the within-CG draw + the keeper. Reverts
+     *      `InvalidContextGraphConfig("samplingIndex oob")` out of bounds.
+     */
+    function getSamplingKaAt(
+        uint256 contextGraphId,
+        uint256 index
+    ) external view returns (uint256 kaId) {
+        uint256[] storage list = _samplingKAList[contextGraphId];
+        if (index >= list.length) {
+            revert KnowledgeAssetsLib.InvalidContextGraphConfig("samplingIndex oob");
         }
         return list[index];
     }
@@ -366,6 +488,41 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
         _requireExists(contextGraphId);
         _contextGraphs[contextGraphId].active = false;
         emit ContextGraphDeactivated(contextGraphId);
+    }
+
+    // -----------------------------------------------------------------------
+    // OT-RFC-53 — registration-deposit escrow accounting (onlyContracts).
+    //
+    // `ContextGraphs` writes the balance at on-chain creation and clears it on
+    // an admin sweep; `KnowledgeAssetsLifecycle` decrements it as the CG owner
+    // funds publishing from the escrow. The underlying TRAC lives in the CSS
+    // vault throughout — these functions only move the per-CG accounting.
+    // -----------------------------------------------------------------------
+
+    function getRegistrationEscrow(uint256 contextGraphId) external view returns (uint96) {
+        return _cgRegistrationEscrow[contextGraphId];
+    }
+
+    function setRegistrationEscrow(uint256 contextGraphId, uint96 amount) external onlyContracts {
+        _requireExists(contextGraphId);
+        _cgRegistrationEscrow[contextGraphId] = amount;
+    }
+
+    function decreaseRegistrationEscrow(uint256 contextGraphId, uint96 amount) external onlyContracts {
+        _requireExists(contextGraphId);
+        uint96 current = _cgRegistrationEscrow[contextGraphId];
+        if (amount > current) {
+            revert KnowledgeAssetsLib.InvalidContextGraphConfig("escrow underflow");
+        }
+        _cgRegistrationEscrow[contextGraphId] = current - amount;
+    }
+
+    function clearRegistrationEscrow(uint256 contextGraphId) external onlyContracts returns (uint96 cleared) {
+        _requireExists(contextGraphId);
+        cleared = _cgRegistrationEscrow[contextGraphId];
+        if (cleared != 0) {
+            _cgRegistrationEscrow[contextGraphId] = 0;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -601,7 +758,7 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
      * configuration and must accept ciphertext commitments.
      *
      * Used by `RandomSampling._pickWeightedChallenge` step 2 to decide
-     * whether the per-KC ciphertext-commitment filter applies (RFC-39
+     * whether the per-KA ciphertext-commitment filter applies (RFC-39
      * Phase A.5). Both call sites converge on this access-policy check.
      */
     function getIsCurated(

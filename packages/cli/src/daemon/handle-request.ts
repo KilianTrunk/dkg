@@ -209,6 +209,7 @@ import {
   shortId,
   sleep,
   deriveBlockExplorerUrl,
+  type AdmissionStatsView,
 } from './http-utils.js';
 import {
   normalizeRepo,
@@ -363,6 +364,7 @@ export async function handleRequest(
   apiHost: string,
   apiPortRef: { value: number },
   routePlugins: RoutePlugin[],
+  admission: AdmissionStatsView,
   emitMemoryGraphChanged?: (event: MemoryGraphChangedEvent) => void,
   emitNotification?: (event: NotificationSseEvent) => void,
 ): Promise<void> {
@@ -402,6 +404,7 @@ export async function handleRequest(
     apiHost,
     apiPortRef,
     routePlugins,
+    admission,
     url,
     path,
     requestToken,

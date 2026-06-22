@@ -13,7 +13,7 @@ export type GraphSetMutationSource =
   | 'dropGraph'
   | 'query';
 
-type GraphSetRefreshSource = 'seed' | 'revalidate' | 'deleteByPattern' | 'query';
+type GraphSetRefreshSource = 'seed' | 'revalidate' | 'deleteByPattern' | 'query' | 'update';
 
 export type GraphSetMutationEvent =
   | {
@@ -123,6 +123,25 @@ export class GraphSetIndexStore implements TripleStore {
       }
     }
     return result;
+  }
+
+  async update(sparql: string): Promise<void> {
+    if (typeof this.inner.update !== 'function') {
+      throw new Error('GraphSetIndexStore: inner store does not support update()');
+    }
+    if (!this.enabled) {
+      await this.inner.update(sparql);
+      return;
+    }
+    await this.inner.update(sparql);
+    // A server-side SPARQL UPDATE (e.g. the RS heal's INSERT…WHERE) can create
+    // or drop named graphs that the index must learn about — without this a
+    // freshly-created scoped graph would be absent from listGraphs(). Same
+    // refresh-from-inner handling as an UPDATE routed through query() above.
+    this.bumpMutation();
+    if (this.graphs || this.refreshInFlight) {
+      await this.maintainIndex(() => this.refreshIndex('update'));
+    }
   }
 
   async hasGraph(graphUri: string): Promise<boolean> {

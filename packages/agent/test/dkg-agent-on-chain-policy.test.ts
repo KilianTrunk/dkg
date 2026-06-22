@@ -454,6 +454,59 @@ describe('DKGAgent.getContextGraphOnChainPolicy', () => {
     expect(Date.now() - newTs).toBeLessThan(1_000);
   });
 
+  // Branimir review on #1239 — the host-mode self-signed admission gate
+  // (`isConfirmedPublicForHostMode`) is a SECURITY-POSITIVE consumer of the
+  // cached `publishPolicy`, so it passes a SHORT `publishPolicyMaxCacheAgeMs`
+  // (~5s) instead of the general 60s TTL. The follow-on goal (per the re-review)
+  // is BOTH directions at once: within the short window the cache is trusted so
+  // the chain RPC is rate-capped to ~1 per window per CG (no eth_call per
+  // envelope), and PAST it the chain re-verifies so an open→curated downgrade is
+  // caught within seconds (not up to 60s).
+  it('publishPolicyMaxCacheAgeMs: within-window cache is trusted (no RPC); a beyond-window entry re-verifies on-chain (Branimir #1239 follow-on)', async () => {
+    const getPolicy = (stub: any, cg: string, maxAgeMs: number) =>
+      (DKGAgent.prototype as any).getContextGraphOnChainPolicy.call(stub, cg, { publishPolicyMaxCacheAgeMs: maxAgeMs });
+
+    // (a) FRESH entry (age 0) within a 5s window → cached "1" used, NO RPC.
+    const freshRpc = recorder(async () => ({ publishPolicy: 0, publishAuthority: '0x0000000000000000000000000000000000000000' }));
+    const fresh = makeStub({
+      subscribedContextGraphs: new Map([['cg-w', { onChainId: '88' }]]),
+      onChainPublishPolicyCache: new Map([['cg-w', 1]]),
+      onChainPublishPolicyCacheUpdatedAt: new Map([['cg-w', Date.now()]]),
+      onChainAccessPolicyCache: new Map([['cg-w', 0]]),
+      isContextGraphRegistered: recorder(async () => true),
+      chain: { getContextGraphPublishPolicy: freshRpc },
+    });
+    expect(await getPolicy(fresh, 'cg-w', 5_000)).toEqual({ accessPolicy: 0, publishPolicy: 1 });
+    expect(freshRpc.calls).toEqual([]); // rate-capped: no eth_call within the window
+
+    // (b) entry OLDER than the 5s window (6s) → bypassed, chain RPC re-verifies → "0".
+    const staleRpc = recorder(async () => ({ publishPolicy: 0, publishAuthority: '0x0000000000000000000000000000000000000000' }));
+    const stale = makeStub({
+      subscribedContextGraphs: new Map([['cg-w', { onChainId: '88' }]]),
+      onChainPublishPolicyCache: new Map([['cg-w', 1]]),
+      onChainPublishPolicyCacheUpdatedAt: new Map([['cg-w', Date.now() - 6_000]]),
+      onChainAccessPolicyCache: new Map([['cg-w', 0]]),
+      isContextGraphRegistered: recorder(async () => true),
+      chain: { getContextGraphPublishPolicy: staleRpc },
+    });
+    expect(await getPolicy(stale, 'cg-w', 5_000)).toEqual({ accessPolicy: 0, publishPolicy: 0 });
+    expect(staleRpc.calls.at(-1)).toEqual([88n]);
+
+    // (c) the SAME 6s-old entry is still FRESH under the default 60s TTL — the
+    // short window is a per-caller tightening, not a global behaviour change.
+    const defaultRpc = recorder(async () => ({ publishPolicy: 0, publishAuthority: '0x0000000000000000000000000000000000000000' }));
+    const def = makeStub({
+      subscribedContextGraphs: new Map([['cg-w', { onChainId: '88' }]]),
+      onChainPublishPolicyCache: new Map([['cg-w', 1]]),
+      onChainPublishPolicyCacheUpdatedAt: new Map([['cg-w', Date.now() - 6_000]]),
+      onChainAccessPolicyCache: new Map([['cg-w', 0]]),
+      isContextGraphRegistered: recorder(async () => true),
+      chain: { getContextGraphPublishPolicy: defaultRpc },
+    });
+    expect(await callPolicy(def, 'cg-w')).toEqual({ accessPolicy: 0, publishPolicy: 1 });
+    expect(defaultRpc.calls).toEqual([]); // 6s < 60s default TTL → cache hit, no RPC
+  });
+
   // Round 3 — degenerate state: registered locally but the on-chain
   // id resolution fails (e.g. corrupted ontology graph). We can't
   // RPC without a numeric id, so we return whatever local triples

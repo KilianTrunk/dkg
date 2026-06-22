@@ -17,6 +17,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { DkgClient } from '../client.js';
+import { DkgHttpError } from '../client.js';
 import type { DkgConfig } from '../config.js';
 import { EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION } from './context-graph-description.js';
 
@@ -33,6 +34,59 @@ const errResult = (text: string): ToolResult => ({
 
 const formatError = (e: unknown): string =>
   e instanceof Error ? e.message : String(e);
+
+// #1116 share-outcome warnings. These three constants + the classifier below are
+// duplicated byte-identical across the MCP, OpenClaw, and Hermes adapters. There
+// is intentionally NO shared runtime module: MCP has no @origintrail-official/
+// dkg-core dependency (deliberately dependency-light — it inlines shared rules),
+// OpenClaw imports dkg-core but MCP must not, and adding a new package is out of
+// scope. Drift is instead caught by a TEST: each adapter's suite asserts these
+// values are byte-identical to the canonical fixture at
+// `tests/fixtures/share-seal-warnings.json`. Update the fixture + all three
+// adapters together; the parity tests flag any mismatch.
+
+// publishReady:false after a FULL share that opted out of sealing (skipSeal:true)
+// — a later finalize(layer:swm) DOES seal it.
+export const SHARE_NOT_PUBLISH_READY_WARNING =
+  'Shared to SWM but NOT publish-ready (sealed:false). Seal it with ' +
+  'dkg_knowledge_asset_finalize (layer:swm works after sharing), then publish.';
+
+// A SUBSET share is publishReady:false too, but unlike a skipSeal full share it is
+// NOT sealable — finalize(layer:swm) now REJECTS it with SWM_SUBSET_NOT_SEALABLE.
+// Surface the real recovery (full share / new asset) instead of "seal it".
+export const SHARE_SUBSET_NOT_PUBLISH_READY_WARNING =
+  'Shared a SUBSET to SWM for peer visibility. A subset is NOT sealable/' +
+  'publishable (finalize layer:swm will reject it). To publish on-chain, share ' +
+  'the full asset (entities:"all"), or model this subset as its own knowledge asset.';
+
+// A FULL share can come back sealed:true but publishReady:false when NOT every
+// sealed root reached SWM (promotedAllRoots false — e.g. foreign-owned roots were
+// skipped). The engine did NOT set the swmShareComplete marker, so finalize(layer:
+// swm) would REJECT — do NOT recommend it here. Re-sharing the full asset recovers.
+export const SHARE_INCOMPLETE_PROMOTE_WARNING =
+  'Sealed, but not all roots reached SWM (some roots may be owned by other ' +
+  'agents) — not yet publishable; re-share the full asset so every sealed root ' +
+  'is in SWM.';
+
+/**
+ * #1116: pick the not-publish-ready share warning from the share outcome. Returns
+ * `undefined` when the share IS publish-ready (no warning). Branch precedence:
+ *  1. sealed:true + publishReady:false → incomplete full promote (marker NOT set;
+ *     finalize layer:swm would reject) → re-share the full asset.
+ *  2. sealed:false + SUBSET (a non-empty specific entity list) → not sealable.
+ *  3. sealed:false + FULL (skipSeal) → sealable later (finalize layer:swm works).
+ * Duplicated byte-identical on OpenClaw (TS) + Hermes (Python).
+ */
+export function classifyShareWarning(outcome: {
+  sealed?: boolean;
+  publishReady?: boolean;
+  isSubset: boolean;
+}): string | undefined {
+  if (outcome.publishReady !== false) return undefined;
+  if (outcome.sealed === true) return SHARE_INCOMPLETE_PROMOTE_WARNING;
+  if (outcome.isSubset) return SHARE_SUBSET_NOT_PUBLISH_READY_WARNING;
+  return SHARE_NOT_PUBLISH_READY_WARNING;
+}
 
 /**
  * The daemon's real assertion-name rule, replicated verbatim from
@@ -210,7 +264,11 @@ export function registerAssertionTools(
         'subset parameter). A FULL share (dkg_knowledge_asset_share with ' +
         '`entities` omitted or "all") auto-seals for you, so you only need to ' +
         'call this explicitly before sharing a SELECTIVE subset of entities, or ' +
-        'to re-seal after editing a previously-sealed draft. (External-signer / ' +
+        'to re-seal after editing a previously-sealed draft. Sealing works even ' +
+        'if the context graph is NOT yet registered on-chain (registration ' +
+        'happens at publish). Pass `layer:"swm"` to seal an asset already shared ' +
+        'to SWM (e.g. shared with `skipSeal:true`) — it recovers and seals the ' +
+        'SWM content without a delete-and-recreate. (External-signer / ' +
         'pre-signed attestation is a tracked follow-up and is not exposed by this ' +
         'tool — author with authorAgentAddress.)',
       inputSchema: {
@@ -225,11 +283,21 @@ export function registerAssertionTools(
         // CONTRACT §C: scheme_version is a POSITIVE integer (daemon >= 1) — zod
         // rejects 0 / negative / non-integer at the boundary as a tool error.
         schemeVersion: z.number().int().positive().optional().describe('Optional attestation scheme version (positive integer)'),
+        // #1116: `layer` selects WHERE the content to seal lives. Default "wm"
+        // seals the open WM draft; "swm" seals an asset already shared to SWM.
+        layer: z
+          .enum(['wm', 'swm'])
+          .optional()
+          .describe(
+            'Which layer holds the content to seal. Default "wm" seals the open ' +
+            'Working Memory draft. Pass "swm" to seal an asset already shared to ' +
+            'SWM (recovers + seals the SWM content without delete-and-recreate).',
+          ),
         projectId: z.string().optional().describe(`${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION} Defaults to .dkg/config.yaml.`),
         subGraphName: z.string().optional(),
       },
     },
-    async ({ name, authorAgentAddress, schemeVersion, projectId, subGraphName }): Promise<ToolResult> => {
+    async ({ name, authorAgentAddress, schemeVersion, layer, projectId, subGraphName }): Promise<ToolResult> => {
       const pid = resolveProject(projectId, config);
       if (!pid) return projectErr();
       try {
@@ -244,6 +312,7 @@ export function registerAssertionTools(
           subGraphName,
           authorAgentAddress,
           schemeVersion,
+          layer,
         });
         return ok(
           `Finalized (sealed) knowledge asset '${name}' (project '${pid}'):\n\n\`\`\`json\n${JSON.stringify(
@@ -267,18 +336,17 @@ export function registerAssertionTools(
         'Step 4 of the canonical write flow: share a knowledge asset (or ' +
         'specific root entities within it) from private Working Memory to ' +
         'Shared Working Memory so teammates see it. A FULL share (omit ' +
-        '`entities` or pass "all") attempts a best-effort auto-seal: when the ' +
-        'seal SUCCEEDS the asset is publish-ready — follow it with ' +
-        'dkg_knowledge_asset_publish to mint the asset on-chain (Verifiable ' +
-        'Memory). But on a capability/signing gap (no local signing key / ' +
-        'non-V10 adapter / unregistered CG) the auto-seal is skipped and the ' +
-        'asset is shared UNSEALED — a later dkg_knowledge_asset_publish then ' +
-        '409s requiring an explicit finalize. For predictable publishing, call ' +
-        'dkg_knowledge_asset_finalize EXPLICITLY first (this is also required to ' +
-        'carry custom finalize/attestation options — authorAgentAddress / ' +
-        'schemeVersion — which the auto-seal cannot). A SELECTIVE subset (`entities` set ' +
-        'to a proper subset) shares to SWM only for peer visibility, is NOT ' +
-        'auto-sealed, and is NOT publishable to Verifiable Memory: ' +
+        '`entities` or pass "all") SEALS BY DEFAULT and is then publish-ready — ' +
+        'follow it with dkg_knowledge_asset_publish to mint the asset on-chain ' +
+        '(Verifiable Memory). Pass `skipSeal:true` to share WITHOUT sealing (an ' +
+        'unsealed SWM share — seal it later with dkg_knowledge_asset_finalize, ' +
+        'where `layer:"swm"` works after sharing). If a default (sealing) share ' +
+        'cannot seal it fails CLOSED (409, Working Memory preserved) and returns ' +
+        'a recovery hint. For custom finalize/attestation options — ' +
+        'authorAgentAddress / schemeVersion — call dkg_knowledge_asset_finalize ' +
+        'EXPLICITLY first (the default seal cannot carry them). A SELECTIVE ' +
+        'subset (`entities` set to a proper subset) shares to SWM ONLY for peer ' +
+        'visibility, is NOT sealed, and is NOT publishable to Verifiable Memory: ' +
         'dkg_knowledge_asset_publish reconstructs the seal\'s full root set and ' +
         'rejects a truncated SWM with a merkleRoot mismatch. To publish on-chain, ' +
         'share the full asset (or model the subset as its own knowledge asset).',
@@ -291,14 +359,24 @@ export function registerAssertionTools(
           .optional()
           .describe(
             'Root entities to share. Omit (or pass the string "all") to share all ' +
-            'roots (auto-seals + publish-ready). A subset (non-empty array) shares ' +
-            'to SWM only and is NOT publishable to Verifiable Memory.',
+            'roots (seals by default + publish-ready). A subset (non-empty array) ' +
+            'shares to SWM only and is NOT publishable to Verifiable Memory.',
+          ),
+        // #1116: a full share SEALS BY DEFAULT. `skipSeal:true` opts out into an
+        // unsealed SWM share (not publish-ready until a later finalize).
+        skipSeal: z
+          .boolean()
+          .optional()
+          .describe(
+            'Set true to share to SWM WITHOUT sealing (not publish-ready). ' +
+            'Default (false) seals a full share so it is immediately publish-ready. ' +
+            'Ignored for a subset share, which is never sealed.',
           ),
         projectId: z.string().optional().describe(`${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION} Defaults to .dkg/config.yaml.`),
         subGraphName: z.string().optional(),
       },
     },
-    async ({ name, entities, projectId, subGraphName }): Promise<ToolResult> => {
+    async ({ name, entities, skipSeal, projectId, subGraphName }): Promise<ToolResult> => {
       const pid = resolveProject(projectId, config);
       if (!pid) return projectErr();
       // CONTRACT §B: "all" | string[] | omitted. Pass "all" / omitted through as a
@@ -318,17 +396,48 @@ export function registerAssertionTools(
         // WM → SWM. The KA `swm/share` route is the same engine call
         // (`agent.assertion.promote`) the legacy promote used; omit `entities`
         // to share every root (the route's default), pass "all", or pass a subset.
-        await client.knowledgeAssetShare({
+        const result = await client.knowledgeAssetShare({
           contextGraphId: pid,
           name,
           subGraphName,
           entities: trimmedEntities,
+          skipSeal,
         });
-        const scope = Array.isArray(entities)
+        // A subset is a non-empty specific array (an empty array was rejected
+        // above; "all"/omitted is a full share). Reused for both the scope label
+        // and the not-publish-ready warning classification.
+        const isSubset = Array.isArray(entities);
+        const scope = isSubset
           ? `${entities.length} entit${entities.length === 1 ? 'y' : 'ies'}`
           : 'all root entities';
-        return ok(`Shared ${scope} from knowledge asset '${name}' (project '${pid}') to SWM.`);
+        // #1116: surface the seal outcome. A full share seals by default
+        // (publishReady:true); when NOT publish-ready, classifyShareWarning picks
+        // the right of the three warnings from {sealed, publishReady, isSubset}.
+        const warning = classifyShareWarning({
+          sealed: result.sealed,
+          publishReady: result.publishReady,
+          isSubset,
+        });
+        if (warning) {
+          return ok(
+            `Shared ${scope} from knowledge asset '${name}' (project '${pid}') to SWM. ` +
+            `${warning}`,
+          );
+        }
+        return ok(
+          `Shared ${scope} from knowledge asset '${name}' (project '${pid}') to SWM ` +
+          `(sealed:true, publish-ready).`,
+        );
       } catch (e) {
+        // #1116: a default (sealing) share that cannot seal fails CLOSED — the
+        // daemon returns 409 UNSEALED_SHARE_BLOCKED with a recovery hint and WM
+        // preserved. Surface the recovery text verbatim so the agent can act.
+        if (e instanceof DkgHttpError && e.status === 409) {
+          const body = e.body as { code?: string; recovery?: string } | undefined;
+          if (body?.code === 'UNSEALED_SHARE_BLOCKED' && body.recovery) {
+            return errResult(body.recovery);
+          }
+        }
         return errResult(`Failed to share knowledge asset: ${formatError(e)}`);
       }
     },
@@ -352,8 +461,10 @@ export function registerAssertionTools(
         'named asset; it is multi-root-safe and avoids the legacy single-root ' +
         'SWM constraint. Fails 409 if the asset is not yet finalized + shared ' +
         '(run dkg_knowledge_asset_finalize / dkg_knowledge_asset_share first). ' +
-        'vm/publish requires the context graph to be registered on-chain — set ' +
-        '`registerIfNeeded: true` to register it first (idempotent) before publishing.',
+        'vm/publish AUTO-registers an unregistered context graph on-chain at ' +
+        'gas/TRAC cost regardless of `registerIfNeeded` (no explicit register ' +
+        'step is needed). `registerIfNeeded: true` only lets you choose the ' +
+        'registration\'s accessPolicy first.',
       inputSchema: {
         // CONTRACT §C: publishEpochs is a POSITIVE integer (zod rejects 0 /
         // negative / non-integer at the boundary → a fail-fast tool error).
@@ -372,21 +483,23 @@ export function registerAssertionTools(
           .regex(/^\d+$/, 'publisher_node_identity_id_override must be a non-negative integer (decimal string)')
           .optional()
           .describe('Optional publisher node identity id override (non-negative integer, decimal string)'),
-        // CONTRACT §G: vm/publish requires the CG to be registered on-chain and
-        // does NOT auto-register. registerIfNeeded registers first (idempotent),
-        // mirroring dkg_shared_memory_publish.
+        // CONTRACT §G: vm/publish AUTO-registers an unregistered CG transparently
+        // (#1116) at gas/TRAC cost regardless of registerIfNeeded. registerIfNeeded
+        // only runs an EXPLICIT register first so you can choose the registration's
+        // accessPolicy (the implicit auto-register defaults the policy).
         registerIfNeeded: z
           .boolean()
           .optional()
           .describe(
-            'If the context graph is not yet registered on-chain, register it first (idempotent), then ' +
-            'publish. Registration may spend gas/TRAC; opt-in. Default false — when false and the CG is ' +
-            'unregistered, publish fails with the daemon\'s not-registered error. CAVEAT: this uses the ' +
-            'explicit register route, which registers with the daemon\'s DEFAULT publishPolicy (derived from ' +
-            'accessPolicy) and does NOT preserve a context graph\'s stored custom publishPolicy / ' +
-            'contribution governance. For a CG created with a non-default publishPolicy/PCA, register it ' +
-            'explicitly with the desired policy first rather than relying on registerIfNeeded. (Read access ' +
-            'is unaffected; daemon-side rehydration tracked in OriginTrail/dkg#1085.)',
+            'Run an EXPLICIT on-chain registration before publishing, which lets you set `accessPolicy` on ' +
+            'that registration. NOTE: this does NOT gate whether registration happens — vm/publish ' +
+            'AUTO-registers an unregistered context graph at gas/TRAC cost regardless of this flag. Set it ' +
+            'only to choose the registration\'s accessPolicy (the implicit auto-register on publish otherwise ' +
+            'defaults the policy). CAVEAT: this explicit register route registers with the daemon\'s DEFAULT ' +
+            'publishPolicy (derived from accessPolicy) and does NOT preserve a context graph\'s stored custom ' +
+            'publishPolicy / contribution governance. For a CG created with a non-default publishPolicy/PCA, ' +
+            'register it explicitly with the desired policy first rather than relying on registerIfNeeded. ' +
+            '(Read access is unaffected; daemon-side rehydration tracked in OriginTrail/dkg#1085.)',
           ),
         accessPolicy: z
           .union([z.literal(0), z.literal(1)])
@@ -417,11 +530,12 @@ export function registerAssertionTools(
       if (accessPolicy !== undefined && registerIfNeeded !== true) {
         return errResult('"accessPolicy" requires "registerIfNeeded": true — it only applies when registering the context graph.');
       }
-      // CONTRACT §G: vm/publish requires the CG to be registered on-chain and does
-      // NOT auto-register. When registerIfNeeded is true, register first (the
-      // client short-circuits an already-registered CG via alreadyRegistered), then
-      // publish — mirroring dkg_shared_memory_publish. A hard registration failure
-      // is a tool error: do NOT publish.
+      // CONTRACT §G: vm/publish AUTO-registers an unregistered CG transparently
+      // (#1116) regardless of registerIfNeeded. When registerIfNeeded is true we
+      // run an EXPLICIT register first (the client short-circuits an already-
+      // registered CG via alreadyRegistered) so the caller can choose the
+      // registration's accessPolicy — mirroring dkg_shared_memory_publish. A hard
+      // registration failure is a tool error: do NOT publish.
       if (registerIfNeeded === true) {
         try {
           await client.registerContextGraph({ id: pid, accessPolicy });

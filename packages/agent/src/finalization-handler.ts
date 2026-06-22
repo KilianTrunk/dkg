@@ -1,8 +1,9 @@
 import {
   decodeFinalizationMessage,
   contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
+  sharedMemoryReadBothFilter,
   contextGraphDataUri, contextGraphMetaUri,
-  contextGraphSubGraphUri, validateSubGraphName,
+  contextGraphSubGraphUri, validateSubGraphName, validateContextGraphId,
   DKGEvent, Logger, createOperationContext,
   assertSafeIri, isSafeIri,
   type EventBus,
@@ -15,7 +16,7 @@ import { GraphManager, type TripleStore, type Quad } from '@origintrail-official
 import { type ChainAdapter, type EventFilter } from '@origintrail-official/dkg-chain';
 import {
   computeFlatKCRootV10 as computeFlatKCRoot, skolemizeByEntity,
-  generateConfirmedFullMetadata, getTentativeStatusQuad,
+  generateConfirmedFullMetadata, buildDeterministicTokenRows, compareRootIris, getTentativeStatusQuad,
   generateSubGraphRegistration,
   shouldApplyMaterialization, writeMaterializedVersion, withMaterializationLock,
   type MaterializedVersion,
@@ -53,6 +54,11 @@ export class FinalizationHandler {
   private readonly markContextGraphMetaDirtyFromQuads: MarkContextGraphMetaDirtyFromQuads | undefined;
   private readonly log = new Logger('FinalizationHandler');
   private readonly processedUals = new Set<string>();
+  // Forward-prevention for the cgId-resolution race (RS heal): chain-authoritative
+  // kaId(batchId)->cgId bindings, cached POSITIVE-ONLY. A 0/miss is NEVER cached —
+  // caching a miss for a KC finalized before its on-chain KA->CG binding lands
+  // would pin it to the legacy `/_meta` fallback forever, re-opening the race.
+  private readonly chainCgIdByBatchId = new Map<string, string>();
 
   constructor(
     store: TripleStore,
@@ -77,7 +83,11 @@ export class FinalizationHandler {
       }
 
       if (msg.contextGraphId && msg.contextGraphId !== contextGraphId) {
-        this.log.warn(ctx, `Finalization: contextGraphId "${msg.contextGraphId}" does not match topic "${contextGraphId}", ignoring`);
+        // #1100: same guard as GossipPublishHandler — frames of other gossip
+        // message types decode "successfully" with garbage in this field, so
+        // only WARN when the mismatched value is a plausible CG id.
+        if (!validateContextGraphId(msg.contextGraphId).valid) return;
+        this.log.warn(ctx, `Finalization: contextGraphId "${msg.contextGraphId.slice(0, 120)}" does not match topic "${contextGraphId}", ignoring`);
         return;
       }
 
@@ -109,15 +119,45 @@ export class FinalizationHandler {
       // the id locally when the wire is empty; resolver failures or
       // not-on-chain CGs fall back to legacy behavior unchanged.
       let ctxGraphId = msg.targetContextGraphId || undefined;
-      if (!ctxGraphId && this.resolveContextGraphOnChainId) {
-        try {
-          const resolved = await this.resolveContextGraphOnChainId(contextGraphId);
-          if (resolved !== null && resolved !== undefined && String(resolved).length > 0) {
-            ctxGraphId = String(resolved);
-            this.log.info(ctx, `Finalization: gossip omitted targetContextGraphId; resolved locally to ${ctxGraphId} (defensive lookup)`);
+      if (!ctxGraphId) {
+        // Forward-prevention (RS cgId-race): resolve from CHAIN TRUTH first.
+        // `getKAContextGraphId(batchId)` is authoritative and immune to the
+        // local ontology-binding lag that strands KCs in legacy `/_meta` — the
+        // root cause the heal-sweep exists to repair. Caching POSITIVE results
+        // only (never a 0/miss) keeps a finalization that races ahead of its
+        // on-chain KA->CG binding from being pinned to legacy forever.
+        let batchIdForResolve = 0n;
+        try { batchIdForResolve = protoToBigInt(msg.batchId); } catch { batchIdForResolve = 0n; }
+        const cacheKey = batchIdForResolve > 0n ? batchIdForResolve.toString() : '';
+        if (cacheKey && this.chainCgIdByBatchId.has(cacheKey)) {
+          ctxGraphId = this.chainCgIdByBatchId.get(cacheKey);
+        } else if (
+          cacheKey && this.chain && this.chain.chainId !== 'none'
+          && typeof this.chain.getKAContextGraphId === 'function'
+        ) {
+          try {
+            const boundCg = await this.chain.getKAContextGraphId(batchIdForResolve);
+            if (boundCg !== null && boundCg !== undefined && BigInt(boundCg) > 0n) {
+              ctxGraphId = boundCg.toString();
+              this.chainCgIdByBatchId.set(cacheKey, ctxGraphId); // POSITIVE-only
+              this.log.info(ctx, `Finalization: resolved cgId from chain truth getKAContextGraphId(${batchIdForResolve})=${ctxGraphId}`);
+            }
+          } catch (err) {
+            this.log.info(ctx, `Finalization: chain getKAContextGraphId(${batchIdForResolve}) failed (RPC lag?), falling back to local resolve: ${err instanceof Error ? err.message : String(err)}`);
           }
-        } catch (err) {
-          this.log.warn(ctx, `Finalization: defensive on-chain CG id lookup failed for ${contextGraphId}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        // Local name-based resolver — the existing belt-and-braces for rolling
+        // upgrades when the chain method is absent/lagging.
+        if (!ctxGraphId && this.resolveContextGraphOnChainId) {
+          try {
+            const resolved = await this.resolveContextGraphOnChainId(contextGraphId);
+            if (resolved !== null && resolved !== undefined && String(resolved).length > 0) {
+              ctxGraphId = String(resolved);
+              this.log.info(ctx, `Finalization: gossip omitted targetContextGraphId; resolved locally to ${ctxGraphId} (defensive lookup)`);
+            }
+          } catch (err) {
+            this.log.warn(ctx, `Finalization: defensive on-chain CG id lookup failed for ${contextGraphId}: ${err instanceof Error ? err.message : String(err)}`);
+          }
         }
       }
 
@@ -308,8 +348,18 @@ export class FinalizationHandler {
     if (safeRoots.length === 0) return [];
 
     const values = safeRoots.map(r => `<${r}>`).join(' ');
+    // #1098/#1099: replicas store gossiped SWM shares in the PER-KA graphs
+    // `…/_shared_memory/{author}/{number}` (workspace-handler.ts ~line 987),
+    // not the bare bucket. Reading only the bucket made every replica report
+    // "no shared memory data … peer missed SWM sharing" on finalization, so
+    // the published KA was never materialized into VM on subscribed peers
+    // (the VM-divergence half of #1098). Read-both: bucket + per-KA graphs.
+    // CONSTRUCT (not SELECT) so literal terms keep full datatype/lang
+    // fidelity for the merkle recompute, and so the same logical triple
+    // present in BOTH the bucket and a per-KA graph collapses to one
+    // (a constructed graph is a set).
     const sparql = `CONSTRUCT { ?s ?p ?o } WHERE {
-      GRAPH <${sharedMemoryGraph}> {
+      GRAPH ?g {
         VALUES ?root { ${values} }
         ?s ?p ?o .
         FILTER(
@@ -317,6 +367,7 @@ export class FinalizationHandler {
           || STRSTARTS(STR(?s), CONCAT(STR(?root), "/.well-known/genid/"))
         )
       }
+      ${sharedMemoryReadBothFilter(sharedMemoryGraph)}
     }`;
 
     const result = await this.store.query(sparql, { source: 'agent.finalization.sharedMemorySlice' });
@@ -1050,8 +1101,18 @@ export class FinalizationHandler {
     }
     const kaMetadata: KAMetadata[] = [];
 
-    for (let tokenIdx = 0; tokenIdx < rootEntities.length; tokenIdx++) {
-      const rootEntity = rootEntities[tokenIdx];
+    // GH #936 — assign per-root tokenIds over a CANONICAL (lexicographic) root
+    // order, NOT the SPARQL/gossip binding order. oxigraph binding order is
+    // store-history-dependent, so two replicas reconciling the same KC from
+    // chain would otherwise mint divergent root→tokenId maps. These tokenIds are
+    // local compatibility labels (the on-chain KA count is 1, no on-chain
+    // dependency — see dkg-publisher.ts), so a content-derived sort makes the
+    // map a pure function of the root SET: identical on every replica and on
+    // both the gossip and chain-reconcile promotion paths.
+    const orderedRoots = [...rootEntities].sort(compareRootIris);
+
+    for (let tokenIdx = 0; tokenIdx < orderedRoots.length; tokenIdx++) {
+      const rootEntity = orderedRoots[tokenIdx];
       const entityQuads = partitioned.get(rootEntity) ?? [];
       if (entityQuads.length === 0) continue;
       kaMetadata.push({
@@ -1143,6 +1204,16 @@ export class FinalizationHandler {
     } catch { /* tentative status may not exist */ }
 
     let metaQuads = generateConfirmedFullMetadata(kcMeta, kaMetadata, provenance);
+
+    // GH #936 — append the SHARED deterministic per-root token rows (no-op for
+    // single-root). This is the SAME helper the publisher uses on the originator
+    // path, so a locally-published and a chain-reconciled multi-root KC expose
+    // an identical, queryable rootEntity→tokenId map. graph = the default
+    // `<cg>/_meta` so the ctxGraphId remap below routes them to the per-cgId
+    // `_meta` (and dual-writes a root copy when keepRootCopyOnLabel).
+    metaQuads.push(
+      ...buildDeterministicTokenRows(ual, kaMetadata, `did:dkg:context-graph:${contextGraphId}/_meta`),
+    );
     if (ctxGraphId) {
       const defaultMeta = `did:dkg:context-graph:${contextGraphId}/_meta`;
       const targetMeta = contextGraphMetaUri(contextGraphId, ctxGraphId);
@@ -1185,12 +1256,27 @@ export class FinalizationHandler {
     const swmMetaGraph = subGraphName
       ? graphManager.sharedMemoryMetaUri(contextGraphId, subGraphName)
       : contextGraphWorkspaceMetaGraphUri(contextGraphId);
+    // #1099: replicas hold the gossiped SWM copy in PER-KA graphs
+    // `…/_shared_memory/{author}/{number}` (workspace-handler.ts ~line 987),
+    // but this cleanup only drained the bare bucket. The stale per-KA copy
+    // survived every publish, kept being served to late subscribers via the
+    // PROTOCOL_SYNC SWM responder (which reads the whole `…/_shared_memory/`
+    // prefix), and re-poisoned even the publisher's own SWM on resync —
+    // publisher and replicas permanently disagreed about SWM content.
+    // Mirror DKGPublisher's `swmGraphsUnder`: drain the bucket AND every
+    // graph under its `/` prefix.
+    const allGraphs = await this.store.listGraphs();
+    const swmGraphsForClear = allGraphs.filter(
+      (g) => g === sharedMemoryGraph || g.startsWith(`${sharedMemoryGraph}/`),
+    );
     for (const rootEntity of rootEntities) {
-      await this.store.deleteByPattern({ graph: sharedMemoryGraph, subject: rootEntity });
-      await this.store.deleteBySubjectPrefix(sharedMemoryGraph, rootEntity + '/.well-known/genid/');
-      await this.store.deleteByPattern({
-        graph: sharedMemoryGraph, subject: rootEntity, predicate: 'http://dkg.io/ontology/workspaceOwner',
-      });
+      for (const g of swmGraphsForClear) {
+        await this.store.deleteByPattern({ graph: g, subject: rootEntity });
+        await this.store.deleteBySubjectPrefix(g, rootEntity + '/.well-known/genid/');
+        await this.store.deleteByPattern({
+          graph: g, subject: rootEntity, predicate: 'http://dkg.io/ontology/workspaceOwner',
+        });
+      }
       await this.store.deleteByPattern({
         graph: swmMetaGraph, subject: rootEntity, predicate: 'http://dkg.io/ontology/workspaceOwner',
       });

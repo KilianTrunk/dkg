@@ -298,6 +298,47 @@ export function generateConfirmedFullMetadata(
   ];
 }
 
+/**
+ * GH #936 — explicit, deterministic per-root token map
+ * (`<ual>/<tokenId>` dkg:tokenId / dkg:entity) for MULTI-root KCs. Emitted via a
+ * SHARED helper so the publisher (originator) and the gossip / chain-reconcile
+ * replica paths expose an IDENTICAL, queryable rootEntity→tokenId mapping — the
+ * same multi-root KC must not surface different token rows depending on which
+ * node materialised it. Kept OUT of generateKCMetadata (metadata.test.ts pins
+ * that output to the collapsed `dkg:rootEntity` shape and forbids these
+ * predicates); both call sites append these rows alongside the confirmed
+ * metadata. `kaEntries` MUST already be in the canonical
+ * (lexicographically-sorted-by-rootEntity) tokenId order — both call sites sort
+ * before minting.
+ */
+/**
+ * GH #936 — the canonical root ordering used for deterministic compatibility
+ * tokenId assignment. The publisher (originator), the gossip path, and the
+ * chain-reconcile path MUST all assign `<ual>/<tokenId>` over roots sorted by
+ * THIS comparator, so every node derives the identical rootEntity→tokenId map.
+ * Shared here so the invariant is API-enforced rather than comment-enforced.
+ */
+export function compareRootIris(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+export function buildDeterministicTokenRows(
+  ual: string,
+  kaEntries: ReadonlyArray<{ tokenId: bigint; rootEntity: string }>,
+  metaGraph: string,
+): Quad[] {
+  if (kaEntries.length <= 1) return [];
+  const rows: Quad[] = [];
+  for (const ka of kaEntries) {
+    const subject = `${ual}/${ka.tokenId}`;
+    rows.push(
+      mq(subject, `${DKG}tokenId`, intLit(ka.tokenId), metaGraph),
+      mq(subject, DKG_ENTITY, ka.rootEntity, metaGraph),
+    );
+  }
+  return rows;
+}
+
 function mq(s: string, p: string, o: string, g: string): Quad {
   return { subject: s, predicate: p, object: o, graph: g };
 }
@@ -313,6 +354,69 @@ function lit(val: string): string {
 
 function intLit(val: number | bigint): string {
   return `"${val}"^^<${XSD}integer>`;
+}
+
+/**
+ * Canonical builder for the "minimal scoped meta" rows the RS prover + access
+ * handler read off a scoped context-graph meta graph: `dkg:batchId` (the UAL
+ * resolution edge) + `dkg:merkleRoot`, the collapsed `dkg:rootEntity`
+ * (+ `dkg:privateMerkleRoot`) member rows on the UAL subject, and — for
+ * MULTI-root KCs only — the `<ual>/<tokenId>` `rootEntity`/`partOf`/
+ * `privateMerkleRoot` pairing rows so each member root↔privateMerkleRoot stays
+ * joinable on its own token subject (single-root keeps the full collapse).
+ *
+ * Single source of truth for the two PUBLISH paths that promote a confirmed KC
+ * into a scoped meta graph: `DKGPublisher.publishFromSharedMemory` (the SWM
+ * path) and `DKGPublisher.promoteConfirmedKCToScopedGraph` (the one-shot
+ * `publish()` RS promotion, #1266). Output is byte-identical to the inline blocks
+ * those two previously carried.
+ *
+ * `restateKaPartition` below writes the SAME shape but from a different data
+ * model — per-root Maps + POSITIONAL `<ual>/<n>` token labels + a DELETE/INSERT
+ * restate — so it intentionally does NOT call this builder. Keep the two shapes
+ * in sync (see the note in `restateKaPartition`).
+ */
+export function buildScopedMinimalMeta(
+  ual: string,
+  kaId: bigint,
+  merkleRoot: Uint8Array,
+  manifestEntries: ReadonlyArray<{ rootEntity: string; tokenId: bigint; privateMerkleRoot?: Uint8Array }>,
+  metaGraph: string,
+): Quad[] {
+  const out: Quad[] = [
+    mq(ual, `${DKG}batchId`, intLit(kaId), metaGraph),
+    mq(ual, `${DKG}merkleRoot`, lit(toHex(merkleRoot)), metaGraph),
+  ];
+  const multiRoot = new Set(manifestEntries.map((ka) => ka.rootEntity)).size > 1;
+  const seenRoots = new Set<string>();
+  const seenPrivRoots = new Set<string>();
+  for (const ka of manifestEntries) {
+    if (!seenRoots.has(ka.rootEntity)) {
+      seenRoots.add(ka.rootEntity);
+      out.push(...entityMemberQuads(ual, ka.rootEntity, metaGraph));
+    }
+    if (ka.privateMerkleRoot && ka.privateMerkleRoot.length > 0) {
+      const privHex = toHex(ka.privateMerkleRoot);
+      if (!seenPrivRoots.has(privHex)) {
+        seenPrivRoots.add(privHex);
+        out.push(mq(ual, `${DKG}privateMerkleRoot`, lit(privHex), metaGraph));
+      }
+    }
+    // MULTI-root only: re-emit the `<ual>/<tokenId>` token rows so each member
+    // root carries its OWN privateMerkleRoot on a shared subject (recoverable
+    // pairing). Not deduped — every token keeps its pairing row.
+    if (multiRoot) {
+      const kaUri = `${ual}/${ka.tokenId}`;
+      out.push(
+        ...entityMemberQuads(kaUri, ka.rootEntity, metaGraph),
+        mq(kaUri, `${DKG}partOf`, ual, metaGraph),
+      );
+      if (ka.privateMerkleRoot && ka.privateMerkleRoot.length > 0) {
+        out.push(mq(kaUri, `${DKG}privateMerkleRoot`, lit(toHex(ka.privateMerkleRoot)), metaGraph));
+      }
+    }
+  }
+  return out;
 }
 
 function dateLit(d: Date): string {
@@ -745,6 +849,10 @@ async function _restateKaPartitionLocked(opts: {
   //    re-emit the legacy `<ual>/<n>` token rows (insertion = manifest order,
   //    matching the pre-trim tokenIdx mint) so the root↔privateMerkleRoot
   //    pairing stays recoverable; single-root keeps the full collapse.
+  //    SAME SHAPE as `buildScopedMinimalMeta` (the publish-path builder) but
+  //    NOT shared: this path works from per-root Maps with POSITIONAL token
+  //    labels and a DELETE/INSERT restate, vs. the builder's manifest + minted
+  //    `ka.tokenId`. Keep the two shapes in sync if either changes.
   const metaQuads: Quad[] = [];
   const partitionMultiRoot = payloadByRoot.size > 1;
   let partitionTokenIdx = 1;

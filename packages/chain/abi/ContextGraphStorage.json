@@ -254,6 +254,17 @@
     "type": "error"
   },
   {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "caller",
+        "type": "address"
+      }
+    ],
+    "name": "OnlyRandomSampling",
+    "type": "error"
+  },
+  {
     "inputs": [],
     "name": "TokenTransferFailed",
     "type": "error"
@@ -439,6 +450,25 @@
       }
     ],
     "name": "ContextGraphDeactivated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "contextGraphId",
+        "type": "uint256"
+      },
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "kaId",
+        "type": "uint256"
+      }
+    ],
+    "name": "KnowledgeAssetPrunedFromSamplingList",
     "type": "event"
   },
   {
@@ -675,6 +705,25 @@
   {
     "inputs": [
       {
+        "internalType": "uint256",
+        "name": "contextGraphId",
+        "type": "uint256"
+      }
+    ],
+    "name": "clearRegistrationEscrow",
+    "outputs": [
+      {
+        "internalType": "uint96",
+        "name": "cleared",
+        "type": "uint96"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
         "internalType": "address",
         "name": "owner_",
         "type": "address"
@@ -735,6 +784,24 @@
       }
     ],
     "name": "deactivateContextGraph",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "contextGraphId",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint96",
+        "name": "amount",
+        "type": "uint96"
+      }
+    ],
+    "name": "decreaseRegistrationEscrow",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"
@@ -849,7 +916,7 @@
         "type": "uint256"
       }
     ],
-    "name": "getContextGraphKCAt",
+    "name": "getContextGraphKaAt",
     "outputs": [
       {
         "internalType": "uint256",
@@ -868,7 +935,7 @@
         "type": "uint256"
       }
     ],
-    "name": "getContextGraphKCCount",
+    "name": "getContextGraphKaCount",
     "outputs": [
       {
         "internalType": "uint256",
@@ -887,7 +954,7 @@
         "type": "uint256"
       }
     ],
-    "name": "getContextGraphKCList",
+    "name": "getContextGraphKaList",
     "outputs": [
       {
         "internalType": "uint256[]",
@@ -1025,6 +1092,68 @@
         "internalType": "address",
         "name": "publishAuthority",
         "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "contextGraphId",
+        "type": "uint256"
+      }
+    ],
+    "name": "getRegistrationEscrow",
+    "outputs": [
+      {
+        "internalType": "uint96",
+        "name": "",
+        "type": "uint96"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "contextGraphId",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "index",
+        "type": "uint256"
+      }
+    ],
+    "name": "getSamplingKaAt",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "kaId",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "contextGraphId",
+        "type": "uint256"
+      }
+    ],
+    "name": "getSamplingKaCount",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
       }
     ],
     "stateMutability": "view",
@@ -1276,6 +1405,24 @@
   {
     "inputs": [
       {
+        "internalType": "uint256",
+        "name": "contextGraphId",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint96",
+        "name": "amount",
+        "type": "uint96"
+      }
+    ],
+    "name": "setRegistrationEscrow",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
         "internalType": "bytes4",
         "name": "interfaceId",
         "type": "bytes4"
@@ -1290,6 +1437,29 @@
       }
     ],
     "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "contextGraphId",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "index",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "expectedKaId",
+        "type": "uint256"
+      }
+    ],
+    "name": "swapRemoveSamplingKnowledgeAssetAt",
+    "outputs": [],
+    "stateMutability": "nonpayable",
     "type": "function"
   },
   {

@@ -74,7 +74,7 @@ function nextSealNumber(author: string): bigint {
 export async function buildSeal(
   params: BuildSealParams,
 ): Promise<PrecomputedAttestation> {
-  const { quads, privateQuads = [], author, contextGraphId, ctx } = params;
+  const { quads, privateQuads = [], author, ctx } = params;
 
   const kaMap = autoPartition(quads);
   const allPublic = [...kaMap.values()].flat();
@@ -101,7 +101,7 @@ export async function buildSeal(
   const td = buildAuthorAttestationTypedData({
     chainId: BigInt(chainIdNum),
     kav10Address: ctx.kav10Address,
-    contextGraphId: BigInt(contextGraphId),
+    // #1116: AuthorAttestation no longer binds contextGraphId.
     merkleRoot,
     authorAddress: author.address,
     reservedKaId,

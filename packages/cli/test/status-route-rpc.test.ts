@@ -20,7 +20,13 @@
  *     'RPC health probe failed' error, and never echoes an RPC URL.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { computeNetworkId } from '../../core/src/genesis.js';
 import { getSharedContext } from '../../chain/test/evm-test-context.js';
+import { loadNetworkConfig } from '../src/config.js';
+import { handleStatusRoutes } from '../src/daemon/routes/status.js';
+import type { RequestContext } from '../src/daemon/routes/context.js';
 import { startLiveDaemon, stopLiveDaemon, authHeaders, type LiveDaemon } from './helpers/live-daemon.js';
 
 // A port nothing listens on — connecting to it is a REAL refused connection.
@@ -89,6 +95,61 @@ describe('/api/status + /api/chain/rpc-health (real daemon, real chain)', () => 
     expect(typeof body.blockNumber).toBe('number');
     for (const probe of body.rpcs) {
       expect(probe).not.toHaveProperty('rpcUrl');
+    }
+  });
+});
+
+describe('/api/status selected overlay details', () => {
+  it('returns the network id and name for the selected overlay genesis', async () => {
+    const network = await loadNetworkConfig('mainnet-gnosis');
+    expect(network).not.toBeNull();
+
+    const server = createServer(async (req, res) => {
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      await handleStatusRoutes({
+        req,
+        res,
+        path: url.pathname,
+        url,
+        network,
+        config: {
+          name: 'status-selected-overlay-test',
+          networkConfig: 'mainnet-gnosis',
+          nodeRole: 'edge',
+          chain: { type: 'mock' },
+        },
+        startedAt: Date.now(),
+        agent: {
+          peerId: 'peer-status-test',
+          multiaddrs: [],
+          node: {
+            libp2p: { getConnections: () => [] },
+            getRelayStats: () => null,
+          },
+          publisher: { getIdentityId: () => 0n },
+        },
+        nodeVersion: '0.0.0-test',
+        nodeCommit: '',
+        // Read-only admission stats view — the daemon supplies this in prod via
+        // handleRequest; stubbed here because this hand-built ctx drives the full
+        // /api/status body, which now surfaces the admission block.
+        admission: { inFlight: 0, max: 0, rejectedTotal: 0 },
+      } as unknown as RequestContext);
+    });
+
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const address = server.address() as AddressInfo;
+      const res = await fetch(`http://127.0.0.1:${address.port}/api/status`);
+      expect(res.status).toBe(200);
+      const body: any = await res.json();
+      const selectedNetworkId = await computeNetworkId('gnosis-mainnet');
+
+      expect(body.networkConfig).toBe('mainnet-gnosis');
+      expect(body.networkId).toBe(selectedNetworkId);
+      expect(body.networkName).toBe('DKG V10 Gnosis Mainnet');
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
     }
   });
 });

@@ -13,7 +13,11 @@ contract ProfileStorage is INamed, IVersioned, HubDependent {
     // (RFC 04 v0.3 / Issue #461). New mapping reads on existing keys return
     // false for the new field. Multiaddrs were briefly added on a prior
     // revision but are deliberately not stored on Profile (RFC 04 §5.2).
-    string private constant _VERSION = "10.0.2";
+    // 10.0.3 -> 10.0.4: active-fee getters (fee / percentage / effective-date)
+    // centralized in `_activeOperatorFee`, fixing the `operatorFees[length - 2]`
+    // underflow panic on the single-not-yet-effective-fee state (the effective-date
+    // getter still had it).
+    string private constant _VERSION = "10.0.4";
 
     event ProfileCreated(uint72 indexed identityId, string nodeName, bytes nodeId, uint16 initialOperatorFee);
     event ProfileDeleted(uint72 indexed identityId, bytes nodeId);
@@ -28,7 +32,7 @@ contract ProfileStorage is INamed, IVersioned, HubDependent {
         uint256 effectiveDate
     );
     event OperatorFeesUpdated(uint72 indexed identityId, ProfileLib.OperatorFee[] operatorFees);
-    // RFC 04 v0.3: relay-capability flag (multiaddrs live in attestation KCs, not Profile).
+    // RFC 04 v0.3: relay-capability flag (multiaddrs live in attestation KAs, not Profile).
     event RelayCapabilityUpdated(uint72 indexed identityId, bool oldValue, bool newValue);
 
     mapping(uint72 => ProfileLib.ProfileInfo) public profiles;
@@ -165,7 +169,7 @@ contract ProfileStorage is INamed, IVersioned, HubDependent {
     // gates the operator's per-round attestation publish (RFC 04 Phase 2)
     // — operators with relayCapable=false don't bother running the cosig
     // + submit pipeline at all. Multiaddrs themselves live in the
-    // per-round attestation KC body, not on Profile (RFC 04 §5.2).
+    // per-round attestation KA body, not on Profile (RFC 04 §5.2).
     // =====================================================================
 
     function getRelayCapable(uint72 identityId) external view returns (bool) {
@@ -233,19 +237,27 @@ contract ProfileStorage is INamed, IVersioned, HubDependent {
         return _safeGetLatestOperatorFee(identityId);
     }
 
-    function getActiveOperatorFee(uint72 identityId) external view returns (ProfileLib.OperatorFee memory) {
-        if (profiles[identityId].operatorFees.length == 0) {
+    /// @dev The currently-active operator fee. Centralizes the `length - 2`
+    ///      underflow guard so every active-fee getter (fee / percentage /
+    ///      effective-date) shares ONE implementation. A single fee is always
+    ///      active; with more than one, the latest applies once its effectiveDate
+    ///      has passed (strict `>`), otherwise the prior fee. The `length == 1`
+    ///      guard also covers the createProfile case where the initial fee's
+    ///      effectiveDate == block.timestamp would otherwise hit `length - 2`.
+    function _activeOperatorFee(uint72 identityId) internal view returns (ProfileLib.OperatorFee memory) {
+        ProfileLib.OperatorFee[] storage fees = profiles[identityId].operatorFees;
+        uint256 length = fees.length;
+        if (length == 0) {
             return ProfileLib.OperatorFee({feePercentage: 0, effectiveDate: 0});
         }
-
-        if (
-            block.timestamp >
-            profiles[identityId].operatorFees[profiles[identityId].operatorFees.length - 1].effectiveDate
-        ) {
-            return profiles[identityId].operatorFees[profiles[identityId].operatorFees.length - 1];
-        } else {
-            return profiles[identityId].operatorFees[profiles[identityId].operatorFees.length - 2];
+        if (length == 1 || block.timestamp > fees[length - 1].effectiveDate) {
+            return fees[length - 1];
         }
+        return fees[length - 2];
+    }
+
+    function getActiveOperatorFee(uint72 identityId) external view returns (ProfileLib.OperatorFee memory) {
+        return _activeOperatorFee(identityId);
     }
 
     function getOperatorFeePercentageByIndex(uint72 identityId, uint256 index) external view returns (uint16) {
@@ -268,18 +280,7 @@ contract ProfileStorage is INamed, IVersioned, HubDependent {
     }
 
     function getActiveOperatorFeePercentage(uint72 identityId) public view returns (uint16) {
-        if (profiles[identityId].operatorFees.length == 0) {
-            return 0;
-        }
-
-        if (
-            block.timestamp >
-            profiles[identityId].operatorFees[profiles[identityId].operatorFees.length - 1].effectiveDate
-        ) {
-            return profiles[identityId].operatorFees[profiles[identityId].operatorFees.length - 1].feePercentage;
-        } else {
-            return profiles[identityId].operatorFees[profiles[identityId].operatorFees.length - 2].feePercentage;
-        }
+        return _activeOperatorFee(identityId).feePercentage;
     }
 
     function getOperatorFeeEffectiveDateByIndex(uint72 identityId, uint256 index) external view returns (uint256) {
@@ -305,18 +306,7 @@ contract ProfileStorage is INamed, IVersioned, HubDependent {
     }
 
     function getActiveOperatorFeeEffectiveDate(uint72 identityId) external view returns (uint256) {
-        if (profiles[identityId].operatorFees.length == 0) {
-            return 0;
-        }
-
-        if (
-            block.timestamp >
-            profiles[identityId].operatorFees[profiles[identityId].operatorFees.length - 1].effectiveDate
-        ) {
-            return profiles[identityId].operatorFees[profiles[identityId].operatorFees.length - 1].effectiveDate;
-        } else {
-            return profiles[identityId].operatorFees[profiles[identityId].operatorFees.length - 2].effectiveDate;
-        }
+        return _activeOperatorFee(identityId).effectiveDate;
     }
 
     function isOperatorFeeChangePending(uint72 identityId) external view returns (bool) {

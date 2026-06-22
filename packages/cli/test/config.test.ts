@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { dkgAuthTokenPath } from '@origintrail-official/dkg-core';
+import { computeNetworkId } from '../../core/src/genesis.js';
 import {
   loadNetworkConfig,
   loadConfig,
@@ -23,9 +24,11 @@ import {
   classifyMonorepoInit,
   sharedHomeInitGate,
   repoDir,
+  resolveNetworkConfigName,
   resolveAutoUpdateSource,
   resolveApprovalPolicy,
   resolveChainConfig,
+  resolveReadyChainConfig,
 } from '../src/config.js';
 
 describe('classifyMonorepoInit (dkg init monorepo home guard — issue #960)', () => {
@@ -140,7 +143,99 @@ describe('loadNetworkConfig', () => {
       expect(config).toBeNull();
       return;
     }
-    expect(config.networkName).toMatch(/testnet/i);
+    expect(config.networkName).toBe('DKG V10 Base Testnet');
+    expect((config as any).genesisId).toBe('base-testnet');
+    expect(config.networkId).toBe('7449c543ff04a550b2dafa999fe8ee577a00b212023bb4d4244e8d58a4792c7b');
+  });
+
+  it('loads mainnet prep configs without activating testnet genesis or relays', async () => {
+    const { _resetNetworkConfigCache } = await import('../src/config.js');
+    const testnetNetworkId = '7449c543ff04a550b2dafa999fe8ee577a00b212023bb4d4244e8d58a4792c7b';
+    const sharedMainnetPrep = {
+      genesisVersion: 1,
+      relays: [
+        '/ip4/178.105.87.39/tcp/9090/p2p/PEER_ID_SOLARIS',
+        '/ip4/178.105.105.102/tcp/9090/p2p/PEER_ID_LUNARIS',
+        '/ip4/178.156.214.4/tcp/9090/p2p/PEER_ID_ORIONIS',
+        '/ip4/178.105.111.185/tcp/9090/p2p/PEER_ID_KEPLER',
+      ],
+      defaultContextGraphs: [],
+      defaultNodeRole: 'edge',
+      autoUpdate: {
+        enabled: true,
+        repo: 'OriginTrail/dkg',
+        branch: 'main',
+        checkIntervalMinutes: 5,
+      },
+    };
+    _resetNetworkConfigCache();
+    const testnetConfig = await loadNetworkConfig('testnet');
+    const testnetRelays = testnetConfig?.relays ?? [];
+    const mainnets = [
+      {
+        name: 'mainnet-base',
+        networkName: 'DKG V10 Base Mainnet',
+        genesisId: 'base-mainnet',
+        networkId: '562ea760dbe27fb4233d58dfc958bbddf844b82596ec3d51dff98718e6bf61ca',
+        chainName: 'base',
+        chainId: 'base:8453',
+        rpcUrl: 'https://mainnet.base.org',
+        hubAddress: '0x99Aa571fD5e681c2D27ee08A7b7989DB02541d13',
+      },
+      {
+        name: 'mainnet-gnosis',
+        networkName: 'DKG V10 Gnosis Mainnet',
+        genesisId: 'gnosis-mainnet',
+        networkId: 'e08a9fb72a648ec2eb2fd9c152ded90a8ad67bb56f27df4781d9bb7e261fb7a7',
+        chainName: 'gnosis',
+        chainId: 'gnosis:100',
+        rpcUrl: 'https://rpc.gnosischain.com',
+        hubAddress: '0x882D0BF07F956b1b94BBfe9E77F47c6fc7D4EC8f',
+      },
+      {
+        name: 'mainnet-neuroweb',
+        networkName: 'DKG V10 NeuroWeb Mainnet',
+        genesisId: 'neuroweb-mainnet',
+        networkId: '83698bd2a305d6261169bfe96dd7c2f8aa9d24bee92150eee949a9a89bb68729',
+        chainName: 'neuroweb',
+        chainId: 'neuroweb:2043',
+        rpcUrl: 'https://astrosat-parachain-rpc.origin-trail.network',
+        hubAddress: '0x0957e25BD33034948abc28204ddA54b6E1142D6F',
+      },
+    ];
+
+    for (const expected of mainnets) {
+      _resetNetworkConfigCache();
+      const config = await loadNetworkConfig(expected.name);
+      expect(config).not.toBeNull();
+      const cfg = config! as any;
+      expect(cfg._status).toMatch(/pre-deployment: replace PEER_ID_\* relay values before enabling/);
+      expect(cfg._status).not.toContain('PLACEHOLDER_MAINNET_NETWORK_ID');
+      expect(cfg.networkId).not.toBe(testnetNetworkId);
+      expect(cfg.relays).not.toEqual(testnetRelays);
+      expect({
+        genesisVersion: cfg.genesisVersion,
+        relays: cfg.relays,
+        defaultContextGraphs: cfg.defaultContextGraphs,
+        defaultNodeRole: cfg.defaultNodeRole,
+        autoUpdate: cfg.autoUpdate,
+      }).toEqual(sharedMainnetPrep);
+      expect(cfg.networkName).toBe(expected.networkName);
+      expect(cfg.genesisId).toBe(expected.genesisId);
+      expect(cfg.networkId).toBe(expected.networkId);
+      expect(await computeNetworkId(expected.genesisId)).toBe(expected.networkId);
+      for (const relay of cfg.relays) {
+        expect(relay).toMatch(/^\/ip4\/178\./);
+        expect(relay).toMatch(/\/p2p\/PEER_ID_/);
+      }
+      expect(cfg.chain).toEqual({
+        name: expected.chainName,
+        type: 'evm',
+        chainId: expected.chainId,
+        rpcUrl: expected.rpcUrl,
+        hubAddress: expected.hubAddress,
+      });
+    }
   });
 
   it('returns null when network config file does not exist', async () => {
@@ -311,6 +406,25 @@ describe('localAgentIntegrations config round-trip', () => {
     expect(readNodeRoleFromConfigSync()).toBe('edge');
   });
 
+  it('round-trips networkConfig through saveConfig/loadConfig (network selector)', async () => {
+    await saveConfig({
+      name: 'test-node',
+      networkConfig: 'mainnet-base',
+      apiPort: 9200,
+      listenPort: 0,
+      nodeRole: 'core',
+    });
+
+    const loaded = await loadConfig();
+    expect(loaded.networkConfig).toBe('mainnet-base');
+    expect(resolveNetworkConfigName(loaded)).toBe('mainnet-base');
+  });
+
+  it('falls back to project default network when networkConfig is unset or blank', () => {
+    expect(resolveNetworkConfigName({})).toBe('testnet');
+    expect(resolveNetworkConfigName({ networkConfig: '   ' })).toBe('testnet');
+  });
+
   it('round-trips relayServerCapacity through saveConfig/loadConfig (operator override)', async () => {
     // PR #524 review (branarakic): the README documents
     // `relayServerCapacity` as a `config.json` knob, so the CLI
@@ -474,6 +588,26 @@ describe('resolveChainConfig (field-level merge)', () => {
       hubAddress: fullNetworkChain.hubAddress,
       chainId: fullNetworkChain.chainId,
     });
+  });
+
+  it('keeps raw chain merging side-effect-free for pre-deployment network metadata', () => {
+    const merged = resolveChainConfig({}, {
+      _status: 'pre-deployment: replace PEER_ID_* relay values before enabling Base mainnet',
+      networkName: 'DKG V10 Base Mainnet',
+      relays: ['/ip4/178.105.87.39/tcp/9090/p2p/PEER_ID_SOLARIS'],
+      chain: fullNetworkChain,
+    });
+
+    expect(merged?.hubAddress).toBe(fullNetworkChain.hubAddress);
+  });
+
+  it('refuses ready chain resolution from a pre-deployment network', () => {
+    expect(() => resolveReadyChainConfig({}, {
+      _status: 'pre-deployment: replace PEER_ID_* relay values before enabling Base mainnet',
+      networkName: 'DKG V10 Base Mainnet',
+      relays: ['/ip4/178.105.87.39/tcp/9090/p2p/PEER_ID_SOLARIS'],
+      chain: fullNetworkChain,
+    })).toThrow(/pre-deployment/);
   });
 
   it('overrides only the fields the operator set, inheriting the rest from network', () => {

@@ -305,6 +305,20 @@ export class SparqlHttpStore implements TripleStore {
     return Math.max(0, before - after);
   }
 
+  /**
+   * Server-side SPARQL UPDATE over the SPARQL 1.1 protocol — the endpoint
+   * (oxigraph-server) executes graph-to-graph `INSERT…WHERE` copies internally,
+   * so terms stay byte-identical (no JS round-trip). See {@link TripleStore.update}.
+   */
+  async update(sparql: string): Promise<void> {
+    const res = await this.postUpdate(sparql);
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`SPARQL HTTP update failed (${res.status}): ${text.slice(0, 300)}`);
+    }
+    this.invalidateListGraphsCache();
+  }
+
   async query(sparql: string, options?: SparqlHttpQueryOptions): Promise<QueryResult> {
     const startedAt = this.now();
     throwIfAborted(options?.signal);

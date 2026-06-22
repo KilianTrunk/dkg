@@ -54,14 +54,14 @@ import { createProfile, createProfiles } from './helpers/profile-helpers';
 import {
   getDefaultPublishingNode,
   getDefaultReceivingNodes,
-  getDefaultKCCreator,
+  getDefaultKACreator,
 } from './helpers/setup-helpers';
 import {
   buildPublishParams,
   buildUpdateParams,
   packReservedKaId,
   DEFAULT_CHAIN_ID,
-} from './helpers/v10-kc-helpers';
+} from './helpers/v10-ka-helpers';
 
 const MIN_STAKE = ethers.parseEther('50000');
 
@@ -205,7 +205,8 @@ describe('@integration V10 PCA — consent-free agent DoS (audit fix)', function
   ) => {
     await Token.mint(attacker.address, 1n);
     await Token.connect(attacker).approve(await NFT.getAddress(), 1n);
-    await NFT.connect(attacker).createAccount(1n);
+    // RFC-51: createAccount(committedTRAC, primaryNode); inert node = 0.
+    await NFT.connect(attacker).createAccount(1n, 0);
     const accountId = await NFT.totalSupply();
     await NFT.connect(attacker).registerAgent(accountId, victim.address);
     expect(await NFT.agentToAccountId(victim.address)).to.equal(accountId);
@@ -273,7 +274,7 @@ describe('@integration V10 PCA — consent-free agent DoS (audit fix)', function
   it('publish: attacker-registered underfunded PCA no longer bricks the victim (falls through to direct spend)', async () => {
     const nodes = await standUpNodes();
     const attacker = accounts[8];
-    const victim = getDefaultKCCreator(accounts); // accounts[9]
+    const victim = getDefaultKACreator(accounts); // accounts[9]
 
     const { accountId, lockDurationEpochs } = await attackerSquats(
       attacker,
@@ -334,7 +335,7 @@ describe('@integration V10 PCA — consent-free agent DoS (audit fix)', function
   it('update: attacker-registered underfunded PCA no longer bricks a paid victim update', async () => {
     const nodes = await standUpNodes();
     const attacker = accounts[8];
-    const victim = getDefaultKCCreator(accounts);
+    const victim = getDefaultKACreator(accounts);
 
     const cgId = await openContextGraphFor(victim);
     const initialTokenAmount = ethers.parseEther('1000');
@@ -345,7 +346,8 @@ describe('@integration V10 PCA — consent-free agent DoS (audit fix)', function
     // the conviction gate active once the victim IS registered.
     await Token.mint(attacker.address, 1n);
     await Token.connect(attacker).approve(await NFT.getAddress(), 1n);
-    await NFT.connect(attacker).createAccount(1n);
+    // RFC-51: createAccount(committedTRAC, primaryNode); inert node = 0.
+    await NFT.connect(attacker).createAccount(1n, 0);
     const attackerAccountId = await NFT.totalSupply();
     const lockEpochs = Number((await NFT.accounts(attackerAccountId))[5]);
 
@@ -413,7 +415,7 @@ describe('@integration V10 PCA — consent-free agent DoS (audit fix)', function
   it('publish: expired squatted PCA falls through at the gate (expiry can never brick the victim)', async () => {
     const nodes = await standUpNodes();
     const attacker = accounts[8];
-    const victim = getDefaultKCCreator(accounts);
+    const victim = getDefaultKACreator(accounts);
 
     const { lockDurationEpochs } = await attackerSquats(attacker, victim);
     const cgId = await openContextGraphFor(victim);
@@ -464,7 +466,7 @@ describe('@integration V10 PCA — consent-free agent DoS (audit fix)', function
   it('publish: fall-through still reverts for an unfunded victim (not a free publish)', async () => {
     const nodes = await standUpNodes();
     const attacker = accounts[8];
-    const victim = getDefaultKCCreator(accounts);
+    const victim = getDefaultKACreator(accounts);
 
     const { lockDurationEpochs } = await attackerSquats(attacker, victim);
     const cgId = await openContextGraphFor(victim);

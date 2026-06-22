@@ -1,5 +1,5 @@
 import { SignerWithAddress } from '@nomicfoundation/hardhat-ethers/signers';
-import { loadFixture } from '@nomicfoundation/hardhat-network-helpers';
+import { loadFixture, time } from '@nomicfoundation/hardhat-network-helpers';
 import { expect } from 'chai';
 import hre from 'hardhat';
 
@@ -759,7 +759,7 @@ describe('@unit Profile contract', function () {
   // =====================================================================
   // RFC 04 v0.3 / Issue #461 — relay-capability flag.
   // Multiaddrs are intentionally NOT stored on Profile — they live in
-  // per-round attestation KCs (RFC 04 §5.2).
+  // per-round attestation KAs (RFC 04 §5.2).
   // =====================================================================
 
   describe('Relay capability flag (RFC 04 v0.3 / Issue #461)', () => {
@@ -804,6 +804,60 @@ describe('@unit Profile contract', function () {
       expect(ask).to.equal(0n);
       expect(opFees.length).to.equal(1);
       expect(relayCapable).to.equal(true);
+    });
+  });
+
+  // ProfileStorage 10.0.4 — getActiveOperatorFee / getActiveOperatorFeePercentage
+  // / getActiveOperatorFeeEffectiveDate used to read operatorFees[length - 2]
+  // whenever the latest fee was not yet effective. With a single fee (length == 1)
+  // that is `operatorFees[-1]`, a uint underflow → out-of-bounds panic → DoS on the
+  // active-fee getters. All three now route through one `_activeOperatorFee` helper,
+  // so every public active-fee getter is exercised in each case below.
+  describe('getActiveOperatorFee* — single-fee length-2 underflow regression', () => {
+    it('returns the sole fee right after createProfile (initial fee effectiveDate == now)', async () => {
+      // createProfile seeds operatorFees[0] at effectiveDate == block.timestamp;
+      // reading the active fee in the same block hits `block.timestamp > effectiveDate == false`.
+      await Profile.createProfile(accounts[1].address, [], 'Node 1', nodeId1, 1000);
+
+      expect(await ProfileStorage.getActiveOperatorFeePercentage(identityId1)).to.equal(1000);
+      expect((await ProfileStorage.getActiveOperatorFee(identityId1)).feePercentage).to.equal(1000);
+      // getActiveOperatorFeeEffectiveDate shares the same helper — must not panic.
+      expect(await ProfileStorage.getActiveOperatorFeeEffectiveDate(identityId1)).to.equal(
+        (await ProfileStorage.getActiveOperatorFee(identityId1)).effectiveDate,
+      );
+    });
+
+    it('returns the sole fee when the single fee is not yet effective (the exact underflow trigger)', async () => {
+      await Profile.createProfile(accounts[1].address, [], 'Node 1', nodeId1, 1000);
+      const future = (await time.latest()) + 100_000;
+      // accounts[0] is registered as a Hub contract in the fixture, so it passes onlyContracts.
+      // Replace the single fee with a not-yet-effective one (length stays 1, effectiveDate in the future).
+      await ProfileStorage.connect(accounts[0]).setOperatorFees(identityId1, [
+        { feePercentage: 1500, effectiveDate: future },
+      ]);
+
+      // Pre-fix this reverted (operatorFees[length - 2] = operatorFees[-1]); now returns the sole fee.
+      expect(await ProfileStorage.getActiveOperatorFeePercentage(identityId1)).to.equal(1500);
+      expect((await ProfileStorage.getActiveOperatorFee(identityId1)).feePercentage).to.equal(1500);
+      // The effective-date getter ALSO panicked on operatorFees[-1] pre-fix (the #1263 🔴);
+      // it now returns the sole not-yet-effective fee's date.
+      expect(await ProfileStorage.getActiveOperatorFeeEffectiveDate(identityId1)).to.equal(future);
+    });
+
+    it('still returns the older active fee when a second fee is pending (length >= 2 path intact)', async () => {
+      await Profile.createProfile(accounts[1].address, [], 'Node 1', nodeId1, 1000);
+      const future = (await time.latest()) + 100_000;
+      // operatorFees = [ (1000 @ now, active), (2000 @ future, pending) ].
+      await ProfileStorage.connect(accounts[0]).addOperatorFee(identityId1, 2000, future);
+
+      // The pending fee is not active yet → active fee stays operatorFees[length - 2] = 1000
+      // (proves the fix did not regress the genuine length >= 2 else-branch).
+      expect(await ProfileStorage.getActiveOperatorFeePercentage(identityId1)).to.equal(1000);
+      expect((await ProfileStorage.getActiveOperatorFee(identityId1)).feePercentage).to.equal(1000);
+      // Effective-date getter returns the ACTIVE (older) fee's date, not the pending one.
+      expect(await ProfileStorage.getActiveOperatorFeeEffectiveDate(identityId1)).to.equal(
+        (await ProfileStorage.getActiveOperatorFee(identityId1)).effectiveDate,
+      );
     });
   });
 });

@@ -101,6 +101,7 @@ import {
   ensureDkgDir,
   TELEMETRY_ENDPOINTS,
   type DkgConfig,
+  type NetworkConfig,
   type AutoUpdateConfig,
   type LocalAgentIntegrationCapabilities,
   type LocalAgentIntegrationConfig,
@@ -124,6 +125,7 @@ import {
   slotEntryPoint,
   CLI_NPM_PACKAGE,
   exitOnStoreConfigErrors,
+  validateNetworkConfigReadiness,
 } from '../config.js';
 import { createPublicSnapshotStore, createPublisherControlFromStore, startPublisherRuntimeIfEnabled, type PublisherRuntime } from '../publisher-runner.js';
 import { createCatchupRunner, type CatchupJobResult, type CatchupRunner } from '../catchup-runner.js';
@@ -238,6 +240,11 @@ import {
   resolveCorsOrigin,
   corsHeaders,
   HttpRateLimiter,
+  InFlightLimiter,
+  type AdmissionStatsView,
+  admitRequest,
+  resolveIntSetting,
+  applyServerLimits,
   isLoopbackClientIp,
   isLoopbackRateLimitExemptPath,
   shouldBypassRateLimitForLoopbackTraffic,
@@ -723,6 +730,30 @@ export function startPromoteWorkerDaemonLifecycle(input: {
   };
 }
 
+type StartupGenesisValidation =
+  | { ok: true; networkId: string }
+  | { ok: false; networkId: string; messages: string[] };
+
+type StartupGenesisValidationInput = Partial<Pick<NetworkConfig, '_status' | 'genesisId' | 'networkId' | 'networkName' | 'relays'>>;
+
+export async function validateStartupGenesis(
+  network: StartupGenesisValidationInput | null | undefined,
+): Promise<StartupGenesisValidation> {
+  const networkId = await computeNetworkId(network?.genesisId);
+  const readiness = validateNetworkConfigReadiness(network);
+  const messages = readiness.ok ? [] : [...readiness.messages];
+  if (network?.networkId && network.networkId !== networkId) {
+    messages.push(
+      `FATAL: genesis mismatch! Expected networkId ${network.networkId.slice(0, 16)}... but computed ${networkId.slice(0, 16)}...`,
+    );
+    messages.push(
+      `This node's genesis does not match ${network.networkName}. Rebuild or update the selected network config.`,
+    );
+  }
+  if (messages.length > 0) return { ok: false, networkId, messages };
+  return { ok: true, networkId };
+}
+
 export async function runDaemon(foreground: boolean): Promise<void> {
   await ensureDkgDir();
   const config = await loadConfig();
@@ -864,7 +895,18 @@ export async function runDaemonInner(
     log(`[dkg-build-info] WARNING: failed to emit startup telemetry: ${String(err)}`);
   }
 
-  const network = await loadNetworkConfig();
+  const selectedNetworkConfig = config.networkConfig?.trim();
+  const network = await loadNetworkConfig(selectedNetworkConfig);
+  if (selectedNetworkConfig && !network) {
+    log(`FATAL: network config "${selectedNetworkConfig}" was not found (expected network/${selectedNetworkConfig}.json).`);
+    process.exit(1);
+  }
+  const genesisValidation = await validateStartupGenesis(network);
+  const networkId = genesisValidation.networkId;
+  if (!genesisValidation.ok) {
+    for (const message of genesisValidation.messages) log(message);
+    process.exit(1);
+  }
   const syncContextGraphs = [
     ...new Set([
       ...resolveContextGraphs(config),
@@ -1221,6 +1263,7 @@ export async function runDaemonInner(
   const agent = await DKGAgent.create({
     kaNumberAllocator,
     name: config.name,
+    genesisId: network?.genesisId,
     framework: "DKG",
     listenPort: config.listenPort,
     dataDir: dkgDir(),
@@ -1386,21 +1429,11 @@ export async function runDaemonInner(
   let promoteWorkerLifecycle: PromoteWorkerDaemonLifecycle | null = null;
   let shuttingDown = false;
 
-  const networkId = await computeNetworkId();
   const publisherControl = createPublisherControlFromStore(
     agent.store,
     createPublicSnapshotStore(dkgDir(), config),
   );
   log(`Network: ${networkId.slice(0, 16)}...`);
-  if (network?.networkId && network.networkId !== networkId) {
-    log(
-      `FATAL: genesis mismatch! Expected networkId ${network.networkId.slice(0, 16)}... but computed ${networkId.slice(0, 16)}...`,
-    );
-    log(
-      `This node's genesis does not match network/testnet.json. Rebuild or update the repo.`,
-    );
-    process.exit(1);
-  }
   if (network) {
     log(
       `Network config: ${network.networkName} (genesis v${network.genesisVersion})`,
@@ -1420,6 +1453,25 @@ export async function runDaemonInner(
       log,
     }),
   );
+
+  // GH #462 — skill_request authorization. Default-deny remote skill invocation
+  // (any connected peer could otherwise invoke any registered skill). Operators
+  // restore open skills with `messaging.openSkills: true`, or allowlist specific
+  // peers via `messaging.skillAllowedPeers`.
+  {
+    const openSkills = config.messaging?.openSkills === true;
+    const allowedSkillPeers = new Set(config.messaging?.skillAllowedPeers ?? []);
+    agent.setSkillAcl((senderPeerId: string) => {
+      if (openSkills) return { accept: true };
+      if (allowedSkillPeers.has(senderPeerId)) return { accept: true };
+      return {
+        accept: false,
+        reason:
+          'unauthorized: skill invocation is default-deny for remote peers; ' +
+          'set messaging.openSkills or add this peer to messaging.skillAllowedPeers (GH #462)',
+      };
+    });
+  }
 
   let chatDb: DashboardDB | null = null;
   agent.onChat((text, senderPeerId, _convId, senderContextGraphId, verifiedContextGraphId, messageId) => {
@@ -2630,6 +2682,7 @@ export async function runDaemonInner(
   // --- File Store ---
 
   const fileStore = new FileStore(join(dkgDir(), "files"));
+  agent.registerImportedArtifactByteStore(fileStore);
 
   // --- Vector Store (optional, for tri-modal memory) ---
   const vectorStore = new VectorStore(dkgDir());
@@ -2672,6 +2725,42 @@ export async function runDaemonInner(
       "/.well-known/skill.md",
     ],
   );
+
+  // Admission control: cap concurrent in-flight requests so a burst (including
+  // loopback traffic, which bypasses the per-IP rate limiter) can't pile
+  // unbounded pending work onto the single event loop / store worker thread.
+  // IP-agnostic on purpose — local agents legitimately burst, so we shed by
+  // concurrency (503 + Retry-After) rather than by per-minute rate. Tunable via
+  // DKG_MAX_INFLIGHT (explicit 0 disables); default 64. Malformed/empty values
+  // fall back to the default instead of silently disabling the cap.
+  const maxInFlight = resolveIntSetting(
+    process.env.DKG_MAX_INFLIGHT,
+    config.maxInFlightRequests,
+    64,
+    { allowNonPositive: true },
+  );
+  const inFlightLimiter = new InFlightLimiter(maxInFlight);
+  // Read-only live view of the limiter's counters for the plugin-facing
+  // RequestContext / /api/status: only the three getters, never the mutating
+  // tryAcquire()/release(). The enforcement path (admitRequest, below) keeps the
+  // real limiter; route/plugin code can read shed stats but can't reach — even
+  // via a runtime cast — the methods that corrupt slot accounting.
+  const admissionStats: AdmissionStatsView = {
+    get inFlight() {
+      return inFlightLimiter.inFlight;
+    },
+    get max() {
+      return inFlightLimiter.max;
+    },
+    get rejectedTotal() {
+      return inFlightLimiter.rejectedTotal;
+    },
+  };
+  // Throttle the "shedding" warning so a sustained burst can't spam the log,
+  // while still letting operators see the limiter is active (per review).
+  let lastShedLogAt = 0;
+  const SHED_LOG_THROTTLE_MS = 10_000;
+
   let corsAllowed: CorsAllowlist = "*";
   daemonState.catchupRunner = createCatchupRunner(agent);
 
@@ -2691,6 +2780,25 @@ export async function runDaemonInner(
         res.end(JSON.stringify({ error: 'Too many requests' }));
         return;
       }
+
+      // Admission control — shed load (503 + Retry-After) when too many
+      // requests are already in flight. Applied to ALL traffic (not bypassed
+      // for loopback) so it also bounds local agents the per-IP rate limiter
+      // exempts; OPTIONS preflight and cheap health/liveness paths are exempt
+      // inside admitRequest so monitoring stays answerable under saturation.
+      const gate = admitRequest(inFlightLimiter, req.method, reqUrl.pathname, res, reqCorsOrigin);
+      if (!gate.admitted) {
+        const nowMs = Date.now();
+        if (nowMs - lastShedLogAt >= SHED_LOG_THROTTLE_MS) {
+          lastShedLogAt = nowMs;
+          log(
+            `admission-control: shedding requests (503) — inFlight=${inFlightLimiter.inFlight}/${inFlightLimiter.max} rejectedTotal=${inFlightLimiter.rejectedTotal}`,
+          );
+        }
+        return;
+      }
+      // (admitRequest registers slot release on the response's `close` event —
+      // covers streaming/plugin responses; nothing to release here.)
 
       // CORS preflight
       if (req.method === "OPTIONS") {
@@ -2854,6 +2962,7 @@ export async function runDaemonInner(
         apiHost,
         apiPortRef,
         routePlugins,
+        admissionStats,
         emitMemoryGraphChanged,
         emitNotification,
       );
@@ -2878,6 +2987,19 @@ export async function runDaemonInner(
         jsonResponse(res, 500, { error: err.message });
       }
     }
+    // Note: the admission slot is released on the response's `close` event
+    // (registered above), not in a finally here — see the comment at acquire.
+  });
+
+  // Bound simultaneous sockets and slow-header connections so a flood of
+  // clients can't exhaust file descriptors or park half-open connections.
+  // Resolution + assignment live in applyServerLimits (unit-tested); tunable via
+  // DKG_MAX_CONNECTIONS / DKG_HEADERS_TIMEOUT_MS, with malformed/empty values
+  // falling back to defaults rather than becoming NaN.
+  applyServerLimits(server, {
+    maxConnectionsEnv: process.env.DKG_MAX_CONNECTIONS,
+    maxConnectionsConfig: config.maxConnections,
+    headersTimeoutEnv: process.env.DKG_HEADERS_TIMEOUT_MS,
   });
 
   const apiPort = config.apiPort || 0;

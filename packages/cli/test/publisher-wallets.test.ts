@@ -140,6 +140,27 @@ describe('publisher wallets', () => {
     ).rejects.toThrow('dkg publisher wallet add <privateKey>');
   });
 
+  it('resolves publisher chain defaults from config.networkConfig', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'dkg-publisher-runtime-'));
+    const wallet = ethers.Wallet.createRandom();
+    await addPublisherWallet(dataDir, wallet.privateKey);
+
+    await expect(
+      createPublisherRuntime({
+        dataDir,
+        config: {
+          name: 'test-node',
+          networkConfig: 'mainnet-base',
+          apiPort: 9200,
+          listenPort: 0,
+          nodeRole: 'edge',
+          contextGraphs: [],
+          store: { backend: 'oxigraph' },
+        },
+      }),
+    ).rejects.toThrow(/DKG V10 Base Mainnet is marked pre-deployment/);
+  });
+
   it('bootstraps publisher runtime from an existing agent store', async () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'dkg-publisher-runtime-'));
     const wallet = ethers.Wallet.createRandom();

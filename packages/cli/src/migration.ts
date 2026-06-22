@@ -69,7 +69,7 @@ export const _migrationIo = {
   execFileSync: execFileSync as (...args: any[]) => any,
   repoDir: repoDir as () => string | null,
   loadConfig: loadConfig as () => Promise<any>,
-  loadNetworkConfig: loadNetworkConfig as () => Promise<any>,
+  loadNetworkConfig: loadNetworkConfig as (network?: string) => Promise<any>,
   swapSlot: swapSlot as (slot: 'a' | 'b') => Promise<void>,
 };
 
@@ -102,7 +102,7 @@ export async function migrateToBlueGreen(
   }
 
   const config = await loadConfig().catch(() => ({} as any));
-  const network = await loadNetworkConfig().catch(() => undefined);
+  const network = await loadNetworkConfig(config?.networkConfig).catch(() => undefined);
   const gitEnv = gitCommandEnv(config?.autoUpdate ?? network?.autoUpdate);
   const localRepo = repoDir();
   const hasLocalRepo = Boolean(localRepo && existsSync(join(localRepo, '.git')));

@@ -100,7 +100,9 @@ export type ResolvedAutoUpdateConfig = AutoUpdateConfig & {
 };
 
 export interface NetworkConfig {
+  _status?: string;
   networkName: string;
+  genesisId: string;
   networkId: string;
   genesisVersion: number;
   relays: string[];
@@ -375,6 +377,11 @@ export interface GraphSetIndexConfig {
 
 export interface DkgConfig {
   name: string;
+  /**
+   * Selects which bundled network/<name>.json overlay this node should use.
+   * When omitted, runtime falls back to project.json#defaultNetwork.
+   */
+  networkConfig?: string;
   relay?: string;
   apiPort: number;
   /** Host to bind the API server (default '127.0.0.1', use '0.0.0.0' for external access). */
@@ -570,6 +577,17 @@ export interface DkgConfig {
   /** HTTP rate limiting settings. */
   rateLimit?: { requestsPerMinute?: number; exempt?: string[] };
   /**
+   * Max concurrent in-flight HTTP requests before the daemon sheds load with
+   * 503 (admission control, IP-agnostic). `<= 0` disables. Overridden by the
+   * `DKG_MAX_INFLIGHT` env var. Defaults to 64.
+   */
+  maxInFlightRequests?: number;
+  /**
+   * Max simultaneous TCP connections the HTTP server will accept. Overridden by
+   * the `DKG_MAX_CONNECTIONS` env var. Defaults to 256.
+   */
+  maxConnections?: number;
+  /**
    * V10 Random Sampling prover (core-only). When the node is `core`
    * AND has an on-chain identity, the agent automatically schedules
    * `RandomSamplingProver.tick()` on `tickIntervalMs`. Edge nodes
@@ -631,6 +649,17 @@ export interface DkgConfig {
    * See {@link ChatConfig} / {@link ChatAclConfig}.
    */
   chat?: ChatConfig;
+  /**
+   * GH #462 — agent-to-agent messaging authorization. `skill_request` over
+   * `/dkg/message/1.0.0` is default-deny for remote peers (the Ed25519 check
+   * authenticates the caller but does not authorize skill invocation). Set
+   * `openSkills: true` to restore the legacy open behaviour, or list specific
+   * peer ids in `skillAllowedPeers`.
+   */
+  messaging?: {
+    openSkills?: boolean;
+    skillAllowedPeers?: string[];
+  };
   /** Route-plugin specs (absolute paths / package names) loaded at daemon startup. ADR 0001. */
   routePlugins?: string[];
   /**
@@ -664,7 +693,7 @@ export interface DkgConfig {
     dhtQuerySelfIntervalMs?: number;
     /**
      * Cadence at which the daemon re-publishes its own profile to the
-     * `agents` Context Graph (default 5min — see
+     * `agents` Context Graph (default 20min — see
      * `AGENT_PROFILE_HEARTBEAT_MS`). Set to `0` to disable; the
      * one-shot startup publish still fires.
      *
@@ -717,6 +746,42 @@ export function resolveContextGraphs(config: DkgConfig): string[] {
 /** Resolve context graphs from network config. */
 export function resolveNetworkDefaultContextGraphs(network: NetworkConfig | null | undefined): string[] {
   return network?.defaultContextGraphs ?? [];
+}
+
+type NetworkReadinessValidation =
+  | { ok: true; messages: [] }
+  | { ok: false; messages: string[] };
+
+type NetworkReadinessInput = Partial<Pick<NetworkConfig, '_status' | 'networkName' | 'relays'>>;
+
+export function validateNetworkConfigReadiness(
+  network: NetworkReadinessInput | null | undefined,
+): NetworkReadinessValidation {
+  const networkName = network?.networkName ?? 'selected network';
+  const messages: string[] = [];
+  if (network?._status?.toLowerCase().startsWith('pre-deployment')) {
+    messages.push(
+      `FATAL: network config ${networkName} is marked ${network._status}.`,
+    );
+  }
+  const placeholderRelays = network?.relays?.filter(relay => relay.includes('/p2p/PEER_ID_')) ?? [];
+  if (placeholderRelays.length > 0) {
+    messages.push(
+      `FATAL: network config ${networkName} contains placeholder relay peer IDs: ${placeholderRelays.join(', ')}`,
+    );
+    messages.push('Replace pre-deployment relay PeerIDs before selecting this network.');
+  }
+  if (messages.length > 0) return { ok: false, messages };
+  return { ok: true, messages: [] };
+}
+
+export function assertNetworkConfigReadiness(
+  network: NetworkReadinessInput | null | undefined,
+): void {
+  const readiness = validateNetworkConfigReadiness(network);
+  if (!readiness.ok) {
+    throw new Error(readiness.messages.join('\n'));
+  }
 }
 
 /** Resolve shared memory TTL from config, accepting both V10 and legacy keys. */
@@ -991,6 +1056,9 @@ export function resolveAutoUpdateSource(
  * The return type is `Partial<ChainConfig>` because either source may be
  * partial; consumers that need both `rpcUrl` and `hubAddress` (lifecycle,
  * publisher-runner) MUST guard for those fields before passing to the agent.
+ *
+ * This is a raw field-merge helper. Call {@link resolveReadyChainConfig} at
+ * CLI/daemon activation boundaries that must reject pre-deployment networks.
  */
 export function resolveChainConfig(
   config: Pick<DkgConfig, 'chain'> | null | undefined,
@@ -1047,10 +1115,20 @@ export function resolveChainConfig(
   return merged;
 }
 
+export function resolveReadyChainConfig(
+  config: Pick<DkgConfig, 'chain'> | null | undefined,
+  network: (Pick<NetworkConfig, 'chain'> & NetworkReadinessInput) | null | undefined,
+): ResolvedChainConfig | undefined {
+  if (config?.chain?.type !== 'mock') {
+    assertNetworkConfigReadiness(network);
+  }
+  return resolveChainConfig(config, network);
+}
+
 /**
  * Load a network config from network/<name>.json.
  *
- * @param network - Network name (e.g. 'testnet', 'mainnet'). Defaults to
+ * @param network - Network name (e.g. 'testnet', 'mainnet-base'). Defaults to
  *   the `defaultNetwork` value from project.json.
  *
  * Candidate paths (tried in order):
@@ -1063,7 +1141,7 @@ export function resolveChainConfig(
  * without requiring a rebuild of the CLI package.
  */
 export async function loadNetworkConfig(network?: string): Promise<NetworkConfig | null> {
-  const name = network ?? loadProjectConfig().defaultNetwork;
+  const name = network?.trim() || loadProjectConfig().defaultNetwork;
   if (_networkConfig && _networkConfigName === name) return _networkConfig;
   try {
     const file = `${name}.json`;
@@ -1080,6 +1158,10 @@ export async function loadNetworkConfig(network?: string): Promise<NetworkConfig
   } catch {
     return null;
   }
+}
+
+export function resolveNetworkConfigName(config?: Pick<DkgConfig, 'networkConfig'> | null): string {
+  return config?.networkConfig?.trim() || loadProjectConfig().defaultNetwork;
 }
 
 export function dkgDir(): string {

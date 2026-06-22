@@ -1116,18 +1116,29 @@ describe('checkForNpmVersionUpdate tag precedence', () => {
     expect(result.status).toBe('up-to-date');
   });
 
-  it('channel pin no-ops gracefully when the dist-tag does not exist yet', async () => {
+  it('channel pin reports no-target (not up-to-date) when the dist-tag does not exist yet', async () => {
     const { checkForNpmVersionUpdate } = await import('../src/daemon.js');
     fetchImpl = async () => makeRegistryResponse({ latest: '9.5.0' }); // no `testnet`
     const result = await checkForNpmVersionUpdate(() => {}, true, 'testnet');
-    expect(result.status).toBe('up-to-date');
+    // Distinct from up-to-date: an unpublished/misconfigured channel must be
+    // visible, not silently reported as current.
+    expect(result.status).toBe('no-target');
+    expect(result.channel).toBe('testnet');
   });
 
-  it('channel pin honours allowPrerelease=false (skips a prerelease tag)', async () => {
+  it('channel pin reports no-target when allowPrerelease=false rejects a prerelease tag', async () => {
     const { checkForNpmVersionUpdate } = await import('../src/daemon.js');
     fetchImpl = async () => makeRegistryResponse({ testnet: '9.6.0-rc.1' });
     const result = await checkForNpmVersionUpdate(() => {}, false, 'testnet');
-    expect(result.status).toBe('up-to-date');
+    expect(result.status).toBe('no-target');
+    expect(result.channel).toBe('testnet');
+  });
+
+  it('channel pin reports no-target when the tag value is not valid semver', async () => {
+    const { checkForNpmVersionUpdate } = await import('../src/daemon.js');
+    fetchImpl = async () => makeRegistryResponse({ testnet: 'not-a-version' });
+    const result = await checkForNpmVersionUpdate(() => {}, true, 'testnet');
+    expect(result.status).toBe('no-target');
   });
 
   it('channel pin follows a stable tag under allowPrerelease=false', async () => {
@@ -1139,6 +1150,38 @@ describe('checkForNpmVersionUpdate tag precedence', () => {
     const result = await checkForNpmVersionUpdate(() => {}, false, 'mainnet');
     expect(result.status).toBe('available');
     expect(result.version).toBe('10.0.0');
+  });
+
+  it('default path does NOT attempt an update to a non-semver latest', async () => {
+    const { checkForNpmVersionUpdate } = await import('../src/daemon.js');
+    fetchImpl = async () => makeRegistryResponse({ latest: 'garbage' });
+    const result = await checkForNpmVersionUpdate(() => {}, true);
+    expect(result.status).toBe('up-to-date'); // not 'available' on garbage
+  });
+});
+
+describe('deriveUpdateCheckState (runCheck → /api/status mapping)', () => {
+  it('no-target → upToDate:true + channelTargetMissing:true (updateAvailable stays false)', async () => {
+    const { deriveUpdateCheckState } = await import('../src/daemon.js');
+    expect(deriveUpdateCheckState({ status: 'no-target', channel: 'mainnet' }))
+      .toEqual({ upToDate: true, channelTargetMissing: true });
+  });
+
+  it('available → upToDate:false + clears channelTargetMissing + carries version', async () => {
+    const { deriveUpdateCheckState } = await import('../src/daemon.js');
+    expect(deriveUpdateCheckState({ status: 'available', version: '10.1.0' }))
+      .toEqual({ upToDate: false, channelTargetMissing: false, version: '10.1.0' });
+  });
+
+  it('up-to-date → upToDate:true + clears channelTargetMissing', async () => {
+    const { deriveUpdateCheckState } = await import('../src/daemon.js');
+    expect(deriveUpdateCheckState({ status: 'up-to-date' }))
+      .toEqual({ upToDate: true, channelTargetMissing: false });
+  });
+
+  it('error → null (caller leaves prior state untouched)', async () => {
+    const { deriveUpdateCheckState } = await import('../src/daemon.js');
+    expect(deriveUpdateCheckState({ status: 'error' })).toBeNull();
   });
 });
 

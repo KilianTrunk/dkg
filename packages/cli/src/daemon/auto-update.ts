@@ -294,6 +294,16 @@ export type NpmVersionResult =
   | { version: null; error: true }
   | { version: null; error: false };
 
+/**
+ * Minimal semver-shape guard: MAJOR.MINOR.PATCH with optional -prerelease/+build.
+ * Used to reject malformed dist-tag values before they reach `compareSemver`
+ * (a non-numeric part makes `compareSemver` return NaN, which is not `<= 0` and
+ * would slip the forward-only gate, attempting an "update" to garbage).
+ */
+export function isLikelySemver(v: string): boolean {
+  return /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(v.trim());
+}
+
 export async function resolveLatestNpmVersion(
   log: (msg: string) => void,
   allowPrerelease = true,
@@ -324,6 +334,12 @@ export async function resolveLatestNpmVersion(
       if (!pinned) {
         log(
           `Auto-update (npm): channel "${channel}" has no published version, skipping`,
+        );
+        return { version: null, error: false };
+      }
+      if (!isLikelySemver(pinned)) {
+        log(
+          `Auto-update (npm): channel "${channel}" → "${pinned}" is not a valid semver, skipping`,
         );
         return { version: null, error: false };
       }
@@ -390,8 +406,10 @@ export function getCurrentCliVersion(): string {
 }
 
 export type NpmVersionStatus = {
-  status: "available" | "up-to-date" | "error";
+  status: "available" | "up-to-date" | "error" | "no-target";
   version?: string;
+  /** Set on "no-target": the pinned channel that has no acceptable version. */
+  channel?: string;
 };
 
 export async function checkForNpmVersionUpdate(
@@ -414,14 +432,53 @@ export async function checkForNpmVersionUpdate(
   }
 
   const result = await resolveLatestNpmVersion(log, allowPrerelease, channel);
-  if (result.version === null)
-    return { status: result.error ? "error" : "up-to-date" };
+  if (result.version === null) {
+    if (result.error) return { status: "error" };
+    // A pinned channel with no acceptable target (tag missing / prerelease
+    // rejected / non-semver) is NOT a clean "up-to-date" — surface it so a
+    // misconfigured or unpublished channel (e.g. mainnet) is visible rather
+    // than silently reported as current.
+    if (channel) return { status: "no-target", channel };
+    return { status: "up-to-date" };
+  }
+
+  // Never trust a non-semver target through the forward-only gate below
+  // (compareSemver would return NaN, which is not <= 0). The channel path
+  // already guards this upstream; this also covers the default tag set
+  // without changing its candidate selection.
+  if (!isLikelySemver(result.version)) {
+    log(
+      `Auto-update (npm): resolved version "${result.version}" is not valid semver, skipping`,
+    );
+    return channel ? { status: "no-target", channel } : { status: "up-to-date" };
+  }
 
   if (result.version === currentVersion) return { status: "up-to-date" };
   if (compareSemver(result.version, currentVersion) <= 0)
     return { status: "up-to-date" };
 
   return { status: "available", version: result.version };
+}
+
+/**
+ * Pure mapping from an {@link NpmVersionStatus} to the daemon's
+ * `lastUpdateCheck` fields. Extracted so the runCheck → /api/status
+ * derivation is unit-testable. The `no-target` case in particular MUST report
+ * `upToDate: true` (there is no update to apply) so `/api/status` does not flip
+ * to `updateAvailable: true`; `channelTargetMissing` carries the distinct
+ * signal. Returns null for `error` — the caller leaves prior state unchanged.
+ */
+export function deriveUpdateCheckState(
+  npmStatus: NpmVersionStatus,
+): { upToDate: boolean; channelTargetMissing: boolean; version?: string } | null {
+  if (npmStatus.status === "error") return null;
+  if (npmStatus.status === "no-target")
+    return { upToDate: true, channelTargetMissing: true };
+  return {
+    upToDate: npmStatus.status === "up-to-date",
+    channelTargetMissing: false,
+    ...(npmStatus.version ? { version: npmStatus.version } : {}),
+  };
 }
 
 /**

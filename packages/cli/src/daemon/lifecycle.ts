@@ -272,6 +272,7 @@ import {
   getCurrentCliVersion,
   type NpmVersionStatus,
   checkForNpmVersionUpdate,
+  deriveUpdateCheckState,
   type UpdateStatus,
   acquireUpdateLock,
   releaseUpdateLock,
@@ -1886,8 +1887,13 @@ export async function runDaemonInner(
 
   if (standalone) {
     const checkIntervalMs = (au?.checkIntervalMinutes ?? 30) * 60_000;
-    const allowPre = au?.allowPrerelease ?? true;
-    const channel = au?.channel;
+    // Even in version-check-only mode (au is null because auto-apply is
+    // disabled) the policy used for the check must reflect the operator's
+    // shipped intent — read allowPrerelease + channel from config/network
+    // rather than hardcoding `true`/none, or a disabled-but-checking node
+    // silently ignores its `allowPrerelease:false` / channel pin.
+    const allowPre = au?.allowPrerelease ?? network?.autoUpdate?.allowPrerelease ?? config.autoUpdate?.allowPrerelease ?? true;
+    const channel = au?.channel ?? network?.autoUpdate?.channel ?? config.autoUpdate?.channel;
 
     log(
       `Auto-update (npm): ${au ? "enabled" : "disabled — version check only"}${channel ? ` channel="${channel}"` : ""} (every ${au?.checkIntervalMinutes ?? 30}min)`,
@@ -1895,11 +1901,17 @@ export async function runDaemonInner(
 
     const runCheck = async () => {
       const npmStatus = await checkForNpmVersionUpdate(log, allowPre, channel);
-      if (npmStatus.status !== "error") {
-        daemonState.lastUpdateCheck.upToDate = npmStatus.status === "up-to-date";
+      const derived = deriveUpdateCheckState(npmStatus);
+      if (derived) {
         daemonState.lastUpdateCheck.checkedAt = Date.now();
-        if (npmStatus.version)
-          daemonState.lastUpdateCheck.latestVersion = npmStatus.version;
+        daemonState.lastUpdateCheck.upToDate = derived.upToDate;
+        daemonState.lastUpdateCheck.channelTargetMissing = derived.channelTargetMissing;
+        if (derived.version)
+          daemonState.lastUpdateCheck.latestVersion = derived.version;
+        if (npmStatus.status === "no-target")
+          log(
+            `Auto-update (npm): WARNING — channel "${npmStatus.channel}" has no acceptable target (tag missing or rejected by allowPrerelease); node will not update until it is published.`,
+          );
       }
       if (npmStatus.status !== "available" || !npmStatus.version) return;
       if (!au) return; // version check only — no auto-apply when polling disabled

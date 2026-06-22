@@ -732,6 +732,10 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
         : null,
       updateAvailable:
         daemonState.lastUpdateCheck.checkedAt > 0 ? !daemonState.lastUpdateCheck.upToDate : null,
+      // True when this node pins an auto-update channel that has no acceptable
+      // target yet (e.g. the `mainnet` tag is unpublished, or points at a
+      // prerelease under allowPrerelease=false). Distinct from updateAvailable.
+      updateChannelTargetMissing: daemonState.lastUpdateCheck.channelTargetMissing,
       latestCommit: daemonState.lastUpdateCheck.latestCommit || null,
       latestVersion: daemonState.lastUpdateCheck.latestVersion || null,
     });

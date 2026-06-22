@@ -131,7 +131,15 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
     //             CSS when the settled score is non-zero.
     //           * `_claim` integrates matured carries (epoch closed) via the
     //             extracted `_nodeEpochReward` helper, then clears them.
-    string private constant _VERSION = "10.0.3";
+    string private constant _VERSION = "10.0.4";
+
+    /// @notice Emitted when a node crosses `minimumStake` during a
+    /// stake / redelegate / claim but the sharding table is full, so its
+    /// admission is deferred. Admission is best-effort housekeeping: the node
+    /// stays out of the ring (earning no score, which is correct) and is
+    /// re-attempted on the next stake/claim once a slot frees. The caller's
+    /// stake / claim / withdraw / redelegate is never blocked by a full table. #1286
+    event NodeAdmissionDeferred(uint72 indexed identityId, uint256 nodeStakeV10);
 
     // ========================================================================
     // Constants
@@ -365,7 +373,7 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
         ParametersStorage ps = parametersStorage;
         ShardingTableStorage sts = shardingTableStorage;
         if (!sts.nodeExists(identityId) && totalNodeStakeAfter >= uint256(ps.minimumStake())) {
-            shardingTable.insertNode(identityId);
+            _tryAdmitNode(identityId);
         }
 
         ask.recalculateActiveSet();
@@ -522,7 +530,7 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
             shardingTable.removeNode(oldIdentityId);
         }
         if (!sts.nodeExists(newIdentityId) && newNodeStakeAfter >= minStake) {
-            shardingTable.insertNode(newIdentityId);
+            _tryAdmitNode(newIdentityId);
         }
 
         ask.recalculateActiveSet();
@@ -721,6 +729,22 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
      *      No-op when the position has no unclaimed window (early epochs
      *      or `lastClaimedEpoch == currentEpoch - 1`).
      */
+    /// @dev Best-effort sharding-table admission. Callers gate on eligibility
+    /// (node not in table AND stake >= minimumStake) before calling. A full
+    /// table (`ShardingTableIsFull`) MUST NOT revert the caller's
+    /// stake/claim/withdraw/redelegate — admission is opportunistic housekeeping.
+    /// On failure the node stays out of the ring (earning no score, which is the
+    /// correct incentive) and is re-attempted by the next stake/claim once a slot
+    /// frees. Fixes #1286 (a full table previously blocked claim — and via
+    /// `withdraw`'s auto-claim, raw-stake withdrawal too).
+    function _tryAdmitNode(uint72 identityId) internal {
+        try shardingTable.insertNode(identityId) {
+            // admitted
+        } catch {
+            emit NodeAdmissionDeferred(identityId, convictionStorage.getNodeStakeV10(identityId));
+        }
+    }
+
     function _claim(uint256 tokenId) internal {
         ConvictionStakingStorage.Position memory pos = convictionStorage.getPosition(tokenId);
         if (pos.identityId == 0) revert PositionNotFound();
@@ -848,7 +872,7 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
                 !shardingTableStorage.nodeExists(identityId) &&
                 newNodeStake >= uint256(parametersStorage.minimumStake())
             ) {
-                shardingTable.insertNode(identityId);
+                _tryAdmitNode(identityId);
             }
         }
         ask.recalculateActiveSet();
@@ -1021,7 +1045,7 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
             !shardingTableStorage.nodeExists(targetNode) &&
             cs.getNodeStakeV10(targetNode) >= uint256(parametersStorage.minimumStake())
         ) {
-            shardingTable.insertNode(targetNode);
+            _tryAdmitNode(targetNode);
         }
         ask.recalculateActiveSet();
     }

@@ -197,6 +197,25 @@
     "inputs": [
       {
         "indexed": true,
+        "internalType": "uint72",
+        "name": "identityId",
+        "type": "uint72"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "nodeStakeV10",
+        "type": "uint256"
+      }
+    ],
+    "name": "NodeAdmissionDeferred",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
         "internalType": "uint256",
         "name": "tokenId",
         "type": "uint256"

@@ -1,4 +1,4 @@
-// Unit test for deploy/active/054_set_context_graph_registration_deposit.ts.
+// Unit test for deploy/active/998a_set_context_graph_registration_deposit.ts.
 //
 // This deploy script is the ONLY path that activates the OT-RFC-53 registration
 // deposit on real networks — the integration suite keeps it dormant via the
@@ -10,7 +10,7 @@
 import { expect } from 'chai';
 import { ethers } from 'ethers';
 
-import deployFn from '../deploy/active/054_set_context_graph_registration_deposit';
+import deployFn from '../deploy/active/998a_set_context_graph_registration_deposit';
 
 const DEPOSIT = 100n * 10n ** 18n; // 100 TRAC — must match the script
 const PS_ADDR = '0x1111111111111111111111111111111111111111';

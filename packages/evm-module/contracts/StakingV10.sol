@@ -131,7 +131,15 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
     //             CSS when the settled score is non-zero.
     //           * `_claim` integrates matured carries (epoch closed) via the
     //             extracted `_nodeEpochReward` helper, then clears them.
-    string private constant _VERSION = "10.0.3";
+    string private constant _VERSION = "10.0.4";
+
+    /// @notice Emitted when a node crosses `minimumStake` during a
+    /// stake / redelegate / claim but the sharding table is full, so its
+    /// admission is deferred. Admission is best-effort housekeeping: the node
+    /// stays out of the ring (earning no score, which is correct) and is
+    /// re-attempted on the next stake/claim once a slot frees. The caller's
+    /// stake / claim / withdraw / redelegate is never blocked by a full table. #1286
+    event NodeAdmissionDeferred(uint72 indexed identityId, uint256 nodeStakeV10);
 
     // ========================================================================
     // Constants
@@ -200,6 +208,8 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
     error PositionNotFound();
     error UnclaimedEpochs();
     error V8StakingStillLive();
+    error NodeAlreadyInShardingTable(uint72 identityId);
+    error NodeBelowMinimumStake(uint72 identityId);
 
     // ========================================================================
     // Constructor + initialize
@@ -365,7 +375,7 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
         ParametersStorage ps = parametersStorage;
         ShardingTableStorage sts = shardingTableStorage;
         if (!sts.nodeExists(identityId) && totalNodeStakeAfter >= uint256(ps.minimumStake())) {
-            shardingTable.insertNode(identityId);
+            _tryAdmitNode(identityId);
         }
 
         ask.recalculateActiveSet();
@@ -522,7 +532,7 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
             shardingTable.removeNode(oldIdentityId);
         }
         if (!sts.nodeExists(newIdentityId) && newNodeStakeAfter >= minStake) {
-            shardingTable.insertNode(newIdentityId);
+            _tryAdmitNode(newIdentityId);
         }
 
         ask.recalculateActiveSet();
@@ -721,6 +731,68 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
      *      No-op when the position has no unclaimed window (early epochs
      *      or `lastClaimedEpoch == currentEpoch - 1`).
      */
+    /// @dev Best-effort sharding-table admission. Callers gate on eligibility
+    /// (node not in table AND stake >= minimumStake) before calling. A full
+    /// table (`ShardingTableIsFull`) MUST NOT revert the caller's
+    /// stake/claim/withdraw/redelegate — admission is opportunistic housekeeping.
+    /// On failure the node stays out of the ring (earning no score, which is the
+    /// correct incentive) and is re-attempted by the next stake/claim once a slot
+    /// frees. Fixes #1286 (a full table previously blocked claim — and via
+    /// `withdraw`'s auto-claim, raw-stake withdrawal too).
+    ///
+    /// NB: a node deferred while OUT of the ring earns no reward, so a later
+    /// zero-reward `_claim` returns before its inline admission and will NOT
+    /// re-admit it. `admitNode` below is the permissionless recovery for that.
+    function _tryAdmitNode(uint72 identityId) internal {
+        try shardingTable.insertNode(identityId) {
+            // admitted
+        } catch (bytes memory reason) {
+            // Only a full table (ShardingTableIsFull) is an expected, benign
+            // deferral. Any other revert (a Hub-wiring / index-invariant / future
+            // check failure) is a real error we must NOT mask while the caller's
+            // staking state is already mutated — rethrow the original revert.
+            bytes4 selector;
+            if (reason.length >= 4) {
+                // solhint-disable-next-line no-inline-assembly
+                assembly {
+                    selector := mload(add(reason, 0x20))
+                }
+            }
+            if (selector == ShardingTable.ShardingTableIsFull.selector) {
+                // ShardingTable rolled back its own state on the full-table revert;
+                // it is a trusted Hub-registered contract, so emitting after the
+                // call is safe (slither reentrancy-events false positive).
+                // slither-disable-next-line reentrancy-events
+                emit NodeAdmissionDeferred(identityId, convictionStorage.getNodeStakeV10(identityId));
+            } else {
+                // solhint-disable-next-line no-inline-assembly
+                assembly {
+                    revert(add(reason, 0x20), mload(reason))
+                }
+            }
+        }
+    }
+
+    /// @notice Permissionless maintenance: admit a node that is eligible for the
+    /// sharding table (V10 stake >= `minimumStake`) but not currently in it —
+    /// e.g. one whose opportunistic admission was deferred because the table was
+    /// full (`_tryAdmitNode` / #1286). Anyone may bring an eligible node into the
+    /// ring once a slot frees, without the node's staker needing to add stake or
+    /// trigger a reward claim (a zero-reward `_claim` returns before its inline
+    /// admission). Reverts `ShardingTableIsFull` if the table is still full (so
+    /// the caller learns), or `NodeAlreadyInShardingTable` / `NodeBelowMinimumStake`
+    /// if the node is not eligible.
+    function admitNode(uint72 identityId) external {
+        if (shardingTableStorage.nodeExists(identityId)) {
+            revert NodeAlreadyInShardingTable(identityId);
+        }
+        if (convictionStorage.getNodeStakeV10(identityId) < uint256(parametersStorage.minimumStake())) {
+            revert NodeBelowMinimumStake(identityId);
+        }
+        shardingTable.insertNode(identityId);
+        ask.recalculateActiveSet();
+    }
+
     function _claim(uint256 tokenId) internal {
         ConvictionStakingStorage.Position memory pos = convictionStorage.getPosition(tokenId);
         if (pos.identityId == 0) revert PositionNotFound();
@@ -848,7 +920,7 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
                 !shardingTableStorage.nodeExists(identityId) &&
                 newNodeStake >= uint256(parametersStorage.minimumStake())
             ) {
-                shardingTable.insertNode(identityId);
+                _tryAdmitNode(identityId);
             }
         }
         ask.recalculateActiveSet();
@@ -1021,7 +1093,7 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
             !shardingTableStorage.nodeExists(targetNode) &&
             cs.getNodeStakeV10(targetNode) >= uint256(parametersStorage.minimumStake())
         ) {
-            shardingTable.insertNode(targetNode);
+            _tryAdmitNode(targetNode);
         }
         ask.recalculateActiveSet();
     }

@@ -741,6 +741,11 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
         try shardingTable.insertNode(identityId) {
             // admitted
         } catch {
+            // insertNode reverted (full table) so its state is rolled back; the
+            // call target is the trusted Hub-registered ShardingTable, so emitting
+            // after it is safe — no reentrancy surface on the revert path (slither
+            // reentrancy-events false positive).
+            // slither-disable-next-line reentrancy-events
             emit NodeAdmissionDeferred(identityId, convictionStorage.getNodeStakeV10(identityId));
         }
     }

@@ -272,6 +272,7 @@ import {
   getCurrentCliVersion,
   type NpmVersionStatus,
   checkForNpmVersionUpdate,
+  deriveUpdateCheckState,
   type UpdateStatus,
   acquireUpdateLock,
   releaseUpdateLock,
@@ -1886,19 +1887,33 @@ export async function runDaemonInner(
 
   if (standalone) {
     const checkIntervalMs = (au?.checkIntervalMinutes ?? 30) * 60_000;
-    const allowPre = au?.allowPrerelease ?? true;
+    // Even in version-check-only mode (au is null because auto-apply is
+    // disabled) the policy used for the check must reflect the operator's
+    // shipped intent, and must mirror resolveAutoUpdateConfig's precedence:
+    // local config BEFORE network default. A disabled node with a local
+    // channel / allowPrerelease pin must observe its own cohort, not the
+    // network's.
+    const allowPre = au?.allowPrerelease ?? config.autoUpdate?.allowPrerelease ?? network?.autoUpdate?.allowPrerelease ?? true;
+    const channel = au?.channel ?? config.autoUpdate?.channel ?? network?.autoUpdate?.channel;
 
     log(
-      `Auto-update (npm): ${au ? "enabled" : "disabled — version check only"} (every ${au?.checkIntervalMinutes ?? 30}min)`,
+      `Auto-update (npm): ${au ? "enabled" : "disabled — version check only"}${channel ? ` channel="${channel}"` : ""} (every ${au?.checkIntervalMinutes ?? 30}min)`,
     );
 
     const runCheck = async () => {
-      const npmStatus = await checkForNpmVersionUpdate(log, allowPre);
-      if (npmStatus.status !== "error") {
-        daemonState.lastUpdateCheck.upToDate = npmStatus.status === "up-to-date";
+      const npmStatus = await checkForNpmVersionUpdate(log, allowPre, channel);
+      const derived = deriveUpdateCheckState(npmStatus);
+      if (derived) {
         daemonState.lastUpdateCheck.checkedAt = Date.now();
-        if (npmStatus.version)
-          daemonState.lastUpdateCheck.latestVersion = npmStatus.version;
+        daemonState.lastUpdateCheck.upToDate = derived.upToDate;
+        daemonState.lastUpdateCheck.channelTargetMissing = derived.channelTargetMissing;
+        // Always write (including '') so a prior "available" version does not
+        // linger after the target disappears or the node catches up.
+        daemonState.lastUpdateCheck.latestVersion = derived.latestVersion;
+        if (npmStatus.status === "no-target")
+          log(
+            `Auto-update (npm): WARNING — channel "${npmStatus.channel}" has no acceptable target (tag missing or rejected by allowPrerelease); node will not update until it is published.`,
+          );
       }
       if (npmStatus.status !== "available" || !npmStatus.version) return;
       if (!au) return; // version check only — no auto-apply when polling disabled

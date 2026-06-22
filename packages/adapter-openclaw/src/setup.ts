@@ -396,6 +396,10 @@ function pruneNetworkPinnedDefaults(
   if (existing.autoUpdate && typeof existing.autoUpdate === 'object' && network.autoUpdate) {
     for (const key of Object.keys(existing.autoUpdate)) {
       if (key === 'enabled') continue;
+      // Never strip an explicit `channel` pin, even when it equals the current
+      // network default — it's a deliberate cohort lock whose whole point is to
+      // survive a later change to that default.
+      if (key === 'channel') continue;
       if (existing.autoUpdate[key] === (network.autoUpdate as any)[key]) {
         delete existing.autoUpdate[key];
       }

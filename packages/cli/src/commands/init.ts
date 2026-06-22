@@ -104,6 +104,69 @@ import {
   runForegroundSupervisor,
 } from '../cli-supervisor.js';
 
+/**
+ * Pure builder for the `autoUpdate` block `dkg init` persists. Extracted from
+ * the interactive wizard so it is unit-testable — the decline path (must write
+ * `{ enabled: false }`, NOT fall through to the enabled network default) and
+ * channel/advanced-field preservation across reruns have each regressed before.
+ * The wizard gathers `answers` interactively and passes them in.
+ */
+export function buildInitAutoUpdate(opts: {
+  enableAutoUpdate: boolean;
+  existingAutoUpdate: AutoUpdateConfig | undefined;
+  networkAutoUpdate?: {
+    repo?: string;
+    branch?: string;
+    allowPrerelease?: boolean;
+    sshKeyPath?: string;
+    checkIntervalMinutes?: number;
+  };
+  projRepo: string;
+  projDefaultBranch: string;
+  answers?: {
+    repo: string;
+    branch: string;
+    allowPrerelease: boolean;
+    sshKeyPath: string;
+    interval: number;
+  };
+}): AutoUpdateConfig {
+  const { enableAutoUpdate, existingAutoUpdate, networkAutoUpdate, projRepo, projDefaultBranch, answers } = opts;
+  if (!enableAutoUpdate) {
+    // Explicit decline: persist `enabled: false` so resolveAutoUpdateConfig
+    // does NOT fall through to the enabled network default. Keep any existing
+    // advanced fields (channel, etc.) — the operator only toggled auto-apply.
+    return existingAutoUpdate
+      ? { ...existingAutoUpdate, enabled: false }
+      : { enabled: false };
+  }
+  const a = answers ?? { repo: '', branch: '', allowPrerelease: true, sshKeyPath: '', interval: NaN };
+  // Effective upstream defaults — what the node would use with nothing
+  // persisted. We persist a field only when it differs, so future changes to
+  // the shipped network/project config propagate without a config rewrite.
+  const effectiveRepo = networkAutoUpdate?.repo ?? projRepo;
+  const effectiveBranch = networkAutoUpdate?.branch ?? projDefaultBranch;
+  const effectiveAllowPrerelease = networkAutoUpdate?.allowPrerelease ?? true;
+  const effectiveSshKeyPath = networkAutoUpdate?.sshKeyPath ?? '';
+  const effectiveInterval = networkAutoUpdate?.checkIntervalMinutes ?? 30;
+  return {
+    enabled: true,
+    // OT-RFC-41 Bundle B1d: explicit npm source for fresh installs.
+    source: 'npm' as const,
+    ...(a.repo && a.repo !== effectiveRepo ? { repo: a.repo } : {}),
+    ...(a.branch && a.branch !== effectiveBranch ? { branch: a.branch } : {}),
+    ...(a.allowPrerelease !== effectiveAllowPrerelease ? { allowPrerelease: a.allowPrerelease } : {}),
+    ...(a.sshKeyPath && a.sshKeyPath !== effectiveSshKeyPath ? { sshKeyPath: a.sshKeyPath } : {}),
+    ...(Number.isFinite(a.interval) && a.interval !== effectiveInterval ? { checkIntervalMinutes: a.interval } : {}),
+    // Preserve advanced fields the wizard does not prompt for so a rerun
+    // doesn't silently revert operator tuning: build timeouts, custom SSH
+    // command, and the per-node `channel` cohort pin.
+    ...(existingAutoUpdate?.buildTimeoutMs ? { buildTimeoutMs: existingAutoUpdate.buildTimeoutMs } : {}),
+    ...(existingAutoUpdate?.sshCommand ? { sshCommand: existingAutoUpdate.sshCommand } : {}),
+    ...(existingAutoUpdate?.channel ? { channel: existingAutoUpdate.channel } : {}),
+  } as AutoUpdateConfig;
+}
+
 export function registerInitCommand(program: Command): void {
 // ─── dkg init ────────────────────────────────────────────────────────
 
@@ -281,21 +344,19 @@ program
       autoUpdateDefault ? 'y' : 'n',
     )).toLowerCase() === 'y';
 
-    let autoUpdate = existing.autoUpdate;
+    const proj = loadProjectConfig();
+    // Gather answers interactively only when enabling; the pure
+    // `buildInitAutoUpdate` (above) does the persist decision for both paths so
+    // it is unit-tested. Prompt defaults show existing value, else the upstream
+    // (network → project) default.
+    let autoUpdateAnswers:
+      | { repo: string; branch: string; allowPrerelease: boolean; sshKeyPath: string; interval: number }
+      | undefined;
     if (enableAutoUpdate) {
-      // Effective upstream defaults — what the node would use if nothing were
-      // persisted in ~/.dkg/config.json. Network config beats project.json.
-      // We persist a field only when it differs from the upstream default, so
-      // future changes to the shipped network or project config propagate on
-      // the next daemon run without requiring a config rewrite. Without this
-      // guard, every accepted-default ends up pinned in the custom config
-      // forever.
-      const proj = loadProjectConfig();
       const effectiveRepo = network?.autoUpdate?.repo ?? proj.repo;
       const effectiveBranch = network?.autoUpdate?.branch ?? proj.defaultBranch;
       const effectiveAllowPrerelease = network?.autoUpdate?.allowPrerelease ?? true;
       const effectiveSshKeyPath = network?.autoUpdate?.sshKeyPath ?? '';
-      // Keep this in sync with `resolveAutoUpdateConfig` in config.ts.
       const effectiveInterval = network?.autoUpdate?.checkIntervalMinutes ?? 30;
 
       const defaultRepo = existing.autoUpdate?.repo ?? effectiveRepo;
@@ -313,28 +374,16 @@ program
       const sshKeyPath = (await ask('SSH private key path (optional; blank uses agent/default SSH config)', defaultSshKeyPath)).trim();
       const interval = parseInt(await ask('Check interval (minutes)', String(defaultInterval)), 10);
 
-      autoUpdate = {
-        enabled: true,
-        // OT-RFC-41 Bundle B1d: explicit source. Under rc.12+, fresh
-        // installs always use the npm path (Edge: install -g; Core:
-        // slot install). The legacy 'auto'/'git' values still parse
-        // (rc.11 nodes carrying them upgrade-in-place) but the
-        // daemon dispatches them as 'npm' under §5 PR 5.
-        source: 'npm' as const,
-        ...(repo && repo !== effectiveRepo ? { repo } : {}),
-        ...(branch && branch !== effectiveBranch ? { branch } : {}),
-        ...(allowPrerelease !== effectiveAllowPrerelease ? { allowPrerelease } : {}),
-        ...(sshKeyPath && sshKeyPath !== effectiveSshKeyPath ? { sshKeyPath } : {}),
-        ...(Number.isFinite(interval) && interval !== effectiveInterval ? { checkIntervalMinutes: interval } : {}),
-        // Preserve advanced fields the wizard does not prompt for so a
-        // rerun of `dkg init` doesn't silently revert operator tuning:
-        //  - `buildTimeoutMs`: per-step overrides for slow ARM64 hosts
-        //  - `sshCommand`: custom GIT_SSH_COMMAND (jump hosts, non-default
-        //    port, custom IdentityFile, etc.)
-        ...(existing.autoUpdate?.buildTimeoutMs ? { buildTimeoutMs: existing.autoUpdate.buildTimeoutMs } : {}),
-        ...(existing.autoUpdate?.sshCommand ? { sshCommand: existing.autoUpdate.sshCommand } : {}),
-      } as AutoUpdateConfig;
+      autoUpdateAnswers = { repo, branch, allowPrerelease, sshKeyPath, interval };
     }
+    const autoUpdate = buildInitAutoUpdate({
+      enableAutoUpdate,
+      existingAutoUpdate: existing.autoUpdate,
+      networkAutoUpdate: network?.autoUpdate,
+      projRepo: proj.repo,
+      projDefaultBranch: proj.defaultBranch,
+      answers: autoUpdateAnswers,
+    });
 
     // Chain configuration. Field-merge: existing config wins per-field over
     // network defaults so an operator who's only customised RPC keeps that
@@ -378,7 +427,12 @@ program
       apiPort,
       nodeRole,
       contextGraphs,
-      autoUpdate: enableAutoUpdate ? autoUpdate : existing.autoUpdate,
+      // `autoUpdate` already holds the correct value for BOTH branches: the
+      // fully-built block when enabled, or `{ enabled: false }` (preserving
+      // existing advanced fields) when declined. The old ternary here re-read
+      // `existing.autoUpdate` on decline, silently discarding the persisted
+      // disable — so a fresh-config operator who said "no" still auto-updated.
+      autoUpdate,
       chain: chainSection ?? existing.chain,
       auth: { enabled: enableAuth, tokens: existing.auth?.tokens },
       // Persist the chosen backend. `storeBlock === null` from the

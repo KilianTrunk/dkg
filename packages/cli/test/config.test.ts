@@ -161,11 +161,15 @@ describe('loadNetworkConfig', () => {
       ],
       defaultContextGraphs: [],
       defaultNodeRole: 'edge',
+      // Mainnet tracks a dedicated `mainnet` dist-tag channel (stable-only),
+      // NOT `latest` — so no node ever follows whatever `latest` points at.
       autoUpdate: {
         enabled: true,
         repo: 'OriginTrail/dkg',
         branch: 'main',
         checkIntervalMinutes: 5,
+        channel: 'mainnet',
+        allowPrerelease: false,
       },
     };
     _resetNetworkConfigCache();

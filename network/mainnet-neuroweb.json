@@ -23,6 +23,8 @@
     "enabled": true,
     "repo": "OriginTrail/dkg",
     "branch": "main",
-    "checkIntervalMinutes": 5
+    "checkIntervalMinutes": 5,
+    "channel": "mainnet",
+    "allowPrerelease": false
   }
 }

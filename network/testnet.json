@@ -15,7 +15,8 @@
     "enabled": true,
     "repo": "OriginTrail/dkg",
     "branch": "main",
-    "checkIntervalMinutes": 5
+    "checkIntervalMinutes": 5,
+    "channel": "testnet"
   },
   "chainResetMarker": "v10-rc12-ka-rename-2026-06-01",
   "chain": {

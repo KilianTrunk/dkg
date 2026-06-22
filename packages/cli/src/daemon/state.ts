@@ -38,6 +38,10 @@ export const daemonState: {
     checkedAt: number;
     latestCommit: string;
     latestVersion: string;
+    /** True when a pinned auto-update channel has no acceptable target
+     *  (tag missing / prerelease rejected / non-semver). Distinct from
+     *  `upToDate` so `/api/status` can show a misconfigured channel. */
+    channelTargetMissing: boolean;
   };
   /** Memoised result of `isStandaloneInstall()` — null = not yet checked. */
   standaloneCache: boolean | null;
@@ -80,6 +84,7 @@ export const daemonState: {
     checkedAt: 0,
     latestCommit: '',
     latestVersion: '',
+    channelTargetMissing: false,
   },
   standaloneCache: null,
   natStatus: 'unknown',

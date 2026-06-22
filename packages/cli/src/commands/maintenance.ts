@@ -129,11 +129,15 @@ program
     const au = resolveAutoUpdateConfig(config, net) ?? (() => {
       const proj = loadProjectConfig();
       return {
+        // Mirror resolveAutoUpdateConfig precedence for the fields a manual
+        // `dkg update` depends on — auto-apply being disabled must NOT drop the
+        // operator's stable-only (allowPrerelease) intent or channel pin.
         enabled: true,
         repo: proj.repo,
         branch: proj.defaultBranch,
-        allowPrerelease: true,
+        allowPrerelease: config.autoUpdate?.allowPrerelease ?? net?.autoUpdate?.allowPrerelease ?? true,
         checkIntervalMinutes: 30,
+        channel: config.autoUpdate?.channel ?? net?.autoUpdate?.channel,
         source: undefined as 'auto' | 'npm' | 'git' | undefined,
       };
     })();
@@ -149,9 +153,11 @@ program
 
       if (opts.check) {
         console.log('Checking NPM registry for updates...');
-        const check = await checkForNpmVersionUpdate(logFn, allowPre);
+        const check = await checkForNpmVersionUpdate(logFn, allowPre, au.channel);
         if (check.status === 'available' && check.version) {
           console.log(`Update available: ${check.version}`);
+        } else if (check.status === 'no-target') {
+          console.log(`No acceptable target for channel "${check.channel}" (tag unpublished, or a pre-release rejected by allowPrerelease=false) — nothing to update to.`);
         } else if (check.status === 'up-to-date') {
           console.log('No updates available.');
         } else {
@@ -193,9 +199,12 @@ program
       }
       if (!version) {
         console.log('Checking NPM registry for updates...');
-        const check = await checkForNpmVersionUpdate(logFn, allowPre);
+        const check = await checkForNpmVersionUpdate(logFn, allowPre, au.channel);
         if (check.status === 'available' && check.version) {
           version = check.version;
+        } else if (check.status === 'no-target') {
+          console.log(`No acceptable target for channel "${check.channel}" (tag unpublished, or a pre-release rejected by allowPrerelease=false) — nothing to update to.`);
+          return;
         } else if (check.status === 'up-to-date') {
           console.log('No update needed — already on latest.');
           return;

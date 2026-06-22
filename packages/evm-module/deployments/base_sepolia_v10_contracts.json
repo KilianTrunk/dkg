@@ -262,12 +262,12 @@
             "deployed": true
         },
         "StakingV10": {
-            "evmAddress": "0x583818aACBcCAb8D19ba2A7bC035Eff33F7deD44",
-            "version": "10.0.3",
+            "evmAddress": "0x9bE42B00263383Ae659c3b43f2f0460579aCCeeC",
+            "version": "10.0.4",
             "gitBranch": "main",
-            "gitCommitHash": "a23407de7801c6a7b85203c9cdc147b3402c2ca9",
-            "deploymentBlock": 43146009,
-            "deploymentTimestamp": 1782060308649,
+            "gitCommitHash": "2513b3463df4bdb604dde93a8d95a30bb89ee049",
+            "deploymentBlock": 43181497,
+            "deploymentTimestamp": 1782131284827,
             "deployed": true
         },
         "DKGStakingConvictionNFT": {

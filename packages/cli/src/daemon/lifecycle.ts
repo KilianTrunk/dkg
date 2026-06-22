@@ -1889,11 +1889,12 @@ export async function runDaemonInner(
     const checkIntervalMs = (au?.checkIntervalMinutes ?? 30) * 60_000;
     // Even in version-check-only mode (au is null because auto-apply is
     // disabled) the policy used for the check must reflect the operator's
-    // shipped intent — read allowPrerelease + channel from config/network
-    // rather than hardcoding `true`/none, or a disabled-but-checking node
-    // silently ignores its `allowPrerelease:false` / channel pin.
-    const allowPre = au?.allowPrerelease ?? network?.autoUpdate?.allowPrerelease ?? config.autoUpdate?.allowPrerelease ?? true;
-    const channel = au?.channel ?? network?.autoUpdate?.channel ?? config.autoUpdate?.channel;
+    // shipped intent, and must mirror resolveAutoUpdateConfig's precedence:
+    // local config BEFORE network default. A disabled node with a local
+    // channel / allowPrerelease pin must observe its own cohort, not the
+    // network's.
+    const allowPre = au?.allowPrerelease ?? config.autoUpdate?.allowPrerelease ?? network?.autoUpdate?.allowPrerelease ?? true;
+    const channel = au?.channel ?? config.autoUpdate?.channel ?? network?.autoUpdate?.channel;
 
     log(
       `Auto-update (npm): ${au ? "enabled" : "disabled — version check only"}${channel ? ` channel="${channel}"` : ""} (every ${au?.checkIntervalMinutes ?? 30}min)`,
@@ -1906,8 +1907,9 @@ export async function runDaemonInner(
         daemonState.lastUpdateCheck.checkedAt = Date.now();
         daemonState.lastUpdateCheck.upToDate = derived.upToDate;
         daemonState.lastUpdateCheck.channelTargetMissing = derived.channelTargetMissing;
-        if (derived.version)
-          daemonState.lastUpdateCheck.latestVersion = derived.version;
+        // Always write (including '') so a prior "available" version does not
+        // linger after the target disappears or the node catches up.
+        daemonState.lastUpdateCheck.latestVersion = derived.latestVersion;
         if (npmStatus.status === "no-target")
           log(
             `Auto-update (npm): WARNING — channel "${npmStatus.channel}" has no acceptable target (tag missing or rejected by allowPrerelease); node will not update until it is published.`,

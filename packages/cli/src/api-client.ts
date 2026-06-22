@@ -167,6 +167,14 @@ export interface DaemonStatusResponse {
     max: number;
     rejectedTotal: number;
   };
+  // Auto-update status (surfaced by /api/status). Optional — daemons may omit.
+  // `updateAvailable` is null until the first check completes;
+  // `updateChannelTargetMissing` is true when a pinned auto-update channel has
+  // no acceptable target (tag unpublished / prerelease rejected / non-semver).
+  updateAvailable?: boolean | null;
+  updateChannelTargetMissing?: boolean;
+  latestVersion?: string | null;
+  latestCommit?: string | null;
 }
 
 export interface ApiClientConnectOptions {

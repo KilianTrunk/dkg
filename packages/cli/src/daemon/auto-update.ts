@@ -294,14 +294,25 @@ export type NpmVersionResult =
   | { version: null; error: true }
   | { version: null; error: false };
 
+// Official semver.org grammar (anchored). Rejects malformed values that a
+// loose shape check would accept (e.g. `10.0.0-alpha..1` — empty prerelease
+// identifier) before they reach `compareSemver` (a non-numeric part makes it
+// return NaN, which is not `<= 0` and would slip the forward-only gate).
+const SEMVER_RE =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/;
+
+/** True when `v` is a valid semver string. */
+export function isValidSemver(v: string): boolean {
+  return SEMVER_RE.test(v.trim());
+}
+
 /**
- * Minimal semver-shape guard: MAJOR.MINOR.PATCH with optional -prerelease/+build.
- * Used to reject malformed dist-tag values before they reach `compareSemver`
- * (a non-numeric part makes `compareSemver` return NaN, which is not `<= 0` and
- * would slip the forward-only gate, attempting an "update" to garbage).
+ * True when `v` carries a prerelease component (the `-…` segment) — build
+ * metadata (`+…`) is NOT a prerelease, so `1.0.0+mainnet-build.1` is stable
+ * even though it contains a hyphen. Used for the `allowPrerelease` gate.
  */
-export function isLikelySemver(v: string): boolean {
-  return /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(v.trim());
+export function isPrerelease(v: string): boolean {
+  return v.trim().split("+")[0].includes("-");
 }
 
 export async function resolveLatestNpmVersion(
@@ -337,13 +348,13 @@ export async function resolveLatestNpmVersion(
         );
         return { version: null, error: false };
       }
-      if (!isLikelySemver(pinned)) {
+      if (!isValidSemver(pinned)) {
         log(
           `Auto-update (npm): channel "${channel}" → "${pinned}" is not a valid semver, skipping`,
         );
         return { version: null, error: false };
       }
-      if (!allowPrerelease && pinned.includes("-")) {
+      if (!allowPrerelease && isPrerelease(pinned)) {
         log(
           `Auto-update (npm): channel "${channel}" points at a pre-release and allowPrerelease=false, skipping`,
         );
@@ -354,7 +365,7 @@ export async function resolveLatestNpmVersion(
 
     const stable = tags.latest ?? null;
     if (!allowPrerelease) {
-      if (stable && !stable.includes("-")) return { version: stable };
+      if (stable && !isPrerelease(stable)) return { version: stable };
       log(
         "Auto-update (npm): latest dist-tag is a pre-release and allowPrerelease=false, skipping",
       );
@@ -446,7 +457,7 @@ export async function checkForNpmVersionUpdate(
   // (compareSemver would return NaN, which is not <= 0). The channel path
   // already guards this upstream; this also covers the default tag set
   // without changing its candidate selection.
-  if (!isLikelySemver(result.version)) {
+  if (!isValidSemver(result.version)) {
     log(
       `Auto-update (npm): resolved version "${result.version}" is not valid semver, skipping`,
     );
@@ -470,14 +481,17 @@ export async function checkForNpmVersionUpdate(
  */
 export function deriveUpdateCheckState(
   npmStatus: NpmVersionStatus,
-): { upToDate: boolean; channelTargetMissing: boolean; version?: string } | null {
+): { upToDate: boolean; channelTargetMissing: boolean; latestVersion: string } | null {
   if (npmStatus.status === "error") return null;
   if (npmStatus.status === "no-target")
-    return { upToDate: true, channelTargetMissing: true };
+    return { upToDate: true, channelTargetMissing: true, latestVersion: "" };
   return {
     upToDate: npmStatus.status === "up-to-date",
     channelTargetMissing: false,
-    ...(npmStatus.version ? { version: npmStatus.version } : {}),
+    // Only an "available" result has a newer version to report; clear it on
+    // up-to-date / no-target so `/api/status` never shows a stale latestVersion.
+    latestVersion:
+      npmStatus.status === "available" ? npmStatus.version ?? "" : "",
   };
 }
 

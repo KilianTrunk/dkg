@@ -1141,6 +1141,22 @@ describe('checkForNpmVersionUpdate tag precedence', () => {
     expect(result.status).toBe('no-target');
   });
 
+  it('channel pin rejects a semver-LIKE-but-invalid tag (empty prerelease identifier)', async () => {
+    const { checkForNpmVersionUpdate } = await import('../src/daemon.js');
+    fetchImpl = async () => makeRegistryResponse({ testnet: '10.0.0-alpha..1' });
+    const result = await checkForNpmVersionUpdate(() => {}, true, 'testnet');
+    expect(result.status).toBe('no-target');
+  });
+
+  it('allowPrerelease=false accepts a STABLE version with hyphenated build metadata', async () => {
+    const { checkForNpmVersionUpdate } = await import('../src/daemon.js');
+    // The hyphen is in +build metadata, not a prerelease — must NOT be rejected.
+    fetchImpl = async () => makeRegistryResponse({ mainnet: '10.0.0+mainnet-build.1' });
+    const result = await checkForNpmVersionUpdate(() => {}, false, 'mainnet');
+    expect(result.status).toBe('available');
+    expect(result.version).toBe('10.0.0+mainnet-build.1');
+  });
+
   it('channel pin follows a stable tag under allowPrerelease=false', async () => {
     const { checkForNpmVersionUpdate } = await import('../src/daemon.js');
     fetchImpl = async () => makeRegistryResponse({
@@ -1161,22 +1177,22 @@ describe('checkForNpmVersionUpdate tag precedence', () => {
 });
 
 describe('deriveUpdateCheckState (runCheck → /api/status mapping)', () => {
-  it('no-target → upToDate:true + channelTargetMissing:true (updateAvailable stays false)', async () => {
+  it('no-target → upToDate:true + channelTargetMissing:true + cleared latestVersion (updateAvailable stays false)', async () => {
     const { deriveUpdateCheckState } = await import('../src/daemon.js');
     expect(deriveUpdateCheckState({ status: 'no-target', channel: 'mainnet' }))
-      .toEqual({ upToDate: true, channelTargetMissing: true });
+      .toEqual({ upToDate: true, channelTargetMissing: true, latestVersion: '' });
   });
 
-  it('available → upToDate:false + clears channelTargetMissing + carries version', async () => {
+  it('available → upToDate:false + clears channelTargetMissing + carries latestVersion', async () => {
     const { deriveUpdateCheckState } = await import('../src/daemon.js');
     expect(deriveUpdateCheckState({ status: 'available', version: '10.1.0' }))
-      .toEqual({ upToDate: false, channelTargetMissing: false, version: '10.1.0' });
+      .toEqual({ upToDate: false, channelTargetMissing: false, latestVersion: '10.1.0' });
   });
 
-  it('up-to-date → upToDate:true + clears channelTargetMissing', async () => {
+  it('up-to-date → upToDate:true, clears channelTargetMissing AND clears stale latestVersion', async () => {
     const { deriveUpdateCheckState } = await import('../src/daemon.js');
-    expect(deriveUpdateCheckState({ status: 'up-to-date' }))
-      .toEqual({ upToDate: true, channelTargetMissing: false });
+    expect(deriveUpdateCheckState({ status: 'up-to-date', version: 'should-be-ignored' }))
+      .toEqual({ upToDate: true, channelTargetMissing: false, latestVersion: '' });
   });
 
   it('error → null (caller leaves prior state untouched)', async () => {

@@ -331,8 +331,12 @@ program
         //  - `buildTimeoutMs`: per-step overrides for slow ARM64 hosts
         //  - `sshCommand`: custom GIT_SSH_COMMAND (jump hosts, non-default
         //    port, custom IdentityFile, etc.)
+        //  - `channel`: per-node npm dist-tag pin (e.g. a "staging"/"qa"
+        //    cohort) overriding the network default — must survive a rerun
+        //    or the per-node channel guarantee silently breaks.
         ...(existing.autoUpdate?.buildTimeoutMs ? { buildTimeoutMs: existing.autoUpdate.buildTimeoutMs } : {}),
         ...(existing.autoUpdate?.sshCommand ? { sshCommand: existing.autoUpdate.sshCommand } : {}),
+        ...(existing.autoUpdate?.channel ? { channel: existing.autoUpdate.channel } : {}),
       } as AutoUpdateConfig;
     }
 

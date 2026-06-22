@@ -270,4 +270,133 @@ describe('@unit StakingV10 full-table admission (#1286)', () => {
     await expect(tx).to.not.emit(StakingV10Contract, 'NodeAdmissionDeferred');
     expect(await ShardingTableStorage.nodeExists(freshId)).to.equal(true);
   });
+
+  // -------------------------------------------------------------------------
+  // #1286 PR review — the permissionless `admitNode(identityId)` recovery.
+  //
+  // A node deferred while OUT of the ring earns no reward, so a later
+  // zero-reward `_claim` returns before its inline admission and will NOT
+  // re-admit it. Neither stake nor claim is therefore guaranteed to recover a
+  // deferred-but-eligible node once a slot frees. `admitNode` is the
+  // permissionless maintenance entrypoint that recovers it directly:
+  //
+  //   function admitNode(uint72 identityId) external {
+  //       if (shardingTableStorage.nodeExists(identityId))      revert NodeAlreadyInShardingTable;
+  //       if (getNodeStakeV10(identityId) < minimumStake)       revert NodeBelowMinimumStake;
+  //       shardingTable.insertNode(identityId);  // propagates ShardingTableIsFull
+  //       ask.recalculateActiveSet();
+  //   }
+  //
+  // `admitNode` emits no StakingV10 success event (NodeAdmissionDeferred lives
+  // only in `_tryAdmitNode`), so success is asserted via nodeExists/nodesCount.
+  // -------------------------------------------------------------------------
+  describe('admitNode (#1286 review)', () => {
+    // Shared setup for the recovery/full cases: fill an N-slot table, then
+    // defer a fresh eligible node by createConviction crossing minStake on the
+    // full table. Returns the freshId, the staker, and the filler ids (for the
+    // caller to free a slot via removeNode). No stake/claim happens after this.
+    const fillAndDefer = async (
+      N: number,
+    ): Promise<{ freshId: number; staker: SignerWithAddress; fillerIds: number[]; minStake: bigint }> => {
+      await ParametersStorage.setShardingTableSizeLimit(N);
+      const fillerIds = await fillTable(N);
+
+      const staker = accounts[10];
+      const freshId = await createProfile(staker, accounts[11]);
+      const minStake = await ParametersStorage.minimumStake();
+      await mintAndApprove(staker, minStake);
+
+      await expect(NFT.connect(staker).createConviction(freshId, minStake, 12))
+        .to.emit(StakingV10Contract, 'NodeAdmissionDeferred')
+        .withArgs(freshId, minStake);
+
+      // Deferred: eligible (stake == minStake) but OUT of the ring.
+      expect(await ShardingTableStorage.nodeExists(freshId)).to.equal(false);
+      expect(await ConvictionStakingStorageContract.getNodeStakeV10(freshId)).to.equal(minStake);
+
+      return { freshId, staker, fillerIds, minStake };
+    };
+
+    it('(a) RECOVERY: free a slot → admitNode admits the deferred node (no stake/claim needed)', async () => {
+      const N = 2;
+      const { freshId, fillerIds } = await fillAndDefer(N);
+
+      // Free exactly one slot — table goes from full (N) to N-1.
+      await ShardingTableContract['removeNode(uint72)'](fillerIds[0]);
+      expect(await ShardingTableStorage.nodesCount()).to.equal(N - 1);
+
+      // KEY FIX: recover via admitNode alone — no createConviction / claim /
+      // withdraw in between. This is the path stake+claim cannot reach (a
+      // zero-reward _claim returns before its inline admission).
+      await StakingV10Contract.admitNode(freshId);
+
+      expect(await ShardingTableStorage.nodeExists(freshId)).to.equal(true);
+      expect(await ShardingTableStorage.nodesCount()).to.equal(N);
+    });
+
+    it('(b) STILL FULL: admitNode reverts ShardingTableIsFull', async () => {
+      const N = 2;
+      const { freshId } = await fillAndDefer(N);
+
+      // No slot freed — the table is still full. admitNode calls insertNode
+      // directly (no try/catch), so ShardingTableIsFull propagates uncaught.
+      await expect(StakingV10Contract.admitNode(freshId))
+        .to.be.revertedWithCustomError(ShardingTableContract, 'ShardingTableIsFull')
+        .withArgs(N, N);
+
+      expect(await ShardingTableStorage.nodeExists(freshId)).to.equal(false);
+    });
+
+    it('(c) BELOW MIN: admitNode reverts NodeBelowMinimumStake', async () => {
+      const N = 5; // table has room — fullness is NOT the gate under test here
+      await ParametersStorage.setShardingTableSizeLimit(N);
+
+      // Fresh profile that has NEVER staked: stake 0 (< minimumStake) and not in
+      // the ring. nodeExists is false, so admitNode falls through to the stake
+      // check and reverts NodeBelowMinimumStake.
+      const staker = accounts[10];
+      const belowId = await createProfile(staker, accounts[11]);
+      expect(await ShardingTableStorage.nodeExists(belowId)).to.equal(false);
+      expect(await ConvictionStakingStorageContract.getNodeStakeV10(belowId)).to.equal(0);
+      const minStake = await ParametersStorage.minimumStake();
+      expect(0n < minStake).to.equal(true);
+
+      await expect(StakingV10Contract.admitNode(belowId))
+        .to.be.revertedWithCustomError(StakingV10Contract, 'NodeBelowMinimumStake')
+        .withArgs(belowId);
+    });
+
+    it('(d) ALREADY IN RING: admitNode reverts NodeAlreadyInShardingTable', async () => {
+      const N = 5;
+      await ParametersStorage.setShardingTableSizeLimit(N);
+      const fillerIds = await fillTable(2);
+      const inRingId = fillerIds[0];
+
+      // The nodeExists check (admitNode line 786) short-circuits BEFORE the
+      // stake check (line 789): a filler is in the ring with stake 0, yet the
+      // revert is NodeAlreadyInShardingTable, not NodeBelowMinimumStake.
+      expect(await ShardingTableStorage.nodeExists(inRingId)).to.equal(true);
+
+      await expect(StakingV10Contract.admitNode(inRingId))
+        .to.be.revertedWithCustomError(StakingV10Contract, 'NodeAlreadyInShardingTable')
+        .withArgs(inRingId);
+    });
+
+    it('(e) PERMISSIONLESS: admitNode succeeds when called by an arbitrary non-owner signer', async () => {
+      const N = 2;
+      const { freshId, fillerIds } = await fillAndDefer(N);
+
+      await ShardingTableContract['removeNode(uint72)'](fillerIds[0]);
+
+      // accounts[0] is HubOwner; accounts[1..N] are filler operational keys;
+      // accounts[10]/[11] are the staker/operator. accounts[15] is none of
+      // these — an arbitrary signer with no privileged role. admitNode has no
+      // auth modifier, so this succeeding IS the permissionless proof.
+      const stranger = accounts[15];
+      await StakingV10Contract.connect(stranger).admitNode(freshId);
+
+      expect(await ShardingTableStorage.nodeExists(freshId)).to.equal(true);
+      expect(await ShardingTableStorage.nodesCount()).to.equal(N);
+    });
+  });
 });

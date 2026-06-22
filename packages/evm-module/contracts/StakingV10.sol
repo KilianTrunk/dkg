@@ -208,6 +208,8 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
     error PositionNotFound();
     error UnclaimedEpochs();
     error V8StakingStillLive();
+    error NodeAlreadyInShardingTable(uint72 identityId);
+    error NodeBelowMinimumStake(uint72 identityId);
 
     // ========================================================================
     // Constructor + initialize
@@ -737,17 +739,58 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
     /// correct incentive) and is re-attempted by the next stake/claim once a slot
     /// frees. Fixes #1286 (a full table previously blocked claim — and via
     /// `withdraw`'s auto-claim, raw-stake withdrawal too).
+    ///
+    /// NB: a node deferred while OUT of the ring earns no reward, so a later
+    /// zero-reward `_claim` returns before its inline admission and will NOT
+    /// re-admit it. `admitNode` below is the permissionless recovery for that.
     function _tryAdmitNode(uint72 identityId) internal {
         try shardingTable.insertNode(identityId) {
             // admitted
-        } catch {
-            // insertNode reverted (full table) so its state is rolled back; the
-            // call target is the trusted Hub-registered ShardingTable, so emitting
-            // after it is safe — no reentrancy surface on the revert path (slither
-            // reentrancy-events false positive).
-            // slither-disable-next-line reentrancy-events
-            emit NodeAdmissionDeferred(identityId, convictionStorage.getNodeStakeV10(identityId));
+        } catch (bytes memory reason) {
+            // Only a full table (ShardingTableIsFull) is an expected, benign
+            // deferral. Any other revert (a Hub-wiring / index-invariant / future
+            // check failure) is a real error we must NOT mask while the caller's
+            // staking state is already mutated — rethrow the original revert.
+            bytes4 selector;
+            if (reason.length >= 4) {
+                // solhint-disable-next-line no-inline-assembly
+                assembly {
+                    selector := mload(add(reason, 0x20))
+                }
+            }
+            if (selector == ShardingTable.ShardingTableIsFull.selector) {
+                // ShardingTable rolled back its own state on the full-table revert;
+                // it is a trusted Hub-registered contract, so emitting after the
+                // call is safe (slither reentrancy-events false positive).
+                // slither-disable-next-line reentrancy-events
+                emit NodeAdmissionDeferred(identityId, convictionStorage.getNodeStakeV10(identityId));
+            } else {
+                // solhint-disable-next-line no-inline-assembly
+                assembly {
+                    revert(add(reason, 0x20), mload(reason))
+                }
+            }
         }
+    }
+
+    /// @notice Permissionless maintenance: admit a node that is eligible for the
+    /// sharding table (V10 stake >= `minimumStake`) but not currently in it —
+    /// e.g. one whose opportunistic admission was deferred because the table was
+    /// full (`_tryAdmitNode` / #1286). Anyone may bring an eligible node into the
+    /// ring once a slot frees, without the node's staker needing to add stake or
+    /// trigger a reward claim (a zero-reward `_claim` returns before its inline
+    /// admission). Reverts `ShardingTableIsFull` if the table is still full (so
+    /// the caller learns), or `NodeAlreadyInShardingTable` / `NodeBelowMinimumStake`
+    /// if the node is not eligible.
+    function admitNode(uint72 identityId) external {
+        if (shardingTableStorage.nodeExists(identityId)) {
+            revert NodeAlreadyInShardingTable(identityId);
+        }
+        if (convictionStorage.getNodeStakeV10(identityId) < uint256(parametersStorage.minimumStake())) {
+            revert NodeBelowMinimumStake(identityId);
+        }
+        shardingTable.insertNode(identityId);
+        ask.recalculateActiveSet();
     }
 
     function _claim(uint256 tokenId) internal {

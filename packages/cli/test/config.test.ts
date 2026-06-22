@@ -181,6 +181,8 @@ describe('loadNetworkConfig', () => {
         chainId: 'base:8453',
         rpcUrl: 'https://mainnet.base.org',
         hubAddress: '0x99Aa571fD5e681c2D27ee08A7b7989DB02541d13',
+        // Relays populated + pre-deployment gate lifted (#1292).
+        pending: false,
       },
       {
         name: 'mainnet-gnosis',
@@ -191,6 +193,8 @@ describe('loadNetworkConfig', () => {
         chainId: 'gnosis:100',
         rpcUrl: 'https://rpc.gnosischain.com',
         hubAddress: '0x882D0BF07F956b1b94BBfe9E77F47c6fc7D4EC8f',
+        // Relays populated + pre-deployment gate lifted (#1292).
+        pending: false,
       },
       {
         name: 'mainnet-neuroweb',
@@ -201,6 +205,8 @@ describe('loadNetworkConfig', () => {
         chainId: 'neuroweb:2043',
         rpcUrl: 'https://astrosat-parachain-rpc.origin-trail.network',
         hubAddress: '0x0957e25BD33034948abc28204ddA54b6E1142D6F',
+        // Relays not provisioned yet — still pre-deployment gated.
+        pending: true,
       },
     ];
 
@@ -209,25 +215,16 @@ describe('loadNetworkConfig', () => {
       const config = await loadNetworkConfig(expected.name);
       expect(config).not.toBeNull();
       const cfg = config! as any;
-      expect(cfg._status).toMatch(/pre-deployment: replace PEER_ID_\* relay values before enabling/);
-      expect(cfg._status).not.toContain('PLACEHOLDER_MAINNET_NETWORK_ID');
+
+      // Invariants for every mainnet preset, gated or live: it must never
+      // inherit the testnet genesis/relays, and its identity + chain wiring
+      // must match the committed values.
       expect(cfg.networkId).not.toBe(testnetNetworkId);
       expect(cfg.relays).not.toEqual(testnetRelays);
-      expect({
-        genesisVersion: cfg.genesisVersion,
-        relays: cfg.relays,
-        defaultContextGraphs: cfg.defaultContextGraphs,
-        defaultNodeRole: cfg.defaultNodeRole,
-        autoUpdate: cfg.autoUpdate,
-      }).toEqual(sharedMainnetPrep);
       expect(cfg.networkName).toBe(expected.networkName);
       expect(cfg.genesisId).toBe(expected.genesisId);
       expect(cfg.networkId).toBe(expected.networkId);
       expect(await computeNetworkId(expected.genesisId)).toBe(expected.networkId);
-      for (const relay of cfg.relays) {
-        expect(relay).toMatch(/^\/ip4\/178\./);
-        expect(relay).toMatch(/\/p2p\/PEER_ID_/);
-      }
       expect(cfg.chain).toEqual({
         name: expected.chainName,
         type: 'evm',
@@ -235,6 +232,40 @@ describe('loadNetworkConfig', () => {
         rpcUrl: expected.rpcUrl,
         hubAddress: expected.hubAddress,
       });
+      // Non-relay prep fields are identical across all mainnets regardless of
+      // readiness (relays are asserted per-readiness below).
+      expect({
+        genesisVersion: cfg.genesisVersion,
+        defaultContextGraphs: cfg.defaultContextGraphs,
+        defaultNodeRole: cfg.defaultNodeRole,
+        autoUpdate: cfg.autoUpdate,
+      }).toEqual({
+        genesisVersion: sharedMainnetPrep.genesisVersion,
+        defaultContextGraphs: sharedMainnetPrep.defaultContextGraphs,
+        defaultNodeRole: sharedMainnetPrep.defaultNodeRole,
+        autoUpdate: sharedMainnetPrep.autoUpdate,
+      });
+
+      if (expected.pending) {
+        // Still pre-deployment: the readiness gate (config.ts) refuses these
+        // via the `_status` marker AND the placeholder relay PeerIDs.
+        expect(cfg._status).toMatch(/pre-deployment: replace PEER_ID_\* relay values before enabling/);
+        expect(cfg._status).not.toContain('PLACEHOLDER_MAINNET_NETWORK_ID');
+        expect(cfg.relays).toEqual(sharedMainnetPrep.relays);
+        for (const relay of cfg.relays) {
+          expect(relay).toMatch(/^\/ip4\/178\./);
+          expect(relay).toMatch(/\/p2p\/PEER_ID_/);
+        }
+      } else {
+        // Live: pre-deployment gate lifted — no `_status`, and every relay
+        // carries a real libp2p PeerID (no placeholder), so the node boots.
+        expect(cfg._status).toBeUndefined();
+        expect(cfg.relays.length).toBeGreaterThan(0);
+        for (const relay of cfg.relays) {
+          expect(relay).not.toContain('PEER_ID_');
+          expect(relay).toMatch(/^\/ip4\/\d+\.\d+\.\d+\.\d+\/tcp\/\d+\/p2p\/12D3KooW[1-9A-HJ-NP-Za-km-z]+$/);
+        }
+      }
     }
   });
 

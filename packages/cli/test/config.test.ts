@@ -161,8 +161,10 @@ describe('loadNetworkConfig', () => {
       ],
       defaultContextGraphs: [],
       defaultNodeRole: 'edge',
+      // Mainnet auto-update is held OFF until launch (Option Y): testnet keeps
+      // a living channel; mainnet stays frozen so no node chases `latest`.
       autoUpdate: {
-        enabled: true,
+        enabled: false,
         repo: 'OriginTrail/dkg',
         branch: 'main',
         checkIntervalMinutes: 5,

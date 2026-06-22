@@ -44,6 +44,19 @@ export interface AutoUpdateConfig {
   branch?: string;
   /** Allow auto-updating to pre-release versions (e.g. 9.0.5-rc.1). */
   allowPrerelease?: boolean;
+  /**
+   * npm dist-tag this node tracks for auto-updates. When set, the updater
+   * follows ONLY `dist-tags[channel]` (e.g. "testnet", "mainnet", "latest")
+   * instead of the default `max(latest, dev, beta, next)`. This decouples a
+   * cohort from whatever `latest` happens to point at — e.g. testnet nodes
+   * pinned to `channel: "testnet"` keep tracking testnet releases even after
+   * `latest` is repurposed for mainnet. Omit to keep the legacy behaviour.
+   *
+   * Forward-only: a node updates only when the channel's target is a HIGHER
+   * semver than its current version (same gate as the default path), so
+   * re-pointing a tag at a LOWER version is a no-op, not a downgrade.
+   */
+  channel?: string;
   /** Optional SSH private key path for git-based update fetches/clones. */
   sshKeyPath?: string;
   /** Optional raw GIT_SSH_COMMAND override for git-based update fetches/clones. */
@@ -114,6 +127,8 @@ export interface NetworkConfig {
     repo: string;
     branch: string;
     allowPrerelease?: boolean;
+    /** npm dist-tag this network's nodes track — see `AutoUpdateConfig.channel`. */
+    channel?: string;
     sshKeyPath?: string;
     sshCommand?: string;
     checkIntervalMinutes: number;
@@ -1005,6 +1020,7 @@ export function resolveAutoUpdateConfig(
   const sshCommand = cfg?.sshCommand ?? net?.sshCommand;
   const checkIntervalMinutes = cfg?.checkIntervalMinutes ?? net?.checkIntervalMinutes ?? 30;
   const source = cfg?.source ?? net?.source;
+  const channel = cfg?.channel ?? net?.channel;
 
   // Merge build timeouts per-key so operators can override one step (e.g.
   // `contracts` on slow ARM hosts) without re-specifying the rest.
@@ -1030,6 +1046,7 @@ export function resolveAutoUpdateConfig(
     checkIntervalMinutes,
     ...(buildTimeoutMs ? { buildTimeoutMs } : {}),
     ...(source ? { source } : {}),
+    ...(channel ? { channel } : {}),
   };
 }
 

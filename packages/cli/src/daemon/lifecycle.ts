@@ -1887,13 +1887,14 @@ export async function runDaemonInner(
   if (standalone) {
     const checkIntervalMs = (au?.checkIntervalMinutes ?? 30) * 60_000;
     const allowPre = au?.allowPrerelease ?? true;
+    const channel = au?.channel;
 
     log(
-      `Auto-update (npm): ${au ? "enabled" : "disabled — version check only"} (every ${au?.checkIntervalMinutes ?? 30}min)`,
+      `Auto-update (npm): ${au ? "enabled" : "disabled — version check only"}${channel ? ` channel="${channel}"` : ""} (every ${au?.checkIntervalMinutes ?? 30}min)`,
     );
 
     const runCheck = async () => {
-      const npmStatus = await checkForNpmVersionUpdate(log, allowPre);
+      const npmStatus = await checkForNpmVersionUpdate(log, allowPre, channel);
       if (npmStatus.status !== "error") {
         daemonState.lastUpdateCheck.upToDate = npmStatus.status === "up-to-date";
         daemonState.lastUpdateCheck.checkedAt = Date.now();

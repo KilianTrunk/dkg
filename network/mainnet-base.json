@@ -19,7 +19,7 @@
     "hubAddress": "0x99Aa571fD5e681c2D27ee08A7b7989DB02541d13"
   },
   "autoUpdate": {
-    "enabled": true,
+    "enabled": false,
     "repo": "OriginTrail/dkg",
     "branch": "main",
     "checkIntervalMinutes": 5

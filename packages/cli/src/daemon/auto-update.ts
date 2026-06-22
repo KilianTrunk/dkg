@@ -286,7 +286,8 @@ export async function writePendingUpdateState(
 /**
  * Query the NPM registry for the latest published version of the CLI package.
  * Uses `dist-tags.latest` by default; when `allowPrerelease` is true, also
- * checks `beta` / `next` tags and picks the highest semver.
+ * checks `beta` / `next` tags and picks the highest semver. When `channel`
+ * is set, follows ONLY that dist-tag instead (still honouring `allowPrerelease`).
  */
 export type NpmVersionResult =
   | { version: string; error?: false }
@@ -296,6 +297,7 @@ export type NpmVersionResult =
 export async function resolveLatestNpmVersion(
   log: (msg: string) => void,
   allowPrerelease = true,
+  channel?: string,
 ): Promise<NpmVersionResult> {
   const { fetch } = _autoUpdateIo;
   const url = `https://registry.npmjs.org/${CLI_NPM_PACKAGE}`;
@@ -313,6 +315,26 @@ export async function resolveLatestNpmVersion(
     const data = (await res.json()) as { "dist-tags"?: Record<string, string> };
     const tags = data["dist-tags"];
     if (!tags) return { version: null, error: true };
+
+    // Channel pin: follow ONLY this dist-tag (e.g. "testnet"), ignoring the
+    // default latest/dev/beta/next set. Lets a cohort track its own release
+    // line without being captured by whatever `latest` points at.
+    if (channel) {
+      const pinned = tags[channel] ?? null;
+      if (!pinned) {
+        log(
+          `Auto-update (npm): channel "${channel}" has no published version, skipping`,
+        );
+        return { version: null, error: false };
+      }
+      if (!allowPrerelease && pinned.includes("-")) {
+        log(
+          `Auto-update (npm): channel "${channel}" points at a pre-release and allowPrerelease=false, skipping`,
+        );
+        return { version: null, error: false };
+      }
+      return { version: pinned };
+    }
 
     const stable = tags.latest ?? null;
     if (!allowPrerelease) {
@@ -375,6 +397,7 @@ export type NpmVersionStatus = {
 export async function checkForNpmVersionUpdate(
   log: (msg: string) => void,
   allowPrerelease = true,
+  channel?: string,
 ): Promise<NpmVersionStatus> {
   const { dkgDir, readFile } = _autoUpdateIo;
   const versionFile = join(dkgDir(), ".current-version");
@@ -390,7 +413,7 @@ export async function checkForNpmVersionUpdate(
     return { status: "error" };
   }
 
-  const result = await resolveLatestNpmVersion(log, allowPrerelease);
+  const result = await resolveLatestNpmVersion(log, allowPrerelease, channel);
   if (result.version === null)
     return { status: result.error ? "error" : "up-to-date" };
 

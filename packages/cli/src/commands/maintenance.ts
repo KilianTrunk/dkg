@@ -134,6 +134,7 @@ program
         branch: proj.defaultBranch,
         allowPrerelease: true,
         checkIntervalMinutes: 30,
+        channel: config.autoUpdate?.channel ?? net?.autoUpdate?.channel,
         source: undefined as 'auto' | 'npm' | 'git' | undefined,
       };
     })();
@@ -149,7 +150,7 @@ program
 
       if (opts.check) {
         console.log('Checking NPM registry for updates...');
-        const check = await checkForNpmVersionUpdate(logFn, allowPre);
+        const check = await checkForNpmVersionUpdate(logFn, allowPre, au.channel);
         if (check.status === 'available' && check.version) {
           console.log(`Update available: ${check.version}`);
         } else if (check.status === 'up-to-date') {
@@ -193,7 +194,7 @@ program
       }
       if (!version) {
         console.log('Checking NPM registry for updates...');
-        const check = await checkForNpmVersionUpdate(logFn, allowPre);
+        const check = await checkForNpmVersionUpdate(logFn, allowPre, au.channel);
         if (check.status === 'available' && check.version) {
           version = check.version;
         } else if (check.status === 'up-to-date') {

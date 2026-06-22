@@ -21,9 +21,11 @@
     "hubAddress": "0x882D0BF07F956b1b94BBfe9E77F47c6fc7D4EC8f"
   },
   "autoUpdate": {
-    "enabled": false,
+    "enabled": true,
     "repo": "OriginTrail/dkg",
     "branch": "main",
-    "checkIntervalMinutes": 5
+    "checkIntervalMinutes": 5,
+    "channel": "mainnet",
+    "allowPrerelease": false
   }
 }

@@ -1,14 +1,13 @@
 {
-  "_status": "pre-deployment: replace PEER_ID_* relay values before enabling Base mainnet",
   "networkName": "DKG V10 Base Mainnet",
   "genesisId": "base-mainnet",
   "networkId": "562ea760dbe27fb4233d58dfc958bbddf844b82596ec3d51dff98718e6bf61ca",
   "genesisVersion": 1,
   "relays": [
-    "/ip4/178.105.87.39/tcp/9090/p2p/PEER_ID_SOLARIS",
-    "/ip4/178.105.105.102/tcp/9090/p2p/PEER_ID_LUNARIS",
-    "/ip4/178.156.214.4/tcp/9090/p2p/PEER_ID_ORIONIS",
-    "/ip4/178.105.111.185/tcp/9090/p2p/PEER_ID_KEPLER"
+    "/ip4/178.104.98.10/tcp/9090/p2p/12D3KooWFWm8sg6dkitmdBd5Uxaqp3CDRL27mFcM7vEHK92Xapyy",
+    "/ip4/168.119.127.54/tcp/9090/p2p/12D3KooWMasqzRrim48ZJM64UyTfHufDTmSG3n3jqwsS5phz8m91",
+    "/ip4/178.156.237.133/tcp/9090/p2p/12D3KooWDgTunUpkGaE7dYCaDP1CCBT6Dm2HPMXSZhJn2KXYLH15",
+    "/ip4/178.105.211.42/tcp/9090/p2p/12D3KooWCodgXHMwybaEe93rbKgWMfGXQvUb6cpT3VCrjCbbnyEu"
   ],
   "defaultContextGraphs": [],
   "defaultNodeRole": "edge",

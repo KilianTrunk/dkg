@@ -263,6 +263,197 @@ describe('V10 UPDATE StorageACK — peer handler + collector quorum', () => {
     expect(ack.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM);
   });
 
+  // #1283 — PUBLIC-update byteSize floor. The pre-fix updateHandler verified
+  // only the new Merkle root and signed the publisher-supplied `newByteSize`
+  // with NO floor, so a publisher could ship a correct new root while
+  // under-declaring `newByteSize` (e.g. 1) to underpay the on-chain
+  // storage-growth charge (the contract only charges when newByteSize >
+  // currentByteSize). The fix mirrors the public-PUBLISH floor into the two
+  // public-update branches. The discriminator that makes these tests prove the
+  // *floor* (not the merkle gate, which runs first): keep `newMerkleRoot`
+  // CORRECT and assert the SPECIFIC BYTESIZE_UNDERCLAIM decline code.
+  describe('#1283 public-update byteSize floor', () => {
+    function makeHandler(wallet: ethers.Wallet, store = new OxigraphStore()) {
+      return new StorageACKHandler(store as any, makeConfig(wallet, 42n), new TypedEventBus() as any);
+    }
+
+    // INLINE public update: CORRECT root, overridable newByteSize.
+    function publicInlineUpdateIntent(overrides: Record<string, unknown> = {}): Uint8Array {
+      return encodeUpdateIntent({
+        kaId: kaId.toString(),
+        contextGraphId,
+        preUpdateMerkleRootCount: Number(preUpdateMerkleRootCount),
+        newMerkleRoot, // correct: computeFlatKCRoot(updatedQuads, [])
+        newByteSize: Number(newByteSize),
+        newTokenAmount: newTokenAmount.toString(),
+        mintAmount: Number(mintAmount),
+        burnTokenIds: burnTokenIds.map((b) => b.toString()),
+        newMerkleLeafCount,
+        publisherPeerId: 'publisher-0',
+        stagingQuads,
+        ...overrides,
+      });
+    }
+
+    it('(a) INLINE under-claim → BYTESIZE_UNDERCLAIM decline (correct root, newByteSize=1)', async () => {
+      // Correct new root passes the MERKLE gate (which runs FIRST), so a decline
+      // here can only come from the new byteSize floor. Pre-fix this signed a
+      // valid ACK (no floor existed); the fix turns it into a typed decline.
+      const handler = makeHandler(ethers.Wallet.createRandom());
+      const decoded = decodeStorageACK(
+        await handler.updateHandler(publicInlineUpdateIntent({ newByteSize: 1 }), fakePeerId),
+      );
+      expect(isStorageACKDecline(decoded)).toBe(true);
+      expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.BYTESIZE_UNDERCLAIM);
+      expect(decoded.declineMessage).toContain('under-claim');
+      // And it is NOT a signed ACK: the signature fields are empty on a decline.
+      const r = decoded.coreNodeSignatureR instanceof Uint8Array
+        ? decoded.coreNodeSignatureR : new Uint8Array(decoded.coreNodeSignatureR);
+      expect(r.length).toBe(0);
+    });
+
+    it('(b) positive control — INLINE newByteSize == stagingQuads.length → VALID signed ACK', async () => {
+      // The floor is `newByteSize < floor`, so equality is accepted. Prove a
+      // REAL ACK by recovering the signer over the exact 13-field update digest.
+      const wallet = ethers.Wallet.createRandom();
+      const handler = makeHandler(wallet);
+      const decoded = decodeStorageACK(
+        await handler.updateHandler(publicInlineUpdateIntent({ newByteSize: Number(newByteSize) }), fakePeerId),
+      );
+      expect(isStorageACKDecline(decoded)).toBe(false);
+
+      const decodedRoot = decoded.merkleRoot instanceof Uint8Array
+        ? decoded.merkleRoot : new Uint8Array(decoded.merkleRoot);
+      expect(Buffer.from(decodedRoot).equals(Buffer.from(newMerkleRoot))).toBe(true);
+
+      const recovered = ethers.recoverAddress(ethers.hashMessage(expectedDigest()), {
+        r: ethers.hexlify(decoded.coreNodeSignatureR instanceof Uint8Array
+          ? decoded.coreNodeSignatureR : new Uint8Array(decoded.coreNodeSignatureR)),
+        yParityAndS: ethers.hexlify(decoded.coreNodeSignatureVS instanceof Uint8Array
+          ? decoded.coreNodeSignatureVS : new Uint8Array(decoded.coreNodeSignatureVS)),
+      });
+      expect(recovered.toLowerCase()).toBe(wallet.address.toLowerCase());
+    });
+
+    it('(b2) positive control — INLINE newByteSize ABOVE the floor → VALID signed ACK', async () => {
+      const wallet = ethers.Wallet.createRandom();
+      const handler = makeHandler(wallet);
+      const decoded = decodeStorageACK(
+        await handler.updateHandler(
+          publicInlineUpdateIntent({ newByteSize: Number(newByteSize) + 1000 }),
+          fakePeerId,
+        ),
+      );
+      expect(isStorageACKDecline(decoded)).toBe(false);
+      // Digest binds the (larger) claimed newByteSize, recovers to the signer.
+      const digestAbove = computeUpdateACKDigest(
+        TEST_CHAIN_ID,
+        TEST_KAV10_ADDR,
+        cgIdBigInt,
+        kaId,
+        preUpdateMerkleRootCount,
+        newMerkleRoot,
+        newByteSize + 1000n,
+        newTokenAmount,
+        mintAmount,
+        burnTokenIds,
+        BigInt(newMerkleLeafCount),
+      );
+      const recovered = ethers.recoverAddress(ethers.hashMessage(digestAbove), {
+        r: ethers.hexlify(decoded.coreNodeSignatureR instanceof Uint8Array
+          ? decoded.coreNodeSignatureR : new Uint8Array(decoded.coreNodeSignatureR)),
+        yParityAndS: ethers.hexlify(decoded.coreNodeSignatureVS instanceof Uint8Array
+          ? decoded.coreNodeSignatureVS : new Uint8Array(decoded.coreNodeSignatureVS)),
+      });
+      expect(recovered.toLowerCase()).toBe(wallet.address.toLowerCase());
+    });
+
+    it('(c) SWM-fallback under-claim → BYTESIZE_UNDERCLAIM decline (no stagingQuads, correct root, newByteSize=1)', async () => {
+      // No inline payload: the data lives in SWM at `<cg>/_shared_memory` (the
+      // legacy read-both bucket the loadSWMQuads CONSTRUCT reads). The recompute
+      // matches `newMerkleRoot`, so the MERKLE gate passes and only the new
+      // Σ(UTF-8 term bytes) floor can decline.
+      const store = new OxigraphStore();
+      const swmGraph = `did:dkg:context-graph:${contextGraphId}/_shared_memory`;
+      await store.insert(updatedQuads.map((q) => ({ ...q, graph: swmGraph })));
+      const handler = makeHandler(ethers.Wallet.createRandom(), store);
+
+      const swmIntent = encodeUpdateIntent({
+        kaId: kaId.toString(),
+        contextGraphId,
+        preUpdateMerkleRootCount: Number(preUpdateMerkleRootCount),
+        newMerkleRoot, // correct: recompute over the SWM quads matches this
+        newByteSize: 1,
+        newTokenAmount: newTokenAmount.toString(),
+        mintAmount: Number(mintAmount),
+        burnTokenIds: burnTokenIds.map((b) => b.toString()),
+        newMerkleLeafCount,
+        publisherPeerId: 'publisher-0',
+        // no stagingQuads → SWM-fallback branch
+      });
+
+      const decoded = decodeStorageACK(await handler.updateHandler(swmIntent, fakePeerId));
+      expect(isStorageACKDecline(decoded)).toBe(true);
+      expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.BYTESIZE_UNDERCLAIM);
+      expect(decoded.declineMessage).toContain('under-claim');
+    });
+
+    it('(c2) SWM-fallback positive control — newByteSize at the Σ UTF-8 term-byte floor → VALID signed ACK', async () => {
+      // The serialization-independent SWM floor is Σ(UTF-8 byteLength(s,p,o));
+      // claiming exactly that floor is accepted (gate is `< floor`).
+      const store = new OxigraphStore();
+      const swmGraph = `did:dkg:context-graph:${contextGraphId}/_shared_memory`;
+      await store.insert(updatedQuads.map((q) => ({ ...q, graph: swmGraph })));
+      const wallet = ethers.Wallet.createRandom();
+      const handler = makeHandler(wallet, store);
+
+      const swmFloor = updatedQuads.reduce(
+        (acc, q) =>
+          acc +
+          Buffer.byteLength(q.subject, 'utf8') +
+          Buffer.byteLength(q.predicate, 'utf8') +
+          Buffer.byteLength(q.object, 'utf8'),
+        0,
+      );
+
+      const swmIntent = encodeUpdateIntent({
+        kaId: kaId.toString(),
+        contextGraphId,
+        preUpdateMerkleRootCount: Number(preUpdateMerkleRootCount),
+        newMerkleRoot,
+        newByteSize: swmFloor,
+        newTokenAmount: newTokenAmount.toString(),
+        mintAmount: Number(mintAmount),
+        burnTokenIds: burnTokenIds.map((b) => b.toString()),
+        newMerkleLeafCount,
+        publisherPeerId: 'publisher-0',
+      });
+
+      const decoded = decodeStorageACK(await handler.updateHandler(swmIntent, fakePeerId));
+      expect(isStorageACKDecline(decoded)).toBe(false);
+      const digestSwm = computeUpdateACKDigest(
+        TEST_CHAIN_ID,
+        TEST_KAV10_ADDR,
+        cgIdBigInt,
+        kaId,
+        preUpdateMerkleRootCount,
+        newMerkleRoot,
+        BigInt(swmFloor),
+        newTokenAmount,
+        mintAmount,
+        burnTokenIds,
+        BigInt(newMerkleLeafCount),
+      );
+      const recovered = ethers.recoverAddress(ethers.hashMessage(digestSwm), {
+        r: ethers.hexlify(decoded.coreNodeSignatureR instanceof Uint8Array
+          ? decoded.coreNodeSignatureR : new Uint8Array(decoded.coreNodeSignatureR)),
+        yParityAndS: ethers.hexlify(decoded.coreNodeSignatureVS instanceof Uint8Array
+          ? decoded.coreNodeSignatureVS : new Uint8Array(decoded.coreNodeSignatureVS)),
+      });
+      expect(recovered.toLowerCase()).toBe(wallet.address.toLowerCase());
+    });
+  });
+
   it('collectUpdate reaches a 3-of-4 quorum, recovering each signer against the update digest', async () => {
     const coreWallets = [
       ethers.Wallet.createRandom(),

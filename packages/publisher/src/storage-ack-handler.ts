@@ -874,6 +874,14 @@ export class StorageACKHandler {
     // it trusts the claimed root (member post-decrypt verification + the
     // on-chain revert are the integrity backstop) but still independently
     // confirms the CG is curated before signing an opaque ACK.
+    //
+    // #1283: byteSize floor for PUBLIC updates. The public inline / SWM branches
+    // below set this to the attested updated-payload size; it is enforced
+    // against the signed `newByteSize` after parsing. Curated/encrypted updates
+    // keep their own catalog-parity check and the core can't see the private
+    // payload, so they leave it null.
+    let publicUpdateByteSizeFloor: bigint | null = null;
+    let publicUpdateFloorBasis = '';
     if (intent.isEncryptedPayload === true) {
       const swmGraphIdForCuration = intent.swmGraphId && intent.swmGraphId.length > 0
         ? intent.swmGraphId
@@ -1015,6 +1023,13 @@ export class StorageACKHandler {
           `computed=${ethers.hexlify(recomputedRoot).slice(0, 18)}... (${parsed.length} triples) — refusing to ACK`,
         );
       }
+      // #1283: public inline update — the core received the EXACT serialized
+      // payload, so require the signed newByteSize to cover its full byte length
+      // (mirrors the public-publish floor). Without this a publisher can ship a
+      // correct new root while under-declaring newByteSize to underpay the
+      // on-chain storage-growth charge.
+      publicUpdateByteSizeFloor = BigInt(intent.stagingQuads.length);
+      publicUpdateFloorBasis = 'exact inline payload bytes';
     } else {
       // Fallback: data should already be in SWM (publishFromSharedMemory
       // remap / SWM-resolution path). Reuse the publish branch's SWM
@@ -1036,6 +1051,17 @@ export class StorageACKHandler {
           `local=${ethers.hexlify(recomputedRoot).slice(0, 18)}... (${swmQuads.length} triples in SWM)`,
         );
       }
+      // #1283: public SWM-fallback update — the original serialization isn't
+      // byte-reconstructable, so use the serialization-independent lower bound
+      // Σ(UTF-8 byteLength(s,p,o)) (mirrors the public-publish SWM floor).
+      publicUpdateByteSizeFloor = 0n;
+      for (const q of swmQuads) {
+        publicUpdateByteSizeFloor +=
+          BigInt(Buffer.byteLength(q.subject, 'utf8')) +
+          BigInt(Buffer.byteLength(q.predicate, 'utf8')) +
+          BigInt(Buffer.byteLength(q.object, 'utf8'));
+      }
+      publicUpdateFloorBasis = 'Σ UTF-8 term bytes (lower bound)';
     }
 
     // Derive the bigint digest inputs. Fail loud on non-numeric / non-
@@ -1067,6 +1093,22 @@ export class StorageACKHandler {
     const newByteSize = typeof intent.newByteSize === 'number'
       ? BigInt(intent.newByteSize)
       : BigInt(intent.newByteSize.low >>> 0) | (BigInt(intent.newByteSize.high >>> 0) << 32n);
+
+    // #1283: enforce the PUBLIC-update byteSize floor before signing. Mirrors
+    // the public-publish BYTESIZE_UNDERCLAIM gate. Nothing on-chain can see the
+    // content, and the contract only charges growth when newByteSize >
+    // currentByteSize (KnowledgeAssetsLifecycle._executeUpdateCore), so an
+    // under-declared newByteSize would let a publisher grow real public storage
+    // for free. Curated updates already enforce catalog byteSize parity above.
+    if (publicUpdateByteSizeFloor !== null && newByteSize < publicUpdateByteSizeFloor) {
+      return this.encodeDecline(
+        cgId,
+        STORAGE_ACK_DECLINE_CODES.BYTESIZE_UNDERCLAIM,
+        `public UPDATE ACK byteSize under-claim: publisher claims newByteSize=${newByteSize} ` +
+        `but the attested updated content requires at least ${publicUpdateByteSizeFloor} UTF-8 bytes ` +
+        `(${publicUpdateFloorBasis}). Refusing to sign an under-priced footprint.`,
+      );
+    }
     const newTokenAmount = intent.newTokenAmount && intent.newTokenAmount.length > 0
       ? BigInt(intent.newTokenAmount)
       : 0n;

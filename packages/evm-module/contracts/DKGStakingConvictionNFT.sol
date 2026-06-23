@@ -92,10 +92,11 @@ contract DKGStakingConvictionNFT is IVersioned, ContractStatus, IInitializable, 
     //           points and events.
     //         * L8 — `identityId != 0` guard added on mint paths so
     //           ambiguous "zero-node" mints fail fast at the wrapper.
-    //         * 10.0.3 — operator-fee migration: added
-    //           `adminDrainOperatorFeesBatch` + `OperatorFeeMigrated`; bumped so
-    //           the breaking migration ABI is detectable via `version()`.
-    string private constant _VERSION = "10.0.3";
+    // 10.0.3 — operator-fee migration: added
+    //          `adminDrainOperatorFeesBatch` + `OperatorFeeMigrated`; bumped so
+    //          the breaking migration ABI is detectable via `version()`.
+    // 10.0.4 — `claim` is permissionless; owner remains the reward beneficiary.
+    string private constant _VERSION = "10.0.4";
 
     // ========================================================================
     // Constants

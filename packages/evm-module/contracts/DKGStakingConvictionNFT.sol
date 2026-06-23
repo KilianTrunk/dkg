@@ -360,11 +360,12 @@ contract DKGStakingConvictionNFT is IVersioned, ContractStatus, IInitializable, 
     // `onlyConvictionNFT` so only this contract can invoke it. Each wrapper:
     //
     //   1. Validates ownership (`ownerOf == msg.sender`) on stake-moving calls;
-    //      claim is permissionless but resolves the current owner as beneficiary.
+    //      claim is permissionless and rewards compound into the tokenId-keyed
+    //      NFT position.
     //   2. For mint paths, fails fast on `lockTier` via `_convictionMultiplier`.
     //   3. Mints / burns the ERC-721 token as needed.
     //   4. Forwards to the matching `StakingV10` method with the staker
-    //      passed explicitly (`msg.sender` for owner actions, ownerOf for claim).
+    //      passed explicitly for owner actions.
     //   5. Emits a wrapper-layer mirror event for NFT-contract watchers —
     //      the authoritative event for off-chain accounting comes from the
     //      `StakingV10` / `ConvictionStakingStorage` layer.
@@ -512,10 +513,13 @@ contract DKGStakingConvictionNFT is IVersioned, ContractStatus, IInitializable, 
     }
 
     /// @notice Walk unclaimed epochs for the position, accumulate reward,
-    ///         and bank it into the `ConvictionStakingStorage` rewards
-    ///         bucket. Updates `lastClaimedEpoch`. Any caller may trigger
-    ///         settlement; the current NFT owner remains the beneficiary.
+    ///         and compound it into the tokenId-keyed staking position.
+    ///         Updates `lastClaimedEpoch`. Any caller may trigger settlement;
+    ///         rewards are not routed to the caller.
     function claim(uint256 tokenId) external {
+        // `ownerOf` is intentionally used as the live-token guard: it reverts
+        // for nonexistent or burned token IDs. `StakingV10.claim` ignores the
+        // address argument; reward attribution is tokenId-keyed.
         stakingV10.claim(ownerOf(tokenId), tokenId);
         // No wrapper-layer event — `StakingV10.claim` emits `RewardsClaimed`
         // with the amount already. The NFT layer does not duplicate reward

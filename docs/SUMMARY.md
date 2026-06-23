@@ -10,6 +10,7 @@
 
 * [OriginTrail DKG V10 Pre-Mainnet Bug Bounty](active-now/dkg-v10-premainnet-bounty.md)
 * [DKG V10 Bounty Program](active-now/dkg-v10-bounty.md)
+* [Staking & Migration (V8 → V10)](active-now/staking-migration.md)
 
 ## OriginTrail V9/V10
 

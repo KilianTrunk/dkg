@@ -725,15 +725,14 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
      *        4. `cs.setLastClaimedEpoch(tokenId, toEpoch)` — advance cursor.
      *      No StakingStorage writes.
      */
-    function claim(address staker, uint256 tokenId) external onlyConvictionNFT {
-        // `staker` is retained for ABI compatibility with the DEPLOYED
-        // DKGStakingConvictionNFT wrapper (10.0.3), whose owner-gated `claim`
-        // calls `stakingV10.claim(msg.sender, tokenId)`. Keeping this 2-arg
-        // signature means the existing wrapper keeps working after StakingV10 is
-        // redeployed — so no wrapper redeploy (which would orphan position NFTs)
-        // is needed. Settlement is tokenId-keyed (the NFT owner is the
-        // beneficiary), so the address argument is intentionally unused.
-        staker;
+    // The first arg (the staker address) is intentionally UNNAMED: it is
+    // retained only for ABI compatibility with the DEPLOYED DKGStakingConvictionNFT
+    // wrapper (10.0.3), whose owner-gated `claim` calls
+    // `stakingV10.claim(msg.sender, tokenId)`. Keeping this 2-arg signature means
+    // the existing wrapper keeps working after StakingV10 is redeployed — so no
+    // wrapper redeploy (which would orphan position NFTs) is needed. Settlement is
+    // tokenId-keyed (the NFT owner is the beneficiary), so the address is unused.
+    function claim(address, uint256 tokenId) external onlyConvictionNFT {
         _claim(tokenId);
     }
 

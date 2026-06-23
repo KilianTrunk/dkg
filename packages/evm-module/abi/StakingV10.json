@@ -472,7 +472,7 @@
     "inputs": [
       {
         "internalType": "address",
-        "name": "staker",
+        "name": "",
         "type": "address"
       },
       {

@@ -1421,6 +1421,31 @@ describe('@unit DKGStakingConvictionNFT', () => {
       expect(await ConvictionStakingStorageContract.totalStakeV10()).to.equal(totalStakeBefore);
     });
 
+    it('no-op: non-owner zero scorePerStake claim advances lastClaimedEpoch but emits nothing', async () => {
+      const { identityId } = await createProfile();
+      const amount = hre.ethers.parseEther('1000');
+      await mintAndApprove(accounts[0], amount);
+      await NFT.connect(accounts[0]).createConviction(identityId, amount, 12);
+      await advanceEpochs(1);
+
+      const posBefore = await ConvictionStakingStorageContract.getPosition(1);
+      const nodeStakeBefore = await ConvictionStakingStorageContract.getNodeStakeV10(identityId);
+      const totalStakeBefore = await ConvictionStakingStorageContract.totalStakeV10();
+
+      const tx = await NFT.connect(accounts[4]).claim(1);
+      await expect(tx).to.not.emit(StakingV10Contract, 'RewardsClaimed');
+
+      const posAfter = await ConvictionStakingStorageContract.getPosition(1);
+      const currentEpoch = await ChronosContract.getCurrentEpoch();
+      expect(posAfter.lastClaimedEpoch).to.equal(currentEpoch - 1n);
+      expect(posAfter.lastClaimedEpoch).to.equal(posBefore.lastClaimedEpoch + 1n);
+      expect(posAfter.raw).to.equal(posBefore.raw);
+      expect(posAfter.cumulativeRewardsClaimed).to.equal(posBefore.cumulativeRewardsClaimed);
+      expect(await ConvictionStakingStorageContract.getNodeStakeV10(identityId)).to.equal(nodeStakeBefore);
+      expect(await ConvictionStakingStorageContract.totalStakeV10()).to.equal(totalStakeBefore);
+      expect(await NFT.ownerOf(1)).to.equal(accounts[0].address);
+    });
+
     // -----------------------------------------------------------------
     // Happy paths — reward accumulation
     // -----------------------------------------------------------------

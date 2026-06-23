@@ -1290,6 +1290,17 @@ describe('@unit DKGStakingConvictionNFT', () => {
       await expect(NFT.connect(accounts[4]).claim(1)).to.not.be.reverted;
     });
 
+    it('keeps stake-moving mutations owner-only after a non-owner claim', async () => {
+      const { identityId } = await createProfile();
+      const { identityId: newIdentityId } = await createProfile(accounts[0], accounts[2]);
+      const amount = hre.ethers.parseEther('1000');
+      await mintAndApprove(accounts[0], amount);
+      await NFT.connect(accounts[0]).createConviction(identityId, amount, 1);
+      await advanceEpochs(2);
+
+      await expectNonOwnerMutationGatesAfterClaim(1, newIdentityId);
+    });
+
     it('direct StakingV10.claim call from non-NFT caller reverts via gate', async () => {
       const { identityId } = await createProfile();
       const amount = hre.ethers.parseEther('1000');

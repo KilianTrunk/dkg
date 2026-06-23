@@ -226,6 +226,14 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
       faucet: { url: 'http://faucet.test', mode: 'testnet' },
     }) as any);
     const readWalletsWithRetry = recorder(async () => ['0xadmin', '0xtest1', '0xtest2', '0xtest3']);
+    // Eager wallet creation (issue #1306). Idempotent generate-if-absent;
+    // mcpSetupAction ignores the return value (the faucet re-reads from disk),
+    // so a minimal stub suffices. Tests assert it's called on a non-dry-run
+    // setup and skipped under --dry-run.
+    const loadOpWallets = recorder(async () => ({
+      adminWallet: { address: '0xadmin', privateKey: '0x0' },
+      wallets: [{ address: '0xtest1', privateKey: '0x0' }],
+    }) as any);
     const requestFaucetFunding = recorder(async () => ({
       success: true,
       fundedWallets: ['0xadmin', '0xtest1', '0xtest2', '0xtest3'],
@@ -263,6 +271,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
       ensureDkgNodeConfig,
       startDaemon,
       readWalletsWithRetry,
+      loadOpWallets,
       requestFaucetFunding,
       logManualFundingInstructions,
       findDkgMonorepoRoot,
@@ -475,6 +484,37 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     expect((deps.requestFaucetFunding as any).calls).toEqual([]);
     expect(existsSync(join(tmpHome, '.dkg', 'config.json'))).toBe(false);
     expect(existsSync(join(tmpHome, '.cursor', 'mcp.json'))).toBe(false);
+  });
+
+  it('#1306: eagerly creates wallets even with --no-fund, and skips under --dry-run', async () => {
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+
+    // --no-fund must STILL create wallets (mainnet has no faucet but the node
+    // needs wallets for manual funding + publishing). Called with the home dir.
+    const deps = makeDeps();
+    await mcpSetupAction({ fund: false, verify: false }, deps);
+    expect((deps.loadOpWallets as any).calls).toHaveLength(1);
+    expect((deps.loadOpWallets as any).calls[0][0]).toBe(join(tmpHome, '.dkg'));
+
+    // --dry-run must NOT create wallets.
+    const dryDeps = makeDeps();
+    await mcpSetupAction({ dryRun: true }, dryDeps);
+    expect((dryDeps.loadOpWallets as any).calls).toEqual([]);
+  });
+
+  it('#1306: a failing loadOpWallets is best-effort — setup continues', async () => {
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const deps = makeDeps({
+      loadOpWallets: recorder(async () => { throw new Error('boom'); }),
+    });
+
+    // A throwing wallet pre-create must NOT abort setup — the daemon still
+    // starts and clients still register.
+    await mcpSetupAction({ fund: false, verify: false }, deps);
+
+    expect((deps.loadOpWallets as any).calls).toHaveLength(1);
+    expect((deps.startDaemon as any).calls).toHaveLength(1);
+    expect(existsSync(join(tmpHome, '.cursor', 'mcp.json'))).toBe(true);
   });
 
   it('honours --print-only: short-circuits before any other step', async () => {

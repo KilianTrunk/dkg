@@ -172,6 +172,13 @@ export interface McpSetupActionDeps {
   startDaemon: typeof import('@origintrail-official/dkg-adapter-openclaw').startDaemon;
   readWalletsWithRetry: typeof import('@origintrail-official/dkg-adapter-openclaw').readWalletsWithRetry;
   logManualFundingInstructions: typeof import('@origintrail-official/dkg-adapter-openclaw').logManualFundingInstructions;
+  /**
+   * Eagerly creates the node's operational wallets (generate-if-absent)
+   * before the daemon starts, so faucet funding (testnet) and manual mainnet
+   * funding have wallets to target even if the daemon never fully boots.
+   * Idempotent. From `@origintrail-official/dkg-agent`; injectable for tests.
+   */
+  loadOpWallets: typeof import('@origintrail-official/dkg-agent').loadOpWallets;
   /** Faucet primitive from `@origintrail-official/dkg-core`. */
   requestFaucetFunding: typeof import('@origintrail-official/dkg-core').requestFaucetFunding;
   /**
@@ -1891,6 +1898,20 @@ export async function mcpSetupAction(
     } catch (err: any) {
       console.error(`[setup] Failed to load network config: ${err?.message ?? err}`);
       throw err;
+    }
+  }
+
+  // Ensure the node's wallets exist BEFORE starting the daemon — matching
+  // `dkg init` — so faucet funding (testnet) and manual mainnet funding have
+  // wallets to target even if the daemon never fully boots. Runs OUTSIDE the
+  // config-write skip-gate above (an existing node can still lack wallets) and
+  // regardless of `--no-fund` (mainnet has no faucet but still needs wallets).
+  // Best-effort; the daemon's boot-time loadOpWallets is an idempotent fallback.
+  if (!dryRun) {
+    try {
+      await deps.loadOpWallets(dkgDirPath);
+    } catch (err: any) {
+      console.warn(`[setup] Could not pre-create wallets (${err?.message ?? err}); the daemon will generate them on first start.`);
     }
   }
 

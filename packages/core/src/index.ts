@@ -177,6 +177,7 @@ export {
 } from './faucet-orchestration.js';
 export {
   ensureDkgNodeConfig,
+  readPersistedNetworkConfigName,
   type DkgNodeConfigOverrides,
   type DkgNodeNetworkConfig,
   type EnsureDkgNodeConfigOptions,

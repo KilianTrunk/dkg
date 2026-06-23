@@ -56,6 +56,11 @@ export interface ResolveSetupNetworkNameOptions {
    * Whether a config file already existed on disk before this setup run.
    * Distinguishes a fresh install (→ default mainnet) from a legacy node
    * that never set a network (→ testnet, preserved).
+   *
+   * Fail-safe: only an explicit `false` (proven-fresh) selects the mainnet
+   * default; `true` OR `undefined` (the signal was not provided) resolves to
+   * the legacy testnet network, so a forgotten/ambiguous signal can never
+   * silently flip a node onto a real-money chain.
    */
   configExisted?: boolean;
 }
@@ -71,5 +76,7 @@ export function resolveSetupNetworkName(opts: ResolveSetupNetworkNameOptions): s
   const existing = opts.existingNetworkConfig?.trim();
   if (existing) return existing;
 
-  return opts.configExisted ? LEGACY_FALLBACK_NETWORK : DEFAULT_SETUP_NETWORK;
+  // Fail-safe: only a proven-fresh node (configExisted === false) gets the
+  // mainnet default. true OR undefined stays on the legacy testnet network.
+  return opts.configExisted === false ? DEFAULT_SETUP_NETWORK : LEGACY_FALLBACK_NETWORK;
 }

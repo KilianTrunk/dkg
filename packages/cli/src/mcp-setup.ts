@@ -1786,11 +1786,23 @@ export async function mcpSetupAction(
     const nc = readPersistedConfig(dkgDirPath)?.networkConfig;
     return typeof nc === 'string' ? nc : undefined;
   })();
+  // `--network` is honored only for a FRESH node (existing nodes keep their
+  // current network; switch via `dkg init --network`). Dropping it on an
+  // existing node keeps the faucet decision aligned with the booted network
+  // (the config-write is already skipped for an unchanged existing node).
+  const explicitNetwork = configExists ? undefined : opts.network;
   const setupNetworkConfigName = resolveSetupNetworkName({
-    explicit: opts.network,
+    explicit: explicitNetwork,
     existingNetworkConfig,
     configExisted: configExists,
   });
+  const requestedNetwork = opts.network?.trim();
+  if (configExists && requestedNetwork && requestedNetwork !== setupNetworkConfigName) {
+    console.log(
+      `[setup] --network ${requestedNetwork} ignored: this node is already configured for ` +
+      `"${setupNetworkConfigName}". Use \`dkg init --network\` to switch an existing node.`,
+    );
+  }
 
   let effectivePort = apiPort;
   let effectiveAgentName = opts.name?.trim() || readPersistedAgentName(dkgDirPath) || mintFallbackAgentName();

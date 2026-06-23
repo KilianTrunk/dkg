@@ -619,7 +619,11 @@ export function detectNetworkSwitch(
 
   // First boot or legacy state file: silently record and move on. We do NOT
   // treat null-previous as a switch — that would abort every operator who
-  // upgrades into this release without ever changing networks.
+  // upgrades into this release without ever changing networks. (Parity with
+  // detectBackendSwitch.) Limitation: a networkConfig edit made in the SAME
+  // upgrade window — before any post-upgrade boot records the tag — is not
+  // caught; this records the new network as the baseline. Subsequent edits
+  // are caught normally.
   if (previous === null) {
     try {
       saveNetworkTag(opts.dataDir, opts.currentNetworkConfig);

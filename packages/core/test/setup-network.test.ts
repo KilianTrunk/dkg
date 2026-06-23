@@ -16,6 +16,13 @@ describe('resolveSetupNetworkName', () => {
     expect(LEGACY_FALLBACK_NETWORK).toBe('testnet');
   });
 
+  it('fails SAFE to testnet when configExisted is omitted (only proven-fresh gets mainnet)', () => {
+    // A forgotten/ambiguous configExisted must never silently flip a node
+    // onto a real-money chain — undefined resolves to the legacy network.
+    expect(resolveSetupNetworkName({})).toBe('testnet');
+    expect(resolveSetupNetworkName({ existingNetworkConfig: undefined })).toBe('testnet');
+  });
+
   it('keeps an existing explicit networkConfig over the default', () => {
     expect(
       resolveSetupNetworkName({ existingNetworkConfig: 'mainnet-base', configExisted: true }),

@@ -695,20 +695,24 @@ export async function runHermesSetup(req: HermesSetupRequest): Promise<HermesSet
   // keeps its persisted networkConfig; a fresh node defaults to
   // mainnet-gnosis; a legacy config without a network stays testnet. Loading
   // the same name we persist keeps the faucet gate honest (mainnet has none).
-  let existingNetworkConfig: string | undefined;
-  try {
-    const cfgPath = join(dkgConfigHome, 'config.json');
-    if (existsSync(cfgPath)) {
-      const raw = JSON.parse(readFileSync(cfgPath, 'utf-8'));
-      if (typeof raw?.networkConfig === 'string') existingNetworkConfig = raw.networkConfig;
-    }
-  } catch { /* unparseable config — treat networkConfig as absent */ }
-  const { resolveSetupNetworkName } = await import('@origintrail-official/dkg-core');
+  const { resolveSetupNetworkName, readPersistedNetworkConfigName } = await import('@origintrail-official/dkg-core');
+  const existingNetworkConfig = readPersistedNetworkConfigName(dkgConfigHome);
+  // `--network` is honored only for a FRESH node (existing nodes keep their
+  // current network; switch via `dkg init --network`). Dropping it on an
+  // existing node keeps the faucet decision aligned with the booted network.
+  const explicitNetwork = dkgConfigExists ? undefined : setupOptions.network;
   const networkConfigName = resolveSetupNetworkName({
-    explicit: setupOptions.network,
+    explicit: explicitNetwork,
     existingNetworkConfig,
     configExisted: dkgConfigExists,
   });
+  const requestedNetwork = setupOptions.network?.trim();
+  if (dkgConfigExists && requestedNetwork && requestedNetwork !== networkConfigName) {
+    warnings.push(
+      `--network ${requestedNetwork} ignored: this node is already configured for "${networkConfigName}". ` +
+      'Use `dkg init --network` to switch an existing node.',
+    );
+  }
 
   if (!dryRun && !dkgConfigExists) {
     try {

@@ -1196,7 +1196,7 @@ export async function assertSelectableNetwork(name: string | undefined | null): 
   const network = await loadNetworkConfig(trimmed);
   if (!network) {
     throw new Error(
-      `Unknown network: "${trimmed}". Available: ${SELECTABLE_SETUP_NETWORKS.join(', ')}.`,
+      `No bundled network config named "${trimmed}". Common options: ${SELECTABLE_SETUP_NETWORKS.join(', ')}.`,
     );
   }
   const readiness = validateNetworkConfigReadiness(network);

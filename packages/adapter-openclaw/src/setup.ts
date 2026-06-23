@@ -28,6 +28,7 @@ import {
   ensureDkgNodeConfig,
   fundWalletsBestEffort,
   logManualFundingInstructions,
+  readPersistedNetworkConfigName,
   readWallets,
   readWalletsWithRetry,
   resolveCliPackageDir,
@@ -364,22 +365,26 @@ export function loadNetworkConfig(networkName = 'testnet'): NetworkConfig {
 export function resolveSetupNetwork(
   explicitNetwork?: string,
 ): { networkName: string; network: NetworkConfig } {
-  const configPath = join(dkgDir(), 'config.json');
-  let existing: Record<string, any> = {};
-  if (existsSync(configPath)) {
-    try {
-      existing = JSON.parse(readFileSync(configPath, 'utf-8'));
-    } catch {
-      // Unparseable config — treat networkConfig as absent; writeDkgConfig
-      // emits its own corruption warning when it re-reads the same file.
-    }
-  }
-  const configExisted = existsSync(configPath) || existsSync(join(dkgDir(), 'config.yaml'));
+  const home = dkgDir();
+  const configExisted = existsSync(join(home, 'config.json')) || existsSync(join(home, 'config.yaml'));
+  const existingNetworkConfig = readPersistedNetworkConfigName(home);
+  // `--network` is honored only for a FRESH node (the user's stated scope:
+  // "when there is no config yet"). An existing node keeps its current
+  // network — switching is a deliberate `dkg init --network` or config edit,
+  // guarded at boot by detectNetworkSwitch.
+  const explicit = configExisted ? undefined : explicitNetwork;
   const networkName = resolveSetupNetworkName({
-    explicit: explicitNetwork,
-    existingNetworkConfig: typeof existing.networkConfig === 'string' ? existing.networkConfig : undefined,
+    explicit,
+    existingNetworkConfig,
     configExisted,
   });
+  const requested = explicitNetwork?.trim();
+  if (configExisted && requested && requested !== networkName) {
+    warn(
+      `--network ${requested} ignored: this node is already configured for "${networkName}". ` +
+      'Use `dkg init --network` to switch an existing node.',
+    );
+  }
   return { networkName, network: loadNetworkConfig(networkName) };
 }
 

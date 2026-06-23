@@ -43,7 +43,7 @@ openclaw gateway restart
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
-| `--network <name>` | `mainnet-gnosis` (fresh node) | Network to set up on (`mainnet-gnosis` \| `mainnet-base` \| `testnet`). Persisted as `config.networkConfig`; an existing node keeps its current network. |
+| `--network <name>` | `mainnet-gnosis` (fresh node) | Network to set up on (`mainnet-gnosis` \| `mainnet-base` \| `testnet`), persisted as `config.networkConfig`. Applies to a FRESH node only; an existing node keeps its current network (switch with `dkg init --network`). |
 | `--no-fund` | off | Skip the testnet faucet call during setup. Use this if your wallets are already funded, the faucet is unreachable, or you're running offline. |
 | `--no-start` | off | Skip starting the DKG daemon (configure only). |
 | `--no-verify` | off | Skip the post-setup verification pass. |

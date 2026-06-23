@@ -30,12 +30,49 @@
  * user-visible output is unchanged from pre-extraction.
  */
 
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import yaml from 'js-yaml';
 import { resolveDkgConfigHome } from './dkg-home.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Read the persisted `networkConfig` selector from a node's home directory,
+ * honoring BOTH `config.json` and `config.yaml` (JSON wins when both exist —
+ * the same precedence as `loadConfig` / `resolveDkgConfigHome`). Returns
+ * `undefined` when no config exists, parsing fails, or `networkConfig` is
+ * unset/blank.
+ *
+ * Setup flows use this (not a json-only read) so a YAML-only node's network
+ * is correctly identified and not mis-resolved to the legacy testnet fallback
+ * (which would misfire the testnet faucet against a mainnet node).
+ */
+export function readPersistedNetworkConfigName(home: string): string | undefined {
+  const pick = (obj: unknown): string | undefined => {
+    if (obj && typeof obj === 'object') {
+      const nc = (obj as Record<string, unknown>).networkConfig;
+      if (typeof nc === 'string' && nc.trim()) return nc.trim();
+    }
+    return undefined;
+  };
+  const jsonPath = join(home, 'config.json');
+  if (existsSync(jsonPath)) {
+    try {
+      const raw = JSON.parse(readFileSync(jsonPath, 'utf-8'));
+      if (raw && typeof raw === 'object') return pick(raw);
+    } catch { /* corrupt JSON — fall through to YAML */ }
+  }
+  const yamlPath = join(home, 'config.yaml');
+  if (existsSync(yamlPath)) {
+    try {
+      const raw = yaml.load(readFileSync(yamlPath, 'utf-8'));
+      if (raw && typeof raw === 'object') return pick(raw);
+    } catch { /* corrupt YAML */ }
+  }
+  return undefined;
+}
 
 function log(msg: string): void {
   console.log(`[setup] ${msg}`);

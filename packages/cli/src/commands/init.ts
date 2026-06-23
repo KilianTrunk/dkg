@@ -304,7 +304,7 @@ program
     const network = await loadNetworkConfig(selectedNetwork);
     if (!network) {
       console.error(
-        `Unknown network: "${selectedNetwork}". Available: ${SELECTABLE_SETUP_NETWORKS.join(', ')}.`,
+        `No bundled network config named "${selectedNetwork}". Common options: ${SELECTABLE_SETUP_NETWORKS.join(', ')}.`,
       );
       rl.close();
       process.exit(1);
@@ -429,7 +429,16 @@ program
     // Chain configuration. Field-merge: existing config wins per-field over
     // network defaults so an operator who's only customised RPC keeps that
     // override even after `dkg init` re-prompts.
-    const chainDefaults = resolveChainConfig(existing, network);
+    //
+    // EXCEPT on a network SWITCH: when the selected network differs from the
+    // node's current one, the existing `chain` block belongs to the OLD
+    // network (e.g. Base-mainnet hub/RPC/chainId) and must NOT pre-fill or
+    // persist — otherwise the node would run the new network's relays/genesis
+    // against the old chain (the Frankenstein config). Derive chain defaults
+    // from the newly selected network only.
+    const effectiveExistingNetwork = existing.networkConfig?.trim() || proj.defaultNetwork;
+    const isNetworkSwitch = selectedNetwork !== effectiveExistingNetwork;
+    const chainDefaults = resolveChainConfig(isNetworkSwitch ? undefined : existing, network);
     const defaultRpcUrl = chainDefaults?.rpcUrl;
     const defaultRpcUrls = chainDefaults?.rpcUrls?.join(', ') ?? '';
     const defaultHubAddress = chainDefaults?.hubAddress;
@@ -478,7 +487,9 @@ program
       // `existing.autoUpdate` on decline, silently discarding the persisted
       // disable — so a fresh-config operator who said "no" still auto-updated.
       autoUpdate,
-      chain: chainSection ?? existing.chain,
+      // On a network switch, never fall back to the stale existing chain
+      // block — let an empty chainSection inherit the new network's chain.
+      chain: isNetworkSwitch ? chainSection : (chainSection ?? existing.chain),
       auth: { enabled: enableAuth, tokens: existing.auth?.tokens },
       // Persist the chosen backend. `storeBlock === null` from the
       // wizard means "use the local default" — we explicitly clear any

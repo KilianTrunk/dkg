@@ -104,7 +104,7 @@ openclaw gateway restart
 - The right-side chat surface connects to OpenClaw and a sent message round-trips
 - The conversation survives a UI reload (proves DKG-backed chat persistence)
 
-**Flags.** `--no-fund` (skip faucet), `--no-start` (configure only), `--no-verify` (skip verification), `--dry-run` (preview without writing). Faucet funding is best-effort: a failed call logs a ready-to-paste `curl` block and setup continues. See the [Testnet Funding](#testnet-funding) section below for the full request/response shape.
+**Flags.** `--no-fund` (skip faucet), `--no-start` (configure only), `--no-verify` (skip verification), `--dry-run` (preview without writing). Faucet funding is best-effort: a failed call logs a ready-to-paste `curl` block and setup continues. See the [Funding](#funding) section below for the full request/response shape.
 
 The full adapter reference — daemon URL config, channel-port overrides, disconnect/reconnect semantics — lives in [`packages/adapter-openclaw/README.md`](packages/adapter-openclaw/README.md).
 

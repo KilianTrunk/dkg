@@ -109,6 +109,10 @@ contract MigrationCreditRecovery is INamed, IVersioned, ContractStatus, IInitial
         ConvictionStakingStorage cs = convictionStorage;
         cs.spendMigrationCredit(msg.sender, amount);
         cs.transferStake(msg.sender, amount);
+        // CSS is a trusted Hub-registered contract (no untrusted callback) and the
+        // credit debit committed before the transfer, so emitting after the calls
+        // is safe — slither reentrancy-events false positive.
+        // slither-disable-next-line reentrancy-events
         emit MigrationCreditWithdrawn(msg.sender, amount);
     }
 
@@ -124,6 +128,10 @@ contract MigrationCreditRecovery is INamed, IVersioned, ContractStatus, IInitial
         if (amount == 0) revert ZeroAmount();
         cs.spendMigrationCredit(msg.sender, amount);
         cs.transferStake(msg.sender, amount);
+        // CSS is a trusted Hub-registered contract (no untrusted callback) and the
+        // credit debit committed before the transfer, so emitting after the calls
+        // is safe — slither reentrancy-events false positive.
+        // slither-disable-next-line reentrancy-events
         emit MigrationCreditWithdrawn(msg.sender, amount);
     }
 }

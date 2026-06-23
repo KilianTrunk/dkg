@@ -1278,6 +1278,24 @@ describe('@unit DKGStakingConvictionNFT', () => {
       expect(vaultBalance).to.be.gte(totalStake);
     };
 
+    const expectNonOwnerMutationGatesAfterClaim = async (
+      tokenId: bigint | number,
+      newIdentityId: number,
+    ) => {
+      const nonOwner = accounts[4];
+
+      await expect(NFT.connect(nonOwner).claim(tokenId)).to.not.be.reverted;
+      await expect(
+        NFT.connect(nonOwner).withdraw(tokenId),
+      ).to.be.revertedWithCustomError(NFT, 'NotPositionOwner');
+      await expect(
+        NFT.connect(nonOwner).relock(tokenId, 3),
+      ).to.be.revertedWithCustomError(NFT, 'NotPositionOwner');
+      await expect(
+        NFT.connect(nonOwner).redelegate(tokenId, newIdentityId),
+      ).to.be.revertedWithCustomError(NFT, 'NotPositionOwner');
+    };
+
     // -----------------------------------------------------------------
     // Revert / gate paths
     // -----------------------------------------------------------------

@@ -1,5 +1,6 @@
 import type { Command } from 'commander';
 import { readFileSync } from 'node:fs';
+import { assertSelectableNetwork } from './config.js';
 
 export type HermesMemoryMode = 'primary' | 'tools-only';
 
@@ -22,6 +23,8 @@ export interface HermesSetupCliOptions {
    * "`--no-fund` truly means do not perform faucet funding").
    */
   fund?: boolean;
+  /** Network overlay to set up on; persisted as config.networkConfig. */
+  network?: string;
   /**
    * Refuse to replace an existing non-DKG `memory.provider` in the Hermes
    * profile config. Default is `false` (replace-by-default per
@@ -44,6 +47,7 @@ export interface NormalizedHermesSetupOptions {
   verify: boolean;
   start: boolean;
   fund: boolean;
+  network?: string;
   preserveProvider: boolean;
   dryRun: boolean;
   nodeSkillContent?: string;
@@ -93,6 +97,7 @@ export function normalizeHermesSetupOptions(opts: HermesSetupCliOptions): Normal
     // Commander boolean-flag convention: `--no-fund` produces `fund === false`,
     // anything else (omitted, explicit `--fund`) defaults to true.
     fund: opts.fund !== false,
+    network: trimmed(opts.network),
     // Default replace-by-default per setup-entrypoint-contract.md §2.
     // `--preserve-provider` (alias `--no-replace-provider`) flips to true.
     preserveProvider: opts.preserveProvider === true,
@@ -105,6 +110,7 @@ export async function hermesSetupAction(
   _command: Pick<Command, 'getOptionValueSource'>,
   deps: HermesSetupActionDeps,
 ): Promise<void> {
+  await assertSelectableNetwork(opts.network);
   await deps.runSetup({
     ...normalizeHermesSetupOptions(opts),
     nodeSkillContent: loadBundledDkgNodeSkill(),

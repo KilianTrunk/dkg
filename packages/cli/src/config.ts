@@ -10,6 +10,7 @@ import {
   findPackageRepoDir,
   isDkgMonorepoRoot,
   resolveDkgConfigHome,
+  SELECTABLE_SETUP_NETWORKS,
 } from '@origintrail-official/dkg-core';
 
 /**
@@ -1179,6 +1180,31 @@ export async function loadNetworkConfig(network?: string): Promise<NetworkConfig
 
 export function resolveNetworkConfigName(config?: Pick<DkgConfig, 'networkConfig'> | null): string {
   return config?.networkConfig?.trim() || loadProjectConfig().defaultNetwork;
+}
+
+/**
+ * Validate an operator-supplied `--network <name>` value before a setup flow
+ * persists it. Rejects unknown overlay names and pre-deployment networks
+ * (e.g. `mainnet-neuroweb`, whose bundled config is still placeholder-gated)
+ * with a clear, early error — instead of letting the node FATAL at daemon
+ * boot. A blank/undefined value is a no-op (the caller falls back to the
+ * setup default). Shared by the openclaw/hermes/mcp setup actions.
+ */
+export async function assertSelectableNetwork(name: string | undefined | null): Promise<void> {
+  const trimmed = name?.trim();
+  if (!trimmed) return;
+  const network = await loadNetworkConfig(trimmed);
+  if (!network) {
+    throw new Error(
+      `No bundled network config named "${trimmed}". Common options: ${SELECTABLE_SETUP_NETWORKS.join(', ')}.`,
+    );
+  }
+  const readiness = validateNetworkConfigReadiness(network);
+  if (!readiness.ok) {
+    throw new Error(
+      `Network "${trimmed}" is not available yet:\n${readiness.messages.join('\n')}`,
+    );
+  }
 }
 
 export function dkgDir(): string {

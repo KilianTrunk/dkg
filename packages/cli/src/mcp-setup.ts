@@ -72,6 +72,8 @@ import { homedir, platform, release as osRelease } from 'node:os';
 import { execSync } from 'node:child_process';
 import yaml from 'js-yaml';
 import TOML from '@iarna/toml';
+import { resolveSetupNetworkName } from '@origintrail-official/dkg-core';
+import { assertSelectableNetwork } from './config.js';
 
 export interface McpSetupCliOptions {
   /** Refresh every detected client regardless of current registration state. */
@@ -95,6 +97,12 @@ export interface McpSetupCliOptions {
   start?: boolean;
   /** Skip wallet funding via testnet faucet. Mirrors openclaw-setup. */
   fund?: boolean;
+  /**
+   * Network overlay to set up on (mainnet-gnosis | mainnet-base | testnet).
+   * Persisted as config.networkConfig; a fresh node defaults to
+   * mainnet-gnosis. Mirrors `dkg init --network`.
+   */
+  network?: string;
   /** Skip post-setup verification probe. Mirrors openclaw-setup. */
   verify?: boolean;
   /** Preview without writing or starting anything. Mirrors openclaw-setup. */
@@ -1629,6 +1637,9 @@ export async function mcpSetupAction(
   if (!Number.isInteger(apiPort) || apiPort < 1 || apiPort > 65535) {
     throw new Error(`Invalid port "${opts.port}" — must be an integer between 1 and 65535`);
   }
+  // Reject an unknown / pre-deployment `--network` value up front (parity
+  // with the openclaw/hermes setup actions) rather than FATAL-ing at boot.
+  await assertSelectableNetwork(opts.network);
 
   // Phase-2: detect setup context (installed vs monorepo dev). Drives
   // `canonicalEntry`'s output shape so a contributor's local CLI dist
@@ -1766,6 +1777,36 @@ export async function mcpSetupAction(
   const jsonPath = join(dkgDirPath, 'config.json');
   const configExists = existsSync(yamlPath) || existsSync(jsonPath);
 
+  // Resolve the target network once (explicit --network wins; else keep an
+  // existing node's networkConfig; else fresh→mainnet-gnosis, legacy→testnet)
+  // and reuse it for both the config write and the faucet gate, so the
+  // persisted selector, the loaded network slice, and the faucet decision
+  // (mainnet has no faucet) all agree.
+  const existingNetworkConfig = ((): string | undefined => {
+    const nc = readPersistedConfig(dkgDirPath)?.networkConfig;
+    return typeof nc === 'string' ? nc : undefined;
+  })();
+  // `--network` is honored only for a FRESH node (existing nodes keep their
+  // current network; switch via `dkg init --network`). Dropping it on an
+  // existing node keeps the faucet decision aligned with the booted network
+  // (the config-write is already skipped for an unchanged existing node).
+  const explicitNetwork = configExists ? undefined : opts.network;
+  const setupNetworkConfigName = resolveSetupNetworkName({
+    explicit: explicitNetwork,
+    existingNetworkConfig,
+    configExisted: configExists,
+  });
+  const requestedNetwork = opts.network?.trim();
+  if (configExists && requestedNetwork && requestedNetwork !== setupNetworkConfigName) {
+    const current = existingNetworkConfig
+      ? `is already configured for "${setupNetworkConfigName}"`
+      : `has no explicit network (defaults to "${setupNetworkConfigName}")`;
+    console.log(
+      `[setup] --network ${requestedNetwork} ignored: this node ${current}. ` +
+      'Use `dkg init --network` to switch an existing node.',
+    );
+  }
+
   let effectivePort = apiPort;
   let effectiveAgentName = opts.name?.trim() || readPersistedAgentName(dkgDirPath) || mintFallbackAgentName();
 
@@ -1823,7 +1864,7 @@ export async function mcpSetupAction(
     console.log(`[setup] [dry-run] Would write ${tildify(jsonPath)} (port ${effectivePort}, name "${effectiveAgentName}")`);
   } else {
     try {
-      const network = deps.loadNetworkConfig();
+      const network = deps.loadNetworkConfig(setupNetworkConfigName);
       // Codex Round-23 Fix 30: call the agent-agnostic
       // ensureDkgNodeConfig directly. The caller-loads-existing
       // contract means we pre-read the persisted config (yaml or
@@ -1835,6 +1876,7 @@ export async function mcpSetupAction(
       deps.ensureDkgNodeConfig({
         agentName: effectiveAgentName,
         network,
+        networkConfigName: setupNetworkConfigName,
         apiPort,
         existing,
         overrides: {
@@ -1910,7 +1952,7 @@ export async function mcpSetupAction(
       );
     } else {
       try {
-        const network = deps.loadNetworkConfig();
+        const network = deps.loadNetworkConfig(setupNetworkConfigName);
         const faucetUrl = network.faucet?.url;
         const faucetMode = network.faucet?.mode ?? 'testnet';
         if (!faucetUrl) {

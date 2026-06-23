@@ -87,8 +87,9 @@ is set, setup uses that exact profile home.
 | `--bridge-health-url <url>` | derived from transport | Optional health URL override. Must belong to the configured bridge/gateway base. |
 | `--port <port>` | `9200` | Shortcut for `--daemon-url http://127.0.0.1:<port>`. |
 | `--memory-mode <mode>` | `primary` | `primary` elects DKG as the Hermes memory provider; `tools-only` skips provider election. |
+| `--network <name>` | `mainnet-gnosis` (fresh node) | Network to set up on (`mainnet-gnosis` \| `mainnet-base` \| `testnet`), persisted as `config.networkConfig`. Applies to a FRESH node only; an existing node keeps its current network (switch with `dkg init --network`). |
 | `--no-start` | off (daemon starts) | Skip starting the DKG daemon. Best-effort daemon registration still fires against an already-running daemon. |
-| `--no-fund` / `--fund` | `--fund` | Fund the node's generated admin and operational wallets through the testnet faucet. `--no-fund` skips. Faucet failures are non-fatal. |
+| `--no-fund` / `--fund` | `--fund` | Fund the node's generated admin and operational wallets through the testnet faucet (testnet only — mainnet has none). `--no-fund` skips. Faucet failures are non-fatal. |
 | `--preserve-provider` | off (replace) | Refuse to replace an existing non-DKG `memory.provider`. Restores the pre-#386 throw-on-conflict behavior. Aliased as `--no-replace-provider`. |
 | `--no-verify` | off | Skip the post-setup verification pass. |
 | `--dry-run` | off | Preview planned changes without writing files, starting the daemon, calling the faucet, or taking a config backup. |
@@ -391,7 +392,7 @@ python -m py_compile packages/adapter-hermes/hermes-plugin/__init__.py packages/
 
 ## More Setup Detail
 
-See [Hermes setup](../../docs/setup/SETUP_HERMES.md).
+See [Hermes setup](../../docs/archive/internal/setup/SETUP_HERMES.md).
 
 ## License
 

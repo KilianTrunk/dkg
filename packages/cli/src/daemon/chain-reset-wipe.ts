@@ -69,6 +69,15 @@ interface PersistedNetworkState {
    * first boot. (RFC 120 review point #6.)
    */
   lastBackend?: string | null;
+  /**
+   * Last resolved network the daemon booted on (the `networkConfig` overlay
+   * name, e.g. `mainnet-gnosis`/`testnet`). Used by `detectNetworkSwitch` to
+   * abort boot when an operator repoints `config.networkConfig` at a different
+   * network on an existing data dir — the store holds the old network's
+   * chain-derived state (KC ids, merkle roots), which is meaningless on the
+   * new chain. `null`/absent on legacy state files and on first boot.
+   */
+  lastNetworkConfig?: string | null;
   savedAt: number;
 }
 
@@ -197,6 +206,23 @@ function saveBackendTag(dataDir: string, backend: string): void {
       {
         ...existing,
         lastBackend: backend,
+        savedAt: Date.now(),
+      } satisfies PersistedNetworkState,
+      null,
+      2,
+    ),
+  );
+}
+
+function saveNetworkTag(dataDir: string, networkConfig: string): void {
+  // Preserve sibling fields (chainResetMarker, lastBackend) like saveBackendTag.
+  const existing = loadState(dataDir) ?? { chainResetMarker: null, savedAt: 0 };
+  writeFileSync(
+    join(dataDir, STATE_FILE),
+    JSON.stringify(
+      {
+        ...existing,
+        lastNetworkConfig: networkConfig,
         savedAt: Date.now(),
       } satisfies PersistedNetworkState,
       null,
@@ -540,4 +566,109 @@ export function detectBackendSwitch(
     log(`WARN: failed to persist new backend tag: ${(err as Error).message}. Will re-warn on next boot.`);
   }
   return { changed: true, previous, current: opts.currentBackend, aborted: false };
+}
+
+export interface NetworkSwitchDetectOptions {
+  dataDir: string;
+  /**
+   * The resolved network this boot is using — the `networkConfig` overlay
+   * name including the fallback (pass `resolveNetworkConfigName(config)`, so
+   * a legacy config with no `networkConfig` is compared as its fallback,
+   * `testnet`). Symmetric across "no networkConfig" ↔ "explicit networkConfig".
+   */
+  currentNetworkConfig: string;
+  /**
+   * Operator opt-in to proceed despite a network change. Sourced from
+   * `process.env.DKG_ACCEPT_NETWORK_SWITCH === '1'` in production; tests
+   * inject explicitly.
+   */
+  acceptNetworkSwitch: boolean;
+  log?: (msg: string) => void;
+}
+
+export interface NetworkSwitchDetectResult {
+  /** True when `lastNetworkConfig` was recorded and differs from current. */
+  changed: boolean;
+  /** Previously-recorded network, or null if none / legacy state file. */
+  previous: string | null;
+  /** Effective current network (passed through for callers). */
+  current: string;
+  /** True when the daemon should abort boot (`changed && !acceptNetworkSwitch`). */
+  aborted: boolean;
+}
+
+/**
+ * Guard against an operator repointing `config.networkConfig` at a different
+ * network on an existing data dir. Mirrors {@link detectBackendSwitch}: the
+ * store still holds the previous network's chain-derived state (KC ids,
+ * merkle roots, publish-journal, RS WAL), which is meaningless on the new
+ * chain — and `chainResetWipe` won't save us (mainnet overlays ship no
+ * `chainResetMarker`, so its hook is inert). So on a recorded mismatch we
+ * abort boot unless `DKG_ACCEPT_NETWORK_SWITCH=1`. First boot / legacy state
+ * silently records and proceeds.
+ */
+export function detectNetworkSwitch(
+  opts: NetworkSwitchDetectOptions,
+): NetworkSwitchDetectResult {
+  const log = opts.log ?? (() => {});
+  const prev = loadState(opts.dataDir);
+  const previous =
+    typeof prev?.lastNetworkConfig === 'string' && prev.lastNetworkConfig.length > 0
+      ? prev.lastNetworkConfig
+      : null;
+
+  // First boot or legacy state file: silently record and move on. We do NOT
+  // treat null-previous as a switch — that would abort every operator who
+  // upgrades into this release without ever changing networks. (Parity with
+  // detectBackendSwitch.) Limitation: a networkConfig edit made in the SAME
+  // upgrade window — before any post-upgrade boot records the tag — is not
+  // caught; this records the new network as the baseline. Subsequent edits
+  // are caught normally.
+  if (previous === null) {
+    try {
+      saveNetworkTag(opts.dataDir, opts.currentNetworkConfig);
+    } catch {
+      // Non-fatal: retry the tag write next boot.
+    }
+    return { changed: false, previous: null, current: opts.currentNetworkConfig, aborted: false };
+  }
+
+  if (previous === opts.currentNetworkConfig) {
+    return { changed: false, previous, current: opts.currentNetworkConfig, aborted: false };
+  }
+
+  // Mismatch.
+  const warningHeader = [
+    `[NETWORK-SWITCH] node network changed since last boot:`,
+    `  previous: ${previous}`,
+    `  current:  ${opts.currentNetworkConfig}`,
+    ``,
+    `The local store holds "${previous}" chain-derived data (knowledge`,
+    `collection ids, merkle roots, publish journal, random-sampling WAL)`,
+    `that is meaningless on "${opts.currentNetworkConfig}". Booting over it`,
+    `risks silent corruption and real-money chain operations against stale`,
+    `state. Either:`,
+    `  - revert config.networkConfig to "${previous}", or`,
+    `  - start the new network from a clean home (recommended): set a fresh`,
+    `    DKG_HOME, or`,
+    `  - accept the stale store by setting DKG_ACCEPT_NETWORK_SWITCH=1 in`,
+    `    the environment and restarting.`,
+  ].join('\n');
+
+  if (!opts.acceptNetworkSwitch) {
+    log(warningHeader);
+    log(``);
+    log(`Refusing to start: set DKG_ACCEPT_NETWORK_SWITCH=1 to proceed.`);
+    return { changed: true, previous, current: opts.currentNetworkConfig, aborted: true };
+  }
+
+  log(warningHeader);
+  log(``);
+  log(`DKG_ACCEPT_NETWORK_SWITCH=1 set — proceeding on the new network.`);
+  try {
+    saveNetworkTag(opts.dataDir, opts.currentNetworkConfig);
+  } catch (err) {
+    log(`WARN: failed to persist new network tag: ${(err as Error).message}. Will re-warn on next boot.`);
+  }
+  return { changed: true, previous, current: opts.currentNetworkConfig, aborted: false };
 }

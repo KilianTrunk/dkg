@@ -177,10 +177,18 @@ export {
 } from './faucet-orchestration.js';
 export {
   ensureDkgNodeConfig,
+  readPersistedNetworkConfigName,
   type DkgNodeConfigOverrides,
   type DkgNodeNetworkConfig,
   type EnsureDkgNodeConfigOptions,
 } from './ensure-dkg-node-config.js';
+export {
+  DEFAULT_SETUP_NETWORK,
+  LEGACY_FALLBACK_NETWORK,
+  SELECTABLE_SETUP_NETWORKS,
+  resolveSetupNetworkName,
+  type ResolveSetupNetworkNameOptions,
+} from './setup-network.js';
 export { resolveCliPackageDir } from './resolve-cli-package-dir.js';
 export { resolveDkgCli, type ResolvedDkgCli } from './resolve-dkg-cli.js';
 export { startDaemon } from './daemon-lifecycle.js';

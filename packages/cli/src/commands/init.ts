@@ -15,6 +15,8 @@ import {
   getFundableWalletAddresses,
   requestFaucetFunding,
   resolveDkgConfigHome,
+  resolveSetupNetworkName,
+  SELECTABLE_SETUP_NETWORKS,
   toErrorMessage,
   hasErrorCode,
 } from '@origintrail-official/dkg-core';
@@ -105,6 +107,29 @@ import {
 } from '../cli-supervisor.js';
 
 /**
+ * Decide whether `dkg init` is SWITCHING an existing node to a different
+ * network (vs a fresh install or a same-network re-init). Only an EXPLICIT
+ * prior `networkConfig` that differs from the selection counts as a switch:
+ *   - fresh node (no networkConfig)               → not a switch (no chain to lose)
+ *   - legacy node (no networkConfig, custom chain) → not a switch (preserve the
+ *     operator's chain/RPC override — its true network is unknown)
+ *   - node with networkConfig === selected        → not a switch (preserve overrides)
+ *   - node with networkConfig !== selected        → SWITCH (drop the stale chain)
+ *
+ * On a switch the caller derives the chain block from the newly-selected
+ * network instead of the stale existing one (prevents a new-network/old-chain
+ * Frankenstein config); otherwise it preserves the existing chain field-merge.
+ * Pure + exported so the decision is unit-testable.
+ */
+export function isInitNetworkSwitch(
+  existingNetworkConfig: string | undefined,
+  selectedNetwork: string,
+): boolean {
+  const prior = existingNetworkConfig?.trim();
+  return !!prior && selectedNetwork !== prior;
+}
+
+/**
  * Pure builder for the `autoUpdate` block `dkg init` persists. Extracted from
  * the interactive wizard so it is unit-testable — the decline path (must write
  * `{ enabled: false }`, NOT fall through to the enabled network default) and
@@ -172,8 +197,12 @@ export function registerInitCommand(program: Command): void {
 
 program
   .command('init')
-  .description('Interactive setup — set node name, role, and relay')
+  .description('Interactive setup — set node name, network, role, and relay')
   .option('--role <role>', "Node role: 'edge' (default; personal laptop / behind NAT) or 'core' (24/7 relay / SLA)")
+  .option(
+    '--network <name>',
+    'Network to set up on (mainnet-gnosis | mainnet-base | testnet). Skips the interactive network prompt. Default for a fresh node: mainnet-gnosis.',
+  )
   .option(
     '--store <backend>',
     'Pre-fill the triple-store backend prompt (oxigraph | blazegraph | sparql-http).',
@@ -258,12 +287,13 @@ program
 
     await ensureDkgDir();
     const existing = await loadConfig();
-    const network = await loadNetworkConfig(existing.networkConfig);
-    const readiness = validateNetworkConfigReadiness(network);
-    if (!readiness.ok) {
-      for (const message of readiness.messages) console.error(message);
-      process.exit(1);
-    }
+    // Distinguish a genuinely fresh install (→ default mainnet) from a
+    // legacy node whose config predates `networkConfig` (→ testnet,
+    // preserved). `loadConfig` merges over defaults, so it can't tell us —
+    // probe the home directly (both json + yaml, like the daemon does).
+    const configExisted = existsSync(join(dkgDir(), 'config.json'))
+      || existsSync(join(dkgDir(), 'config.yaml'));
+
     const rl = createInterface({ input: process.stdin, output: process.stdout });
     const ask = (q: string, def?: string): Promise<string> =>
       new Promise(resolve => {
@@ -271,11 +301,62 @@ program
         rl.question(`${q}${suffix}: `, answer => resolve(answer.trim() || def || ''));
       });
 
-    if (network) {
-      console.log(`DKG Node Setup — ${network.networkName}\n`);
+    // DKG network selection — MUST run before loadNetworkConfig, because the
+    // chosen network drives every downstream default (role, relay, context
+    // graphs, auto-update, and the blockchain-config prompts below). Default:
+    // mainnet-gnosis for a fresh node, the existing network on re-init, and
+    // testnet for a legacy config that never set one. `--network` (or `-y`)
+    // skips the prompt.
+    const explicitNetwork = typeof opts.network === 'string' ? opts.network.trim() : '';
+    const networkDefault = resolveSetupNetworkName({
+      existingNetworkConfig: existing.networkConfig,
+      configExisted,
+    });
+    let selectedNetwork: string;
+    if (explicitNetwork) {
+      selectedNetwork = explicitNetwork;
+    } else if (opts.yes) {
+      selectedNetwork = networkDefault;
     } else {
-      console.log('DKG Node Setup\n');
+      // Numbered menu, matching the triple-store backend prompt's UX. Accepts
+      // either the number (1-3) or a typed network name; an out-of-range
+      // number falls back to the resolved default.
+      const networkLabels: Record<string, string> = {
+        'mainnet-gnosis': 'mainnet-gnosis  (Gnosis mainnet — default; xDAI gas)',
+        'mainnet-base':   'mainnet-base    (Base mainnet; ETH gas)',
+        'testnet':        'testnet         (Base Sepolia testnet — faucet-funded)',
+      };
+      const networks = SELECTABLE_SETUP_NETWORKS as readonly string[];
+      const defaultListed = networks.includes(networkDefault);
+      const defaultIdx = defaultListed ? networks.indexOf(networkDefault) : 0;
+      const defaultAnswer = defaultListed ? String(defaultIdx + 1) : networkDefault;
+      console.log('  DKG network:');
+      networks.forEach((n, i) => console.log(`    ${i + 1}) ${networkLabels[n] ?? n}`));
+      if (!defaultListed) {
+        console.log(`    (current: ${networkDefault} — press Enter to keep it, or type a number / network name)`);
+      }
+      const networkInput = await ask(`Choose (1-${networks.length})`, defaultAnswer);
+      selectedNetwork = /^\d+$/.test(networkInput)
+        ? (networks[parseInt(networkInput, 10) - 1] ?? networkDefault)
+        : networkInput;
     }
+
+    const network = await loadNetworkConfig(selectedNetwork);
+    if (!network) {
+      console.error(
+        `No bundled network config named "${selectedNetwork}". Common options: ${SELECTABLE_SETUP_NETWORKS.join(', ')}.`,
+      );
+      rl.close();
+      process.exit(1);
+    }
+    const readiness = validateNetworkConfigReadiness(network);
+    if (!readiness.ok) {
+      for (const message of readiness.messages) console.error(message);
+      rl.close();
+      process.exit(1);
+    }
+
+    console.log(`DKG Node Setup — ${network.networkName}\n`);
 
     const name = await ask('Node name', existing.name !== 'dkg-node' ? existing.name : undefined);
     // OT-RFC-41 Bundle B1d: `--role <edge|core>` flag short-circuits
@@ -388,7 +469,16 @@ program
     // Chain configuration. Field-merge: existing config wins per-field over
     // network defaults so an operator who's only customised RPC keeps that
     // override even after `dkg init` re-prompts.
-    const chainDefaults = resolveChainConfig(existing, network);
+    //
+    // EXCEPT on a network SWITCH (an existing node with an explicit
+    // networkConfig that differs from the selection): the existing `chain`
+    // block belongs to the OLD network (e.g. Base-mainnet hub/RPC/chainId) and
+    // must NOT pre-fill or persist — otherwise the node would run the new
+    // network's relays/genesis against the old chain (the Frankenstein config).
+    // See isInitNetworkSwitch — a fresh/legacy node is NOT a switch, so its
+    // chain field-merge (incl. operator RPC overrides) is preserved.
+    const isNetworkSwitch = isInitNetworkSwitch(existing.networkConfig, selectedNetwork);
+    const chainDefaults = resolveChainConfig(isNetworkSwitch ? undefined : existing, network);
     const defaultRpcUrl = chainDefaults?.rpcUrl;
     const defaultRpcUrls = chainDefaults?.rpcUrls?.join(', ') ?? '';
     const defaultHubAddress = chainDefaults?.hubAddress;
@@ -423,6 +513,10 @@ program
     const config = {
       ...existing,
       name: name || 'dkg-node',
+      // Persist the selected network explicitly (see resolveSetupNetworkName)
+      // so the node never silently follows a change to the project.json
+      // default — switching networks must be a deliberate act.
+      networkConfig: selectedNetwork,
       relay: (!existing.relay && relay === networkDefaultRelay) ? undefined : (relay || undefined),
       apiPort,
       nodeRole,
@@ -433,7 +527,9 @@ program
       // `existing.autoUpdate` on decline, silently discarding the persisted
       // disable — so a fresh-config operator who said "no" still auto-updated.
       autoUpdate,
-      chain: chainSection ?? existing.chain,
+      // On a network switch, never fall back to the stale existing chain
+      // block — let an empty chainSection inherit the new network's chain.
+      chain: isNetworkSwitch ? chainSection : (chainSection ?? existing.chain),
       auth: { enabled: enableAuth, tokens: existing.auth?.tokens },
       // Persist the chosen backend. `storeBlock === null` from the
       // wizard means "use the local default" — we explicitly clear any

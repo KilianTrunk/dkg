@@ -2221,27 +2221,33 @@ describe('@unit DKGStakingConvictionNFT', () => {
       expect(posAfter.cumulativeRewardsClaimed).to.equal(expectedReward);
     });
 
-    it('Alice cannot claim after transfer (reverts NotPositionOwner)', async () => {
+    it('Alice can trigger claim after transfer for Bob-owned rewards', async () => {
       const { identityId } = await createProfile();
       const amount = hre.ethers.parseEther('1000');
       await mintAndApprove(accounts[0], amount);
       await NFT.connect(accounts[0]).createConviction(identityId, amount, 12);
 
-      // Advance + inject so there's actual reward on the table — otherwise
-      // a revert at the ownership gate would be indistinguishable from a
-      // no-op window. This verifies the gate fires BEFORE the walk.
       const creationEpoch = await ChronosContract.getCurrentEpoch();
       await advanceEpochs(1);
       const scorePerStake36 = hre.ethers.parseEther('0.001');
       const nodeScore18 = hre.ethers.parseEther('100');
+      const pool = hre.ethers.parseEther('1000');
       await injectEpochRewardState(
         creationEpoch,
         identityId,
         scorePerStake36,
         nodeScore18,
         nodeScore18,
-        hre.ethers.parseEther('1000'),
+        pool,
       );
+      const expectedReward = computeReward(
+        (amount * SIX_X) / SCALE18,
+        scorePerStake36,
+        pool,
+        nodeScore18,
+        nodeScore18,
+      );
+      await fundVault(expectedReward);
 
       await NFT.connect(accounts[0]).transferFrom(
         accounts[0].address,
@@ -2249,11 +2255,16 @@ describe('@unit DKGStakingConvictionNFT', () => {
         1,
       );
 
-      // Alice no longer owns the NFT — wrapper-layer ownership gate fires.
-      await expect(NFT.connect(accounts[0]).claim(1)).to.be.revertedWithCustomError(
-        NFT,
-        'NotPositionOwner',
-      );
+      const rawBefore = (await ConvictionStakingStorageContract.getPosition(1)).raw;
+      const tx = await NFT.connect(accounts[0]).claim(1);
+      await expect(tx)
+        .to.emit(StakingV10Contract, 'RewardsClaimed')
+        .withArgs(1n, expectedReward);
+
+      expect(await NFT.ownerOf(1)).to.equal(accounts[4].address);
+      const posAfter = await ConvictionStakingStorageContract.getPosition(1);
+      expect(posAfter.raw).to.equal(rawBefore + expectedReward);
+      expect(posAfter.cumulativeRewardsClaimed).to.equal(expectedReward);
     });
 
     it('Alice cannot relock / redelegate / withdraw after transfer', async () => {

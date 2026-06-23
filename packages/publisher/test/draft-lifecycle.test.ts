@@ -6,13 +6,19 @@ import {
   TypedEventBus,
   generateEd25519Keypair,
   contextGraphAssertionUri,
+  contextGraphDataUri,
   contextGraphMetaUri,
   contextGraphSharedMemoryUri,
   contextGraphLayerUri,
   MemoryLayer,
   assertionLifecycleUri,
 } from '@origintrail-official/dkg-core';
-import { DKGPublisher, AssertionNotPersistedError } from '../src/index.js';
+import {
+  DKGPublisher,
+  AssertionNotPersistedError,
+  generatedPrivateCatalogFloorQuads,
+  generatedPrivateCatalogTripleKeys,
+} from '../src/index.js';
 import { ethers } from 'ethers';
 import { createEVMAdapter, getSharedContext, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 
@@ -182,6 +188,31 @@ describe('Working Memory Assertion Lifecycle', () => {
     if (swmResult.type === 'bindings') {
       expect(swmResult.bindings.length).toBe(3);
     }
+  });
+
+  it('promote strips generated private-CG catalog floor from SWM and WM when trusted', async () => {
+    const name = 'private-catalog-promote';
+    const cgDid = contextGraphDataUri(CG_ID);
+    await publisher.assertionCreate(CG_ID, name, AGENT);
+    await publisher.assertionWrite(CG_ID, name, AGENT, [
+      { subject: 'urn:test:entity:catalog-content', predicate: 'http://schema.org/name', object: '"Content"' },
+      ...generatedPrivateCatalogFloorQuads(CG_ID),
+    ]);
+
+    const result = await publisher.assertionPromote(CG_ID, name, AGENT, {
+      publisherPeerId: PEER,
+      trustedNonManifestCatalogTriples: generatedPrivateCatalogTripleKeys(CG_ID),
+    });
+
+    expect(result.promotedCount).toBe(1);
+    const swmCatalog = await store.query(
+      `SELECT ?p ?o WHERE { GRAPH <${SWM_GRAPH}> { <${cgDid}> ?p ?o } }`,
+    );
+    expect(swmCatalog.type).toBe('bindings');
+    if (swmCatalog.type === 'bindings') expect(swmCatalog.bindings).toHaveLength(0);
+
+    const remaining = await publisher.assertionQuery(CG_ID, name, AGENT);
+    expect(remaining).toHaveLength(0);
   });
 
   // Issue #864 — when the assertion data graph is empty but `_meta` says

@@ -9,7 +9,11 @@ import {
   DKG_ROOT_ENTITY_LEGACY,
 } from '@origintrail-official/dkg-core';
 import { OxigraphStore, type Quad } from '@origintrail-official/dkg-storage';
-import { DKGPublisher } from '../src/index.js';
+import {
+  DKGPublisher,
+  generatedPrivateCatalogFloorQuads,
+  generatedPrivateCatalogTripleKeys,
+} from '../src/index.js';
 import type { PublishResult } from '../src/publisher.js';
 
 const CONTEXT_GRAPH = 'publish-boundary';
@@ -173,6 +177,35 @@ describe('publishFromSharedMemory multi-root selection (OT-RFC-44 / Design B: on
     expect(publishSpy.calls[0][0].quads).toEqual([
       { subject: 'urn:test:root:one', predicate: 'http://schema.org/name', object: '"promoted"', graph: '' },
     ]);
+  });
+
+  it('loads selected data root plus generated private-CG catalog root and threads trusted floor', async () => {
+    const { publisher, store, publishSpy } = await makePublisher();
+    const cgDid = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
+    await store.insert([
+      q('urn:test:root:one'),
+      ...generatedPrivateCatalogFloorQuads(CONTEXT_GRAPH, SWM_GRAPH),
+    ]);
+
+    await expect(
+      publisher.publishFromSharedMemory(CONTEXT_GRAPH, {
+        rootEntities: ['urn:test:root:one', cgDid],
+      }, {
+        trustedNonManifestCatalogTriples: generatedPrivateCatalogTripleKeys(CONTEXT_GRAPH),
+      }),
+    ).resolves.toMatchObject({ status: 'tentative' });
+
+    expect(publishSpy.calls).toHaveLength(1);
+    const publishArgs = publishSpy.calls[0][0];
+    expect(publishArgs.trustedNonManifestCatalogTriples).toEqual(
+      generatedPrivateCatalogTripleKeys(CONTEXT_GRAPH),
+    );
+    expect(publishArgs.quads).toEqual(
+      expect.arrayContaining([
+        { subject: 'urn:test:root:one', predicate: 'http://schema.org/name', object: '"value"', graph: '' },
+        ...generatedPrivateCatalogFloorQuads(CONTEXT_GRAPH),
+      ]),
+    );
   });
 
   it('falls back to direct publish when SWM ACKs fail with NO_DATA_IN_SWM', async () => {

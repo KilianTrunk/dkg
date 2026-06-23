@@ -1,6 +1,7 @@
 import type { Quad } from '@origintrail-official/dkg-storage';
 import type { OnChainPublishResult } from '@origintrail-official/dkg-chain';
 import type { OperationContext } from '@origintrail-official/dkg-core';
+import type { TrustedCatalogTripleKeys } from './catalog-trust.js';
 
 export const DEFAULT_PUBLISH_EPOCHS = 12;
 /** PublishIntent encodes epochs as uint32; reject larger overrides before wire encoding. */
@@ -201,6 +202,12 @@ export interface PublishOptions {
    * this overrides contextGraphId as the ACK domain and on-chain contextGraphId.
    */
   publishContextGraphId?: string;
+  /**
+   * Internal/private-CG catalog path: exact generated catalog triples that ride
+   * in the KC Merkle root but are not user KA manifest roots. Public callers
+   * should not set this for arbitrary metadata.
+   */
+  trustedNonManifestCatalogTriples?: TrustedCatalogTripleKeys;
   /**
    * When true, the data is already in peers' SWM via shared memory gossip.
    * V10 ACK collection will NOT send inline staging quads — core nodes

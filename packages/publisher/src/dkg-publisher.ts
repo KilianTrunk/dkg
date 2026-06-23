@@ -7,6 +7,12 @@ import { GraphManager, PrivateContentStore } from '@origintrail-official/dkg-sto
 import { DEFAULT_PUBLISH_EPOCHS, MAX_PUBLISH_EPOCHS, type Publisher, type PublishOptions, type PublishResult, type KAManifestEntry, type PhaseCallback, type V10CoreNodeACK } from './publisher.js';
 import { skolemizeByEntity } from './auto-partition.js';
 import { canonicalPublishPayload } from './canonical-publish-payload.js';
+import {
+  assertTrustedCatalogTriplesAreGeneratedFloor,
+  catalogTripleKey,
+  splitTrustedGeneratedCatalogRootMap,
+  trustedCatalogTripleKeySet,
+} from './catalog-trust.js';
 import { partitionCatalogQuads, catalogCommittedLeaves, computeCatalogRoot, contextGraphCatalogUri, isAgentRegistryContextGraph } from '@origintrail-official/dkg-core';
 import { RESERVED_SUBJECT_PREFIXES, findReservedSubjectPrefix, isReservedSubject } from './reserved-subjects.js';
 import { skolemize } from './skolemize.js';
@@ -1245,6 +1251,7 @@ export class DKGPublisher implements Publisher {
       onChainContextGraphId?: string;
       contextGraphSignatures?: Array<{ identityId: bigint; r: Uint8Array; vs: Uint8Array }>;
       v10ACKProvider?: PublishOptions['v10ACKProvider'];
+      trustedNonManifestCatalogTriples?: PublishOptions['trustedNonManifestCatalogTriples'];
       subGraphName?: string;
       /**
        * Per-call override for the on-chain attribution target — see
@@ -1408,6 +1415,7 @@ export class DKGPublisher implements Publisher {
       operationCtx: ctx,
       onPhase: options?.onPhase,
       v10ACKProvider: options?.v10ACKProvider,
+      trustedNonManifestCatalogTriples: options?.trustedNonManifestCatalogTriples,
       publishContextGraphId: chainCgId ?? undefined,
       fromSharedMemory: true,
       subGraphName: options?.subGraphName,
@@ -1866,7 +1874,13 @@ export class DKGPublisher implements Publisher {
     onPhase?.('prepare:ensureContextGraph', 'end');
 
     onPhase?.('prepare:partition', 'start');
-    const canonical = canonicalPublishPayload(quads, privateQuads);
+    assertTrustedCatalogTriplesAreGeneratedFloor(
+      contextGraphId,
+      options.trustedNonManifestCatalogTriples,
+    );
+    const canonical = canonicalPublishPayload(quads, privateQuads, {
+      trustedNonManifestCatalogTriples: options.trustedNonManifestCatalogTriples,
+    });
     onPhase?.('prepare:partition', 'end');
 
     const manifestEntries: KAManifestEntry[] = [];
@@ -1914,7 +1928,15 @@ export class DKGPublisher implements Publisher {
     onPhase?.('prepare:validate', 'start');
     const publishOwnershipKey = options.subGraphName ? `${contextGraphId}\0${options.subGraphName}` : contextGraphId;
     const existing = this.ownedEntities.get(publishOwnershipKey) ?? new Set();
-    const validation = validatePublishRequest(allSkolemizedQuads, manifestEntries, contextGraphId, existing);
+    const validation = validatePublishRequest(
+      allSkolemizedQuads,
+      manifestEntries,
+      contextGraphId,
+      existing,
+      {
+        trustedNonManifestCatalogTriples: options.trustedNonManifestCatalogTriples,
+      },
+    );
     if (!validation.valid) {
       throw new Error(`Validation failed: ${validation.errors.join('; ')}`);
     }
@@ -3285,7 +3307,29 @@ export class DKGPublisher implements Publisher {
 
     onPhase?.('prepare', 'start');
     onPhase?.('prepare:partition', 'start');
+    assertTrustedCatalogTriplesAreGeneratedFloor(
+      contextGraphId,
+      options.trustedNonManifestCatalogTriples,
+    );
     const kaMap = skolemizeByEntity(quads);
+    const {
+      contentRootMap,
+      generatedCatalogRootEntities,
+    } = splitTrustedGeneratedCatalogRootMap(
+      kaMap,
+      options.trustedNonManifestCatalogTriples,
+    );
+    for (const rootEntity of generatedCatalogRootEntities) {
+      const hiddenPrivateQuads = privateQuads.filter(
+        (q) => q.subject === rootEntity || q.subject.startsWith(rootEntity + '/.well-known/genid/'),
+      );
+      if (hiddenPrivateQuads.length > 0) {
+        throw new Error(
+          `Generated catalog subject "${rootEntity}" has private triples; ` +
+          'refusing to exclude it from the KA manifest',
+        );
+      }
+    }
     onPhase?.('prepare:partition', 'end');
 
     onPhase?.('prepare:manifest', 'start');
@@ -3293,7 +3337,7 @@ export class DKGPublisher implements Publisher {
     const entityPrivateMap = new Map<string, Quad[]>();
 
     let tokenCounter = 1n;
-    for (const [rootEntity, publicQuads] of kaMap) {
+    for (const [rootEntity] of contentRootMap) {
       const entityPrivateQuads = privateQuads.filter(
         (q) => q.subject === rootEntity || q.subject.startsWith(rootEntity + '/.well-known/genid/'),
       );
@@ -3380,11 +3424,11 @@ export class DKGPublisher implements Publisher {
       // payload. Purging the union (and not just the new roots) is what
       // closes the leak described above.
       const rootsToPurge = new Set<string>(priorRootEntities);
-      for (const [rootEntity] of kaMap) rootsToPurge.add(rootEntity);
+      for (const [rootEntity] of contentRootMap) rootsToPurge.add(rootEntity);
       for (const rootEntity of rootsToPurge) {
         await this.privateStore.deletePrivateTriples(contextGraphId, rootEntity, options.subGraphName);
       }
-      for (const [rootEntity] of kaMap) {
+      for (const [rootEntity] of contentRootMap) {
         const entityPrivateQuads = entityPrivateMap.get(rootEntity) ?? [];
         if (entityPrivateQuads.length > 0) {
           await this.privateStore.storePrivateTriples(contextGraphId, rootEntity, entityPrivateQuads, options.subGraphName);
@@ -3431,7 +3475,7 @@ export class DKGPublisher implements Publisher {
         metaGraph: labelMeta,
         ual: ualForRestate,
         merkleRoot: kcMerkleRoot,
-        payloadByRoot: kaMap,
+        payloadByRoot: contentRootMap,
         privateRootByRoot: updatePrivateRootByRoot,
         version,
       });
@@ -3930,7 +3974,7 @@ export class DKGPublisher implements Publisher {
           ual,
           kaId,
           merkleRoot: kcMerkleRoot,
-          payloadByRoot: kaMap,
+          payloadByRoot: contentRootMap,
           privateRootByRoot,
           version: updateVersion,
         });
@@ -5314,6 +5358,7 @@ export class DKGPublisher implements Publisher {
       subGraphName?: string;
       publisherPeerId?: string;
       senderAgentAddress?: string;
+      trustedNonManifestCatalogTriples?: PublishOptions['trustedNonManifestCatalogTriples'];
       /**
        * Strict curator-ack gate (OT-RFC-49 curator-leader), same contract as
        * `ShareOptions.confirmBeforeCommit`: called after the gossip message is
@@ -5443,6 +5488,22 @@ export class DKGPublisher implements Publisher {
     quadsToPromote = quadsToPromote.filter(
       (q) => !isReservedSubject(q.subject) && !isTrustLevelQuad(q),
     );
+
+    assertTrustedCatalogTriplesAreGeneratedFloor(
+      contextGraphId,
+      opts?.trustedNonManifestCatalogTriples,
+    );
+    const trustedGeneratedCatalogTriples = trustedCatalogTripleKeySet(
+      opts?.trustedNonManifestCatalogTriples,
+    );
+    const trustedGeneratedCatalogQuads = trustedGeneratedCatalogTriples.size > 0
+      ? quadsToPromote.filter((q) => trustedGeneratedCatalogTriples.has(catalogTripleKey(q)))
+      : [];
+    if (trustedGeneratedCatalogQuads.length > 0) {
+      quadsToPromote = quadsToPromote.filter(
+        (q) => !trustedGeneratedCatalogTriples.has(catalogTripleKey(q)),
+      );
+    }
 
     if (opts?.entities && opts.entities !== 'all') {
       const entitySet = new Set(opts.entities);
@@ -5636,7 +5697,9 @@ export class DKGPublisher implements Publisher {
     const effectivePromoteQuads = skippedRoots.size > 0
       ? quadsToPromote.filter(q => !skippedRoots.has(q.subject) && !skippedRoots.has(q.subject.split('/.well-known/genid/')[0]))
       : quadsToPromote;
-    await this.store.delete(effectivePromoteQuads.map((q) => ({ ...q, graph: graphUri })));
+    await this.store.delete(
+      [...effectivePromoteQuads, ...trustedGeneratedCatalogQuads].map((q) => ({ ...q, graph: graphUri })),
+    );
 
     // Update the assertion's memory layer from WM → SWM in _meta
     const assertionMetaGraph = contextGraphMetaUri(contextGraphId);

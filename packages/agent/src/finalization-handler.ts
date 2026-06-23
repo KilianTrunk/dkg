@@ -16,8 +16,11 @@ import { GraphManager, type TripleStore, type Quad } from '@origintrail-official
 import { type ChainAdapter, type EventFilter } from '@origintrail-official/dkg-chain';
 import {
   computeFlatKCRootV10 as computeFlatKCRoot, skolemizeByEntity,
+  generatedPrivateCatalogFloorQuads,
+  generatedPrivateCatalogTripleKeys,
   generateConfirmedFullMetadata, buildDeterministicTokenRows, compareRootIris, getTentativeStatusQuad,
   generateSubGraphRegistration,
+  splitTrustedGeneratedCatalogRootMap,
   shouldApplyMaterialization, writeMaterializedVersion, withMaterializationLock,
   type MaterializedVersion,
   type KCMetadata, type KAMetadata, type OnChainProvenance,
@@ -192,9 +195,16 @@ export class FinalizationHandler {
 
       if (sharedMemoryQuads.length > 0) {
         const privateRoots = await this.getPrivateRootsFromMeta(contextGraphId, msg.rootEntities, subGraphName);
-        const merkleMatch = this.verifyMerkleMatch(sharedMemoryQuads, privateRoots, msg.kcMerkleRoot);
+        const allowGeneratedCatalogFloor = await this.allowsGeneratedCatalogFloor(ctxGraphId);
+        const merkleMatchedQuads = this.sharedMemoryQuadsMatchingMerkle(
+          contextGraphId,
+          sharedMemoryQuads,
+          privateRoots,
+          msg.kcMerkleRoot,
+          allowGeneratedCatalogFloor,
+        );
 
-        if (merkleMatch) {
+        if (merkleMatchedQuads) {
           const batchId = protoToBigInt(msg.batchId);
           // PR #845 review #9: derive `txIndex` from the verified receipt
           // (via `verifyOnChain`), NOT from gossip-supplied `msg.txIndex`.
@@ -258,7 +268,7 @@ export class FinalizationHandler {
             // `shouldApplyMaterialization` and `writeMaterializedVersion`.
             const outcome = await this.applyVerifiedFinalization({
               contextGraphId,
-              sharedMemoryQuads,
+              sharedMemoryQuads: merkleMatchedQuads,
               ual: msg.ual,
               rootEntities: msg.rootEntities,
               publisherAddress: msg.publisherAddress,
@@ -377,6 +387,41 @@ export class FinalizationHandler {
   private verifyMerkleMatch(sharedMemoryQuads: Quad[], privateRoots: Uint8Array[], expectedMerkleRoot: Uint8Array): boolean {
     const computedRoot = computeFlatKCRoot(sharedMemoryQuads, privateRoots);
     return ethers.hexlify(computedRoot) === ethers.hexlify(expectedMerkleRoot);
+  }
+
+  private sharedMemoryQuadsMatchingMerkle(
+    contextGraphId: string,
+    sharedMemoryQuads: Quad[],
+    privateRoots: Uint8Array[],
+    expectedMerkleRoot: Uint8Array,
+    allowGeneratedCatalogFloor: boolean,
+  ): Quad[] | null {
+    if (this.verifyMerkleMatch(sharedMemoryQuads, privateRoots, expectedMerkleRoot)) {
+      return sharedMemoryQuads;
+    }
+
+    if (!allowGeneratedCatalogFloor) return null;
+
+    const withGeneratedCatalog = [
+      ...sharedMemoryQuads,
+      ...generatedPrivateCatalogFloorQuads(contextGraphId),
+    ];
+    if (this.verifyMerkleMatch(withGeneratedCatalog, privateRoots, expectedMerkleRoot)) {
+      return withGeneratedCatalog;
+    }
+
+    return null;
+  }
+
+  private async allowsGeneratedCatalogFloor(onChainCgId: string | bigint | undefined): Promise<boolean> {
+    if (onChainCgId === undefined || onChainCgId === null) return false;
+    if (!this.chain || this.chain.chainId === 'none') return false;
+    if (typeof this.chain.getContextGraphAccessPolicy !== 'function') return false;
+    try {
+      return Number(await this.chain.getContextGraphAccessPolicy(BigInt(onChainCgId))) === 1;
+    } catch {
+      return false;
+    }
   }
 
   private async getPrivateRootsFromMeta(contextGraphId: string, rootEntities: string[], subGraphName?: string): Promise<Uint8Array[]> {
@@ -678,7 +723,12 @@ export class FinalizationHandler {
     // KC root and comparing to the chain root. This is the same flat-KC root
     // the gossip path verifies against, so a match is an authoritative
     // merkle verification.
-    const snapshot = await this.findSwmSnapshotForMerkleRoot(contextGraphId, merkleRoot, subGraphName);
+    const snapshot = await this.findSwmSnapshotForMerkleRoot(
+      contextGraphId,
+      merkleRoot,
+      subGraphName,
+      onChainCgId,
+    );
     if (!snapshot) {
       this.log.info(ctx, `Chain-reconcile: no local SWM snapshot matches the published merkleRoot for ${ual}; deferring to sweep retry`);
       return 'no-swm';
@@ -778,10 +828,17 @@ export class FinalizationHandler {
     contextGraphId: string,
     merkleRoot: Uint8Array,
     subGraphName?: string,
+    onChainCgId?: string,
   ): Promise<{ rootEntities: string[]; sharedMemoryQuads: Quad[]; subGraphName?: string } | null> {
+    const allowGeneratedCatalogFloor = await this.allowsGeneratedCatalogFloor(onChainCgId);
     // Caller knows the exact namespace → search only that one.
     if (subGraphName) {
-      const hit = await this.findSwmSnapshotInNamespace(contextGraphId, merkleRoot, subGraphName);
+      const hit = await this.findSwmSnapshotInNamespace(
+        contextGraphId,
+        merkleRoot,
+        subGraphName,
+        allowGeneratedCatalogFloor,
+      );
       return hit ? { ...hit, subGraphName } : null;
     }
 
@@ -791,7 +848,12 @@ export class FinalizationHandler {
     // forever because its SWM snapshot lives under a sub-graph meta graph,
     // not the root workspace meta. Return the namespace we matched in so the
     // caller promotes into the correct data graph.
-    const rootHit = await this.findSwmSnapshotInNamespace(contextGraphId, merkleRoot, undefined);
+    const rootHit = await this.findSwmSnapshotInNamespace(
+      contextGraphId,
+      merkleRoot,
+      undefined,
+      allowGeneratedCatalogFloor,
+    );
     if (rootHit) return { ...rootHit, subGraphName: undefined };
 
     let subGraphNames: string[] = [];
@@ -799,7 +861,12 @@ export class FinalizationHandler {
       subGraphNames = await new GraphManager(this.store).listSubGraphs(contextGraphId);
     } catch { /* no sub-graphs / store can't enumerate */ }
     for (const sg of subGraphNames) {
-      const hit = await this.findSwmSnapshotInNamespace(contextGraphId, merkleRoot, sg);
+      const hit = await this.findSwmSnapshotInNamespace(
+        contextGraphId,
+        merkleRoot,
+        sg,
+        allowGeneratedCatalogFloor,
+      );
       if (hit) return { ...hit, subGraphName: sg };
     }
     return null;
@@ -814,6 +881,7 @@ export class FinalizationHandler {
     contextGraphId: string,
     merkleRoot: Uint8Array,
     subGraphName?: string,
+    allowGeneratedCatalogFloor = false,
   ): Promise<{ rootEntities: string[]; sharedMemoryQuads: Quad[] } | null> {
     const graphManager = new GraphManager(this.store);
     const wsMetaGraph = subGraphName
@@ -850,8 +918,15 @@ export class FinalizationHandler {
       const sharedMemoryQuads = await this.getSharedMemoryQuadsForRoots(contextGraphId, roots, subGraphName);
       if (sharedMemoryQuads.length === 0) continue;
       const privateRoots = await this.getPrivateRootsFromMeta(contextGraphId, roots, subGraphName);
-      if (this.verifyMerkleMatch(sharedMemoryQuads, privateRoots, merkleRoot)) {
-        return { rootEntities: roots, sharedMemoryQuads };
+      const merkleMatchedQuads = this.sharedMemoryQuadsMatchingMerkle(
+        contextGraphId,
+        sharedMemoryQuads,
+        privateRoots,
+        merkleRoot,
+        allowGeneratedCatalogFloor,
+      );
+      if (merkleMatchedQuads) {
+        return { rootEntities: roots, sharedMemoryQuads: merkleMatchedQuads };
       }
     }
     return null;
@@ -1094,7 +1169,20 @@ export class FinalizationHandler {
     if (msgRootEntities.length > 0) {
       const msgSet = new Set(msgRootEntities);
       const extraInMsg = msgRootEntities.filter(r => !localRootSet.has(r));
-      const missingInMsg = [...localRootSet].filter(r => !msgSet.has(r));
+      let generatedCatalogRootSet = new Set<string>();
+      try {
+        generatedCatalogRootSet = new Set(
+          splitTrustedGeneratedCatalogRootMap(
+            partitioned,
+            generatedPrivateCatalogTripleKeys(contextGraphId),
+          ).generatedCatalogRootEntities,
+        );
+      } catch {
+        generatedCatalogRootSet = new Set<string>();
+      }
+      const missingInMsg = [...localRootSet].filter(
+        r => !msgSet.has(r) && !generatedCatalogRootSet.has(r),
+      );
       if (extraInMsg.length > 0 || missingInMsg.length > 0) {
         this.log.warn(ctx, `Finalization: root entity set mismatch — extra in msg: [${extraInMsg.join(', ')}], missing: [${missingInMsg.join(', ')}]`);
       }

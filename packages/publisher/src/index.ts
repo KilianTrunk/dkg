@@ -6,7 +6,18 @@ export {
   canonicalPublishPayload,
   type CanonicalPublishPayload,
   type CanonicalManifestEntry,
+  type CanonicalPublishPayloadOptions,
 } from './canonical-publish-payload.js';
+export {
+  assertTrustedCatalogTriplesAreGeneratedFloor,
+  catalogTripleKey,
+  generatedPrivateCatalogFloorQuads,
+  generatedPrivateCatalogTripleKeys,
+  splitTrustedGeneratedCatalogRootMap,
+  trustedCatalogTripleKeySet,
+  type TrustedCatalogTripleKeys,
+  type TrustedCatalogRootSplit,
+} from './catalog-trust.js';
 export { resolveLiftWorkspaceSlice } from './workspace-resolution.js';
 export {
   computeTripleHash,

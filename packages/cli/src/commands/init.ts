@@ -318,10 +318,27 @@ program
     } else if (opts.yes) {
       selectedNetwork = networkDefault;
     } else {
-      selectedNetwork = await ask(
-        `DKG network (${SELECTABLE_SETUP_NETWORKS.join(' / ')})`,
-        networkDefault,
-      );
+      // Numbered menu, matching the triple-store backend prompt's UX. Accepts
+      // either the number (1-3) or a typed network name; an out-of-range
+      // number falls back to the resolved default.
+      const networkLabels: Record<string, string> = {
+        'mainnet-gnosis': 'mainnet-gnosis  (Gnosis mainnet — default; xDAI gas)',
+        'mainnet-base':   'mainnet-base    (Base mainnet; ETH gas)',
+        'testnet':        'testnet         (Base Sepolia testnet — faucet-funded)',
+      };
+      const networks = SELECTABLE_SETUP_NETWORKS as readonly string[];
+      const defaultListed = networks.includes(networkDefault);
+      const defaultIdx = defaultListed ? networks.indexOf(networkDefault) : 0;
+      const defaultAnswer = defaultListed ? String(defaultIdx + 1) : networkDefault;
+      console.log('  DKG network:');
+      networks.forEach((n, i) => console.log(`    ${i + 1}) ${networkLabels[n] ?? n}`));
+      if (!defaultListed) {
+        console.log(`    (current: ${networkDefault} — press Enter to keep it, or type a number / network name)`);
+      }
+      const networkInput = await ask(`Choose (1-${networks.length})`, defaultAnswer);
+      selectedNetwork = /^\d+$/.test(networkInput)
+        ? (networks[parseInt(networkInput, 10) - 1] ?? networkDefault)
+        : networkInput;
     }
 
     const network = await loadNetworkConfig(selectedNetwork);

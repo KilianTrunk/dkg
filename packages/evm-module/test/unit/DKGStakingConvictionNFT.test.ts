@@ -2580,6 +2580,13 @@ describe('@unit DKGStakingConvictionNFT', () => {
     });
   });
 
+  describe('version()', () => {
+    it('reports the permissionless-claim wrapper version while StakingV10 stays stable', async () => {
+      expect(await NFT.version()).to.equal('10.0.4');
+      expect(await StakingV10Contract.version()).to.equal('10.0.4');
+    });
+  });
+
   // ------------------------------------------------------------
   // CCO-8 — Code-review follow-ups (L1 / L2 / L8 / M5).
   // ------------------------------------------------------------

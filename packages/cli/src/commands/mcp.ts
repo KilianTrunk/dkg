@@ -191,15 +191,6 @@ mcpCmd
       console.error(`  Reason: ${err?.message ?? err}`);
       process.exit(1);
     }
-    let agentExports: typeof import('@origintrail-official/dkg-agent');
-    try {
-      agentExports = await import('@origintrail-official/dkg-agent');
-    } catch (err: any) {
-      console.error('\n[dkg mcp setup] Wallet primitive (dkg-agent) is not available.');
-      console.error(`  Reason: ${err?.message ?? err}`);
-      process.exit(1);
-    }
-
     const { mcpSetupAction } = await import('../mcp-setup.js');
     try {
       await mcpSetupAction(opts, {
@@ -208,7 +199,15 @@ mcpCmd
         startDaemon: openclawSetupExports.startDaemon,
         readWalletsWithRetry: openclawSetupExports.readWalletsWithRetry,
         logManualFundingInstructions: openclawSetupExports.logManualFundingInstructions,
-        loadOpWallets: agentExports.loadOpWallets,
+        // Lazy + best-effort (parity with openclaw/hermes): dkg-agent is
+        // imported only inside the non-dry-run wallet step, so `--print-only`
+        // / `--dry-run` never require it, and an import failure degrades to a
+        // warning (mcpSetupAction wraps the call in try/catch) instead of
+        // aborting setup.
+        loadOpWallets: async (dir: string) => {
+          const { loadOpWallets } = await import('@origintrail-official/dkg-agent');
+          return loadOpWallets(dir);
+        },
         requestFaucetFunding: coreExports.requestFaucetFunding,
         findDkgMonorepoRoot: coreExports.findDkgMonorepoRoot,
         resolveDkgConfigHome: coreExports.resolveDkgConfigHome,

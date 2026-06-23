@@ -502,6 +502,21 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     expect((dryDeps.loadOpWallets as any).calls).toEqual([]);
   });
 
+  it('#1306: a failing loadOpWallets is best-effort — setup continues', async () => {
+    mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
+    const deps = makeDeps({
+      loadOpWallets: recorder(async () => { throw new Error('boom'); }),
+    });
+
+    // A throwing wallet pre-create must NOT abort setup — the daemon still
+    // starts and clients still register.
+    await mcpSetupAction({ fund: false, verify: false }, deps);
+
+    expect((deps.loadOpWallets as any).calls).toHaveLength(1);
+    expect((deps.startDaemon as any).calls).toHaveLength(1);
+    expect(existsSync(join(tmpHome, '.cursor', 'mcp.json'))).toBe(true);
+  });
+
   it('honours --print-only: short-circuits before any other step', async () => {
     const deps = makeDeps();
     const stdoutSpy = captureWrites(process.stdout, 'write');

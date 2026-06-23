@@ -490,4 +490,48 @@ describe('runSetup Step 5 — faucet funding', () => {
     }
   });
 
+  it('#1306: a failing loadOpWallets is best-effort — setup still completes', async () => {
+    const env = setupFaucetEnv();
+    try {
+      const loadOpWallets = vi.fn(async () => { throw new Error('boom'); });
+      // Wallet pre-creation is best-effort; a throw must NOT abort setup.
+      await expect(
+        runSetup(
+          { workspace: env.workspace, network: 'testnet', start: false, verify: false, fund: false },
+          { loadOpWallets },
+        ),
+      ).resolves.toBeUndefined();
+      expect(loadOpWallets).toHaveBeenCalledTimes(1);
+    } finally {
+      env.restore();
+    }
+  });
+
+  it('#1306: eager-created wallets feed the faucet (pre-creation runs before funding)', async () => {
+    const env = setupFaucetEnv();
+    // Remove the pre-seeded wallets so ONLY the hook can provide them — proves
+    // the hook writes wallets.json BEFORE the funding step reads it.
+    rmSync(join(env.dkgHome, 'wallets.json'));
+    try {
+      const loadOpWallets = vi.fn(async (dir: string) => {
+        const cfg = {
+          adminWallet: { address: '0xADMIN', privateKey: '0x0' },
+          wallets: [{ address: '0xOP1', privateKey: '0x0' }],
+        };
+        writeFileSync(join(dir, 'wallets.json'), JSON.stringify(cfg));
+        return cfg;
+      });
+      await runSetup(
+        { workspace: env.workspace, network: 'testnet', start: false, verify: false },
+        { loadOpWallets },
+      );
+      // The faucet now finds the eager-created wallets and funds them.
+      expect(requestFaucetFunding).toHaveBeenCalledTimes(1);
+      const [, , addresses] = vi.mocked(requestFaucetFunding).mock.calls[0];
+      expect(addresses).toEqual(['0xADMIN', '0xOP1']);
+    } finally {
+      env.restore();
+    }
+  });
+
 });

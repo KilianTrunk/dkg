@@ -761,7 +761,12 @@ export async function runHermesSetup(
     try {
       await deps.loadOpWallets(dkgConfigHome);
     } catch (err: any) {
-      warnings.push(`Could not pre-create wallets (${err?.message ?? String(err)}); the daemon will generate them on first start.`);
+      // Informational only — emit via console.warn (NOT the status-bearing
+      // `warnings` array) so a best-effort, daemon-recoverable wallet
+      // pre-creation failure does not flip an otherwise-clean setup to
+      // `degraded`. Matches openclaw (`warn()`)/mcp and the `--network ignored`
+      // precedent above.
+      console.warn(`[hermes-setup] Could not pre-create wallets (${err?.message ?? String(err)}); the daemon will generate them on first start.`);
     }
   }
 

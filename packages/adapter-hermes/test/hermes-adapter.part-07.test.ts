@@ -24,6 +24,7 @@ import {
   runDisconnect,
   runReconnect,
   resolveHermesProfile,
+  runHermesSetup,
   runSetup,
   runUninstall,
   runVerify,
@@ -106,6 +107,39 @@ describe('Hermes profile setup helpers', () => {
       loadOpWallets.mockClear();
       await runSetup({ hermesHome, verify: false, start: false, fund: false, dryRun: true }, { loadOpWallets });
       expect(loadOpWallets).not.toHaveBeenCalled();
+    } finally {
+      if (oldDkgHome === undefined) delete process.env.DKG_HOME;
+      else process.env.DKG_HOME = oldDkgHome;
+      rmSync(hermesHome, { recursive: true, force: true });
+      rmSync(dkgHome, { recursive: true, force: true });
+    }
+  });
+
+  // issue #1306 — a failing wallet pre-creation is best-effort and must NOT push
+  // into the status-bearing `warnings[]` (which would flip the integration to
+  // `degraded` in the daemon-UI). It goes to console.warn instead. Call
+  // runHermesSetup directly to observe `result.warnings`.
+  it('#1306: a failing loadOpWallets does not flip setup to degraded (console.warn channel)', async () => {
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-profile-'));
+    const dkgHome = mkdtempSync(join(tmpdir(), 'dkg-home-1306f-'));
+    vi.stubGlobal('fetch', async () =>
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    const oldDkgHome = process.env.DKG_HOME;
+    process.env.DKG_HOME = dkgHome;
+    try {
+      const loadOpWallets = vi.fn(async () => { throw new Error('boom'); });
+      const result = await runHermesSetup(
+        { hermesHome, verify: false, start: false, fund: false },
+        { loadOpWallets },
+      );
+      expect(loadOpWallets).toHaveBeenCalledTimes(1);
+      // The wallet failure must NOT appear in the status-bearing warnings/errors.
+      expect(result.warnings.join('\n')).not.toContain('pre-create wallets');
+      expect(result.errors.join('\n')).not.toContain('pre-create wallets');
     } finally {
       if (oldDkgHome === undefined) delete process.env.DKG_HOME;
       else process.env.DKG_HOME = oldDkgHome;

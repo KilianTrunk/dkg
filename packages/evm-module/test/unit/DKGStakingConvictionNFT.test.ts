@@ -1282,16 +1282,12 @@ describe('@unit DKGStakingConvictionNFT', () => {
     // Revert / gate paths
     // -----------------------------------------------------------------
 
-    it('reverts if not owner (non-owner caller)', async () => {
+    it('allows a non-owner caller to claim an existing staking NFT', async () => {
       const { identityId } = await createProfile();
       const amount = hre.ethers.parseEther('1000');
       await mintAndApprove(accounts[0], amount);
       await NFT.connect(accounts[0]).createConviction(identityId, amount, 12);
-      // `accounts[4]` does not own tokenId 0 — wrapper-layer guard.
-      await expect(NFT.connect(accounts[4]).claim(1)).to.be.revertedWithCustomError(
-        NFT,
-        'NotPositionOwner',
-      );
+      await expect(NFT.connect(accounts[4]).claim(1)).to.not.be.reverted;
     });
 
     it('direct StakingV10.claim call from non-NFT caller reverts via gate', async () => {

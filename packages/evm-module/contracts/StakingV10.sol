@@ -716,11 +716,7 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
      *        4. `cs.setLastClaimedEpoch(tokenId, toEpoch)` — advance cursor.
      *      No StakingStorage writes.
      */
-    function claim(
-        address staker,
-        uint256 tokenId
-    ) external onlyConvictionNFT {
-        staker;
+    function claim(uint256 tokenId) external onlyConvictionNFT {
         _claim(tokenId);
     }
 

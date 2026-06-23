@@ -518,9 +518,9 @@ contract DKGStakingConvictionNFT is IVersioned, ContractStatus, IInitializable, 
     ///         rewards are not routed to the caller.
     function claim(uint256 tokenId) external {
         // `ownerOf` is intentionally used as the live-token guard: it reverts
-        // for nonexistent or burned token IDs. `StakingV10.claim` ignores the
-        // address argument; reward attribution is tokenId-keyed.
-        stakingV10.claim(ownerOf(tokenId), tokenId);
+        // for nonexistent or burned token IDs.
+        ownerOf(tokenId);
+        stakingV10.claim(tokenId);
         // No wrapper-layer event — `StakingV10.claim` emits `RewardsClaimed`
         // with the amount already. The NFT layer does not duplicate reward
         // accounting events.

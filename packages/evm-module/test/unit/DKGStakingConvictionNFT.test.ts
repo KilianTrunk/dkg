@@ -1325,7 +1325,7 @@ describe('@unit DKGStakingConvictionNFT', () => {
       await mintAndApprove(accounts[0], amount);
       await NFT.connect(accounts[0]).createConviction(identityId, amount, 12);
       await expect(
-        StakingV10Contract.connect(accounts[0]).claim(accounts[0].address, 0),
+        StakingV10Contract.connect(accounts[0]).claim(0),
       ).to.be.revertedWithCustomError(StakingV10Contract, 'OnlyConvictionNFT');
     });
 

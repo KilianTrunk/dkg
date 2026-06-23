@@ -471,11 +471,6 @@
   {
     "inputs": [
       {
-        "internalType": "address",
-        "name": "staker",
-        "type": "address"
-      },
-      {
         "internalType": "uint256",
         "name": "tokenId",
         "type": "uint256"

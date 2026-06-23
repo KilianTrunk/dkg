@@ -1278,20 +1278,45 @@ describe('@unit DKGStakingConvictionNFT', () => {
       expect(vaultBalance).to.be.gte(totalStake);
     };
 
+    const expectNonOwnerMutationGatesAfterClaim = async (
+      tokenId: bigint | number,
+      newIdentityId: number,
+    ) => {
+      const nonOwner = accounts[4];
+
+      await expect(NFT.connect(nonOwner).claim(tokenId)).to.not.be.reverted;
+      await expect(
+        NFT.connect(nonOwner).withdraw(tokenId),
+      ).to.be.revertedWithCustomError(NFT, 'NotPositionOwner');
+      await expect(
+        NFT.connect(nonOwner).relock(tokenId, 3),
+      ).to.be.revertedWithCustomError(NFT, 'NotPositionOwner');
+      await expect(
+        NFT.connect(nonOwner).redelegate(tokenId, newIdentityId),
+      ).to.be.revertedWithCustomError(NFT, 'NotPositionOwner');
+    };
+
     // -----------------------------------------------------------------
     // Revert / gate paths
     // -----------------------------------------------------------------
 
-    it('reverts if not owner (non-owner caller)', async () => {
+    it('allows a non-owner caller to claim an existing staking NFT', async () => {
       const { identityId } = await createProfile();
       const amount = hre.ethers.parseEther('1000');
       await mintAndApprove(accounts[0], amount);
       await NFT.connect(accounts[0]).createConviction(identityId, amount, 12);
-      // `accounts[4]` does not own tokenId 0 — wrapper-layer guard.
-      await expect(NFT.connect(accounts[4]).claim(1)).to.be.revertedWithCustomError(
-        NFT,
-        'NotPositionOwner',
-      );
+      await expect(NFT.connect(accounts[4]).claim(1)).to.not.be.reverted;
+    });
+
+    it('keeps stake-moving mutations owner-only after a non-owner claim', async () => {
+      const { identityId } = await createProfile();
+      const { identityId: newIdentityId } = await createProfile(accounts[0], accounts[2]);
+      const amount = hre.ethers.parseEther('1000');
+      await mintAndApprove(accounts[0], amount);
+      await NFT.connect(accounts[0]).createConviction(identityId, amount, 1);
+      await advanceEpochs(2);
+
+      await expectNonOwnerMutationGatesAfterClaim(1, newIdentityId);
     });
 
     it('direct StakingV10.claim call from non-NFT caller reverts via gate', async () => {
@@ -1300,8 +1325,45 @@ describe('@unit DKGStakingConvictionNFT', () => {
       await mintAndApprove(accounts[0], amount);
       await NFT.connect(accounts[0]).createConviction(identityId, amount, 12);
       await expect(
-        StakingV10Contract.connect(accounts[0]).claim(accounts[0].address, 0),
+        StakingV10Contract.connect(accounts[0]).claim(0),
       ).to.be.revertedWithCustomError(StakingV10Contract, 'OnlyConvictionNFT');
+    });
+
+    it('rejects a nonexistent token id at the NFT boundary without advancing a live cursor', async () => {
+      const { identityId } = await createProfile();
+      const amount = hre.ethers.parseEther('1000');
+      await mintAndApprove(accounts[0], amount);
+      await NFT.connect(accounts[0]).createConviction(identityId, amount, 12);
+      await advanceEpochs(1);
+
+      const posBefore = await ConvictionStakingStorageContract.getPosition(1);
+      await expect(
+        NFT.connect(accounts[4]).claim(2),
+      ).to.be.revertedWithCustomError(NFT, 'ERC721NonexistentToken').withArgs(2n);
+
+      const posAfter = await ConvictionStakingStorageContract.getPosition(1);
+      expect(posAfter.lastClaimedEpoch).to.equal(posBefore.lastClaimedEpoch);
+    });
+
+    it('rejects a burned token id at the NFT boundary without advancing the replacement cursor', async () => {
+      const { identityId } = await createProfile();
+      const amount = hre.ethers.parseEther('1000');
+      await mintAndApprove(accounts[0], amount);
+      await NFT.connect(accounts[0]).createConviction(identityId, amount, 1);
+      await advanceEpochs(2);
+      await NFT.connect(accounts[0]).claim(1);
+
+      const newTokenId = await NFT.connect(accounts[0]).relock.staticCall(1, 12);
+      await NFT.connect(accounts[0]).relock(1, 12);
+      await advanceEpochs(1);
+
+      const posBefore = await ConvictionStakingStorageContract.getPosition(newTokenId);
+      await expect(
+        NFT.connect(accounts[4]).claim(1),
+      ).to.be.revertedWithCustomError(NFT, 'ERC721NonexistentToken').withArgs(1n);
+
+      const posAfter = await ConvictionStakingStorageContract.getPosition(newTokenId);
+      expect(posAfter.lastClaimedEpoch).to.equal(posBefore.lastClaimedEpoch);
     });
 
     // -----------------------------------------------------------------
@@ -1357,6 +1419,31 @@ describe('@unit DKGStakingConvictionNFT', () => {
       // Totals unchanged.
       expect(await ConvictionStakingStorageContract.getNodeStakeV10(identityId)).to.equal(nodeStakeBefore);
       expect(await ConvictionStakingStorageContract.totalStakeV10()).to.equal(totalStakeBefore);
+    });
+
+    it('no-op: non-owner zero scorePerStake claim advances lastClaimedEpoch but emits nothing', async () => {
+      const { identityId } = await createProfile();
+      const amount = hre.ethers.parseEther('1000');
+      await mintAndApprove(accounts[0], amount);
+      await NFT.connect(accounts[0]).createConviction(identityId, amount, 12);
+      await advanceEpochs(1);
+
+      const posBefore = await ConvictionStakingStorageContract.getPosition(1);
+      const nodeStakeBefore = await ConvictionStakingStorageContract.getNodeStakeV10(identityId);
+      const totalStakeBefore = await ConvictionStakingStorageContract.totalStakeV10();
+
+      const tx = await NFT.connect(accounts[4]).claim(1);
+      await expect(tx).to.not.emit(StakingV10Contract, 'RewardsClaimed');
+
+      const posAfter = await ConvictionStakingStorageContract.getPosition(1);
+      const currentEpoch = await ChronosContract.getCurrentEpoch();
+      expect(posAfter.lastClaimedEpoch).to.equal(currentEpoch - 1n);
+      expect(posAfter.lastClaimedEpoch).to.equal(posBefore.lastClaimedEpoch + 1n);
+      expect(posAfter.raw).to.equal(posBefore.raw);
+      expect(posAfter.cumulativeRewardsClaimed).to.equal(posBefore.cumulativeRewardsClaimed);
+      expect(await ConvictionStakingStorageContract.getNodeStakeV10(identityId)).to.equal(nodeStakeBefore);
+      expect(await ConvictionStakingStorageContract.totalStakeV10()).to.equal(totalStakeBefore);
+      expect(await NFT.ownerOf(1)).to.equal(accounts[0].address);
     });
 
     // -----------------------------------------------------------------
@@ -2225,27 +2312,33 @@ describe('@unit DKGStakingConvictionNFT', () => {
       expect(posAfter.cumulativeRewardsClaimed).to.equal(expectedReward);
     });
 
-    it('Alice cannot claim after transfer (reverts NotPositionOwner)', async () => {
+    it('Alice can trigger claim after transfer for Bob-owned rewards', async () => {
       const { identityId } = await createProfile();
       const amount = hre.ethers.parseEther('1000');
       await mintAndApprove(accounts[0], amount);
       await NFT.connect(accounts[0]).createConviction(identityId, amount, 12);
 
-      // Advance + inject so there's actual reward on the table — otherwise
-      // a revert at the ownership gate would be indistinguishable from a
-      // no-op window. This verifies the gate fires BEFORE the walk.
       const creationEpoch = await ChronosContract.getCurrentEpoch();
       await advanceEpochs(1);
       const scorePerStake36 = hre.ethers.parseEther('0.001');
       const nodeScore18 = hre.ethers.parseEther('100');
+      const pool = hre.ethers.parseEther('1000');
       await injectEpochRewardState(
         creationEpoch,
         identityId,
         scorePerStake36,
         nodeScore18,
         nodeScore18,
-        hre.ethers.parseEther('1000'),
+        pool,
       );
+      const expectedReward = computeReward(
+        (amount * SIX_X) / SCALE18,
+        scorePerStake36,
+        pool,
+        nodeScore18,
+        nodeScore18,
+      );
+      await fundVault(expectedReward);
 
       await NFT.connect(accounts[0]).transferFrom(
         accounts[0].address,
@@ -2253,11 +2346,16 @@ describe('@unit DKGStakingConvictionNFT', () => {
         1,
       );
 
-      // Alice no longer owns the NFT — wrapper-layer ownership gate fires.
-      await expect(NFT.connect(accounts[0]).claim(1)).to.be.revertedWithCustomError(
-        NFT,
-        'NotPositionOwner',
-      );
+      const rawBefore = (await ConvictionStakingStorageContract.getPosition(1)).raw;
+      const tx = await NFT.connect(accounts[0]).claim(1);
+      await expect(tx)
+        .to.emit(StakingV10Contract, 'RewardsClaimed')
+        .withArgs(1n, expectedReward);
+
+      expect(await NFT.ownerOf(1)).to.equal(accounts[4].address);
+      const posAfter = await ConvictionStakingStorageContract.getPosition(1);
+      expect(posAfter.raw).to.equal(rawBefore + expectedReward);
+      expect(posAfter.cumulativeRewardsClaimed).to.equal(expectedReward);
     });
 
     it('Alice cannot relock / redelegate / withdraw after transfer', async () => {
@@ -2479,6 +2577,13 @@ describe('@unit DKGStakingConvictionNFT', () => {
       expect((await ConvictionStakingStorageContract.getPosition(2)).multiplier18).to.equal(
         THREE_AND_HALF_X,
       );
+    });
+  });
+
+  describe('version()', () => {
+    it('reports the permissionless-claim wrapper version while StakingV10 stays stable', async () => {
+      expect(await NFT.version()).to.equal('10.0.4');
+      expect(await StakingV10Contract.version()).to.equal('10.0.4');
     });
   });
 

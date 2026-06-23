@@ -32,7 +32,7 @@ import {HubLib} from "./libraries/HubLib.sol";
  *
  * @dev V10 split-contract architecture. This contract is a dumb ERC-721
  *      ownership receipt: it mints/burns tokens, validates ownership on
- *      mutating calls, and forwards every business action to `StakingV10`.
+ *      stake-moving calls, and forwards every business action to `StakingV10`.
  *      All stake / withdrawal / reward / migration logic lives in
  *      `StakingV10`, gated by `onlyConvictionNFT` so only this wrapper can
  *      invoke it. TRAC never touches this contract: users approve
@@ -92,10 +92,11 @@ contract DKGStakingConvictionNFT is IVersioned, ContractStatus, IInitializable, 
     //           points and events.
     //         * L8 — `identityId != 0` guard added on mint paths so
     //           ambiguous "zero-node" mints fail fast at the wrapper.
-    //         * 10.0.3 — operator-fee migration: added
-    //           `adminDrainOperatorFeesBatch` + `OperatorFeeMigrated`; bumped so
-    //           the breaking migration ABI is detectable via `version()`.
-    string private constant _VERSION = "10.0.3";
+    // 10.0.3 — operator-fee migration: added
+    //          `adminDrainOperatorFeesBatch` + `OperatorFeeMigrated`; bumped so
+    //          the breaking migration ABI is detectable via `version()`.
+    // 10.0.4 — `claim` is permissionless; owner remains the reward beneficiary.
+    string private constant _VERSION = "10.0.4";
 
     // ========================================================================
     // Constants
@@ -358,12 +359,13 @@ contract DKGStakingConvictionNFT is IVersioned, ContractStatus, IInitializable, 
     // state machine, V8 migration) lives in `StakingV10`, which is gated by
     // `onlyConvictionNFT` so only this contract can invoke it. Each wrapper:
     //
-    //   1. Validates ownership (`ownerOf == msg.sender`) on mutating calls.
+    //   1. Validates ownership (`ownerOf == msg.sender`) on stake-moving calls;
+    //      claim is permissionless and rewards compound into the tokenId-keyed
+    //      NFT position.
     //   2. For mint paths, fails fast on `lockTier` via `_convictionMultiplier`.
     //   3. Mints / burns the ERC-721 token as needed.
-    //   4. Forwards to the matching `StakingV10` method with `msg.sender`
-    //      passed explicitly as the `staker` argument (StakingV10 never
-    //      trusts `tx.origin`).
+    //   4. Forwards to the matching `StakingV10` method with the staker
+    //      passed explicitly for owner actions.
     //   5. Emits a wrapper-layer mirror event for NFT-contract watchers —
     //      the authoritative event for off-chain accounting comes from the
     //      `StakingV10` / `ConvictionStakingStorage` layer.
@@ -498,8 +500,9 @@ contract DKGStakingConvictionNFT is IVersioned, ContractStatus, IInitializable, 
         // CEI ordering — the receipt NFT is dropped BEFORE the CSS
         // teardown + TRAC payout run, so the on-chain ownership claim
         // ends before any external token movement. ownerOf-gated
-        // re-entry paths on this contract (claim / withdraw / relock /
-        // redelegate) revert at the entry ownership check.
+        // re-entry paths on this contract (withdraw / relock / redelegate)
+        // revert at the entry ownership check; claim reverts at ownerOf
+        // because the receipt is already burned.
         // StakingV10.withdraw gates on the CSS position (`pos.identityId
         // == 0`), not NFT existence, so the teardown is unaffected.
         _burn(tokenId);
@@ -510,11 +513,14 @@ contract DKGStakingConvictionNFT is IVersioned, ContractStatus, IInitializable, 
     }
 
     /// @notice Walk unclaimed epochs for the position, accumulate reward,
-    ///         and bank it into the `ConvictionStakingStorage` rewards
-    ///         bucket. Updates `lastClaimedEpoch`.
+    ///         and compound it into the tokenId-keyed staking position.
+    ///         Updates `lastClaimedEpoch`. Any caller may trigger settlement;
+    ///         rewards are not routed to the caller.
     function claim(uint256 tokenId) external {
-        if (ownerOf(tokenId) != msg.sender) revert NotPositionOwner();
-        stakingV10.claim(msg.sender, tokenId);
+        // `ownerOf` is intentionally used as the live-token guard: it reverts
+        // for nonexistent or burned token IDs.
+        ownerOf(tokenId);
+        stakingV10.claim(tokenId);
         // No wrapper-layer event — `StakingV10.claim` emits `RewardsClaimed`
         // with the amount already. The NFT layer does not duplicate reward
         // accounting events.

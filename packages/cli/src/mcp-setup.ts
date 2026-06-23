@@ -170,8 +170,6 @@ export interface McpSetupActionDeps {
    */
   ensureDkgNodeConfig: typeof import('@origintrail-official/dkg-core').ensureDkgNodeConfig;
   startDaemon: typeof import('@origintrail-official/dkg-adapter-openclaw').startDaemon;
-  readWalletsWithRetry: typeof import('@origintrail-official/dkg-adapter-openclaw').readWalletsWithRetry;
-  logManualFundingInstructions: typeof import('@origintrail-official/dkg-adapter-openclaw').logManualFundingInstructions;
   /**
    * Eagerly creates the node's operational wallets (generate-if-absent)
    * before the daemon starts, so faucet funding (testnet) and manual mainnet
@@ -179,8 +177,13 @@ export interface McpSetupActionDeps {
    * Idempotent. From `@origintrail-official/dkg-agent`; injectable for tests.
    */
   loadOpWallets: typeof import('@origintrail-official/dkg-agent').loadOpWallets;
-  /** Faucet primitive from `@origintrail-official/dkg-core`. */
-  requestFaucetFunding: typeof import('@origintrail-official/dkg-core').requestFaucetFunding;
+  /**
+   * Shared best-effort faucet orchestrator — the SAME one openclaw/hermes use.
+   * Reads `wallets.json` (with retry when the daemon was started this run),
+   * gates on `network.faucet.url`, calls the faucet, and logs manual curl
+   * instructions on failure. Non-throwing. From `@origintrail-official/dkg-core`.
+   */
+  fundWalletsBestEffort: typeof import('@origintrail-official/dkg-core').fundWalletsBestEffort;
   /**
    * Walks ancestors looking for a DKG monorepo root. Defaulted to the
    * dkg-core implementation in production; injectable so tests can
@@ -1929,88 +1932,37 @@ export async function mcpSetupAction(
   }
 
   // ── Step 3: optional faucet ───────────────────────────────────────
-  // Reads wallets from `~/.dkg/wallets.json` (written async by the
-  // daemon) with the same 5×1s retry openclaw-setup uses. Faucet
-  // failures log a manual `curl` block and continue — funding is
-  // non-fatal for setup.
+  // Delegates to the SAME shared orchestrator as `dkg openclaw setup` /
+  // `dkg hermes setup` (`fundWalletsBestEffort`) instead of a bespoke
+  // `/api/status` reachability probe. The old probe gated funding on a 2s
+  // `GET /api/status` responding — which routinely times out on a real
+  // testnet node (peers + store make `/api/status` slow), so funding was
+  // silently skipped even though wallets and a faucet existed. The
+  // orchestrator needs only `wallets.json` (eager-created above, issue #1306)
+  // + a `network.faucet.url`; it reads wallets with retry when the daemon was
+  // started this run (so a freshly-flushed wallets.json is picked up), gates
+  // on the faucet, calls it, and logs manual `curl` instructions on failure.
+  // Funding is non-fatal — `fundWalletsBestEffort` never throws, so the outer
+  // try/catch only guards the `loadNetworkConfig` lookup.
   //
-  // F14: the funding decision is decoupled from `shouldStart`. The
-  // pre-fix outer guard `if (shouldFund && !dryRun && shouldStart)`
-  // silently skipped funding whenever `--no-start` was supplied,
-  // even when the daemon was already running from a prior invocation
-  // and a re-run-to-retry-funding was the user's actual goal.
-  // Post-fix flow:
-  //   1. Honour `--no-fund` (explicit opt-out, unchanged).
-  //   2. Honour `--dry-run` (no network calls).
-  //   3. Probe daemon reachability at `/api/status` on
-  //      `effectivePort`. If unreachable, log explicit
-  //      "skipping wallet funding (daemon not reachable on port X)"
-  //      with the reason — replaces the silent omission. If
-  //      reachable, proceed with funding regardless of which
-  //      invocation started the daemon.
+  // The `--no-start + already-running daemon → fund` goal (F14) is preserved:
+  // funding no longer depends on a reachability probe, only on wallets.json
+  // existing — which it does whether the daemon ran this invocation, a prior
+  // one, or the #1306 eager-create produced it.
   if (!shouldFund) {
     console.log('[setup] Skipping wallet funding (--no-fund)');
   } else if (dryRun) {
     console.log('[setup] [dry-run] Would attempt wallet funding');
   } else {
-    let daemonReachable = false;
     try {
-      // F26: bound the probe with AbortSignal.timeout(2000) so a
-      // partially-up daemon (port bound but unresponsive — half-stuck
-      // process or deadlocked startup) doesn't hang setup. The probe
-      // is best-effort; treating timeout as "not reachable" is the
-      // correct fallback because we move on to log the explicit
-      // skip-with-reason message anyway.
-      const probe = await fetch(`http://127.0.0.1:${effectivePort}/api/status`, {
-        signal: AbortSignal.timeout(2000),
+      const network = deps.loadNetworkConfig(setupNetworkConfigName);
+      await deps.fundWalletsBestEffort({
+        network,
+        idempotencySeed: effectiveAgentName,
+        didStartDaemon: shouldStart,
       });
-      daemonReachable = probe.ok;
-    } catch { /* not reachable (or timed out) */ }
-
-    if (!daemonReachable) {
-      console.log(
-        `[setup] Skipping wallet funding (daemon not reachable on port ${effectivePort})`,
-      );
-    } else {
-      try {
-        const network = deps.loadNetworkConfig(setupNetworkConfigName);
-        const faucetUrl = network.faucet?.url;
-        const faucetMode = network.faucet?.mode ?? 'testnet';
-        if (!faucetUrl) {
-          console.log('[setup] No faucet URL configured for this network; skipping wallet funding.');
-        } else {
-          const wallets = await deps.readWalletsWithRetry();
-          if (wallets.length === 0) {
-            console.log('[setup] No wallets to fund yet (daemon may not have flushed wallets.json).');
-          } else {
-            try {
-              const result = await deps.requestFaucetFunding(faucetUrl, faucetMode, wallets, effectiveAgentName);
-              if (result?.success === false) {
-                console.warn(
-                  `[setup] Faucet returned failure${result.error ? ` (${result.error})` : ''}; emitting manual instructions.`,
-                );
-                deps.logManualFundingInstructions(wallets, faucetUrl, faucetMode);
-              } else if (result?.error) {
-                const failedWallets = Array.isArray(result.failedWallets) && result.failedWallets.length
-                  ? result.failedWallets
-                  : wallets;
-                console.warn(`[setup] Faucet partially completed (${result.error}); emitting manual instructions for remaining wallet(s).`);
-                deps.logManualFundingInstructions(failedWallets, faucetUrl, faucetMode);
-              } else {
-                const fundedWalletCount = Array.isArray(result?.fundedWallets) && result.fundedWallets.length
-                  ? result.fundedWallets.length
-                  : wallets.length;
-                console.log(`[setup] Funded ${fundedWalletCount} wallet(s) via testnet faucet.`);
-              }
-            } catch (err: any) {
-              console.warn(`[setup] Faucet call failed (${err?.message ?? err}); emitting manual instructions.`);
-              deps.logManualFundingInstructions(wallets, faucetUrl, faucetMode);
-            }
-          }
-        }
-      } catch (err: any) {
-        console.warn(`[setup] Faucet step skipped: ${err?.message ?? err}`);
-      }
+    } catch (err: any) {
+      console.warn(`[setup] Faucet step skipped: ${err?.message ?? err}`);
     }
   }
 

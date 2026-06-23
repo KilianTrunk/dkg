@@ -149,6 +149,10 @@ mcpCmd
   .option('--name <name>', 'Override agent name (used only on first init)')
   .option('--no-start', 'Skip daemon start (configure only)')
   .option('--no-fund', 'Skip wallet funding via testnet faucet')
+  .option(
+    '--network <name>',
+    'Network to set up on (mainnet-gnosis | mainnet-base | testnet). Default for a fresh node: mainnet-gnosis.',
+  )
   .option('--no-verify', 'Skip post-setup verification probe')
   .option('--dry-run', 'Preview steps without writing or starting anything')
   .option('--force', 'Refresh every detected client regardless of current registration state')

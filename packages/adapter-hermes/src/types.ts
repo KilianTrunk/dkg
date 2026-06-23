@@ -111,6 +111,10 @@ export interface HermesSetupRequest {
   // Skill content resolved by caller (CLI passes loadBundledDkgNodeSkill())
   nodeSkillContent?: string;
 
+  // Network overlay to set up on (e.g. mainnet-gnosis, mainnet-base, testnet).
+  // Persisted as config.networkConfig; default for a fresh node is mainnet-gnosis.
+  network?: string;
+
   // Parity flags (issue #386 acceptance)
   start?: boolean;
   fund?: boolean;

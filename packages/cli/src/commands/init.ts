@@ -15,6 +15,8 @@ import {
   getFundableWalletAddresses,
   requestFaucetFunding,
   resolveDkgConfigHome,
+  resolveSetupNetworkName,
+  SELECTABLE_SETUP_NETWORKS,
   toErrorMessage,
   hasErrorCode,
 } from '@origintrail-official/dkg-core';
@@ -172,8 +174,12 @@ export function registerInitCommand(program: Command): void {
 
 program
   .command('init')
-  .description('Interactive setup — set node name, role, and relay')
+  .description('Interactive setup — set node name, network, role, and relay')
   .option('--role <role>', "Node role: 'edge' (default; personal laptop / behind NAT) or 'core' (24/7 relay / SLA)")
+  .option(
+    '--network <name>',
+    'Network to set up on (mainnet-gnosis | mainnet-base | testnet). Skips the interactive network prompt. Default for a fresh node: mainnet-gnosis.',
+  )
   .option(
     '--store <backend>',
     'Pre-fill the triple-store backend prompt (oxigraph | blazegraph | sparql-http).',
@@ -258,12 +264,13 @@ program
 
     await ensureDkgDir();
     const existing = await loadConfig();
-    const network = await loadNetworkConfig(existing.networkConfig);
-    const readiness = validateNetworkConfigReadiness(network);
-    if (!readiness.ok) {
-      for (const message of readiness.messages) console.error(message);
-      process.exit(1);
-    }
+    // Distinguish a genuinely fresh install (→ default mainnet) from a
+    // legacy node whose config predates `networkConfig` (→ testnet,
+    // preserved). `loadConfig` merges over defaults, so it can't tell us —
+    // probe the home directly (both json + yaml, like the daemon does).
+    const configExisted = existsSync(join(dkgDir(), 'config.json'))
+      || existsSync(join(dkgDir(), 'config.yaml'));
+
     const rl = createInterface({ input: process.stdin, output: process.stdout });
     const ask = (q: string, def?: string): Promise<string> =>
       new Promise(resolve => {
@@ -271,11 +278,45 @@ program
         rl.question(`${q}${suffix}: `, answer => resolve(answer.trim() || def || ''));
       });
 
-    if (network) {
-      console.log(`DKG Node Setup — ${network.networkName}\n`);
+    // DKG network selection — MUST run before loadNetworkConfig, because the
+    // chosen network drives every downstream default (role, relay, context
+    // graphs, auto-update, and the blockchain-config prompts below). Default:
+    // mainnet-gnosis for a fresh node, the existing network on re-init, and
+    // testnet for a legacy config that never set one. `--network` (or `-y`)
+    // skips the prompt.
+    const explicitNetwork = typeof opts.network === 'string' ? opts.network.trim() : '';
+    const networkDefault = resolveSetupNetworkName({
+      existingNetworkConfig: existing.networkConfig,
+      configExisted,
+    });
+    let selectedNetwork: string;
+    if (explicitNetwork) {
+      selectedNetwork = explicitNetwork;
+    } else if (opts.yes) {
+      selectedNetwork = networkDefault;
     } else {
-      console.log('DKG Node Setup\n');
+      selectedNetwork = await ask(
+        `DKG network (${SELECTABLE_SETUP_NETWORKS.join(' / ')})`,
+        networkDefault,
+      );
     }
+
+    const network = await loadNetworkConfig(selectedNetwork);
+    if (!network) {
+      console.error(
+        `Unknown network: "${selectedNetwork}". Available: ${SELECTABLE_SETUP_NETWORKS.join(', ')}.`,
+      );
+      rl.close();
+      process.exit(1);
+    }
+    const readiness = validateNetworkConfigReadiness(network);
+    if (!readiness.ok) {
+      for (const message of readiness.messages) console.error(message);
+      rl.close();
+      process.exit(1);
+    }
+
+    console.log(`DKG Node Setup — ${network.networkName}\n`);
 
     const name = await ask('Node name', existing.name !== 'dkg-node' ? existing.name : undefined);
     // OT-RFC-41 Bundle B1d: `--role <edge|core>` flag short-circuits
@@ -423,6 +464,10 @@ program
     const config = {
       ...existing,
       name: name || 'dkg-node',
+      // Persist the selected network explicitly (see resolveSetupNetworkName)
+      // so the node never silently follows a change to the project.json
+      // default — switching networks must be a deliberate act.
+      networkConfig: selectedNetwork,
       relay: (!existing.relay && relay === networkDefaultRelay) ? undefined : (relay || undefined),
       apiPort,
       nodeRole,

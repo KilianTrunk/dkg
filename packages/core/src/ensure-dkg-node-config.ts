@@ -77,6 +77,15 @@ export interface EnsureDkgNodeConfigOptions {
   agentName: string;
   /** Loaded `network/<env>.json` slice. */
   network: DkgNodeNetworkConfig;
+  /**
+   * The network overlay name to persist as `config.networkConfig` (e.g.
+   * `'mainnet-gnosis'`). Callers resolve this via `resolveSetupNetworkName`
+   * and MUST load `network` from the SAME name so the persisted selector and
+   * the network slice agree. Persisting it explicitly is what makes setup
+   * default new nodes onto mainnet without relying on (or mutating) the
+   * `project.json#defaultNetwork` runtime fallback.
+   */
+  networkConfigName: string;
   /** Daemon API port to use when no existing config has one. */
   apiPort: number;
   /**
@@ -102,7 +111,7 @@ export interface EnsureDkgNodeConfigOptions {
  * extraction output).
  */
 export function ensureDkgNodeConfig(opts: EnsureDkgNodeConfigOptions): void {
-  const { agentName, network, apiPort, existing, overrides } = opts;
+  const { agentName, network, networkConfigName, apiPort, existing, overrides } = opts;
 
   const dir = dkgDir();
   const configPath = join(dir, 'config.json');
@@ -130,6 +139,12 @@ export function ensureDkgNodeConfig(opts: EnsureDkgNodeConfigOptions): void {
   const config: Record<string, any> = {
     ...existing,
     name: overrides?.nameExplicit ? agentName : (existing.name ?? agentName),
+    // Persist the selected network EXPLICITLY. Unlike `chain`/`autoUpdate`
+    // (deliberately left to the runtime resolver above), the network
+    // selector is pinned so a node never silently follows a change to the
+    // `project.json#defaultNetwork` runtime fallback — switching networks is
+    // a deliberate, money-bearing act, not an implicit default drift.
+    networkConfig: networkConfigName,
     apiPort: overrides?.portExplicit ? apiPort : (existing.apiPort ?? apiPort),
     nodeRole: existing.nodeRole ?? (network.defaultNodeRole as 'edge' | 'core'),
     contextGraphs: existing.contextGraphs ?? network.defaultContextGraphs,

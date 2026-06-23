@@ -11,9 +11,13 @@ Working Memory, Shared Working Memory, querying, local imports, discovery, and d
 
 Verifiable Memory publishing, updates, endorsement, verification, and other chain operations require gas and TRAC.
 
-Setup flows try to fund generated testnet wallets when a faucet is configured:
+Your node's network is chosen at setup (default: **mainnet-gnosis**) and persisted as `config.networkConfig`; pass `--network <name>` to pick another (`mainnet-base`, `testnet`).
 
-* `dkg init` — auto-funds when a faucet is reachable; has no `--no-fund` flag
+**On mainnet (gnosis / base) there is no faucet** — fund the node's operational wallets yourself with the chain's native gas token (xDAI on Gnosis, ETH on Base) and TRAC before publishing.
+
+**On testnet**, setup flows auto-fund the generated wallets when a faucet is configured (the bundled testnet config provides one); this is skipped automatically on mainnet:
+
+* `dkg init` — auto-funds on testnet when the faucet is reachable; has no `--no-fund` flag
 * `dkg mcp setup`
 * `dkg hermes setup`
 * `dkg openclaw setup`

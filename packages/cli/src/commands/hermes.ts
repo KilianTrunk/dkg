@@ -171,6 +171,10 @@ hermesCmd
   .option('--no-fund', 'Skip wallet funding via testnet faucet')
   .option('--fund', 'Fund wallets via testnet faucet (default)')
   .option(
+    '--network <name>',
+    'Network to set up on (mainnet-gnosis | mainnet-base | testnet). Default for a fresh node: mainnet-gnosis.',
+  )
+  .option(
     '--preserve-provider',
     'Refuse to replace an existing non-DKG memory.provider in the Hermes profile config (default: replace with backup)',
   )

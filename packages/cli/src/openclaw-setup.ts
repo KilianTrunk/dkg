@@ -1,5 +1,6 @@
 import type { Command } from 'commander';
 import type { runSetup as RunSetupFn } from '@origintrail-official/dkg-adapter-openclaw';
+import { assertSelectableNetwork } from './config.js';
 
 /**
  * Options surface for the `dkg openclaw setup` subcommand as parsed by
@@ -16,6 +17,8 @@ export interface OpenClawSetupCliOptions {
   start?: boolean;
   dryRun?: boolean;
   fund?: boolean;
+  /** Network overlay to set up on; persisted as config.networkConfig. */
+  network?: string;
 }
 
 export interface OpenClawSetupActionDeps {
@@ -34,5 +37,6 @@ export async function openclawSetupAction(
   _command: Pick<Command, 'getOptionValueSource'>,
   deps: OpenClawSetupActionDeps,
 ): Promise<void> {
+  await assertSelectableNetwork(opts.network);
   await deps.runSetup(opts);
 }

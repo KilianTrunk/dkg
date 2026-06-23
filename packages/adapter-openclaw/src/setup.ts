@@ -32,6 +32,7 @@ import {
   readWalletsWithRetry,
   resolveCliPackageDir,
   resolveDkgConfigHome,
+  resolveSetupNetworkName,
   startDaemon,
 } from '@origintrail-official/dkg-core';
 import type { DkgOpenClawConfig } from './types.js';
@@ -73,6 +74,13 @@ export interface SetupOptions {
    * failed call logs manual `curl` instructions and setup continues.
    */
   fund?: boolean;
+  /**
+   * Network overlay to set up on (e.g. `mainnet-gnosis`, `mainnet-base`,
+   * `testnet`). Persisted as `config.networkConfig`. When omitted, a fresh
+   * node defaults to mainnet-gnosis and an existing node keeps its current
+   * network — see `resolveSetupNetworkName`.
+   */
+  network?: string;
   /**
    * Abort signal for cooperative cancellation. Checked at each step boundary
    * so an aborted job stops between steps without further filesystem writes
@@ -313,10 +321,11 @@ function readPersistedAgentName(): string | undefined {
 // `resolveCliPackageDir` was extracted to `@origintrail-official/dkg-core` in
 // S1 of issue #386. See the import + re-export at the top of this file.
 
-export function loadNetworkConfig(): NetworkConfig {
+export function loadNetworkConfig(networkName = 'testnet'): NetworkConfig {
+  const file = `${networkName}.json`;
   const cliDir = resolveCliPackageDir();
   if (cliDir) {
-    const candidate = join(cliDir, 'network', 'testnet.json');
+    const candidate = join(cliDir, 'network', file);
     if (existsSync(candidate)) {
       return JSON.parse(readFileSync(candidate, 'utf-8'));
     }
@@ -325,21 +334,53 @@ export function loadNetworkConfig(): NetworkConfig {
   // Monorepo pre-build fallback: the cli package copies `network/*.json`
   // from the repo root into `packages/cli/network/` during its build, so
   // before `pnpm build` has run the cli-scoped path above won't resolve.
-  // Probe the repo-root `network/testnet.json` directly so the monorepo dev
+  // Probe the repo-root `network/<name>.json` directly so the monorepo dev
   // flow (tests, scratch checkouts) keeps working pre-build.
-  const monorepoPath = resolve(__dirname, '..', '..', '..', 'network', 'testnet.json');
+  const monorepoPath = resolve(__dirname, '..', '..', '..', 'network', file);
   if (existsSync(monorepoPath)) {
     return JSON.parse(readFileSync(monorepoPath, 'utf-8'));
   }
-  const devPath = resolve(__dirname, '..', '..', '..', '..', 'network', 'testnet.json');
+  const devPath = resolve(__dirname, '..', '..', '..', '..', 'network', file);
   if (existsSync(devPath)) {
     return JSON.parse(readFileSync(devPath, 'utf-8'));
   }
 
   throw new Error(
-    'Could not find network/testnet.json. Ensure the DKG CLI is installed ' +
+    `Could not find network/${file}. Ensure the DKG CLI is installed ` +
     '(npm install -g @origintrail-official/dkg).',
   );
+}
+
+/**
+ * Resolve which network this setup run should use and load its config.
+ *
+ * The name follows {@link resolveSetupNetworkName}: an explicit `--network`
+ * wins; otherwise an existing node keeps its persisted `networkConfig`; a
+ * fresh node defaults to mainnet-gnosis; and a legacy config that never set
+ * a network stays on testnet. Loading the SAME name we persist keeps the
+ * written `networkConfig` and the network slice (relays/faucet/chain) in
+ * agreement.
+ */
+export function resolveSetupNetwork(
+  explicitNetwork?: string,
+): { networkName: string; network: NetworkConfig } {
+  const configPath = join(dkgDir(), 'config.json');
+  let existing: Record<string, any> = {};
+  if (existsSync(configPath)) {
+    try {
+      existing = JSON.parse(readFileSync(configPath, 'utf-8'));
+    } catch {
+      // Unparseable config — treat networkConfig as absent; writeDkgConfig
+      // emits its own corruption warning when it re-reads the same file.
+    }
+  }
+  const configExisted = existsSync(configPath) || existsSync(join(dkgDir(), 'config.yaml'));
+  const networkName = resolveSetupNetworkName({
+    explicit: explicitNetwork,
+    existingNetworkConfig: typeof existing.networkConfig === 'string' ? existing.networkConfig : undefined,
+    configExisted,
+  });
+  return { networkName, network: loadNetworkConfig(networkName) };
 }
 
 export function resolveCanonicalNodeSkillSourcePath(): string {
@@ -458,6 +499,10 @@ export function writeDkgConfig(
   network: NetworkConfig,
   apiPort: number,
   overrides?: DkgConfigOverrides,
+  // Trailing + defaulted so legacy positional callers (and tests) keep
+  // working; `runSetup` always passes the resolved selection. The default
+  // mirrors this function's historical testnet-only behaviour.
+  networkConfigName = 'testnet',
 ): void {
   const configPath = join(dkgDir(), 'config.json');
 
@@ -497,7 +542,7 @@ export function writeDkgConfig(
 
   // Delegate the agent-agnostic field-level merge + write to dkg-core.
   // adapter-hermes will use the same helper in S2 (issue #386).
-  ensureDkgNodeConfig({ agentName, network, apiPort, existing, overrides });
+  ensureDkgNodeConfig({ agentName, network, networkConfigName, apiPort, existing, overrides });
 }
 
 // ---------------------------------------------------------------------------
@@ -1626,8 +1671,11 @@ export async function runSetup(options: SetupOptions): Promise<void> {
   // Step 3: Write DKG config
   throwIfAborted();
   let network: NetworkConfig | null = null;
+  let networkConfigName: string | undefined;
   try {
-    network = loadNetworkConfig();
+    const resolved = resolveSetupNetwork(options.network);
+    network = resolved.network;
+    networkConfigName = resolved.networkName;
   } catch (err: any) {
     if (dryRun) {
       warn(`Could not load network config: ${err.message}`);
@@ -1647,11 +1695,11 @@ export async function runSetup(options: SetupOptions): Promise<void> {
   // value so the dry-run / skipped-writeDkgConfig path still has something
   // sensible to pass.
   let effectiveAgentName = agentName;
-  if (!dryRun && network) {
+  if (!dryRun && network && networkConfigName) {
     writeDkgConfig(agentName, network, apiPort, {
       nameExplicit: options.name != null,
       portExplicit: options.port != null,
-    });
+    }, networkConfigName);
     // Read back the effective port AND effective name from the merged
     // config so downstream steps (daemon start, workspace config, verify,
     // faucet funding) use the persisted values even when an existing config

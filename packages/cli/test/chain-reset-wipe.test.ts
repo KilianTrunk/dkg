@@ -26,7 +26,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, chmodSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { chainResetWipe, detectBackendSwitch } from '../src/daemon/chain-reset-wipe.js';
+import { chainResetWipe, detectBackendSwitch, detectNetworkSwitch } from '../src/daemon/chain-reset-wipe.js';
 
 const STATE_FILE = '.network-state.json';
 const NEW_MARKER = 'v10-rs-staking-consolidation-2026-04-30';
@@ -725,5 +725,132 @@ describe('detectBackendSwitch', () => {
     const persisted = JSON.parse(readFileSync(join(dataDir, STATE_FILE), 'utf8'));
     expect(persisted.chainResetMarker).toBe(NEW_MARKER);
     expect(persisted.lastBackend).toBe('oxigraph-worker');
+  });
+});
+
+describe('detectNetworkSwitch', () => {
+  it('records current network on first boot (no state file) without warning', () => {
+    const logs: string[] = [];
+    const result = detectNetworkSwitch({
+      dataDir,
+      currentNetworkConfig: 'testnet',
+      acceptNetworkSwitch: false,
+      log: (m) => logs.push(m),
+    });
+
+    expect(result.changed).toBe(false);
+    expect(result.previous).toBeNull();
+    expect(result.aborted).toBe(false);
+
+    const persisted = JSON.parse(readFileSync(join(dataDir, STATE_FILE), 'utf8'));
+    expect(persisted.lastNetworkConfig).toBe('testnet');
+    expect(logs.find((l) => l.includes('NETWORK-SWITCH'))).toBeUndefined();
+  });
+
+  it('records current network on a legacy state file (lastNetworkConfig absent) without aborting', () => {
+    writeFileSync(
+      join(dataDir, STATE_FILE),
+      JSON.stringify({ chainResetMarker: NEW_MARKER, lastBackend: 'oxigraph-worker', savedAt: Date.now() }),
+    );
+
+    const result = detectNetworkSwitch({
+      dataDir,
+      currentNetworkConfig: 'mainnet-gnosis',
+      acceptNetworkSwitch: false,
+    });
+
+    expect(result.changed).toBe(false);
+    expect(result.previous).toBeNull();
+    expect(result.aborted).toBe(false);
+
+    const persisted = JSON.parse(readFileSync(join(dataDir, STATE_FILE), 'utf8'));
+    expect(persisted.lastNetworkConfig).toBe('mainnet-gnosis');
+    // Sibling fields must survive the network-tag write.
+    expect(persisted.chainResetMarker).toBe(NEW_MARKER);
+    expect(persisted.lastBackend).toBe('oxigraph-worker');
+  });
+
+  it('is a no-op when network matches previous boot', () => {
+    writeFileSync(
+      join(dataDir, STATE_FILE),
+      JSON.stringify({ chainResetMarker: null, lastNetworkConfig: 'mainnet-gnosis', savedAt: Date.now() }),
+    );
+
+    const logs: string[] = [];
+    const result = detectNetworkSwitch({
+      dataDir,
+      currentNetworkConfig: 'mainnet-gnosis',
+      acceptNetworkSwitch: false,
+      log: (m) => logs.push(m),
+    });
+
+    expect(result.changed).toBe(false);
+    expect(result.previous).toBe('mainnet-gnosis');
+    expect(result.aborted).toBe(false);
+    expect(logs).toEqual([]);
+  });
+
+  it('aborts boot on mismatch without acceptNetworkSwitch, surfaces multi-line warning', () => {
+    writeFileSync(
+      join(dataDir, STATE_FILE),
+      JSON.stringify({ chainResetMarker: null, lastNetworkConfig: 'testnet', savedAt: Date.now() }),
+    );
+
+    const logs: string[] = [];
+    const result = detectNetworkSwitch({
+      dataDir,
+      currentNetworkConfig: 'mainnet-gnosis',
+      acceptNetworkSwitch: false,
+      log: (m) => logs.push(m),
+    });
+
+    expect(result.changed).toBe(true);
+    expect(result.previous).toBe('testnet');
+    expect(result.aborted).toBe(true);
+
+    const joined = logs.join('\n');
+    expect(joined).toMatch(/NETWORK-SWITCH/);
+    expect(joined).toMatch(/previous: testnet/);
+    expect(joined).toMatch(/current:\s+mainnet-gnosis/);
+    expect(joined).toMatch(/DKG_ACCEPT_NETWORK_SWITCH=1/);
+
+    // The old tag must persist so reverting config.networkConfig matches next boot.
+    const persisted = JSON.parse(readFileSync(join(dataDir, STATE_FILE), 'utf8'));
+    expect(persisted.lastNetworkConfig).toBe('testnet');
+  });
+
+  it('proceeds and updates state when acceptNetworkSwitch=true', () => {
+    writeFileSync(
+      join(dataDir, STATE_FILE),
+      JSON.stringify({ chainResetMarker: null, lastNetworkConfig: 'testnet', savedAt: Date.now() }),
+    );
+
+    const logs: string[] = [];
+    const result = detectNetworkSwitch({
+      dataDir,
+      currentNetworkConfig: 'mainnet-gnosis',
+      acceptNetworkSwitch: true,
+      log: (m) => logs.push(m),
+    });
+
+    expect(result.changed).toBe(true);
+    expect(result.aborted).toBe(false);
+
+    const joined = logs.join('\n');
+    expect(joined).toMatch(/NETWORK-SWITCH/);
+    expect(joined).toMatch(/proceeding/i);
+    expect(joined).not.toMatch(/Refusing to start/);
+
+    const persisted = JSON.parse(readFileSync(join(dataDir, STATE_FILE), 'utf8'));
+    expect(persisted.lastNetworkConfig).toBe('mainnet-gnosis');
+  });
+
+  it('coexists with detectBackendSwitch — both tags persist independently', () => {
+    detectBackendSwitch({ dataDir, currentBackend: 'oxigraph-worker', acceptStoreReset: false });
+    detectNetworkSwitch({ dataDir, currentNetworkConfig: 'mainnet-gnosis', acceptNetworkSwitch: false });
+
+    const persisted = JSON.parse(readFileSync(join(dataDir, STATE_FILE), 'utf8'));
+    expect(persisted.lastBackend).toBe('oxigraph-worker');
+    expect(persisted.lastNetworkConfig).toBe('mainnet-gnosis');
   });
 });

@@ -29,8 +29,28 @@ describe('ensureDkgNodeConfig — store-backend default (issue #960)', () => {
     JSON.parse(readFileSync(join(tempHome, 'config.json'), 'utf-8'));
 
   it('seeds the oxigraph-server default on a fresh install with no explicit store', () => {
-    ensureDkgNodeConfig({ agentName: 'node-a', network: NETWORK, apiPort: 9200, existing: {} });
+    ensureDkgNodeConfig({ agentName: 'node-a', network: NETWORK, networkConfigName: 'testnet', apiPort: 9200, existing: {} });
     expect(readWritten().store).toEqual({ backend: 'oxigraph-server' });
+  });
+
+  it('persists the selected network as config.networkConfig', () => {
+    ensureDkgNodeConfig({ agentName: 'node-a', network: NETWORK, networkConfigName: 'mainnet-gnosis', apiPort: 9200, existing: {} });
+    expect(readWritten().networkConfig).toBe('mainnet-gnosis');
+  });
+
+  it('rewrites networkConfig to the selected value even when one already exists', () => {
+    writeFileSync(
+      join(tempHome, 'config.json'),
+      JSON.stringify({ name: 'node-a', nodeRole: 'edge', networkConfig: 'testnet' }) + '\n',
+    );
+    ensureDkgNodeConfig({
+      agentName: 'node-a',
+      network: NETWORK,
+      networkConfigName: 'mainnet-base',
+      apiPort: 9200,
+      existing: { name: 'node-a', nodeRole: 'edge', networkConfig: 'testnet' },
+    });
+    expect(readWritten().networkConfig).toBe('mainnet-base');
   });
 
   it('does NOT flip an existing (block-less) node onto a new backend', () => {
@@ -41,6 +61,7 @@ describe('ensureDkgNodeConfig — store-backend default (issue #960)', () => {
     ensureDkgNodeConfig({
       agentName: 'node-a',
       network: NETWORK,
+      networkConfigName: 'testnet',
       apiPort: 9200,
       existing: { name: 'node-a', nodeRole: 'edge' },
     });
@@ -54,6 +75,7 @@ describe('ensureDkgNodeConfig — store-backend default (issue #960)', () => {
     ensureDkgNodeConfig({
       agentName: 'node-a',
       network: NETWORK,
+      networkConfigName: 'testnet',
       apiPort: 9200,
       existing: { name: 'node-a', nodeRole: 'edge' },
     });
@@ -62,7 +84,7 @@ describe('ensureDkgNodeConfig — store-backend default (issue #960)', () => {
 
   it('preserves an explicit existing store block (even on a fresh write)', () => {
     const store = { backend: 'blazegraph', options: { url: 'http://localhost:9999/blazegraph' } };
-    ensureDkgNodeConfig({ agentName: 'node-a', network: NETWORK, apiPort: 9200, existing: { store } });
+    ensureDkgNodeConfig({ agentName: 'node-a', network: NETWORK, networkConfigName: 'testnet', apiPort: 9200, existing: { store } });
     expect(readWritten().store).toEqual(store);
   });
 });

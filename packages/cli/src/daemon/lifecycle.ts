@@ -111,6 +111,7 @@ import {
   type LocalAgentIntegrationTransport,
   resolveContextGraphs,
   resolveNetworkDefaultContextGraphs,
+  resolveNetworkConfigName,
   resolveApprovalPolicy,
   resolveSharedMemoryTtlMs,
   repoDir,
@@ -279,7 +280,7 @@ import {
   performNpmUpdate,
   performNpmUpdateEdge,
 } from './auto-update.js';
-import { chainResetWipe, detectBackendSwitch } from './chain-reset-wipe.js';
+import { chainResetWipe, detectBackendSwitch, detectNetworkSwitch } from './chain-reset-wipe.js';
 import {
   checkExternalStoreReachable,
   checkOrSetStoreIdentity,
@@ -935,6 +936,23 @@ export async function runDaemonInner(
     log,
   });
   if (backendSwitch.aborted) {
+    process.exit(1);
+  }
+
+  // Detect a network switch (config.networkConfig repointed at a different
+  // network on an existing data dir). The store still holds the previous
+  // network's chain-derived state, which is meaningless on the new chain —
+  // and chainResetWipe won't catch it (mainnet overlays ship no
+  // chainResetMarker). Abort unless DKG_ACCEPT_NETWORK_SWITCH=1. Compare the
+  // RESOLVED name so a legacy config (no networkConfig) is treated as its
+  // 'testnet' fallback and never spuriously trips on a normal restart.
+  const networkSwitch = detectNetworkSwitch({
+    dataDir: dkgDir(),
+    currentNetworkConfig: resolveNetworkConfigName(config),
+    acceptNetworkSwitch: process.env.DKG_ACCEPT_NETWORK_SWITCH === '1',
+    log,
+  });
+  if (networkSwitch.aborted) {
     process.exit(1);
   }
 

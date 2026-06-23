@@ -40,10 +40,16 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /**
  * Read the persisted `networkConfig` selector from a node's home directory,
- * honoring BOTH `config.json` and `config.yaml` (JSON wins when both exist —
- * the same precedence as `loadConfig` / `resolveDkgConfigHome`). Returns
- * `undefined` when no config exists, parsing fails, or `networkConfig` is
- * unset/blank.
+ * honoring BOTH `config.json` and `config.yaml`. A present, parseable
+ * `config.json` is authoritative (its `networkConfig`, or `undefined` if
+ * unset — `config.yaml` is not consulted); `config.yaml` is read only when
+ * `config.json` is absent. Returns `undefined` when no config exists or
+ * `networkConfig` is unset/blank.
+ *
+ * NOTE: on a CORRUPT `config.json` this falls through to `config.yaml`
+ * (best-effort), whereas the daemon's `loadConfig` re-throws and refuses to
+ * boot — harmless divergence since a corrupt config.json makes the node
+ * unbootable, so the resolved name is moot.
  *
  * Setup flows use this (not a json-only read) so a YAML-only node's network
  * is correctly identified and not mis-resolved to the legacy testnet fallback

@@ -380,8 +380,11 @@ export function resolveSetupNetwork(
   });
   const requested = explicitNetwork?.trim();
   if (configExisted && requested && requested !== networkName) {
+    const current = existingNetworkConfig
+      ? `is already configured for "${networkName}"`
+      : `has no explicit network (defaults to "${networkName}")`;
     warn(
-      `--network ${requested} ignored: this node is already configured for "${networkName}". ` +
+      `--network ${requested} ignored: this node ${current}. ` +
       'Use `dkg init --network` to switch an existing node.',
     );
   }

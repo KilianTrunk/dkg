@@ -107,6 +107,29 @@ import {
 } from '../cli-supervisor.js';
 
 /**
+ * Decide whether `dkg init` is SWITCHING an existing node to a different
+ * network (vs a fresh install or a same-network re-init). Only an EXPLICIT
+ * prior `networkConfig` that differs from the selection counts as a switch:
+ *   - fresh node (no networkConfig)               → not a switch (no chain to lose)
+ *   - legacy node (no networkConfig, custom chain) → not a switch (preserve the
+ *     operator's chain/RPC override — its true network is unknown)
+ *   - node with networkConfig === selected        → not a switch (preserve overrides)
+ *   - node with networkConfig !== selected        → SWITCH (drop the stale chain)
+ *
+ * On a switch the caller derives the chain block from the newly-selected
+ * network instead of the stale existing one (prevents a new-network/old-chain
+ * Frankenstein config); otherwise it preserves the existing chain field-merge.
+ * Pure + exported so the decision is unit-testable.
+ */
+export function isInitNetworkSwitch(
+  existingNetworkConfig: string | undefined,
+  selectedNetwork: string,
+): boolean {
+  const prior = existingNetworkConfig?.trim();
+  return !!prior && selectedNetwork !== prior;
+}
+
+/**
  * Pure builder for the `autoUpdate` block `dkg init` persists. Extracted from
  * the interactive wizard so it is unit-testable — the decline path (must write
  * `{ enabled: false }`, NOT fall through to the enabled network default) and
@@ -430,14 +453,14 @@ program
     // network defaults so an operator who's only customised RPC keeps that
     // override even after `dkg init` re-prompts.
     //
-    // EXCEPT on a network SWITCH: when the selected network differs from the
-    // node's current one, the existing `chain` block belongs to the OLD
-    // network (e.g. Base-mainnet hub/RPC/chainId) and must NOT pre-fill or
-    // persist — otherwise the node would run the new network's relays/genesis
-    // against the old chain (the Frankenstein config). Derive chain defaults
-    // from the newly selected network only.
-    const effectiveExistingNetwork = existing.networkConfig?.trim() || proj.defaultNetwork;
-    const isNetworkSwitch = selectedNetwork !== effectiveExistingNetwork;
+    // EXCEPT on a network SWITCH (an existing node with an explicit
+    // networkConfig that differs from the selection): the existing `chain`
+    // block belongs to the OLD network (e.g. Base-mainnet hub/RPC/chainId) and
+    // must NOT pre-fill or persist — otherwise the node would run the new
+    // network's relays/genesis against the old chain (the Frankenstein config).
+    // See isInitNetworkSwitch — a fresh/legacy node is NOT a switch, so its
+    // chain field-merge (incl. operator RPC overrides) is preserved.
+    const isNetworkSwitch = isInitNetworkSwitch(existing.networkConfig, selectedNetwork);
     const chainDefaults = resolveChainConfig(isNetworkSwitch ? undefined : existing, network);
     const defaultRpcUrl = chainDefaults?.rpcUrl;
     const defaultRpcUrls = chainDefaults?.rpcUrls?.join(', ') ?? '';

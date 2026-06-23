@@ -708,8 +708,14 @@ export async function runHermesSetup(req: HermesSetupRequest): Promise<HermesSet
   });
   const requestedNetwork = setupOptions.network?.trim();
   if (dkgConfigExists && requestedNetwork && requestedNetwork !== networkConfigName) {
-    warnings.push(
-      `--network ${requestedNetwork} ignored: this node is already configured for "${networkConfigName}". ` +
+    // Informational only — emit via console.warn (NOT the status-bearing
+    // `warnings` array) so a deliberately-ignored flag does not flip an
+    // otherwise-clean setup to `degraded`. Matches openclaw/mcp.
+    const current = existingNetworkConfig
+      ? `is already configured for "${networkConfigName}"`
+      : `has no explicit network (defaults to "${networkConfigName}")`;
+    console.warn(
+      `[hermes-setup] --network ${requestedNetwork} ignored: this node ${current}. ` +
       'Use `dkg init --network` to switch an existing node.',
     );
   }

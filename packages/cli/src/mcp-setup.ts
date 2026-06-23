@@ -1798,9 +1798,12 @@ export async function mcpSetupAction(
   });
   const requestedNetwork = opts.network?.trim();
   if (configExists && requestedNetwork && requestedNetwork !== setupNetworkConfigName) {
+    const current = existingNetworkConfig
+      ? `is already configured for "${setupNetworkConfigName}"`
+      : `has no explicit network (defaults to "${setupNetworkConfigName}")`;
     console.log(
-      `[setup] --network ${requestedNetwork} ignored: this node is already configured for ` +
-      `"${setupNetworkConfigName}". Use \`dkg init --network\` to switch an existing node.`,
+      `[setup] --network ${requestedNetwork} ignored: this node ${current}. ` +
+      'Use `dkg init --network` to switch an existing node.',
     );
   }
 

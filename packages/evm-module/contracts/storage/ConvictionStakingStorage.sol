@@ -383,11 +383,16 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     // ============================================================
     // Migrated-but-unallocated TRAC, per delegator. Backed 1:1 by TRAC
     // physically held in THIS contract (moved here by the drain worker via
-    // StakingStorage.transferStake). The only sink is `spendMigrationCredit`
-    // (driven by DKGStakingConvictionNFT.allocate) — credit is NEVER
-    // withdrawable to a wallet. Lives here (durable storage), not on the
-    // wrapper (logic), so a wrapper redeploy mid-migration cannot strand the
-    // already-moved TRAC.
+    // StakingStorage.transferStake). The only ledger mutator is
+    // `spendMigrationCredit`, driven by TWO sinks:
+    // `StakingV10.allocateFromCredit` (spend into a position) AND
+    // `MigrationCreditRecovery.withdrawMigrationCredit` (refund straight to the
+    // wallet via `transferStake`). The latter is a standalone Hub-registered
+    // contract — the node-independent recovery sink for a chain with no V10
+    // profile yet; it passes this contract's `onlyContracts` gate at call time,
+    // so it works against an already-deployed CSS with no redeploy. Lives
+    // here (durable storage), not on the wrapper (logic), so a wrapper redeploy
+    // mid-migration cannot strand the already-moved TRAC.
     mapping(address => uint96) public migrationCredit;
     // Lock-shortening (seconds) applied to ANY tier-6/12 migration allocation
     // (universal — no per-staker eligibility distinction). Set

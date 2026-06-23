@@ -1640,7 +1640,23 @@ export function verifyMemorySlotInvariants(configPath?: string): void {
 // Main entry point
 // ---------------------------------------------------------------------------
 
-export async function runSetup(options: SetupOptions): Promise<void> {
+/**
+ * Injected runtime deps for `runSetup`. Kept separate from the user-facing
+ * `SetupOptions` so the adapter stays free of a `@origintrail-official/dkg-agent`
+ * dependency: the cli layer (which has dkg-agent) provides `loadOpWallets`.
+ */
+export interface RunSetupDeps {
+  /**
+   * Eagerly create the node's operational wallets (generate-if-absent) after
+   * the config write and before the daemon starts, so faucet funding and
+   * manual mainnet funding have wallets even if the daemon never fully boots
+   * (issue #1306). Best-effort; omitted by callers where the daemon is already
+   * running (the node-UI route) or in unit tests.
+   */
+  loadOpWallets?: (dir: string) => Promise<unknown>;
+}
+
+export async function runSetup(options: SetupOptions, deps: RunSetupDeps = {}): Promise<void> {
   const dryRun = options.dryRun ?? false;
   const shouldVerify = options.verify !== false;
   const shouldStart = options.start !== false;
@@ -1724,6 +1740,21 @@ export async function runSetup(options: SetupOptions): Promise<void> {
     } catch { /* use pre-merge values */ }
   } else if (network) {
     log(`[dry-run] Would write ${join(dkgDir(), 'config.json')} (${network.networkName}, port ${apiPort})`);
+  }
+
+  // Eagerly ensure the node's wallets exist BEFORE the daemon starts (issue
+  // #1306) — matching `dkg init` — so faucet funding (testnet) and manual
+  // mainnet funding have wallets to target even if the daemon never fully
+  // boots. Runs regardless of `--no-fund` (mainnet has no faucet but still
+  // needs wallets). Best-effort; the daemon's boot-time loadOpWallets is an
+  // idempotent fallback. `loadOpWallets` is injected by the cli layer so the
+  // adapter stays dkg-agent-free.
+  if (!dryRun && deps.loadOpWallets) {
+    try {
+      await deps.loadOpWallets(dkgDir());
+    } catch (err: any) {
+      warn(`Could not pre-create wallets (${err?.message ?? String(err)}); the daemon will generate them on first start.`);
+    }
   }
 
   // Step 4: Preflight ~/.openclaw/openclaw.json BEFORE the daemon spins up

@@ -54,7 +54,10 @@ export interface NormalizedHermesSetupOptions {
 }
 
 export interface HermesSetupActionDeps {
-  runSetup: (opts: NormalizedHermesSetupOptions) => Promise<void>;
+  runSetup: (
+    opts: NormalizedHermesSetupOptions,
+    runDeps?: { loadOpWallets?: (dir: string) => Promise<unknown> },
+  ) => Promise<void>;
 }
 
 function trimmed(value: unknown): string | undefined {
@@ -111,8 +114,19 @@ export async function hermesSetupAction(
   deps: HermesSetupActionDeps,
 ): Promise<void> {
   await assertSelectableNetwork(opts.network);
-  await deps.runSetup({
-    ...normalizeHermesSetupOptions(opts),
-    nodeSkillContent: loadBundledDkgNodeSkill(),
-  });
+  // Inject the wallet creator from the cli layer (which has dkg-agent) so the
+  // adapter eagerly creates wallets before the daemon starts (issue #1306)
+  // without the adapter package depending on dkg-agent.
+  await deps.runSetup(
+    {
+      ...normalizeHermesSetupOptions(opts),
+      nodeSkillContent: loadBundledDkgNodeSkill(),
+    },
+    {
+      loadOpWallets: async (dir: string) => {
+        const { loadOpWallets } = await import('@origintrail-official/dkg-agent');
+        return loadOpWallets(dir);
+      },
+    },
+  );
 }

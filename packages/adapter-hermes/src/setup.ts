@@ -656,7 +656,25 @@ function rewriteActiveProviderLine(raw: string, newProvider: string): string | n
  * (`setup-entrypoint-contract.md` §9 sketch) doesn't change between
  * S2 → S3 → S4.
  */
-export async function runHermesSetup(req: HermesSetupRequest): Promise<HermesSetupResult> {
+/**
+ * Injected runtime deps for Hermes setup. Separate from the user-facing
+ * request so the adapter stays free of a `@origintrail-official/dkg-agent`
+ * dependency: the cli layer (which has dkg-agent) provides `loadOpWallets`.
+ */
+export interface RunHermesSetupDeps {
+  /**
+   * Eagerly create the node's operational wallets (generate-if-absent) after
+   * the config bootstrap and before the daemon starts, so faucet funding and
+   * manual mainnet funding have wallets even if the daemon never fully boots
+   * (issue #1306). Best-effort; omitted in unit tests / when not provided.
+   */
+  loadOpWallets?: (dir: string) => Promise<unknown>;
+}
+
+export async function runHermesSetup(
+  req: HermesSetupRequest,
+  deps: RunHermesSetupDeps = {},
+): Promise<HermesSetupResult> {
   const cliOptions = setupRequestToCliOptions(req);
   const setupOptions = toSetupOptions(cliOptions);
   const profile = resolveHermesProfile(setupOptions);
@@ -730,6 +748,21 @@ export async function runHermesSetup(req: HermesSetupRequest): Promise<HermesSet
     }
   } else if (dryRun) {
     console.log('[hermes-setup] [dry-run] Would bootstrap ~/.dkg/config.json if missing');
+  }
+
+  // Eagerly ensure the node's wallets exist BEFORE the daemon starts (issue
+  // #1306) — matching `dkg init` — so faucet funding (testnet) and manual
+  // mainnet funding have wallets even if the daemon never fully boots. Runs
+  // regardless of `--no-fund` and of `dkgConfigExists` (an existing-config node
+  // may still lack wallets). Best-effort; the daemon's boot-time loadOpWallets
+  // is an idempotent fallback. `loadOpWallets` is injected by the cli layer so
+  // the adapter stays dkg-agent-free.
+  if (!dryRun && deps.loadOpWallets) {
+    try {
+      await deps.loadOpWallets(dkgConfigHome);
+    } catch (err: any) {
+      warnings.push(`Could not pre-create wallets (${err?.message ?? String(err)}); the daemon will generate them on first start.`);
+    }
   }
 
   // Step 3: start daemon.
@@ -836,8 +869,11 @@ export async function runHermesSetup(req: HermesSetupRequest): Promise<HermesSet
  * unchanged; on `result.ok === false` we throw so existing tests that
  * `await expect(runSetup(...)).rejects.toThrow(...)` still pass.
  */
-export async function runSetup(options: HermesCliOptions = {}): Promise<void> {
-  const result = await runHermesSetup(cliOptionsToSetupRequest(options));
+export async function runSetup(
+  options: HermesCliOptions = {},
+  deps: RunHermesSetupDeps = {},
+): Promise<void> {
+  const result = await runHermesSetup(cliOptionsToSetupRequest(options), deps);
   if (!result.ok) {
     throw new Error(result.errors.join('\n'));
   }

@@ -38,5 +38,13 @@ export async function openclawSetupAction(
   deps: OpenClawSetupActionDeps,
 ): Promise<void> {
   await assertSelectableNetwork(opts.network);
-  await deps.runSetup(opts);
+  // Inject the wallet creator from the cli layer (which has dkg-agent) so the
+  // adapter eagerly creates wallets before the daemon starts (issue #1306)
+  // without the adapter package depending on dkg-agent.
+  await deps.runSetup(opts, {
+    loadOpWallets: async (dir: string) => {
+      const { loadOpWallets } = await import('@origintrail-official/dkg-agent');
+      return loadOpWallets(dir);
+    },
+  });
 }

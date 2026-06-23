@@ -462,4 +462,32 @@ describe('runSetup Step 5 — faucet funding', () => {
     }
   });
 
+  it('#1306: eagerly creates wallets via the injected hook (even --no-fund), skipped on --dry-run', async () => {
+    const env = setupFaucetEnv();
+    try {
+      // --no-fund must STILL create wallets (mainnet has no faucet but the node
+      // needs wallets for manual funding + publishing). Called with the home dir.
+      const loadOpWallets = vi.fn(async () => ({
+        adminWallet: { address: '0xAAAA', privateKey: '0x0' },
+        wallets: [],
+      }));
+      await runSetup(
+        { workspace: env.workspace, network: 'testnet', start: false, verify: false, fund: false },
+        { loadOpWallets },
+      );
+      expect(loadOpWallets).toHaveBeenCalledTimes(1);
+      expect(loadOpWallets.mock.calls[0][0]).toBe(env.dkgHome);
+
+      // --dry-run must NOT create wallets.
+      loadOpWallets.mockClear();
+      await runSetup(
+        { workspace: env.workspace, network: 'testnet', start: false, verify: false, dryRun: true },
+        { loadOpWallets },
+      );
+      expect(loadOpWallets).not.toHaveBeenCalled();
+    } finally {
+      env.restore();
+    }
+  });
+
 });

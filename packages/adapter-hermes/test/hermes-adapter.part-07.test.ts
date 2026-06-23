@@ -78,6 +78,42 @@ describe('Hermes profile setup helpers', () => {
     expect(readFileSync(join(dkgHome, 'config.yaml'), 'utf-8')).toBe(yamlBefore);
   });
 
+  // issue #1306 — eager wallet creation. The injected `loadOpWallets` hook
+  // fires after config bootstrap and before daemon start, even with --no-fund
+  // (mainnet has no faucet but the node still needs wallets), and is skipped
+  // under --dry-run. Existing tests omit the hook, so they are unaffected.
+  it('#1306: eagerly creates wallets via the injected hook (even --no-fund), skipped on --dry-run', async () => {
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-profile-'));
+    const dkgHome = mkdtempSync(join(tmpdir(), 'dkg-home-1306-'));
+    vi.stubGlobal('fetch', async () =>
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    const oldDkgHome = process.env.DKG_HOME;
+    process.env.DKG_HOME = dkgHome;
+    try {
+      const loadOpWallets = vi.fn(async () => ({
+        adminWallet: { address: '0xAAAA', privateKey: '0x0' },
+        wallets: [],
+      }));
+
+      await runSetup({ hermesHome, verify: false, start: false, fund: false }, { loadOpWallets });
+      expect(loadOpWallets).toHaveBeenCalledTimes(1);
+      expect(loadOpWallets.mock.calls[0][0]).toBe(dkgHome);
+
+      loadOpWallets.mockClear();
+      await runSetup({ hermesHome, verify: false, start: false, fund: false, dryRun: true }, { loadOpWallets });
+      expect(loadOpWallets).not.toHaveBeenCalled();
+    } finally {
+      if (oldDkgHome === undefined) delete process.env.DKG_HOME;
+      else process.env.DKG_HOME = oldDkgHome;
+      rmSync(hermesHome, { recursive: true, force: true });
+      rmSync(dkgHome, { recursive: true, force: true });
+    }
+  });
+
   // issue #960 — positive control for the test above: a genuinely fresh DKG
   // home (no config.json AND no config.yaml) DOES get bootstrapped, and the
   // written config adopts the `oxigraph-server` store default. This proves the

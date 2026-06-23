@@ -28,6 +28,7 @@ import {
   ConvictionStakingStorage,
   DKGStakingConvictionNFT,
   Hub,
+  MigrationCreditRecovery,
   ParametersStorage,
   Profile,
   StakingStorage,
@@ -53,6 +54,7 @@ type Fixture = {
   accounts: SignerWithAddress[];
   Hub: Hub;
   NFT: DKGStakingConvictionNFT;
+  Recovery: MigrationCreditRecovery;
   StakingV10: StakingV10;
   StakingStorage: StakingStorage;
   ConvictionStakingStorage: ConvictionStakingStorage;
@@ -63,7 +65,12 @@ type Fixture = {
 };
 
 async function deployFixture(): Promise<Fixture> {
-  await hre.deployments.fixture(['DKGStakingConvictionNFT', 'StakingV10', 'Profile']);
+  await hre.deployments.fixture([
+    'DKGStakingConvictionNFT',
+    'StakingV10',
+    'MigrationCreditRecovery',
+    'Profile',
+  ]);
 
   const accounts = await hre.ethers.getSigners();
   const Hub = await hre.ethers.getContract<Hub>('Hub');
@@ -73,6 +80,7 @@ async function deployFixture(): Promise<Fixture> {
     accounts,
     Hub,
     NFT: await hre.ethers.getContract<DKGStakingConvictionNFT>('DKGStakingConvictionNFT'),
+    Recovery: await hre.ethers.getContract<MigrationCreditRecovery>('MigrationCreditRecovery'),
     StakingV10: await hre.ethers.getContract<StakingV10>('StakingV10'),
     StakingStorage: await hre.ethers.getContract<StakingStorage>('StakingStorage'),
     ConvictionStakingStorage: await hre.ethers.getContract<ConvictionStakingStorage>(
@@ -92,6 +100,7 @@ describe('@integration pool & allocate migration', function () {
 
   let accounts: SignerWithAddress[];
   let NFT: DKGStakingConvictionNFT;
+  let Recovery: MigrationCreditRecovery;
   let StakingV10Contract: StakingV10;
   let HubContract: Hub;
   let SS: StakingStorage;
@@ -105,6 +114,7 @@ describe('@integration pool & allocate migration', function () {
       accounts,
       Hub: HubContract,
       NFT,
+      Recovery,
       StakingV10: StakingV10Contract,
       StakingStorage: SS,
       ConvictionStakingStorage: CSS,
@@ -709,6 +719,173 @@ describe('@integration pool & allocate migration', function () {
       await NFT.connect(d).allocate(id, stake, 0); // tier-0 exempt from the active-tier gate
       await NFT.connect(d).withdraw(1n);
       expect(await TokenContract.balanceOf(d.address)).to.equal(walletBefore + stake);
+    });
+  });
+
+  // ===========================================================================
+  // withdrawMigrationCredit — node-INDEPENDENT recovery (the zero-node escape)
+  //
+  // The tier-0 recovery above still needs a V10 profile to allocate against. On
+  // a freshly-deployed chain with ZERO profiles, `allocate` reverts
+  // ProfileDoesNotExist, so that safety net is unreachable and admin-drained
+  // credit would be frozen to the wallet. These cover the direct credit→wallet
+  // refund that removes the node-existence precondition.
+  // ===========================================================================
+  describe('withdrawMigrationCredit (node-independent recovery)', () => {
+    it('is a standalone Hub-registered contract with its own name/version', async () => {
+      // Registration is what lets it pass CSS's onlyContracts gate; the
+      // behavioural tests below prove the gate admits it (transfers succeed).
+      expect(await Recovery.name()).to.equal('MigrationCreditRecovery');
+      expect(await Recovery.version()).to.equal('1.0.0');
+      expect(await HubContract['isContract(address)'](await Recovery.getAddress())).to.equal(true);
+    });
+
+    // Seed V8 stake on an identityId that was NEVER createProfile'd, then drain
+    // it to credit — the exact post-drain state of a chain with zero V10
+    // profiles. `drainV8ToCredit` reads StakingStorage by (delegator, id) and
+    // does not require a V10 profile, so this is a faithful reproduction.
+    const drainWithoutProfile = async (
+      d: SignerWithAddress,
+      id: number,
+      stake: bigint,
+    ) => {
+      await seedV8Stake(d, id, stake);
+      await NFT.connect(accounts[0]).adminMigrateToCredit(d.address, [id]);
+    };
+
+    it('refunds credit to the wallet when NO profile exists (allocate is impossible)', async () => {
+      const d = accounts[2];
+      const idNoProfile = 1; // never createProfile'd → ProfileStorage has nothing
+      const stake = hre.ethers.parseEther('5000');
+      await drainWithoutProfile(d, idNoProfile, stake);
+
+      // Precondition: the allocate-based recovery is genuinely blocked here.
+      await expect(
+        NFT.connect(d).allocate(idNoProfile, stake, 0),
+      ).to.be.revertedWithCustomError(StakingV10Contract, 'ProfileDoesNotExist');
+
+      const walletBefore = await TokenContract.balanceOf(d.address);
+      const cssBefore = await TokenContract.balanceOf(await CSS.getAddress());
+
+      await expect(Recovery.connect(d).withdrawMigrationCredit(stake))
+        .to.emit(Recovery, 'MigrationCreditWithdrawn')
+        .withArgs(d.address, stake);
+
+      // 1:1 invariant — ledger AND vault both decrement by exactly `amount`.
+      expect(await NFT.migrationCredit(d.address)).to.equal(0n);
+      expect(await TokenContract.balanceOf(d.address)).to.equal(walletBefore + stake);
+      expect(await TokenContract.balanceOf(await CSS.getAddress())).to.equal(cssBefore - stake);
+    });
+
+    it('withdrawMigrationCreditAll drains the full balance in one call', async () => {
+      const d = accounts[3];
+      const stake = hre.ethers.parseEther('1234');
+      await drainWithoutProfile(d, 1, stake);
+
+      const walletBefore = await TokenContract.balanceOf(d.address);
+      await expect(Recovery.connect(d).withdrawMigrationCreditAll())
+        .to.emit(Recovery, 'MigrationCreditWithdrawn')
+        .withArgs(d.address, stake);
+      expect(await NFT.migrationCredit(d.address)).to.equal(0n);
+      expect(await TokenContract.balanceOf(d.address)).to.equal(walletBefore + stake);
+    });
+
+    it('supports partial withdrawals — repeatable until the credit is drained', async () => {
+      const d = accounts[2];
+      const stake = hre.ethers.parseEther('900');
+      const part = hre.ethers.parseEther('300');
+      await drainWithoutProfile(d, 1, stake);
+
+      const walletBefore = await TokenContract.balanceOf(d.address);
+      await Recovery.connect(d).withdrawMigrationCredit(part);
+      expect(await NFT.migrationCredit(d.address)).to.equal(stake - part);
+      expect(await TokenContract.balanceOf(d.address)).to.equal(walletBefore + part);
+
+      // Drain the remainder via the convenience function.
+      await Recovery.connect(d).withdrawMigrationCreditAll();
+      expect(await NFT.migrationCredit(d.address)).to.equal(0n);
+      expect(await TokenContract.balanceOf(d.address)).to.equal(walletBefore + stake);
+    });
+
+    it('reverts on over-withdraw (more than the credit) and leaves credit intact', async () => {
+      const d = accounts[2];
+      const stake = hre.ethers.parseEther('500');
+      await drainWithoutProfile(d, 1, stake);
+      await expect(
+        Recovery.connect(d).withdrawMigrationCredit(stake + 1n),
+      ).to.be.revertedWith('Amount exceeds credit');
+      expect(await NFT.migrationCredit(d.address)).to.equal(stake);
+    });
+
+    it('reverts ZeroAmount on a zero withdraw and on All with no credit', async () => {
+      const d = accounts[4]; // never credited
+      await expect(
+        Recovery.connect(d).withdrawMigrationCredit(0),
+      ).to.be.revertedWithCustomError(Recovery, 'ZeroAmount');
+      await expect(
+        Recovery.connect(d).withdrawMigrationCreditAll(),
+      ).to.be.revertedWithCustomError(Recovery, 'ZeroAmount');
+    });
+
+    it('is self-scoped — a caller can only ever withdraw their OWN credit', async () => {
+      const a = accounts[2];
+      const b = accounts[3];
+      const stakeA = hre.ethers.parseEther('700');
+      const stakeB = hre.ethers.parseEther('400');
+      await drainWithoutProfile(a, 1, stakeA);
+      await drainWithoutProfile(b, 2, stakeB);
+
+      // A drains all of A's credit; B's is untouched.
+      await Recovery.connect(a).withdrawMigrationCreditAll();
+      expect(await NFT.migrationCredit(a.address)).to.equal(0n);
+      expect(await NFT.migrationCredit(b.address)).to.equal(stakeB);
+
+      // A (now empty) cannot reach into B's credit.
+      await expect(
+        Recovery.connect(a).withdrawMigrationCredit(stakeB),
+      ).to.be.revertedWith('Amount exceeds credit');
+    });
+
+    it('mixed path: allocate part to a real node, then withdraw the remainder', async () => {
+      // The realistic flow — "I converted some into conviction, cash out the
+      // rest." Proves the credit ledger and position accounting stay
+      // independent: the allocation does not consume the withdrawable remainder
+      // and the withdraw does not disturb the live position.
+      const d = accounts[2];
+      const id = await createProfile(1); // a REAL profile so allocate succeeds
+      const stake = hre.ethers.parseEther('1000');
+      const allocated = hre.ethers.parseEther('600');
+      const remainder = stake - allocated;
+      await seedV8Stake(d, id, stake);
+      await NFT.connect(accounts[0]).adminMigrateToCredit(d.address, [id]);
+
+      await NFT.connect(d).allocate(id, allocated, 0); // tier-0 position, tokenId 1
+      expect(await NFT.migrationCredit(d.address)).to.equal(remainder);
+
+      const walletBefore = await TokenContract.balanceOf(d.address);
+      await Recovery.connect(d).withdrawMigrationCreditAll();
+      expect(await NFT.migrationCredit(d.address)).to.equal(0n);
+      expect(await TokenContract.balanceOf(d.address)).to.equal(walletBefore + remainder);
+
+      // The allocated position is untouched and still independently withdrawable.
+      expect((await CSS.getPosition(1)).raw).to.equal(allocated);
+      await NFT.connect(d).withdraw(1n);
+      expect(await TokenContract.balanceOf(d.address)).to.equal(walletBefore + stake);
+    });
+
+    it('refunds operator-fee credit too (same bucket, still no node required)', async () => {
+      const op = accounts[0]; // createProfile sets accounts[0] as the ADMIN_KEY holder
+      const id = await createProfile(1);
+      const fee = hre.ethers.parseEther('250');
+      await TokenContract.mint(await SS.getAddress(), fee);
+      await SS.connect(accounts[0]).increaseOperatorFeeBalance(id, fee);
+      await NFT.connect(accounts[0]).adminDrainOperatorFeesBatch([id], [op.address]);
+      expect(await NFT.migrationCredit(op.address)).to.equal(fee);
+
+      const before = await TokenContract.balanceOf(op.address);
+      await Recovery.connect(op).withdrawMigrationCreditAll();
+      expect(await NFT.migrationCredit(op.address)).to.equal(0n);
+      expect(await TokenContract.balanceOf(op.address)).to.equal(before + fee);
     });
   });
 

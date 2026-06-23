@@ -332,11 +332,11 @@ analysis reports are under `bench/results/profiles/`, including
 
 | Guide | Use it when |
 |---|---|
-| [MCP Setup](docs/archive/internal/setup/SETUP_MCP.md) | You want Cursor / Claude Code / Claude Desktop / Windsurf / VSCode + Copilot / Cline / Codex CLI to use DKG as memory |
+| [MCP Setup](packages/mcp-dkg/README.md) | You want Cursor / Claude Code / Claude Desktop / Windsurf / VSCode + Copilot / Cline / Codex CLI to use DKG as memory |
 | [Join the Testnet](docs/archive/internal/setup/JOIN_TESTNET.md) | You want a full node setup and first publish/query flow |
-| [OpenClaw Setup](docs/archive/internal/setup/SETUP_OPENCLAW.md) | You want OpenClaw to use DKG as memory/tools |
-| [Hermes Setup](docs/archive/internal/setup/SETUP_HERMES.md) | You want Hermes Agent to use DKG as memory/tools |
-| [ElizaOS Setup](docs/archive/internal/setup/SETUP_ELIZAOS.md) | You want ElizaOS integration |
+| [OpenClaw Setup](packages/adapter-openclaw/README.md) | You want OpenClaw to use DKG as memory/tools |
+| [Hermes Setup](packages/adapter-hermes/README.md) | You want Hermes Agent to use DKG as memory/tools |
+| [ElizaOS Setup](packages/adapter-elizaos/README.md) | You want ElizaOS integration |
 | [Custom agent Setup](docs/archive/internal/setup/SETUP_CUSTOM.md) | You are wiring an agent framework not covered above |
 | [Testnet Faucet](docs/archive/internal/setup/TESTNET_FAUCET.md) | You need Base Sepolia ETH and TRAC |
 

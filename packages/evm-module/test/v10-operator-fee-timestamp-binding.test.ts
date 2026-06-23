@@ -407,6 +407,66 @@ describe('@integration H-5 regression — operator fee bound to epoch timestamp'
   );
 
   // -------------------------------------------------------------------------
+  // Permissionless claim: operator-fee liveness
+  // -------------------------------------------------------------------------
+  it('Permissionless staking NFT claim settles previous epoch before fee update', async function () {
+    const nodeOp = accounts[1];
+    const nodeAdmin = accounts[2];
+    const delegator = accounts[3];
+    const keeper = accounts[4];
+
+    expect(await Chronos.getCurrentEpoch()).to.equal(1n);
+
+    const { identityId } = await createProfile(ProfileContract, {
+      operational: nodeOp,
+      admin: nodeAdmin,
+    });
+
+    await ProfileContract.connect(nodeAdmin).updateOperatorFee(
+      identityId,
+      Number(FEE_OLD),
+    );
+
+    await advanceEpoch(Chronos);
+    const epoch2 = await Chronos.getCurrentEpoch();
+    expect(epoch2).to.equal(2n);
+
+    await Token.mint(delegator.address, RAW);
+    await Token.connect(delegator).approve(
+      await StakingV10Contract.getAddress(),
+      RAW,
+    );
+    await NFT.connect(delegator).createConviction(identityId, RAW, LOCK_EPOCHS);
+    const tokenId = 1n;
+
+    await injectEpochRewards(ctx, identityId, epoch2, RAW);
+
+    await advanceEpoch(Chronos);
+    expect(await Chronos.getCurrentEpoch()).to.equal(3n);
+    expect(await CSS.isOperatorFeeClaimedForEpoch(identityId, epoch2)).to.equal(false);
+
+    await expect(
+      ProfileContract.connect(nodeAdmin).updateOperatorFee(
+        identityId,
+        Number(FEE_HIGH),
+      ),
+    ).to.be.revertedWith(
+      'Cannot update operatorFee if operatorFee has not been calculated and claimed for previous epochs',
+    );
+
+    await NFT.connect(keeper).claim(tokenId);
+
+    expect(await CSS.isOperatorFeeClaimedForEpoch(identityId, epoch2)).to.equal(true);
+
+    await expect(
+      ProfileContract.connect(nodeAdmin).updateOperatorFee(
+        identityId,
+        Number(FEE_HIGH),
+      ),
+    ).to.not.be.reverted;
+  });
+
+  // -------------------------------------------------------------------------
   // Fix 1: StakingKPI.getNetNodeRewards preview parity
   // -------------------------------------------------------------------------
   //

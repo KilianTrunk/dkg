@@ -2024,7 +2024,9 @@ export class DKGAgent extends DKGAgentBase {
           { awaitCuratorAck: opts?.awaitCuratorAck, curatorAckTimeoutMs: opts?.curatorAckTimeoutMs },
           createOperationContext('share'),
         );
-        const trustedNonManifestCatalogTriples = (await agent.isPrivateContextGraph(contextGraphId))
+        const trustedCatalogOnChainContextGraphId = await agent.getContextGraphOnChainId(contextGraphId) ?? undefined;
+        const isPrivateContextGraph = await agent.isPrivateContextGraph(contextGraphId);
+        const trustedNonManifestCatalogTriples = isPrivateContextGraph
           ? generatedPrivateCatalogTripleKeys(contextGraphId)
           : undefined;
         const { promotedCount, gossipMessage, promotedAllRoots } = await agent.publisher.assertionPromote(
@@ -2034,6 +2036,7 @@ export class DKGAgent extends DKGAgentBase {
             publisherPeerId: agent.node.peerId.toString(),
             senderAgentAddress: gossipSigner?.agentAddress,
             trustedNonManifestCatalogTriples,
+            onChainContextGraphId: trustedCatalogOnChainContextGraphId,
             confirmBeforeCommit,
           },
         );

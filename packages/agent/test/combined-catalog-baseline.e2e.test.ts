@@ -120,5 +120,18 @@ describe('baseline — curated CG product-path publish (pre-catalog)', () => {
     const secondRoots = secondPub.kaManifest.map((m: any) => String(m.rootEntity ?? m.entity ?? m.subject ?? ''));
     expect(secondRoots).toEqual(['urn:acme:shipment/SH-43']);
     expect(secondRoots).not.toContain(cgUal);
+
+    const postSecondCatalog: any = await (publisher as any).store.query(
+      `SELECT ?p ?o WHERE { GRAPH <${catalogGraph}> { <${cgUal}> ?p ?o } }`,
+    );
+    expect(postSecondCatalog.type).toBe('bindings');
+    const postSecondTriples = postSecondCatalog.bindings.map((b: any) => ({ p: b.p, o: b.o }));
+    expect(postSecondTriples.filter((t: any) => t.p === 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type').map((t: any) => t.o))
+      .toEqual(expect.arrayContaining([
+        'http://www.w3.org/ns/dcat#Dataset',
+        'https://dkg.network/ontology#PrivateContextGraph',
+      ]));
+    expect(postSecondTriples.find((t: any) => t.p === 'http://purl.org/dc/terms/accessRights')?.o)
+      .toBe('http://publications.europa.eu/resource/authority/access-right/RESTRICTED');
   });
 });

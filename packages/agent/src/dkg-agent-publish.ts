@@ -1570,8 +1570,9 @@ export class PublishMethods extends DKGAgentBase {
     // path always has — so under a DEGRADED / stale policy probe a public update
     // fails closed (throws) consistently with publish, where the OLD update path
     // would have proceeded. Fail-closed, never a leak; see PR #1208 notes.
+    const shouldInjectCuratedCatalogFloor = isCuratedUpdate && updateOnChainId != null;
     let updateQuads = quads;
-    if (isCuratedUpdate) {
+    if (shouldInjectCuratedCatalogFloor) {
       const cgDid = contextGraphDataUri(contextGraphId);
       const { otherQuads: nonCatalogQuads } = partitionCatalogQuads(quads, cgDid);
       const catalogFloor = buildPublicProjection({
@@ -1591,7 +1592,7 @@ export class PublishMethods extends DKGAgentBase {
       operationCtx: ctx,
       onPhase,
       precomputedUpdateAttestation: opts?.precomputedUpdateAttestation,
-      trustedNonManifestCatalogTriples: isCuratedUpdate
+      trustedNonManifestCatalogTriples: shouldInjectCuratedCatalogFloor
         ? generatedPrivateCatalogTripleKeys(contextGraphId)
         : undefined,
       v10UpdateACKProvider,
@@ -2599,10 +2600,11 @@ export class PublishMethods extends DKGAgentBase {
     }
 
     const privateQuads = opts?.privateQuads ?? [];
+    const trustedCatalogOnChainId = opts?.targetOnChainCgId ?? await this.getContextGraphOnChainId(contextGraphId);
     const canonical = canonicalPublishPayload(
       quads,
       privateQuads,
-      (await this.isPrivateContextGraph(contextGraphId))
+      trustedCatalogOnChainId != null && (await this.isPrivateContextGraph(contextGraphId))
         ? { trustedNonManifestCatalogTriples: generatedPrivateCatalogTripleKeys(contextGraphId) }
         : undefined,
     );

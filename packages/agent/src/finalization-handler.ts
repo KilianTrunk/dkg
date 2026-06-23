@@ -49,6 +49,28 @@ export type ResolveContextGraphOnChainId = (
 
 export type MarkContextGraphMetaDirtyFromQuads = (quads: readonly Quad[]) => void;
 
+function stripOptionalLiteral(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  if (value.startsWith('"')) {
+    try {
+      return JSON.parse(value);
+    } catch {
+      const lastQuote = value.lastIndexOf('"');
+      return value.slice(1, lastQuote > 0 ? lastQuote : undefined);
+    }
+  }
+  return value;
+}
+
+function sameBigIntLiteral(left: string | bigint | null | undefined, right: string | bigint | null | undefined): boolean {
+  if (left === undefined || left === null || right === undefined || right === null) return false;
+  try {
+    return BigInt(left) === BigInt(right);
+  } catch {
+    return false;
+  }
+}
+
 export class FinalizationHandler {
   private readonly store: TripleStore;
   private readonly chain: ChainAdapter | undefined;
@@ -195,7 +217,7 @@ export class FinalizationHandler {
 
       if (sharedMemoryQuads.length > 0) {
         const privateRoots = await this.getPrivateRootsFromMeta(contextGraphId, msg.rootEntities, subGraphName);
-        const allowGeneratedCatalogFloor = await this.allowsGeneratedCatalogFloor(ctxGraphId);
+        const allowGeneratedCatalogFloor = await this.allowsGeneratedCatalogFloor(contextGraphId, ctxGraphId);
         const merkleMatchedQuads = this.sharedMemoryQuadsMatchingMerkle(
           contextGraphId,
           sharedMemoryQuads,
@@ -413,10 +435,64 @@ export class FinalizationHandler {
     return null;
   }
 
-  private async allowsGeneratedCatalogFloor(onChainCgId: string | bigint | undefined): Promise<boolean> {
+  private async storedOnChainContextGraphId(contextGraphId: string): Promise<string | undefined> {
+    const ontologyGraph = contextGraphDataUri('ontology');
+    const contextGraphUri = contextGraphDataUri(contextGraphId);
+    const result = await this.store.query(
+      `SELECT ?id WHERE { GRAPH <${ontologyGraph}> { <${contextGraphUri}> <https://dkg.network/ontology#ContextGraphOnChainId> ?id } } LIMIT 1`,
+    );
+    if (result.type !== 'bindings' || result.bindings.length === 0) return undefined;
+    return stripOptionalLiteral(result.bindings[0]?.['id'])?.trim();
+  }
+
+  private async onChainContextGraphMatchesLocalId(
+    contextGraphId: string,
+    onChainCgId: string | bigint | undefined,
+  ): Promise<boolean> {
+    if (onChainCgId === undefined || onChainCgId === null) return false;
+    const normalizedOnChainId = String(onChainCgId).trim();
+    const normalizedContextGraphId = contextGraphId.trim();
+
+    if (/^\d+$/.test(normalizedContextGraphId) && normalizedContextGraphId === normalizedOnChainId) return true;
+
+    const liveNameHashMatches = async (): Promise<boolean> => {
+      if (typeof this.chain?.getContextGraphNameHash !== 'function') return false;
+      try {
+        const nameHash = await this.chain.getContextGraphNameHash(BigInt(normalizedOnChainId));
+        return typeof nameHash === 'string' &&
+          nameHash.toLowerCase() === ethers.keccak256(ethers.toUtf8Bytes(normalizedContextGraphId)).toLowerCase();
+      } catch {
+        return false;
+      }
+    };
+
+    let resolvedOnChainId: string | null | undefined;
+    try {
+      resolvedOnChainId = await this.resolveContextGraphOnChainId?.(contextGraphId);
+    } catch {
+      resolvedOnChainId = undefined;
+    }
+    if (sameBigIntLiteral(resolvedOnChainId, normalizedOnChainId)) {
+      return typeof this.chain?.getContextGraphNameHash === 'function'
+        ? liveNameHashMatches()
+        : true;
+    }
+
+    const storedOnChainId = await this.storedOnChainContextGraphId(contextGraphId);
+    if (sameBigIntLiteral(storedOnChainId, normalizedOnChainId)) {
+      return typeof this.chain?.getContextGraphNameHash === 'function'
+        ? liveNameHashMatches()
+        : true;
+    }
+
+    return liveNameHashMatches();
+  }
+
+  private async allowsGeneratedCatalogFloor(contextGraphId: string, onChainCgId: string | bigint | undefined): Promise<boolean> {
     if (onChainCgId === undefined || onChainCgId === null) return false;
     if (!this.chain || this.chain.chainId === 'none') return false;
     if (typeof this.chain.getContextGraphAccessPolicy !== 'function') return false;
+    if (!await this.onChainContextGraphMatchesLocalId(contextGraphId, onChainCgId)) return false;
     try {
       return Number(await this.chain.getContextGraphAccessPolicy(BigInt(onChainCgId))) === 1;
     } catch {
@@ -830,7 +906,7 @@ export class FinalizationHandler {
     subGraphName?: string,
     onChainCgId?: string,
   ): Promise<{ rootEntities: string[]; sharedMemoryQuads: Quad[]; subGraphName?: string } | null> {
-    const allowGeneratedCatalogFloor = await this.allowsGeneratedCatalogFloor(onChainCgId);
+    const allowGeneratedCatalogFloor = await this.allowsGeneratedCatalogFloor(contextGraphId, onChainCgId);
     // Caller knows the exact namespace → search only that one.
     if (subGraphName) {
       const hit = await this.findSwmSnapshotInNamespace(

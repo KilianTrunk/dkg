@@ -129,6 +129,22 @@ describe('canonicalPublishPayload — shared canonicalization for agent ↔ publ
     expect(result.skolemizedPublicQuads).toHaveLength(skolemized.length);
   });
 
+  it('keeps generated catalog-looking quads manifest-visible without the trusted floor option', () => {
+    const contextGraphId = 'private-catalog-cg';
+    const content = [
+      q('urn:example:shipment:1', 'http://schema.org/name', '"Shipment 1"'),
+    ];
+    const catalog = generatedPrivateCatalogFloorQuads(contextGraphId);
+
+    const result = canonicalPublishPayload([...content, ...catalog]);
+
+    expect(result.manifestEntries.map((m) => m.rootEntity).sort()).toEqual([
+      'did:dkg:context-graph:private-catalog-cg',
+      'urn:example:shipment:1',
+    ]);
+    expect(result.generatedCatalogRootEntities).toEqual([]);
+  });
+
   it('refuses to hide a generated catalog subject that also carries non-catalog triples', () => {
     const contextGraphId = 'private-catalog-cg';
     const cgDid = `did:dkg:context-graph:${contextGraphId}`;

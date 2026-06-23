@@ -12,6 +12,7 @@ import {
   generatedPrivateCatalogFloorQuads,
 } from '@origintrail-official/dkg-publisher';
 import { FinalizationHandler } from '../src/finalization-handler.js';
+import { ethers } from 'ethers';
 
 const CONTEXT_GRAPH = 'test-contextGraph';
 
@@ -393,11 +394,16 @@ describe('FinalizationHandler.handleChainReconciledKC (Phase B)', () => {
   }
 
   /** Minimal chain whose getKAContextGraphId binds the KA to the given CG. */
-  function makeBindingChain(boundCg: bigint, accessPolicy = 1): ChainAdapter {
+  function makeBindingChain(
+    boundCg: bigint,
+    accessPolicy = 1,
+    nameHash: string | null = ethers.keccak256(ethers.toUtf8Bytes(CONTEXT_GRAPH)),
+  ): ChainAdapter {
     return {
       chainId: 'evm:31337',
       getKAContextGraphId: async (_kaId: bigint) => boundCg,
       getContextGraphAccessPolicy: async (_contextGraphId: bigint) => accessPolicy,
+      getContextGraphNameHash: async (_contextGraphId: bigint) => nameHash,
     } as unknown as ChainAdapter;
   }
 
@@ -469,6 +475,23 @@ describe('FinalizationHandler.handleChainReconciledKC (Phase B)', () => {
       [],
     );
     const handler = new FinalizationHandler(store, makeBindingChain(42n, 0));
+
+    const outcome = await handler.handleChainReconciledKC(input(merkleRoot), createOperationContext('system'));
+    expect(outcome).toBe('no-swm');
+  });
+
+  it('does not regenerate the private-CG catalog floor when live name hash does not match the local CG', async () => {
+    const store = new OxigraphStore();
+    await seedSwmSnapshot(store);
+    const merkleRoot = computeFlatKCRootV10(
+      [
+        { subject: ENTITY, predicate: 'http://schema.org/name', object: '"Reconciled"', graph: '' },
+        ...generatedPrivateCatalogFloorQuads(CONTEXT_GRAPH),
+      ],
+      [],
+    );
+    const staleNameHash = `0x${'11'.repeat(32)}`;
+    const handler = new FinalizationHandler(store, makeBindingChain(42n, 1, staleNameHash));
 
     const outcome = await handler.handleChainReconciledKC(input(merkleRoot), createOperationContext('system'));
     expect(outcome).toBe('no-swm');

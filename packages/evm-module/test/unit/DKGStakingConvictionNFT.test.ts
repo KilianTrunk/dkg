@@ -1345,6 +1345,27 @@ describe('@unit DKGStakingConvictionNFT', () => {
       expect(posAfter.lastClaimedEpoch).to.equal(posBefore.lastClaimedEpoch);
     });
 
+    it('rejects a burned token id at the NFT boundary without advancing the replacement cursor', async () => {
+      const { identityId } = await createProfile();
+      const amount = hre.ethers.parseEther('1000');
+      await mintAndApprove(accounts[0], amount);
+      await NFT.connect(accounts[0]).createConviction(identityId, amount, 1);
+      await advanceEpochs(2);
+      await NFT.connect(accounts[0]).claim(1);
+
+      const newTokenId = await NFT.connect(accounts[0]).relock.staticCall(1, 12);
+      await NFT.connect(accounts[0]).relock(1, 12);
+      await advanceEpochs(1);
+
+      const posBefore = await ConvictionStakingStorageContract.getPosition(newTokenId);
+      await expect(
+        NFT.connect(accounts[4]).claim(1),
+      ).to.be.revertedWithCustomError(NFT, 'ERC721NonexistentToken').withArgs(1n);
+
+      const posAfter = await ConvictionStakingStorageContract.getPosition(newTokenId);
+      expect(posAfter.lastClaimedEpoch).to.equal(posBefore.lastClaimedEpoch);
+    });
+
     // -----------------------------------------------------------------
     // No-op paths
     // -----------------------------------------------------------------

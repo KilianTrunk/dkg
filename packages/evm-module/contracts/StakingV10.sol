@@ -131,7 +131,16 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
     //             CSS when the settled score is non-zero.
     //           * `_claim` integrates matured carries (epoch closed) via the
     //             extracted `_nodeEpochReward` helper, then clears them.
-    string private constant _VERSION = "10.0.4";
+    //   10.0.5 — Permissionless claim WITHOUT a wrapper redeploy: adds the
+    //           public `claimFor(tokenId)` settlement entry point (anyone may
+    //           trigger; rewards compound to the tokenId-keyed NFT owner). The
+    //           `onlyConvictionNFT` `claim` keeps its 2-arg `(staker, tokenId)`
+    //           signature so the deployed 10.0.3 wrapper still works post-
+    //           redeploy — superseding #1302's wrapper-side change, which could
+    //           not ship to mainnet without orphaning existing position NFTs.
+    //           Also carries the #1297 boost-expiry reward-boundary fix (which
+    //           had landed under the unchanged 10.0.4 string).
+    string private constant _VERSION = "10.0.5";
 
     /// @notice Emitted when a node crosses `minimumStake` during a
     /// stake / redelegate / claim but the sharding table is full, so its
@@ -716,7 +725,26 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
      *        4. `cs.setLastClaimedEpoch(tokenId, toEpoch)` — advance cursor.
      *      No StakingStorage writes.
      */
-    function claim(uint256 tokenId) external onlyConvictionNFT {
+    // The first arg (the staker address) is intentionally UNNAMED: it is
+    // retained only for ABI compatibility with the DEPLOYED DKGStakingConvictionNFT
+    // wrapper (10.0.3), whose owner-gated `claim` calls
+    // `stakingV10.claim(msg.sender, tokenId)`. Keeping this 2-arg signature means
+    // the existing wrapper keeps working after StakingV10 is redeployed — so no
+    // wrapper redeploy (which would orphan position NFTs) is needed. Settlement is
+    // tokenId-keyed (the NFT owner is the beneficiary), so the address is unused.
+    function claim(address, uint256 tokenId) external onlyConvictionNFT {
+        _claim(tokenId);
+    }
+
+    /// @notice Permissionless settlement: ANY caller may trigger a claim for
+    ///         `tokenId`. Rewards compound into the tokenId-keyed position, so
+    ///         the current NFT owner benefits regardless of caller — no funds
+    ///         are routed to `msg.sender`. This is the wrapper-independent
+    ///         permissionless-claim entry point: keepers can settle rewards (and
+    ///         the per-epoch operator fee) without touching the stateful ERC-721
+    ///         wrapper. `_claim` reverts `PositionNotFound` for a nonexistent or
+    ///         already-withdrawn position, so no extra guard is required.
+    function claimFor(uint256 tokenId) external {
         _claim(tokenId);
     }
 

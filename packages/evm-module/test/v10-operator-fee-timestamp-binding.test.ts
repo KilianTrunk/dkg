@@ -454,7 +454,9 @@ describe('@integration H-5 regression — operator fee bound to epoch timestamp'
       'Cannot update operatorFee if operatorFee has not been calculated and claimed for previous epochs',
     );
 
-    await NFT.connect(keeper).claim(tokenId);
+    // A keeper (non-owner) settles the prior epoch via the permissionless
+    // StakingV10.claimFor — unblocking the node admin's operatorFee update.
+    await StakingV10Contract.connect(keeper).claimFor(tokenId);
 
     expect(await CSS.isOperatorFeeClaimedForEpoch(identityId, epoch2)).to.equal(true);
 

@@ -22,6 +22,7 @@ const redact = createLogRedactor();
 
 const worker = new OtlpLogWorker({
   endpoint,
+  token: process.env.OTLP_TOKEN, // bearer token (e.g. when pushing through Alloy)
   network,
   peerId: `12D3KooW-${nodeName}`,
   nodeName, // becomes service.instance.id → the Grafana node-selector label

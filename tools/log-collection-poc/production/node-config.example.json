@@ -1,0 +1,15 @@
+{
+  "_comment": "Add these keys to each OriginTrail-hosted node's config.json. `name` MUST be unique per node — it becomes the Grafana Node selector value. `network` is auto-derived by the node (testnet/mainnet) → the Environment label. Requires a node build that includes the OTLP log-collection feature (PR #1317).",
+
+  "name": "testnet-core-01",
+
+  "telemetry": {
+    "enabled": true,
+    "logs": {
+      "exporter": "otlp",
+      "endpoint": "https://logs-ingest.xtrmstrngth.com/v1/logs",
+      "token": "<INGEST_TOKEN>",
+      "level": "info"
+    }
+  }
+}

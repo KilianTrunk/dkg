@@ -1,0 +1,59 @@
+// Grafana Alloy — OTLP ingest bridge for DKG V10 node logs.
+//
+//   DKG nodes --OTLP/HTTP (bearer token)--> Alloy --Loki push API--> existing Loki
+//
+// Why Alloy (not native OTLP→Loki): the production Loki is 2.5.0, which has no
+// OTLP endpoint and no structured metadata. Alloy receives OTLP and writes via
+// the classic /loki/api/v1/push, promoting the node-identity resource
+// attributes to index labels (service_name, service_instance_id,
+// deployment_environment) so a Grafana dashboard can pick a node.
+//
+// Env:
+//   LOKI_PUSH_URL — e.g. http://localhost:3100/loki/api/v1/push (Loki on host).
+//
+// AUTH: the OTLP port is NOT exposed directly. It is reached only through the
+// Cloudflare-proxied ingest hostname, which enforces the bearer token (a
+// Cloudflare WAF rule on the Authorization header, or a Cloudflare service
+// token). Alloy binds to localhost on the host; nodes hit Cloudflare → origin.
+// (Per-version Alloy receiver auth is finicky; gating at the edge is simpler
+// and equally strong.)
+
+otelcol.receiver.otlp "default" {
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+  output {
+    logs = [otelcol.processor.batch.default.input]
+  }
+}
+
+otelcol.processor.batch "default" {
+  output {
+    logs = [otelcol.processor.transform.loki_labels.input]
+  }
+}
+
+// Tell the Loki exporter which resource attributes become Loki INDEX labels.
+// Keep this list SMALL and low-cardinality — never add operation_id here.
+otelcol.processor.transform "loki_labels" {
+  error_mode = "ignore"
+  log_statements {
+    context = "resource"
+    statements = [
+      `set(attributes["loki.resource.labels"], "service.name, service.instance.id, deployment.environment, dkg.node_role")`,
+    ]
+  }
+  output {
+    logs = [otelcol.exporter.loki.default.input]
+  }
+}
+
+otelcol.exporter.loki "default" {
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = sys.env("LOKI_PUSH_URL")
+  }
+}

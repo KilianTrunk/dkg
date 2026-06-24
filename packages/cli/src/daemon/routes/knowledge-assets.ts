@@ -336,7 +336,7 @@ function hasFinalizeOnlyCreateFields(raw: Record<string, unknown>): boolean {
   return FINALIZE_ONLY_CREATE_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(raw, field));
 }
 
-function resolveAtomicCreateAuthorAgentAddress(
+function resolveAuthorAgentAddressFromFinalizeOptions(
   finalizeOptions: Record<string, unknown>,
   tokenAgentAddress?: string,
 ): string | undefined {
@@ -790,7 +790,7 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       // finalize throws KaIdNamespaceMismatch. So stamp under the same resolved
       // author the finalize uses: the body author, else the token's agent (else
       // undefined → the daemon's default agent for node/admin tokens).
-      const createAuthorAgentAddress = resolveAtomicCreateAuthorAgentAddress(
+      const createAuthorAgentAddress = resolveAuthorAgentAddressFromFinalizeOptions(
         finalizeOptions,
         writePreflightCallerAgentAddress,
       );
@@ -1069,9 +1069,16 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       if (verb === "finalize") {
         const finalizeOptions = resolveFinalizeOptions(parsed, res, writePreflightCallerAgentAddress);
         if (finalizeOptions === null) return;
+        const finalizeAuthorAgentAddress = resolveAuthorAgentAddressFromFinalizeOptions(
+          finalizeOptions,
+          writePreflightCallerAgentAddress,
+        );
         let seal;
         try {
-          seal = await agent.assertion.finalize(contextGraphId, name, finalizeOptions);
+          seal = await agent.assertion.finalize(contextGraphId, name, {
+            ...finalizeOptions,
+            ...(finalizeAuthorAgentAddress ? { agentAddress: finalizeAuthorAgentAddress } : {}),
+          });
         } catch (e: any) {
           // #1116 (review A1): a finalize(layer:"swm") on an asset that was only
           // SUBSET-shared is rejected — subset shares are SWM-only, not

@@ -33,6 +33,8 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import type { ServerResponse } from 'node:http';
 import { resolveRequiredWriteContextGraphId } from '../src/daemon/http-utils.js';
+import { handleMemoryRoutes } from '../src/daemon/routes/memory.js';
+import type { RequestContext } from '../src/daemon/routes/context.js';
 import {
   startLiveDaemon,
   stopLiveDaemon,
@@ -126,6 +128,89 @@ function preSignedAttestationFor(address: string) {
       vs: `0x${'22'.repeat(32)}`,
     },
   };
+}
+
+function routeRes() {
+  const res: any = { statusCode: 0, body: '', headers: {} as Record<string, string>, writableEnded: false };
+  res.writeHead = (status: number, headers?: Record<string, string>) => {
+    res.statusCode = status;
+    if (headers) Object.assign(res.headers, headers);
+    return res;
+  };
+  res.setHeader = (key: string, value: string) => { res.headers[key] = value; };
+  res.end = (body?: string) => {
+    res.body = body ?? '';
+    res.writableEnded = true;
+  };
+  return res;
+}
+
+async function runSharedMemoryPublishRoute(params: {
+  body: Record<string, unknown>;
+  bearer?: string;
+  tokenAgents?: Record<string, string>;
+}) {
+  const res = routeRes();
+  const seen: Array<Record<string, any>> = [];
+  const url = new URL('http://127.0.0.1/api/shared-memory/publish');
+  const agent = {
+    resolveAgentByToken: (token?: string) => (token ? params.tokenAgents?.[token] : undefined),
+    async listContextGraphs() {
+      return [{ id: 'cg', uri: 'did:dkg:context-graph:cg', subscribed: true, synced: true }];
+    },
+    async contextGraphExists(id: string) {
+      return id === 'cg';
+    },
+    store: {
+      async query() {
+        return {
+          type: 'quads' as const,
+          quads: [{ subject: 'urn:root', predicate: 'urn:p', object: 'urn:o' }],
+        };
+      },
+    },
+    async getContextGraphOnChainId() {
+      return '1';
+    },
+    async publishFromSharedMemory(contextGraphId: string, selection: unknown, opts: Record<string, unknown>) {
+      seen.push({ contextGraphId, selection, opts });
+      return {
+        kaId: 1n,
+        status: 'confirmed',
+        kaManifest: [{ tokenId: 1n, rootEntity: 'urn:root' }],
+        publicQuads: [{ subject: 'urn:root', predicate: 'urn:p', object: 'urn:o' }],
+      };
+    },
+  };
+  const tracker = {
+    start() {},
+    async trackPhase(_ctx: unknown, _phase: string, fn: () => unknown) { return fn(); },
+    complete() {},
+    fail() {},
+    setCost() {},
+    setTxHash() {},
+  };
+  const req = {
+    method: 'POST',
+    headers: params.bearer ? { authorization: `Bearer ${params.bearer}` } : {},
+    __dkgPrebufferedBody: Buffer.from(JSON.stringify(params.body)),
+  };
+  await handleMemoryRoutes({
+    req,
+    res,
+    agent,
+    tracker,
+    dashDb: { insertNotification: () => 1 },
+    config: {},
+    network: {},
+    path: url.pathname,
+    url,
+    requestToken: params.bearer,
+    requestAgentAddress: params.tokenAgents?.[params.bearer ?? ''] ?? 'did:dkg:agent:test',
+    emitMemoryGraphChanged: () => {},
+    emitNotification: () => {},
+  } as unknown as RequestContext);
+  return { res, seen };
 }
 
 // The routes' real write-preflight opts (knowledge-assets.ts:478-482 /
@@ -282,6 +367,47 @@ describe('resolveRequiredWriteContextGraphId — write-target resolution (real r
     const resolved = await resolveRequiredWriteContextGraphId(provider, 'agent-cg', res, SCOPED);
     expect(resolved).toBe('agent-cg');
     expect(listCalls).toEqual([{ callerAgentAddress: CALLER }]);
+  });
+});
+
+describe('shared-memory publish authorship route matrix', () => {
+  it('defaults selection publish authorship to the agent-scoped token', async () => {
+    const agentAddress = `0x${'ab'.repeat(20)}`;
+    const { res, seen } = await runSharedMemoryPublishRoute({
+      bearer: 'agent-a-token',
+      tokenAgents: { 'agent-a-token': agentAddress },
+      body: { contextGraphId: 'cg', selection: ['urn:root'] },
+    });
+
+    expect(res.statusCode, res.body).toBe(200);
+    expect(seen).toHaveLength(1);
+    expect(seen[0].opts.authorAgentAddress).toBe(agentAddress);
+  });
+
+  it('allows selection publish when body author matches the agent-scoped token', async () => {
+    const agentAddress = `0x${'cd'.repeat(20)}`;
+    const { res, seen } = await runSharedMemoryPublishRoute({
+      bearer: 'agent-a-token',
+      tokenAgents: { 'agent-a-token': agentAddress },
+      body: { contextGraphId: 'cg', selection: ['urn:root'], authorAgentAddress: agentAddress },
+    });
+
+    expect(res.statusCode, res.body).toBe(200);
+    expect(seen).toHaveLength(1);
+    expect(seen[0].opts.authorAgentAddress).toBe(agentAddress);
+  });
+
+  it('keeps node-token selection publish explicit author override behavior', async () => {
+    const authorAgentAddress = `0x${'ef'.repeat(20)}`;
+    const { res, seen } = await runSharedMemoryPublishRoute({
+      bearer: 'node-token',
+      tokenAgents: {},
+      body: { contextGraphId: 'cg', selection: ['urn:root'], authorAgentAddress },
+    });
+
+    expect(res.statusCode, res.body).toBe(200);
+    expect(seen).toHaveLength(1);
+    expect(seen[0].opts.authorAgentAddress).toBe(authorAgentAddress);
   });
 });
 

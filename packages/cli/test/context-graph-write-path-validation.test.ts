@@ -117,6 +117,17 @@ function rowProvider(rows: Row[]) {
   };
 }
 
+function preSignedAttestationFor(address: string) {
+  return {
+    address,
+    reservedKaId: '1',
+    signature: {
+      r: `0x${'11'.repeat(32)}`,
+      vs: `0x${'22'.repeat(32)}`,
+    },
+  };
+}
+
 // The routes' real write-preflight opts (knowledge-assets.ts:478-482 /
 // context-graph.ts): unscoped when there is no agent token, scoped to the
 // token-resolved agent address otherwise.
@@ -279,7 +290,7 @@ describe('context-graph write-path validation — real daemon route wiring', () 
   const LOCAL_CG = 'write-path-cg';
 
   beforeAll(async () => {
-    daemon = await startLiveDaemon({ authEnabled: false });
+    daemon = await startLiveDaemon();
     const created = await postJson(daemon, '/api/context-graph/create', { id: LOCAL_CG, name: LOCAL_CG });
     expect(created.status).toBe(200);
   }, 90_000);
@@ -289,6 +300,42 @@ describe('context-graph write-path validation — real daemon route wiring', () 
   });
 
   const QUADS = [{ subject: 'urn:s', predicate: 'urn:p', object: 'urn:o' }];
+
+  async function postJsonAsAgent(authToken: string, path: string, body: unknown) {
+    const res = await fetch(`${daemon.base}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
+      body: JSON.stringify(body),
+    });
+    return { status: res.status, body: (await res.json().catch(() => ({}))) as Record<string, any> };
+  }
+
+  async function registerAgentClient(label: string) {
+    const registered = await postJson(daemon, '/api/agent/register', {
+      name: `${label}-${Date.now().toString(36)}`,
+      framework: 'test',
+    });
+    expect(registered.status, `${label} register: ${JSON.stringify(registered.body)}`).toBeLessThan(300);
+    const agentAddress = String(registered.body.agentAddress);
+    const authToken = String(registered.body.authToken);
+    expect(agentAddress).toMatch(/^0x[0-9a-fA-F]{40}$/);
+    expect(authToken.length).toBeGreaterThan(0);
+    return {
+      agentAddress,
+      authToken,
+      post: (path: string, body: unknown) => postJsonAsAgent(authToken, path, body),
+    };
+  }
+
+  async function createRegisteredAgentContextGraph(
+    agent: Awaited<ReturnType<typeof registerAgentClient>>,
+    id: string,
+  ) {
+    const created = await agent.post('/api/context-graph/create', { id, name: id, accessPolicy: 1 });
+    expect(created.status, `agent CG create: ${JSON.stringify(created.body)}`).toBeLessThan(300);
+    const registered = await agent.post('/api/context-graph/register', { id, accessPolicy: 1 });
+    expect(registered.status, `agent CG register: ${JSON.stringify(registered.body)}`).toBe(200);
+  }
 
   // ── every write route rejects an unknown contextGraphId before mutating ──
   it('rejects unknown wm/write targets with CONTEXT_GRAPH_NOT_FOUND before mutation', async () => {
@@ -345,6 +392,42 @@ describe('context-graph write-path validation — real daemon route wiring', () 
     const res = await postJson(daemon, '/api/shared-memory/publish', { contextGraphId: 'missing-cg', selection: 'all' });
     expect(res.status).toBe(400);
     expect(res.body).toMatchObject({ code: 'CONTEXT_GRAPH_NOT_FOUND' });
+  });
+
+  it('rejects an agent token that selection-publishes as a different authorAgentAddress before reading shared memory', async () => {
+    const agentA = await registerAgentClient('swm-publish-author-a');
+    const agentB = await registerAgentClient('swm-publish-author-b');
+    const cg = `swm-publish-author-${Date.now().toString(36)}`;
+    await createRegisteredAgentContextGraph(agentA, cg);
+
+    const res = await agentA.post('/api/shared-memory/publish', {
+      contextGraphId: cg,
+      selection: 'all',
+      authorAgentAddress: agentB.agentAddress,
+    });
+
+    expect(res.status).toBe(403);
+    expect(String(res.body.error)).toContain(agentA.agentAddress);
+    expect(String(res.body.error)).toContain(agentB.agentAddress);
+    expect(String(res.body.error)).toContain('authorAgentAddress');
+  });
+
+  it('rejects an agent token that selection-publishes with a different pre-signed author before reading shared memory', async () => {
+    const agentA = await registerAgentClient('swm-publish-presign-a');
+    const agentB = await registerAgentClient('swm-publish-presign-b');
+    const cg = `swm-publish-presign-${Date.now().toString(36)}`;
+    await createRegisteredAgentContextGraph(agentA, cg);
+
+    const res = await agentA.post('/api/shared-memory/publish', {
+      contextGraphId: cg,
+      selection: 'all',
+      preSignedAuthorAttestation: preSignedAttestationFor(agentB.agentAddress),
+    });
+
+    expect(res.status).toBe(403);
+    expect(String(res.body.error)).toContain(agentA.agentAddress);
+    expect(String(res.body.error)).toContain(agentB.agentAddress);
+    expect(String(res.body.error)).toContain('preSignedAuthorAttestation.address');
   });
 
   // ── a real locally-created graph (and its full DID) is accepted ──

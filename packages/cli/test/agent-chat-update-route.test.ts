@@ -130,6 +130,17 @@ describe('POST /api/update — kaId + attestation contract (KC→KA), real daemo
     expect(res.body.error).toMatch(/precomputedUpdateAttestation.*requires/);
   });
 
+  it('rejects a null precomputedUpdateAttestation with 400', async () => {
+    const res = await postJson(daemon, '/api/update', {
+      kaId: '7',
+      contextGraphId: CG,
+      quads: QUADS,
+      precomputedUpdateAttestation: null,
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/precomputedUpdateAttestation.*object/);
+  });
+
   it('rejects an agent token with another agent update attestation before update', async () => {
     const agentA = await registerAgentClient(daemon, 'update-author-a');
     const agentB = await registerAgentClient(daemon, 'update-author-b');

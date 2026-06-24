@@ -2143,8 +2143,8 @@ export async function mcpSetupAction(
   // are out of scope for setup.
   if (shouldVerify && !dryRun && shouldStart) {
     try {
-      // F26: same hang-bound as the funding-step reachability probe.
-      // A partially-up daemon must not block setup completion.
+      // Bound the health probe with a 2s timeout so a partially-up daemon
+      // (port bound but unresponsive) can't block setup completion.
       const res = await fetch(`http://127.0.0.1:${effectivePort}/api/status`, {
         signal: AbortSignal.timeout(2000),
       });

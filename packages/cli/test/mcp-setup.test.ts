@@ -217,7 +217,8 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
     // a recorder so tests assert it's invoked with (network, idempotencySeed,
     // didStartDaemon) on a normal setup and skipped under --no-fund / --dry-run.
     // Its internal wallet-read + faucet-call + manual-instructions behavior is
-    // covered by dkg-core's faucet-orchestration tests, not re-asserted here.
+    // covered directly by packages/core/test/faucet-orchestration.test.ts, not
+    // re-asserted here.
     const fundWalletsBestEffort = recorder(async (_opts: any) => {});
     // Phase-2: detectContext defaults to "installed" by returning null
     // from findDkgMonorepoRoot. Tests that exercise the monorepo path
@@ -381,7 +382,7 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
   // directly — so `--no-start` (daemon not started this run) STILL funds. This
   // also preserves the F14 "re-run-to-retry-funding" goal: funding depends only
   // on wallets.json existing, never on a daemon being reachable.
-  it('funds without any reachability probe even with --no-start (didStartDaemon=false)', async () => {
+  it('funds under --no-start (didStartDaemon=false), unconditional on daemon reachability', async () => {
     mkdirSync(join(tmpHome, '.cursor'), { recursive: true });
     const deps = makeDeps();
 
@@ -494,10 +495,11 @@ describe('mcpSetupAction — bundled init + daemon-start + register flow', () =>
 
   // Faucet failure handling — manual `curl` instructions on a faucet error or
   // partial success — now lives INSIDE `fundWalletsBestEffort` (the shared
-  // orchestrator) and is covered by dkg-core's faucet-orchestration tests. The
-  // mcp layer only decides whether to invoke it (asserted above), so the former
-  // mcp-level faucet-failure/partial-success tests were removed with the
-  // bespoke inline faucet path.
+  // orchestrator) and is covered directly by
+  // packages/core/test/faucet-orchestration.test.ts. The mcp layer only decides
+  // whether to invoke it (asserted above), so the former mcp-level
+  // faucet-failure/partial-success tests were removed with the bespoke inline
+  // faucet path.
 
   // ── Phase-2: monorepo context detection + --installed/--monorepo flags ──
 

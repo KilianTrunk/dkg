@@ -10,9 +10,6 @@ import { ethers } from 'ethers';
 import { resolveRpcUrls } from '@origintrail-official/dkg-chain';
 import {
   dkgAuthTokenPath,
-  FAUCET_WALLETS_PER_REQUEST,
-  getFundableWalletAddresses,
-  requestFaucetFunding,
   resolveDkgConfigHome,
   toErrorMessage,
   hasErrorCode,

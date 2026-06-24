@@ -968,6 +968,15 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
     if (parsed.precomputedUpdateAttestation != null && !precomputedUpdateAttestation) {
       return;
     }
+    const tokenAgentAddress = requestToken ? agent.resolveAgentByToken(requestToken) : undefined;
+    const updateAuthorAddress = precomputedUpdateAttestation?.authorAddress;
+    if (tokenAgentAddress && updateAuthorAddress && tokenAgentAddress !== updateAuthorAddress) {
+      return jsonResponse(res, 403, {
+        error:
+          `Author mismatch: authenticated as ${tokenAgentAddress} but request body claims ${updateAuthorAddress}. ` +
+          `The author is resolved from the agent-scoped bearer token; omit precomputedUpdateAttestation.authorAddress or use the matching agent's token.`,
+      });
+    }
     if (!kaId || !contextGraphId || !quads?.length) {
       return jsonResponse(res, 400, {
         error: 'Missing "kaId", "contextGraphId", or "quads"',

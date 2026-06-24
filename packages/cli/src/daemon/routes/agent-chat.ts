@@ -191,6 +191,7 @@ import {
   isPublishQuad,
   parsePublishRequestBody,
   jsonResponse,
+  oversizedRdfLiteralResponseBody,
   safeDecodeURIComponent,
   safeParseJson,
   validateOptionalSubGraphName,
@@ -1051,6 +1052,9 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
       // those to 422 (Unprocessable Entity) so the API surfaces a proper 4xx
       // instead of letting it bubble to the generic 500 handler.
       const message = err instanceof Error ? err.message : String(err);
+      if ((err as any)?.code === "OVERSIZED_RDF_LITERAL") {
+        return jsonResponse(res, 400, oversizedRdfLiteralResponseBody(err));
+      }
       if (message.includes('precomputedUpdateAttestation')) {
         return jsonResponse(res, 422, { error: message });
       }

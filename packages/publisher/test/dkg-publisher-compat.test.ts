@@ -35,4 +35,35 @@ describe('DKGPublisher compatibility aliases', () => {
 
     expect(publisher.autoPartition(quads)).toEqual(publisher.skolemizeByEntity(quads));
   });
+
+  it('rejects oversized RDF literals at shared-memory producer boundary', async () => {
+    const publisher = await makePublisher();
+    const oversized = `"${'x'.repeat(60_000)}"`;
+
+    await expect(
+      publisher.share('test', [
+        q('urn:compat:oversized', 'http://schema.org/text', oversized),
+      ], { publisherPeerId: 'test-peer' }),
+    ).rejects.toMatchObject({
+      code: 'OVERSIZED_RDF_LITERAL',
+      actualBytes: 60_002,
+    });
+  });
+
+  it('rejects oversized private literals before publish canonicalization', async () => {
+    const publisher = await makePublisher();
+    const oversized = `"${'x'.repeat(60_000)}"`;
+
+    await expect(
+      publisher.publish({
+        contextGraphId: 'test',
+        publisherPeerId: 'test-peer',
+        quads: [q('urn:compat:root', 'http://schema.org/name', '"ok"')],
+        privateQuads: [q('urn:compat:root', 'http://schema.org/text', oversized)],
+      }),
+    ).rejects.toMatchObject({
+      code: 'OVERSIZED_RDF_LITERAL',
+      actualBytes: 60_002,
+    });
+  });
 });

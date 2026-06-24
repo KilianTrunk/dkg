@@ -296,7 +296,7 @@ describe('BlazegraphStore (mocked HTTP)', () => {
     await expect(s.insert([
       { subject: 'http://s1', predicate: 'http://p', object: '"small"', graph: 'http://g' },
       { subject: 'http://s2', predicate: 'http://p', object: oversized, graph: 'http://g' },
-    ])).rejects.toThrow(/MUTF-8 limit/);
+    ])).rejects.toMatchObject({ code: 'OVERSIZED_RDF_LITERAL' });
     expect(fetchCalls).toHaveLength(0);
   });
 

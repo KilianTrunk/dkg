@@ -24,6 +24,7 @@ import {
   assertionLifecycleUri,
   validateAssertionName,
   PayloadTooLargeError,
+  assertQuadLiteralsMutf8Safe,
   IMPORTED_ARTIFACT_MAX_PAGE_BYTES,
   isDkgContentHash,
   verifyDkgContentHash,
@@ -40,6 +41,7 @@ import {
   validateRequiredContextGraphId,
   normalizeContextGraphIdOrUri,
   resolveRequiredWriteContextGraphId,
+  oversizedRdfLiteralResponseBody,
   SMALL_BODY_BYTES,
   MAX_UPLOAD_BYTES,
   type ImportFileExtractionPayload,
@@ -959,6 +961,12 @@ export async function handleKaImportFile(ctx: RequestContext, name: string): Pro
       error: string,
       tripleCount: number,
       failedPipelineUsed: string | null = pipelineUsed,
+      details: Partial<
+        Pick<
+          ImportFileExtractionPayload,
+          "code" | "limitBytes" | "actualBytes" | "subject" | "predicate" | "graph"
+        >
+      > = {},
     ) => {
       const failedRecord = recordFailedExtraction(
         error,
@@ -973,6 +981,7 @@ export async function handleKaImportFile(ctx: RequestContext, name: string): Pro
           ? { mdIntermediateHash: failedRecord.mdIntermediateHash }
           : {}),
         error,
+        ...details,
       });
     };
     const previousExtractionStatusRecord = getExtractionStatusRecord(
@@ -1397,6 +1406,28 @@ export async function handleKaImportFile(ctx: RequestContext, name: string): Pro
           graph: skippedMetaGraph,
         });
       }
+      try {
+        assertQuadLiteralsMutf8Safe(skippedMetaQuads, {
+          label: 'import-file.skippedMetaQuads',
+        });
+      } catch (err: any) {
+        if (err?.code === "OVERSIZED_RDF_LITERAL") {
+          const oversizedBody = oversizedRdfLiteralResponseBody(err);
+          return respondWithFailedExtraction(
+            400,
+            String(oversizedBody.error ?? err.message),
+            0,
+            null,
+            oversizedBody as Partial<
+              Pick<
+                ImportFileExtractionPayload,
+                "code" | "limitBytes" | "actualBytes" | "subject" | "predicate" | "graph"
+              >
+            >,
+          );
+        }
+        throw err;
+      }
 
       let skippedMetaCleanupSucceeded = false;
       let skippedDataDropSucceeded = false;
@@ -1807,6 +1838,28 @@ export async function handleKaImportFile(ctx: RequestContext, name: string): Pro
         object: JSON.stringify(uploadedFilename),
         graph: metaGraph,
       });
+    }
+    try {
+      assertQuadLiteralsMutf8Safe([...dataGraphQuads, ...metaQuads], {
+        label: 'import-file.quads',
+      });
+    } catch (err: any) {
+      if (err?.code === "OVERSIZED_RDF_LITERAL") {
+        const oversizedBody = oversizedRdfLiteralResponseBody(err);
+        return respondWithFailedExtraction(
+          400,
+          String(oversizedBody.error ?? err.message),
+          triples.length,
+          pipelineUsed,
+          oversizedBody as Partial<
+            Pick<
+              ImportFileExtractionPayload,
+              "code" | "limitBytes" | "actualBytes" | "subject" | "predicate" | "graph"
+            >
+          >,
+        );
+      }
+      throw err;
     }
 
     // Round 14 Bug 42: lock acquisition moved to the top of the

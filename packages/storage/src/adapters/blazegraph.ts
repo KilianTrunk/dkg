@@ -10,6 +10,7 @@ import type {
 } from '../triple-store.js';
 import { registerTripleStoreAdapter } from '../triple-store.js';
 import { buildBlankNodeSafeDelete } from './sparql-http.js';
+import { assertQuadLiteralsMutf8Safe, JAVA_WRITE_UTF_MAX_BYTES } from '@origintrail-official/dkg-core';
 
 /**
  * BlazegraphStore — TripleStore adapter backed by a remote Blazegraph
@@ -34,8 +35,11 @@ export class BlazegraphStore implements TripleStore {
 
   async insert(quads: DKGQuad[]): Promise<void> {
     if (quads.length === 0) return;
-    const safe = rejectOversizedLiterals(quads, BLAZEGRAPH_MUTF8_LIMIT);
-    const nquads = safe.map(quadToNQuad).join('\n') + '\n';
+    assertQuadLiteralsMutf8Safe(quads, {
+      maxBytes: JAVA_WRITE_UTF_MAX_BYTES,
+      label: 'BlazegraphStore.insert',
+    });
+    const nquads = quads.map(quadToNQuad).join('\n') + '\n';
     const res = await fetch(this.url, {
       method: 'POST',
       headers: { 'Content-Type': 'text/x-nquads' },

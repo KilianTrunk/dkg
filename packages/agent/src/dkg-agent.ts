@@ -1880,8 +1880,9 @@ export class DKGAgent extends DKGAgentBase {
         contextGraphId: string,
         name: string,
         input: import('@origintrail-official/dkg-storage').Quad[] | JsonLdContent | Array<{ subject: string; predicate: string; object: string }>,
-        opts?: { subGraphName?: string },
+        opts?: { subGraphName?: string; agentAddress?: string },
       ): Promise<void> {
+        const writeAgentAddress = opts?.agentAddress ?? agentAddress;
         let quads: import('@origintrail-official/dkg-storage').Quad[];
         if (Array.isArray(input) && input.length > 0 && 'graph' in input[0]) {
           quads = input as import('@origintrail-official/dkg-storage').Quad[];
@@ -1892,7 +1893,7 @@ export class DKGAgent extends DKGAgentBase {
           quads = (input as Array<{ subject: string; predicate: string; object: string }>)
             .map(t => ({ subject: t.subject, predicate: t.predicate, object: t.object, graph: '' }));
         }
-        return agent.publisher.assertionWrite(contextGraphId, name, agentAddress, quads, opts?.subGraphName);
+        return agent.publisher.assertionWrite(contextGraphId, name, writeAgentAddress, quads, opts?.subGraphName);
       },
 
       async query(contextGraphId: string, name: string, opts?: { subGraphName?: string }): Promise<import('@origintrail-official/dkg-storage').Quad[]> {
@@ -1907,7 +1908,8 @@ export class DKGAgent extends DKGAgentBase {
       ): Promise<{ seeded: number; fromLayer: 'swm' | 'vm'; entities: number }> {
         return agent.publisher.assertionPullFrom(contextGraphId, name, agentAddress, sourceLayer, opts);
       },
-      async promote(contextGraphId: string, name: string, opts?: { entities?: string[] | 'all'; subGraphName?: string; authorAgentAddress?: string; preSignedAuthorAttestation?: PreSignedAuthorAttestation; awaitCuratorAck?: boolean; curatorAckTimeoutMs?: number; skipSeal?: boolean }): Promise<{ promotedCount: number; sealed: boolean; publishReady: boolean }> {
+      async promote(contextGraphId: string, name: string, opts?: { entities?: string[] | 'all'; subGraphName?: string; agentAddress?: string; authorAgentAddress?: string; preSignedAuthorAttestation?: PreSignedAuthorAttestation; awaitCuratorAck?: boolean; curatorAckTimeoutMs?: number; skipSeal?: boolean }): Promise<{ promotedCount: number; sealed: boolean; publishReady: boolean }> {
+        const promoteAgentAddress = opts?.agentAddress ?? agentAddress;
         // Seal-before-share: the on-chain publish path
         // (`publishFromFinalizedAssertion`) requires a FINALIZED assertion, and
         // the seal must be computed over the Working-Memory content BEFORE
@@ -1940,7 +1942,7 @@ export class DKGAgent extends DKGAgentBase {
         let sealed = false;
         if (promotingAllEntities && !opts?.skipSeal) {
           try {
-            await agent.assertionFinalize(contextGraphId, name, agentAddress, {
+            await agent.assertionFinalize(contextGraphId, name, promoteAgentAddress, {
               subGraphName: opts?.subGraphName,
               authorAgentAddress: opts?.authorAgentAddress,
               preSignedAuthorAttestation: opts?.preSignedAuthorAttestation,
@@ -2024,9 +2026,10 @@ export class DKGAgent extends DKGAgentBase {
           createOperationContext('share'),
         );
         const { promotedCount, gossipMessage, promotedAllRoots } = await agent.publisher.assertionPromote(
-          contextGraphId, name, agentAddress,
+          contextGraphId, name, promoteAgentAddress,
           {
-            ...opts,
+            ...(opts?.entities !== undefined ? { entities: opts.entities } : {}),
+            ...(opts?.subGraphName !== undefined ? { subGraphName: opts.subGraphName } : {}),
             publisherPeerId: agent.node.peerId.toString(),
             senderAgentAddress: gossipSigner?.agentAddress,
             confirmBeforeCommit,
@@ -2039,7 +2042,7 @@ export class DKGAgent extends DKGAgentBase {
         // …) left the prior SWM content + seal intact, so the asset stays publishable
         // under the old seal until a share actually succeeds.
         if (isNonSealingShare) {
-          await agent.publisher.clearAssertionSeal(contextGraphId, name, agentAddress, opts?.subGraphName);
+          await agent.publisher.clearAssertionSeal(contextGraphId, name, promoteAgentAddress, opts?.subGraphName);
         }
         if (gossipMessage) {
           try {
@@ -2051,7 +2054,7 @@ export class DKGAgent extends DKGAgentBase {
         // OT-RFC-43 A2 (decision 2) — stamp dkg:swmCurrentAssertion on the
         // lifecycle URN so the SWM pointer is observable (and can diverge from
         // WM/VM). Best-effort; never blocks the share result.
-        await agent._stampSwmPointer(contextGraphId, name, agentAddress, opts?.subGraphName);
+        await agent._stampSwmPointer(contextGraphId, name, promoteAgentAddress, opts?.subGraphName);
         // #1116 (round 9) — the swmShareComplete marker mark/clear now lives INSIDE
         // assertionPromote (co-located with the member-row REPLACE, gated on the
         // same isFullCompletePromote), so it stays in lockstep with the rows for
@@ -2109,6 +2112,7 @@ export class DKGAgent extends DKGAgentBase {
         name: string,
         opts?: {
           subGraphName?: string;
+          agentAddress?: string;
           authorAgentAddress?: string;
           preSignedAuthorAttestation?: PreSignedAuthorAttestation;
           schemeVersion?: number;
@@ -2132,6 +2136,7 @@ export class DKGAgent extends DKGAgentBase {
         kav10Address: string;
         eip712Digest: string;
       }> {
+        const finalizeAgentAddress = opts?.agentAddress ?? agentAddress;
         // #1116 seal-in-SWM: pull the asset's roots back out of SWM into a
         // transient WM draft (reusing pull-from — incl. its seal-independent
         // root resolution), run the ordinary finalize over that draft, then DROP
@@ -2144,7 +2149,7 @@ export class DKGAgent extends DKGAgentBase {
         // clean-slate, so a finalize that fails here leaves the asset safely
         // re-tryable (seal-in-SWM is atomic-on-failure).
         if (opts?.layer !== 'swm') {
-          return agent.assertionFinalize(contextGraphId, name, agentAddress, {
+          return agent.assertionFinalize(contextGraphId, name, finalizeAgentAddress, {
             subGraphName: opts?.subGraphName,
             authorAgentAddress: opts?.authorAgentAddress,
             preSignedAuthorAttestation: opts?.preSignedAuthorAttestation,
@@ -2160,7 +2165,7 @@ export class DKGAgent extends DKGAgentBase {
         // published as a partial asset, breaking the subset-shares-aren't-
         // publishable invariant.
         const fullyShared = await agent.publisher.hasSwmShareComplete(
-          contextGraphId, name, agentAddress, opts?.subGraphName,
+          contextGraphId, name, finalizeAgentAddress, opts?.subGraphName,
         );
         if (!fullyShared) {
           throw Object.assign(
@@ -2179,11 +2184,11 @@ export class DKGAgent extends DKGAgentBase {
         // asset (seal gone, no fresh seal) if the pull threw PULL_FROM_EMPTY_SOURCE.
         // Dropping it makes finalize(layer:"swm") atomic-on-failure: on a failed
         // pull the prior seal survives and the asset stays re-tryable.
-        await agent.publisher.assertionPullFrom(contextGraphId, name, agentAddress, 'swm', {
+        await agent.publisher.assertionPullFrom(contextGraphId, name, finalizeAgentAddress, 'swm', {
           subGraphName: opts?.subGraphName,
           onConflict: 'replace',
         });
-        const swmSeal = await agent.assertionFinalize(contextGraphId, name, agentAddress, {
+        const swmSeal = await agent.assertionFinalize(contextGraphId, name, finalizeAgentAddress, {
           subGraphName: opts?.subGraphName,
           authorAgentAddress: opts?.authorAgentAddress,
           preSignedAuthorAttestation: opts?.preSignedAuthorAttestation,
@@ -2195,13 +2200,13 @@ export class DKGAgent extends DKGAgentBase {
         // so status reports "swm-shared". This must precede the WM-draft cleanup
         // below, whose stale-WM-pointer retirement is gated on the SWM pointer
         // being present (the content is genuinely SWM-resident).
-        await agent._stampSwmPointer(contextGraphId, name, agentAddress, opts?.subGraphName);
+        await agent._stampSwmPointer(contextGraphId, name, finalizeAgentAddress, opts?.subGraphName);
         // Best-effort: the seal (in _meta) and the SWM content are already
         // durable, so a cleanup failure is harmless (it only leaves a sealed WM
         // draft alongside SWM — which the finalize-after-edit guards still
         // protect). Drop it so the post-condition is "purely in SWM".
         try {
-          await agent.publisher.clearWmDraftDataGraph(contextGraphId, name, agentAddress, opts?.subGraphName);
+          await agent.publisher.clearWmDraftDataGraph(contextGraphId, name, finalizeAgentAddress, opts?.subGraphName);
         } catch (cleanupErr: any) {
           agent.log.warn(
             createOperationContext('share'),

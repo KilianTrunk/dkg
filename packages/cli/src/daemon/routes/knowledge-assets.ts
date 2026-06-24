@@ -336,6 +336,20 @@ function hasFinalizeOnlyCreateFields(raw: Record<string, unknown>): boolean {
   return FINALIZE_ONLY_CREATE_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(raw, field));
 }
 
+function resolveAtomicCreateAuthorAgentAddress(
+  finalizeOptions: Record<string, unknown>,
+  tokenAgentAddress?: string,
+): string | undefined {
+  const finalizedAuthor = finalizeOptions.authorAgentAddress;
+  if (typeof finalizedAuthor === "string") return finalizedAuthor;
+  const attestation = finalizeOptions.preSignedAuthorAttestation;
+  if (attestation && typeof attestation === "object") {
+    const preSignedAuthor = (attestation as { address?: unknown }).address;
+    if (typeof preSignedAuthor === "string") return preSignedAuthor;
+  }
+  return tokenAgentAddress;
+}
+
 // uint32 epoch ceiling (matches sibling routes memory.ts / publisher.ts). Not an
 // id encoder — the on-chain endEpoch is a uint40 but the publish API caps at uint32.
 const MAX_PUBLISH_EPOCHS = 0xffffffff;
@@ -776,7 +790,13 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       // finalize throws KaIdNamespaceMismatch. So stamp under the same resolved
       // author the finalize uses: the body author, else the token's agent (else
       // undefined → the daemon's default agent for node/admin tokens).
-      const createAuthorAgentAddress = resolvedAuthorAgentAddress ?? writePreflightCallerAgentAddress;
+      const createAuthorAgentAddress = resolveAtomicCreateAuthorAgentAddress(
+        finalizeOptions,
+        writePreflightCallerAgentAddress,
+      );
+      const atomicAuthorLane = createAuthorAgentAddress
+        ? { agentAddress: createAuthorAgentAddress }
+        : {};
       const assertionUri = await agent.assertion.create(resolvedContextGraphId, name, {
         subGraphName,
         ...(createAuthorAgentAddress ? { agentAddress: createAuthorAgentAddress } : {}),
@@ -789,12 +809,15 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       // explicit finalize:false leaves an editable WM draft and never touches
       // the chain (OT-RFC-43 §10.5.5). `also*` are opt-in transitions on top.
       if (hasQuads) {
-        await agent.assertion.write(resolvedContextGraphId, name, quads, { subGraphName });
+        await agent.assertion.write(resolvedContextGraphId, name, quads, { subGraphName, ...atomicAuthorLane });
         result.written = quads.length;
         emitMemoryGraphChanged?.({ contextGraphId: resolvedContextGraphId, layers: ["wm"], subGraphName, operation: "assertion_written", source: "api", counts: { triples: quads.length } });
       }
       if (shouldFinalize) {
-        const seal = await agent.assertion.finalize(resolvedContextGraphId, name, finalizeOptions);
+        const seal = await agent.assertion.finalize(resolvedContextGraphId, name, {
+          ...finalizeOptions,
+          ...atomicAuthorLane,
+        });
         result.merkleRoot = hex(seal.merkleRoot);
         // Surface the sealed author so clients (and tests) can confirm custodial
         // attribution on the atomic create+finalize path, mirroring the dedicated
@@ -813,6 +836,7 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
           // covers the seal-on-share path too.
           const share = await agent.assertion.promote(resolvedContextGraphId, name, {
             subGraphName,
+            ...atomicAuthorLane,
             ...(resolvedAuthorAgentAddress ? { authorAgentAddress: resolvedAuthorAgentAddress } : {}),
           });
           result.swmShared = true;
@@ -834,7 +858,11 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       if (alsoPublishVm === true || (typeof alsoPublishVm === "object" && alsoPublishVm !== null)) {
         try {
           const opts = typeof alsoPublishVm === "object" && alsoPublishVm ? alsoPublishVm : {};
-          const pub: any = await agent.publishFromFinalizedAssertion(resolvedContextGraphId, name, { subGraphName, ...opts });
+          const pub: any = await agent.publishFromFinalizedAssertion(resolvedContextGraphId, name, {
+            subGraphName,
+            ...opts,
+            ...atomicAuthorLane,
+          });
           result.kaId = pub?.kaId;
           result.ual = pub?.ual;
           result.txHash = pub?.onChainResult?.txHash;

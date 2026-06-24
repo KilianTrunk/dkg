@@ -3310,6 +3310,7 @@ export class PublishMethods extends DKGAgentBase {
     name: string,
     opts?: {
       subGraphName?: string;
+      agentAddress?: string;
       operationCtx?: OperationContext;
       onPhase?: PhaseCallback;
       publisherNodeIdentityIdOverride?: bigint;
@@ -3317,7 +3318,7 @@ export class PublishMethods extends DKGAgentBase {
       clearSharedMemoryAfter?: boolean;
     },
   ): Promise<PublishResult & { assertionUri: string; seal: AssertionSeal }> {
-    const agentAddress = this.defaultAgentAddress ?? this.peerId;
+    const agentAddress = opts?.agentAddress ?? this.defaultAgentAddress ?? this.peerId;
     const assertionUri = contextGraphAssertionUri(
       contextGraphId,
       agentAddress,

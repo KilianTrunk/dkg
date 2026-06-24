@@ -305,6 +305,9 @@ export function resolveFinalizeOptions(
   if (!authorizeAgentScopedAuthorClaim(res, tokenAgentAddress, authorAgentAddress, "authorAgentAddress")) {
     return null;
   }
+  if (!authorizeAgentScopedAuthorClaim(res, tokenAgentAddress, resolvedPreSignedAttestation?.address, "preSignedAuthorAttestation.address")) {
+    return null;
+  }
   // Token attribution — parity with /api/shared-memory/publish (memory.ts).
   // An agent-scoped bearer token attributes authorship to that agent when the
   // body specified neither an explicit `authorAgentAddress` nor a pre-signed

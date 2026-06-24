@@ -54,6 +54,14 @@ describe('resolveFinalizeOptions — token authorship attribution (F1)', () => {
     expect(errors).toEqual([{ code: 403 }]);
   });
 
+  it('allows an explicit body authorAgentAddress that matches the token agent with different casing', () => {
+    const mixedCaseTokenAgent = `0x${'AB'.repeat(20)}`;
+    const { res, errors } = stubRes();
+    const out = resolveFinalizeOptions({ authorAgentAddress: mixedCaseTokenAgent }, res, TOKEN_AGENT);
+    expect(errors).toEqual([]);
+    expect((out as Record<string, unknown>).authorAgentAddress).toBe(mixedCaseTokenAgent);
+  });
+
   it('does NOT auto-attribute for a node-level/admin token (undefined agent)', () => {
     // resolveAgentByToken returns undefined for admin/node tokens → no author
     // override → publisher signs as itself (pre-fix default preserved).

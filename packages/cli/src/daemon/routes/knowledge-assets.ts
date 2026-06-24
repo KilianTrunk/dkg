@@ -1053,16 +1053,19 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         // corrupt an in-progress draft and — if the following write() throws —
         // leave that wipe behind. So gate it on an active-draft existence check:
         // brand-new or discarded names get created; existing drafts stay append-only.
-        const existing = await agent.assertion.history(contextGraphId, name, { subGraphName });
+        const writeAuthorLane = writePreflightCallerAgentAddress
+          ? { agentAddress: writePreflightCallerAgentAddress }
+          : {};
+        const existing = await agent.assertion.history(contextGraphId, name, { subGraphName, ...writeAuthorLane });
         if (!existing || existing.state === "discarded") {
           // Stamp the kaId under the request token's agent (OT-RFC-43 §F2) so a
           // later finalize as that agent doesn't hit KaIdNamespaceMismatch.
           await agent.assertion.create(contextGraphId, name, {
             subGraphName,
-            ...(writePreflightCallerAgentAddress ? { agentAddress: writePreflightCallerAgentAddress } : {}),
+            ...writeAuthorLane,
           });
         }
-        await agent.assertion.write(contextGraphId, name, parsed.quads, { subGraphName });
+        await agent.assertion.write(contextGraphId, name, parsed.quads, { subGraphName, ...writeAuthorLane });
         emitMemoryGraphChanged?.({ contextGraphId, layers: ["wm"], subGraphName, operation: "assertion_written", source: "api", counts: { triples: parsed.quads.length } });
         return jsonResponse(res, 200, { written: parsed.quads.length });
       }
@@ -1158,7 +1161,19 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         skipSeal = parsed.skipSeal;
       }
       try {
-        const share = await agent.assertion.promote(contextGraphId, name, { entities: parsed.entities, subGraphName, awaitCuratorAck, skipSeal });
+        const shareAuthorLane = writePreflightCallerAgentAddress
+          ? {
+              agentAddress: writePreflightCallerAgentAddress,
+              authorAgentAddress: writePreflightCallerAgentAddress,
+            }
+          : {};
+        const share = await agent.assertion.promote(contextGraphId, name, {
+          entities: parsed.entities,
+          subGraphName,
+          awaitCuratorAck,
+          skipSeal,
+          ...shareAuthorLane,
+        });
         if (share.promotedCount !== 0) {
           emitMemoryGraphChanged?.({ contextGraphId, layers: ["wm", "swm"], subGraphName, operation: "assertion_promoted", source: "api", counts: { triples: share.promotedCount } });
           recordActivityAndNotify(ctx, { contextGraphId, kind: "promoted", actorAgentAddress: requestAgentAddress, subGraphName, tripleCount: share.promotedCount });

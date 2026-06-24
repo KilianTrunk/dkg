@@ -77,6 +77,44 @@ async function write(cg: string, name: string, quads: unknown[]) {
 async function wmQuads(cg: string, name: string) {
   return getJson(daemon, `/api/knowledge-assets/${encodeURIComponent(name)}/wm/quads?contextGraphId=${cg}`);
 }
+async function postJsonAsAgent(authToken: string, path: string, body: unknown) {
+  const r = await fetch(`${daemon.base}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
+    body: JSON.stringify(body),
+  });
+  return { status: r.status, body: (await r.json().catch(() => ({}))) as Record<string, any> };
+}
+async function getJsonAsAgent(authToken: string, path: string) {
+  const r = await fetch(`${daemon.base}${path}`, { headers: { Authorization: `Bearer ${authToken}` } });
+  return { status: r.status, body: (await r.json().catch(() => ({}))) as Record<string, any> };
+}
+async function registerAgentClient(label: string) {
+  const reg = await postJson(daemon, '/api/agent/register', {
+    name: `${label}-${Date.now().toString(36)}`,
+    framework: 'test',
+  });
+  expect(reg.status, `${label} register: ${JSON.stringify(reg.body)}`).toBeLessThan(300);
+  const agentAddress = String(reg.body.agentAddress);
+  const authToken = String(reg.body.authToken);
+  expect(agentAddress).toMatch(/^0x[0-9a-fA-F]{40}$/);
+  expect(authToken.length).toBeGreaterThan(0);
+  return {
+    agentAddress,
+    authToken,
+    post: (path: string, body: unknown) => postJsonAsAgent(authToken, path, body),
+    get: (path: string) => getJsonAsAgent(authToken, path),
+  };
+}
+async function createRegisteredAgentContextGraph(
+  agent: Awaited<ReturnType<typeof registerAgentClient>>,
+  id: string,
+) {
+  const created = await agent.post('/api/context-graph/create', { id, name: id, accessPolicy: 1 });
+  expect(created.status, `agent CG create: ${JSON.stringify(created.body)}`).toBeLessThan(300);
+  const registered = await agent.post('/api/context-graph/register', { id, accessPolicy: 1 });
+  expect(registered.status, `agent CG register: ${JSON.stringify(registered.body)}`).toBe(200);
+}
 
 describe('/api/knowledge-assets routes (real daemon, real chain)', () => {
   beforeAll(async () => {
@@ -170,6 +208,81 @@ describe('/api/knowledge-assets routes (real daemon, real chain)', () => {
       if (res.body.merkleRoot !== undefined) {
         expect(String(res.body.merkleRoot)).toMatch(/^0x[0-9a-f]{8,}$/);
       }
+    });
+
+    it('atomic create without an explicit author seals as the agent-scoped token', async () => {
+      const agent = await registerAgentClient('ka-atomic-default-author');
+      const cg = `ka-atomic-default-${Date.now().toString(36)}`;
+      await createRegisteredAgentContextGraph(agent, cg);
+
+      const res = await agent.post('/api/knowledge-assets', {
+        contextGraphId: cg,
+        name: 'agent-default-atomic',
+        quads: [{ subject: 'ex:A', predicate: 'ex:p', object: '"x"' }],
+        finalize: true,
+      });
+
+      expect(res.status, `agent atomic create: ${JSON.stringify(res.body)}`).toBe(201);
+      expect(String(res.body.authorAddress).toLowerCase()).toBe(agent.agentAddress.toLowerCase());
+      const descriptor = await agent.get(
+        `/api/knowledge-assets/agent-default-atomic?contextGraphId=${cg}&agentAddress=${agent.agentAddress}`,
+      );
+      expect(descriptor.status, `agent atomic descriptor: ${JSON.stringify(descriptor.body)}`).toBe(200);
+      expect(descriptor.body.status).toBe('wm-sealed');
+      expect(String(descriptor.body.agentAddress).toLowerCase()).toBe(agent.agentAddress.toLowerCase());
+      expect(descriptor.body.wmCurrentAssertion).toBeTruthy();
+    });
+
+    it('rejects mismatched atomic create authorAgentAddress before opening a draft', async () => {
+      const agentA = await registerAgentClient('ka-atomic-author-a');
+      const agentB = await registerAgentClient('ka-atomic-author-b');
+      const cg = `ka-atomic-author-guard-${Date.now().toString(36)}`;
+      const name = 'agent-mismatch-atomic';
+      await createRegisteredAgentContextGraph(agentA, cg);
+
+      const res = await agentA.post('/api/knowledge-assets', {
+        contextGraphId: cg,
+        name,
+        quads: [{ subject: 'ex:A', predicate: 'ex:p', object: '"x"' }],
+        finalize: true,
+        authorAgentAddress: agentB.agentAddress,
+      });
+
+      expect(res.status, `mismatched atomic create: ${JSON.stringify(res.body)}`).toBe(403);
+      expect(String(res.body.error)).toContain(agentA.agentAddress);
+      expect(String(res.body.error)).toContain(agentB.agentAddress);
+      const descriptor = await agentA.get(
+        `/api/knowledge-assets/${name}?contextGraphId=${cg}&agentAddress=${agentA.agentAddress}`,
+      );
+      expect(descriptor.status, `post-403 descriptor: ${JSON.stringify(descriptor.body)}`).toBe(404);
+    });
+
+    it('rejects mismatched atomic create pre-signed author before opening a draft', async () => {
+      const agentA = await registerAgentClient('ka-atomic-attestation-a');
+      const agentB = await registerAgentClient('ka-atomic-attestation-b');
+      const cg = `ka-atomic-attestation-guard-${Date.now().toString(36)}`;
+      const name = 'agent-attestation-mismatch-atomic';
+      await createRegisteredAgentContextGraph(agentA, cg);
+
+      const res = await agentA.post('/api/knowledge-assets', {
+        contextGraphId: cg,
+        name,
+        quads: [{ subject: 'ex:A', predicate: 'ex:p', object: '"x"' }],
+        finalize: true,
+        preSignedAuthorAttestation: {
+          address: agentB.agentAddress,
+          reservedKaId: '1',
+          signature: { r: `0x${'11'.repeat(32)}`, vs: `0x${'22'.repeat(32)}` },
+        },
+      });
+
+      expect(res.status, `mismatched atomic attestation: ${JSON.stringify(res.body)}`).toBe(403);
+      expect(String(res.body.error)).toContain(agentA.agentAddress);
+      expect(String(res.body.error)).toContain(agentB.agentAddress);
+      const descriptor = await agentA.get(
+        `/api/knowledge-assets/${name}?contextGraphId=${cg}&agentAddress=${agentA.agentAddress}`,
+      );
+      expect(descriptor.status, `post-403 descriptor: ${JSON.stringify(descriptor.body)}`).toBe(404);
     });
   });
 

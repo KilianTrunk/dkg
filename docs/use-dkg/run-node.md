@@ -33,7 +33,7 @@ http://127.0.0.1:9200/ui
 
 ## Core Node Profile Registration
 
-Current node roles are `edge` and `core`. There is no current `thin` node role; older notes that use "thin" or "light" usually refer to what the current docs call an Edge Node.
+The two node roles are `edge` and `core`.
 
 An Edge Node can run, sync, query, and serve local agents without an on-chain node profile. A Core Node needs an on-chain profile because Storage ACKs, Random Sampling, staking, and node-operator authorization use its numeric `identityId`.
 

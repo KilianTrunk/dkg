@@ -47,11 +47,11 @@ describe('resolveFinalizeOptions — token authorship attribution (F1)', () => {
     expect((out as Record<string, unknown>).authorAgentAddress).toBe(TOKEN_AGENT);
   });
 
-  it('lets an explicit body authorAgentAddress win over the token', () => {
+  it('rejects an explicit body authorAgentAddress that differs from the token agent', () => {
     const { res, errors } = stubRes();
     const out = resolveFinalizeOptions({ authorAgentAddress: BODY_AGENT }, res, TOKEN_AGENT);
-    expect(errors).toEqual([]);
-    expect((out as Record<string, unknown>).authorAgentAddress).toBe(BODY_AGENT);
+    expect(out).toBeNull();
+    expect(errors).toEqual([{ code: 403 }]);
   });
 
   it('does NOT auto-attribute for a node-level/admin token (undefined agent)', () => {

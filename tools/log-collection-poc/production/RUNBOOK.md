@@ -50,7 +50,10 @@ On every OriginTrail-hosted node (running a build with PR #1317), add the block 
 Restart the node. Local logging (SQLite + daemon.log) is unaffected; this only adds the redacted OTLP copy.
 
 ## Step 4 — view in Grafana
-`https://polaris.xtrmstrngth.com/d/dkg-node-logs` → pick a **Node** → set the time range (top-right) → logs appear. `Level` and `Filter (regex)` narrow further; the bottom panel is volume-by-level.
+- **Per-node:** `https://polaris.xtrmstrngth.com/d/dkg-node-logs` → pick a **Node** → set the time range (top-right) → logs appear. `Level` and `Filter (regex)` narrow further; the bottom panel is volume-by-level.
+- **Fleet overview:** `https://polaris.xtrmstrngth.com/d/dkg-fleet-logs` → active-node count, log volume per node, errors per node, recent fleet-wide errors (filter by `Environment`).
+
+Both dashboards are already imported. Optional alerts: `example-alerts.md`. Node-operator self-serve guide (any operator, their own backend): `../OPERATOR-GUIDE.md`.
 
 ---
 

@@ -97,6 +97,7 @@ import {
   pickNetworkTunables,
   sharedMemoryReadBothFilter,
   partitionCatalogQuads,
+  assertQuadLiteralsMutf8Safe,
 } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad, type LargeLiteralStorageConfig } from '@origintrail-official/dkg-storage';
 import { EVMChainAdapter, NoChainAdapter, enrichEvmError, buildKnowledgeAssetUal, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
@@ -418,6 +419,11 @@ export type ResolveCuratedChainKeyContextOptions = {
 function normalizeOptionalContextGraphId(value: string | null | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
+}
+
+function rejectOversizedRdfLiterals(quads: Quad[] | undefined, label: string): void {
+  if (!quads || quads.length === 0) return;
+  assertQuadLiteralsMutf8Safe(quads, { label });
 }
 
 export class PublishMethods extends DKGAgentBase {
@@ -989,6 +995,8 @@ export class PublishMethods extends DKGAgentBase {
     if (publicQuads.length === 0 && privateQuads.length === 0) {
       throw new InvalidContentError('Content must include at least one public or private payload');
     }
+    rejectOversizedRdfLiterals(publicQuads, 'publishAsync.publicQuads');
+    rejectOversizedRdfLiterals(privateQuads, 'publishAsync.privateQuads');
 
     const partitioned = partitionPublishAsyncQuads(publicQuads, privateQuads);
     const gossipSigner = opts?.localOnly ? null : await this.resolveWorkspaceGossipSigningAgent(contextGraphId);
@@ -1285,6 +1293,8 @@ export class PublishMethods extends DKGAgentBase {
     const ctx = opts?.operationCtx ?? createOperationContext('publish');
     const onPhase = opts?.onPhase;
     this.log.info(ctx, `Starting publish to context graph "${contextGraphId}" with ${quads.length} triples`);
+    rejectOversizedRdfLiterals(quads, 'agent.publish.quads');
+    rejectOversizedRdfLiterals(privateQuads, 'agent.publish.privateQuads');
 
     const isSystem = contextGraphId === SYSTEM_CONTEXT_GRAPHS.AGENTS || contextGraphId === SYSTEM_CONTEXT_GRAPHS.ONTOLOGY;
     if (!isSystem && !this.subscribedContextGraphs.has(contextGraphId)) {
@@ -1519,6 +1529,8 @@ export class PublishMethods extends DKGAgentBase {
     const ctx = opts?.operationCtx ?? createOperationContext('update');
     const onPhase = opts?.onPhase;
     this.log.info(ctx, `Starting update of kaId=${kaId} in context graph "${contextGraphId}" with ${quads.length} triples`);
+    rejectOversizedRdfLiterals(quads, 'agent.update.quads');
+    rejectOversizedRdfLiterals(privateQuads, 'agent.update.privateQuads');
     // GH #842: thread the on-chain cgId so the publisher can promote the update
     // payload into the per-cgId partition the RS prover reads. Without it,
     // updated KAs stay unprovable (data-corrupted / leaf-count-mismatch).

@@ -28,6 +28,7 @@ import type { RequestContext } from "./context.js";
 import {
   isPayloadTooLargeError,
   jsonResponse,
+  oversizedRdfLiteralResponseBody,
   payloadTooLargeResponseBody,
   readBody,
   safeParseJson,
@@ -38,6 +39,7 @@ import {
   isWritableQuad,
   validateQuadObjectTerms,
   respondIfReconcileUnavailable,
+  validateWritableQuadLiteralSizes,
   normalizeContextGraphIdOrUri,
   resolveRequiredWriteContextGraphId,
 } from "../http-utils.js";
@@ -122,6 +124,10 @@ const FINALIZE_ONLY_CREATE_FIELDS = [
  * publish path, which never down-classified them).
  */
 function respondAssertionError(res: RequestContext["res"], e: any): void {
+  if (e?.code === "OVERSIZED_RDF_LITERAL") {
+    jsonResponse(res, 400, oversizedRdfLiteralResponseBody(e));
+    return;
+  }
   if (isPayloadTooLargeError(e)) {
     jsonResponse(res, 413, payloadTooLargeResponseBody(e));
     return;
@@ -583,7 +589,7 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
   if (method === "POST" && path === `${PREFIX}/publish`) {
     const rawBody = await readBody(req);
     const parsed = parsePublishRequestBody(rawBody);
-    if (!parsed.ok) return jsonResponse(res, 400, { error: parsed.error });
+    if (!parsed.ok) return jsonResponse(res, 400, parsed.body ?? { error: parsed.error });
     const raw = JSON.parse(rawBody) as Record<string, unknown>;
     const {
       contextGraphId,
@@ -655,6 +661,9 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       if (isPayloadTooLargeError(e)) {
         return jsonResponse(res, 413, payloadTooLargeResponseBody(e));
       }
+      if (e?.code === "OVERSIZED_RDF_LITERAL") {
+        return jsonResponse(res, 400, oversizedRdfLiteralResponseBody(e));
+      }
       // Transient KA-number-floor reconcile failure (rate-limited RPC) -> 503.
       if (respondIfReconcileUnavailable(res, e)) return;
       return jsonResponse(res, 500, { error: e?.message ?? String(e) });
@@ -724,6 +733,13 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
     // author attestation and reserves the on-chain identity, so it requires the
     // CG to be registered). OT-RFC-43 §10.5.5.
     const hasQuads = Array.isArray(quads) && quads.length > 0;
+    if (hasQuads) {
+      if (!quads.every(isWritableQuad)) {
+        return jsonResponse(res, 400, { error: '"quads" must be an array of { subject, predicate, object } objects (graph optional); string-shaped quads are not accepted' });
+      }
+      const literalSize = validateWritableQuadLiteralSizes("quads", quads);
+      if (!literalSize.ok) return jsonResponse(res, 400, literalSize.body);
+    }
     const shouldFinalize = hasQuads && finalize !== false;
     // #1116 D5: the create ROUTE stays a primitive — create+write+seal, with
     // opt-in share (this preserves the "create stops at a sealed WM draft"
@@ -858,6 +874,9 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       if (errors.length > 0) return jsonResponse(res, 207, { created: true, ...result, errors });
       return jsonResponse(res, 201, result);
     } catch (e: any) {
+      if (e?.code === "OVERSIZED_RDF_LITERAL") {
+        return jsonResponse(res, 400, oversizedRdfLiteralResponseBody(e));
+      }
       // Transient KA-number-floor reconcile failure (rate-limited RPC) -> 503.
       if (respondIfReconcileUnavailable(res, e)) return;
       return jsonResponse(res, 500, { error: e?.message ?? String(e) });
@@ -1018,6 +1037,8 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         // literal nor an absolute IRI before they reach (and crash) the parser.
         const wmObjErr = validateQuadObjectTerms("quads", parsed.quads);
         if (wmObjErr) return jsonResponse(res, 400, { error: wmObjErr });
+        const literalSize = validateWritableQuadLiteralSizes("quads", parsed.quads);
+        if (!literalSize.ok) return jsonResponse(res, 400, literalSize.body);
         // A bare write to a name that was never created used to fall through to
         // the legacy `/assertion/{addr}/{name}` graph and produce a KA that is
         // permanently 404 in the descriptor API (no `_meta` lifecycle record,

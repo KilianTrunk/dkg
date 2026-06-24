@@ -23,6 +23,7 @@ import { startLiveDaemon, stopLiveDaemon, postJson, type LiveDaemon } from './he
 
 let daemon: LiveDaemon | undefined;
 const CG = 'wq-validation-cg';
+const OVERSIZED_LITERAL = `"${'x'.repeat(60_000)}"`;
 
 beforeAll(async () => {
   daemon = await startLiveDaemon({ authEnabled: true });
@@ -52,6 +53,16 @@ describe('GH #787 — POST /api/shared-memory/write quad-shape validation', () =
     });
     expect(status, JSON.stringify(body)).toBe(200);
   });
+
+  it('returns 400 for oversized RDF literals before SWM write', async () => {
+    const { status, body } = await postJson(daemon!, '/api/shared-memory/write', {
+      contextGraphId: CG,
+      quads: [{ subject: 'urn:wq:oversized-swm', predicate: 'http://schema.org/text', object: OVERSIZED_LITERAL }],
+    });
+    expect(status, JSON.stringify(body)).toBe(400);
+    expect(body.code).toBe('OVERSIZED_RDF_LITERAL');
+    expect(body.actualBytes).toBeGreaterThan(60_000);
+  });
 });
 
 describe('GH #306 — POST /api/knowledge-assets/{name}/wm/write quad-shape validation', () => {
@@ -73,6 +84,18 @@ describe('GH #306 — POST /api/knowledge-assets/{name}/wm/write quad-shape vali
       contextGraphId: CG, quads: [{ subject: 'urn:wq:s306', predicate: 'http://schema.org/name', object: '"ok306"' }],
     });
     expect(status, JSON.stringify(body)).toBe(200);
+  });
+
+  it('returns 400 for oversized RDF literals before WM write', async () => {
+    const created = await postJson(daemon!, '/api/knowledge-assets', { contextGraphId: CG, name: 'ka-306-oversized' });
+    expect(created.status).toBeLessThan(300);
+    const { status, body } = await postJson(daemon!, '/api/knowledge-assets/ka-306-oversized/wm/write', {
+      contextGraphId: CG,
+      quads: [{ subject: 'urn:wq:oversized-wm', predicate: 'http://schema.org/text', object: OVERSIZED_LITERAL }],
+    });
+    expect(status, JSON.stringify(body)).toBe(400);
+    expect(body.code).toBe('OVERSIZED_RDF_LITERAL');
+    expect(body.actualBytes).toBeGreaterThan(60_000);
   });
 });
 

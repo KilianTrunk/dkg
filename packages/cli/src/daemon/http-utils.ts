@@ -7,6 +7,8 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   PayloadTooLargeError,
+  assertQuadLiteralsMutf8Safe,
+  isOversizedRdfLiteralError,
   validateContextGraphId,
   validateSubGraphName,
   isSafeIri,
@@ -67,6 +69,26 @@ export function payloadTooLargeResponseBody(err: unknown): Record<string, unknow
   return body;
 }
 
+export function oversizedRdfLiteralResponseBody(err: unknown): Record<string, unknown> {
+  const shaped = (err && typeof err === 'object') ? err as Record<string, unknown> : {};
+  const message = err instanceof Error ? err.message : String(err ?? 'Oversized RDF literal');
+  const body: Record<string, unknown> = {
+    error: message,
+    code: 'OVERSIZED_RDF_LITERAL',
+  };
+  const maxBytes = shaped.maxBytes;
+  if (typeof maxBytes === 'number') body.limitBytes = maxBytes;
+  const actualBytes = shaped.actualBytes;
+  if (typeof actualBytes === 'number') body.actualBytes = actualBytes;
+  const subject = shaped.subject;
+  if (typeof subject === 'string') body.subject = subject;
+  const predicate = shaped.predicate;
+  if (typeof predicate === 'string') body.predicate = predicate;
+  const graph = shaped.graph;
+  if (typeof graph === 'string') body.graph = graph;
+  return body;
+}
+
 export async function resolveNameToPeerId(
   agent: DKGAgent,
   nameOrId: string,
@@ -118,6 +140,21 @@ export function isWritableQuad(value: unknown): boolean {
     typeof v.object === "string" &&
     (v.graph === undefined || typeof v.graph === "string")
   );
+}
+
+export function validateWritableQuadLiteralSizes(
+  label: string,
+  quads: Array<{ subject: string; predicate: string; object: string; graph?: string }>,
+): { ok: true } | { ok: false; body: Record<string, unknown> } {
+  try {
+    assertQuadLiteralsMutf8Safe(quads, { label });
+    return { ok: true };
+  } catch (err) {
+    if (isOversizedRdfLiteralError(err)) {
+      return { ok: false, body: oversizedRdfLiteralResponseBody(err) };
+    }
+    throw err;
+  }
 }
 
 /**
@@ -182,7 +219,7 @@ export function respondIfReconcileUnavailable(res: ServerResponse, e: any): bool
 
 export function parsePublishRequestBody(
   body: string,
-): { ok: true; value: PublishRequestBody } | { ok: false; error: string } {
+): { ok: true; value: PublishRequestBody } | { ok: false; error: string; body?: Record<string, unknown> } {
   let parsed: unknown;
   try {
     parsed = JSON.parse(body);
@@ -218,6 +255,10 @@ export function parsePublishRequestBody(
   }
   const quadObjectError = validateQuadObjectTerms("quads", quads);
   if (quadObjectError) return { ok: false, error: quadObjectError };
+  const quadSize = validateWritableQuadLiteralSizes("quads", quads);
+  if (!quadSize.ok) {
+    return { ok: false, error: String(quadSize.body.error ?? 'Oversized RDF literal'), body: quadSize.body };
+  }
 
   if (
     privateQuads !== undefined &&
@@ -231,6 +272,10 @@ export function parsePublishRequestBody(
   if (privateQuads !== undefined) {
     const privateQuadObjectError = validateQuadObjectTerms("privateQuads", privateQuads);
     if (privateQuadObjectError) return { ok: false, error: privateQuadObjectError };
+    const privateQuadSize = validateWritableQuadLiteralSizes("privateQuads", privateQuads);
+    if (!privateQuadSize.ok) {
+      return { ok: false, error: String(privateQuadSize.body.error ?? 'Oversized RDF literal'), body: privateQuadSize.body };
+    }
   }
 
   if (
@@ -1024,6 +1069,12 @@ export interface ImportFileExtractionPayload {
   pipelineUsed: string | null;
   mdIntermediateHash?: string;
   error?: string;
+  code?: string;
+  limitBytes?: number;
+  actualBytes?: number;
+  subject?: string;
+  predicate?: string;
+  graph?: string;
   // #1101: when status === "skipped", explain WHY extraction was skipped so
   // callers don't have to guess (the dominant cause is an unrecognized
   // content type with no registered converter).
@@ -1050,6 +1101,12 @@ export function buildImportFileResponse(args: {
         ? { mdIntermediateHash: args.extraction.mdIntermediateHash }
         : {}),
       ...(args.extraction.error ? { error: args.extraction.error } : {}),
+      ...(args.extraction.code ? { code: args.extraction.code } : {}),
+      ...(args.extraction.limitBytes != null ? { limitBytes: args.extraction.limitBytes } : {}),
+      ...(args.extraction.actualBytes != null ? { actualBytes: args.extraction.actualBytes } : {}),
+      ...(args.extraction.subject ? { subject: args.extraction.subject } : {}),
+      ...(args.extraction.predicate ? { predicate: args.extraction.predicate } : {}),
+      ...(args.extraction.graph ? { graph: args.extraction.graph } : {}),
       ...(args.extraction.skipReason ? { skipReason: args.extraction.skipReason } : {}),
     },
   };

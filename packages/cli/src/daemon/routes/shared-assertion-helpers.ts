@@ -18,11 +18,13 @@ import {
   ImportedArtifactMetadataError,
   isDkgContentHash,
   resolveImportedArtifactMetadata,
+  assertRdfLiteralMutf8Safe,
 } from '@origintrail-official/dkg-core';
 import { type PromoteJob, type PromoteJobState } from '@origintrail-official/dkg-publisher';
 import { daemonState } from '../state.js';
 import {
   jsonResponse,
+  oversizedRdfLiteralResponseBody,
   safeDecodeURIComponent,
   normalizeContextGraphIdOrUri,
   isValidContextGraphId,
@@ -285,6 +287,11 @@ export function normalizeSemanticQuads(raw: unknown): Array<{ subject: string; p
     } else {
       normalizedObject = rdfLiteral(object);
     }
+    assertRdfLiteralMutf8Safe(normalizedObject, {
+      label: `semanticQuads[${index}].object`,
+      subject,
+      predicate,
+    });
     return { subject, predicate, object: normalizedObject };
   });
 }
@@ -491,6 +498,10 @@ export async function isPublicOpenContextGraph(
 export function handleImportArtifactRouteError(res: ServerResponse, err: unknown): boolean {
   if (err instanceof ImportArtifactRouteError) {
     jsonResponse(res, err.statusCode, { error: err.message });
+    return true;
+  }
+  if ((err as { code?: string })?.code === 'OVERSIZED_RDF_LITERAL') {
+    jsonResponse(res, 400, oversizedRdfLiteralResponseBody(err));
     return true;
   }
   const message = err instanceof Error ? err.message : String(err);

@@ -62,6 +62,19 @@ export interface OtlpLogWorkerOptions {
   role?: string;
   /** OTel resource service.name. Default 'dkg-node'. */
   serviceName?: string;
+  /**
+   * Per-node identifier. Becomes the OTel `service.instance.id`, which Loki
+   * promotes to the index label `service_instance_id` — this is what a Grafana
+   * "pick a node" dashboard variable selects on. Defaults to nodeName, then
+   * peerId. Hosted nodes should set a unique `name` in config.
+   */
+  serviceInstanceId?: string;
+  /**
+   * Deployment environment (e.g. 'testnet' | 'mainnet'). Becomes the OTel
+   * `deployment.environment`, which Loki promotes to the label
+   * `deployment_environment`. Defaults to `network`.
+   */
+  deploymentEnvironment?: string;
   /** Minimum level forwarded remotely. Default 'info' (debug stays local). */
   minLevel?: string;
   /** Bounded in-memory buffer; drop-oldest on overflow. Default 500. */
@@ -125,6 +138,11 @@ export class OtlpLogWorker {
     this.resourceAttrs = [
       attr('service.name', opts.serviceName ?? DEFAULTS.serviceName),
       attr('service.version', opts.version),
+      // Promoted to Loki index labels by default → drive Grafana dashboard
+      // variables (node selector + environment) off these.
+      attr('service.instance.id', opts.serviceInstanceId ?? opts.nodeName ?? opts.peerId),
+      attr('deployment.environment', opts.deploymentEnvironment ?? opts.network),
+      // Kept as structured metadata for richer filtering / correlation.
       attr('dkg.network', opts.network),
       attr('dkg.peer_id', opts.peerId),
       attr('dkg.node_name', opts.nodeName),

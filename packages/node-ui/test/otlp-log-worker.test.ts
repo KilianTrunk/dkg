@@ -112,6 +112,9 @@ describe('OtlpLogWorker — OTLP/HTTP log export', () => {
     expect(attrMap['dkg.network']).toBe('devnet');
     expect(attrMap['dkg.node_role']).toBe('core');
     expect(attrMap['dkg.peer_id']).toBe('12D3KooWtest');
+    // Label-promoted identity for the Grafana node selector.
+    expect(attrMap['service.instance.id']).toBe('test-node'); // defaults to nodeName
+    expect(attrMap['deployment.environment']).toBe('devnet'); // defaults to network
 
     const logRecord = resourceLogs[0].scopeLogs[0].logRecords[0];
     expect(logRecord.severityNumber).toBe(17); // error

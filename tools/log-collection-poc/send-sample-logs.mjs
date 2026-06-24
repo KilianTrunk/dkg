@@ -8,20 +8,23 @@
  * redaction happens at-source (the collector/Loki never see the secret).
  *
  * Usage (after `docker compose up -d` and a workspace build):
- *   node send-sample-logs.mjs [endpoint]
- *   # default endpoint: http://localhost:4318/v1/logs
+ *   node send-sample-logs.mjs [endpoint] [nodeName] [network]
+ *   # defaults: http://localhost:4318/v1/logs  poc-node  devnet
+ *   # run twice with different node names to populate the Grafana node selector.
  */
 import { createLogRedactor } from '../../packages/core/dist/log-redaction.js';
 import { OtlpLogWorker } from '../../packages/node-ui/dist/otlp-log-worker.js';
 
 const endpoint = process.argv[2] || 'http://localhost:4318/v1/logs';
+const nodeName = process.argv[3] || 'poc-node';
+const network = process.argv[4] || 'devnet';
 const redact = createLogRedactor();
 
 const worker = new OtlpLogWorker({
   endpoint,
-  network: 'devnet',
-  peerId: '12D3KooWPoCsampleSenderPeerId',
-  nodeName: 'poc-node',
+  network,
+  peerId: `12D3KooW-${nodeName}`,
+  nodeName, // becomes service.instance.id → the Grafana node-selector label
   version: '10.0.0',
   commit: 'poc0001',
   role: 'core',

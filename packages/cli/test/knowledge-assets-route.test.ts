@@ -670,6 +670,19 @@ describe('/api/knowledge-assets routes (real daemon, real chain)', () => {
       expect(String(res.body.error)).toMatch(/authorAgentAddress/);
     });
 
+    it('rejects a pre-signed author override (the seal encodes the author) (400)', async () => {
+      const res = await postJson(daemon, '/api/knowledge-assets/share/vm/publish', {
+        contextGraphId: REG,
+        preSignedAuthorAttestation: {
+          address: `0x${'11'.repeat(20)}`,
+          reservedKaId: '1',
+          signature: { r: `0x${'aa'.repeat(32)}`, vs: `0x${'bb'.repeat(32)}` },
+        },
+      });
+      expect(res.status).toBe(400);
+      expect(String(res.body.error)).toMatch(/preSignedAuthorAttestation/);
+    });
+
     it('does NOT down-classify a genuine publisher failure: a real ACK-quorum miss stays 5xx', async () => {
       // A finalized+shared KA on an EDGE node cannot reach StorageACK quorum
       // (no connected core peers) → the real publisher throws and the route

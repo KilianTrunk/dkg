@@ -535,6 +535,36 @@ describe('/api/knowledge-assets routes (real daemon, real chain)', () => {
       expect(res.body.promotedCount).toBeGreaterThan(0);
     });
 
+    it('agent-scoped token full share auto-seals as the token agent', async () => {
+      const agent = await registerAgentClient('ka-share-default-author');
+      const cg = `ka-share-default-${Date.now().toString(36)}`;
+      const name = 'agent-default-share';
+      await createRegisteredAgentContextGraph(agent, cg);
+
+      const draft = await agent.post('/api/knowledge-assets', {
+        contextGraphId: cg,
+        name,
+        quads: [{ subject: 'ex:A', predicate: 'ex:p', object: '"x"' }],
+        finalize: false,
+      });
+      expect(draft.status, `agent draft: ${JSON.stringify(draft.body)}`).toBe(201);
+      expect(draft.body.status).toBe('draft-open');
+
+      const res = await agent.post(`/api/knowledge-assets/${name}/swm/share`, { contextGraphId: cg });
+
+      expect(res.status, `agent share: ${JSON.stringify(res.body)}`).toBe(200);
+      expect(res.body.swmShared).toBe(true);
+      expect(res.body.sealed).toBe(true);
+      expect(res.body.publishReady).toBe(true);
+      const descriptor = await agent.get(
+        `/api/knowledge-assets/${name}?contextGraphId=${cg}&agentAddress=${agent.agentAddress}`,
+      );
+      expect(descriptor.status, `agent descriptor: ${JSON.stringify(descriptor.body)}`).toBe(200);
+      expect(descriptor.body.status).toBe('swm-shared');
+      expect(String(descriptor.body.agentAddress).toLowerCase()).toBe(agent.agentAddress.toLowerCase());
+      expect(String(descriptor.body.reservedUal).toLowerCase()).toContain(agent.agentAddress.toLowerCase());
+    });
+
     // #1116 — the route's thin wrapper over the seal-by-default share contract.
     // The B1/B2 agent e2e tests pin the ENGINE outcomes; these pin the ROUTE's
     // strict-boolean validation + the seal-outcome fields it forwards (sealed /

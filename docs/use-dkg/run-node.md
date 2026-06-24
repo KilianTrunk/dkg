@@ -72,6 +72,28 @@ The Core provisioning path sends `Profile.createProfile` from the primary operat
 
 After the profile exists, the daemon can also register additional operational wallets for ACK signing. That follow-up path requires the admin wallet.
 
+### Manual registration with an external admin key
+
+If the operator does not want to store the admin wallet private key on the node host, do not rely on `POST /api/identity/ensure` for initial setup. That route is the daemon convenience path and requires `adminPrivateKey` for profile creation and later profile/key-management repair transactions.
+
+Instead:
+
+1. Run `dkg init --role core --network <network>` on the node host.
+2. Run `dkg wallet` and collect the admin wallet address plus all operational / ACK wallet addresses. Treat the primary operational address as `op1`.
+3. Register the profile manually on-chain:
+   * If signing from the primary operational wallet, call `Profile.createProfile(adminAddress, [op2, op3, ...], nodeName, nodeId, initialOperatorFee)`.
+   * If signing from the external admin wallet, call `Profile.createProfile(adminAddress, [op1, op2, op3, ...], nodeName, nodeId, initialOperatorFee)`.
+
+Include all operational / ACK wallets in the initial `createProfile` call if the admin key will not be present on the node host. Otherwise the daemon cannot later run `addOperationalWallets`, because that repair path requires the admin private key. If `dkg init` generated the admin key on the host, move that private key into the external signer according to your key-management process and make sure the node host does not retain it.
+
+After profile creation, stake from the primary operational wallet:
+
+1. Approve TRAC to the `StakingV10` contract address resolved from the Hub.
+2. Call `DKGStakingConvictionNFT.createConviction(identityId, amount, lockTier)`.
+3. Verify `IdentityStorage.getIdentityId(op1)` or `GET /api/identity` returns a non-zero `identityId`.
+
+Once this is done, the daemon should discover the existing profile on startup instead of creating one.
+
 ### Manual Trigger
 
 If the daemon started before the wallets were funded, or a transient RPC failure left identity unresolved, fix the funding or RPC issue and trigger registration without restarting:

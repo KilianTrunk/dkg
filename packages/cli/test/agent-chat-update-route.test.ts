@@ -152,6 +152,27 @@ describe('POST /api/update — kaId + attestation contract (KC→KA), real daemo
     expect(String(res.body.error)).toContain('precomputedUpdateAttestation.authorAddress');
   });
 
+  it('allows an agent token with a mixed-case self update attestation through the guard', async () => {
+    const agent = await registerAgentClient(daemon, 'update-author-case');
+    const mixedCaseAgent = `0x${agent.agentAddress.slice(2).toUpperCase()}`;
+    expect(mixedCaseAgent).not.toBe(agent.agentAddress);
+    const seal = {
+      authorAddress: mixedCaseAgent,
+      expectedNewMerkleRoot: HEX32,
+      signature: { r: HEX32, vs: HEX32 },
+    };
+
+    const res = await agent.post('/api/update', {
+      kaId: '7',
+      contextGraphId: CG,
+      quads: QUADS,
+      precomputedUpdateAttestation: seal,
+    });
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toMatch(/expectedNewMerkleRoot mismatch/);
+  });
+
   it('maps a missing precomputedUpdateAttestation precondition to 422, not 500', async () => {
     // An on-chain update requires an off-band UpdateAuthorAttestation seal;
     // when it's absent the publisher throws a plain Error mentioning

@@ -464,6 +464,35 @@ describe('/api/knowledge-assets routes (real daemon, real chain)', () => {
         expect(BigInt(atomic.body.kaId) >> 96n).toBe(BigInt(agentAddress));
       }
     });
+
+    it('node token finalizes an explicitly selected local author lane', async () => {
+      const agent = await registerAgentClient('ka-node-finalize-author');
+      const cg = `ka-node-finalize-${Date.now().toString(36)}`;
+      const name = 'node-explicit-author-finalize';
+      await createRegisteredAgentContextGraph(agent, cg);
+
+      const draft = await agent.post('/api/knowledge-assets', {
+        contextGraphId: cg,
+        name,
+        quads: [{ subject: 'ex:A', predicate: 'ex:p', object: '"x"' }],
+        finalize: false,
+      });
+      expect(draft.status, `agent draft create: ${JSON.stringify(draft.body)}`).toBe(201);
+      expect(draft.body.status).toBe('draft-open');
+
+      const fin = await postJson(daemon, `/api/knowledge-assets/${name}/wm/finalize`, {
+        contextGraphId: cg,
+        authorAgentAddress: agent.agentAddress,
+      });
+      expect(fin.status, `node finalize override: ${JSON.stringify(fin.body)}`).toBe(200);
+      expect(String(fin.body.authorAddress).toLowerCase()).toBe(agent.agentAddress.toLowerCase());
+
+      const descriptor = await agent.get(
+        `/api/knowledge-assets/${name}?contextGraphId=${cg}&agentAddress=${agent.agentAddress}`,
+      );
+      expect(descriptor.status, `agent descriptor: ${JSON.stringify(descriptor.body)}`).toBe(200);
+      expect(descriptor.body.status).toBe('wm-sealed');
+    });
   });
 
   // ── swm/share ─────────────────────────────────────────────────────

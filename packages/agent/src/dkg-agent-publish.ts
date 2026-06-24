@@ -106,8 +106,9 @@ import {
   ACKCollector, StorageACKHandler,
   VerifyCollector, VerifyProposalHandler, buildVerificationMetadata,
   resolveWorkspaceAgentRecipients,
-  computeTripleHashV10 as computeTripleHash, computeFlatKCRootV10 as computeFlatKCRoot, skolemizeByEntity, isReservedSubject, computePrivateRootV10 as computePrivateRoot,
+  computeTripleHashV10 as computeTripleHash, computeFlatKCRootV10 as computeFlatKCRoot, skolemizeByEntity, isReservedSubject,
   canonicalPublishPayload,
+  generatedPrivateCatalogTripleKeys,
   resolveLiftWorkspaceSlice,
   validateLiftPublishPayload,
   subtractFinalizedExactQuads,
@@ -1179,6 +1180,9 @@ export class PublishMethods extends DKGAgentBase {
     const canonical = canonicalPublishPayload(
       subtracted.resolved.quads,
       subtracted.resolved.privateQuads ?? [],
+      (await this.isPrivateContextGraph(request.contextGraphId))
+        ? { trustedNonManifestCatalogTriples: generatedPrivateCatalogTripleKeys(request.contextGraphId) }
+        : undefined,
     );
 
     // Resolve author: callback → custodial keystore → publisher fallback. User-input pre-validated in publishAsync entry.
@@ -1566,8 +1570,9 @@ export class PublishMethods extends DKGAgentBase {
     // path always has — so under a DEGRADED / stale policy probe a public update
     // fails closed (throws) consistently with publish, where the OLD update path
     // would have proceeded. Fail-closed, never a leak; see PR #1208 notes.
+    const shouldInjectCuratedCatalogFloor = isCuratedUpdate && updateOnChainId != null;
     let updateQuads = quads;
-    if (isCuratedUpdate) {
+    if (shouldInjectCuratedCatalogFloor) {
       const cgDid = contextGraphDataUri(contextGraphId);
       const { otherQuads: nonCatalogQuads } = partitionCatalogQuads(quads, cgDid);
       const catalogFloor = buildPublicProjection({
@@ -1587,6 +1592,9 @@ export class PublishMethods extends DKGAgentBase {
       operationCtx: ctx,
       onPhase,
       precomputedUpdateAttestation: opts?.precomputedUpdateAttestation,
+      trustedNonManifestCatalogTriples: shouldInjectCuratedCatalogFloor
+        ? generatedPrivateCatalogTripleKeys(contextGraphId)
+        : undefined,
       v10UpdateACKProvider,
       // Curated → wire the single-blob AEAD hook so the producer's
       // `useEncryptedInlineUpdate` gate fires (catalog commit). Public →
@@ -2005,7 +2013,10 @@ export class PublishMethods extends DKGAgentBase {
     // only, so the placeholder `graph` here does not affect the root.
     // Idempotent across re-finalize: identical quads dedupe in the WM store.
     const quads = [...userQuads];
-    if (await this.isPrivateContextGraph(contextGraphId)) {
+    const trustedGeneratedCatalogTriples = (await this.isPrivateContextGraph(contextGraphId))
+      ? generatedPrivateCatalogTripleKeys(contextGraphId)
+      : undefined;
+    if (trustedGeneratedCatalogTriples) {
       const cgDid = contextGraphDataUri(contextGraphId);
       // `graph` is a non-empty placeholder only (buildPublicProjection requires
       // one); assertionWrite re-stamps it with the correct wmGraphUri.
@@ -2067,7 +2078,10 @@ export class PublishMethods extends DKGAgentBase {
     //     instead of bundling everything currently sitting in shared
     //     memory (Round 4 review §9). Now safe by construction — the
     //     guard above guarantees every key passes `isSafeIri`.
-    const rootEntities = allRootEntities;
+    const canonicalForManifest = canonicalPublishPayload(quads, [], {
+      trustedNonManifestCatalogTriples: trustedGeneratedCatalogTriples,
+    });
+    const rootEntities = canonicalForManifest.manifestEntries.map((m) => m.rootEntity);
     if (rootEntities.length === 0) {
       throw new Error(
         `Cannot finalize assertion <${assertionUri}>: skolemizeByEntity produced ` +
@@ -2585,30 +2599,16 @@ export class PublishMethods extends DKGAgentBase {
       );
     }
 
-    const kaMap = skolemizeByEntity(quads);
-    const allSkolemizedQuads = [...kaMap.values()].flat();
-    // Mirror the publisher's per-rootEntity private partition + root
-    // derivation (see `dkg-publisher.ts:1526-1570`). Each public root
-    // entity gets the private quads whose subjects either equal it or
-    // skolemize beneath its `…/.well-known/genid/` namespace; each
-    // such non-empty bag becomes a `computePrivateRootV10` leaf in the
-    // KC merkle. The order MUST follow the publisher's manifest
-    // iteration over `kaMap`, which is the insertion order — same map
-    // we built two lines up.
     const privateQuads = opts?.privateQuads ?? [];
-    const privateRoots: Uint8Array[] = [];
-    for (const rootEntity of kaMap.keys()) {
-      if (privateQuads.length === 0) break;
-      const entityPrivateQuads = privateQuads.filter(
-        (q) =>
-          q.subject === rootEntity ||
-          q.subject.startsWith(rootEntity + '/.well-known/genid/'),
-      );
-      if (entityPrivateQuads.length === 0) continue;
-      const root = computePrivateRoot(entityPrivateQuads);
-      if (root) privateRoots.push(root);
-    }
-    const merkleRoot = computeFlatKCRoot(allSkolemizedQuads, privateRoots);
+    const trustedCatalogOnChainId = opts?.targetOnChainCgId ?? await this.getContextGraphOnChainId(contextGraphId);
+    const canonical = canonicalPublishPayload(
+      quads,
+      privateQuads,
+      trustedCatalogOnChainId != null && (await this.isPrivateContextGraph(contextGraphId))
+        ? { trustedNonManifestCatalogTriples: generatedPrivateCatalogTripleKeys(contextGraphId) }
+        : undefined,
+    );
+    const merkleRoot = canonical.kcMerkleRoot;
 
     const chainId = await this.chain.getEvmChainId();
     const kav10Address = await this.chain.getKnowledgeAssetsLifecycleAddress();
@@ -3930,10 +3930,9 @@ export class PublishMethods extends DKGAgentBase {
    * by the SAME `buildPublicProjection`, so the committed catalog is byte-identical
    * across both paths.
    *
-   * IDEMPOTENT: if the catalog is already in the SWM read scope (finalize path, or
-   * a prior from-SWM publish), it does nothing. Re-injection would in any case
-   * dedupe in the V10 merkle (identical leaves) so `catalogLeafCount` is stable,
-   * but the guard avoids the redundant write entirely.
+    * IDEMPOTENT: repeated insertion dedupes in the store/V10 Merkle path because
+    * the floor is deterministic, so `catalogLeafCount` stays stable across
+    * finalize-path and direct from-SWM publishes.
    *
    * Returns a possibly-extended `selection`: for a `{rootEntities}` publish the
    * CG-DID catalog subject is appended so it is in scope for BOTH the author seal
@@ -3949,19 +3948,12 @@ export class PublishMethods extends DKGAgentBase {
   ): Promise<'all' | { rootEntities: string[] }> {
     const swmGraph = contextGraphSharedMemoryUri(contextGraphId, subGraphName);
     const cgDid = contextGraphDataUri(contextGraphId);
-    const existing = await this.store.query(
-      `CONSTRUCT { <${cgDid}> <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DCAT_DATASET}> } ` +
-      `WHERE { GRAPH ?g { <${cgDid}> <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DCAT_DATASET}> } ${sharedMemoryReadBothFilter(swmGraph)} }`,
+    const catalogQuads = buildPublicProjection({ ual: cgDid, accessPolicy: 'private', graph: swmGraph });
+    await this.store.insert(catalogQuads);
+    this.log.info(
+      ctx,
+      `OT-RFC-49: ensured ${catalogQuads.length}-quad public _catalog floor in SWM for curated CG ${contextGraphId} (from-SWM publish without finalize)`,
     );
-    const alreadyPresent = existing.type === 'quads' && existing.quads.length > 0;
-    if (!alreadyPresent) {
-      const catalogQuads = buildPublicProjection({ ual: cgDid, accessPolicy: 'private', graph: swmGraph });
-      await this.store.insert(catalogQuads);
-      this.log.info(
-        ctx,
-        `OT-RFC-49: injected ${catalogQuads.length}-quad public _catalog floor into SWM for curated CG ${contextGraphId} (from-SWM publish without finalize)`,
-      );
-    }
     if (selection !== 'all' && !selection.rootEntities.includes(cgDid)) {
       return { rootEntities: [...selection.rootEntities, cgDid] };
     }
@@ -4079,7 +4071,11 @@ export class PublishMethods extends DKGAgentBase {
     // spurious. Returns a possibly-extended selection so the CG-DID catalog
     // subject is in scope for a `{rootEntities}` publish too (the seal-read and
     // the publisher reload scope identically).
-    if (onChainId != null && (await this.isPrivateContextGraph(contextGraphId))) {
+    const hasGeneratedPrivateCatalog = onChainId != null && (await this.isPrivateContextGraph(contextGraphId));
+    const trustedNonManifestCatalogTriples = hasGeneratedPrivateCatalog
+      ? generatedPrivateCatalogTripleKeys(contextGraphId)
+      : undefined;
+    if (hasGeneratedPrivateCatalog) {
       selection = await this._ensureCuratedCatalogInSwm(contextGraphId, selection, options?.subGraphName, ctx);
     }
 
@@ -4165,6 +4161,7 @@ export class PublishMethods extends DKGAgentBase {
       onChainContextGraphId: onChainId,
       contextGraphSignatures: options?.contextGraphSignatures,
       v10ACKProvider,
+      trustedNonManifestCatalogTriples,
       subGraphName: options?.subGraphName,
       publisherNodeIdentityIdOverride: options?.publisherNodeIdentityIdOverride,
       publishEpochs: options?.publishEpochs,

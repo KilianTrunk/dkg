@@ -2,11 +2,17 @@ import type { Quad, TripleStore } from '@origintrail-official/dkg-storage';
 import type { ChainAdapter, OnChainPublishResult, AddBatchToContextGraphParams } from '@origintrail-official/dkg-chain';
 import { enrichEvmError } from '@origintrail-official/dkg-chain';
 import type { EventBus, OperationContext } from '@origintrail-official/dkg-core';
-import { DKGEvent, Logger, createOperationContext, sha256, encodeWorkspacePublishRequest, encodeEncryptedWorkspacePayload, encryptWorkspacePayload, contextGraphDataUri, contextGraphDataGraphUri, contextGraphMetaUri, contextGraphAssertionUri, contextGraphLayerUri, MemoryLayer, assertionLifecycleUri, contextGraphSubGraphUri, contextGraphSubGraphMetaUri, SYSTEM_CONTEXT_GRAPHS, validateSubGraphName, isSafeIri, assertSafeIri, assertSafeRdfTerm, DKG_GOSSIP_MAX_MESSAGE_BYTES, SwmGossipPayloadTooLargeError, type Ed25519Keypair, buildAuthorAttestationTypedData, buildUpdateAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1, TrustLevel, TRUST_LEVEL_PREDICATE, assertNoUserAuthoredTrustLevelQuads, buildTrustLevelQuads, isTrustLevelQuad, DKG_ENTITY, DKG_ROOT_ENTITY_LEGACY, ENTITY_PRED_ALT, parseAssertionSealQuads, ASSERTION_SEAL_PREDICATES, sharedMemoryReadBothFilter } from '@origintrail-official/dkg-core';
+import { DKGEvent, Logger, createOperationContext, sha256, encodeWorkspacePublishRequest, encodeEncryptedWorkspacePayload, encryptWorkspacePayload, contextGraphDataUri, contextGraphDataGraphUri, contextGraphMetaUri, contextGraphAssertionUri, contextGraphLayerUri, MemoryLayer, assertionLifecycleUri, contextGraphSubGraphUri, contextGraphSubGraphMetaUri, SYSTEM_CONTEXT_GRAPHS, validateSubGraphName, isSafeIri, assertSafeIri, assertSafeRdfTerm, DKG_GOSSIP_MAX_MESSAGE_BYTES, SwmGossipPayloadTooLargeError, type Ed25519Keypair, buildAuthorAttestationTypedData, buildUpdateAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1, TrustLevel, TRUST_LEVEL_PREDICATE, assertNoUserAuthoredTrustLevelQuads, buildTrustLevelQuads, isTrustLevelQuad, DKG_ENTITY, DKG_ROOT_ENTITY_LEGACY, ENTITY_PRED_ALT, parseAssertionSealQuads, ASSERTION_SEAL_PREDICATES, sharedMemoryReadBothFilter, DKG_ONTOLOGY } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore } from '@origintrail-official/dkg-storage';
 import { DEFAULT_PUBLISH_EPOCHS, MAX_PUBLISH_EPOCHS, type Publisher, type PublishOptions, type PublishResult, type KAManifestEntry, type PhaseCallback, type V10CoreNodeACK } from './publisher.js';
 import { skolemizeByEntity } from './auto-partition.js';
 import { canonicalPublishPayload } from './canonical-publish-payload.js';
+import {
+  assertTrustedCatalogTriplesAreGeneratedFloor,
+  catalogTripleKey,
+  splitTrustedGeneratedCatalogRootMap,
+  trustedCatalogTripleKeySet,
+} from './catalog-trust.js';
 import { partitionCatalogQuads, catalogCommittedLeaves, computeCatalogRoot, contextGraphCatalogUri, isAgentRegistryContextGraph } from '@origintrail-official/dkg-core';
 import { RESERVED_SUBJECT_PREFIXES, findReservedSubjectPrefix, isReservedSubject } from './reserved-subjects.js';
 import { skolemize } from './skolemize.js';
@@ -313,9 +319,11 @@ export type WriteConditionalToWorkspaceOptions = ConditionalShareOptions;
 // public entry points at all (the daemon's direct `store.insert`
 // bypass, which is the other legitimate non-guard path).
 const INTERNAL_ORIGIN_TOKEN = Symbol('dkg-publisher:internal-origin');
+const TRUSTED_CATALOG_ORIGIN_TOKEN = Symbol('dkg-publisher:trusted-catalog-origin');
 
 type InternalPublishOptions = PublishOptions & {
   [INTERNAL_ORIGIN_TOKEN]?: true;
+  [TRUSTED_CATALOG_ORIGIN_TOKEN]?: true;
 };
 
 interface PublisherSigner {
@@ -338,6 +346,32 @@ interface PublisherSigner {
 
 function isInternalOrigin(options: PublishOptions): boolean {
   return (options as InternalPublishOptions)[INTERNAL_ORIGIN_TOKEN] === true;
+}
+
+function isTrustedCatalogInternalOrigin(options: PublishOptions): boolean {
+  return (options as InternalPublishOptions)[TRUSTED_CATALOG_ORIGIN_TOKEN] === true;
+}
+
+function stripOptionalLiteral(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  if (value.startsWith('"')) {
+    try {
+      return JSON.parse(value);
+    } catch {
+      const lastQuote = value.lastIndexOf('"');
+      return value.slice(1, lastQuote > 0 ? lastQuote : undefined);
+    }
+  }
+  return value;
+}
+
+function sameBigIntLiteral(left: string | bigint | undefined, right: string | bigint | undefined): boolean {
+  if (left === undefined || right === undefined) return false;
+  try {
+    return BigInt(left) === BigInt(right);
+  } catch {
+    return false;
+  }
 }
 
 // Round 14 Bug 41: case-insensitive check against `RESERVED_SUBJECT_PREFIXES`.
@@ -532,6 +566,169 @@ export class DKGPublisher implements Publisher {
 
   setWorkspaceSenderKeyEncryptor(encryptor: WorkspaceSenderKeyEncryptor | undefined): void {
     this.workspaceSenderKeyEncryptor = encryptor;
+  }
+
+  private async storedOnChainContextGraphId(contextGraphId: string): Promise<string | undefined> {
+    const ontologyGraph = contextGraphDataUri('ontology');
+    const contextGraphUri = contextGraphDataUri(contextGraphId);
+    const result = await this.store.query(
+      `SELECT ?id WHERE { GRAPH <${ontologyGraph}> { <${contextGraphUri}> <https://dkg.network/ontology#ContextGraphOnChainId> ?id } } LIMIT 1`,
+    );
+    if (result.type !== 'bindings' || result.bindings.length === 0) return undefined;
+    return stripOptionalLiteral(result.bindings[0]?.['id'])?.trim();
+  }
+
+  private async onChainContextGraphMatchesLocalId(
+    contextGraphId: string,
+    onChainContextGraphId: bigint | string | undefined,
+  ): Promise<boolean> {
+    if (onChainContextGraphId === undefined || onChainContextGraphId === null) return false;
+    const normalizedOnChainId = String(onChainContextGraphId).trim();
+    const normalizedContextGraphId = contextGraphId.trim();
+
+    if (/^\d+$/.test(normalizedContextGraphId) && normalizedContextGraphId === normalizedOnChainId) return true;
+
+    const liveNameHashMatches = async (): Promise<boolean> => {
+      if (typeof this.chain?.getContextGraphNameHash !== 'function') return false;
+      try {
+        const nameHash = await this.chain.getContextGraphNameHash(BigInt(normalizedOnChainId));
+        return typeof nameHash === 'string' &&
+          nameHash.toLowerCase() === ethers.keccak256(ethers.toUtf8Bytes(normalizedContextGraphId)).toLowerCase();
+      } catch {
+        return false;
+      }
+    };
+
+    const storedOnChainId = await this.storedOnChainContextGraphId(contextGraphId);
+    if (sameBigIntLiteral(storedOnChainId, normalizedOnChainId)) {
+      return typeof this.chain?.getContextGraphNameHash === 'function'
+        ? liveNameHashMatches()
+        : true;
+    }
+
+    return liveNameHashMatches();
+  }
+
+  private async onChainContextGraphIsPrivate(
+    contextGraphId: string,
+    onChainContextGraphId: bigint | string | undefined,
+  ): Promise<boolean> {
+    if (onChainContextGraphId === undefined || onChainContextGraphId === null) return false;
+    if (!this.chain || this.chain.chainId === 'none') return false;
+    if (typeof this.chain.getContextGraphAccessPolicy !== 'function') return false;
+    if (!await this.onChainContextGraphMatchesLocalId(contextGraphId, onChainContextGraphId)) return false;
+    try {
+      return Number(await this.chain.getContextGraphAccessPolicy(BigInt(onChainContextGraphId))) === 1;
+    } catch {
+      return false;
+    }
+  }
+
+  private async localContextGraphHasPrivateAccessSignal(contextGraphId: string): Promise<boolean> {
+    if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) return false;
+
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+    const agentsGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.AGENTS);
+    const cgMeta = contextGraphMetaUri(contextGraphId);
+    const cgData = contextGraphDataUri(contextGraphId);
+    const result = await this.store.query(
+      `SELECT ?policy ?gate WHERE {
+        {
+          GRAPH <${ontologyGraph}> {
+            <${cgData}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?policy
+          }
+        } UNION {
+          GRAPH <${agentsGraph}> {
+            <${cgData}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?policy
+          }
+        } UNION {
+          GRAPH <${cgMeta}> {
+            <${cgData}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?policy
+          }
+        } UNION {
+          GRAPH <${ontologyGraph}> {
+            <${cgData}> <${DKG_ONTOLOGY.DKG_ALLOWED_AGENT}> ?gate
+          }
+        } UNION {
+          GRAPH <${agentsGraph}> {
+            <${cgData}> <${DKG_ONTOLOGY.DKG_ALLOWED_AGENT}> ?gate
+          }
+        } UNION {
+          GRAPH <${cgMeta}> {
+            <${cgData}> <${DKG_ONTOLOGY.DKG_ALLOWED_AGENT}> ?gate
+          }
+        } UNION {
+          GRAPH <${ontologyGraph}> {
+            <${cgData}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT}> ?gate
+          }
+        } UNION {
+          GRAPH <${agentsGraph}> {
+            <${cgData}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT}> ?gate
+          }
+        } UNION {
+          GRAPH <${cgMeta}> {
+            <${cgData}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT}> ?gate
+          }
+        } UNION {
+          GRAPH <${ontologyGraph}> {
+            <${cgData}> <${DKG_ONTOLOGY.DKG_ALLOWED_PEER}> ?gate
+          }
+        } UNION {
+          GRAPH <${agentsGraph}> {
+            <${cgData}> <${DKG_ONTOLOGY.DKG_ALLOWED_PEER}> ?gate
+          }
+        } UNION {
+          GRAPH <${cgMeta}> {
+            <${cgData}> <${DKG_ONTOLOGY.DKG_ALLOWED_PEER}> ?gate
+          }
+        }
+      }`,
+    );
+    if (result.type !== 'bindings') return false;
+    let hasPrivatePolicy = false;
+    let hasGate = false;
+    for (const row of result.bindings) {
+      const policy = stripOptionalLiteral(row['policy'])?.trim().toLowerCase();
+      if (policy === 'public') return false;
+      if (policy === 'private') hasPrivatePolicy = true;
+      if (stripOptionalLiteral(row['gate'])?.trim()) hasGate = true;
+    }
+    return hasPrivatePolicy || hasGate;
+  }
+
+  private async assertTrustedCatalogTriplesAllowed(params: {
+    contextGraphId: string;
+    trustedNonManifestCatalogTriples: PublishOptions['trustedNonManifestCatalogTriples'];
+    onChainContextGraphId?: bigint | string;
+    internalCatalogOrigin?: boolean;
+    allowLocalPrivateContextGraph?: boolean;
+  }): Promise<void> {
+    const {
+      contextGraphId,
+      trustedNonManifestCatalogTriples,
+      onChainContextGraphId,
+      internalCatalogOrigin = false,
+      allowLocalPrivateContextGraph = false,
+    } = params;
+    assertTrustedCatalogTriplesAreGeneratedFloor(
+      contextGraphId,
+      trustedNonManifestCatalogTriples,
+    );
+
+    if (trustedCatalogTripleKeySet(trustedNonManifestCatalogTriples).size === 0) return;
+    if (internalCatalogOrigin) return;
+    const storedOnChainContextGraphId = await this.storedOnChainContextGraphId(contextGraphId);
+    const effectiveOnChainContextGraphId = onChainContextGraphId ?? storedOnChainContextGraphId;
+    if (
+      allowLocalPrivateContextGraph &&
+      effectiveOnChainContextGraphId === undefined &&
+      await this.localContextGraphHasPrivateAccessSignal(contextGraphId)
+    ) return;
+    if (await this.onChainContextGraphIsPrivate(contextGraphId, effectiveOnChainContextGraphId)) return;
+
+    throw new Error(
+      'trustedNonManifestCatalogTriples is only allowed for internal private context graph catalog floor handling',
+    );
   }
 
   private async resolvePublisherAddress(
@@ -1245,6 +1442,7 @@ export class DKGPublisher implements Publisher {
       onChainContextGraphId?: string;
       contextGraphSignatures?: Array<{ identityId: bigint; r: Uint8Array; vs: Uint8Array }>;
       v10ACKProvider?: PublishOptions['v10ACKProvider'];
+      trustedNonManifestCatalogTriples?: PublishOptions['trustedNonManifestCatalogTriples'];
       subGraphName?: string;
       /**
        * Per-call override for the on-chain attribution target — see
@@ -1401,6 +1599,15 @@ export class DKGPublisher implements Publisher {
       );
     }
 
+    const hasTrustedCatalogTriples = trustedCatalogTripleKeySet(
+      options?.trustedNonManifestCatalogTriples,
+    ).size > 0;
+    await this.assertTrustedCatalogTriplesAllowed({
+      contextGraphId,
+      trustedNonManifestCatalogTriples: options?.trustedNonManifestCatalogTriples,
+      onChainContextGraphId: chainCgId,
+    });
+
     this.log.info(ctx, `Publishing ${quads.length} quads from shared memory to ${ctxGraphId ? `context graph ${ctxGraphId}` : 'data graph'}${chainCgId && !ctxGraphId ? ` (on-chain CG ${chainCgId})` : ''}${options?.subGraphName ? ` (sub-graph: ${options.subGraphName})` : ''}`);
     const internalPublishOptions: InternalPublishOptions = {
       contextGraphId,
@@ -1408,6 +1615,7 @@ export class DKGPublisher implements Publisher {
       operationCtx: ctx,
       onPhase: options?.onPhase,
       v10ACKProvider: options?.v10ACKProvider,
+      trustedNonManifestCatalogTriples: options?.trustedNonManifestCatalogTriples,
       publishContextGraphId: chainCgId ?? undefined,
       fromSharedMemory: true,
       subGraphName: options?.subGraphName,
@@ -1419,6 +1627,7 @@ export class DKGPublisher implements Publisher {
       // OT-RFC-43 A2 — reuse the finalize-stamped kaId (no re-allocate).
       reservedKaId: options?.reservedKaId,
       [INTERNAL_ORIGIN_TOKEN]: true,
+      ...(hasTrustedCatalogTriples ? { [TRUSTED_CATALOG_ORIGIN_TOKEN]: true } : {}),
     };
     let publishResult: PublishResult;
     try {
@@ -1866,7 +2075,15 @@ export class DKGPublisher implements Publisher {
     onPhase?.('prepare:ensureContextGraph', 'end');
 
     onPhase?.('prepare:partition', 'start');
-    const canonical = canonicalPublishPayload(quads, privateQuads);
+    await this.assertTrustedCatalogTriplesAllowed({
+      contextGraphId,
+      trustedNonManifestCatalogTriples: options.trustedNonManifestCatalogTriples,
+      onChainContextGraphId: publisherContextGraphId,
+      internalCatalogOrigin: isTrustedCatalogInternalOrigin(options),
+    });
+    const canonical = canonicalPublishPayload(quads, privateQuads, {
+      trustedNonManifestCatalogTriples: options.trustedNonManifestCatalogTriples,
+    });
     onPhase?.('prepare:partition', 'end');
 
     const manifestEntries: KAManifestEntry[] = [];
@@ -1914,7 +2131,15 @@ export class DKGPublisher implements Publisher {
     onPhase?.('prepare:validate', 'start');
     const publishOwnershipKey = options.subGraphName ? `${contextGraphId}\0${options.subGraphName}` : contextGraphId;
     const existing = this.ownedEntities.get(publishOwnershipKey) ?? new Set();
-    const validation = validatePublishRequest(allSkolemizedQuads, manifestEntries, contextGraphId, existing);
+    const validation = validatePublishRequest(
+      allSkolemizedQuads,
+      manifestEntries,
+      contextGraphId,
+      existing,
+      {
+        trustedNonManifestCatalogTriples: options.trustedNonManifestCatalogTriples,
+      },
+    );
     if (!validation.valid) {
       throw new Error(`Validation failed: ${validation.errors.join('; ')}`);
     }
@@ -3285,7 +3510,31 @@ export class DKGPublisher implements Publisher {
 
     onPhase?.('prepare', 'start');
     onPhase?.('prepare:partition', 'start');
+    await this.assertTrustedCatalogTriplesAllowed({
+      contextGraphId,
+      trustedNonManifestCatalogTriples: options.trustedNonManifestCatalogTriples,
+      onChainContextGraphId: publisherContextGraphId,
+      internalCatalogOrigin: isTrustedCatalogInternalOrigin(options),
+    });
     const kaMap = skolemizeByEntity(quads);
+    const {
+      contentRootMap,
+      generatedCatalogRootEntities,
+    } = splitTrustedGeneratedCatalogRootMap(
+      kaMap,
+      options.trustedNonManifestCatalogTriples,
+    );
+    for (const rootEntity of generatedCatalogRootEntities) {
+      const hiddenPrivateQuads = privateQuads.filter(
+        (q) => q.subject === rootEntity || q.subject.startsWith(rootEntity + '/.well-known/genid/'),
+      );
+      if (hiddenPrivateQuads.length > 0) {
+        throw new Error(
+          `Generated catalog subject "${rootEntity}" has private triples; ` +
+          'refusing to exclude it from the KA manifest',
+        );
+      }
+    }
     onPhase?.('prepare:partition', 'end');
 
     onPhase?.('prepare:manifest', 'start');
@@ -3293,7 +3542,7 @@ export class DKGPublisher implements Publisher {
     const entityPrivateMap = new Map<string, Quad[]>();
 
     let tokenCounter = 1n;
-    for (const [rootEntity, publicQuads] of kaMap) {
+    for (const [rootEntity] of contentRootMap) {
       const entityPrivateQuads = privateQuads.filter(
         (q) => q.subject === rootEntity || q.subject.startsWith(rootEntity + '/.well-known/genid/'),
       );
@@ -3380,11 +3629,11 @@ export class DKGPublisher implements Publisher {
       // payload. Purging the union (and not just the new roots) is what
       // closes the leak described above.
       const rootsToPurge = new Set<string>(priorRootEntities);
-      for (const [rootEntity] of kaMap) rootsToPurge.add(rootEntity);
+      for (const [rootEntity] of contentRootMap) rootsToPurge.add(rootEntity);
       for (const rootEntity of rootsToPurge) {
         await this.privateStore.deletePrivateTriples(contextGraphId, rootEntity, options.subGraphName);
       }
-      for (const [rootEntity] of kaMap) {
+      for (const [rootEntity] of contentRootMap) {
         const entityPrivateQuads = entityPrivateMap.get(rootEntity) ?? [];
         if (entityPrivateQuads.length > 0) {
           await this.privateStore.storePrivateTriples(contextGraphId, rootEntity, entityPrivateQuads, options.subGraphName);
@@ -3431,7 +3680,7 @@ export class DKGPublisher implements Publisher {
         metaGraph: labelMeta,
         ual: ualForRestate,
         merkleRoot: kcMerkleRoot,
-        payloadByRoot: kaMap,
+        payloadByRoot: contentRootMap,
         privateRootByRoot: updatePrivateRootByRoot,
         version,
       });
@@ -3930,7 +4179,7 @@ export class DKGPublisher implements Publisher {
           ual,
           kaId,
           merkleRoot: kcMerkleRoot,
-          payloadByRoot: kaMap,
+          payloadByRoot: contentRootMap,
           privateRootByRoot,
           version: updateVersion,
         });
@@ -5314,6 +5563,8 @@ export class DKGPublisher implements Publisher {
       subGraphName?: string;
       publisherPeerId?: string;
       senderAgentAddress?: string;
+      trustedNonManifestCatalogTriples?: PublishOptions['trustedNonManifestCatalogTriples'];
+      onChainContextGraphId?: string | bigint;
       /**
        * Strict curator-ack gate (OT-RFC-49 curator-leader), same contract as
        * `ShareOptions.confirmBeforeCommit`: called after the gossip message is
@@ -5443,6 +5694,24 @@ export class DKGPublisher implements Publisher {
     quadsToPromote = quadsToPromote.filter(
       (q) => !isReservedSubject(q.subject) && !isTrustLevelQuad(q),
     );
+
+    await this.assertTrustedCatalogTriplesAllowed({
+      contextGraphId,
+      trustedNonManifestCatalogTriples: opts?.trustedNonManifestCatalogTriples,
+      onChainContextGraphId: opts?.onChainContextGraphId,
+      allowLocalPrivateContextGraph: true,
+    });
+    const trustedGeneratedCatalogTriples = trustedCatalogTripleKeySet(
+      opts?.trustedNonManifestCatalogTriples,
+    );
+    const trustedGeneratedCatalogQuads = trustedGeneratedCatalogTriples.size > 0
+      ? quadsToPromote.filter((q) => trustedGeneratedCatalogTriples.has(catalogTripleKey(q)))
+      : [];
+    if (trustedGeneratedCatalogQuads.length > 0) {
+      quadsToPromote = quadsToPromote.filter(
+        (q) => !trustedGeneratedCatalogTriples.has(catalogTripleKey(q)),
+      );
+    }
 
     if (opts?.entities && opts.entities !== 'all') {
       const entitySet = new Set(opts.entities);
@@ -5636,7 +5905,9 @@ export class DKGPublisher implements Publisher {
     const effectivePromoteQuads = skippedRoots.size > 0
       ? quadsToPromote.filter(q => !skippedRoots.has(q.subject) && !skippedRoots.has(q.subject.split('/.well-known/genid/')[0]))
       : quadsToPromote;
-    await this.store.delete(effectivePromoteQuads.map((q) => ({ ...q, graph: graphUri })));
+    await this.store.delete(
+      [...effectivePromoteQuads, ...trustedGeneratedCatalogQuads].map((q) => ({ ...q, graph: graphUri })),
+    );
 
     // Update the assertion's memory layer from WM → SWM in _meta
     const assertionMetaGraph = contextGraphMetaUri(contextGraphId);

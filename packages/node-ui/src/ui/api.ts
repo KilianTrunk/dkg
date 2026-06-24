@@ -1358,7 +1358,8 @@ export type PromoteOutcome =
   | { kind: 'success'; promotedCount: number; message: string }
   | { kind: 'noop'; message: string }
   | { kind: 'not-persisted'; message: string; expectedTripleCount?: number }
-  | { kind: 'payload-too-large'; message: string; actualBytes?: number; limitBytes?: number };
+  | { kind: 'payload-too-large'; message: string; actualBytes?: number; limitBytes?: number }
+  | { kind: 'insufficient-funds'; message: string };
 
 export function describePromoteResult(
   assertionName: string,
@@ -1413,7 +1414,35 @@ export function describePromoteError(
       };
     }
   }
+  // Funded-wallet selection found no operational wallet holding the gas + TRAC
+  // a publish to Verifiable Memory needs. The daemon returns a 400 with
+  // `code: 'NO_FUNDED_PUBLISHER_WALLET'` and an actionable message listing
+  // per-wallet balances. Some re-wrapped error paths drop the structured code
+  // but preserve the message, so match either the code or the message marker.
+  const fundsMessage = describeInsufficientPublisherFunds(err);
+  if (fundsMessage) {
+    return { kind: 'insufficient-funds', message: fundsMessage };
+  }
   return null;
+}
+
+/**
+ * Extract the actionable "no operational wallet has funds" message from a
+ * publish error (code-first, message fallback), or null when `err` is not a
+ * funds error. Exported so publish CTAs that don't route through
+ * `describePromoteError` can surface the same message.
+ */
+export function describeInsufficientPublisherFunds(err: unknown): string | null {
+  const MARKER = /No operational wallet has enough funds/i;
+  if (err instanceof HttpError) {
+    const body = err.body as { code?: string; error?: string } | undefined;
+    if (body?.code === 'NO_FUNDED_PUBLISHER_WALLET') {
+      return body.error ?? err.message;
+    }
+    if (typeof body?.error === 'string' && MARKER.test(body.error)) return body.error;
+  }
+  const msg = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
+  return MARKER.test(msg) ? msg : null;
 }
 
 // --- File preview ---

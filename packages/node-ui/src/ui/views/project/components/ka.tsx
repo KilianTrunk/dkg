@@ -171,10 +171,11 @@ export function VerifyOnDkgButton({
       }
       onVerified();
     } catch (err: any) {
-      // Issue #864 — `ASSERTION_NOT_PERSISTED` (HTTP 409) gets a
-      // typed message that points the user at the re-import path
-      // instead of the raw backend error string.
-      const typed = action.kind === 'promote' ? describePromoteError(assertionName, err) : null;
+      // Issue #864 — `ASSERTION_NOT_PERSISTED` (HTTP 409, promote) gets a typed
+      // message that points the user at the re-import path. Publish errors flow
+      // through the same helper so a NO_FUNDED_PUBLISHER_WALLET failure renders
+      // the actionable "fund a wallet" message instead of a raw backend string.
+      const typed = describePromoteError(assertionName, err);
       setError(typed ? typed.message : (err?.message ?? 'Action failed'));
     } finally {
       setBusy(false);

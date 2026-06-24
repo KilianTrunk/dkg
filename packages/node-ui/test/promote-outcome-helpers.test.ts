@@ -2,8 +2,14 @@ import { describe, expect, it } from 'vitest';
 import {
   describePromoteResult,
   describePromoteError,
+  describeInsufficientPublisherFunds,
   HttpError,
 } from '../src/ui/api.js';
+
+const FUNDS_MSG =
+  'No operational wallet has enough funds to publish to Verifiable Memory — each publish needs native gas AND TRAC on the same wallet. ' +
+  'Operational wallet balances:\n  0xAAA: 0.0 TRAC, 0.0 gas\n  0xBBB: 0.0 TRAC, 0.0 gas\n' +
+  'Fund one of these wallets (run `dkg wallets` to list addresses) and retry the publish.';
 
 /**
  * Codex review on #874 / #898 round 2 — pin the contract that the
@@ -103,5 +109,48 @@ describe('describePromoteError', () => {
   it('returns null for non-HttpError throwables (network errors, generic Error)', () => {
     expect(describePromoteError('x', new Error('network'))).toBeNull();
     expect(describePromoteError('x', 'string error' as unknown)).toBeNull();
+  });
+
+  it('returns kind="insufficient-funds" for a 400 with code NO_FUNDED_PUBLISHER_WALLET (funded-wallet selection)', () => {
+    const err = new HttpError(400, FUNDS_MSG, { code: 'NO_FUNDED_PUBLISHER_WALLET', error: FUNDS_MSG });
+    const out = describePromoteError('skills-catalog', err);
+    expect(out).not.toBeNull();
+    if (!out || out.kind !== 'insufficient-funds') throw new Error('expected insufficient-funds outcome');
+    expect(out.message).toContain('No operational wallet has enough funds');
+    expect(out.message).toContain('0xAAA');
+  });
+
+  it('returns kind="insufficient-funds" when the structured code is missing but the message marker survives (re-wrapped error path)', () => {
+    const err = new HttpError(500, FUNDS_MSG, { error: FUNDS_MSG });
+    const out = describePromoteError('skills-catalog', err);
+    expect(out?.kind).toBe('insufficient-funds');
+  });
+
+  it('returns kind="insufficient-funds" for a plain Error carrying the marker message', () => {
+    const out = describePromoteError('skills-catalog', new Error(FUNDS_MSG));
+    expect(out?.kind).toBe('insufficient-funds');
+  });
+});
+
+describe('describeInsufficientPublisherFunds', () => {
+  it('extracts the message from a 400 with the structured funds code', () => {
+    const err = new HttpError(400, FUNDS_MSG, { code: 'NO_FUNDED_PUBLISHER_WALLET', error: FUNDS_MSG });
+    expect(describeInsufficientPublisherFunds(err)).toContain('No operational wallet has enough funds');
+  });
+
+  it('matches the message marker when the code is absent', () => {
+    const err = new HttpError(500, FUNDS_MSG, { error: FUNDS_MSG });
+    expect(describeInsufficientPublisherFunds(err)).toBe(FUNDS_MSG);
+  });
+
+  it('matches a plain Error / string carrying the marker', () => {
+    expect(describeInsufficientPublisherFunds(new Error(FUNDS_MSG))).toBe(FUNDS_MSG);
+    expect(describeInsufficientPublisherFunds(FUNDS_MSG)).toBe(FUNDS_MSG);
+  });
+
+  it('returns null for unrelated errors', () => {
+    expect(describeInsufficientPublisherFunds(new Error('insufficient funds for gas'))).toBeNull();
+    expect(describeInsufficientPublisherFunds(new HttpError(500, 'Internal'))).toBeNull();
+    expect(describeInsufficientPublisherFunds(undefined)).toBeNull();
   });
 });

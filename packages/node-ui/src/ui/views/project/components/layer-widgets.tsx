@@ -1,6 +1,6 @@
 import React, { useMemo, useState, useCallback, useEffect } from 'react';
 import type { ReactNode } from 'react';
-import { listAssertions, promoteAssertion, describePromoteError, ensureContextGraphOnChain, knowledgeAssetFinalize, knowledgeAssetPublish } from '../../../api.js';
+import { listAssertions, promoteAssertion, describePromoteError, describeInsufficientPublisherFunds, ensureContextGraphOnChain, knowledgeAssetFinalize, knowledgeAssetPublish } from '../../../api.js';
 import type { MemoryEntity } from '../../../hooks/useMemoryEntities.js';
 import { useProjectProfileContext } from '../../../hooks/useProjectProfile.js';
 import { LAYER_CONFIG, entityMeta, layerNoun } from '../helpers.js';
@@ -174,6 +174,7 @@ export function LayerActionsWidget({ layer, count, contextGraphId, onComplete, o
         const assertions = await listAssertions(contextGraphId, 'swm');
         let published = 0;
         let lastErr: string | null = null;
+        let fundsErr: string | null = null;
         for (const a of assertions) {
           currentAssertion = a.name;
           try {
@@ -181,15 +182,20 @@ export function LayerActionsWidget({ layer, count, contextGraphId, onComplete, o
             published += 1;
           } catch (e: any) {
             lastErr = e?.message ?? 'publish failed';
+            fundsErr = fundsErr ?? describeInsufficientPublisherFunds(e);
           }
         }
         if (published > 0) {
-          const tail = lastErr ? ' (some assertions could not be published)' : '';
+          // Surface a funds failure explicitly even on partial success so the
+          // user knows to fund a wallet, not just that "some could not be published".
+          const tail = fundsErr
+            ? ' — some failed: no operational wallet has enough funds (native gas + TRAC). Fund a wallet and retry.'
+            : (lastErr ? ' (some assertions could not be published)' : '');
           setResult(`Published ${published} knowledge asset${published !== 1 ? 's' : ''} to Verifiable Memory${tail}`);
         } else if (assertions.length === 0) {
           setResult('Nothing to publish — promote assertions to Shared Memory first.');
         } else {
-          throw new Error(lastErr ?? 'Publish failed');
+          throw new Error(fundsErr ?? lastErr ?? 'Publish failed');
         }
       }
       onComplete?.();

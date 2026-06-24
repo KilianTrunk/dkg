@@ -12,6 +12,7 @@ import {
   effectivePublishAllowance,
   enrichEvmError,
   EVMChainAdapter,
+  InsufficientPublisherFundsError,
   isTooLowAllowanceError,
   resolveRpcUrls,
   V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE,
@@ -2457,14 +2458,34 @@ describe('createKnowledgeAssets / updateKnowledgeCollectionV10 — approval sign
     return new Map<string, bigint>();
   }
 
-  function makeMultiWalletV10Adapter(allowanceByOwner: Map<string, bigint>) {
+  const ABUNDANT_WEI = 10n ** 18n;
+
+  // Hardhat account #3 — a third distinct operational key for pool-rotation tests.
+  const THIRD_PK = '0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6';
+
+  function makeMultiWalletV10Adapter(
+    allowanceByOwner: Map<string, bigint>,
+    funding?: { native?: Map<string, bigint>; trac?: Map<string, bigint> },
+    extraOperationalKeys: string[] = [],
+  ) {
     const a = new EVMChainAdapter(minimalConfig({
       privateKey: DEPLOYER_PK,
-      additionalKeys: [OTHER_PK],
+      additionalKeys: [OTHER_PK, ...extraOperationalKeys],
     }));
-    const [walletA, walletB] = (a as any).signerPool as [ethers.Wallet, ethers.Wallet];
+    const signerPool = (a as any).signerPool as ethers.Wallet[];
+    const [walletA, walletB] = signerPool;
 
     (a as any).initialized = true;
+
+    // Funding-aware selection reads native (provider.getBalance) + TRAC
+    // (token.balanceOf) for each candidate. Stub both deterministically —
+    // default ABUNDANT so funding-aware selection is a no-op (round-robin)
+    // unless a test sets specific per-wallet balances. Without these stubs the
+    // adapter would hit the dead test RPC (slow) and rely on fail-open.
+    const nativeByAddr = funding?.native ?? new Map<string, bigint>();
+    const tracByAddr = funding?.trac ?? new Map<string, bigint>();
+    (a as any).provider.getBalance = recorder(async (addr: string) =>
+      nativeByAddr.get(String(addr).toLowerCase()) ?? ABUNDANT_WEI);
 
     const tokenWithSigner = {
       allowance: recorder(async (owner: string, _spender: string) => {
@@ -2474,6 +2495,9 @@ describe('createKnowledgeAssets / updateKnowledgeCollectionV10 — approval sign
     };
     (a as any).contracts.token = {
       connect: recorder(() => tokenWithSigner),
+      // Read path (`readTracBalance`) calls this.contracts.token.balanceOf.
+      balanceOf: recorder(async (addr: string) =>
+        tracByAddr.get(String(addr).toLowerCase()) ?? ABUNDANT_WEI),
     };
 
     const populateSpy = recorder(async () => ({
@@ -2505,7 +2529,7 @@ describe('createKnowledgeAssets / updateKnowledgeCollectionV10 — approval sign
     });
     (a as any).signPopulatedTransaction = signSpy;
 
-    return { a, walletA, walletB, tokenWithSigner, sendSpy, signSpy, populateSpy };
+    return { a, walletA, walletB, wallets: signerPool, tokenWithSigner, sendSpy, signSpy, populateSpy, nativeByAddr, tracByAddr };
   }
 
   function makeV10PublishParams(publisherAddress?: string): any {
@@ -2687,6 +2711,184 @@ describe('createKnowledgeAssets / updateKnowledgeCollectionV10 — approval sign
     expect(signSpy.calls).toHaveLength(1);
     expect(signSpy.calls[0][0]).toBe(walletB);
   });
+
+// -----------------------------------------------------------------------------
+// Funding-aware publish wallet selection. `nextAuthorizedSigner` must PREFER an
+// authorized wallet that holds native gas AND TRAC, so a publish is never
+// routed to an authorized-but-empty wallet (the unfunded-wallet publish
+// failure). Selection only PREFERS — when none is fundable it falls back to the
+// best-funded wallet, and the publish then surfaces an actionable
+// InsufficientPublisherFundsError instead of a raw "insufficient funds" string.
+// -----------------------------------------------------------------------------
+describe('createKnowledgeAssets — funding-aware wallet selection', () => {
+  const CG = 7n;
+  const lc = (addr: string) => addr.toLowerCase();
+  const ONE = 10n ** 18n;
+
+  it('prefers a funded authorized wallet over an unfunded one (skips the empty round-robin head)', async () => {
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    // walletA (round-robin head) has gas but ZERO TRAC; walletB is funded.
+    nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);
+    tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), ONE);
+    const chosen = await (a as any).nextAuthorizedSigner(CG);
+    expect(chosen.address).toBe(walletB.address);
+  });
+
+  it('rotates among multiple funded wallets (preserves cross-wallet nonce concurrency)', async () => {
+    const { a, walletA, walletB } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    // Both abundantly funded (helper default) → behaves like plain round-robin.
+    const first = await (a as any).nextAuthorizedSigner(CG);
+    const second = await (a as any).nextAuthorizedSigner(CG);
+    expect(first.address).toBe(walletA.address);
+    expect(second.address).toBe(walletB.address);
+    expect(first.address).not.toBe(second.address);
+  });
+
+  it('falls back to the best-funded authorized wallet when none is fundable', async () => {
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    // Neither fundable (both have 0 gas); walletB holds more TRAC → best-funded.
+    nativeByAddr.set(lc(walletA.address), 0n); nativeByAddr.set(lc(walletB.address), 0n);
+    tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), 5n);
+    const chosen = await (a as any).nextAuthorizedSigner(CG);
+    expect(chosen.address).toBe(walletB.address);
+  });
+
+  it('fails open: a balance-read error never blocks selection (returns the round-robin head)', async () => {
+    const { a, walletA } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    (a as any).provider.getBalance = recorder(async () => { throw new Error('rpc down'); });
+    const chosen = await (a as any).nextAuthorizedSigner(CG);
+    expect(chosen.address).toBe(walletA.address);
+  });
+
+  it('no token contract: only native gas gates selection', async () => {
+    const { a, walletA, walletB, nativeByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    nativeByAddr.set(lc(walletA.address), 0n); nativeByAddr.set(lc(walletB.address), ONE);
+    (a as any).contracts.token = undefined; // read-only / no-token adapter
+    const chosen = await (a as any).nextAuthorizedSigner(CG);
+    // walletA has 0 gas → skipped; walletB has gas → chosen (TRAC not gating).
+    expect(chosen.address).toBe(walletB.address);
+  });
+
+  it('still throws "no authorized publisher" when no wallet is authorized (unchanged)', async () => {
+    const { a } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    (a as any).contracts.contextGraphs = { isAuthorizedPublisher: recorder(async () => false) };
+    await expect((a as any).nextAuthorizedSigner(CG)).rejects.toThrow(/No authorized publisher wallet/);
+  });
+
+  it('wraps an insufficient-funds publish failure into an actionable InsufficientPublisherFundsError listing per-wallet balances', async () => {
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    nativeByAddr.set(lc(walletA.address), 0n); nativeByAddr.set(lc(walletB.address), 0n);
+    tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), 0n);
+    // The signing step throws an ethers-style INSUFFICIENT_FUNDS error.
+    (a as any).signPopulatedTransaction = recorder(async () => {
+      const e: any = new Error('insufficient funds for gas * price + value');
+      e.code = 'INSUFFICIENT_FUNDS';
+      throw e;
+    });
+
+    let caught: any;
+    try {
+      await a.createKnowledgeAssets(makeV10PublishParams());
+    } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(InsufficientPublisherFundsError);
+    expect(caught.code).toBe('NO_FUNDED_PUBLISHER_WALLET');
+    expect(caught.message).toContain(walletA.address);
+    expect(caught.message).toContain(walletB.address);
+    expect(caught.message).toMatch(/Fund one of these wallets/i);
+    expect(caught.cause).toBeDefined(); // original error preserved
+  });
+
+  it('kill-switch DKG_DISABLE_FUNDED_WALLET_SELECTION reverts to balance-blind round-robin', async () => {
+    const prev = process.env.DKG_DISABLE_FUNDED_WALLET_SELECTION;
+    process.env.DKG_DISABLE_FUNDED_WALLET_SELECTION = '1';
+    try {
+      // Kill-switch is read in the constructor, so it must be set BEFORE the
+      // adapter is built (inside the helper).
+      const { a, walletA, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+      nativeByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletA.address), 0n);
+      const chosen = await (a as any).nextAuthorizedSigner(CG);
+      expect(chosen.address).toBe(walletA.address); // round-robin head, balance-blind
+      expect((a as any).provider.getBalance.calls.length).toBe(0); // no balance reads
+    } finally {
+      if (prev === undefined) delete process.env.DKG_DISABLE_FUNDED_WALLET_SELECTION;
+      else process.env.DKG_DISABLE_FUNDED_WALLET_SELECTION = prev;
+    }
+  });
+
+  it('no-contextGraphs adapter: funding-aware selection over the whole pool', async () => {
+    const { a, walletA, walletB, nativeByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    (a as any).contracts.contextGraphs = undefined; // no on-chain publish-authority surface
+    nativeByAddr.set(lc(walletA.address), 0n); nativeByAddr.set(lc(walletB.address), ONE);
+    const chosen = await (a as any).nextAuthorizedSigner(CG);
+    expect(chosen.address).toBe(walletB.address); // skips the unfunded round-robin head
+  });
+
+  it('caches funding within the TTL (one balance read per wallet across selections; forceRefresh bypasses)', async () => {
+    const { a } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    await (a as any).nextAuthorizedSigner(CG);
+    const afterFirst = (a as any).provider.getBalance.calls.length;
+    expect(afterFirst).toBeGreaterThan(0);
+    await (a as any).nextAuthorizedSigner(CG);
+    expect((a as any).provider.getBalance.calls.length).toBe(afterFirst); // cache hit, no new reads
+    await (a as any).getWalletFunding((a as any).signer.address, { forceRefresh: true });
+    expect((a as any).provider.getBalance.calls.length).toBeGreaterThan(afterFirst); // forceRefresh re-reads
+  });
+
+  it('rotates among the FUNDED subset when a middle wallet is unfunded (preserves #953 concurrency)', async () => {
+    const { a, wallets, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner(), undefined, [THIRD_PK]);
+    expect(wallets.length).toBe(3);
+    const [w0, w1, w2] = wallets;
+    nativeByAddr.set(lc(w1.address), 0n); tracByAddr.set(lc(w1.address), 0n); // middle wallet unfunded
+    const first = await (a as any).nextAuthorizedSigner(CG);
+    const second = await (a as any).nextAuthorizedSigner(CG);
+    const picked = [first.address, second.address];
+    expect(picked).not.toContain(w1.address);       // never the unfunded one
+    expect(new Set(picked).size).toBe(2);            // distinct → cross-wallet concurrency preserved
+    expect(picked.slice().sort()).toEqual([w0.address, w2.address].slice().sort());
+  });
+
+  it('does NOT wrap a non-funds contract revert on a funded wallet (no masking)', async () => {
+    const { a } = makeMultiWalletV10Adapter(makeAllowanceByOwner()); // both abundantly funded
+    (a as any).signPopulatedTransaction = recorder(async () => {
+      const e: any = new Error('execution reverted: InvalidAuthorAttestation');
+      e.code = 'CALL_EXCEPTION';
+      throw e;
+    });
+    let caught: any;
+    try { await a.createKnowledgeAssets(makeV10PublishParams()); } catch (e) { caught = e; }
+    expect(caught).not.toBeInstanceOf(InsufficientPublisherFundsError);
+    expect(caught.message).toContain('InvalidAuthorAttestation');
+  });
+
+  it('does NOT wrap a non-revert error (nonce) even on a zero-TRAC wallet', async () => {
+    const { a, walletA, walletB, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), 0n);
+    (a as any).signPopulatedTransaction = recorder(async () => {
+      const e: any = new Error('nonce has already been used');
+      e.code = 'NONCE_EXPIRED';
+      throw e;
+    });
+    let caught: any;
+    try { await a.createKnowledgeAssets(makeV10PublishParams()); } catch (e) { caught = e; }
+    expect(caught).not.toBeInstanceOf(InsufficientPublisherFundsError);
+    expect(caught.code).toBe('NONCE_EXPIRED');
+  });
+
+  it('wraps a TRAC transferFrom revert on a zero-TRAC wallet that holds gas', async () => {
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);
+    tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), 0n);
+    (a as any).signPopulatedTransaction = recorder(async () => {
+      const e: any = new Error('execution reverted: ERC20: transfer amount exceeds balance');
+      e.code = 'CALL_EXCEPTION';
+      throw e;
+    });
+    let caught: any;
+    try { await a.createKnowledgeAssets(makeV10PublishParams()); } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(InsufficientPublisherFundsError);
+    expect(caught.code).toBe('NO_FUNDED_PUBLISHER_WALLET');
+  });
+});
 });
 
 // -----------------------------------------------------------------------------

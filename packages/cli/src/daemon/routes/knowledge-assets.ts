@@ -1259,10 +1259,19 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
           try {
             await agent.ensureRegisteredForPublish(contextGraphId, { callerAgentAddress: requestAgentAddress });
           } catch (regErr: any) {
+            const regMsg = regErr?.message ?? String(regErr);
+            // On-chain CG registration is signed by the PRIMARY operational
+            // wallet (not the funded-wallet-selected publish wallet), so a
+            // funds failure here means the primary wallet specifically needs
+            // funding — make that actionable.
+            const fundsHint = /insufficient funds|NO_FUNDED_PUBLISHER_WALLET/i.test(regMsg)
+              ? " On-chain registration is signed by the PRIMARY operational wallet — fund it (native gas + TRAC) and retry."
+              : "";
             return jsonResponse(res, 400, {
+              ...(regErr?.code ? { code: regErr.code } : {}),
               error:
                 `Context graph "${contextGraphId}" could not be auto-registered on-chain before publish: ` +
-                `${regErr?.message ?? String(regErr)}`,
+                `${regMsg.replace(/\.\s*$/, "")}.${fundsHint}`,
             });
           }
           pub = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts });
@@ -1306,6 +1315,14 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         // caller precondition; map it to the same 409 (code-first).
         if (e?.code === "PUBLISH_NOT_FULL_SHARE" || /is not finalized/.test(msg) || /No quads in shared memory/.test(msg) || /has no private payload/.test(msg)) {
           return jsonResponse(res, 409, { code: e?.code === "PUBLISH_NOT_FULL_SHARE" ? "PUBLISH_NOT_FULL_SHARE" : "VM_PUBLISH_PRECONDITION", error: msg });
+        }
+        // Funded-wallet selection found no operational wallet holding the
+        // gas + TRAC a publish needs. This is a user-actionable funding
+        // condition (4xx), not a server/on-chain bug — surface the structured
+        // code (code-first; message carries the per-wallet balances either way)
+        // so node-ui can render a friendly "fund a wallet and retry" message.
+        if (e?.code === "NO_FUNDED_PUBLISHER_WALLET" || /No operational wallet has enough funds/i.test(msg)) {
+          return jsonResponse(res, 400, { code: "NO_FUNDED_PUBLISHER_WALLET", error: msg });
         }
         return jsonResponse(res, 500, { error: msg });
       }

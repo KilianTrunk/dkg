@@ -329,8 +329,8 @@ function parsePrecomputedUpdateAttestation(
   raw: unknown,
   res: ServerResponse,
 ): PublishOptions['precomputedUpdateAttestation'] | undefined {
-  if (raw == null) return undefined;
-  if (typeof raw !== 'object') {
+  if (raw === undefined) return undefined;
+  if (raw === null || typeof raw !== 'object') {
     jsonResponse(res, 400, {
       error: '"precomputedUpdateAttestation" must be an object',
     });

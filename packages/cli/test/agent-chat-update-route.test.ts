@@ -44,6 +44,32 @@ const QUADS = [{ subject: 'urn:root', predicate: 'http://schema.org/name', objec
 // A syntactically-valid 32-byte hex used to build a structurally-valid seal.
 const HEX32 = '0x' + '11'.repeat(32);
 
+async function postJsonAsAgent(daemon: LiveDaemon, authToken: string, path: string, body: unknown) {
+  const res = await fetch(`${daemon.base}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
+    body: JSON.stringify(body),
+  });
+  return { status: res.status, body: (await res.json().catch(() => ({}))) as Record<string, any> };
+}
+
+async function registerAgentClient(daemon: LiveDaemon, label: string) {
+  const registered = await postJson(daemon, '/api/agent/register', {
+    name: `${label}-${Date.now().toString(36)}`,
+    framework: 'test',
+  });
+  expect(registered.status, `${label} register: ${JSON.stringify(registered.body)}`).toBeLessThan(300);
+  const agentAddress = String(registered.body.agentAddress);
+  const authToken = String(registered.body.authToken);
+  expect(agentAddress).toMatch(/^0x[0-9a-fA-F]{40}$/);
+  expect(authToken.length).toBeGreaterThan(0);
+  return {
+    agentAddress,
+    authToken,
+    post: (path: string, body: unknown) => postJsonAsAgent(daemon, authToken, path, body),
+  };
+}
+
 describe('POST /api/update — kaId + attestation contract (KC→KA), real daemon', () => {
   let daemon: LiveDaemon;
   const CG = 'update-contract-cg';
@@ -102,6 +128,28 @@ describe('POST /api/update — kaId + attestation contract (KC→KA), real daemo
     });
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/precomputedUpdateAttestation.*requires/);
+  });
+
+  it('rejects an agent token with another agent update attestation before update', async () => {
+    const agentA = await registerAgentClient(daemon, 'update-author-a');
+    const agentB = await registerAgentClient(daemon, 'update-author-b');
+    const seal = {
+      authorAddress: agentB.agentAddress,
+      expectedNewMerkleRoot: HEX32,
+      signature: { r: HEX32, vs: HEX32 },
+    };
+
+    const res = await agentA.post('/api/update', {
+      kaId: '7',
+      contextGraphId: CG,
+      quads: QUADS,
+      precomputedUpdateAttestation: seal,
+    });
+
+    expect(res.status).toBe(403);
+    expect(String(res.body.error)).toContain(agentA.agentAddress);
+    expect(String(res.body.error)).toContain(agentB.agentAddress);
+    expect(String(res.body.error)).toContain('precomputedUpdateAttestation.authorAddress');
   });
 
   it('maps a missing precomputedUpdateAttestation precondition to 422, not 500', async () => {

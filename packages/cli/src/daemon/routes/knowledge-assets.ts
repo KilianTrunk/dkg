@@ -37,6 +37,7 @@ import {
   parsePublishRequestBody,
   isWritableQuad,
   validateQuadObjectTerms,
+  respondIfReconcileUnavailable,
   normalizeContextGraphIdOrUri,
   resolveRequiredWriteContextGraphId,
 } from "../http-utils.js";
@@ -157,23 +158,10 @@ function respondAssertionError(res: RequestContext["res"], e: any): void {
     });
     return;
   }
-  const msg = e?.message ?? String(e);
   // KA-number-floor reconcile couldn't reach the chain (e.g. a rate-limited RPC
-  // returned 429 on the one-time-per-author read). This is a transient
-  // dependency failure, not a client error — surface a retryable 503 instead of
-  // a blanket 500 so the caller knows to retry. Match by code OR message so it
-  // works even if the error was re-wrapped on the way up.
-  if (
-    e?.code === "KA_FLOOR_RECONCILE_UNAVAILABLE" ||
-    /failed to reconcile KA-number floor/i.test(msg)
-  ) {
-    jsonResponse(res, 503, {
-      error: msg,
-      code: "KA_FLOOR_RECONCILE_UNAVAILABLE",
-      retryable: e?.retryable !== false,
-    });
-    return;
-  }
+  // 429'd the one-time-per-author read) -> retryable 503, not 500.
+  if (respondIfReconcileUnavailable(res, e)) return;
+  const msg = e?.message ?? String(e);
   if (
     e?.name === "ReservedNamespaceError" ||
     msg.includes("not found") ||
@@ -667,6 +655,8 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       if (isPayloadTooLargeError(e)) {
         return jsonResponse(res, 413, payloadTooLargeResponseBody(e));
       }
+      // Transient KA-number-floor reconcile failure (rate-limited RPC) -> 503.
+      if (respondIfReconcileUnavailable(res, e)) return;
       return jsonResponse(res, 500, { error: e?.message ?? String(e) });
     }
   }
@@ -868,6 +858,8 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       if (errors.length > 0) return jsonResponse(res, 207, { created: true, ...result, errors });
       return jsonResponse(res, 201, result);
     } catch (e: any) {
+      // Transient KA-number-floor reconcile failure (rate-limited RPC) -> 503.
+      if (respondIfReconcileUnavailable(res, e)) return;
       return jsonResponse(res, 500, { error: e?.message ?? String(e) });
     }
   }

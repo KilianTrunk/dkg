@@ -380,7 +380,7 @@ import {
   isLocalOxigraphConfig,
   sliceIntoCiphertextChunks,
 } from './dkg-agent-helpers.js';
-import { reconcileAndAllocateKaNumber } from './allocator.js';
+import { reconcileAndAllocateKaNumber, readMaxKaNumberWithRetry } from './allocator.js';
 import {
   swmSenderStateKey,
   swmReceiverStateKey,
@@ -2346,7 +2346,9 @@ export class PublishMethods extends DKGAgentBase {
         let chainMax = -1n;
         if (typeof this.chain.getMaxKaNumberForAuthor === 'function') {
           try {
-            chainMax = await this.chain.getMaxKaNumberForAuthor(authorAddress);
+            // Retry transient RPC failures (429/timeout/5xx) on the floor read
+            // so a rate-limited public RPC doesn't hard-fail finalize.
+            chainMax = await readMaxKaNumberWithRetry(this.chain.getMaxKaNumberForAuthor.bind(this.chain), authorAddress);
           } catch (err) {
             // #1116 (round 11) — CAPABILITY GAP (the chain read to reconcile the
             // KA-number floor failed — a transient/RPC capability problem, not bad input).
@@ -2678,7 +2680,8 @@ export class PublishMethods extends DKGAgentBase {
         let selChainMax = -1n;
         if (typeof this.chain.getMaxKaNumberForAuthor === 'function') {
           try {
-            selChainMax = await this.chain.getMaxKaNumberForAuthor(authorAddress);
+            // Retry transient RPC failures (429/timeout/5xx) on the floor read.
+            selChainMax = await readMaxKaNumberWithRetry(this.chain.getMaxKaNumberForAuthor.bind(this.chain), authorAddress);
           } catch (err) {
             throw new Error(
               `OT-RFC-43 §F2: failed to reconcile KA-number floor for author ${authorAddress} (selection publish): ` +

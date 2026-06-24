@@ -143,6 +143,34 @@ export function validateQuadObjectTerms(
   return `Invalid "${label}[${badIndex}].object": RDF object must be a quoted literal term or absolute IRI`;
 }
 
+/**
+ * KA-number-floor reconcile resilience (follow-up to the "KA create 500-on-429"
+ * fix). If `e` is the transient reconcile failure — the chain RPC couldn't serve
+ * the one-time-per-author floor read (e.g. a 429 after the bounded retry in
+ * `allocator.ts` is exhausted) — send a retryable **503** and return true;
+ * otherwise return false so the caller falls through to its normal mapping.
+ * Matched by `code` OR message so it works for both the typed
+ * `KaFloorReconcileError` and the `…at finalize` direct-call wrap, even if
+ * re-wrapped on the way up. Used by every route that can trigger the reconcile
+ * (named create, one-shot publish, shared-memory publish, and the WM-verb routes
+ * via `respondAssertionError`) so they answer consistently instead of 500.
+ */
+export function respondIfReconcileUnavailable(res: ServerResponse, e: any): boolean {
+  const msg = e?.message ?? String(e);
+  if (
+    e?.code === "KA_FLOOR_RECONCILE_UNAVAILABLE" ||
+    /failed to reconcile KA-number floor/i.test(msg)
+  ) {
+    jsonResponse(res, 503, {
+      error: msg,
+      code: "KA_FLOOR_RECONCILE_UNAVAILABLE",
+      retryable: e?.retryable !== false,
+    });
+    return true;
+  }
+  return false;
+}
+
 export function parsePublishRequestBody(
   body: string,
 ): { ok: true; value: PublishRequestBody } | { ok: false; error: string } {

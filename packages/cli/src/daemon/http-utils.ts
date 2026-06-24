@@ -120,9 +120,20 @@ export function isWritableQuad(value: unknown): boolean {
   );
 }
 
-function validatePublishQuadObjectTerms(
+/**
+ * GH #306 / #787 (follow-up) — validate each quad's `object` term is either a
+ * quoted RDF literal (`"…"`) or an absolute IRI. Shared by the publish path AND
+ * the write routes (wm/write, shared-memory/write, conditional-write): the shape
+ * guards ({@link isPublishQuad} / {@link isWritableQuad}) only check the fields
+ * are strings, so an object that is neither a literal nor an IRI (e.g. a bare
+ * word `hello` or a number `123`) slips past them and crashes the RDF parser
+ * with an uncaught "No scheme found in an absolute IRI" → HTTP 500 instead of an
+ * actionable 400. Operates on any `{ object: string }` (PublishQuad or writable
+ * quad alike).
+ */
+export function validateQuadObjectTerms(
   label: string,
-  quads: PublishQuad[],
+  quads: ReadonlyArray<{ object: string }>,
 ): string | null {
   const badIndex = quads.findIndex((q) => {
     const object = q.object.trim();
@@ -168,7 +179,7 @@ export function parsePublishRequestBody(
       error: 'Missing or invalid "quads" (must be a non-empty quad array)',
     };
   }
-  const quadObjectError = validatePublishQuadObjectTerms("quads", quads);
+  const quadObjectError = validateQuadObjectTerms("quads", quads);
   if (quadObjectError) return { ok: false, error: quadObjectError };
 
   if (
@@ -181,7 +192,7 @@ export function parsePublishRequestBody(
     };
   }
   if (privateQuads !== undefined) {
-    const privateQuadObjectError = validatePublishQuadObjectTerms("privateQuads", privateQuads);
+    const privateQuadObjectError = validateQuadObjectTerms("privateQuads", privateQuads);
     if (privateQuadObjectError) return { ok: false, error: privateQuadObjectError };
   }
 

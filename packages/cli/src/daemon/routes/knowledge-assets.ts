@@ -36,6 +36,7 @@ import {
   validateRequiredContextGraphId,
   parsePublishRequestBody,
   isWritableQuad,
+  validateQuadObjectTerms,
   normalizeContextGraphIdOrUri,
   resolveRequiredWriteContextGraphId,
 } from "../http-utils.js";
@@ -157,6 +158,22 @@ function respondAssertionError(res: RequestContext["res"], e: any): void {
     return;
   }
   const msg = e?.message ?? String(e);
+  // KA-number-floor reconcile couldn't reach the chain (e.g. a rate-limited RPC
+  // returned 429 on the one-time-per-author read). This is a transient
+  // dependency failure, not a client error — surface a retryable 503 instead of
+  // a blanket 500 so the caller knows to retry. Match by code OR message so it
+  // works even if the error was re-wrapped on the way up.
+  if (
+    e?.code === "KA_FLOOR_RECONCILE_UNAVAILABLE" ||
+    /failed to reconcile KA-number floor/i.test(msg)
+  ) {
+    jsonResponse(res, 503, {
+      error: msg,
+      code: "KA_FLOOR_RECONCILE_UNAVAILABLE",
+      retryable: e?.retryable !== false,
+    });
+    return;
+  }
   if (
     e?.name === "ReservedNamespaceError" ||
     msg.includes("not found") ||
@@ -1005,6 +1022,10 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         if (!parsed.quads.every(isWritableQuad)) {
           return jsonResponse(res, 400, { error: '"quads" must be an array of { subject, predicate, object } objects (graph optional); string-shaped quads are not accepted' });
         }
+        // GH #306/#787 (follow-up) — reject objects that are neither a quoted
+        // literal nor an absolute IRI before they reach (and crash) the parser.
+        const wmObjErr = validateQuadObjectTerms("quads", parsed.quads);
+        if (wmObjErr) return jsonResponse(res, 400, { error: wmObjErr });
         // A bare write to a name that was never created used to fall through to
         // the legacy `/assertion/{addr}/{name}` graph and produce a KA that is
         // permanently 404 in the descriptor API (no `_meta` lifecycle record,

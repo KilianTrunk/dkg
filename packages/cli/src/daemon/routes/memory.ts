@@ -198,6 +198,7 @@ import {
   resolveNameToPeerId,
   isPublishQuad,
   isWritableQuad,
+  validateQuadObjectTerms,
   parsePublishRequestBody,
   jsonResponse,
   safeDecodeURIComponent,
@@ -1646,6 +1647,13 @@ WHERE {
     // of crashing the SWM write path with a TypeError (HTTP 500).
     if (!Array.isArray(quads) || !quads.every(isWritableQuad))
       return jsonResponse(res, 400, { error: '"quads" must be an array of { subject, predicate, object } objects (graph optional); string-shaped quads are not accepted' });
+    // GH #306/#787 (follow-up) — also reject objects that are neither a quoted
+    // literal nor an absolute IRI; otherwise they slip past the shape guard and
+    // crash the RDF parser ("No scheme found in an absolute IRI") with HTTP 500.
+    {
+      const objErr = validateQuadObjectTerms("quads", quads);
+      if (objErr) return jsonResponse(res, 400, { error: objErr });
+    }
     const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
       agent,
       contextGraphId,
@@ -2220,6 +2228,13 @@ WHERE {
     // GH #787 / #306 — reject string-shaped / malformed quads (4xx, not a 500 crash).
     if (!Array.isArray(quads) || !quads.every(isWritableQuad))
       return jsonResponse(res, 400, { error: '"quads" must be an array of { subject, predicate, object } objects (graph optional); string-shaped quads are not accepted' });
+    // GH #306/#787 (follow-up) — also reject objects that are neither a quoted
+    // literal nor an absolute IRI; otherwise they slip past the shape guard and
+    // crash the RDF parser ("No scheme found in an absolute IRI") with HTTP 500.
+    {
+      const objErr = validateQuadObjectTerms("quads", quads);
+      if (objErr) return jsonResponse(res, 400, { error: objErr });
+    }
     const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
       agent,
       contextGraphId,

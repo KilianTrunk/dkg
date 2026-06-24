@@ -70,6 +70,11 @@ async function registerAgentClient(daemon: LiveDaemon, label: string) {
   };
 }
 
+async function getUpdateOperationsSince(daemon: LiveDaemon, from: number) {
+  const res = await fetch(`${daemon.base}/api/operations?name=update&from=${from}&limit=10`);
+  return { status: res.status, body: (await res.json().catch(() => ({}))) as Record<string, any> };
+}
+
 describe('POST /api/update — kaId + attestation contract (KC→KA), real daemon', () => {
   let daemon: LiveDaemon;
   const CG = 'update-contract-cg';
@@ -131,6 +136,7 @@ describe('POST /api/update — kaId + attestation contract (KC→KA), real daemo
   });
 
   it('rejects a null precomputedUpdateAttestation with 400', async () => {
+    const from = Date.now() - 1;
     const res = await postJson(daemon, '/api/update', {
       kaId: '7',
       contextGraphId: CG,
@@ -139,6 +145,9 @@ describe('POST /api/update — kaId + attestation contract (KC→KA), real daemo
     });
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/precomputedUpdateAttestation.*object/);
+    const operations = await getUpdateOperationsSince(daemon, from);
+    expect(operations.status).toBe(200);
+    expect(operations.body.total).toBe(0);
   });
 
   it('rejects an agent token with another agent update attestation before update', async () => {

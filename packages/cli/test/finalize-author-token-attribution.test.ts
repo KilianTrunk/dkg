@@ -62,6 +62,19 @@ describe('resolveFinalizeOptions — token authorship attribution (F1)', () => {
     expect((out as Record<string, unknown>).authorAgentAddress).toBe(mixedCaseTokenAgent);
   });
 
+  it('rejects a pre-signed author attestation whose address differs from the token agent', () => {
+    const { res, errors } = stubRes();
+    const out = resolveFinalizeOptions({
+      preSignedAuthorAttestation: {
+        address: BODY_AGENT,
+        reservedKaId: '1',
+        signature: { r: `0x${'11'.repeat(32)}`, vs: `0x${'22'.repeat(32)}` },
+      },
+    }, res, TOKEN_AGENT);
+    expect(out).toBeNull();
+    expect(errors).toEqual([{ code: 403 }]);
+  });
+
   it('does NOT auto-attribute for a node-level/admin token (undefined agent)', () => {
     // resolveAgentByToken returns undefined for admin/node tokens → no author
     // override → publisher signs as itself (pre-fix default preserved).

@@ -966,7 +966,7 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
       parsed.precomputedUpdateAttestation,
       res,
     );
-    if (parsed.precomputedUpdateAttestation != null && !precomputedUpdateAttestation) {
+    if (parsed.precomputedUpdateAttestation !== undefined && !precomputedUpdateAttestation) {
       return;
     }
     const tokenAgentAddress = requestToken ? agent.resolveAgentByToken(requestToken) : undefined;

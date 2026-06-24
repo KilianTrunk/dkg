@@ -49,6 +49,8 @@ export default defineConfig({
           'test/blazegraph-docker.test.ts',
           'test/store-identity-tag.test.ts',
           'test/publisher-runner-lu11.test.ts',
+          // SQLite-backed vector store. Pure local DB coverage; no hardhat.
+          'test/vector-store-extra.test.ts',
           // Release 2 — managed local Oxigraph server (opt-in). Pure logic
           // + injected fetch/spawn/fs; no network, no real binary.
           'test/oxigraph-binary.test.ts',

@@ -8,7 +8,8 @@ export * from './publisher-extension.js';
 export * from './imported-artifact-bytes.js';
 export * from './imported-artifact-metadata.js';
 export * from './event-bus.js';
-export { Logger, createOperationContext, type OperationContext, type OperationName, type LogSink } from './logger.js';
+export { Logger, createOperationContext, type OperationContext, type OperationName, type LogSink, type LogRecord } from './logger.js';
+export { createLogRedactor, redactLogEntry, redactMessage, DEFAULT_SENSITIVE_KEYS, REDACTED } from './log-redaction.js';
 export * from './crypto/index.js';
 export * from './proto/index.js';
 export {

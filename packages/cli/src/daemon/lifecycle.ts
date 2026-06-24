@@ -70,7 +70,7 @@ import {
 } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets, KaNumberAllocator } from '@origintrail-official/dkg-agent';
 import { isExternalBackend } from '@origintrail-official/dkg-storage';
-import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, DEFAULT_PROTOCOL_OUTBOX_BACKOFFS_MS, DEFAULT_PROTOCOL_OUTBOX_MAX_AGE_MS, pickNetworkTunables } from '@origintrail-official/dkg-core';
+import { computeNetworkId, createOperationContext, createLogRedactor, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, DEFAULT_PROTOCOL_OUTBOX_BACKOFFS_MS, DEFAULT_PROTOCOL_OUTBOX_MAX_AGE_MS, pickNetworkTunables } from '@origintrail-official/dkg-core';
 import { findReservedSubjectPrefix, isSkolemizedUri } from '@origintrail-official/dkg-publisher';
 import {
   DashboardDB,
@@ -79,6 +79,7 @@ import {
   handleNodeUIRequest,
   ChatMemoryManager,
   LogPushWorker,
+  OtlpLogWorker,
   LlmClient,
   SqliteMessageIdempotencyStore,
   SqliteProtocolOutboxStore,
@@ -1966,6 +1967,11 @@ export async function runDaemonInner(
   chatDb = dashDb;
   log("Dashboard DB initialized at " + join(dkgDir(), "node-ui.db"));
 
+  // Redactor for the copy of each record that LEAVES the node. The local
+  // dashboard DB keeps full-fidelity records (it's the operator's own machine);
+  // redaction only protects data crossing the trust boundary to a collector.
+  const redactForRemote = createLogRedactor(config.telemetry?.logs?.redact);
+
   Logger.setSink((entry) => {
     try {
       dashDb.insertLog({
@@ -1979,7 +1985,12 @@ export async function runDaemonInner(
     } catch {
       /* DB write must never break the node */
     }
-    logPusher?.push(entry);
+    // Fan out a single redacted copy to every active remote shipper.
+    if (logPusher || otlpExporter) {
+      const safe = redactForRemote(entry);
+      logPusher?.push(safe);
+      otlpExporter?.push(safe);
+    }
   });
 
   // Extract the plain value from an RDF typed literal like "6"^^<xsd:integer>
@@ -2149,6 +2160,7 @@ export async function runDaemonInner(
     : "mainnet";
   const syslogEndpoint = TELEMETRY_ENDPOINTS[networkKey]?.syslog;
   let logPusher: LogPushWorker | null = null;
+  let otlpExporter: OtlpLogWorker | null = null;
 
   function startLogPusher(): { ok: boolean; error?: string } {
     if (logPusher) return { ok: true };
@@ -2190,8 +2202,59 @@ export async function runDaemonInner(
     log("Telemetry: log streaming disabled");
   }
 
+  function startOtlpExporter(): { ok: boolean; error?: string } {
+    if (otlpExporter) return { ok: true };
+    const endpoint =
+      config.telemetry?.logs?.endpoint || TELEMETRY_ENDPOINTS[networkKey]?.otlpLogs;
+    if (!endpoint) {
+      return {
+        ok: false,
+        error: `OTLP log export is not configured for ${networkKey} (set config.telemetry.logs.endpoint)`,
+      };
+    }
+    const minLevel = config.telemetry?.logs?.level ?? "info";
+    otlpExporter = new OtlpLogWorker({
+      endpoint,
+      token: config.telemetry?.logs?.token,
+      network: networkKey,
+      peerId: agent.peerId,
+      nodeName: config.name,
+      version: nodeVersion,
+      commit: nodeCommit,
+      role: config.nodeRole ?? "edge",
+      minLevel,
+      bufferMaxEntries: config.telemetry?.logs?.bufferMaxEntries,
+      onError: (m) => log(`Telemetry(OTLP): ${m}`),
+    });
+    otlpExporter.start();
+    log(`Telemetry: OTLP log export enabled → ${endpoint} (level ≥ ${minLevel})`);
+    return { ok: true };
+  }
+
+  function stopOtlpExporter(): void {
+    if (!otlpExporter) return;
+    otlpExporter.stop();
+    otlpExporter = null;
+    log("Telemetry: OTLP log export disabled");
+  }
+
+  // Dispatch to the configured log exporter. 'syslog' is the default when
+  // unset (preserves prior behaviour); 'otlp' is the recommended path; 'none'
+  // keeps logs local-only even while telemetry is enabled.
+  function startTelemetry(): { ok: boolean; error?: string } {
+    const mode = config.telemetry?.logs?.exporter ?? "syslog";
+    if (mode === "none") return { ok: true };
+    if (mode === "otlp") return startOtlpExporter();
+    return startLogPusher();
+  }
+
+  function stopTelemetry(): void {
+    stopLogPusher();
+    stopOtlpExporter();
+  }
+
   if (config.telemetry?.enabled) {
-    const r = startLogPusher();
+    const r = startTelemetry();
     if (!r.ok) {
       log(`Telemetry: ${r.error}`);
       config.telemetry.enabled = false;
@@ -2619,10 +2682,10 @@ export async function runDaemonInner(
       enabled: boolean,
     ): Promise<{ ok: boolean; error?: string }> => {
       if (enabled) {
-        const r = startLogPusher();
+        const r = startTelemetry();
         if (!r.ok) return r;
       } else {
-        stopLogPusher();
+        stopTelemetry();
       }
       config.telemetry = { ...config.telemetry, enabled };
       await saveConfig(config);

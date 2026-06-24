@@ -9,14 +9,22 @@ export interface OperationContext {
   sourceOperationId?: string;
 }
 
-export type LogSink = (entry: {
+/**
+ * The canonical structured log record emitted on every Logger call. This is
+ * the single shape that flows to the local dashboard DB and to any remote
+ * shipper (syslog, OTLP). Keep it stable — redaction and the OTLP exporter
+ * both consume it.
+ */
+export interface LogRecord {
   level: string;
   operationName: string;
   operationId: string;
   sourceOperationId?: string;
   module: string;
   message: string;
-}) => void;
+}
+
+export type LogSink = (entry: LogRecord) => void;
 
 /**
  * Structured logger that prefixes every message with a timestamp,

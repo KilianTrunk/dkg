@@ -446,6 +446,22 @@ export function isSameAgentAddress(left: string, right: string): boolean {
   return left === right || comparableAgentAddress(left) === comparableAgentAddress(right);
 }
 
+export function authorizeAgentScopedAuthorClaim(
+  res: ServerResponse,
+  tokenAgentAddress: string | undefined,
+  claimedAuthorAddress: string | undefined,
+  claimField: string,
+): boolean {
+  if (!tokenAgentAddress || !claimedAuthorAddress) return true;
+  if (tokenAgentAddress === claimedAuthorAddress) return true;
+  jsonResponse(res, 403, {
+    error:
+      `Author mismatch: authenticated as ${tokenAgentAddress} but request body claims ${claimedAuthorAddress}. ` +
+      `The author is resolved from the agent-scoped bearer token; omit ${claimField} or use the matching agent's token.`,
+  });
+  return false;
+}
+
 export function assertImportedArtifactOwnerAddress(
   assertionAgentAddress: string,
   requestAgentAddress: string,

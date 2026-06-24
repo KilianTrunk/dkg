@@ -58,6 +58,7 @@ import {
 import {
   decodePromoteJobId,
   asyncPromoteUnavailable,
+  authorizeAgentScopedAuthorClaim,
 } from "./shared-assertion-helpers.js";
 import { PromoteJobConflictError } from "@origintrail-official/dkg-publisher";
 import { deriveStatus } from "@origintrail-official/dkg-publisher";
@@ -299,6 +300,9 @@ export function resolveFinalizeOptions(
     (typeof schemeVersion !== "number" || !Number.isInteger(schemeVersion) || schemeVersion < 1)
   ) {
     jsonResponse(res, 400, { error: '"schemeVersion" must be a positive integer when supplied' });
+    return null;
+  }
+  if (!authorizeAgentScopedAuthorClaim(res, tokenAgentAddress, authorAgentAddress, "authorAgentAddress")) {
     return null;
   }
   // Token attribution — parity with /api/shared-memory/publish (memory.ts).

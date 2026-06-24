@@ -34,7 +34,11 @@ cloudflared tunnel run dkg-logs
 ```
 - **Do NOT** put a Cloudflare Access policy on `logs-ingest.xtrmstrngth.com`.
 - **Firewall** TCP 4318 from the public internet (only `cloudflared` on localhost reaches it).
-- **Auth:** add a Cloudflare WAF custom rule on that hostname: *block when `http.request.headers["authorization"][0] ne "Bearer <INGEST_TOKEN>"`*. Pick a long random `<INGEST_TOKEN>` (e.g. `openssl rand -hex 32`).
+- **Auth:** pick a long random token (`openssl rand -hex 32`) and add a Cloudflare **WAF custom rule** (Security → WAF → Custom rules) — **exact expression** (Block action):
+  ```
+  (http.host eq "logs-ingest.xtrmstrngth.com" and not any(http.request.headers["authorization"][*] eq "Bearer <INGEST_TOKEN>"))
+  ```
+  This blocks every request to the ingest hostname that doesn't carry the exact bearer token. Put the same token in each node's `telemetry.logs.token`. (Verified end-to-end in your real Loki/Grafana via a proxy push on 2026-06-24 — the dashboard renders per-node, redacted lines.)
 
 (Alternative without Cloudflare Tunnel: terminate TLS at your existing reverse proxy and `proxy_pass` the hostname to `127.0.0.1:4318`, enforcing the bearer header there.)
 

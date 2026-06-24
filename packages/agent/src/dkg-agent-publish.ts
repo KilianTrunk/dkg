@@ -407,6 +407,19 @@ import type { DKGAgent } from './dkg-agent.js';
  */
 export const SEAL_CAPABILITY_GAP_CODE = 'SEAL_CAPABILITY_GAP';
 
+export type ResolveCuratedChainKeyContextOptions = {
+  /**
+   * Binding-only id for AEAD associated data. This value must never affect
+   * plaintext/encrypted policy selection.
+   */
+  aeadBindingContextGraphId?: string;
+};
+
+function normalizeOptionalContextGraphId(value: string | null | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
 export class PublishMethods extends DKGAgentBase {
   async publishWorkspaceGossip(this: DKGAgent,
     contextGraphId: string,
@@ -1284,7 +1297,27 @@ export class PublishMethods extends DKGAgentBase {
     }
     const v10ACKProvider = this.createV10ACKProvider(contextGraphId);
 
-    const onChainId = opts?.onChainContextGraphId ?? await this.getContextGraphOnChainId(contextGraphId);
+    const suppliedOnChainId = normalizeOptionalContextGraphId(opts?.onChainContextGraphId);
+    let derivedOnChainId: string | undefined;
+    try {
+      derivedOnChainId = normalizeOptionalContextGraphId(await this.getContextGraphOnChainId(contextGraphId));
+    } catch (err) {
+      if (!suppliedOnChainId) throw err;
+      this.log.warn(
+        ctx,
+        `Could not verify caller-supplied on-chain cgId ${suppliedOnChainId} for "${contextGraphId}" ` +
+          `before publish policy resolution; treating it as an explicit target: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+      );
+    }
+    const onChainId = suppliedOnChainId ?? derivedOnChainId;
+    const explicitPublishPolicyTarget = suppliedOnChainId && suppliedOnChainId !== derivedOnChainId
+      ? suppliedOnChainId
+      : undefined;
+    const publishBindingOptions = onChainId
+      ? { aeadBindingContextGraphId: onChainId }
+      : undefined;
 
     // RFC-001 §9.x — sign-at-creation. The publisher refuses on-chain
     // publishes without a `precomputedAttestation`, so the agent
@@ -1339,15 +1372,16 @@ export class PublishMethods extends DKGAgentBase {
     // authorAgentAddress, so we let _resolveEncryptInlinePayload fall back
     // to `defaultAgentAddress ?? peerId`.
     //
-    // Codex PR #608 R2 #12: thread the target on-chain CG id through so
-    // the AEAD key derives from the canonical id consumers will use to
-    // verify/decrypt the published KC. Falls back to the source id when
-    // there's no remap, which is the common case.
+    // Codex PR #608 R2 #12 / GH #1309: keep policy target provenance
+    // separate from the AEAD binding id. Agent-derived same-CG ids bind
+    // AEAD to the canonical on-chain id without being treated as explicit
+    // remaps; caller-supplied mismatches stay explicit policy targets.
     const encryptInlinePayload = await this._resolveEncryptInlinePayload(
       contextGraphId,
       opts?.subGraphName,
       undefined,
-      onChainId ?? undefined,
+      explicitPublishPolicyTarget,
+      publishBindingOptions,
     );
     // OT-RFC-38 LU-11 — also resolve the chunked emitter for curated
     // CGs. When set, the publisher prefers this path: chunks fan out
@@ -1357,7 +1391,8 @@ export class PublishMethods extends DKGAgentBase {
       contextGraphId,
       opts?.subGraphName,
       undefined,
-      onChainId ?? undefined,
+      explicitPublishPolicyTarget,
+      publishBindingOptions,
     );
 
     const result = await this.publisher.publish({
@@ -1521,13 +1556,17 @@ export class PublishMethods extends DKGAgentBase {
     // `undefined` for a public CG, so the function's truthiness IS the curated
     // gate — exactly what the producer keys `useEncryptedInlineUpdate` off of.
     // No separate accessPolicy read is needed. The 4th arg mirrors publish: the
-    // target on-chain cgId so the AEAD key derives from the canonical id
-    // consumers verify against.
+    // target on-chain cgId is now binding-only so the AEAD key derives from
+    // the canonical id consumers verify against without reclassifying the
+    // same-CG update as an explicit remap.
     const updateEncryptInlinePayload = await this._resolveEncryptInlinePayload(
       contextGraphId,
       undefined,
       undefined,
-      updateOnChainId ?? undefined,
+      undefined,
+      updateOnChainId
+        ? { aeadBindingContextGraphId: updateOnChainId }
+        : undefined,
     );
     const isCuratedUpdate = typeof updateEncryptInlinePayload === 'function';
 
@@ -1545,7 +1584,10 @@ export class PublishMethods extends DKGAgentBase {
           contextGraphId,
           undefined,
           undefined,
-          updateOnChainId ?? undefined,
+          undefined,
+          updateOnChainId
+            ? { aeadBindingContextGraphId: updateOnChainId }
+            : undefined,
         )
       : undefined;
 
@@ -2819,11 +2861,12 @@ export class PublishMethods extends DKGAgentBase {
     contextGraphId: string,
     subGraphName: string | undefined,
     authorAgentAddress: string | undefined,
-    publishContextGraphId: string | undefined,
+    explicitPolicyTargetContextGraphId: string | undefined,
     logPrefix: string,
+    options?: ResolveCuratedChainKeyContextOptions,
   ): Promise<{ chainKey: Uint8Array; aeadCgId: string; senderAddress: string } | undefined> {
     const ctx = createOperationContext('publish');
-    const targetCgId = publishContextGraphId ?? contextGraphId;
+    const targetCgId = explicitPolicyTargetContextGraphId ?? contextGraphId;
     const probeIsCurated = async (cgId: string, opts?: { rawOnChainSlot?: boolean }): Promise<boolean | null> => {
       // Consume the SHARED tri-state resolver (the same one behind the
       // SWM-gossip gate) so the publish-inline path can never DIVERGE from it,
@@ -2872,12 +2915,12 @@ export class PublishMethods extends DKGAgentBase {
       } catch { /* fall through to the plaintext-inline default */ }
       return false;
     };
-    const explicitRawTarget = publishContextGraphId !== undefined && /^\d+$/.test(targetCgId.trim());
+    const explicitRawTarget = explicitPolicyTargetContextGraphId !== undefined && /^\d+$/.test(targetCgId.trim());
     let sourceIsCurated: boolean | null;
     let targetIsCurated: boolean | null;
     if (targetCgId !== contextGraphId && explicitRawTarget) {
       targetIsCurated = await probeIsCurated(targetCgId, { rawOnChainSlot: true });
-      sourceIsCurated = targetIsCurated ? null : await probeIsCurated(contextGraphId);
+      sourceIsCurated = targetIsCurated == null ? null : await probeIsCurated(contextGraphId);
     } else {
       sourceIsCurated = await probeIsCurated(contextGraphId);
       targetIsCurated = targetCgId === contextGraphId
@@ -2994,7 +3037,7 @@ export class PublishMethods extends DKGAgentBase {
 
     return {
       chainKey: state.chainKey,
-      aeadCgId: publishContextGraphId ?? contextGraphId,
+      aeadCgId: options?.aeadBindingContextGraphId ?? explicitPolicyTargetContextGraphId ?? contextGraphId,
       senderAddress,
     };
   }
@@ -3003,10 +3046,11 @@ export class PublishMethods extends DKGAgentBase {
     contextGraphId: string,
     subGraphName?: string,
     authorAgentAddress?: string,
-    publishContextGraphId?: string,
+    explicitPolicyTargetContextGraphId?: string,
+    options?: ResolveCuratedChainKeyContextOptions,
   ): Promise<((plaintext: Uint8Array) => Promise<Uint8Array>) | undefined> {
     const resolved = await this._resolveCuratedChainKeyContext(
-      contextGraphId, subGraphName, authorAgentAddress, publishContextGraphId, 'LU-5',
+      contextGraphId, subGraphName, authorAgentAddress, explicitPolicyTargetContextGraphId, 'LU-5', options,
     );
     if (!resolved) return undefined;
     const { chainKey, aeadCgId } = resolved;
@@ -3056,7 +3100,8 @@ export class PublishMethods extends DKGAgentBase {
     contextGraphId: string,
     subGraphName?: string,
     authorAgentAddress?: string,
-    publishContextGraphId?: string,
+    explicitPolicyTargetContextGraphId?: string,
+    options?: ResolveCuratedChainKeyContextOptions,
   ): Promise<
     | ((input: { plaintextNquads: Uint8Array; batchId: Uint8Array; publishOperationId: string }) => Promise<{
         ciphertextChunksRoot: Uint8Array;
@@ -3067,7 +3112,7 @@ export class PublishMethods extends DKGAgentBase {
     | undefined
   > {
     const resolved = await this._resolveCuratedChainKeyContext(
-      contextGraphId, subGraphName, authorAgentAddress, publishContextGraphId, 'LU-11',
+      contextGraphId, subGraphName, authorAgentAddress, explicitPolicyTargetContextGraphId, 'LU-11', options,
     );
     if (!resolved) return undefined;
     const { chainKey, aeadCgId } = resolved;
@@ -4132,7 +4177,10 @@ export class PublishMethods extends DKGAgentBase {
       contextGraphId,
       options?.subGraphName,
       options?.authorAgentAddress,
-      onChainId ?? undefined,
+      ctxGraphIdStr,
+      onChainId
+        ? { aeadBindingContextGraphId: onChainId }
+        : undefined,
     );
     if (encryptInlinePayload) {
       this.log.info(ctx, `LU-5: curated CG ${contextGraphId} — wrapping inline ACK payload with chain-key AEAD`);
@@ -4147,7 +4195,10 @@ export class PublishMethods extends DKGAgentBase {
       contextGraphId,
       options?.subGraphName,
       options?.authorAgentAddress,
-      onChainId ?? undefined,
+      ctxGraphIdStr,
+      onChainId
+        ? { aeadBindingContextGraphId: onChainId }
+        : undefined,
     );
     if (encryptInlineChunked) {
       this.log.info(ctx, `LU-11: curated CG ${contextGraphId} — chunked path active (per-chunk SWM gossip + V2 ACK)`);

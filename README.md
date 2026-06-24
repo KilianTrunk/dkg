@@ -138,6 +138,23 @@ dkg start     # starts the node daemon on http://127.0.0.1:9200
 
 `dkg init` asks which network to join — **mainnet-gnosis** (default), **mainnet-base**, or **testnet**. Mainnet nodes have no faucet; testnet nodes auto-fund their wallets when the faucet is reachable. Pass `--network <name>` to skip the prompt.
 
+For a Core Node, choose the `core` role during setup or pass it explicitly:
+
+```bash
+dkg init --role core --network mainnet-gnosis
+dkg start
+```
+
+Core Nodes need an on-chain node profile (`identityId`). On startup the daemon checks the primary operational wallet; if it has no profile and `nodeRole` is `core`, it attempts to create the profile, approve TRAC to `StakingV10`, and mint the initial staking conviction. If the node is already running after you fund or repair wallets, trigger the same identity-creation path manually:
+
+```bash
+TOKEN=$(dkg auth show)
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:9200/api/identity/ensure
+```
+
+Verify with `GET /api/identity` or `/api/status`: Core registration is complete when `identityId` is non-zero and `hasIdentity` is `true`. Current node roles are `edge` and `core`; old references to "thin" nodes should be read as the Edge/local-client role, not a separate registration mode. See [Daemon Lifecycle](docs/use-dkg/run-node.md#core-node-profile-registration) for the full Core profile checklist.
+
 Once running, open the dashboard at [http://127.0.0.1:9200/ui](http://127.0.0.1:9200/ui), or query directly:
 
 ```bash
@@ -199,7 +216,7 @@ By design, `list` shows only verified and featured tiers and `install` refuses c
 dkg init                                 # interactive setup — network, node name, role, store (--network to skip the prompt)
 dkg start [-f]                           # start the node daemon (-f for foreground)
 dkg stop                                 # graceful shutdown
-dkg status                               # node health, peer count, identity
+dkg status                               # node health, peer count, store status
 dkg logs                                 # tail the daemon log
 dkg peers                                # connected peers and transport info
 dkg peer info <peer-id>                  # inspect a peer's identity and addresses

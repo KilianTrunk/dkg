@@ -12,10 +12,11 @@ Run `dkg <command> --help` for the current option surface.
 Common commands:
 
 ```bash
-dkg init                                 # interactive setup — node name, role, relay, triple-store backend (default: oxigraph-server)
+dkg init                                 # interactive setup: node name, role, relay, triple-store backend (default: oxigraph-server)
+dkg init --role core --network <name>    # initialize a Core Node that will create an on-chain node profile on startup
 dkg start [-f]                           # start the node daemon (-f for foreground)
 dkg stop                                 # graceful shutdown
-dkg status                               # node health, peer count, identity
+dkg status                               # node health, peer count, store status
 dkg logs                                 # tail the daemon log
 dkg peers                                # list discovered agents on the network
 dkg peer info <peer-id>                  # inspect a peer's identity and addresses
@@ -62,7 +63,7 @@ dkg publisher stats                      # publisher throughput stats
 
 # Code & memory indexing
 dkg index [directory]                    # index a code repo into the dev-coordination CG
-dkg wallet                               # show operational wallet addresses & balances
+dkg wallet                               # show admin and operational wallet addresses and balances
 dkg set-ask <amount>                     # set the node's on-chain ask (TRAC per KB·epoch)
 
 # Identity & auth

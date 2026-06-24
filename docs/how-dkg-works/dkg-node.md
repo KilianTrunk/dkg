@@ -9,8 +9,6 @@ doc_type: concept
 
 The DKG Node is the local authority for one operator's participation in the network.
 
-![DKG Node](../.gitbook/assets/dkg-node.png)
-
 The DKG Node owns:
 
 * daemon lifecycle and HTTP API
@@ -29,6 +27,6 @@ A node can run as an Edge Node or a Core Node. Edge is the default role for loca
 
 Core Nodes have an on-chain node profile identified by `identityId`. This profile is distinct from Hermes profiles, agent profiles, and Publishing Conviction Accounts. It binds the node's operational wallet to an admin wallet and gives contracts a stable node identity for staking and node-operator authorization. Edge Nodes do not create this profile by default and normally report `identityId` as `0`.
 
-Older archived notes may use "thin" or "light" for local client nodes. In current V10 docs and config, use `nodeRole: "edge"` for that role and `nodeRole: "core"` for Core infrastructure nodes.
+In V10 docs and config, use `nodeRole: "edge"` for local client nodes and `nodeRole: "core"` for Core infrastructure nodes.
 
 Agents should treat the node as the system boundary. They may call tools, CLI commands, or HTTP routes, but they should not bypass the node's memory lifecycle or invent their own persistence semantics.

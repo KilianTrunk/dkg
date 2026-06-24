@@ -80,6 +80,8 @@ dkg hermes setup
 
 `dkg hermes setup` bootstraps the DKG node config (no separate `dkg init` needed), starts the daemon, optionally funds wallets, and wires the Hermes profile with replace-by-default provider election (use `--preserve-provider` to opt out, `--no-start` / `--no-fund` for advanced flows). See the [adapter guide](packages/adapter-hermes/README.md) for details.
 
+**Network:** setup defaults to **mainnet-gnosis**; pass `--network <mainnet-gnosis | mainnet-base | testnet>` to choose another. Mainnet nodes have no faucet; testnet nodes auto-fund their wallets when the faucet is reachable.
+
 ### OpenClaw adapter
 
 Two commands:
@@ -104,7 +106,9 @@ openclaw gateway restart
 - The right-side chat surface connects to OpenClaw and a sent message round-trips
 - The conversation survives a UI reload (proves DKG-backed chat persistence)
 
-**Flags.** `--no-fund` (skip faucet), `--no-start` (configure only), `--no-verify` (skip verification), `--dry-run` (preview without writing). Faucet funding is best-effort: a failed call logs a ready-to-paste `curl` block and setup continues. See the [Funding](#funding) section below for the full request/response shape.
+**Network:** setup defaults to **mainnet-gnosis**; pass `--network <mainnet-gnosis | mainnet-base | testnet>` to choose another. Mainnet nodes have no faucet; testnet nodes auto-fund their wallets when the faucet is reachable.
+
+**Flags.** `--network <name>` (choose network), `--no-fund` (skip faucet), `--no-start` (configure only), `--no-verify` (skip verification), `--dry-run` (preview without writing). Faucet funding is best-effort: a failed call logs a ready-to-paste `curl` block and setup continues. See the [Funding](#funding) section below for the full request/response shape.
 
 The full adapter reference — daemon URL config, channel-port overrides, disconnect/reconnect semantics — lives in [`packages/adapter-openclaw/README.md`](packages/adapter-openclaw/README.md).
 
@@ -125,6 +129,8 @@ dkg mcp setup
 ```
 
 `dkg mcp setup` bootstraps the DKG node config (no separate `dkg init` needed), starts the daemon, optionally funds wallets, and registers MCP entries in each detected client (you confirm per client unless `--yes` is passed). See the [MCP integration guide](packages/mcp-dkg/README.md) for client-by-client paths, mode overrides (`--installed` / `--monorepo`), the manual JSON shape, the contributor monorepo dev workflow, and troubleshooting (including the WSL2 caveat for Windows-side MCP clients).
+
+**Network:** setup defaults to **mainnet-gnosis**; pass `--network <mainnet-gnosis | mainnet-base | testnet>` to choose another. Mainnet nodes have no faucet; testnet nodes auto-fund their wallets when the faucet is reachable.
 
 ### Standalone node
 
@@ -153,7 +159,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:9200/api/identity/ensure
 ```
 
-Verify with `GET /api/identity` or `/api/status`: Core registration is complete when `identityId` is non-zero and `hasIdentity` is `true`. Current node roles are `edge` and `core`; old references to "thin" nodes should be read as the Edge/local-client role, not a separate registration mode. See [Daemon Lifecycle](docs/use-dkg/run-node.md#core-node-profile-registration) for the full Core profile checklist.
+Verify with `GET /api/identity` or `/api/status`: Core registration is complete when `identityId` is non-zero and `hasIdentity` is `true`. The two node roles are `edge` and `core`. See [Daemon Lifecycle](docs/use-dkg/run-node.md#core-node-profile-registration) for the full Core profile checklist.
 
 Once running, open the dashboard at [http://127.0.0.1:9200/ui](http://127.0.0.1:9200/ui), or query directly:
 

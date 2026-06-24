@@ -10,9 +10,6 @@ import { ethers } from 'ethers';
 import { resolveRpcUrls } from '@origintrail-official/dkg-chain';
 import {
   dkgAuthTokenPath,
-  FAUCET_WALLETS_PER_REQUEST,
-  getFundableWalletAddresses,
-  requestFaucetFunding,
   resolveDkgConfigHome,
   toErrorMessage,
   hasErrorCode,
@@ -197,8 +194,6 @@ mcpCmd
         loadNetworkConfig: openclawSetupExports.loadNetworkConfig,
         ensureDkgNodeConfig: coreExports.ensureDkgNodeConfig,
         startDaemon: openclawSetupExports.startDaemon,
-        readWalletsWithRetry: openclawSetupExports.readWalletsWithRetry,
-        logManualFundingInstructions: openclawSetupExports.logManualFundingInstructions,
         // Lazy + best-effort (parity with openclaw/hermes): dkg-agent is
         // imported only inside the non-dry-run wallet step, so `--print-only`
         // / `--dry-run` never require it, and an import failure degrades to a
@@ -208,7 +203,11 @@ mcpCmd
           const { loadOpWallets } = await import('@origintrail-official/dkg-agent');
           return loadOpWallets(dir);
         },
-        requestFaucetFunding: coreExports.requestFaucetFunding,
+        // Shared faucet orchestrator — the SAME one openclaw/hermes use.
+        // Replaces the old bespoke `/api/status` reachability probe +
+        // `requestFaucetFunding` path that silently skipped funding on a slow
+        // testnet node.
+        fundWalletsBestEffort: coreExports.fundWalletsBestEffort,
         findDkgMonorepoRoot: coreExports.findDkgMonorepoRoot,
         resolveDkgConfigHome: coreExports.resolveDkgConfigHome,
       });

@@ -380,7 +380,7 @@ import {
   isLocalOxigraphConfig,
   sliceIntoCiphertextChunks,
 } from './dkg-agent-helpers.js';
-import { reconcileAndAllocateKaNumber, readMaxKaNumberWithRetry } from './allocator.js';
+import { reconcileAndAllocateKaNumber, readMaxKaNumberWithRetry, isTransientChainError } from './allocator.js';
 import {
   swmSenderStateKey,
   swmReceiverStateKey,
@@ -2352,12 +2352,15 @@ export class PublishMethods extends DKGAgentBase {
           } catch (err) {
             // #1116 (round 11) — CAPABILITY GAP (the chain read to reconcile the
             // KA-number floor failed — a transient/RPC capability problem, not bad input).
+            // PR #1319 review: tag the transient/deterministic verdict so the daemon
+            // HTTP layer (respondIfReconcileUnavailable) only 503s a genuinely
+            // retryable failure — a deterministic revert falls through to its normal mapping.
             throw Object.assign(
               new Error(
                 `OT-RFC-43 A2: failed to reconcile KA-number floor for author ${authorAddress} at finalize: ` +
                   (err instanceof Error ? err.message : String(err)),
               ),
-              { code: SEAL_CAPABILITY_GAP_CODE },
+              { code: SEAL_CAPABILITY_GAP_CODE, retryable: isTransientChainError(err) },
             );
           }
         }
@@ -2683,9 +2686,15 @@ export class PublishMethods extends DKGAgentBase {
             // Retry transient RPC failures (429/timeout/5xx) on the floor read.
             selChainMax = await readMaxKaNumberWithRetry(this.chain.getMaxKaNumberForAuthor.bind(this.chain), authorAddress);
           } catch (err) {
-            throw new Error(
-              `OT-RFC-43 §F2: failed to reconcile KA-number floor for author ${authorAddress} (selection publish): ` +
-                (err instanceof Error ? err.message : String(err)),
+            // PR #1319 review: tag the transient/deterministic verdict (same as the
+            // finalize path) so the daemon only 503s a genuinely retryable failure;
+            // a deterministic revert falls through to its normal mapping.
+            throw Object.assign(
+              new Error(
+                `OT-RFC-43 §F2: failed to reconcile KA-number floor for author ${authorAddress} (selection publish): ` +
+                  (err instanceof Error ? err.message : String(err)),
+              ),
+              { retryable: isTransientChainError(err) },
             );
           }
         }

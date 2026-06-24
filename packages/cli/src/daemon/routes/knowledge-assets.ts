@@ -36,6 +36,8 @@ import {
   validateRequiredContextGraphId,
   parsePublishRequestBody,
   isWritableQuad,
+  validateQuadObjectTerms,
+  respondIfReconcileUnavailable,
   normalizeContextGraphIdOrUri,
   resolveRequiredWriteContextGraphId,
 } from "../http-utils.js";
@@ -156,6 +158,9 @@ function respondAssertionError(res: RequestContext["res"], e: any): void {
     });
     return;
   }
+  // KA-number-floor reconcile couldn't reach the chain (e.g. a rate-limited RPC
+  // 429'd the one-time-per-author read) -> retryable 503, not 500.
+  if (respondIfReconcileUnavailable(res, e)) return;
   const msg = e?.message ?? String(e);
   if (
     e?.name === "ReservedNamespaceError" ||
@@ -650,6 +655,8 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       if (isPayloadTooLargeError(e)) {
         return jsonResponse(res, 413, payloadTooLargeResponseBody(e));
       }
+      // Transient KA-number-floor reconcile failure (rate-limited RPC) -> 503.
+      if (respondIfReconcileUnavailable(res, e)) return;
       return jsonResponse(res, 500, { error: e?.message ?? String(e) });
     }
   }
@@ -851,6 +858,8 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       if (errors.length > 0) return jsonResponse(res, 207, { created: true, ...result, errors });
       return jsonResponse(res, 201, result);
     } catch (e: any) {
+      // Transient KA-number-floor reconcile failure (rate-limited RPC) -> 503.
+      if (respondIfReconcileUnavailable(res, e)) return;
       return jsonResponse(res, 500, { error: e?.message ?? String(e) });
     }
   }
@@ -1005,6 +1014,10 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         if (!parsed.quads.every(isWritableQuad)) {
           return jsonResponse(res, 400, { error: '"quads" must be an array of { subject, predicate, object } objects (graph optional); string-shaped quads are not accepted' });
         }
+        // GH #306/#787 (follow-up) — reject objects that are neither a quoted
+        // literal nor an absolute IRI before they reach (and crash) the parser.
+        const wmObjErr = validateQuadObjectTerms("quads", parsed.quads);
+        if (wmObjErr) return jsonResponse(res, 400, { error: wmObjErr });
         // A bare write to a name that was never created used to fall through to
         // the legacy `/assertion/{addr}/{name}` graph and produce a KA that is
         // permanently 404 in the descriptor API (no `_meta` lifecycle record,

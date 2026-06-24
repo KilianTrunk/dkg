@@ -120,9 +120,20 @@ export function isWritableQuad(value: unknown): boolean {
   );
 }
 
-function validatePublishQuadObjectTerms(
+/**
+ * GH #306 / #787 (follow-up) — validate each quad's `object` term is either a
+ * quoted RDF literal (`"…"`) or an absolute IRI. Shared by the publish path AND
+ * the write routes (wm/write, shared-memory/write, conditional-write): the shape
+ * guards ({@link isPublishQuad} / {@link isWritableQuad}) only check the fields
+ * are strings, so an object that is neither a literal nor an IRI (e.g. a bare
+ * word `hello` or a number `123`) slips past them and crashes the RDF parser
+ * with an uncaught "No scheme found in an absolute IRI" → HTTP 500 instead of an
+ * actionable 400. Operates on any `{ object: string }` (PublishQuad or writable
+ * quad alike).
+ */
+export function validateQuadObjectTerms(
   label: string,
-  quads: PublishQuad[],
+  quads: ReadonlyArray<{ object: string }>,
 ): string | null {
   const badIndex = quads.findIndex((q) => {
     const object = q.object.trim();
@@ -130,6 +141,43 @@ function validatePublishQuadObjectTerms(
   });
   if (badIndex === -1) return null;
   return `Invalid "${label}[${badIndex}].object": RDF object must be a quoted literal term or absolute IRI`;
+}
+
+/**
+ * KA-number-floor reconcile resilience (follow-up to the "KA create 500-on-429"
+ * fix). If `e` is a **transient** reconcile failure — the chain RPC couldn't serve
+ * the one-time-per-author floor read (e.g. a 429 after the bounded retry in
+ * `allocator.ts` is exhausted) — send a retryable **503** and return true;
+ * otherwise return false so the caller falls through to its normal mapping.
+ *
+ * The transient-vs-deterministic verdict comes from `retryable` (derived from
+ * `isTransientChainError`): the typed `KaFloorReconcileError` carries it, and the
+ * finalize/selection re-wrap sites in `dkg-agent-publish.ts` tag the same marker.
+ * A deterministic failure (`retryable === false`, e.g. a revert) is NOT a 503 —
+ * advertising a retry would be pointless — so it falls through. The legacy
+ * message-text match is honored ONLY when the error explicitly marks itself
+ * retryable, so a bare re-wrapped message can never force a deterministic error
+ * into a retryable 503 (PR #1319 review). Used by every route that can trigger the
+ * reconcile (named create, one-shot publish, shared-memory publish, and the
+ * WM-verb routes via `respondAssertionError`) so they answer consistently.
+ */
+export function respondIfReconcileUnavailable(res: ServerResponse, e: any): boolean {
+  const msg = e?.message ?? String(e);
+  const isTyped = e?.code === "KA_FLOOR_RECONCILE_UNAVAILABLE";
+  // Message-text fallback (for errors re-wrapped on the way up) is accepted only
+  // when the error explicitly carries a retryable marker — never for a bare
+  // message, which might be hiding a deterministic revert.
+  const isMarkedLegacyTransient =
+    e?.retryable === true && /failed to reconcile KA-number floor/i.test(msg);
+  if ((!isTyped && !isMarkedLegacyTransient) || e?.retryable === false) {
+    return false;
+  }
+  jsonResponse(res, 503, {
+    error: msg,
+    code: "KA_FLOOR_RECONCILE_UNAVAILABLE",
+    retryable: true,
+  });
+  return true;
 }
 
 export function parsePublishRequestBody(
@@ -168,7 +216,7 @@ export function parsePublishRequestBody(
       error: 'Missing or invalid "quads" (must be a non-empty quad array)',
     };
   }
-  const quadObjectError = validatePublishQuadObjectTerms("quads", quads);
+  const quadObjectError = validateQuadObjectTerms("quads", quads);
   if (quadObjectError) return { ok: false, error: quadObjectError };
 
   if (
@@ -181,7 +229,7 @@ export function parsePublishRequestBody(
     };
   }
   if (privateQuads !== undefined) {
-    const privateQuadObjectError = validatePublishQuadObjectTerms("privateQuads", privateQuads);
+    const privateQuadObjectError = validateQuadObjectTerms("privateQuads", privateQuads);
     if (privateQuadObjectError) return { ok: false, error: privateQuadObjectError };
   }
 

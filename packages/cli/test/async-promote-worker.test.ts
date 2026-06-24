@@ -386,20 +386,25 @@ describe('createPromoteWorkerSupervisor', () => {
   let queue: AsyncPromoteQueue;
   let logs: string[];
 
-  function makeRequest(name: string): PromoteRequest {
-    return { contextGraphId: 'cg', assertionName: name, entities: 'all' };
+  function makeRequest(name: string, overrides: Partial<PromoteRequest> = {}): PromoteRequest {
+    return { contextGraphId: 'cg', assertionName: name, entities: 'all', ...overrides };
   }
 
   function makeAgentStub(promote: (req: PromoteRequest) => Promise<{ promotedCount: number }>) {
     return {
       promoteQueue: queue,
       assertion: {
-        async promote(cgId: string, name: string, opts: { entities?: any; subGraphName?: string }) {
+        async promote(
+          cgId: string,
+          name: string,
+          opts: { entities?: any; subGraphName?: string; authorAgentAddress?: string },
+        ) {
           return promote({
             contextGraphId: cgId,
             assertionName: name,
             entities: opts.entities ?? 'all',
             subGraphName: opts.subGraphName,
+            ...(opts.authorAgentAddress ? { authorAgentAddress: opts.authorAgentAddress } : {}),
           });
         },
       },
@@ -449,6 +454,34 @@ describe('createPromoteWorkerSupervisor', () => {
     await sup.stop();
 
     expect((await queue.getStats()).succeeded).toBe(3);
+  });
+
+  it('passes the stored enqueue author into agent.promote', async () => {
+    const authorAgentAddress = '0x1111111111111111111111111111111111111111';
+    await queue.enqueue(makeRequest('agent-a-share', { authorAgentAddress }));
+    const seen: PromoteRequest[] = [];
+
+    const sup = createPromoteWorkerSupervisor({
+      agent: makeAgentStub(async (req) => {
+        seen.push(req);
+        return { promotedCount: 1 };
+      }),
+      workerConcurrency: 1,
+      pollIntervalMs: 1_000_000,
+      heartbeatIntervalMs: 0,
+      log: (m) => logs.push(m),
+      workerIdPrefix: 'test',
+    });
+
+    await sup.start();
+    expect(await sup.tickOnce()).toBe(1);
+    await sup.stop();
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({
+      assertionName: 'agent-a-share',
+      authorAgentAddress,
+    });
   });
 
   it('a tick on an empty queue picks up zero jobs and does not throw', async () => {

@@ -1,0 +1,437 @@
+{
+  "address": "0xcD0048A5628B37B8f743cC2FeA18817A29e97270",
+  "abi": [
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "hubAddress",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "constructor"
+    },
+    {
+      "inputs": [],
+      "name": "AdminAddressZero",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "AdminEqualsOperational",
+      "type": "error"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        },
+        {
+          "internalType": "address",
+          "name": "sender",
+          "type": "address"
+        }
+      ],
+      "name": "AdminFunctionOnly",
+      "type": "error"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        }
+      ],
+      "name": "CannotDeleteOnlyAdminKey",
+      "type": "error"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        }
+      ],
+      "name": "CannotDeleteOnlyOperationalKey",
+      "type": "error"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "key",
+          "type": "bytes32"
+        }
+      ],
+      "name": "KeyAlreadyAttached",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "KeyIsEmpty",
+      "type": "error"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "key",
+          "type": "bytes32"
+        }
+      ],
+      "name": "KeyNotAttached",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "OperationalAddressZero",
+      "type": "error"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "key",
+          "type": "bytes32"
+        }
+      ],
+      "name": "OperationalKeyTaken",
+      "type": "error"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "wallet",
+          "type": "address"
+        }
+      ],
+      "name": "OperationalWalletDuplicate",
+      "type": "error"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "string",
+          "name": "msg",
+          "type": "string"
+        }
+      ],
+      "name": "UnauthorizedAccess",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "ZeroAddressHub",
+      "type": "error"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        },
+        {
+          "indexed": true,
+          "internalType": "bytes32",
+          "name": "operationalKey",
+          "type": "bytes32"
+        },
+        {
+          "indexed": true,
+          "internalType": "bytes32",
+          "name": "adminKey",
+          "type": "bytes32"
+        }
+      ],
+      "name": "IdentityCreated",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        }
+      ],
+      "name": "IdentityDeleted",
+      "type": "event"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        },
+        {
+          "internalType": "bytes32",
+          "name": "key",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "uint256",
+          "name": "keyPurpose",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "keyType",
+          "type": "uint256"
+        }
+      ],
+      "name": "addKey",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        },
+        {
+          "internalType": "address[]",
+          "name": "operationalWallets",
+          "type": "address[]"
+        }
+      ],
+      "name": "addOperationalWallets",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "operational",
+          "type": "address"
+        },
+        {
+          "internalType": "address",
+          "name": "admin",
+          "type": "address"
+        }
+      ],
+      "name": "createIdentity",
+      "outputs": [
+        {
+          "internalType": "uint72",
+          "name": "",
+          "type": "uint72"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        }
+      ],
+      "name": "deleteIdentity",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "hub",
+      "outputs": [
+        {
+          "internalType": "contract Hub",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "identityStorage",
+      "outputs": [
+        {
+          "internalType": "contract IdentityStorage",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "initialize",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "name",
+      "outputs": [
+        {
+          "internalType": "string",
+          "name": "",
+          "type": "string"
+        }
+      ],
+      "stateMutability": "pure",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        },
+        {
+          "internalType": "bytes32",
+          "name": "key",
+          "type": "bytes32"
+        }
+      ],
+      "name": "removeKey",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bool",
+          "name": "_status",
+          "type": "bool"
+        }
+      ],
+      "name": "setStatus",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "status",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "version",
+      "outputs": [
+        {
+          "internalType": "string",
+          "name": "",
+          "type": "string"
+        }
+      ],
+      "stateMutability": "pure",
+      "type": "function"
+    }
+  ],
+  "transactionHash": "0xd9bbd640503b628d10f2dced702f53459b61dba0efaccc23faa81eadd5aa5e86",
+  "receipt": {
+    "to": null,
+    "from": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    "contractAddress": "0xcD0048A5628B37B8f743cC2FeA18817A29e97270",
+    "transactionIndex": 0,
+    "gasUsed": "1117591",
+    "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "blockHash": "0xdea4d08701fe2f394d44c48775373c9452fd54ff8d981267be5afc9fff049028",
+    "transactionHash": "0xd9bbd640503b628d10f2dced702f53459b61dba0efaccc23faa81eadd5aa5e86",
+    "logs": [],
+    "blockNumber": 233,
+    "cumulativeGasUsed": "1117591",
+    "status": 1,
+    "byzantium": true
+  },
+  "args": [
+    "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+  ],
+  "numDeployments": 1,
+  "solcInputHash": "25f7b97326fdffc4ccdb60a7767831e0",
+  "metadata": "{\"compiler\":{\"version\":\"0.8.20+commit.a1b79de6\"},\"language\":\"Solidity\",\"output\":{\"abi\":[{\"inputs\":[{\"internalType\":\"address\",\"name\":\"hubAddress\",\"type\":\"address\"}],\"stateMutability\":\"nonpayable\",\"type\":\"constructor\"},{\"inputs\":[],\"name\":\"AdminAddressZero\",\"type\":\"error\"},{\"inputs\":[],\"name\":\"AdminEqualsOperational\",\"type\":\"error\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"},{\"internalType\":\"address\",\"name\":\"sender\",\"type\":\"address\"}],\"name\":\"AdminFunctionOnly\",\"type\":\"error\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"}],\"name\":\"CannotDeleteOnlyAdminKey\",\"type\":\"error\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"}],\"name\":\"CannotDeleteOnlyOperationalKey\",\"type\":\"error\"},{\"inputs\":[{\"internalType\":\"bytes32\",\"name\":\"key\",\"type\":\"bytes32\"}],\"name\":\"KeyAlreadyAttached\",\"type\":\"error\"},{\"inputs\":[],\"name\":\"KeyIsEmpty\",\"type\":\"error\"},{\"inputs\":[{\"internalType\":\"bytes32\",\"name\":\"key\",\"type\":\"bytes32\"}],\"name\":\"KeyNotAttached\",\"type\":\"error\"},{\"inputs\":[],\"name\":\"OperationalAddressZero\",\"type\":\"error\"},{\"inputs\":[{\"internalType\":\"bytes32\",\"name\":\"key\",\"type\":\"bytes32\"}],\"name\":\"OperationalKeyTaken\",\"type\":\"error\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"wallet\",\"type\":\"address\"}],\"name\":\"OperationalWalletDuplicate\",\"type\":\"error\"},{\"inputs\":[{\"internalType\":\"string\",\"name\":\"msg\",\"type\":\"string\"}],\"name\":\"UnauthorizedAccess\",\"type\":\"error\"},{\"inputs\":[],\"name\":\"ZeroAddressHub\",\"type\":\"error\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"},{\"indexed\":true,\"internalType\":\"bytes32\",\"name\":\"operationalKey\",\"type\":\"bytes32\"},{\"indexed\":true,\"internalType\":\"bytes32\",\"name\":\"adminKey\",\"type\":\"bytes32\"}],\"name\":\"IdentityCreated\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"}],\"name\":\"IdentityDeleted\",\"type\":\"event\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"},{\"internalType\":\"bytes32\",\"name\":\"key\",\"type\":\"bytes32\"},{\"internalType\":\"uint256\",\"name\":\"keyPurpose\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"keyType\",\"type\":\"uint256\"}],\"name\":\"addKey\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"},{\"internalType\":\"address[]\",\"name\":\"operationalWallets\",\"type\":\"address[]\"}],\"name\":\"addOperationalWallets\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"operational\",\"type\":\"address\"},{\"internalType\":\"address\",\"name\":\"admin\",\"type\":\"address\"}],\"name\":\"createIdentity\",\"outputs\":[{\"internalType\":\"uint72\",\"name\":\"\",\"type\":\"uint72\"}],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"}],\"name\":\"deleteIdentity\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"hub\",\"outputs\":[{\"internalType\":\"contract Hub\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"identityStorage\",\"outputs\":[{\"internalType\":\"contract IdentityStorage\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"initialize\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"name\",\"outputs\":[{\"internalType\":\"string\",\"name\":\"\",\"type\":\"string\"}],\"stateMutability\":\"pure\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"},{\"internalType\":\"bytes32\",\"name\":\"key\",\"type\":\"bytes32\"}],\"name\":\"removeKey\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"bool\",\"name\":\"_status\",\"type\":\"bool\"}],\"name\":\"setStatus\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"status\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"version\",\"outputs\":[{\"internalType\":\"string\",\"name\":\"\",\"type\":\"string\"}],\"stateMutability\":\"pure\",\"type\":\"function\"}],\"devdoc\":{\"kind\":\"dev\",\"methods\":{},\"version\":1},\"userdoc\":{\"kind\":\"user\",\"methods\":{},\"version\":1}},\"settings\":{\"compilationTarget\":{\"contracts/Identity.sol\":\"Identity\"},\"evmVersion\":\"london\",\"libraries\":{},\"metadata\":{\"bytecodeHash\":\"ipfs\",\"useLiteralContent\":true},\"optimizer\":{\"enabled\":true,\"runs\":200},\"remappings\":[],\"viaIR\":true},\"sources\":{\"@openzeppelin/contracts/access/Ownable.sol\":{\"content\":\"// SPDX-License-Identifier: MIT\\n// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)\\n\\npragma solidity ^0.8.20;\\n\\nimport {Context} from \\\"../utils/Context.sol\\\";\\n\\n/**\\n * @dev Contract module which provides a basic access control mechanism, where\\n * there is an account (an owner) that can be granted exclusive access to\\n * specific functions.\\n *\\n * The initial owner is set to the address provided by the deployer. This can\\n * later be changed with {transferOwnership}.\\n *\\n * This module is used through inheritance. It will make available the modifier\\n * `onlyOwner`, which can be applied to your functions to restrict their use to\\n * the owner.\\n */\\nabstract contract Ownable is Context {\\n    address private _owner;\\n\\n    /**\\n     * @dev The caller account is not authorized to perform an operation.\\n     */\\n    error OwnableUnauthorizedAccount(address account);\\n\\n    /**\\n     * @dev The owner is not a valid owner account. (eg. `address(0)`)\\n     */\\n    error OwnableInvalidOwner(address owner);\\n\\n    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);\\n\\n    /**\\n     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.\\n     */\\n    constructor(address initialOwner) {\\n        if (initialOwner == address(0)) {\\n            revert OwnableInvalidOwner(address(0));\\n        }\\n        _transferOwnership(initialOwner);\\n    }\\n\\n    /**\\n     * @dev Throws if called by any account other than the owner.\\n     */\\n    modifier onlyOwner() {\\n        _checkOwner();\\n        _;\\n    }\\n\\n    /**\\n     * @dev Returns the address of the current owner.\\n     */\\n    function owner() public view virtual returns (address) {\\n        return _owner;\\n    }\\n\\n    /**\\n     * @dev Throws if the sender is not the owner.\\n     */\\n    function _checkOwner() internal view virtual {\\n        if (owner() != _msgSender()) {\\n            revert OwnableUnauthorizedAccount(_msgSender());\\n        }\\n    }\\n\\n    /**\\n     * @dev Leaves the contract without owner. It will not be possible to call\\n     * `onlyOwner` functions. Can only be called by the current owner.\\n     *\\n     * NOTE: Renouncing ownership will leave the contract without an owner,\\n     * thereby disabling any functionality that is only available to the owner.\\n     */\\n    function renounceOwnership() public virtual onlyOwner {\\n        _transferOwnership(address(0));\\n    }\\n\\n    /**\\n     * @dev Transfers ownership of the contract to a new account (`newOwner`).\\n     * Can only be called by the current owner.\\n     */\\n    function transferOwnership(address newOwner) public virtual onlyOwner {\\n        if (newOwner == address(0)) {\\n            revert OwnableInvalidOwner(address(0));\\n        }\\n        _transferOwnership(newOwner);\\n    }\\n\\n    /**\\n     * @dev Transfers ownership of the contract to a new account (`newOwner`).\\n     * Internal function without access restriction.\\n     */\\n    function _transferOwnership(address newOwner) internal virtual {\\n        address oldOwner = _owner;\\n        _owner = newOwner;\\n        emit OwnershipTransferred(oldOwner, newOwner);\\n    }\\n}\\n\",\"keccak256\":\"0xff6d0bb2e285473e5311d9d3caacb525ae3538a80758c10649a4d61029b017bb\",\"license\":\"MIT\"},\"@openzeppelin/contracts/utils/Context.sol\":{\"content\":\"// SPDX-License-Identifier: MIT\\n// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)\\n\\npragma solidity ^0.8.20;\\n\\n/**\\n * @dev Provides information about the current execution context, including the\\n * sender of the transaction and its data. While these are generally available\\n * via msg.sender and msg.data, they should not be accessed in such a direct\\n * manner, since when dealing with meta-transactions the account sending and\\n * paying for execution may not be the actual sender (as far as an application\\n * is concerned).\\n *\\n * This contract is only required for intermediate, library-like contracts.\\n */\\nabstract contract Context {\\n    function _msgSender() internal view virtual returns (address) {\\n        return msg.sender;\\n    }\\n\\n    function _msgData() internal view virtual returns (bytes calldata) {\\n        return msg.data;\\n    }\\n\\n    function _contextSuffixLength() internal view virtual returns (uint256) {\\n        return 0;\\n    }\\n}\\n\",\"keccak256\":\"0x493033a8d1b176a037b2cc6a04dad01a5c157722049bbecf632ca876224dd4b2\",\"license\":\"MIT\"},\"contracts/Identity.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nimport {IdentityStorage} from \\\"./storage/IdentityStorage.sol\\\";\\nimport {ContractStatus} from \\\"./abstract/ContractStatus.sol\\\";\\nimport {IInitializable} from \\\"./interfaces/IInitializable.sol\\\";\\nimport {INamed} from \\\"./interfaces/INamed.sol\\\";\\nimport {IVersioned} from \\\"./interfaces/IVersioned.sol\\\";\\nimport {IdentityLib} from \\\"./libraries/IdentityLib.sol\\\";\\n\\ncontract Identity is INamed, IVersioned, ContractStatus, IInitializable {\\n    event IdentityCreated(uint72 indexed identityId, bytes32 indexed operationalKey, bytes32 indexed adminKey);\\n    event IdentityDeleted(uint72 indexed identityId);\\n\\n    string private constant _NAME = \\\"Identity\\\";\\n    // Version history:\\n    //   1.0.0 \\u2014 initial release.\\n    //   1.1.0 \\u2014 `addOperationalWallets` now disambiguates same-identity\\n    //           collisions (primary added by `createIdentity` OR intra-\\n    //           array duplicate within the same call) from cross-identity\\n    //           collisions via the new `OperationalWalletDuplicate(wallet)`\\n    //           error. `OperationalKeyTaken(key)` remains reserved for\\n    //           the cross-identity case. Dropped the dead `KeyIsEmpty()`\\n    //           pre-check (impossible after the zero-address check).\\n    string private constant _VERSION = \\\"10.0.2\\\";\\n\\n    IdentityStorage public identityStorage;\\n\\n    // solhint-disable-next-line no-empty-blocks\\n    constructor(address hubAddress) ContractStatus(hubAddress) {}\\n\\n    modifier onlyAdmin(uint72 identityId) {\\n        _checkAdmin(identityId);\\n        _;\\n    }\\n\\n    function initialize() public onlyHub {\\n        identityStorage = IdentityStorage(hub.getContractAddress(\\\"IdentityStorage\\\"));\\n    }\\n\\n    function name() external pure virtual override returns (string memory) {\\n        return _NAME;\\n    }\\n\\n    function version() external pure virtual override returns (string memory) {\\n        return _VERSION;\\n    }\\n\\n    function createIdentity(address operational, address admin) external onlyContracts returns (uint72) {\\n        if (operational == address(0)) {\\n            revert IdentityLib.OperationalAddressZero();\\n        }\\n        if (admin == address(0)) {\\n            revert IdentityLib.AdminAddressZero();\\n        }\\n        if (admin == operational) {\\n            revert IdentityLib.AdminEqualsOperational();\\n        }\\n\\n        IdentityStorage ids = identityStorage;\\n\\n        uint72 identityId = ids.generateIdentityId();\\n\\n        bytes32 adminKey = keccak256(abi.encodePacked(admin));\\n        ids.addKey(identityId, adminKey, IdentityLib.ADMIN_KEY, IdentityLib.ECDSA);\\n\\n        bytes32 operationalKey = keccak256(abi.encodePacked(operational));\\n        ids.addKey(identityId, operationalKey, IdentityLib.OPERATIONAL_KEY, IdentityLib.ECDSA);\\n\\n        ids.setOperationalKeyIdentityId(operationalKey, identityId);\\n\\n        emit IdentityCreated(identityId, operationalKey, adminKey);\\n\\n        return identityId;\\n    }\\n\\n    function deleteIdentity(uint72 identityId) external onlyContracts {\\n        identityStorage.deleteIdentity(identityId);\\n\\n        emit IdentityDeleted(identityId);\\n    }\\n\\n    function addKey(\\n        uint72 identityId,\\n        bytes32 key,\\n        uint256 keyPurpose,\\n        uint256 keyType\\n    ) external onlyAdmin(identityId) {\\n        if (key == bytes32(0)) {\\n            revert IdentityLib.KeyIsEmpty();\\n        }\\n\\n        IdentityStorage ids = identityStorage;\\n\\n        if (keyPurpose == IdentityLib.OPERATIONAL_KEY) {\\n            if (ids.identityIds(key) != 0) {\\n                revert IdentityLib.OperationalKeyTaken(key);\\n            }\\n            ids.setOperationalKeyIdentityId(key, identityId);\\n        }\\n\\n        bytes32 attachedKey;\\n        (, , attachedKey) = ids.getKey(identityId, key);\\n        if (attachedKey == key) {\\n            revert IdentityLib.KeyAlreadyAttached(key);\\n        }\\n\\n        ids.addKey(identityId, key, keyPurpose, keyType);\\n    }\\n\\n    function removeKey(uint72 identityId, bytes32 key) external onlyAdmin(identityId) {\\n        if (key == bytes32(0)) {\\n            revert IdentityLib.KeyIsEmpty();\\n        }\\n\\n        IdentityStorage ids = identityStorage;\\n\\n        uint256 purpose;\\n        bytes32 attachedKey;\\n        (purpose, , attachedKey) = ids.getKey(identityId, key);\\n        if (attachedKey != key) {\\n            revert IdentityLib.KeyNotAttached(key);\\n        }\\n\\n        if (\\n            ids.getKeysByPurpose(identityId, IdentityLib.ADMIN_KEY).length == 1 &&\\n            ids.keyHasPurpose(identityId, key, IdentityLib.ADMIN_KEY)\\n        ) {\\n            revert IdentityLib.CannotDeleteOnlyAdminKey(identityId);\\n        }\\n\\n        if (\\n            ids.getKeysByPurpose(identityId, IdentityLib.OPERATIONAL_KEY).length == 1 &&\\n            ids.keyHasPurpose(identityId, key, IdentityLib.OPERATIONAL_KEY)\\n        ) {\\n            revert IdentityLib.CannotDeleteOnlyOperationalKey(identityId);\\n        }\\n\\n        ids.removeKey(identityId, key);\\n\\n        if (purpose == IdentityLib.OPERATIONAL_KEY) {\\n            ids.removeOperationalKeyIdentityId(key);\\n        }\\n    }\\n\\n    function addOperationalWallets(uint72 identityId, address[] calldata operationalWallets) external onlyContracts {\\n        IdentityStorage ids = identityStorage;\\n\\n        bytes32 operationalKey;\\n        bytes32 attachedKey;\\n        uint72 existingId;\\n\\n        for (uint256 i; i < operationalWallets.length; ) {\\n            if (operationalWallets[i] == address(0)) {\\n                revert IdentityLib.OperationalAddressZero();\\n            }\\n\\n            operationalKey = keccak256(abi.encodePacked(operationalWallets[i]));\\n\\n            existingId = ids.identityIds(operationalKey);\\n            // Same-identity collision: either the wallet was attached as\\n            // the primary op key by `createIdentity` (the createProfile\\n            // entrypoint passes `msg.sender` to that, then the same\\n            // address inside `operationalWallets` reaches us here), or\\n            // it was added by an earlier iteration of this same loop\\n            // (intra-array duplicate). Both surface as\\n            // `OperationalWalletDuplicate(wallet)` so callers don't\\n            // confuse them with the cross-identity collision below.\\n            if (existingId == identityId) {\\n                revert IdentityLib.OperationalWalletDuplicate(operationalWallets[i]);\\n            }\\n            if (existingId != 0) {\\n                revert IdentityLib.OperationalKeyTaken(operationalKey);\\n            }\\n\\n            ids.setOperationalKeyIdentityId(operationalKey, identityId);\\n\\n            (, , attachedKey) = ids.getKey(identityId, operationalKey);\\n            // Defensive: the key is already attached with some purpose\\n            // (admin OR operational). On the createProfile path this\\n            // fires when an op-wallet entry equals `adminWallet` \\u2014 the\\n            // key was attached as `ADMIN_KEY` by `createIdentity` and\\n            // would now be attached again as `OPERATIONAL_KEY`. The\\n            // surfaced error is `KeyAlreadyAttached(key)`; admin/\\n            // operational wallet reuse is a deliberate operator choice\\n            // and stays un-policed beyond this attachment check.\\n            if (attachedKey == operationalKey) {\\n                revert IdentityLib.KeyAlreadyAttached(operationalKey);\\n            }\\n\\n            ids.addKey(identityId, operationalKey, IdentityLib.OPERATIONAL_KEY, IdentityLib.ECDSA);\\n\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _checkAdmin(uint72 identityId) internal view virtual {\\n        if (\\n            !identityStorage.keyHasPurpose(identityId, keccak256(abi.encodePacked(msg.sender)), IdentityLib.ADMIN_KEY)\\n        ) {\\n            revert IdentityLib.AdminFunctionOnly(identityId, msg.sender);\\n        }\\n    }\\n}\\n\",\"keccak256\":\"0x197a29fe922e21b9b00cac5d238da24043a523b197bb65e31b92850fab04b66e\",\"license\":\"Apache-2.0\"},\"contracts/abstract/ContractStatus.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nimport {HubDependent} from \\\"./HubDependent.sol\\\";\\n\\nabstract contract ContractStatus is HubDependent {\\n    bool public status;\\n\\n    // solhint-disable-next-line no-empty-blocks\\n    constructor(address hubAddress) HubDependent(hubAddress) {}\\n\\n    function setStatus(bool _status) external onlyHub {\\n        status = _status;\\n    }\\n}\\n\",\"keccak256\":\"0x6eeb698feb6e409965b19a80bb5d7cd61488519ed156a80a354d76a65ae5d368\",\"license\":\"Apache-2.0\"},\"contracts/abstract/HubDependent.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nimport {Hub} from \\\"../storage/Hub.sol\\\";\\nimport {HubLib} from \\\"../libraries/HubLib.sol\\\";\\n\\nabstract contract HubDependent {\\n    Hub public hub;\\n\\n    constructor(address hubAddress) {\\n        if (hubAddress == address(0)) {\\n            revert HubLib.ZeroAddressHub();\\n        }\\n\\n        hub = Hub(hubAddress);\\n    }\\n\\n    modifier onlyHub() {\\n        _checkHub();\\n        _;\\n    }\\n\\n    modifier onlyHubOwner() {\\n        _checkHubOwner();\\n        _;\\n    }\\n\\n    modifier onlyContracts() {\\n        _checkHubContract();\\n        _;\\n    }\\n\\n    function _checkHub() internal view virtual {\\n        if (msg.sender != address(hub) && msg.sender != hub.owner()) {\\n            revert HubLib.UnauthorizedAccess(\\\"Only Hub\\\");\\n        }\\n    }\\n\\n    function _checkHubOwner() internal view virtual {\\n        if (msg.sender != hub.owner()) {\\n            revert HubLib.UnauthorizedAccess(\\\"Only Hub Owner\\\");\\n        }\\n    }\\n\\n    function _checkHubContract() internal view virtual {\\n        if (!hub.isContract(msg.sender) && msg.sender != hub.owner()) {\\n            revert HubLib.UnauthorizedAccess(\\\"Only Contracts in Hub\\\");\\n        }\\n    }\\n}\\n\",\"keccak256\":\"0x643f4dcb2699e967c2ffbfb7c412e0973abc1409e0753a35f75c4661b89f977d\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/IContractStatus.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface IContractStatus {\\n    function setStatus(bool _status) external;\\n}\\n\",\"keccak256\":\"0x0eaaee7100a88d51de69ac7ec4d5e58d9bdd2582537476631a0717379ca16c40\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/ICustodian.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface ICustodian {\\n    function getOwners() external view returns (address[] memory);\\n}\\n\",\"keccak256\":\"0x513e0babede5cc394427a5fb941c80c255be8716e24ff5ee4ea7a6e18335e0b0\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/IERC734Extended.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface IERC734Extended {\\n    event KeyAdded(uint72 indexed identityId, bytes32 indexed key, uint256 purpose, uint256 keyType);\\n    event KeyRemoved(uint72 indexed identityId, bytes32 indexed key, uint256 purpose, uint256 keyType);\\n\\n    struct Key {\\n        uint256 purpose; //e.g., ADMIN_KEY = 1, OPERATIONAL_KEY = 2, etc.\\n        uint256 keyType; // e.g. 1 = ECDSA, 2 = RSA, etc.\\n        bytes32 key;\\n    }\\n\\n    function addKey(uint72 identityId, bytes32 _key, uint256 _purpose, uint256 _keyType) external;\\n\\n    function removeKey(uint72 identityId, bytes32 _key) external;\\n\\n    function keyHasPurpose(uint72 identityId, bytes32 _key, uint256 _purpose) external view returns (bool exists);\\n\\n    function getKey(\\n        uint72 identityId,\\n        bytes32 _key\\n    ) external view returns (uint256 purpose, uint256 keyType, bytes32 key);\\n\\n    function getKeysByPurpose(uint72 identityId, uint256 _purpose) external view returns (bytes32[] memory keys);\\n}\\n\",\"keccak256\":\"0x8368bd185b0927b971bd9be5a86f4ae1b6b1ab3bb7196138e188369299d84b2e\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/IInitializable.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface IInitializable {\\n    function initialize() external;\\n}\\n\",\"keccak256\":\"0xad07f8f7bb2bad96f3d5c97ef6673e15574ad11701be1ac9feb94f750c0dee51\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/INamed.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface INamed {\\n    function name() external view returns (string memory);\\n}\\n\",\"keccak256\":\"0x111fc7e3f1b6c9e9da05cecf65d9985177bcface705870536fe409089b89a27c\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/IVersioned.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface IVersioned {\\n    function version() external view returns (string memory);\\n}\\n\",\"keccak256\":\"0x5e104c26deb107969a5bc1f38614f11af0261fc84f1ebbd2ab3bd064b4795de0\",\"license\":\"Apache-2.0\"},\"contracts/libraries/ByteArr.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nlibrary ByteArr {\\n    error IndexOutOfBounds(uint256 index, uint256 length);\\n\\n    function indexOf(bytes32[] storage self, bytes32 item) internal view returns (uint256 index, bool isThere) {\\n        for (uint256 i; i < self.length; i++) {\\n            if (self[i] == item) {\\n                return (i, true);\\n            }\\n        }\\n        return (0, false);\\n    }\\n\\n    function removeByIndex(bytes32[] storage self, uint256 index) internal returns (bytes32[] memory) {\\n        if (index >= self.length) {\\n            revert IndexOutOfBounds(index, self.length);\\n        }\\n\\n        self[index] = self[self.length - 1];\\n        self.pop();\\n\\n        return self;\\n    }\\n\\n    function getFuncHash(bytes storage _data) internal view returns (bytes4) {\\n        bytes4 output;\\n        for (uint256 i; i < 4; i++) {\\n            output |= bytes4(_data[i] & 0xFF) >> (i * 8);\\n        }\\n        return output;\\n    }\\n}\\n\",\"keccak256\":\"0xda22abb602ad11e56607c95de66fe428810c2be38d9cb40a9c99c7334f971750\",\"license\":\"Apache-2.0\"},\"contracts/libraries/HubLib.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nlibrary HubLib {\\n    struct Contract {\\n        string name;\\n        address addr;\\n    }\\n\\n    struct ForwardCallInputArgs {\\n        string contractName;\\n        bytes[] encodedData;\\n    }\\n\\n    error ZeroAddressHub();\\n    error UnauthorizedAccess(string msg);\\n    error InvalidTargetContract(address addr);\\n    error ContractNotRegistered(string contractName);\\n}\\n\",\"keccak256\":\"0xcb693696568e706c95ff32538831d177d379e28f7fd0518b787c1d7a5334d71b\",\"license\":\"Apache-2.0\"},\"contracts/libraries/IdentityLib.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nlibrary IdentityLib {\\n    uint256 public constant ADMIN_KEY = 1;\\n    uint256 public constant OPERATIONAL_KEY = 2;\\n    uint256 public constant ECDSA = 1;\\n    uint256 public constant RSA = 2;\\n\\n    error OperationalAddressZero();\\n    error AdminAddressZero();\\n    error AdminEqualsOperational();\\n    error KeyIsEmpty();\\n    error OperationalKeyTaken(bytes32 key);\\n    error KeyAlreadyAttached(bytes32 key);\\n    error KeyNotAttached(bytes32 key);\\n    error CannotDeleteOnlyAdminKey(uint72 identityId);\\n    error CannotDeleteOnlyOperationalKey(uint72 identityId);\\n    error AdminFunctionOnly(uint72 identityId, address sender);\\n\\n    // Distinct diagnostic for the `Identity.addOperationalWallets`\\n    // same-identity collision case. `existingId == identityId` covers\\n    // both \\\"wallet was added as the primary by `createIdentity`\\\" and\\n    // \\\"wallet was added by an earlier iteration of the same\\n    // `addOperationalWallets` call\\\" \\u2014 both are duplicate attachments\\n    // to the SAME identity from the caller's perspective.\\n    // `OperationalKeyTaken(bytes32)` remains in use for the\\n    // cross-identity (`identityIds[k] != 0 && != identityId`) case.\\n    error OperationalWalletDuplicate(address wallet);\\n}\\n\",\"keccak256\":\"0x75c4626aae9f57c7696b906ecc7e3a0a5ca5178fb4ec3bd3b9954e1143d81f2c\",\"license\":\"Apache-2.0\"},\"contracts/libraries/UnorderedNamedContractDynamicSet.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nlibrary UnorderedNamedContractDynamicSet {\\n    struct Contract {\\n        string name;\\n        address addr;\\n    }\\n\\n    struct Set {\\n        mapping(string => uint256) stringIndexPointers;\\n        mapping(address => uint256) addressIndexPointers;\\n        Contract[] contractList;\\n    }\\n\\n    error EmptyName();\\n    error ZeroAddress();\\n    error ContractAlreadyExists(string name);\\n    error AddressAlreadyInSet(address addr);\\n    error ContractDoesNotExist(string name);\\n    error AddressDoesNotExist(address addr);\\n\\n    function append(UnorderedNamedContractDynamicSet.Set storage self, string calldata name, address addr) internal {\\n        if (keccak256(abi.encodePacked(name)) == keccak256(abi.encodePacked(\\\"\\\"))) revert EmptyName();\\n        if (addr == address(0)) revert ZeroAddress();\\n        if (exists(self, name)) revert ContractAlreadyExists(name);\\n        if (self.contractList.length > 0 && (self.addressIndexPointers[addr] != 0 || self.contractList[0].addr == addr))\\n            revert AddressAlreadyInSet(addr);\\n\\n        self.stringIndexPointers[name] = size(self);\\n        self.addressIndexPointers[addr] = size(self);\\n        self.contractList.push(UnorderedNamedContractDynamicSet.Contract(name, addr));\\n    }\\n\\n    function update(UnorderedNamedContractDynamicSet.Set storage self, string calldata name, address addr) internal {\\n        if (addr == address(0)) revert ZeroAddress();\\n        if (!exists(self, name)) revert ContractDoesNotExist(name);\\n\\n        address currentAddr = self.contractList[self.stringIndexPointers[name]].addr;\\n        if (currentAddr == addr) {\\n            // Idempotent: same address already registered for this name (e.g. re-run deploy in tests).\\n            return;\\n        }\\n        if (self.contractList.length > 0 && (self.addressIndexPointers[addr] != 0 || self.contractList[0].addr == addr))\\n            revert AddressAlreadyInSet(addr);\\n\\n        delete self.addressIndexPointers[currentAddr];\\n        self.addressIndexPointers[addr] = self.stringIndexPointers[name];\\n        self.contractList[self.stringIndexPointers[name]].addr = addr;\\n    }\\n\\n    function remove(UnorderedNamedContractDynamicSet.Set storage self, string calldata name) internal {\\n        if (!exists(self, name)) revert ContractDoesNotExist(name);\\n\\n        uint256 contractToRemoveIndex = self.stringIndexPointers[name];\\n\\n        delete self.addressIndexPointers[self.contractList[contractToRemoveIndex].addr];\\n\\n        UnorderedNamedContractDynamicSet.Contract memory contractToMove = self.contractList[size(self) - 1];\\n\\n        self.stringIndexPointers[contractToMove.name] = contractToRemoveIndex;\\n        self.addressIndexPointers[contractToMove.addr] = contractToRemoveIndex;\\n        self.contractList[contractToRemoveIndex] = contractToMove;\\n\\n        delete self.stringIndexPointers[name];\\n        self.contractList.pop();\\n    }\\n\\n    function remove(UnorderedNamedContractDynamicSet.Set storage self, address addr) internal {\\n        if (!exists(self, addr)) revert AddressDoesNotExist(addr);\\n\\n        uint256 contractToRemoveIndex = self.addressIndexPointers[addr];\\n\\n        delete self.stringIndexPointers[self.contractList[contractToRemoveIndex].name];\\n\\n        UnorderedNamedContractDynamicSet.Contract memory contractToMove = self.contractList[size(self) - 1];\\n\\n        self.stringIndexPointers[contractToMove.name] = contractToRemoveIndex;\\n        self.addressIndexPointers[contractToMove.addr] = contractToRemoveIndex;\\n        self.contractList[contractToRemoveIndex] = contractToMove;\\n\\n        delete self.addressIndexPointers[addr];\\n        self.contractList.pop();\\n    }\\n\\n    function get(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        string calldata name\\n    ) internal view returns (UnorderedNamedContractDynamicSet.Contract memory) {\\n        if (!exists(self, name)) revert ContractDoesNotExist(name);\\n\\n        return self.contractList[self.stringIndexPointers[name]];\\n    }\\n\\n    function get(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        address addr\\n    ) internal view returns (UnorderedNamedContractDynamicSet.Contract memory) {\\n        if (!exists(self, addr)) revert AddressDoesNotExist(addr);\\n\\n        return self.contractList[self.addressIndexPointers[addr]];\\n    }\\n\\n    function get(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        uint256 index\\n    ) internal view returns (UnorderedNamedContractDynamicSet.Contract memory) {\\n        return self.contractList[index];\\n    }\\n\\n    function getAll(\\n        UnorderedNamedContractDynamicSet.Set storage self\\n    ) internal view returns (UnorderedNamedContractDynamicSet.Contract[] memory) {\\n        return self.contractList;\\n    }\\n\\n    function getIndex(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        string calldata name\\n    ) internal view returns (uint256) {\\n        return self.stringIndexPointers[name];\\n    }\\n\\n    function getIndex(UnorderedNamedContractDynamicSet.Set storage self, address addr) internal view returns (uint256) {\\n        return self.addressIndexPointers[addr];\\n    }\\n\\n    function exists(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        string calldata name\\n    ) internal view returns (bool) {\\n        if (size(self) == 0) {\\n            return false;\\n        }\\n        return\\n            keccak256(abi.encodePacked(self.contractList[self.stringIndexPointers[name]].name)) ==\\n            keccak256(abi.encodePacked(name));\\n    }\\n\\n    function exists(UnorderedNamedContractDynamicSet.Set storage self, address addr) internal view returns (bool) {\\n        if (size(self) == 0) {\\n            return false;\\n        }\\n        return addr == self.contractList[self.addressIndexPointers[addr]].addr;\\n    }\\n\\n    function size(UnorderedNamedContractDynamicSet.Set storage self) internal view returns (uint256) {\\n        return self.contractList.length;\\n    }\\n}\\n\",\"keccak256\":\"0x51b09c4bc2d3342e78c0a77eceff9ba5a7e694ba663535abec0e859c5e32b5ab\",\"license\":\"Apache-2.0\"},\"contracts/storage/Hub.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nimport {IContractStatus} from \\\"../interfaces/IContractStatus.sol\\\";\\nimport {ICustodian} from \\\"../interfaces/ICustodian.sol\\\";\\nimport {IInitializable} from \\\"../interfaces/IInitializable.sol\\\";\\nimport {INamed} from \\\"../interfaces/INamed.sol\\\";\\nimport {IVersioned} from \\\"../interfaces/IVersioned.sol\\\";\\nimport {HubLib} from \\\"../libraries/HubLib.sol\\\";\\nimport {UnorderedNamedContractDynamicSet} from \\\"../libraries/UnorderedNamedContractDynamicSet.sol\\\";\\nimport {Ownable} from \\\"@openzeppelin/contracts/access/Ownable.sol\\\";\\n\\ncontract Hub is INamed, IVersioned, Ownable {\\n    using UnorderedNamedContractDynamicSet for UnorderedNamedContractDynamicSet.Set;\\n\\n    event NewContract(string contractName, address newContractAddress);\\n    event ContractChanged(string contractName, address newContractAddress);\\n    event NewAssetStorage(string contractName, address newContractAddress);\\n    event AssetStorageChanged(string contractName, address newContractAddress);\\n    event ContractRemoved(string contractName, address contractAddress);\\n    event AssetStorageRemoved(string contractName, address contractAddress);\\n\\n    string private constant _NAME = \\\"Hub\\\";\\n    string private constant _VERSION = \\\"1.0.0\\\";\\n\\n    UnorderedNamedContractDynamicSet.Set internal contractSet;\\n    UnorderedNamedContractDynamicSet.Set internal assetStorageSet;\\n\\n    constructor() Ownable(msg.sender) {}\\n\\n    // @dev Only transactions by HubController owner or one of the owners of the MultiSig Wallet\\n    modifier onlyOwnerOrMultiSigOwner() {\\n        _checkOwnerOrMultiSigOwner();\\n        _;\\n    }\\n\\n    function name() external pure virtual override returns (string memory) {\\n        return _NAME;\\n    }\\n\\n    function version() external pure virtual override returns (string memory) {\\n        return _VERSION;\\n    }\\n\\n    function setContractAddress(\\n        string calldata contractName,\\n        address newContractAddress\\n    ) external onlyOwnerOrMultiSigOwner {\\n        _setContractAddress(contractName, newContractAddress);\\n    }\\n\\n    function setAssetStorageAddress(string calldata assetStorageName, address assetStorageAddress) external onlyOwner {\\n        _setAssetStorageAddress(assetStorageName, assetStorageAddress);\\n    }\\n\\n    function removeContractByName(string calldata contractName) external onlyOwner {\\n        if (contractSet.exists(contractName)) {\\n            address contractAddress = contractSet.get(contractName).addr;\\n\\n            contractSet.remove(contractName);\\n\\n            emit ContractRemoved(contractName, contractAddress);\\n        }\\n    }\\n\\n    function removeContractByAddress(address contractAddress) external onlyOwner {\\n        if (contractSet.exists(contractAddress)) {\\n            string memory contractName = contractSet.get(contractAddress).name;\\n\\n            contractSet.remove(contractAddress);\\n\\n            emit ContractRemoved(contractName, contractAddress);\\n        }\\n    }\\n\\n    function removeAssetStorageByName(string calldata assetStorageName) external onlyOwner {\\n        if (assetStorageSet.exists(assetStorageName)) {\\n            address assetStorageAddress = assetStorageSet.get(assetStorageName).addr;\\n\\n            assetStorageSet.remove(assetStorageName);\\n\\n            emit AssetStorageRemoved(assetStorageName, assetStorageAddress);\\n        }\\n    }\\n\\n    function removeAssetStorageByAddress(address assetStorageAddress) external onlyOwner {\\n        if (assetStorageSet.exists(assetStorageAddress)) {\\n            string memory assetStorageName = assetStorageSet.get(assetStorageAddress).name;\\n\\n            assetStorageSet.remove(assetStorageAddress);\\n\\n            emit AssetStorageRemoved(assetStorageName, assetStorageAddress);\\n        }\\n    }\\n\\n    function getContractAddress(string calldata contractName) external view returns (address) {\\n        return contractSet.get(contractName).addr;\\n    }\\n\\n    function getAssetStorageAddress(string calldata assetStorageName) external view returns (address) {\\n        return assetStorageSet.get(assetStorageName).addr;\\n    }\\n\\n    function getAllContracts() external view returns (UnorderedNamedContractDynamicSet.Contract[] memory) {\\n        return contractSet.getAll();\\n    }\\n\\n    function getAllAssetStorages() external view returns (UnorderedNamedContractDynamicSet.Contract[] memory) {\\n        return assetStorageSet.getAll();\\n    }\\n\\n    function isContract(string calldata contractName) external view returns (bool) {\\n        return contractSet.exists(contractName);\\n    }\\n\\n    function isContract(address selectedContractAddress) external view returns (bool) {\\n        return contractSet.exists(selectedContractAddress);\\n    }\\n\\n    function isAssetStorage(string calldata assetStorageName) external view returns (bool) {\\n        return assetStorageSet.exists(assetStorageName);\\n    }\\n\\n    function isAssetStorage(address assetStorageAddress) external view returns (bool) {\\n        return assetStorageSet.exists(assetStorageAddress);\\n    }\\n\\n    /**\\n     * @dev Forwards a function call to a specified target contract.\\n     * @notice This function can only be called by the contract owner or a multisig owner.\\n     * @param target The address of the target contract.\\n     * @param data The calldata containing the function signature and arguments for the target contract's function.\\n     * @return result The return data of the target contract's function call.\\n     */\\n    function forwardCall(address target, bytes calldata data) public onlyOwnerOrMultiSigOwner returns (bytes memory) {\\n        // Check if the target contract is registered in the Hub\\n        if (!contractSet.exists(target) && !assetStorageSet.exists(target)) {\\n            revert HubLib.InvalidTargetContract(target);\\n        }\\n\\n        // Perform the function call to the target contract with the specified calldata\\n        (bool success, bytes memory result) = target.call{value: 0}(data);\\n\\n        // If the call is unsuccessful, revert the transaction with the original revert reason\\n        if (!success) {\\n            assembly {\\n                // Load the free memory pointer from memory slot 0x40\\n                // Memory slot 0x40 is conventionally used to store the free memory pointer in Solidity, which points\\n                // to the next available memory slot for storing data during the execution of a contract function.\\n                let ptr := mload(0x40)\\n                // Get the size of the return data from the unsuccessful call\\n                let size := returndatasize()\\n                // Copy the return data to the memory location pointed to by ptr\\n                returndatacopy(ptr, 0, size)\\n                // Revert the transaction with the return data as the revert reason\\n                revert(ptr, size)\\n            }\\n        }\\n\\n        return result;\\n    }\\n\\n    function setAndReinitializeContracts(\\n        HubLib.Contract[] calldata newContracts,\\n        HubLib.Contract[] calldata newAssetStorageContracts,\\n        address[] calldata contractsToReinitialize,\\n        HubLib.ForwardCallInputArgs[] calldata forwardCallsData\\n    ) external onlyOwnerOrMultiSigOwner {\\n        _setContracts(newContracts);\\n        _setAssetStorageContracts(newAssetStorageContracts);\\n        _reinitializeContracts(contractsToReinitialize);\\n        _forwardCalls(forwardCallsData);\\n    }\\n\\n    function _setContractAddress(string calldata contractName, address newContractAddress) internal {\\n        if (contractSet.exists(contractName)) {\\n            contractSet.update(contractName, newContractAddress);\\n\\n            address oldContractAddress = contractSet.get(contractName).addr;\\n            if (_isContract(oldContractAddress)) {\\n                try IContractStatus(oldContractAddress).setStatus(false) {\\n                    // success\\n                } catch {\\n                    // Best-effort: contract may not implement IContractStatus; ignore.\\n                }\\n            }\\n\\n            emit ContractChanged(contractName, newContractAddress);\\n        } else {\\n            contractSet.append(contractName, newContractAddress);\\n\\n            emit NewContract(contractName, newContractAddress);\\n        }\\n\\n        if (_isContract(newContractAddress)) {\\n            try IContractStatus(newContractAddress).setStatus(true) {\\n                // success\\n            } catch {\\n                // Best-effort: contract may not implement IContractStatus; ignore.\\n            }\\n        }\\n\\n        emit NewContract(contractName, newContractAddress);\\n    }\\n\\n    function _setContracts(HubLib.Contract[] calldata newContracts) internal {\\n        for (uint256 i; i < newContracts.length; ) {\\n            _setContractAddress(newContracts[i].name, newContracts[i].addr);\\n\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _setAssetStorageAddress(string calldata assetStorageName, address assetStorageAddress) internal {\\n        if (assetStorageSet.exists(assetStorageName)) {\\n            emit AssetStorageChanged(assetStorageName, assetStorageAddress);\\n            assetStorageSet.update(assetStorageName, assetStorageAddress);\\n        } else {\\n            emit NewAssetStorage(assetStorageName, assetStorageAddress);\\n            assetStorageSet.append(assetStorageName, assetStorageAddress);\\n        }\\n    }\\n\\n    function _setAssetStorageContracts(HubLib.Contract[] calldata newAssetStorageContracts) internal {\\n        for (uint256 i; i < newAssetStorageContracts.length; ) {\\n            _setAssetStorageAddress(newAssetStorageContracts[i].name, newAssetStorageContracts[i].addr);\\n\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _reinitializeContracts(address[] calldata contractsToReinitialize) internal {\\n        for (uint256 i; i < contractsToReinitialize.length; ) {\\n            IInitializable(contractsToReinitialize[i]).initialize();\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _forwardCalls(HubLib.ForwardCallInputArgs[] calldata forwardCallsData) internal {\\n        for (uint256 i; i < forwardCallsData.length; ) {\\n            address contractAddress;\\n\\n            // Try to get the contract address using getContractAddress\\n            try this.getContractAddress(forwardCallsData[i].contractName) returns (address addr) {\\n                contractAddress = addr;\\n            } catch {\\n                // If getContractAddress fails, try getAssetStorageAddress\\n                try this.getAssetStorageAddress(forwardCallsData[i].contractName) returns (address addr) {\\n                    contractAddress = addr;\\n                } catch {\\n                    revert HubLib.ContractNotRegistered(forwardCallsData[i].contractName);\\n                }\\n            }\\n            for (uint256 j; j < forwardCallsData[i].encodedData.length; ) {\\n                forwardCall(contractAddress, forwardCallsData[i].encodedData[j]);\\n                unchecked {\\n                    j++;\\n                }\\n            }\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _isContract(address addr) internal view returns (bool) {\\n        uint256 size;\\n        assembly {\\n            size := extcodesize(addr)\\n        }\\n        return size > 0;\\n    }\\n\\n    function _isMultiSigOwner(address multiSigAddress) internal view returns (bool) {\\n        try ICustodian(multiSigAddress).getOwners() returns (address[] memory multiSigOwners) {\\n            for (uint256 i = 0; i < multiSigOwners.length; i++) {\\n                if (msg.sender == multiSigOwners[i]) {\\n                    return true;\\n                }\\n            }\\n        } catch {\\n            // Not a multisig or call reverted; treat as not owner.\\n        }\\n\\n        return false;\\n    }\\n\\n    function _checkOwnerOrMultiSigOwner() internal view virtual {\\n        address hubOwner = owner();\\n        if (msg.sender != hubOwner && !_isMultiSigOwner(hubOwner)) {\\n            revert HubLib.UnauthorizedAccess(\\\"Only Hub Owner or Multisig Owner\\\");\\n        }\\n    }\\n}\\n\",\"keccak256\":\"0x732252bb857277a35ab314beef2dbaceb5f96ce2f6d3b83a224927e503609def\",\"license\":\"Apache-2.0\"},\"contracts/storage/IdentityStorage.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nimport {HubDependent} from \\\"../abstract/HubDependent.sol\\\";\\nimport {IERC734Extended} from \\\"../interfaces/IERC734Extended.sol\\\";\\nimport {INamed} from \\\"../interfaces/INamed.sol\\\";\\nimport {IVersioned} from \\\"../interfaces/IVersioned.sol\\\";\\nimport {ByteArr} from \\\"../libraries/ByteArr.sol\\\";\\nimport {IdentityLib} from \\\"../libraries/IdentityLib.sol\\\";\\nimport {IdentityStorage} from \\\"../storage/IdentityStorage.sol\\\";\\n\\ncontract IdentityStorage is IERC734Extended, INamed, IVersioned, HubDependent {\\n    using ByteArr for bytes32[];\\n\\n    string private constant _NAME = \\\"IdentityStorage\\\";\\n    string private constant _VERSION = \\\"10.0.2\\\";\\n\\n    uint72 public lastIdentityId;\\n\\n    struct Identity {\\n        mapping(bytes32 => Key) keys;\\n        mapping(uint256 => bytes32[]) keysByPurpose;\\n    }\\n\\n    // operationalKey => identityId\\n    mapping(bytes32 => uint72) public identityIds;\\n    // identityId => Identity\\n    mapping(uint72 => Identity) internal identities;\\n\\n    constructor(address hubAddress) HubDependent(hubAddress) {}\\n\\n    function name() external pure virtual override returns (string memory) {\\n        return _NAME;\\n    }\\n\\n    function version() external pure virtual override returns (string memory) {\\n        return _VERSION;\\n    }\\n\\n    function deleteIdentity(uint72 identityId) external virtual onlyContracts {\\n        bytes32[] memory operationalKeys = identities[identityId].keysByPurpose[IdentityLib.OPERATIONAL_KEY];\\n        uint256 operationalKeysNumber = operationalKeys.length;\\n\\n        for (uint256 i; i < operationalKeysNumber; ) {\\n            delete identityIds[operationalKeys[i]];\\n            unchecked {\\n                i++;\\n            }\\n        }\\n\\n        delete identities[identityId];\\n    }\\n\\n    function addKey(\\n        uint72 identityId,\\n        bytes32 _key,\\n        uint256 _purpose,\\n        uint256 _type\\n    ) external virtual override onlyContracts {\\n        Identity storage identity = identities[identityId];\\n        identity.keys[_key].purpose = _purpose;\\n        identity.keys[_key].keyType = _type;\\n        identity.keys[_key].key = _key;\\n        identity.keysByPurpose[_purpose].push(_key);\\n\\n        emit KeyAdded(identityId, _key, _purpose, _type);\\n    }\\n\\n    function removeKey(uint72 identityId, bytes32 _key) external virtual override onlyContracts {\\n        IdentityStorage.Identity storage identity = identities[identityId];\\n\\n        uint256 index;\\n        (index, ) = identity.keysByPurpose[identity.keys[_key].purpose].indexOf(_key);\\n        identity.keysByPurpose[identity.keys[_key].purpose].removeByIndex(index);\\n\\n        emit KeyRemoved(identityId, identity.keys[_key].key, identity.keys[_key].purpose, identity.keys[_key].keyType);\\n\\n        delete identity.keys[_key];\\n    }\\n\\n    function keyHasPurpose(\\n        uint72 identityId,\\n        bytes32 _key,\\n        uint256 _purpose\\n    ) external view virtual override returns (bool) {\\n        return identities[identityId].keys[_key].purpose == _purpose;\\n    }\\n\\n    function getKey(\\n        uint72 identityId,\\n        bytes32 _key\\n    ) external view virtual override returns (uint256, uint256, bytes32) {\\n        return (\\n            identities[identityId].keys[_key].purpose,\\n            identities[identityId].keys[_key].keyType,\\n            identities[identityId].keys[_key].key\\n        );\\n    }\\n\\n    function getKeysByPurpose(\\n        uint72 identityId,\\n        uint256 _purpose\\n    ) external view virtual override returns (bytes32[] memory) {\\n        return identities[identityId].keysByPurpose[_purpose];\\n    }\\n\\n    function getIdentityId(address operational) external view returns (uint72) {\\n        return identityIds[keccak256(abi.encodePacked(operational))];\\n    }\\n\\n    function setOperationalKeyIdentityId(bytes32 operationalKey, uint72 identityId) external virtual onlyContracts {\\n        identityIds[operationalKey] = identityId;\\n    }\\n\\n    function removeOperationalKeyIdentityId(bytes32 operationalKey) external virtual onlyContracts {\\n        delete identityIds[operationalKey];\\n    }\\n\\n    function setLastIdentityId(uint72 identityId) external virtual onlyContracts {\\n        lastIdentityId = identityId;\\n    }\\n\\n    function generateIdentityId() external virtual onlyContracts returns (uint72) {\\n        unchecked {\\n            return ++lastIdentityId;\\n        }\\n    }\\n}\\n\",\"keccak256\":\"0xef5c32eff475aef41483352683fad4e27f33e2bb9d4a0b891cf02e1987acce91\",\"license\":\"Apache-2.0\"}},\"version\":1}",
+  "bytecode": "0x60803461008c57601f61137038819003918201601f19168301916001600160401b038311848410176100915780849260209460405283398101031261008c57516001600160a01b0381169081900361008c57801561007a57600080546001600160a01b0319169190911790556040516112c890816100a88239f35b60405163a10d827b60e01b8152600490fd5b600080fd5b634e487b7160e01b600052604160045260246000fdfe6040608081526004908136101561001557600080fd5b600091823560e01c9081622236a214610b4457816306fdde0314610b04578163200d2ed214610adf578163365a86fc14610ab757816354fd4d5014610a755781635c40f6f414610a3457816367ac664f146106df5781638129fc1c14610624578163bee3b94e14610404578163d10e73ab14610182578163dc06a39d146100d1575063f11abfd8146100a657600080fd5b346100cd57816003193601126100cd5760015490516001600160a01b039091168152602090f35b5080fd5b9190503461017e57602036600319011261017e576100ed610e3e565b906100f6611196565b6001546001600160a01b0316918490833b156100cd5760246001600160481b0391838551968794859363dc06a39d60e01b85521680998401525af19081156101755750610166575b507f8eb76f325ff8b1aeeacdc5189acc141ef54246ceae65dc6d5458e385388472a88280a280f35b61016f90610ea2565b3861013e565b513d85823e3d90fd5b8280fd5b839150346100cd57826003193601126100cd578035906001600160a01b038083169081840361040057602435918183168084036103fc576101c1611196565b81156103ec5780156103dc57146103cc5760015416948051633f2f9ac560e21b8152602096878286818a855af19182156103c2578792610393575b508251888101906001600160601b0319809660601b1682526014815261022181610ecc565b51902094813b1561035957835196635f71dca760e11b958689526001600160481b03851698898482015288602482015260016044820152600160648201528a8160848183895af180156103895761037a575b508551908b82019260601b1682526014815261028e81610ecc565b51902094823b1561037657845190815287828201528560248201526002604482015260016064820152888160848183875af1801561036c5761035d575b50813b1561035957835163383a4c6560e11b81529081018581526001600160481b039093166020840152918791839182908490829060400103925af1801561034f57917f075aca39edba283f02f8c21a516c19dd1208d3b3d647f7012be49fe0e8dc2fd7918693610340575b50519580a48152f35b61034990610ea2565b88610337565b82513d88823e3d90fd5b8780fd5b61036690610ea2565b896102cb565b85513d8b823e3d90fd5b8880fd5b61038390610ea2565b8b610273565b87513d8d823e3d90fd5b6103b4919250883d8a116103bb575b6103ac8183610ee8565b810190610f29565b90886101fc565b503d6103a2565b83513d89823e3d90fd5b855163225c752360e11b81528390fd5b87516339bfddb560e01b81528590fd5b8751639134a1c160e01b81528590fd5b8680fd5b8480fd5b9190503461017e57608036600319011261017e57610420610e3e565b602435906044359061043181611031565b8215610614576001546001600160a01b03169260028314610550575b845163345914fd60e11b81526001600160481b03831687820190815260208101839052606090829081906040010381885afa908115610546579082918991610515575b50146104ff579083929187943b15610400576001600160481b039360849386928851998a978896635f71dca760e11b885216908601526024850152604484015260643560648401525af19081156104f657506104ea575080f35b6104f390610ea2565b80f35b513d84823e3d90fd5b85602491865191633dfa6b7760e11b8352820152fd5b610536915060603d811161053f575b61052e8183610ee8565b810190610f48565b91505038610490565b503d610524565b86513d8a823e3d90fd5b8451631fc2b3ab60e01b8152868101829052602081602481885afa90811561054657906001600160481b039189916105f6575b50166105e057833b156103fc57845163383a4c6560e11b81528681018281526001600160481b0384166020820152889082908190604001038183895af18015610546576105d1575b5061044d565b6105da90610ea2565b386105cb565b8560249186519163b72c08d360e01b8352820152fd5b61060e915060203d81116103bb576103ac8183610ee8565b38610583565b5050505163ad55a66560e01b8152fd5b9190503461017e578260031936011261017e5761063f6110ee565b82548151630110ceef60e21b81526020938101849052600f60248201526e4964656e7469747953746f7261676560881b60448201526001600160a01b039390918290606490829087165afa918215610175575083916106b1575b50166001600160601b0360a01b600154161760015580f35b6106d2915060203d81116106d8575b6106ca8183610ee8565b810190610f0a565b38610699565b503d6106c0565b839150346100cd57826003193601126100cd576106fa610e3e565b92602480359061070986611031565b8115610a2557600154835163345914fd60e11b81526001600160481b038816868201908152602081018590526001600160a01b039092169591606090829081906040010381895afa8015610a1b578490889289916109f5575b50036109e057845163238ce1ef60e11b8082526001600160481b038a168483018190526001868401529189816044818c5afa9081156109bc57906001918b916109c6575b50511480610963575b61094f578651908152818482015260028582015288816044818b5afa90811561092357906001918a9161092d575b505114806108ba575b6108a757508697869795963b156108a35786516367ac664f60e01b81526001600160481b03909116838201908152602081018690528690829081906040010381838c5af1801561089957906002929161088a575b5014610844578380f35b853b15610886578385519687948593620ef85560ea1b85528401525af19081156104f65750610877575b80828180808380f35b61088090610ea2565b8161086e565b8380fd5b61089390610ea2565b8961083a565b87513d88823e3d90fd5b8580fd5b85516342513a3360e01b81529283015250fd5b508551631af27dbd60e11b815281848201528585820152600260448201526020816064818b5afa9081156109235789916108f5575b506107e6565b610916915060203d811161091c575b61090e8183610ee8565b810190610fdf565b8a6108ef565b503d610904565b87513d8b823e3d90fd5b61094991503d808c833e6109418183610ee8565b810190610f63565b8b6107dd565b508551633f28e31760e01b81529283015250fd5b508651631af27dbd60e11b815282858201528686820152600160448201526020816064818c5afa9081156109bc578a9161099e575b506107af565b6109b6915060203d811161091c5761090e8183610ee8565b8b610998565b88513d8c823e3d90fd5b6109da91503d808d833e6109418183610ee8565b8c6107a6565b508351635e570dd560e01b8152908101839052fd5b9050610a1091925060603d811161053f5761052e8183610ee8565b92919050918a610762565b85513d89823e3d90fd5b50505163ad55a66560e01b8152fd5b8390346100cd5760203660031901126100cd57358015158091036100cd57610a5a6110ee565b815460ff60a01b191660a09190911b60ff60a01b1617815580f35b5050346100cd57816003193601126100cd578051610ab391610a9682610ecc565b600682526518981718171960d11b60208301525191829182610e59565b0390f35b5050346100cd57816003193601126100cd57905490516001600160a01b039091168152602090f35b5050346100cd57816003193601126100cd5760ff6020925460a01c1690519015158152f35b5050346100cd57816003193601126100cd578051610ab391610b2582610ecc565b60088252674964656e7469747960c01b60208301525191829182610e59565b90503461017e578160031936011261017e57610b5e610e3e565b9160249081359267ffffffffffffffff908185116103fc57366023860112156103fc57848101359182116103fc57838501948436918460051b0101116103fc57610ba9949194611196565b6001805490966001600160481b03808216946001600160a01b03938416939192918b5b8a8110610bd7578c80f35b81610beb610be6838e87610ff7565b61101d565b1615610e2e57868d610c01610be6848f88610ff7565b90888d8d8051906020928284809401906060986001600160601b0319908a1b16825260148152610c3081610ecc565b519020978892519586938492631fc2b3ab60e01b84528301525afa928315610e2357908a93929192610e06575b5050168a8114610dde57610dc8578e90883b156100cd578b5163383a4c6560e11b81528a81018481526001600160481b03891660208201528390829081900360400181838e5af18015610dbe5791888c8f610ce99084958997610daf575b5051958693849363345914fd60e11b85528401602090939291936001600160481b0360408201951681520152565b03818d5afa928315610da457908493929192610d84575b505014610d6f57863b15610d6b57895190635f71dca760e11b825289898301528b820152600260448201528c60648201528d81608481838b5af18015610d5f57908d9291610d50575b5001610bcc565b610d5990610ea2565b38610d49565b8e8b51903d90823e3d90fd5b8d80fd5b878b918b5191633dfa6b7760e11b8352820152fd5b610d9a9250803d1061053f5761052e8183610ee8565b9150503880610d00565b8d51903d90823e3d90fd5b610db890610ea2565b38610cbb565b8d513d85823e3d90fd5b8a5163b72c08d360e01b8152808a018390528c90fd5b508b8b8a8f610df2610be6888a938c610ff7565b9251632f0e925360e01b8152921690820152fd5b610e1c9250803d106103bb576103ac8183610ee8565b3880610c5d565b8e51903d90823e3d90fd5b8851639134a1c160e01b81528790fd5b600435906001600160481b0382168203610e5457565b600080fd5b6020808252825181830181905290939260005b828110610e8e57505060409293506000838284010152601f8019910116010190565b818101860151848201604001528501610e6c565b67ffffffffffffffff8111610eb657604052565b634e487b7160e01b600052604160045260246000fd5b6040810190811067ffffffffffffffff821117610eb657604052565b90601f8019910116810190811067ffffffffffffffff821117610eb657604052565b90816020910312610e5457516001600160a01b0381168103610e545790565b90816020910312610e5457516001600160481b0381168103610e545790565b90816060910312610e54578051916040602083015192015190565b906020908183820312610e5457825167ffffffffffffffff93848211610e54570181601f82011215610e54578051938411610eb6578360051b9060405194610fad85840187610ee8565b85528380860192820101928311610e54578301905b828210610fd0575050505090565b81518152908301908301610fc2565b90816020910312610e5457518015158103610e545790565b91908110156110075760051b0190565b634e487b7160e01b600052603260045260246000fd5b356001600160a01b0381168103610e545790565b60018060a01b036001541660206001600160481b036064604051838101903360601b82526014815261106281610ecc565b519020946040519485938492631af27dbd60e11b845216968760048401526024830152600160448301525afa9081156110e2576000916110c4575b50156110a65750565b60449060405190635181719f60e11b82526004820152336024820152fd5b6110dc915060203d811161091c5761090e8183610ee8565b3861109d565b6040513d6000823e3d90fd5b6000546001600160a01b0390811633811415919082611141575b505061111057565b60405163f0b1bddb60e01b815260206004820152600860248201526727b7363c90243ab160c11b6044820152606490fd5b604051638da5cb5b60e01b8152919250602090829060049082905afa9081156110e257600091611178575b50163314153880611108565b611190915060203d81116106d8576106ca8183610ee8565b3861116c565b600054604051631627905560e01b81523360048201526020916001600160a01b03908116918381602481865afa80156110e2578491600091611275575b50159283611223575b5050506111e65750565b6064906040519063f0b1bddb60e01b82526004820152601560248201527427b7363c9021b7b73a3930b1ba399034b710243ab160591b6044820152fd5b604051638da5cb5b60e01b8152929350829060049082905afa9081156110e257600091611258575b50163314153882816111dc565b61126f9150833d85116106d8576106ca8183610ee8565b3861124b565b61128c9150823d841161091c5761090e8183610ee8565b386111d356fea2646970667358221220789245a4efd9f34190513b7ae6d8f6684c3a5bb660ab73b0bb7f5378cec41c8564736f6c63430008140033",
+  "deployedBytecode": "0x6040608081526004908136101561001557600080fd5b600091823560e01c9081622236a214610b4457816306fdde0314610b04578163200d2ed214610adf578163365a86fc14610ab757816354fd4d5014610a755781635c40f6f414610a3457816367ac664f146106df5781638129fc1c14610624578163bee3b94e14610404578163d10e73ab14610182578163dc06a39d146100d1575063f11abfd8146100a657600080fd5b346100cd57816003193601126100cd5760015490516001600160a01b039091168152602090f35b5080fd5b9190503461017e57602036600319011261017e576100ed610e3e565b906100f6611196565b6001546001600160a01b0316918490833b156100cd5760246001600160481b0391838551968794859363dc06a39d60e01b85521680998401525af19081156101755750610166575b507f8eb76f325ff8b1aeeacdc5189acc141ef54246ceae65dc6d5458e385388472a88280a280f35b61016f90610ea2565b3861013e565b513d85823e3d90fd5b8280fd5b839150346100cd57826003193601126100cd578035906001600160a01b038083169081840361040057602435918183168084036103fc576101c1611196565b81156103ec5780156103dc57146103cc5760015416948051633f2f9ac560e21b8152602096878286818a855af19182156103c2578792610393575b508251888101906001600160601b0319809660601b1682526014815261022181610ecc565b51902094813b1561035957835196635f71dca760e11b958689526001600160481b03851698898482015288602482015260016044820152600160648201528a8160848183895af180156103895761037a575b508551908b82019260601b1682526014815261028e81610ecc565b51902094823b1561037657845190815287828201528560248201526002604482015260016064820152888160848183875af1801561036c5761035d575b50813b1561035957835163383a4c6560e11b81529081018581526001600160481b039093166020840152918791839182908490829060400103925af1801561034f57917f075aca39edba283f02f8c21a516c19dd1208d3b3d647f7012be49fe0e8dc2fd7918693610340575b50519580a48152f35b61034990610ea2565b88610337565b82513d88823e3d90fd5b8780fd5b61036690610ea2565b896102cb565b85513d8b823e3d90fd5b8880fd5b61038390610ea2565b8b610273565b87513d8d823e3d90fd5b6103b4919250883d8a116103bb575b6103ac8183610ee8565b810190610f29565b90886101fc565b503d6103a2565b83513d89823e3d90fd5b855163225c752360e11b81528390fd5b87516339bfddb560e01b81528590fd5b8751639134a1c160e01b81528590fd5b8680fd5b8480fd5b9190503461017e57608036600319011261017e57610420610e3e565b602435906044359061043181611031565b8215610614576001546001600160a01b03169260028314610550575b845163345914fd60e11b81526001600160481b03831687820190815260208101839052606090829081906040010381885afa908115610546579082918991610515575b50146104ff579083929187943b15610400576001600160481b039360849386928851998a978896635f71dca760e11b885216908601526024850152604484015260643560648401525af19081156104f657506104ea575080f35b6104f390610ea2565b80f35b513d84823e3d90fd5b85602491865191633dfa6b7760e11b8352820152fd5b610536915060603d811161053f575b61052e8183610ee8565b810190610f48565b91505038610490565b503d610524565b86513d8a823e3d90fd5b8451631fc2b3ab60e01b8152868101829052602081602481885afa90811561054657906001600160481b039189916105f6575b50166105e057833b156103fc57845163383a4c6560e11b81528681018281526001600160481b0384166020820152889082908190604001038183895af18015610546576105d1575b5061044d565b6105da90610ea2565b386105cb565b8560249186519163b72c08d360e01b8352820152fd5b61060e915060203d81116103bb576103ac8183610ee8565b38610583565b5050505163ad55a66560e01b8152fd5b9190503461017e578260031936011261017e5761063f6110ee565b82548151630110ceef60e21b81526020938101849052600f60248201526e4964656e7469747953746f7261676560881b60448201526001600160a01b039390918290606490829087165afa918215610175575083916106b1575b50166001600160601b0360a01b600154161760015580f35b6106d2915060203d81116106d8575b6106ca8183610ee8565b810190610f0a565b38610699565b503d6106c0565b839150346100cd57826003193601126100cd576106fa610e3e565b92602480359061070986611031565b8115610a2557600154835163345914fd60e11b81526001600160481b038816868201908152602081018590526001600160a01b039092169591606090829081906040010381895afa8015610a1b578490889289916109f5575b50036109e057845163238ce1ef60e11b8082526001600160481b038a168483018190526001868401529189816044818c5afa9081156109bc57906001918b916109c6575b50511480610963575b61094f578651908152818482015260028582015288816044818b5afa90811561092357906001918a9161092d575b505114806108ba575b6108a757508697869795963b156108a35786516367ac664f60e01b81526001600160481b03909116838201908152602081018690528690829081906040010381838c5af1801561089957906002929161088a575b5014610844578380f35b853b15610886578385519687948593620ef85560ea1b85528401525af19081156104f65750610877575b80828180808380f35b61088090610ea2565b8161086e565b8380fd5b61089390610ea2565b8961083a565b87513d88823e3d90fd5b8580fd5b85516342513a3360e01b81529283015250fd5b508551631af27dbd60e11b815281848201528585820152600260448201526020816064818b5afa9081156109235789916108f5575b506107e6565b610916915060203d811161091c575b61090e8183610ee8565b810190610fdf565b8a6108ef565b503d610904565b87513d8b823e3d90fd5b61094991503d808c833e6109418183610ee8565b810190610f63565b8b6107dd565b508551633f28e31760e01b81529283015250fd5b508651631af27dbd60e11b815282858201528686820152600160448201526020816064818c5afa9081156109bc578a9161099e575b506107af565b6109b6915060203d811161091c5761090e8183610ee8565b8b610998565b88513d8c823e3d90fd5b6109da91503d808d833e6109418183610ee8565b8c6107a6565b508351635e570dd560e01b8152908101839052fd5b9050610a1091925060603d811161053f5761052e8183610ee8565b92919050918a610762565b85513d89823e3d90fd5b50505163ad55a66560e01b8152fd5b8390346100cd5760203660031901126100cd57358015158091036100cd57610a5a6110ee565b815460ff60a01b191660a09190911b60ff60a01b1617815580f35b5050346100cd57816003193601126100cd578051610ab391610a9682610ecc565b600682526518981718171960d11b60208301525191829182610e59565b0390f35b5050346100cd57816003193601126100cd57905490516001600160a01b039091168152602090f35b5050346100cd57816003193601126100cd5760ff6020925460a01c1690519015158152f35b5050346100cd57816003193601126100cd578051610ab391610b2582610ecc565b60088252674964656e7469747960c01b60208301525191829182610e59565b90503461017e578160031936011261017e57610b5e610e3e565b9160249081359267ffffffffffffffff908185116103fc57366023860112156103fc57848101359182116103fc57838501948436918460051b0101116103fc57610ba9949194611196565b6001805490966001600160481b03808216946001600160a01b03938416939192918b5b8a8110610bd7578c80f35b81610beb610be6838e87610ff7565b61101d565b1615610e2e57868d610c01610be6848f88610ff7565b90888d8d8051906020928284809401906060986001600160601b0319908a1b16825260148152610c3081610ecc565b519020978892519586938492631fc2b3ab60e01b84528301525afa928315610e2357908a93929192610e06575b5050168a8114610dde57610dc8578e90883b156100cd578b5163383a4c6560e11b81528a81018481526001600160481b03891660208201528390829081900360400181838e5af18015610dbe5791888c8f610ce99084958997610daf575b5051958693849363345914fd60e11b85528401602090939291936001600160481b0360408201951681520152565b03818d5afa928315610da457908493929192610d84575b505014610d6f57863b15610d6b57895190635f71dca760e11b825289898301528b820152600260448201528c60648201528d81608481838b5af18015610d5f57908d9291610d50575b5001610bcc565b610d5990610ea2565b38610d49565b8e8b51903d90823e3d90fd5b8d80fd5b878b918b5191633dfa6b7760e11b8352820152fd5b610d9a9250803d1061053f5761052e8183610ee8565b9150503880610d00565b8d51903d90823e3d90fd5b610db890610ea2565b38610cbb565b8d513d85823e3d90fd5b8a5163b72c08d360e01b8152808a018390528c90fd5b508b8b8a8f610df2610be6888a938c610ff7565b9251632f0e925360e01b8152921690820152fd5b610e1c9250803d106103bb576103ac8183610ee8565b3880610c5d565b8e51903d90823e3d90fd5b8851639134a1c160e01b81528790fd5b600435906001600160481b0382168203610e5457565b600080fd5b6020808252825181830181905290939260005b828110610e8e57505060409293506000838284010152601f8019910116010190565b818101860151848201604001528501610e6c565b67ffffffffffffffff8111610eb657604052565b634e487b7160e01b600052604160045260246000fd5b6040810190811067ffffffffffffffff821117610eb657604052565b90601f8019910116810190811067ffffffffffffffff821117610eb657604052565b90816020910312610e5457516001600160a01b0381168103610e545790565b90816020910312610e5457516001600160481b0381168103610e545790565b90816060910312610e54578051916040602083015192015190565b906020908183820312610e5457825167ffffffffffffffff93848211610e54570181601f82011215610e54578051938411610eb6578360051b9060405194610fad85840187610ee8565b85528380860192820101928311610e54578301905b828210610fd0575050505090565b81518152908301908301610fc2565b90816020910312610e5457518015158103610e545790565b91908110156110075760051b0190565b634e487b7160e01b600052603260045260246000fd5b356001600160a01b0381168103610e545790565b60018060a01b036001541660206001600160481b036064604051838101903360601b82526014815261106281610ecc565b519020946040519485938492631af27dbd60e11b845216968760048401526024830152600160448301525afa9081156110e2576000916110c4575b50156110a65750565b60449060405190635181719f60e11b82526004820152336024820152fd5b6110dc915060203d811161091c5761090e8183610ee8565b3861109d565b6040513d6000823e3d90fd5b6000546001600160a01b0390811633811415919082611141575b505061111057565b60405163f0b1bddb60e01b815260206004820152600860248201526727b7363c90243ab160c11b6044820152606490fd5b604051638da5cb5b60e01b8152919250602090829060049082905afa9081156110e257600091611178575b50163314153880611108565b611190915060203d81116106d8576106ca8183610ee8565b3861116c565b600054604051631627905560e01b81523360048201526020916001600160a01b03908116918381602481865afa80156110e2578491600091611275575b50159283611223575b5050506111e65750565b6064906040519063f0b1bddb60e01b82526004820152601560248201527427b7363c9021b7b73a3930b1ba399034b710243ab160591b6044820152fd5b604051638da5cb5b60e01b8152929350829060049082905afa9081156110e257600091611258575b50163314153882816111dc565b61126f9150833d85116106d8576106ca8183610ee8565b3861124b565b61128c9150823d841161091c5761090e8183610ee8565b386111d356fea2646970667358221220789245a4efd9f34190513b7ae6d8f6684c3a5bb660ab73b0bb7f5378cec41c8564736f6c63430008140033",
+  "devdoc": {
+    "kind": "dev",
+    "methods": {},
+    "version": 1
+  },
+  "userdoc": {
+    "kind": "user",
+    "methods": {},
+    "version": 1
+  },
+  "storageLayout": {
+    "storage": [
+      {
+        "astId": 27334,
+        "contract": "contracts/Identity.sol:Identity",
+        "label": "hub",
+        "offset": 0,
+        "slot": "0",
+        "type": "t_contract(Hub)46218"
+      },
+      {
+        "astId": 27303,
+        "contract": "contracts/Identity.sol:Identity",
+        "label": "status",
+        "offset": 20,
+        "slot": "0",
+        "type": "t_bool"
+      },
+      {
+        "astId": 13509,
+        "contract": "contracts/Identity.sol:Identity",
+        "label": "identityStorage",
+        "offset": 0,
+        "slot": "1",
+        "type": "t_contract(IdentityStorage)46643"
+      }
+    ],
+    "types": {
+      "t_bool": {
+        "encoding": "inplace",
+        "label": "bool",
+        "numberOfBytes": "1"
+      },
+      "t_contract(Hub)46218": {
+        "encoding": "inplace",
+        "label": "contract Hub",
+        "numberOfBytes": "20"
+      },
+      "t_contract(IdentityStorage)46643": {
+        "encoding": "inplace",
+        "label": "contract IdentityStorage",
+        "numberOfBytes": "20"
+      }
+    }
+  }
+}

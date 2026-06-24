@@ -1,0 +1,244 @@
+{
+  "address": "0xC7143d5bA86553C06f5730c8dC9f8187a621A8D4",
+  "abi": [
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "_startTime",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "_epochLength",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "constructor"
+    },
+    {
+      "inputs": [],
+      "name": "InvalidEpochLength",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "InvalidStartTime",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "EPOCH_LENGTH",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "START_TIME",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "elapsedTimeInCurrentEpoch",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "timestamp",
+          "type": "uint256"
+        }
+      ],
+      "name": "epochAtTimestamp",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "epochLength",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "getCurrentEpoch",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "epochNumber",
+          "type": "uint256"
+        }
+      ],
+      "name": "hasEpochElapsed",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "isChronosActive",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "startTime",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "timeUntilNextEpoch",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "epochNumber",
+          "type": "uint256"
+        }
+      ],
+      "name": "timestampForEpoch",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "totalElapsedTime",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    }
+  ],
+  "transactionHash": "0xf90e3284fe0de561e92370c753bf5d23368d805823bd7a6ee5a41c529a3f784f",
+  "receipt": {
+    "to": null,
+    "from": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    "contractAddress": "0xC7143d5bA86553C06f5730c8dC9f8187a621A8D4",
+    "transactionIndex": 0,
+    "gasUsed": "355299",
+    "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "blockHash": "0x626ec88fdde95d43e1ca8da785b31b04bba60e23fcd3dcab71121e93d2e01b38",
+    "transactionHash": "0xf90e3284fe0de561e92370c753bf5d23368d805823bd7a6ee5a41c529a3f784f",
+    "logs": [],
+    "blockNumber": 222,
+    "cumulativeGasUsed": "355299",
+    "status": 1,
+    "byzantium": true
+  },
+  "args": [
+    1782309810,
+    "2592000"
+  ],
+  "numDeployments": 1,
+  "solcInputHash": "25f7b97326fdffc4ccdb60a7767831e0",
+  "metadata": "{\"compiler\":{\"version\":\"0.8.20+commit.a1b79de6\"},\"language\":\"Solidity\",\"output\":{\"abi\":[{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"_startTime\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"_epochLength\",\"type\":\"uint256\"}],\"stateMutability\":\"nonpayable\",\"type\":\"constructor\"},{\"inputs\":[],\"name\":\"InvalidEpochLength\",\"type\":\"error\"},{\"inputs\":[],\"name\":\"InvalidStartTime\",\"type\":\"error\"},{\"inputs\":[],\"name\":\"EPOCH_LENGTH\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"START_TIME\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"elapsedTimeInCurrentEpoch\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"timestamp\",\"type\":\"uint256\"}],\"name\":\"epochAtTimestamp\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"epochLength\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"getCurrentEpoch\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"epochNumber\",\"type\":\"uint256\"}],\"name\":\"hasEpochElapsed\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"isChronosActive\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"startTime\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"timeUntilNextEpoch\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"epochNumber\",\"type\":\"uint256\"}],\"name\":\"timestampForEpoch\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"totalElapsedTime\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"}],\"devdoc\":{\"kind\":\"dev\",\"methods\":{},\"version\":1},\"userdoc\":{\"kind\":\"user\",\"methods\":{},\"version\":1}},\"settings\":{\"compilationTarget\":{\"contracts/storage/Chronos.sol\":\"Chronos\"},\"evmVersion\":\"london\",\"libraries\":{},\"metadata\":{\"bytecodeHash\":\"ipfs\",\"useLiteralContent\":true},\"optimizer\":{\"enabled\":true,\"runs\":200},\"remappings\":[],\"viaIR\":true},\"sources\":{\"contracts/storage/Chronos.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ncontract Chronos {\\n    uint256 public immutable START_TIME;\\n    uint256 public immutable EPOCH_LENGTH;\\n\\n    error InvalidStartTime();\\n    error InvalidEpochLength();\\n\\n    constructor(uint256 _startTime, uint256 _epochLength) {\\n        if (_startTime <= 0) {\\n            revert InvalidStartTime();\\n        }\\n        if (_epochLength <= 0) {\\n            revert InvalidEpochLength();\\n        }\\n\\n        START_TIME = _startTime;\\n        EPOCH_LENGTH = _epochLength;\\n    }\\n\\n    function startTime() external view returns (uint256) {\\n        return START_TIME;\\n    }\\n\\n    function epochLength() external view returns (uint256) {\\n        return EPOCH_LENGTH;\\n    }\\n\\n    function getCurrentEpoch() external view returns (uint256) {\\n        if (block.timestamp < START_TIME) {\\n            return 1;\\n        }\\n        return ((block.timestamp - START_TIME) / EPOCH_LENGTH) + 1;\\n    }\\n\\n    function epochAtTimestamp(uint256 timestamp) external view returns (uint256) {\\n        if (timestamp < START_TIME) {\\n            return 1;\\n        }\\n        return ((timestamp - START_TIME) / EPOCH_LENGTH) + 1;\\n    }\\n\\n    function timeUntilNextEpoch() external view returns (uint256) {\\n        if (block.timestamp < START_TIME) {\\n            return START_TIME + EPOCH_LENGTH - block.timestamp;\\n        }\\n        // Slither: `block.timestamp % EPOCH_LENGTH` is flagged as weak-PRNG\\n        // because miners can nudge `block.timestamp` within a small window.\\n        // This is deterministic time math, NOT randomness \\u2014 the modulo\\n        // computes \\\"seconds elapsed since the start of the current epoch\\\",\\n        // which has the same minor miner-influence as `block.timestamp`\\n        // itself does (already trusted protocol-wide for epoch advancement).\\n        // No randomness derivation, no PRNG semantics.\\n        // slither-disable-next-line weak-prng\\n        uint256 elapsed = (block.timestamp - START_TIME) % EPOCH_LENGTH;\\n        return EPOCH_LENGTH - elapsed;\\n    }\\n\\n    function hasEpochElapsed(uint256 epochNumber) external view returns (bool) {\\n        return block.timestamp >= (START_TIME + (epochNumber - 1) * EPOCH_LENGTH);\\n    }\\n\\n    function timestampForEpoch(uint256 epochNumber) external view returns (uint256) {\\n        if (epochNumber == 0) {\\n            return 0;\\n        }\\n        return START_TIME + (epochNumber - 1) * EPOCH_LENGTH;\\n    }\\n\\n    function elapsedTimeInCurrentEpoch() external view returns (uint256) {\\n        if (block.timestamp < START_TIME) {\\n            return 0;\\n        }\\n        // Slither weak-prng \\u2014 deterministic time math, not randomness.\\n        // See `timeUntilNextEpoch` above for the long-form rationale.\\n        // slither-disable-next-line weak-prng\\n        return (block.timestamp - START_TIME) % EPOCH_LENGTH;\\n    }\\n\\n    function totalElapsedTime() external view returns (uint256) {\\n        if (block.timestamp < START_TIME) {\\n            return 0;\\n        }\\n        return block.timestamp - START_TIME;\\n    }\\n\\n    function isChronosActive() external view returns (bool) {\\n        return block.timestamp >= START_TIME;\\n    }\\n}\\n\",\"keccak256\":\"0x1c1fa02e0ea347116b72bf3d9df60a3fedce60a02f4c0f7b6ebdf9379cf68ced\",\"license\":\"Apache-2.0\"}},\"version\":1}",
+  "bytecode": "0x60c0346100f757601f61068e38819003918201601f19168301916001600160401b038311848410176100fc5780849260409485528339810103126100f757602081519101519080156100e55781156100d35760805260a05260405161057b9081610113823960805181818161018301528181610218015281816102960152818161030b0152818161037b015281816103c2015281816104b90152610515015260a05181818161015c0152818161025601528181610340015281816103fa015281816104340152818161048c01526104ee0152f35b6040516388ac089760e01b8152600490fd5b604051632ca4094f60e21b8152600490fd5b600080fd5b634e487b7160e01b600052604160045260246000fdfe60806040818152600436101561001457600080fd5b600091823560e01c9081630745bad1146102015750806357d775f8146101095780635a5da627146101e557806378e97925146100cc5780638b51bfc6146101c557806397c4ad541461012e5780639e3d52f91461010e578063ac4746ab14610109578063b97dd9e2146100ed578063cac44cda146100d1578063ddaa26ad146100cc5763e26ec56a146100a657600080fd5b346100c857816003193601126100c8576020906100c16104b7565b9051908152f35b5080fd5b61027e565b50346100c857816003193601126100c8576020906100c1610513565b50346100c857816003193601126100c8576020906100c1610309565b61023e565b50346100c85760203660031901126100c8576020906100c1600435610471565b50346100c85760203660031901126100c8576004359160001983019283116101b157506101a76101816020937f00000000000000000000000000000000000000000000000000000000000000009061045e565b7f00000000000000000000000000000000000000000000000000000000000000006102fc565b4210159051908152f35b634e487b7160e01b81526011600452602490fd5b50346100c85760203660031901126100c8576020906100c1600435610379565b50346100c857816003193601126100c8576020906100c16103c0565b8390346100c857816003193601126100c8576020907f00000000000000000000000000000000000000000000000000000000000000004210158152f35b346102795760003660031901126102795760206040517f00000000000000000000000000000000000000000000000000000000000000008152f35b600080fd5b346102795760003660031901126102795760206040517f00000000000000000000000000000000000000000000000000000000000000008152f35b919082039182116102c657565b634e487b7160e01b600052601160045260246000fd5b81156102e6570490565b634e487b7160e01b600052601260045260246000fd5b919082018092116102c657565b7f00000000000000000000000000000000000000000000000000000000000000008042106103735761033e61036591426102b9565b7f0000000000000000000000000000000000000000000000000000000000000000906102dc565b600181018091116102c65790565b50600190565b7f0000000000000000000000000000000000000000000000000000000000000000908181106103af576103659161033e916102b9565b5050600190565b81156102e6570690565b7f0000000000000000000000000000000000000000000000000000000000000000804210610429576103f561042691426102b9565b6104207f000000000000000000000000000000000000000000000000000000000000000080926103b6565b906102b9565b90565b6104269061045942917f0000000000000000000000000000000000000000000000000000000000000000906102fc565b6102b9565b818102929181159184041417156102c657565b80156104b15760001981019081116102c657610181610426917f00000000000000000000000000000000000000000000000000000000000000009061045e565b50600090565b7f00000000000000000000000000000000000000000000000000000000000000008042106104b1576104ec61042691426102b9565b7f0000000000000000000000000000000000000000000000000000000000000000906103b6565b7f00000000000000000000000000000000000000000000000000000000000000008042106104b15761042690426102b956fea2646970667358221220ef481adbc8892adfab72331c4e028f988f97faec68fc71ea3f654dcfc4ca541c64736f6c63430008140033",
+  "deployedBytecode": "0x60806040818152600436101561001457600080fd5b600091823560e01c9081630745bad1146102015750806357d775f8146101095780635a5da627146101e557806378e97925146100cc5780638b51bfc6146101c557806397c4ad541461012e5780639e3d52f91461010e578063ac4746ab14610109578063b97dd9e2146100ed578063cac44cda146100d1578063ddaa26ad146100cc5763e26ec56a146100a657600080fd5b346100c857816003193601126100c8576020906100c16104b7565b9051908152f35b5080fd5b61027e565b50346100c857816003193601126100c8576020906100c1610513565b50346100c857816003193601126100c8576020906100c1610309565b61023e565b50346100c85760203660031901126100c8576020906100c1600435610471565b50346100c85760203660031901126100c8576004359160001983019283116101b157506101a76101816020937f00000000000000000000000000000000000000000000000000000000000000009061045e565b7f00000000000000000000000000000000000000000000000000000000000000006102fc565b4210159051908152f35b634e487b7160e01b81526011600452602490fd5b50346100c85760203660031901126100c8576020906100c1600435610379565b50346100c857816003193601126100c8576020906100c16103c0565b8390346100c857816003193601126100c8576020907f00000000000000000000000000000000000000000000000000000000000000004210158152f35b346102795760003660031901126102795760206040517f00000000000000000000000000000000000000000000000000000000000000008152f35b600080fd5b346102795760003660031901126102795760206040517f00000000000000000000000000000000000000000000000000000000000000008152f35b919082039182116102c657565b634e487b7160e01b600052601160045260246000fd5b81156102e6570490565b634e487b7160e01b600052601260045260246000fd5b919082018092116102c657565b7f00000000000000000000000000000000000000000000000000000000000000008042106103735761033e61036591426102b9565b7f0000000000000000000000000000000000000000000000000000000000000000906102dc565b600181018091116102c65790565b50600190565b7f0000000000000000000000000000000000000000000000000000000000000000908181106103af576103659161033e916102b9565b5050600190565b81156102e6570690565b7f0000000000000000000000000000000000000000000000000000000000000000804210610429576103f561042691426102b9565b6104207f000000000000000000000000000000000000000000000000000000000000000080926103b6565b906102b9565b90565b6104269061045942917f0000000000000000000000000000000000000000000000000000000000000000906102fc565b6102b9565b818102929181159184041417156102c657565b80156104b15760001981019081116102c657610181610426917f00000000000000000000000000000000000000000000000000000000000000009061045e565b50600090565b7f00000000000000000000000000000000000000000000000000000000000000008042106104b1576104ec61042691426102b9565b7f0000000000000000000000000000000000000000000000000000000000000000906103b6565b7f00000000000000000000000000000000000000000000000000000000000000008042106104b15761042690426102b956fea2646970667358221220ef481adbc8892adfab72331c4e028f988f97faec68fc71ea3f654dcfc4ca541c64736f6c63430008140033",
+  "devdoc": {
+    "kind": "dev",
+    "methods": {},
+    "version": 1
+  },
+  "userdoc": {
+    "kind": "user",
+    "methods": {},
+    "version": 1
+  },
+  "storageLayout": {
+    "storage": [],
+    "types": null
+  }
+}

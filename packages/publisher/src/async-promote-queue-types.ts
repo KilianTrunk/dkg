@@ -62,6 +62,7 @@ export interface PromoteRequest {
   subGraphName?: string;
   assertionName: string;
   entities: readonly string[] | 'all';
+  authorAgentAddress?: string;
 }
 
 /**

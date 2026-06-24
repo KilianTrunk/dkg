@@ -2468,13 +2468,14 @@ export class DKGAgent extends DKGAgentBase {
       async promoteAsync(
         contextGraphId: string,
         name: string,
-        opts?: { entities?: readonly string[] | 'all'; subGraphName?: string },
+        opts?: { entities?: readonly string[] | 'all'; subGraphName?: string; authorAgentAddress?: string },
       ): Promise<{ jobId: string }> {
         const jobId = await agent.promoteQueue.enqueue({
           contextGraphId,
           assertionName: name,
           subGraphName: opts?.subGraphName,
           entities: opts?.entities ?? 'all',
+          ...(opts?.authorAgentAddress ? { authorAgentAddress: opts.authorAgentAddress } : {}),
         });
         return { jobId };
       },

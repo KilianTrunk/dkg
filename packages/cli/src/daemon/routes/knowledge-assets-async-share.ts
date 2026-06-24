@@ -106,10 +106,13 @@ export async function handleKaShareAsyncEnqueue(ctx: RequestContext, name: strin
     }
   }
   try {
+    const asyncShareAuthorLane = writePreflightCallerAgentAddress
+      ? { authorAgentAddress: writePreflightCallerAgentAddress }
+      : {};
     const result = await agent.assertion.promoteAsync(
       resolvedContextGraphId,
       name,
-      { entities: entities ?? "all", subGraphName },
+      { entities: entities ?? "all", subGraphName, ...asyncShareAuthorLane },
     );
     return jsonResponse(res, 200, {
       jobId: result.jobId,

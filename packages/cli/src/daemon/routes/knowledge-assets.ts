@@ -1222,9 +1222,13 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         }
       }
       try {
+        const asyncShareAuthorLane = writePreflightCallerAgentAddress
+          ? { authorAgentAddress: writePreflightCallerAgentAddress }
+          : {};
         const result = await agent.assertion.promoteAsync(contextGraphId, name, {
           entities: entities ?? "all",
           subGraphName,
+          ...asyncShareAuthorLane,
         });
         return jsonResponse(res, 200, { jobId: result.jobId, state: "queued" });
       } catch (err: any) {

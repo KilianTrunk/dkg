@@ -155,6 +155,7 @@ function isPromoteRequest(value: unknown): value is PromoteRequest {
   if (typeof value['contextGraphId'] !== 'string' || value['contextGraphId'].length === 0) return false;
   if (typeof value['assertionName'] !== 'string' || value['assertionName'].length === 0) return false;
   if (value['subGraphName'] !== undefined && typeof value['subGraphName'] !== 'string') return false;
+  if (value['authorAgentAddress'] !== undefined && typeof value['authorAgentAddress'] !== 'string') return false;
   const entities = value['entities'];
   if (entities === 'all') return true;
   return Array.isArray(entities) && entities.every((e) => typeof e === 'string' && e.length > 0);

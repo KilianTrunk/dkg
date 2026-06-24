@@ -453,7 +453,7 @@ export function authorizeAgentScopedAuthorClaim(
   claimField: string,
 ): boolean {
   if (!tokenAgentAddress || !claimedAuthorAddress) return true;
-  if (tokenAgentAddress === claimedAuthorAddress) return true;
+  if (isSameAgentAddress(tokenAgentAddress, claimedAuthorAddress)) return true;
   jsonResponse(res, 403, {
     error:
       `Author mismatch: authenticated as ${tokenAgentAddress} but request body claims ${claimedAuthorAddress}. ` +

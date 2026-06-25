@@ -590,6 +590,27 @@ describe('PrivateContentStore', () => {
     expect((await ps.getPrivateTriples('cg-stage', entity)).map((quad) => quad.object)).toEqual(['"pending"']);
   });
 
+  it('rejects oversized aggregate operation-staged private payloads before replacing existing staged data', async () => {
+    const entity = 'did:dkg:agent:AsyncPrivateOversized';
+    const prior: Quad[] = [
+      { subject: entity, predicate: 'http://ex.org/secret', object: '"prior"', graph: '' },
+    ];
+    const oversizedAggregate: Quad[] = [
+      { subject: entity, predicate: 'http://ex.org/a', object: `"${'a'.repeat(35_000)}"`, graph: '' },
+      { subject: entity, predicate: 'http://ex.org/b', object: `"${'b'.repeat(35_000)}"`, graph: '' },
+    ];
+
+    await ps.storePrivateTriplesForOperation('cg-stage', 'op-oversized', entity, prior);
+
+    await expect(
+      ps.storePrivateTriplesForOperation('cg-stage', 'op-oversized', entity, oversizedAggregate),
+    ).rejects.toMatchObject({
+      code: 'OVERSIZED_RDF_LITERAL',
+      predicate: 'http://dkg.io/ontology/privateStagedQuads',
+    });
+    expect(await ps.getPrivateTriplesForOperation('cg-stage', 'op-oversized', entity)).toEqual(prior);
+  });
+
   it('hasPrivateTriples returns false before any data is stored', () => {
     expect(ps.hasPrivateTriples('unknown-cg', 'urn:x')).toBe(false);
   });

@@ -553,6 +553,45 @@ describe('#1116 seal decoupled from CG — full vs skipSeal share, seal-in-SWM',
     expect(pub.seal).toBeDefined();
   }, 30_000);
 
+  it('strips the generated private-CG catalog floor on pre-registration product-path promote', async () => {
+    const agent = await createAgent('PrivateCgCatalogPromoteBot');
+    const cg = `${CG_ID}-private-local`;
+    const callerAgentAddress = agent.defaultAgentAddress ?? agent.peerId;
+    await agent.createContextGraph({
+      id: cg,
+      name: 'Private Local CG Catalog Promote E2E',
+      accessPolicy: 1,
+      callerAgentAddress,
+    });
+    expect(await agent.getContextGraphOnChainId(cg)).toBeNull();
+
+    const name = 'private-local-catalog-promote';
+    await agent.assertion.create(cg, name);
+    await agent.assertion.write(cg, name, [
+      { subject: `${ENTITY_BASE}:plcp`, predicate: 'http://schema.org/name', object: '"Private Local Catalog Promote"' },
+    ]);
+    await agent.assertion.finalize(cg, name);
+
+    const promoted = await agent.assertion.promote(cg, name);
+    expect(promoted.sealed).toBe(true);
+    expect(promoted.publishReady).toBe(true);
+
+    const cgDid = `did:dkg:context-graph:${cg}`;
+    const swmGraph = `${cgDid}/_shared_memory`;
+    const swmMetaGraph = `${cgDid}/_shared_memory_meta`;
+    const swmCatalog = await (agent as any).store.query(
+      `SELECT ?p ?o WHERE { GRAPH <${swmGraph}> { <${cgDid}> ?p ?o } }`,
+    );
+    expect(swmCatalog.type).toBe('bindings');
+    expect(swmCatalog.bindings).toHaveLength(0);
+
+    const swmCatalogOwner = await (agent as any).store.query(
+      `SELECT ?owner WHERE { GRAPH <${swmMetaGraph}> { <${cgDid}> <http://dkg.io/ontology/workspaceOwner> ?owner } }`,
+    );
+    expect(swmCatalogOwner.type).toBe('bindings');
+    expect(swmCatalogOwner.bindings).toHaveLength(0);
+  }, 30_000);
+
   // B3 (#1116 CORE REGRESSION GUARD): the seal is context-graph-INDEPENDENT, so
   // a default FULL share SEALS even when the CG was NEVER registered on-chain —
   // registration is deferred to publish time. This is the claim the existing

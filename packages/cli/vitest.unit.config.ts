@@ -14,6 +14,7 @@ export default defineConfig({
       ? ['test/daemon-http-behavior-extra.test.ts']
       : [
           'test/api-client.test.ts',
+          'test/reconcile-503-mapping.test.ts',
           'test/config.test.ts',
           'test/status-route-rpc.test.ts',
           'test/memory-graph-events.test.ts',
@@ -49,6 +50,8 @@ export default defineConfig({
           'test/blazegraph-docker.test.ts',
           'test/store-identity-tag.test.ts',
           'test/publisher-runner-lu11.test.ts',
+          // SQLite-backed vector store. Pure local DB coverage; no hardhat.
+          'test/vector-store-extra.test.ts',
           // Release 2 — managed local Oxigraph server (opt-in). Pure logic
           // + injected fetch/spawn/fs; no network, no real binary.
           'test/oxigraph-binary.test.ts',
@@ -61,6 +64,8 @@ export default defineConfig({
           'test/blazegraph-integration.test.ts',
           // #761 — context graph write-target validation (from main).
           'test/context-graph-write-path-validation.test.ts',
+          'test/http-literal-size-validation.test.ts',
+          'test/epcis-route-readiness.test.ts',
           // Notifications-pane redesign (A3) — assertion_activity emitter
           // helper. Pure logic + a tmp SQLite DashboardDB, no hardhat.
           'test/activity-notification.test.ts',

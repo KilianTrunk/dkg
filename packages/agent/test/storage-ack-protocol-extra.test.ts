@@ -56,6 +56,15 @@ describe('A-9: storage-ack protocol id (libp2p) pin', () => {
     expect(combined).toMatch(registerRE);
   });
 
+  it('agent wires core-side StorageACK decline logging', () => {
+    const combined = walk(AGENT_SRC)
+      .map((f) => readFileSync(f, 'utf8'))
+      .join('\n');
+
+    expect(combined).toMatch(/onDecline:\s*\(details\)\s*=>/);
+    expect(combined).toContain('V10 StorageACK declined: code=');
+  });
+
   it('agent source never publishes ACKs on GossipSub', () => {
     // A false-positive here would be any call like
     // `publish('/dkg/10.0.1/storage-ack', ...)` or

@@ -22,6 +22,8 @@ Your node's network is chosen at setup (default: **mainnet-gnosis**) and persist
 * `dkg hermes setup`
 * `dkg openclaw setup`
 
+Core Node profile registration also needs funded node wallets. A fresh Core wallet file has one admin wallet plus operational wallets. The primary operational wallet needs the native gas token and enough TRAC for the initial V10 staking conviction; the admin wallet should have native gas for profile key-management and operational-wallet registration. See [Daemon Lifecycle](run-node.md#core-node-profile-registration) for the full Core checklist.
+
 Skip funding on the `setup` commands with:
 
 ```bash

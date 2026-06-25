@@ -7,10 +7,15 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   PayloadTooLargeError,
+  assertQuadLiteralsMutf8Safe,
+  isOversizedRdfLiteralError,
   validateContextGraphId,
   validateSubGraphName,
   isSafeIri,
+  NO_FUNDED_PUBLISHER_WALLET_CODE,
+  messageIndicatesNoFundedPublisherWallet,
 } from '@origintrail-official/dkg-core';
+import { enrichEvmError } from '@origintrail-official/dkg-chain';
 import type { DKGAgent, ContextGraphWritePreflightProbe } from '@origintrail-official/dkg-agent';
 import type { DkgConfig } from '../config.js';
 import { enforceSignedRequestPostBody } from '../auth.js';
@@ -67,6 +72,77 @@ export function payloadTooLargeResponseBody(err: unknown): Record<string, unknow
   return body;
 }
 
+/**
+ * True iff `err` is (or looks like) the funded-wallet-selection failure
+ * (`InsufficientPublisherFundsError`, code `NO_FUNDED_PUBLISHER_WALLET`) —
+ * code-first, with a message-marker fallback for a re-wrap that dropped `.code`.
+ * Code + marker are the shared dkg-core contract so the daemon, publisher
+ * classifier, chain, and node-ui cannot drift. Shared by the `/vm/publish` route
+ * catch and the top-level daemon handler.
+ */
+export function isNoFundedPublisherWalletLike(err: unknown): boolean {
+  const e = err as { code?: unknown; message?: unknown } | null | undefined;
+  if (e?.code === NO_FUNDED_PUBLISHER_WALLET_CODE) return true;
+  return messageIndicatesNoFundedPublisherWallet(e?.message);
+}
+
+/** The HTTP-400 response body for a no-funded-wallet publish failure: the
+ *  structured `code` plus the actionable message (which lists per-wallet
+ *  balances). Single source of truth for both publish routes. */
+export function noFundedPublisherWalletBody(message: string): { code: string; error: string } {
+  return { code: NO_FUNDED_PUBLISHER_WALLET_CODE, error: message };
+}
+
+/**
+ * Map a thrown request error to the daemon's top-level HTTP response — the
+ * single neutral place that rethrowing routes (e.g. `/api/shared-memory/publish`)
+ * and the lifecycle catch agree on status codes: 413 payload-too-large; 400 for
+ * SyntaxError / reserved-namespace / NO_FUNDED_PUBLISHER_WALLET; otherwise a 500
+ * with the EVM-decoded message. Unit-testable in isolation.
+ */
+export function respondWithDaemonError(res: ServerResponse, err: any): void {
+  if (res.headersSent || res.writableEnded) return;
+  if (isPayloadTooLargeError(err)) {
+    jsonResponse(res, 413, payloadTooLargeResponseBody(err));
+  } else if (err instanceof SyntaxError) {
+    jsonResponse(res, 400, { error: err.message });
+  } else if (
+    // Round 9 Bug 25: user-authored quads with reserved URN prefixes map to 400
+    // so share/publish routes that rethrow get the correct status.
+    err?.name === 'ReservedNamespaceError' ||
+    (typeof err?.message === 'string' && err.message.includes('reserved namespace'))
+  ) {
+    jsonResponse(res, 400, { error: err.message });
+  } else if (isNoFundedPublisherWalletLike(err)) {
+    // Funded-wallet selection found no operational wallet with gas + TRAC — a
+    // user-actionable funding condition (4xx), not a server bug.
+    jsonResponse(res, 400, noFundedPublisherWalletBody(typeof err?.message === 'string' ? err.message : String(err)));
+  } else {
+    enrichEvmError(err);
+    jsonResponse(res, 500, { error: err?.message ?? String(err) });
+  }
+}
+
+export function oversizedRdfLiteralResponseBody(err: unknown): Record<string, unknown> {
+  const shaped = (err && typeof err === 'object') ? err as Record<string, unknown> : {};
+  const message = err instanceof Error ? err.message : String(err ?? 'Oversized RDF literal');
+  const body: Record<string, unknown> = {
+    error: message,
+    code: 'OVERSIZED_RDF_LITERAL',
+  };
+  const maxBytes = shaped.maxBytes;
+  if (typeof maxBytes === 'number') body.limitBytes = maxBytes;
+  const actualBytes = shaped.actualBytes;
+  if (typeof actualBytes === 'number') body.actualBytes = actualBytes;
+  const subject = shaped.subject;
+  if (typeof subject === 'string') body.subject = subject;
+  const predicate = shaped.predicate;
+  if (typeof predicate === 'string') body.predicate = predicate;
+  const graph = shaped.graph;
+  if (typeof graph === 'string') body.graph = graph;
+  return body;
+}
+
 export async function resolveNameToPeerId(
   agent: DKGAgent,
   nameOrId: string,
@@ -120,9 +196,35 @@ export function isWritableQuad(value: unknown): boolean {
   );
 }
 
-function validatePublishQuadObjectTerms(
+export function validateWritableQuadLiteralSizes(
   label: string,
-  quads: PublishQuad[],
+  quads: Array<{ subject: string; predicate: string; object: string; graph?: string }>,
+): { ok: true } | { ok: false; body: Record<string, unknown> } {
+  try {
+    assertQuadLiteralsMutf8Safe(quads, { label });
+    return { ok: true };
+  } catch (err) {
+    if (isOversizedRdfLiteralError(err)) {
+      return { ok: false, body: oversizedRdfLiteralResponseBody(err) };
+    }
+    throw err;
+  }
+}
+
+/**
+ * GH #306 / #787 (follow-up) — validate each quad's `object` term is either a
+ * quoted RDF literal (`"…"`) or an absolute IRI. Shared by the publish path AND
+ * the write routes (wm/write, shared-memory/write, conditional-write): the shape
+ * guards ({@link isPublishQuad} / {@link isWritableQuad}) only check the fields
+ * are strings, so an object that is neither a literal nor an IRI (e.g. a bare
+ * word `hello` or a number `123`) slips past them and crashes the RDF parser
+ * with an uncaught "No scheme found in an absolute IRI" → HTTP 500 instead of an
+ * actionable 400. Operates on any `{ object: string }` (PublishQuad or writable
+ * quad alike).
+ */
+export function validateQuadObjectTerms(
+  label: string,
+  quads: ReadonlyArray<{ object: string }>,
 ): string | null {
   const badIndex = quads.findIndex((q) => {
     const object = q.object.trim();
@@ -132,9 +234,46 @@ function validatePublishQuadObjectTerms(
   return `Invalid "${label}[${badIndex}].object": RDF object must be a quoted literal term or absolute IRI`;
 }
 
+/**
+ * KA-number-floor reconcile resilience (follow-up to the "KA create 500-on-429"
+ * fix). If `e` is a **transient** reconcile failure — the chain RPC couldn't serve
+ * the one-time-per-author floor read (e.g. a 429 after the bounded retry in
+ * `allocator.ts` is exhausted) — send a retryable **503** and return true;
+ * otherwise return false so the caller falls through to its normal mapping.
+ *
+ * The transient-vs-deterministic verdict comes from `retryable` (derived from
+ * `isTransientChainError`): the typed `KaFloorReconcileError` carries it, and the
+ * finalize/selection re-wrap sites in `dkg-agent-publish.ts` tag the same marker.
+ * A deterministic failure (`retryable === false`, e.g. a revert) is NOT a 503 —
+ * advertising a retry would be pointless — so it falls through. The legacy
+ * message-text match is honored ONLY when the error explicitly marks itself
+ * retryable, so a bare re-wrapped message can never force a deterministic error
+ * into a retryable 503 (PR #1319 review). Used by every route that can trigger the
+ * reconcile (named create, one-shot publish, shared-memory publish, and the
+ * WM-verb routes via `respondAssertionError`) so they answer consistently.
+ */
+export function respondIfReconcileUnavailable(res: ServerResponse, e: any): boolean {
+  const msg = e?.message ?? String(e);
+  const isTyped = e?.code === "KA_FLOOR_RECONCILE_UNAVAILABLE";
+  // Message-text fallback (for errors re-wrapped on the way up) is accepted only
+  // when the error explicitly carries a retryable marker — never for a bare
+  // message, which might be hiding a deterministic revert.
+  const isMarkedLegacyTransient =
+    e?.retryable === true && /failed to reconcile KA-number floor/i.test(msg);
+  if ((!isTyped && !isMarkedLegacyTransient) || e?.retryable === false) {
+    return false;
+  }
+  jsonResponse(res, 503, {
+    error: msg,
+    code: "KA_FLOOR_RECONCILE_UNAVAILABLE",
+    retryable: true,
+  });
+  return true;
+}
+
 export function parsePublishRequestBody(
   body: string,
-): { ok: true; value: PublishRequestBody } | { ok: false; error: string } {
+): { ok: true; value: PublishRequestBody } | { ok: false; error: string; body?: Record<string, unknown> } {
   let parsed: unknown;
   try {
     parsed = JSON.parse(body);
@@ -168,8 +307,12 @@ export function parsePublishRequestBody(
       error: 'Missing or invalid "quads" (must be a non-empty quad array)',
     };
   }
-  const quadObjectError = validatePublishQuadObjectTerms("quads", quads);
+  const quadObjectError = validateQuadObjectTerms("quads", quads);
   if (quadObjectError) return { ok: false, error: quadObjectError };
+  const quadSize = validateWritableQuadLiteralSizes("quads", quads);
+  if (!quadSize.ok) {
+    return { ok: false, error: String(quadSize.body.error ?? 'Oversized RDF literal'), body: quadSize.body };
+  }
 
   if (
     privateQuads !== undefined &&
@@ -181,8 +324,12 @@ export function parsePublishRequestBody(
     };
   }
   if (privateQuads !== undefined) {
-    const privateQuadObjectError = validatePublishQuadObjectTerms("privateQuads", privateQuads);
+    const privateQuadObjectError = validateQuadObjectTerms("privateQuads", privateQuads);
     if (privateQuadObjectError) return { ok: false, error: privateQuadObjectError };
+    const privateQuadSize = validateWritableQuadLiteralSizes("privateQuads", privateQuads);
+    if (!privateQuadSize.ok) {
+      return { ok: false, error: String(privateQuadSize.body.error ?? 'Oversized RDF literal'), body: privateQuadSize.body };
+    }
   }
 
   if (
@@ -976,6 +1123,12 @@ export interface ImportFileExtractionPayload {
   pipelineUsed: string | null;
   mdIntermediateHash?: string;
   error?: string;
+  code?: string;
+  limitBytes?: number;
+  actualBytes?: number;
+  subject?: string;
+  predicate?: string;
+  graph?: string;
   // #1101: when status === "skipped", explain WHY extraction was skipped so
   // callers don't have to guess (the dominant cause is an unrecognized
   // content type with no registered converter).
@@ -1002,6 +1155,12 @@ export function buildImportFileResponse(args: {
         ? { mdIntermediateHash: args.extraction.mdIntermediateHash }
         : {}),
       ...(args.extraction.error ? { error: args.extraction.error } : {}),
+      ...(args.extraction.code ? { code: args.extraction.code } : {}),
+      ...(args.extraction.limitBytes != null ? { limitBytes: args.extraction.limitBytes } : {}),
+      ...(args.extraction.actualBytes != null ? { actualBytes: args.extraction.actualBytes } : {}),
+      ...(args.extraction.subject ? { subject: args.extraction.subject } : {}),
+      ...(args.extraction.predicate ? { predicate: args.extraction.predicate } : {}),
+      ...(args.extraction.graph ? { graph: args.extraction.graph } : {}),
       ...(args.extraction.skipReason ? { skipReason: args.extraction.skipReason } : {}),
     },
   };

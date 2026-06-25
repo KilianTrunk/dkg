@@ -28,6 +28,7 @@ import type { RequestContext } from "./context.js";
 import {
   isPayloadTooLargeError,
   jsonResponse,
+  oversizedRdfLiteralResponseBody,
   payloadTooLargeResponseBody,
   readBody,
   safeParseJson,
@@ -36,8 +37,13 @@ import {
   validateRequiredContextGraphId,
   parsePublishRequestBody,
   isWritableQuad,
+  validateQuadObjectTerms,
+  respondIfReconcileUnavailable,
+  validateWritableQuadLiteralSizes,
   normalizeContextGraphIdOrUri,
   resolveRequiredWriteContextGraphId,
+  isNoFundedPublisherWalletLike,
+  noFundedPublisherWalletBody,
 } from "../http-utils.js";
 import { validatePreSignedAuthorAttestation } from "./memory.js";
 import { recordAssertionActivity } from "../activity-notification.js";
@@ -59,6 +65,7 @@ import {
   decodePromoteJobId,
   asyncPromoteUnavailable,
   authorizeAgentScopedAuthorClaim,
+  buildAutoRegisterFailureBody,
   isSameAgentAddress,
   scopedTokenPromoteLane,
 } from "./shared-assertion-helpers.js";
@@ -123,6 +130,10 @@ const FINALIZE_ONLY_CREATE_FIELDS = [
  * publish path, which never down-classified them).
  */
 function respondAssertionError(res: RequestContext["res"], e: any): void {
+  if (e?.code === "OVERSIZED_RDF_LITERAL") {
+    jsonResponse(res, 400, oversizedRdfLiteralResponseBody(e));
+    return;
+  }
   if (isPayloadTooLargeError(e)) {
     jsonResponse(res, 413, payloadTooLargeResponseBody(e));
     return;
@@ -159,6 +170,9 @@ function respondAssertionError(res: RequestContext["res"], e: any): void {
     });
     return;
   }
+  // KA-number-floor reconcile couldn't reach the chain (e.g. a rate-limited RPC
+  // 429'd the one-time-per-author read) -> retryable 503, not 500.
+  if (respondIfReconcileUnavailable(res, e)) return;
   const msg = e?.message ?? String(e);
   if (
     e?.name === "ReservedNamespaceError" ||
@@ -648,7 +662,7 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
   if (method === "POST" && path === `${PREFIX}/publish`) {
     const rawBody = await readBody(req);
     const parsed = parsePublishRequestBody(rawBody);
-    if (!parsed.ok) return jsonResponse(res, 400, { error: parsed.error });
+    if (!parsed.ok) return jsonResponse(res, 400, parsed.body ?? { error: parsed.error });
     const raw = JSON.parse(rawBody) as Record<string, unknown>;
     const {
       contextGraphId,
@@ -720,6 +734,11 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       if (isPayloadTooLargeError(e)) {
         return jsonResponse(res, 413, payloadTooLargeResponseBody(e));
       }
+      if (e?.code === "OVERSIZED_RDF_LITERAL") {
+        return jsonResponse(res, 400, oversizedRdfLiteralResponseBody(e));
+      }
+      // Transient KA-number-floor reconcile failure (rate-limited RPC) -> 503.
+      if (respondIfReconcileUnavailable(res, e)) return;
       return jsonResponse(res, 500, { error: e?.message ?? String(e) });
     }
   }
@@ -787,6 +806,13 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
     // author attestation and reserves the on-chain identity, so it requires the
     // CG to be registered). OT-RFC-43 §10.5.5.
     const hasQuads = Array.isArray(quads) && quads.length > 0;
+    if (hasQuads) {
+      if (!quads.every(isWritableQuad)) {
+        return jsonResponse(res, 400, { error: '"quads" must be an array of { subject, predicate, object } objects (graph optional); string-shaped quads are not accepted' });
+      }
+      const literalSize = validateWritableQuadLiteralSizes("quads", quads);
+      if (!literalSize.ok) return jsonResponse(res, 400, literalSize.body);
+    }
     const shouldFinalize = hasQuads && finalize !== false;
     // #1116 D5: the create ROUTE stays a primitive — create+write+seal, with
     // opt-in share (this preserves the "create stops at a sealed WM draft"
@@ -935,6 +961,11 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       if (errors.length > 0) return jsonResponse(res, 207, { created: true, ...result, errors });
       return jsonResponse(res, 201, result);
     } catch (e: any) {
+      if (e?.code === "OVERSIZED_RDF_LITERAL") {
+        return jsonResponse(res, 400, oversizedRdfLiteralResponseBody(e));
+      }
+      // Transient KA-number-floor reconcile failure (rate-limited RPC) -> 503.
+      if (respondIfReconcileUnavailable(res, e)) return;
       return jsonResponse(res, 500, { error: e?.message ?? String(e) });
     }
   }
@@ -1095,6 +1126,12 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         if (!parsed.quads.every(isWritableQuad)) {
           return jsonResponse(res, 400, { error: '"quads" must be an array of { subject, predicate, object } objects (graph optional); string-shaped quads are not accepted' });
         }
+        // GH #306/#787 (follow-up) — reject objects that are neither a quoted
+        // literal nor an absolute IRI before they reach (and crash) the parser.
+        const wmObjErr = validateQuadObjectTerms("quads", parsed.quads);
+        if (wmObjErr) return jsonResponse(res, 400, { error: wmObjErr });
+        const literalSize = validateWritableQuadLiteralSizes("quads", parsed.quads);
+        if (!literalSize.ok) return jsonResponse(res, 400, literalSize.body);
         // A bare write to a name that was never created used to fall through to
         // the legacy `/assertion/{addr}/{name}` graph and produce a KA that is
         // permanently 404 in the descriptor API (no `_meta` lifecycle record,
@@ -1343,11 +1380,7 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
           try {
             await agent.ensureRegisteredForPublish(contextGraphId, { callerAgentAddress: requestAgentAddress });
           } catch (regErr: any) {
-            return jsonResponse(res, 400, {
-              error:
-                `Context graph "${contextGraphId}" could not be auto-registered on-chain before publish: ` +
-                `${regErr?.message ?? String(regErr)}`,
-            });
+            return jsonResponse(res, 400, buildAutoRegisterFailureBody(contextGraphId, regErr));
           }
           pub = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts, ...publishStorageLane });
         }
@@ -1390,6 +1423,14 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         // caller precondition; map it to the same 409 (code-first).
         if (e?.code === "PUBLISH_NOT_FULL_SHARE" || /is not finalized/.test(msg) || /No quads in shared memory/.test(msg) || /has no private payload/.test(msg)) {
           return jsonResponse(res, 409, { code: e?.code === "PUBLISH_NOT_FULL_SHARE" ? "PUBLISH_NOT_FULL_SHARE" : "VM_PUBLISH_PRECONDITION", error: msg });
+        }
+        // Funded-wallet selection found no operational wallet holding the
+        // gas + TRAC a publish needs. This is a user-actionable funding
+        // condition (4xx), not a server/on-chain bug. Classification + body are
+        // shared with the top-level daemon handler (lifecycle.ts) so the two
+        // publish routes cannot drift on the code/marker contract.
+        if (isNoFundedPublisherWalletLike(e)) {
+          return jsonResponse(res, 400, noFundedPublisherWalletBody(msg));
         }
         return jsonResponse(res, 500, { error: msg });
       }

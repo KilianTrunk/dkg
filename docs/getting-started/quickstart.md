@@ -93,6 +93,15 @@ dkg start     # starts the node daemon on http://127.0.0.1:9200
 
 `dkg init` asks which network to join — **Gnosis mainnet** (`mainnet-gnosis`, the default), `mainnet-base`, or `testnet` — at the prompt, or pass `--network <name>` to skip it. Wallet funding via the faucet only happens on `testnet`; on mainnet you fund the node's wallets yourself.
 
+For Core Node operation, initialize with the Core role:
+
+```bash
+dkg init --role core --network mainnet-gnosis
+dkg start
+```
+
+Core Nodes are registered on-chain with a node profile (`identityId`). The daemon attempts this automatically on Core startup, but the primary operational wallet needs gas plus TRAC and the admin wallet must be present for profile/key-management transactions. If you fund or fix wallets after the daemon is already running, call `POST /api/identity/ensure` as described in [Daemon Lifecycle](../use-dkg/run-node.md#core-node-profile-registration).
+
 Once running, open the dashboard at [http://127.0.0.1:9200/ui](http://127.0.0.1:9200/ui), or query directly:
 
 ```bash

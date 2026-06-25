@@ -202,6 +202,19 @@ export {
   assertSafeRdfTerm,
 } from './sparql-safe.js';
 export {
+  JAVA_WRITE_UTF_MAX_BYTES,
+  DKG_RDF_LITERAL_SAFE_MUTF8_BYTES,
+  OVERSIZED_RDF_LITERAL_ERROR_CODE,
+  OversizedRdfLiteralError,
+  javaModifiedUtf8ByteLength,
+  rdfLiteralTermMutf8ByteLength,
+  isOversizedRdfLiteralError,
+  assertRdfLiteralMutf8Safe,
+  assertQuadLiteralsMutf8Safe,
+  type RdfLiteralSizeContext,
+  type QuadLiteralLike,
+} from './rdf-literal-size.js';
+export {
   DKGError,
   DKGUserError,
   DKGInternalError,
@@ -209,6 +222,9 @@ export {
   SwmGossipPayloadTooLargeError,
   toErrorMessage,
   hasErrorCode,
+  NO_FUNDED_PUBLISHER_WALLET_CODE,
+  NO_FUNDED_PUBLISHER_WALLET_MESSAGE_PREFIX,
+  messageIndicatesNoFundedPublisherWallet,
 } from './errors.js';
 export {
   dkgHomeDir,

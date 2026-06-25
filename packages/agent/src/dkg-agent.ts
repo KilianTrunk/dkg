@@ -94,6 +94,7 @@ import {
   resolveWorkspaceAgentRecipients,
   computeTripleHashV10 as computeTripleHash, computeFlatKCRootV10 as computeFlatKCRoot, skolemizeByEntity, isReservedSubject, computePrivateRootV10 as computePrivateRoot,
   canonicalPublishPayload,
+  generatedPrivateCatalogTripleKeys,
   resolveLiftWorkspaceSlice,
   validateLiftPublishPayload,
   subtractFinalizedExactQuads,
@@ -2030,6 +2031,11 @@ export class DKGAgent extends DKGAgentBase {
           { awaitCuratorAck: opts?.awaitCuratorAck, curatorAckTimeoutMs: opts?.curatorAckTimeoutMs },
           createOperationContext('share'),
         );
+        const trustedCatalogOnChainContextGraphId = await agent.getContextGraphOnChainId(contextGraphId) ?? undefined;
+        const isPrivateContextGraph = await agent.isPrivateContextGraph(contextGraphId);
+        const trustedNonManifestCatalogTriples = isPrivateContextGraph
+          ? generatedPrivateCatalogTripleKeys(contextGraphId)
+          : undefined;
         const { promotedCount, gossipMessage, promotedAllRoots } = await agent.publisher.assertionPromote(
           contextGraphId, name, promoteAgentAddress,
           {
@@ -2037,6 +2043,8 @@ export class DKGAgent extends DKGAgentBase {
             ...(opts?.subGraphName !== undefined ? { subGraphName: opts.subGraphName } : {}),
             publisherPeerId: agent.node.peerId.toString(),
             senderAgentAddress: gossipSigner?.agentAddress,
+            trustedNonManifestCatalogTriples,
+            onChainContextGraphId: trustedCatalogOnChainContextGraphId,
             confirmBeforeCommit,
           },
         );

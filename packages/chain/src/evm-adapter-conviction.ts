@@ -11,11 +11,11 @@
 
 import { EVMChainAdapterBase } from './evm-adapter-base.js';
 import { ethers, Contract } from 'ethers';
-import type { TxResult, V10PublishingConvictionAccountInfo } from './chain-adapter.js';
+import type { TxResult, V10PublishingConvictionAccountInfo, ConvictionReader } from './chain-adapter.js';
 import { PcaUnavailableError } from './pca-errors.js';
 import { enrichEvmError, getPcaLogicInterface } from './evm-adapter-errors.js';
 
-export class ConvictionMethods extends EVMChainAdapterBase {
+export class ConvictionMethods extends EVMChainAdapterBase implements ConvictionReader {
   // =====================================================================
   // Staking + Publishing Conviction Account legacy surface — ARCHIVED
   /**

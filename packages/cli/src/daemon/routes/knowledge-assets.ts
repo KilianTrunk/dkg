@@ -42,6 +42,8 @@ import {
   validateWritableQuadLiteralSizes,
   normalizeContextGraphIdOrUri,
   resolveRequiredWriteContextGraphId,
+  isNoFundedPublisherWalletLike,
+  noFundedPublisherWalletBody,
 } from "../http-utils.js";
 import { validatePreSignedAuthorAttestation } from "./memory.js";
 import { recordAssertionActivity } from "../activity-notification.js";
@@ -63,8 +65,6 @@ import {
   decodePromoteJobId,
   asyncPromoteUnavailable,
   buildAutoRegisterFailureBody,
-  isNoFundedPublisherWalletLike,
-  noFundedPublisherWalletBody,
 } from "./shared-assertion-helpers.js";
 import { PromoteJobConflictError } from "@origintrail-official/dkg-publisher";
 import { deriveStatus } from "@origintrail-official/dkg-publisher";

@@ -14,7 +14,7 @@ import {
   isNoFundedPublisherWalletLike,
   noFundedPublisherWalletBody,
   respondWithDaemonError,
-} from '../src/daemon/routes/shared-assertion-helpers.js';
+} from '../src/daemon/http-utils.js';
 
 const FUNDS_MESSAGE =
   'No operational wallet has enough funds to publish to Verifiable Memory — fund a wallet and retry.';

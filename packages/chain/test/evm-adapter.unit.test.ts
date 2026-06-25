@@ -2902,6 +2902,27 @@ describe('createKnowledgeAssets — funding-aware wallet selection', () => {
     expect(caught.code).toBe('NONCE_EXPIRED');
   });
 
+  it('emits NO_FUNDED when the only funded wallet is NOT authorized for the context graph (cannot be routed to)', async () => {
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    // walletA (selected/pinned): authorized, gas, ZERO TRAC. walletB: funded but UNAUTHORIZED.
+    nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);
+    tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), ONE);
+    (a as any).contracts.contextGraphs.isAuthorizedPublisher = recorder(async (_cg: bigint, addr: string) =>
+      addr.toLowerCase() === walletA.address.toLowerCase());
+    const params = makeV10PublishParams(walletA.address);
+    params.tokenAmount = 1000n;
+    (a as any).signPopulatedTransaction = recorder(async () => {
+      const e: any = new Error('execution reverted: ERC20: transfer amount exceeds balance');
+      e.code = 'CALL_EXCEPTION';
+      throw e;
+    });
+    let caught: any;
+    try { await a.createKnowledgeAssets(params); } catch (e) { caught = e; }
+    // The funded wallet is unauthorized → not a viable reroute → terminal NO_FUNDED.
+    expect(caught).toBeInstanceOf(InsufficientPublisherFundsError);
+    expect(caught.code).toBe('NO_FUNDED_PUBLISHER_WALLET');
+  });
+
   it('does NOT wrap a non-funds contract revert on a zero-TRAC signer (no funds marker, not masked)', async () => {
     const { a, walletA, walletB, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
     tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), 0n);

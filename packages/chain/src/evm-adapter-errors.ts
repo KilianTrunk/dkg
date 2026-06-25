@@ -10,6 +10,10 @@
  * module.
  */
 import { ethers, Interface } from 'ethers';
+import {
+  NO_FUNDED_PUBLISHER_WALLET_CODE,
+  NO_FUNDED_PUBLISHER_WALLET_MESSAGE_PREFIX,
+} from '@origintrail-official/dkg-core';
 import { loadAbi } from './evm-adapter-abi.js';
 
 export function errorMessage(err: unknown): string {
@@ -301,8 +305,10 @@ export function isInsufficientFundsError(err: unknown): boolean {
   return /insufficient funds/i.test(errorMessage(err));
 }
 
-/** Machine-readable code carried by {@link InsufficientPublisherFundsError}. */
-export const NO_FUNDED_PUBLISHER_WALLET_CODE = 'NO_FUNDED_PUBLISHER_WALLET';
+/** Machine-readable code carried by {@link InsufficientPublisherFundsError}.
+ *  Defined in dkg-core (UI-safe shared package) and re-exported here so chain
+ *  consumers can keep importing it from dkg-chain. */
+export { NO_FUNDED_PUBLISHER_WALLET_CODE };
 
 /** Per-operational-wallet balance snapshot for the no-funded-wallet diagnostic. */
 export interface PublisherWalletBalance {
@@ -346,7 +352,7 @@ export function formatNoFundedPublisherWalletMessage(balances: PublisherWalletBa
     .map((b) => `  ${b.address}: ${formatWeiOrUnknown(b.tracWei)} TRAC, ${formatWeiOrUnknown(b.nativeWei)} gas`)
     .join('\n');
   return (
-    'No operational wallet has enough funds to publish to Verifiable Memory — ' +
+    `${NO_FUNDED_PUBLISHER_WALLET_MESSAGE_PREFIX} to publish to Verifiable Memory — ` +
     'each publish needs native gas AND TRAC on the same wallet. ' +
     'Operational wallet balances:\n' + lines + '\n' +
     'Fund one of these wallets (run `dkg wallets` to list addresses) and retry the publish.'

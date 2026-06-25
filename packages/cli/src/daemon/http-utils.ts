@@ -12,7 +12,10 @@ import {
   validateContextGraphId,
   validateSubGraphName,
   isSafeIri,
+  NO_FUNDED_PUBLISHER_WALLET_CODE,
+  messageIndicatesNoFundedPublisherWallet,
 } from '@origintrail-official/dkg-core';
+import { enrichEvmError } from '@origintrail-official/dkg-chain';
 import type { DKGAgent, ContextGraphWritePreflightProbe } from '@origintrail-official/dkg-agent';
 import type { DkgConfig } from '../config.js';
 import { enforceSignedRequestPostBody } from '../auth.js';
@@ -67,6 +70,57 @@ export function payloadTooLargeResponseBody(err: unknown): Record<string, unknow
   const hint = shaped.hint;
   if (typeof hint === 'string' && hint.length > 0) body.hint = hint;
   return body;
+}
+
+/**
+ * True iff `err` is (or looks like) the funded-wallet-selection failure
+ * (`InsufficientPublisherFundsError`, code `NO_FUNDED_PUBLISHER_WALLET`) —
+ * code-first, with a message-marker fallback for a re-wrap that dropped `.code`.
+ * Code + marker are the shared dkg-core contract so the daemon, publisher
+ * classifier, chain, and node-ui cannot drift. Shared by the `/vm/publish` route
+ * catch and the top-level daemon handler.
+ */
+export function isNoFundedPublisherWalletLike(err: unknown): boolean {
+  const e = err as { code?: unknown; message?: unknown } | null | undefined;
+  if (e?.code === NO_FUNDED_PUBLISHER_WALLET_CODE) return true;
+  return messageIndicatesNoFundedPublisherWallet(e?.message);
+}
+
+/** The HTTP-400 response body for a no-funded-wallet publish failure: the
+ *  structured `code` plus the actionable message (which lists per-wallet
+ *  balances). Single source of truth for both publish routes. */
+export function noFundedPublisherWalletBody(message: string): { code: string; error: string } {
+  return { code: NO_FUNDED_PUBLISHER_WALLET_CODE, error: message };
+}
+
+/**
+ * Map a thrown request error to the daemon's top-level HTTP response — the
+ * single neutral place that rethrowing routes (e.g. `/api/shared-memory/publish`)
+ * and the lifecycle catch agree on status codes: 413 payload-too-large; 400 for
+ * SyntaxError / reserved-namespace / NO_FUNDED_PUBLISHER_WALLET; otherwise a 500
+ * with the EVM-decoded message. Unit-testable in isolation.
+ */
+export function respondWithDaemonError(res: ServerResponse, err: any): void {
+  if (res.headersSent || res.writableEnded) return;
+  if (isPayloadTooLargeError(err)) {
+    jsonResponse(res, 413, payloadTooLargeResponseBody(err));
+  } else if (err instanceof SyntaxError) {
+    jsonResponse(res, 400, { error: err.message });
+  } else if (
+    // Round 9 Bug 25: user-authored quads with reserved URN prefixes map to 400
+    // so share/publish routes that rethrow get the correct status.
+    err?.name === 'ReservedNamespaceError' ||
+    (typeof err?.message === 'string' && err.message.includes('reserved namespace'))
+  ) {
+    jsonResponse(res, 400, { error: err.message });
+  } else if (isNoFundedPublisherWalletLike(err)) {
+    // Funded-wallet selection found no operational wallet with gas + TRAC — a
+    // user-actionable funding condition (4xx), not a server bug.
+    jsonResponse(res, 400, noFundedPublisherWalletBody(typeof err?.message === 'string' ? err.message : String(err)));
+  } else {
+    enrichEvmError(err);
+    jsonResponse(res, 500, { error: err?.message ?? String(err) });
+  }
 }
 
 export function oversizedRdfLiteralResponseBody(err: unknown): Record<string, unknown> {

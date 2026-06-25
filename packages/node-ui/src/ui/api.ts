@@ -1426,6 +1426,13 @@ export function describePromoteError(
  * `describePromoteError`).
  */
 export function describeInsufficientPublisherFunds(err: unknown): string | null {
+  // Mirrors the dkg-core funds contract (NO_FUNDED_PUBLISHER_WALLET code +
+  // NO_FUNDED_PUBLISHER_WALLET_MESSAGE_PREFIX). Kept as local literals because
+  // this browser module (Vite bundle) cannot import dkg-core's node module
+  // graph; a test in promote-outcome-helpers.test.ts pins them to the shared
+  // dkg-core values so they cannot drift silently. The structured `code` is the
+  // primary signal; the message marker is only a fallback for a code-stripped
+  // re-wrap.
   const MARKER = /No operational wallet has enough funds/i;
   if (err instanceof HttpError) {
     const body = err.body as { code?: string; error?: string } | undefined;

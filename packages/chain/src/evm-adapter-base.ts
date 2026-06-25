@@ -1395,6 +1395,7 @@ export class EVMChainAdapterBase {
   protected async enrichInsufficientPublisherFundsError(
     err: unknown,
     signer: Wallet,
+    contextGraphId: bigint,
     requiredTracWei: bigint = 0n,
   ): Promise<unknown> {
     try {
@@ -1411,12 +1412,12 @@ export class EVMChainAdapterBase {
       }
       // Only emit NO_FUNDED_PUBLISHER_WALLET — which asserts the WHOLE pool is
       // unfunded and maps downstream to a TERMINAL insufficient_funds failure —
-      // when NO operational wallet can fund this cost. If the selected wallet was
-      // short but another wallet could cover it (a cost-blind pre-pin, an explicit
-      // pinned address, or a stale cached balance), preserve the original error so
-      // a retry can reroute to a funded wallet instead of being told no wallet is
-      // funded.
-      if (selectedShort && !(await this.poolHasFundableSigner(requiredTracWei))) {
+      // when no wallet AUTHORIZED for this context graph can fund the cost. If the
+      // selected wallet was short but another authorized wallet could cover it (a
+      // cost-blind pre-pin, an explicit pinned address, or a stale cached
+      // balance), preserve the original error so a retry can reroute to that
+      // wallet instead of being told no wallet is funded.
+      if (selectedShort && !(await this.poolHasFundableSigner(contextGraphId, requiredTracWei))) {
         const balances = await this.snapshotPublisherWalletBalances();
         return new InsufficientPublisherFundsError(
           formatNoFundedPublisherWalletMessage(balances),
@@ -1431,17 +1432,24 @@ export class EVMChainAdapterBase {
   }
 
   /**
-   * True iff ANY operational wallet in the pool is fundable for a publish costing
-   * `requiredTracWei` (own balance above floor+cost, or a covering PCA agent).
-   * Used to distinguish a whole-pool funding problem (→ NO_FUNDED, terminal) from
-   * the selected wallet merely being the wrong, recoverable pick. Cached reads;
+   * True iff some operational wallet AUTHORIZED for `contextGraphId` is fundable
+   * for a publish costing `requiredTracWei` (own balance above floor+cost, or a
+   * covering PCA agent). Only an authorized+funded wallet is a viable reroute, so
+   * a funded-but-unauthorized wallet does NOT suppress NO_FUNDED. Used to
+   * distinguish a whole-pool funding problem (→ NO_FUNDED, terminal) from the
+   * selected wallet merely being the wrong, recoverable pick. Cached reads;
    * fail-open per wallet.
    */
-  protected async poolHasFundableSigner(requiredTracWei: bigint): Promise<boolean> {
+  protected async poolHasFundableSigner(contextGraphId: bigint, requiredTracWei: bigint): Promise<boolean> {
+    const contextGraphs = this.contracts.contextGraphs;
     const checks = await Promise.all(
-      this.signerPool.map(async (s) =>
-        this.isWalletPublishFundable(s.address, await this.getWalletFunding(s.address), requiredTracWei),
-      ),
+      this.signerPool.map(async (s) => {
+        // No ContextGraphs surface ⇒ every operational wallet is a candidate
+        // (mirrors nextAuthorizedSigner); otherwise only authorized wallets are
+        // viable reroutes.
+        if (contextGraphs && !(await contextGraphs.isAuthorizedPublisher(contextGraphId, s.address))) return false;
+        return this.isWalletPublishFundable(s.address, await this.getWalletFunding(s.address), requiredTracWei);
+      }),
     );
     return checks.some(Boolean);
   }
@@ -2473,6 +2481,7 @@ export class EVMChainAdapterBase {
       throw await this.enrichInsufficientPublisherFundsError(
         err,
         txSigner,
+        params.contextGraphId,
         floorPublishTokenAmount(params.tokenAmount),
       );
     });

@@ -6,6 +6,10 @@ import {
   describeBulkVmPublishResult,
   HttpError,
 } from '../src/ui/api.js';
+import {
+  NO_FUNDED_PUBLISHER_WALLET_CODE,
+  NO_FUNDED_PUBLISHER_WALLET_MESSAGE_PREFIX,
+} from '@origintrail-official/dkg-core';
 
 const FUNDS_MSG =
   'No operational wallet has enough funds to publish to Verifiable Memory — each publish needs native gas AND TRAC on the same wallet. ' +
@@ -26,6 +30,24 @@ const FUNDS_MSG =
  * contract stable so a future refactor of either helper doesn't
  * silently re-break that CTA.
  */
+// The browser module keeps local copies of the funds CODE + message marker (it
+// cannot import dkg-core in the Vite bundle). Pin them to the shared dkg-core
+// contract so a wording/code change there is caught here rather than drifting.
+describe('describeInsufficientPublisherFunds vs the shared dkg-core funds contract', () => {
+  const sharedMessage =
+    `${NO_FUNDED_PUBLISHER_WALLET_MESSAGE_PREFIX} to publish to Verifiable Memory — fund a wallet and retry.`;
+
+  it('recognizes the shared structured code', () => {
+    const err = new HttpError(400, sharedMessage, { code: NO_FUNDED_PUBLISHER_WALLET_CODE, error: sharedMessage });
+    expect(describeInsufficientPublisherFunds(err)).toBe(sharedMessage);
+  });
+
+  it('recognizes the shared message prefix when the code is stripped by a re-wrap', () => {
+    expect(describeInsufficientPublisherFunds(new Error(sharedMessage))).toBe(sharedMessage);
+    expect(describeInsufficientPublisherFunds(new HttpError(500, sharedMessage, { error: sharedMessage }))).toBe(sharedMessage);
+  });
+});
+
 // Pins the formatting extracted from the entities/layer-widgets publish-all
 // loops into the shared describeBulkVmPublishResult (api.ts) — the dedupe must
 // not change the partial-success / funds-tail / nothing-published behavior.

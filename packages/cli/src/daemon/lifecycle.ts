@@ -250,6 +250,7 @@ import {
   shortId,
   sleep,
   deriveBlockExplorerUrl,
+  respondWithDaemonError,
 } from './http-utils.js';
 import {
   normalizeRepo,
@@ -372,7 +373,6 @@ import {
 import { handleRequest } from './handle-request.js';
 import { loadRoutePlugins, countConfiguredPluginSpecs } from './plugin-loader.js';
 import type { MemoryGraphChangedEvent, MemoryGraphLayer } from './routes/context.js';
-import { respondWithDaemonError } from './routes/shared-assertion-helpers.js';
 import {
   createPromoteWorkerSupervisor,
   type PromoteWorkerConfig,

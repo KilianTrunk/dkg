@@ -59,6 +59,7 @@ import {
   decodePromoteJobId,
   asyncPromoteUnavailable,
   authorizeAgentScopedAuthorClaim,
+  isSameAgentAddress,
 } from "./shared-assertion-helpers.js";
 import { PromoteJobConflictError } from "@origintrail-official/dkg-publisher";
 import { deriveStatus } from "@origintrail-official/dkg-publisher";
@@ -317,12 +318,15 @@ export function resolveFinalizeOptions(
   // Without this, the create + finalize routes ignored the token and a custodial
   // agent's publish was sealed under the node's own signer instead of the agent
   // (the on-chain author came out as the node's operational wallet).
-  const effectiveAuthorAgentAddress =
+  const explicitAuthorAgentAddress =
     typeof authorAgentAddress === "string"
-      ? authorAgentAddress
-      : resolvedPreSignedAttestation == null
+      ? tokenAgentAddress && isSameAgentAddress(tokenAgentAddress, authorAgentAddress)
         ? tokenAgentAddress
-        : undefined;
+        : authorAgentAddress
+      : undefined;
+  const effectiveAuthorAgentAddress =
+    explicitAuthorAgentAddress ??
+    (resolvedPreSignedAttestation == null ? tokenAgentAddress : undefined);
   return {
     ...(subGraphName ? { subGraphName } : {}),
     ...(typeof effectiveAuthorAgentAddress === "string" ? { authorAgentAddress: effectiveAuthorAgentAddress } : {}),
@@ -341,11 +345,19 @@ function resolveAuthorAgentAddressFromFinalizeOptions(
   tokenAgentAddress?: string,
 ): string | undefined {
   const finalizedAuthor = finalizeOptions.authorAgentAddress;
-  if (typeof finalizedAuthor === "string") return finalizedAuthor;
+  if (typeof finalizedAuthor === "string") {
+    return tokenAgentAddress && isSameAgentAddress(tokenAgentAddress, finalizedAuthor)
+      ? tokenAgentAddress
+      : finalizedAuthor;
+  }
   const attestation = finalizeOptions.preSignedAuthorAttestation;
   if (attestation && typeof attestation === "object") {
     const preSignedAuthor = (attestation as { address?: unknown }).address;
-    if (typeof preSignedAuthor === "string") return preSignedAuthor;
+    if (typeof preSignedAuthor === "string") {
+      return tokenAgentAddress && isSameAgentAddress(tokenAgentAddress, preSignedAuthor)
+        ? tokenAgentAddress
+        : preSignedAuthor;
+    }
   }
   return tokenAgentAddress;
 }

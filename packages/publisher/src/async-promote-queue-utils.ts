@@ -80,15 +80,14 @@ export function uniquenessKey(request: PromoteUniquenessInput): string {
 }
 
 export function uniquenessLookupKeys(request: PromoteUniquenessInput): string[] {
-  const keys = [uniquenessKey(request)];
-  if (request.agentAddress === undefined) {
-    keys.push(legacyUniquenessKey(request));
-  }
-  return keys;
+  return Array.from(new Set([uniquenessKey(request), legacyUniquenessKey(request)]));
 }
 
 export function requestsShareUniquenessKey(a: PromoteUniquenessInput, b: PromoteUniquenessInput): boolean {
-  return uniquenessKey(a) === uniquenessKey(b);
+  if (legacyUniquenessKey(a) !== legacyUniquenessKey(b)) return false;
+  const aLane = normalizedAgentLane(a.agentAddress);
+  const bLane = normalizedAgentLane(b.agentAddress);
+  return aLane === '' || bLane === '' || aLane === bLane;
 }
 
 export function quad(subject: string, predicate: string, object: string, graph: string): Quad {

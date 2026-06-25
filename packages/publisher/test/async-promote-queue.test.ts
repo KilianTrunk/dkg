@@ -18,6 +18,9 @@ import {
   DEFAULT_PROMOTE_CONTROL_GRAPH_URI,
   PROMOTE_PAYLOAD,
   PROMOTE_STATE,
+  PROMOTE_UNIQUENESS_KEY,
+  jobSubject,
+  legacyUniquenessKey,
   literal,
   serializeJob,
   uniquenessKey,
@@ -65,6 +68,21 @@ describe('TripleStoreAsyncPromoteQueue', () => {
 
   function advance(ms: number): void {
     now += ms;
+  }
+
+  async function rewriteStoredUniquenessKey(jobId: string, key: string): Promise<void> {
+    await store.deleteByPattern({
+      subject: jobSubject(jobId),
+      predicate: PROMOTE_UNIQUENESS_KEY,
+      graph: DEFAULT_PROMOTE_CONTROL_GRAPH_URI,
+    });
+    await store.insert([{
+      subject: jobSubject(jobId),
+      predicate: PROMOTE_UNIQUENESS_KEY,
+      object: literal(key),
+      graph: DEFAULT_PROMOTE_CONTROL_GRAPH_URI,
+    }]);
+    await store.flush?.();
   }
 
   // ---------------------------------------------------------------------------
@@ -153,6 +171,18 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     // Default daemon lane is also independent from explicit agent lanes.
     const third = await queue.enqueue(makeRequest());
     expect(third).toBe('job-3');
+  });
+
+  it('3d. enqueue() treats legacy no-agent active jobs as conflicting with explicit upgraded lanes', async () => {
+    const queue = createQueue();
+    const legacyRequest = makeRequest();
+    const legacyJobId = await queue.enqueue(legacyRequest);
+    await rewriteStoredUniquenessKey(legacyJobId, legacyUniquenessKey(legacyRequest));
+
+    await expect(queue.enqueue(makeRequest({ agentAddress: `0x${'aa'.repeat(20)}` }))).rejects.toMatchObject({
+      name: 'PromoteJobConflictError',
+      existingJobId: legacyJobId,
+    });
   });
 
   it('3b. enqueue() serialises concurrent uniqueness checks for the same assertion', async () => {
@@ -357,6 +387,32 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     const claimedB = await queue.claimNext('worker-2');
     expect(claimedB?.jobId).toBe(jobB);
     expect(claimedB?.request.agentAddress).toBe(agentB);
+  });
+
+  it('13c. claimNext() does not claim an explicit lane while a legacy no-agent job is running', async () => {
+    const queue = createQueue();
+    const legacyRequest = makeRequest();
+    const legacyJobId = await queue.enqueue(legacyRequest);
+    await rewriteStoredUniquenessKey(legacyJobId, legacyUniquenessKey(legacyRequest));
+    const legacyClaim = await queue.claimNext('worker-1');
+    expect(legacyClaim?.jobId).toBe(legacyJobId);
+
+    await store.insert(
+      serializeJob(
+        {
+          jobId: 'explicit-after-upgrade',
+          request: makeRequest({ agentAddress: `0x${'aa'.repeat(20)}` }),
+          state: 'queued',
+          enqueuedAt: now + 1,
+          updatedAt: now + 1,
+          attempt: { count: 0, maxRetries: 5 },
+          formatVersion: ASYNC_PROMOTE_QUEUE_FORMAT_VERSION,
+        },
+        DEFAULT_PROMOTE_CONTROL_GRAPH_URI,
+      ),
+    );
+
+    expect(await queue.claimNext('worker-2')).toBeNull();
   });
 
   it('14. heartbeat() extends the lease without changing state', async () => {

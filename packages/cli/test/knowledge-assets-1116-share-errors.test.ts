@@ -180,6 +180,44 @@ describe('#1116 share/seal route error mapping (fake agent)', () => {
     expect(finalizeCalls[0]?.contextGraphId).toBe(CG_ID);
   });
 
+  it('wm/finalize: uses the token-canonical storage lane when body author differs only by case', async () => {
+    const token = 'agent-token-finalize-case';
+    const tokenAgentAddress = `0x${'cd'.repeat(20)}`;
+    const mixedCaseAuthor = `0x${'CD'.repeat(20)}`;
+    const finalizeCalls: Array<{ contextGraphId: unknown; name: unknown; opts: any }> = [];
+
+    await startWith(
+      {
+        finalize: async (contextGraphId: unknown, name: unknown, opts: any) => {
+          finalizeCalls.push({ contextGraphId, name, opts });
+          return {
+            assertionUri: 'did:dkg:assertion:case-finalize',
+            merkleRoot: new Uint8Array(32),
+            authorAddress: tokenAgentAddress,
+            schemeVersion: 1,
+            chainId: 1n,
+            kav10Address: `0x${'ef'.repeat(20)}`,
+            eip712Digest: `0x${'12'.repeat(32)}`,
+          };
+        },
+      },
+      {
+        resolveAgentByToken: (t?: string) => (t === token ? tokenAgentAddress : undefined),
+      },
+      { requestToken: token, requestAgentAddress: tokenAgentAddress },
+    );
+
+    const res = await post('wm/finalize', {
+      contextGraphId: CG_ID,
+      authorAgentAddress: mixedCaseAuthor,
+    });
+
+    expect(res.status).toBe(200);
+    expect(finalizeCalls).toHaveLength(1);
+    expect(finalizeCalls[0]?.opts?.agentAddress).toBe(tokenAgentAddress);
+    expect(finalizeCalls[0]?.opts?.authorAgentAddress).toBe(tokenAgentAddress);
+  });
+
   it('swm/share: an unrelated promote error still propagates (not silently 409ed)', async () => {
     // Guard: the new 409 branch must only catch UNSEALED_SHARE_BLOCKED. Any
     // other error rethrows to the outer handler (→ 500 here).

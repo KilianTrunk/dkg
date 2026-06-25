@@ -111,24 +111,9 @@ describe('describePromoteError', () => {
     expect(describePromoteError('x', 'string error' as unknown)).toBeNull();
   });
 
-  it('returns kind="insufficient-funds" for a 400 with code NO_FUNDED_PUBLISHER_WALLET (funded-wallet selection)', () => {
-    const err = new HttpError(400, FUNDS_MSG, { code: 'NO_FUNDED_PUBLISHER_WALLET', error: FUNDS_MSG });
-    const out = describePromoteError('skills-catalog', err);
-    expect(out).not.toBeNull();
-    if (!out || out.kind !== 'insufficient-funds') throw new Error('expected insufficient-funds outcome');
-    expect(out.message).toContain('No operational wallet has enough funds');
-    expect(out.message).toContain('0xAAA');
-  });
-
-  it('returns kind="insufficient-funds" when the structured code is missing but the message marker survives (re-wrapped error path)', () => {
-    const err = new HttpError(500, FUNDS_MSG, { error: FUNDS_MSG });
-    const out = describePromoteError('skills-catalog', err);
-    expect(out?.kind).toBe('insufficient-funds');
-  });
-
-  it('returns kind="insufficient-funds" for a plain Error carrying the marker message', () => {
-    const out = describePromoteError('skills-catalog', new Error(FUNDS_MSG));
-    expect(out?.kind).toBe('insufficient-funds');
+  it('stays promote-focused: returns null for publish NO_FUNDED_PUBLISHER_WALLET errors (handled by describeInsufficientPublisherFunds)', () => {
+    expect(describePromoteError('skills-catalog', new HttpError(400, FUNDS_MSG, { code: 'NO_FUNDED_PUBLISHER_WALLET', error: FUNDS_MSG }))).toBeNull();
+    expect(describePromoteError('skills-catalog', new Error(FUNDS_MSG))).toBeNull();
   });
 });
 

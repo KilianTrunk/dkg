@@ -21,10 +21,10 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
    * uses this to bind off-chain signatures to the tx signer before
    * `publishDirect` is submitted.
    */
-  async getAuthorizedPublisherAddress(contextGraphId: bigint): Promise<string> {
+  async getAuthorizedPublisherAddress(contextGraphId: bigint, requiredTracWei: bigint = 0n): Promise<string> {
     await this.init();
 
-    return (await this.nextAuthorizedSigner(contextGraphId)).address;
+    return (await this.nextAuthorizedSigner(contextGraphId, requiredTracWei)).address;
   }
 
   // =====================================================================

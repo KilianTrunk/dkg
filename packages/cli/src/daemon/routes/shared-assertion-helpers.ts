@@ -40,6 +40,32 @@ const XSD_DATE_TIME = 'http://www.w3.org/2001/XMLSchema#dateTime';
 const MAX_MARKDOWN_READ_BYTES = 5 * 1024 * 1024;
 const DEFAULT_MARKDOWN_READ_BYTES = 1024 * 1024;
 
+/**
+ * Build the HTTP-400 body for an on-chain context-graph auto-registration
+ * failure that precedes a publish. Shared by `/api/knowledge-assets/:name/vm/publish`
+ * (knowledge-assets.ts) and `/api/shared-memory/publish` (memory.ts) so the
+ * funds marker, wording, punctuation trim, and `{ code, error }` shape cannot
+ * drift between the two publish routes. On-chain registration is signed by the
+ * node's PRIMARY operational wallet (not the funded-wallet-selected publish
+ * wallet), so a funds failure here is actionable on that specific wallet.
+ */
+export function buildAutoRegisterFailureBody(
+  contextGraphId: string,
+  regErr: { message?: unknown; code?: unknown } | unknown,
+): { code?: string; error: string } {
+  const e = regErr as { message?: unknown; code?: unknown } | null | undefined;
+  const regMsg = (typeof e?.message === 'string' ? e.message : undefined) ?? String(regErr);
+  const fundsHint = /insufficient funds|NO_FUNDED_PUBLISHER_WALLET/i.test(regMsg)
+    ? ' On-chain registration is signed by the PRIMARY operational wallet — fund it (native gas + TRAC) and retry.'
+    : '';
+  return {
+    ...(typeof e?.code === 'string' && e.code.length > 0 ? { code: e.code } : {}),
+    error:
+      `Context graph "${contextGraphId}" could not be auto-registered on-chain before publish: ` +
+      `${regMsg.replace(/\.\s*$/, '')}.${fundsHint}`,
+  };
+}
+
 export type ImportedArtifactResolution = {
   contextGraphId: string;
   assertionUri: string;

@@ -1358,8 +1358,7 @@ export type PromoteOutcome =
   | { kind: 'success'; promotedCount: number; message: string }
   | { kind: 'noop'; message: string }
   | { kind: 'not-persisted'; message: string; expectedTripleCount?: number }
-  | { kind: 'payload-too-large'; message: string; actualBytes?: number; limitBytes?: number }
-  | { kind: 'insufficient-funds'; message: string };
+  | { kind: 'payload-too-large'; message: string; actualBytes?: number; limitBytes?: number };
 
 export function describePromoteResult(
   assertionName: string,
@@ -1414,23 +1413,17 @@ export function describePromoteError(
       };
     }
   }
-  // Funded-wallet selection found no operational wallet holding the gas + TRAC
-  // a publish to Verifiable Memory needs. The daemon returns a 400 with
-  // `code: 'NO_FUNDED_PUBLISHER_WALLET'` and an actionable message listing
-  // per-wallet balances. Some re-wrapped error paths drop the structured code
-  // but preserve the message, so match either the code or the message marker.
-  const fundsMessage = describeInsufficientPublisherFunds(err);
-  if (fundsMessage) {
-    return { kind: 'insufficient-funds', message: fundsMessage };
-  }
+  // NOTE: publish-only `NO_FUNDED_PUBLISHER_WALLET` failures are intentionally
+  // NOT classified here — this helper stays promote-focused. Publish paths call
+  // `describeInsufficientPublisherFunds` directly for the funds message.
   return null;
 }
 
 /**
  * Extract the actionable "no operational wallet has funds" message from a
  * publish error (code-first, message fallback), or null when `err` is not a
- * funds error. Exported so publish CTAs that don't route through
- * `describePromoteError` can surface the same message.
+ * funds error. Used by publish CTAs (separate from the promote-focused
+ * `describePromoteError`).
  */
 export function describeInsufficientPublisherFunds(err: unknown): string | null {
   const MARKER = /No operational wallet has enough funds/i;

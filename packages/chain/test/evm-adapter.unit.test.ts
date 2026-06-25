@@ -2916,6 +2916,56 @@ describe('createKnowledgeAssets — funding-aware wallet selection', () => {
     expect(caught).toBeInstanceOf(InsufficientPublisherFundsError);
     expect(caught.code).toBe('NO_FUNDED_PUBLISHER_WALLET');
   });
+
+  it('expires the funding cache past the TTL: a newly funded wallet is re-read and selected', async () => {
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    // walletA (head) unfunded (0 TRAC); walletB funded → B chosen first.
+    nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);
+    tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), ONE);
+    const first = await (a as any).nextAuthorizedSigner(CG);
+    expect(first.address).toBe(walletB.address);
+    // walletA is funded, but its zero balance is still cached. Backdate every
+    // cache entry past the TTL so the next selection must re-read.
+    tracByAddr.set(lc(walletA.address), ONE);
+    for (const entry of ((a as any).fundingCache as Map<string, { ts: number }>).values()) entry.ts = 0;
+    const second = await (a as any).nextAuthorizedSigner(CG);
+    expect(second.address).toBe(walletA.address); // re-read picks up the now-funded head
+  });
+
+  it('honors a non-zero minPublisherTracWei floor (strict > boundary)', async () => {
+    const FLOOR = 100n;
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    (a as any).minPublisherTracWei = FLOOR;
+    nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);
+    tracByAddr.set(lc(walletA.address), FLOOR); tracByAddr.set(lc(walletB.address), FLOOR + 1n);
+    const chosen = await (a as any).nextAuthorizedSigner(CG);
+    expect(chosen.address).toBe(walletB.address); // A at exactly the floor is NOT fundable (strict >)
+  });
+
+  it('honors a non-zero minPublisherNativeWei floor (strict > boundary)', async () => {
+    const FLOOR = 100n;
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    (a as any).minPublisherNativeWei = FLOOR;
+    nativeByAddr.set(lc(walletA.address), FLOOR); nativeByAddr.set(lc(walletB.address), FLOOR + 1n);
+    tracByAddr.set(lc(walletA.address), ONE); tracByAddr.set(lc(walletB.address), ONE);
+    const chosen = await (a as any).nextAuthorizedSigner(CG);
+    expect(chosen.address).toBe(walletB.address); // A at exactly the native floor is NOT fundable
+  });
+
+  it('cost-aware fallback selection: skips a dust-TRAC wallet that cannot cover the publish cost', async () => {
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    // walletA (head): gas + 1 wei TRAC (dust — above the 0n floor but below the
+    // publish cost). walletB: covers. createKnowledgeAssets (no publisherAddress)
+    // selects cost-aware against floorPublishTokenAmount(params.tokenAmount).
+    nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);
+    tracByAddr.set(lc(walletA.address), 1n); tracByAddr.set(lc(walletB.address), ONE);
+    const params = makeV10PublishParams();
+    params.tokenAmount = 1000n; // publish costs 1000 wei TRAC
+    let chosenSigner: any;
+    (a as any).signPopulatedTransaction = recorder(async (signer: any) => { chosenSigner = signer; throw new Error('SENTINEL'); });
+    await expect(a.createKnowledgeAssets(params)).rejects.toThrow('SENTINEL');
+    expect(chosenSigner.address).toBe(walletB.address); // dust-TRAC head skipped for the covering wallet
+  });
 });
 });
 

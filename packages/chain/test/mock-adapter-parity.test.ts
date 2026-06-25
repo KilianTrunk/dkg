@@ -94,7 +94,6 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   // enrichment). EVM-only — the mock has no provider/ERC-20 balance surface
   // and selects from its single signerAddress, so there is nothing to mirror.
   'selectFundedSigner',
-  'isWalletFundable',
   'isWalletPublishFundable',
   'isConvictionFundedAgent',
   'getWalletFunding',

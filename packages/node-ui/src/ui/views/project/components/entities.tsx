@@ -459,7 +459,7 @@ export function AssertionsList({ contextGraphId, layer, onComplete, scrollKey }:
       onComplete();
     } catch (err: any) {
       const typed = describePromoteError(assertion.name, err);
-      setError(typed ? typed.message : (err?.message ?? 'Action failed'));
+      setError(typed?.message ?? describeInsufficientPublisherFunds(err) ?? (err?.message ?? 'Action failed'));
     } finally {
       setBusy(null);
     }
@@ -531,7 +531,7 @@ export function AssertionsList({ contextGraphId, layer, onComplete, scrollKey }:
       onComplete();
     } catch (err: any) {
       const typed = describePromoteError(currentAssertion ?? 'selected assertion', err);
-      setError(typed ? typed.message : (err?.message ?? 'Action failed'));
+      setError(typed?.message ?? describeInsufficientPublisherFunds(err) ?? (err?.message ?? 'Action failed'));
     } finally {
       setBusy(null);
     }

@@ -1,3 +1,4 @@
+import { NO_FUNDED_PUBLISHER_WALLET_CODE } from '@origintrail-official/dkg-chain';
 import type { PublishResult } from './publisher.js';
 import {
   createLiftJobFailureMetadata,
@@ -143,7 +144,7 @@ export function mapPublishExceptionToLiftJobFailure(
   // valid from the 'broadcast' state, so only force it there — funded selection
   // is a broadcast-phase concern; any other state falls back to the classifier.
   const errorCode = (input.error as { code?: unknown } | null | undefined)?.code;
-  const isNoFundedWallet = errorCode === 'NO_FUNDED_PUBLISHER_WALLET'
+  const isNoFundedWallet = errorCode === NO_FUNDED_PUBLISHER_WALLET_CODE
     || lower.includes('no operational wallet has enough funds');
   const code = isNoFundedWallet && input.failedFromState === 'broadcast'
     ? 'insufficient_funds'

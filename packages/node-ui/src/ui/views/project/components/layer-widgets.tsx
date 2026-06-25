@@ -201,7 +201,7 @@ export function LayerActionsWidget({ layer, count, contextGraphId, onComplete, o
       onComplete?.();
     } catch (err: any) {
       const typed = describePromoteError(currentAssertion ?? 'an assertion', err);
-      setError(typed ? typed.message : (err?.message ?? 'Action failed'));
+      setError(typed?.message ?? describeInsufficientPublisherFunds(err) ?? (err?.message ?? 'Action failed'));
     } finally {
       setBusy(false);
     }

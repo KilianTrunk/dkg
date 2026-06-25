@@ -1181,7 +1181,7 @@ export class EVMChainAdapterBase {
    * revert). Selection is serialized via `signerSelectionQueue` so concurrent
    * publishes advance the `signerIndex` cursor coherently.
    */
-  protected async nextAuthorizedSigner(contextGraphId: bigint): Promise<Wallet> {
+  protected async nextAuthorizedSigner(contextGraphId: bigint, requiredTracWei: bigint = 0n): Promise<Wallet> {
     const previousSelection = this.signerSelectionQueue;
     let releaseSelection!: () => void;
     this.signerSelectionQueue = new Promise<void>((resolve) => { releaseSelection = resolve; });
@@ -1218,7 +1218,7 @@ export class EVMChainAdapterBase {
 
       const chosen = this.fundedWalletSelectionDisabled
         ? authorized[0]
-        : await this.selectFundedSigner(authorized);
+        : await this.selectFundedSigner(authorized, requiredTracWei);
 
       // Advance the cursor just past the chosen wallet so the next selection
       // rotates — preserving cross-wallet nonce concurrency (#953) when more
@@ -1239,7 +1239,7 @@ export class EVMChainAdapterBase {
    * none is fundable, return the best-funded wallet (max native, then max TRAC)
    * so the publish still attempts and the contract gives the real verdict.
    */
-  protected async selectFundedSigner(authorized: Wallet[]): Promise<Wallet> {
+  protected async selectFundedSigner(authorized: Wallet[], requiredTracWei: bigint): Promise<Wallet> {
     const fundings = await Promise.all(authorized.map((s) => this.getWalletFunding(s.address)));
     // Fundability is own-balance first (cheap), with a Publishing Conviction
     // Account (PCA) fallback: a registered+covering PCA agent wallet pays the
@@ -1248,7 +1248,7 @@ export class EVMChainAdapterBase {
     // legitimately holds gas + zero own-TRAC, so without this fallback the
     // funding gate would skip it and lose the conviction discount.
     const fundable = await Promise.all(
-      authorized.map((s, i) => this.isWalletPublishFundable(s.address, fundings[i])),
+      authorized.map((s, i) => this.isWalletPublishFundable(s.address, fundings[i], requiredTracWei)),
     );
     for (let i = 0; i < authorized.length; i += 1) {
       if (fundable[i]) return authorized[i];
@@ -1264,46 +1264,44 @@ export class EVMChainAdapterBase {
     return authorized[bestIdx];
   }
 
-  /** A wallet is fundable when native > floor AND TRAC > floor. A `null`
-   *  metric (read failed / no token contract) is treated as satisfied so the
-   *  selector fails open. (Sync; does not consider the PCA fallback — use
-   *  {@link isWalletPublishFundable} for selection.) */
-  protected isWalletFundable(f: { native: bigint | null; trac: bigint | null }): boolean {
-    const nativeOk = f.native === null || f.native > this.minPublisherNativeWei;
-    const tracOk = f.trac === null || f.trac > this.minPublisherTracWei;
-    return nativeOk && tracOk;
-  }
-
   /**
-   * Fundable for publishing: native gas above floor AND (own TRAC above floor
-   * OR the wallet is a registered, covering PCA agent). The PCA conviction
-   * reads only run when own TRAC is short (so a normal funded wallet pays no
-   * extra RPC) and FAIL OPEN to "not a PCA agent" so a flaky conviction read
-   * never falsely marks an otherwise-empty wallet fundable.
+   * The single fundability predicate: native gas above the floor AND own-TRAC
+   * covers the publish (above the operator floor AND `>= requiredTracWei`, the
+   * publish cost — `0n` when the cost is unknown, so only the floor applies), OR
+   * the wallet is a registered, covering PCA agent (publish paid from its
+   * conviction account, not its own TRAC). A `null` metric (read failed / no
+   * token contract) is treated as satisfied so selection FAILS OPEN. The PCA
+   * conviction reads run only when own-TRAC is short, so a normally funded
+   * wallet pays no extra RPC.
    */
   protected async isWalletPublishFundable(
     address: string,
     f: { native: bigint | null; trac: bigint | null },
+    requiredTracWei: bigint,
   ): Promise<boolean> {
     const nativeOk = f.native === null || f.native > this.minPublisherNativeWei;
     if (!nativeOk) return false; // even a PCA agent needs gas
-    const tracOk = f.trac === null || f.trac > this.minPublisherTracWei;
-    if (tracOk) return true;
-    return this.isConvictionFundedAgent(address);
+    const ownTracOk = f.trac === null
+      || (f.trac > this.minPublisherTracWei && f.trac >= requiredTracWei);
+    if (ownTracOk) return true;
+    return this.isConvictionFundedAgent(address, requiredTracWei);
   }
 
   /**
-   * True iff `address` is a registered Publishing Conviction Account agent
-   * whose account can still cover a publish (live, non-expired, non-zero
-   * allowance) — i.e. it can publish without holding its own TRAC. Cheap-exit
-   * when the PCA NFT is not deployed; best-effort otherwise (any read failure ⇒
+   * True iff `address` is a registered Publishing Conviction Account agent whose
+   * account can cover a publish costing `requiredCostWei` — i.e. it can publish
+   * without holding its own TRAC. A `0n`/unknown cost falls back to a `1n`
+   * liveness probe (account exists, not expired, has allowance). Cheap-exit when
+   * the PCA NFT is not deployed; best-effort otherwise (any read failure ⇒
    * false, so the wallet then relies on its own-TRAC gate rather than being
-   * optimistically selected and reverting). NOTE: a tiny consent-free "squat"
-   * PCA (RFC-001 §3.6) whose allowance rounds up to ≥1 wei but cannot cover a
-   * real publish can still pass this liveness probe; that is an
-   * attacker-induced edge that degrades to a single retry, not a fund loss.
+   * optimistically selected and reverting). NOTE: with the `1n` liveness probe
+   * (cost unknown), a tiny consent-free "squat" PCA (RFC-001 §3.6) whose
+   * allowance rounds up to ≥1 wei but cannot cover a real publish can still pass;
+   * that is an attacker-induced edge that degrades to a single retry, not a fund
+   * loss. When the real cost is threaded (the createKnowledgeAssets paths) the
+   * probe prices the actual publish and rejects such squats.
    */
-  protected async isConvictionFundedAgent(address: string): Promise<boolean> {
+  protected async isConvictionFundedAgent(address: string, requiredCostWei: bigint): Promise<boolean> {
     if (!this.contracts.dkgPublishingConvictionNFT) return false;
     const conv = this as unknown as {
       getConvictionAgentAccountId(agent: string): Promise<bigint>;
@@ -1316,11 +1314,8 @@ export class EVMChainAdapterBase {
         'pca agent account lookup',
       );
       if (accountId <= 0n) return false;
-      // `baseCost = 1n` is a liveness probe (account exists, not expired, >=1 wei
-      // discounted allowance). The exact publish cost is unknown at selection
-      // time, so this confirms the PCA path is usable rather than pricing it.
       return await withTimeout(
-        conv.convictionAccountCanCover(accountId, 1n),
+        conv.convictionAccountCanCover(accountId, requiredCostWei > 0n ? requiredCostWei : 1n),
         RPC_READ_STALL_TIMEOUT_MS,
         'pca account coverage probe',
       );
@@ -1398,7 +1393,11 @@ export class EVMChainAdapterBase {
    * carrying every operational wallet's balances; otherwise return `err`
    * unchanged. Best-effort — never lets the enrichment mask the original error.
    */
-  protected async enrichInsufficientPublisherFundsError(err: unknown, signer: Wallet): Promise<unknown> {
+  protected async enrichInsufficientPublisherFundsError(
+    err: unknown,
+    signer: Wallet,
+    requiredTracWei: bigint = 0n,
+  ): Promise<unknown> {
     try {
       let fundsProblem = isInsufficientFundsError(err);
       if (!fundsProblem && this.looksLikeFundsRevert(err)) {
@@ -1406,13 +1405,19 @@ export class EVMChainAdapterBase {
         // (not an "insufficient funds" string). Only reclassify when the error
         // is a CHAIN REVERT (filtered by looksLikeFundsRevert — excludes
         // nonce / RPC / dropped-receipt / WAL-hook control-flow errors) AND the
-        // signing wallet holds ZERO of a required resource, so a wallet that is
-        // genuinely unusable for publishing is named — without masking an
-        // unrelated revert on a wallet that actually holds gas + TRAC. Strict
-        // `=== 0n` (not the selection floor) keeps a positive floor from
-        // turning an unrelated revert into a funds message.
+        // signing wallet cannot fund the publish: native gas is zero, OR own
+        // TRAC is zero / below the publish cost `requiredTracWei` AND the wallet
+        // is not a covering PCA agent (which pays from its conviction account).
+        // This avoids masking an unrelated revert on a wallet that can actually
+        // fund the publish.
         const f = await this.getWalletFunding(signer.address, { forceRefresh: true });
-        fundsProblem = f.native === 0n || f.trac === 0n;
+        const nativeShort = f.native === 0n;
+        let tracShort = f.trac !== null
+          && (f.trac === 0n || (requiredTracWei > 0n && f.trac < requiredTracWei));
+        if (tracShort && await this.isConvictionFundedAgent(signer.address, requiredTracWei)) {
+          tracShort = false; // PCA covers the cost; this is not a funds problem
+        }
+        fundsProblem = nativeShort || tracShort;
       }
       if (fundsProblem) {
         const balances = await this.snapshotPublisherWalletBalances();
@@ -2275,7 +2280,13 @@ export class EVMChainAdapterBase {
       }
       txSigner = selected;
     } else {
-      txSigner = await this.nextAuthorizedSigner(params.contextGraphId);
+      // No pre-pinned publisher address: select cost-aware here, where the
+      // publish `tokenAmount` IS known (unlike the publisher's pre-pin via
+      // getAuthorizedPublisherAddress, which runs before the cost is sized).
+      txSigner = await this.nextAuthorizedSigner(
+        params.contextGraphId,
+        floorPublishTokenAmount(params.tokenAmount),
+      );
     }
     const ka = this.contracts.knowledgeAssetsLifecycle.connect(txSigner) as Contract;
     const kaAddress = await ka.getAddress();
@@ -2447,7 +2458,11 @@ export class EVMChainAdapterBase {
       // InsufficientPublisherFundsError listing every operational wallet's
       // balances, so the user is told which wallet to fund instead of seeing a
       // raw ethers "insufficient funds" string. Non-funds errors pass through.
-      throw await this.enrichInsufficientPublisherFundsError(err, txSigner);
+      throw await this.enrichInsufficientPublisherFundsError(
+        err,
+        txSigner,
+        floorPublishTokenAmount(params.tokenAmount),
+      );
     });
 
     let kaId = 0n;

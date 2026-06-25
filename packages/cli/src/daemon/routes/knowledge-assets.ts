@@ -62,6 +62,7 @@ import {
 import {
   decodePromoteJobId,
   asyncPromoteUnavailable,
+  buildAutoRegisterFailureBody,
 } from "./shared-assertion-helpers.js";
 import { PromoteJobConflictError } from "@origintrail-official/dkg-publisher";
 import { deriveStatus } from "@origintrail-official/dkg-publisher";
@@ -1259,20 +1260,7 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
           try {
             await agent.ensureRegisteredForPublish(contextGraphId, { callerAgentAddress: requestAgentAddress });
           } catch (regErr: any) {
-            const regMsg = regErr?.message ?? String(regErr);
-            // On-chain CG registration is signed by the PRIMARY operational
-            // wallet (not the funded-wallet-selected publish wallet), so a
-            // funds failure here means the primary wallet specifically needs
-            // funding — make that actionable.
-            const fundsHint = /insufficient funds|NO_FUNDED_PUBLISHER_WALLET/i.test(regMsg)
-              ? " On-chain registration is signed by the PRIMARY operational wallet — fund it (native gas + TRAC) and retry."
-              : "";
-            return jsonResponse(res, 400, {
-              ...(regErr?.code ? { code: regErr.code } : {}),
-              error:
-                `Context graph "${contextGraphId}" could not be auto-registered on-chain before publish: ` +
-                `${regMsg.replace(/\.\s*$/, "")}.${fundsHint}`,
-            });
+            return jsonResponse(res, 400, buildAutoRegisterFailureBody(contextGraphId, regErr));
           }
           pub = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts });
         }

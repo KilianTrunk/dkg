@@ -66,6 +66,7 @@ import {
 import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, assertSafeRdfTerm, sparqlIri, contextGraphSharedMemoryUri, sharedMemoryReadBothFilter, contextGraphAssertionUri, contextGraphMetaUri, escapeDkgRdfLiteral, escapeSparqlLiteral, PROTOCOL_SYNC } from '@origintrail-official/dkg-core';
 import { skolemizeByEntity, findReservedSubjectPrefix, isSkolemizedUri, type PublishOptions, type PublishResult } from '@origintrail-official/dkg-publisher';
 import type { Quad } from '@origintrail-official/dkg-storage';
+import { buildAutoRegisterFailureBody } from "./shared-assertion-helpers.js";
 import {
   DashboardDB,
   MetricsCollector,
@@ -2122,20 +2123,7 @@ WHERE {
         // (insufficient TRAC, missing chain signer, etc.)
         // instead of a generic 500 from the publish leg later.
         tracker.fail(ctx, regErr);
-        const regMsg = regErr?.message ?? String(regErr);
-        // On-chain CG registration is signed by the PRIMARY operational wallet
-        // (not the funded-wallet-selected publish wallet), so a funds failure
-        // here means the primary wallet specifically needs funding. Mirror the
-        // /vm/publish route's actionable hint.
-        const fundsHint = /insufficient funds|NO_FUNDED_PUBLISHER_WALLET/i.test(regMsg)
-          ? " On-chain registration is signed by the PRIMARY operational wallet — fund it (native gas + TRAC) and retry."
-          : "";
-        return jsonResponse(res, 400, {
-          ...(regErr?.code ? { code: regErr.code } : {}),
-          error:
-            `Context graph "${resolvedContextGraphId}" could not be auto-registered on-chain before publish: ` +
-            `${regMsg.replace(/\.\s*$/, "")}.${fundsHint}`,
-        });
+        return jsonResponse(res, 400, buildAutoRegisterFailureBody(resolvedContextGraphId, regErr));
       }
       const basePublishOptions = {
         operationCtx: ctx,

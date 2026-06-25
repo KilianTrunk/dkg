@@ -1172,14 +1172,17 @@ export class EVMChainAdapterBase {
    * Pick the operational wallet that signs the next publish tx. Among the
    * wallets the on-chain ContextGraphs contract authorizes for this context
    * graph (round-robin order from `signerIndex`), PREFER one that is funded
-   * (native gas AND TRAC above the configured floors) so a publish is never
-   * routed to an authorized-but-empty wallet — the unfunded-wallet
-   * publish-failure this selector exists to fix. Falls back to plain
-   * round-robin over the full pool when the auth surface is unavailable, and to
-   * the best-funded authorized wallet when none is fundable (the publish then
-   * surfaces an actionable InsufficientPublisherFundsError rather than a raw
-   * revert). Selection is serialized via `signerSelectionQueue` so concurrent
-   * publishes advance the `signerIndex` cursor coherently.
+   * (native gas AND TRAC above the configured floors, or a covering PCA agent)
+   * so a publish is never routed to an authorized-but-empty wallet — the
+   * unfunded-wallet publish-failure this selector exists to fix. When the
+   * ContextGraphs auth surface is unavailable, every operational wallet is a
+   * candidate — still funding-aware over the full pool, NOT a plain pick. When
+   * no candidate is fundable, falls back to the best-funded one (the publish
+   * then surfaces an actionable InsufficientPublisherFundsError rather than a
+   * raw revert). The DKG_DISABLE_FUNDED_WALLET_SELECTION kill-switch is the only
+   * path that reverts to a plain round-robin pick (the first authorized wallet).
+   * Selection is serialized via `signerSelectionQueue` so concurrent publishes
+   * advance the `signerIndex` cursor coherently.
    */
   protected async nextAuthorizedSigner(contextGraphId: bigint, requiredTracWei: bigint = 0n): Promise<Wallet> {
     const previousSelection = this.signerSelectionQueue;

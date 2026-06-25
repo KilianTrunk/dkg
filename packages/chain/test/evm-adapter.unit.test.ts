@@ -3051,6 +3051,46 @@ describe('createKnowledgeAssets — funding-aware wallet selection', () => {
     await expect(a.createKnowledgeAssets(params)).rejects.toThrow('SENTINEL');
     expect(chosenSigner.address).toBe(walletB.address); // dust-TRAC head skipped for the covering wallet
   });
+
+  it('skips a funded round-robin HEAD that is NOT authorized and selects a later authorized+funded wallet', async () => {
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    // Mixed case: both wallets abundantly funded, but walletA (the round-robin
+    // head) is UNAUTHORIZED for the CG and walletB is authorized. Authorization
+    // must gate selection so the funded-but-unauthorized head is never picked.
+    nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);
+    tracByAddr.set(lc(walletA.address), ONE); tracByAddr.set(lc(walletB.address), ONE);
+    (a as any).contracts.contextGraphs.isAuthorizedPublisher = recorder(async (_cg: bigint, addr: string) =>
+      addr.toLowerCase() === lc(walletB.address));
+    const chosen = await (a as any).nextAuthorizedSigner(CG);
+    expect(chosen.address).toBe(walletB.address); // funded-but-unauthorized head filtered out
+  });
+
+  it('cost-aware PCA: prices convictionAccountCanCover at the publish cost and skips a PCA that covers only the 1-wei probe', async () => {
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    // walletA (head): gas, ZERO own-TRAC, a registered PCA agent whose conviction
+    // account covers the 1-wei liveness probe but NOT a real publish cost.
+    // walletB: own-TRAC covers the cost. createKnowledgeAssets must price the PCA
+    // coverage check at floorPublishTokenAmount(tokenAmount) (NOT the 1-wei probe),
+    // so walletA is rejected and walletB is chosen.
+    nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);
+    tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), ONE);
+    (a as any).contracts.dkgPublishingConvictionNFT = {};
+    (a as any).getConvictionAgentAccountId = recorder(async (addr: string) =>
+      addr.toLowerCase() === lc(walletA.address) ? 42n : 0n);
+    const coverCalls: bigint[] = [];
+    (a as any).convictionAccountCanCover = recorder(async (_id: bigint, cost: bigint) => {
+      coverCalls.push(cost);
+      return cost <= 1n; // covers the 1-wei liveness probe only, NOT a real publish cost
+    });
+    const params = makeV10PublishParams();
+    params.tokenAmount = 1000n;
+    let chosenSigner: any;
+    (a as any).signPopulatedTransaction = recorder(async (signer: any) => { chosenSigner = signer; throw new Error('SENTINEL'); });
+    await expect(a.createKnowledgeAssets(params)).rejects.toThrow('SENTINEL');
+    expect(chosenSigner.address).toBe(walletB.address); // PCA head can't cover the REAL cost → skipped
+    expect(coverCalls.length).toBe(1); // only walletA's PCA was probed (walletB fundable via own-TRAC)
+    expect(coverCalls[0] > 1n).toBe(true); // priced at the REAL publish cost, not the 1-wei liveness probe
+  });
 });
 });
 

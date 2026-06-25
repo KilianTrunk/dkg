@@ -324,7 +324,9 @@ export function resolveFinalizeOptions(
       ? authorAgentAddress
       : undefined;
   const effectiveAuthorAgentAddress =
-    explicitAuthorAgentAddress ??
+    (explicitAuthorAgentAddress && tokenAgentAddress && isSameAgentAddress(tokenAgentAddress, explicitAuthorAgentAddress)
+      ? tokenAgentAddress
+      : explicitAuthorAgentAddress) ??
     (resolvedPreSignedAttestation == null ? tokenAgentAddress : undefined);
   return {
     ...(subGraphName ? { subGraphName } : {}),

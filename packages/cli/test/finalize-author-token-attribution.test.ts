@@ -54,12 +54,12 @@ describe('resolveFinalizeOptions — token authorship attribution (F1)', () => {
     expect(errors).toEqual([{ code: 403 }]);
   });
 
-  it('allows an explicit body authorAgentAddress that matches the token agent with different casing', () => {
+  it('canonicalizes an explicit body authorAgentAddress that matches the token agent with different casing', () => {
     const mixedCaseTokenAgent = `0x${'AB'.repeat(20)}`;
     const { res, errors } = stubRes();
     const out = resolveFinalizeOptions({ authorAgentAddress: mixedCaseTokenAgent }, res, TOKEN_AGENT);
     expect(errors).toEqual([]);
-    expect((out as Record<string, unknown>).authorAgentAddress).toBe(mixedCaseTokenAgent);
+    expect((out as Record<string, unknown>).authorAgentAddress).toBe(TOKEN_AGENT);
   });
 
   it('rejects a pre-signed author attestation whose address differs from the token agent', () => {

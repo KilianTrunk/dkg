@@ -233,6 +233,25 @@ describe('/api/knowledge-assets routes (real daemon, real chain)', () => {
       expect(descriptor.body.wmCurrentAssertion).toBeTruthy();
     });
 
+    it('atomic create canonicalizes a mixed-case self authorAgentAddress before sealing', async () => {
+      const agent = await registerAgentClient('ka-atomic-author-case');
+      const cg = `ka-atomic-author-case-${Date.now().toString(36)}`;
+      await createRegisteredAgentContextGraph(agent, cg);
+      const mixedCaseAgent = `0x${agent.agentAddress.slice(2).toUpperCase()}`;
+      expect(mixedCaseAgent).not.toBe(agent.agentAddress);
+
+      const res = await agent.post('/api/knowledge-assets', {
+        contextGraphId: cg,
+        name: 'agent-case-atomic',
+        quads: [{ subject: 'ex:Case', predicate: 'ex:p', object: '"x"' }],
+        finalize: true,
+        authorAgentAddress: mixedCaseAgent,
+      });
+
+      expect(res.status, `mixed-case atomic create: ${JSON.stringify(res.body)}`).toBe(201);
+      expect(String(res.body.authorAddress).toLowerCase()).toBe(agent.agentAddress.toLowerCase());
+    });
+
     it('rejects mismatched atomic create authorAgentAddress before opening a draft', async () => {
       const agentA = await registerAgentClient('ka-atomic-author-a');
       const agentB = await registerAgentClient('ka-atomic-author-b');

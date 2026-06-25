@@ -332,7 +332,7 @@ import {
 } from '../local-agents.js';
 
 import type { RequestContext } from './context.js';
-import { authorizeAgentScopedAuthorClaim } from './shared-assertion-helpers.js';
+import { authorizeAgentScopedAuthorClaim, isSameAgentAddress } from './shared-assertion-helpers.js';
 
 /**
  * Validate a `preSignedAuthorAttestation` payload from a finalize request.
@@ -1864,7 +1864,10 @@ WHERE {
         ) {
           return;
         }
-        resolvedAuthorAgentAddress = bodyAuthorAgentAddress;
+        resolvedAuthorAgentAddress =
+          tokenAgentAddress && isSameAgentAddress(tokenAgentAddress, bodyAuthorAgentAddress)
+            ? tokenAgentAddress
+            : bodyAuthorAgentAddress;
       } else if (tokenAgentAddress != null) {
         resolvedAuthorAgentAddress = tokenAgentAddress;
       }

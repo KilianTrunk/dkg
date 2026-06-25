@@ -410,6 +410,20 @@ describe('shared-memory publish authorship route matrix', () => {
     expect(seen[0].opts.authorAgentAddress).toBe(agentAddress);
   });
 
+  it('canonicalizes selection publish when body author matches the agent-scoped token with different casing', async () => {
+    const agentAddress = `0x${'dc'.repeat(20)}`;
+    const mixedCaseAgent = `0x${agentAddress.slice(2).toUpperCase()}`;
+    const { res, seen } = await runSharedMemoryPublishRoute({
+      bearer: 'agent-a-token',
+      tokenAgents: { 'agent-a-token': agentAddress },
+      body: { contextGraphId: 'cg', selection: ['urn:root'], authorAgentAddress: mixedCaseAgent },
+    });
+
+    expect(res.statusCode, res.body).toBe(200);
+    expect(seen).toHaveLength(1);
+    expect(seen[0].opts.authorAgentAddress).toBe(agentAddress);
+  });
+
   it('keeps node-token selection publish explicit author override behavior', async () => {
     const authorAgentAddress = `0x${'ef'.repeat(20)}`;
     const { res, seen } = await runSharedMemoryPublishRoute({

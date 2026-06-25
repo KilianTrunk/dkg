@@ -350,15 +350,6 @@ function resolveAuthorAgentAddressFromFinalizeOptions(
       ? tokenAgentAddress
       : finalizedAuthor;
   }
-  const attestation = finalizeOptions.preSignedAuthorAttestation;
-  if (attestation && typeof attestation === "object") {
-    const preSignedAuthor = (attestation as { address?: unknown }).address;
-    if (typeof preSignedAuthor === "string") {
-      return tokenAgentAddress && isSameAgentAddress(tokenAgentAddress, preSignedAuthor)
-        ? tokenAgentAddress
-        : preSignedAuthor;
-    }
-  }
   return tokenAgentAddress;
 }
 

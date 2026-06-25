@@ -218,6 +218,43 @@ describe('#1116 share/seal route error mapping (fake agent)', () => {
     expect(finalizeCalls[0]?.opts?.authorAgentAddress).toBe(tokenAgentAddress);
   });
 
+  it('wm/finalize: node/admin pre-signed author does not change the storage lane', async () => {
+    const preSignedAuthor = `0x${'ab'.repeat(20)}`;
+    const finalizeCalls: Array<{ contextGraphId: unknown; name: unknown; opts: any }> = [];
+
+    await startWith({
+      finalize: async (contextGraphId: unknown, name: unknown, opts: any) => {
+        finalizeCalls.push({ contextGraphId, name, opts });
+        return {
+          assertionUri: 'did:dkg:assertion:presigned-finalize',
+          merkleRoot: new Uint8Array(32),
+          authorAddress: preSignedAuthor,
+          schemeVersion: 1,
+          chainId: 1n,
+          kav10Address: `0x${'ef'.repeat(20)}`,
+          eip712Digest: `0x${'12'.repeat(32)}`,
+        };
+      },
+    });
+
+    const res = await post('wm/finalize', {
+      contextGraphId: CG_ID,
+      preSignedAuthorAttestation: {
+        address: preSignedAuthor,
+        reservedKaId: '1',
+        signature: {
+          r: `0x${'01'.repeat(32)}`,
+          vs: `0x${'02'.repeat(32)}`,
+        },
+      },
+    });
+
+    expect(res.status).toBe(200);
+    expect(finalizeCalls).toHaveLength(1);
+    expect(finalizeCalls[0]?.opts?.agentAddress).toBeUndefined();
+    expect(finalizeCalls[0]?.opts?.preSignedAuthorAttestation?.address).toBe(preSignedAuthor);
+  });
+
   it('swm/share: an unrelated promote error still propagates (not silently 409ed)', async () => {
     // Guard: the new 409 branch must only catch UNSEALED_SHARE_BLOCKED. Any
     // other error rethrows to the outer handler (→ 500 here).

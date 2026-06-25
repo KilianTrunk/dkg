@@ -13,6 +13,7 @@ import {
   enrichEvmError,
   EVMChainAdapter,
   InsufficientPublisherFundsError,
+  isNoFundedPublisherWalletError,
   isTooLowAllowanceError,
   resolveRpcUrls,
   V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE,
@@ -125,6 +126,23 @@ describe('decodeEvmError / enrichEvmError (07 EVM_MODULE — custom errors)', ()
 
   it('returns null for unrecognized error selector', () => {
     expect(decodeEvmError('0xdeadbeef')).toBeNull();
+  });
+});
+
+describe('isNoFundedPublisherWalletError (code-first + shared message marker)', () => {
+  it('matches the structured code', () => {
+    expect(isNoFundedPublisherWalletError({ code: 'NO_FUNDED_PUBLISHER_WALLET' })).toBe(true);
+  });
+  it('matches the shared message marker when .code is dropped by a wrapper', () => {
+    // Same semantics as the daemon-side predicate — keyed on the dkg-core
+    // "No operational wallet has enough funds" prefix, not the literal code.
+    expect(isNoFundedPublisherWalletError(new Error('No operational wallet has enough funds to publish.'))).toBe(true);
+  });
+  it('does NOT match unrelated errors', () => {
+    expect(isNoFundedPublisherWalletError({ code: 'CALL_EXCEPTION' })).toBe(false);
+    expect(isNoFundedPublisherWalletError(new Error('insufficient funds for gas'))).toBe(false);
+    expect(isNoFundedPublisherWalletError(undefined)).toBe(false);
+    expect(isNoFundedPublisherWalletError(null)).toBe(false);
   });
 });
 

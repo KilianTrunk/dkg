@@ -13,6 +13,7 @@ import { ethers, Interface } from 'ethers';
 import {
   NO_FUNDED_PUBLISHER_WALLET_CODE,
   NO_FUNDED_PUBLISHER_WALLET_MESSAGE_PREFIX,
+  messageIndicatesNoFundedPublisherWallet,
 } from '@origintrail-official/dkg-core';
 import { loadAbi } from './evm-adapter-abi.js';
 
@@ -336,10 +337,16 @@ export class InsufficientPublisherFundsError extends Error {
   }
 }
 
-/** True iff `err` is (or was tagged as) an {@link InsufficientPublisherFundsError}. */
+/**
+ * True iff `err` is the no-funded-publisher-wallet failure — code-first, with a
+ * message-marker fallback for a wrapper that dropped `.code`. Uses the same
+ * shared dkg-core contract (`messageIndicatesNoFundedPublisherWallet`) as the
+ * daemon-side predicate, so the chain and daemon classifiers agree on semantics.
+ */
 export function isNoFundedPublisherWalletError(err: unknown): boolean {
-  return !!err && typeof err === 'object'
-    && (err as { code?: unknown }).code === NO_FUNDED_PUBLISHER_WALLET_CODE;
+  const e = err as { code?: unknown; message?: unknown } | null | undefined;
+  return e?.code === NO_FUNDED_PUBLISHER_WALLET_CODE
+    || messageIndicatesNoFundedPublisherWallet(e?.message);
 }
 
 function formatWeiOrUnknown(wei: bigint | null): string {

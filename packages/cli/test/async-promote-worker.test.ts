@@ -397,13 +397,14 @@ describe('createPromoteWorkerSupervisor', () => {
         async promote(
           cgId: string,
           name: string,
-          opts: { entities?: any; subGraphName?: string; authorAgentAddress?: string },
+          opts: { entities?: any; subGraphName?: string; agentAddress?: string; authorAgentAddress?: string },
         ) {
           return promote({
             contextGraphId: cgId,
             assertionName: name,
             entities: opts.entities ?? 'all',
             subGraphName: opts.subGraphName,
+            ...(opts.agentAddress ? { agentAddress: opts.agentAddress } : {}),
             ...(opts.authorAgentAddress ? { authorAgentAddress: opts.authorAgentAddress } : {}),
           });
         },
@@ -456,9 +457,10 @@ describe('createPromoteWorkerSupervisor', () => {
     expect((await queue.getStats()).succeeded).toBe(3);
   });
 
-  it('passes the stored enqueue author into agent.promote', async () => {
+  it('passes the stored enqueue storage lane and author into agent.promote', async () => {
+    const agentAddress = '0x2222222222222222222222222222222222222222';
     const authorAgentAddress = '0x1111111111111111111111111111111111111111';
-    await queue.enqueue(makeRequest('agent-a-share', { authorAgentAddress }));
+    await queue.enqueue(makeRequest('agent-a-share', { agentAddress, authorAgentAddress }));
     const seen: PromoteRequest[] = [];
 
     const sup = createPromoteWorkerSupervisor({
@@ -480,6 +482,7 @@ describe('createPromoteWorkerSupervisor', () => {
     expect(seen).toHaveLength(1);
     expect(seen[0]).toMatchObject({
       assertionName: 'agent-a-share',
+      agentAddress,
       authorAgentAddress,
     });
   });

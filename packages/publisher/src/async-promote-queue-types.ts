@@ -31,6 +31,10 @@ export type PromoteJobState = (typeof PROMOTE_JOB_STATES)[number];
  * `running` row with `promoteStarted === false` can be safely
  * reclaimed.
  *
+ * Version 3 adds the persisted `agentAddress` storage lane. Without it,
+ * an agent-token enqueue can sign as the token agent while the worker
+ * replays promote against the daemon-default WM namespace.
+ *
  * Anything missing `formatVersion` (or carrying `formatVersion < 2`)
  * predates the marker contract and MUST be routed to the manual /
  * abandoned recovery path — see Codex PR #665 review id=3302135756
@@ -38,7 +42,7 @@ export type PromoteJobState = (typeof PROMOTE_JOB_STATES)[number];
  * legacy job). Bump this constant any time the on-disk job shape or
  * the recovery invariants change.
  */
-export const ASYNC_PROMOTE_QUEUE_FORMAT_VERSION = 2;
+export const ASYNC_PROMOTE_QUEUE_FORMAT_VERSION = 3;
 
 /**
  * Classification of a promote failure, used by the queue's retry policy.
@@ -62,6 +66,9 @@ export interface PromoteRequest {
   subGraphName?: string;
   assertionName: string;
   entities: readonly string[] | 'all';
+  /** Storage namespace used to locate the WM draft. */
+  agentAddress?: string;
+  /** Signing author used by finalize/seal during promote replay. */
   authorAgentAddress?: string;
 }
 

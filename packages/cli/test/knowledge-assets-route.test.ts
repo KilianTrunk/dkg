@@ -826,6 +826,31 @@ describe('/api/knowledge-assets routes (real daemon, real chain)', () => {
       const other = await getJson(daemon, `/api/knowledge-assets/scoped?contextGraphId=${LOCAL}&agentAddress=${reg.body.agentAddress}`);
       expect(other.status).toBe(404);
     });
+
+    it('agent-token reads and discards its own WM draft without an explicit agentAddress query param', async () => {
+      const agent = await registerAgentClient('ka-token-lane-wm');
+      const cg = `ka-token-lane-wm-${Date.now().toString(36)}`;
+      const name = 'token-lane-draft';
+      await createRegisteredAgentContextGraph(agent, cg);
+
+      const writeRes = await agent.post(`/api/knowledge-assets/${name}/wm/write`, {
+        contextGraphId: cg,
+        quads: [{ subject: 'ex:token-lane', predicate: 'ex:p', object: '"token-lane"' }],
+      });
+      expect(writeRes.status, `write: ${JSON.stringify(writeRes.body)}`).toBe(200);
+
+      const readRes = await agent.get(`/api/knowledge-assets/${name}/wm/quads?contextGraphId=${cg}`);
+      expect(readRes.status, `read: ${JSON.stringify(readRes.body)}`).toBe(200);
+      expect(readRes.body.count).toBe(1);
+      expect(readRes.body.quads?.[0]?.subject).toBe('ex:token-lane');
+
+      const discardRes = await agent.post(`/api/knowledge-assets/${name}/wm/discard`, { contextGraphId: cg });
+      expect(discardRes.status, `discard: ${JSON.stringify(discardRes.body)}`).toBe(200);
+
+      const afterDiscard = await agent.get(`/api/knowledge-assets/${name}/wm/quads?contextGraphId=${cg}`);
+      expect(afterDiscard.status, `after discard: ${JSON.stringify(afterDiscard.body)}`).toBe(200);
+      expect(afterDiscard.body.count).toBe(0);
+    });
   });
 
   // ── wm/pull-from ──────────────────────────────────────────────────
@@ -852,6 +877,38 @@ describe('/api/knowledge-assets routes (real daemon, real chain)', () => {
       expect(typeof res.body.seeded).toBe('number');
       expect(res.body.seeded).toBeGreaterThanOrEqual(1);
       expect(res.body.entities).toBeGreaterThanOrEqual(1);
+    });
+
+    it('agent-token pulls from its own SWM lane without an explicit agentAddress body field', async () => {
+      const agent = await registerAgentClient('ka-token-lane-pull');
+      const cg = `ka-token-lane-pull-${Date.now().toString(36)}`;
+      const name = 'token-lane-pull';
+      await createRegisteredAgentContextGraph(agent, cg);
+
+      const writeRes = await agent.post(`/api/knowledge-assets/${name}/wm/write`, {
+        contextGraphId: cg,
+        quads: [{ subject: 'ex:token-pull', predicate: 'ex:p', object: '"token-pull"' }],
+      });
+      expect(writeRes.status, `write: ${JSON.stringify(writeRes.body)}`).toBe(200);
+
+      const shareRes = await agent.post(`/api/knowledge-assets/${name}/swm/share`, {
+        contextGraphId: cg,
+        skipSeal: true,
+      });
+      expect(shareRes.status, `share: ${JSON.stringify(shareRes.body)}`).toBe(200);
+
+      const pullRes = await agent.post(`/api/knowledge-assets/${name}/wm/pull-from`, {
+        contextGraphId: cg,
+        layer: 'swm',
+        onConflict: 'replace',
+      });
+      expect(pullRes.status, `pull: ${JSON.stringify(pullRes.body)}`).toBe(200);
+      expect(pullRes.body.seeded).toBeGreaterThan(0);
+
+      const readRes = await agent.get(`/api/knowledge-assets/${name}/wm/quads?contextGraphId=${cg}`);
+      expect(readRes.status, `read: ${JSON.stringify(readRes.body)}`).toBe(200);
+      expect(readRes.body.count).toBeGreaterThan(0);
+      expect(readRes.body.quads.some((q: any) => q.subject === 'ex:token-pull')).toBe(true);
     });
   });
 

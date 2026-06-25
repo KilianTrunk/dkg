@@ -414,6 +414,7 @@ export function createPromoteWorkerSupervisor(config: PromoteWorkerConfig): Prom
             return config.agent.assertion.promote(request.contextGraphId, request.assertionName, {
               entities,
               subGraphName: request.subGraphName,
+              ...(request.agentAddress ? { agentAddress: request.agentAddress } : {}),
               ...(request.authorAgentAddress ? { authorAgentAddress: request.authorAgentAddress } : {}),
             });
           },

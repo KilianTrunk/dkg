@@ -922,18 +922,21 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
   }
 
   // Shared GET preflight: decode/validate the :identifier, require + normalize
-  // contextGraphId, validate subGraphName, extract optional agentAddress.
+  // contextGraphId, validate subGraphName, extract optional agentAddress. For
+  // agent-scoped bearer tokens, omitted agentAddress defaults to the token's
+  // storage lane so GETs see the same draft the write routes created.
   function readGetParams(): { cg: string; subGraphName?: string; agentAddress?: string } | null {
     if (decodeAndValidateName(name, res) === null) return null;
     const rawCg = url.searchParams.get("contextGraphId");
     if (!validateRequiredContextGraphId(rawCg, res)) return null;
     const subGraphName = url.searchParams.get("subGraphName") ?? undefined;
     if (!validateOptionalSubGraphName(subGraphName, res)) return null;
-    const agentAddress = url.searchParams.get("agentAddress") ?? undefined;
-    if (agentAddress !== undefined && !/^0x[0-9a-fA-F]{40}$/.test(agentAddress)) {
+    const explicitAgentAddress = url.searchParams.get("agentAddress") ?? undefined;
+    if (explicitAgentAddress !== undefined && !/^0x[0-9a-fA-F]{40}$/.test(explicitAgentAddress)) {
       jsonResponse(res, 400, { error: '"agentAddress" must be a 0x-prefixed 20-byte EVM address' });
       return null;
     }
+    const agentAddress = explicitAgentAddress ?? writePreflightCallerAgentAddress;
     return { cg: normalizeContextGraphIdOrUri(rawCg as string), subGraphName, agentAddress };
   }
 
@@ -964,7 +967,10 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       if (typeof hist.name === "string") resolvedName = hist.name;
     }
     try {
-      const quads = await agent.assertion.query(p.cg, resolvedName, p.subGraphName ? { subGraphName: p.subGraphName } : undefined);
+      const quads = await agent.assertion.query(p.cg, resolvedName, {
+        ...(p.subGraphName ? { subGraphName: p.subGraphName } : {}),
+        ...(p.agentAddress ? { agentAddress: p.agentAddress } : {}),
+      });
       const sorted = [...quads].sort((l, r) => JSON.stringify(l).localeCompare(JSON.stringify(r)));
       return jsonResponse(res, 200, { quads: sorted, count: sorted.length });
     } catch (e: any) {
@@ -1108,7 +1114,10 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         });
       }
       if (verb === "discard") {
-        await agent.assertion.discard(contextGraphId, name, { subGraphName });
+        await agent.assertion.discard(contextGraphId, name, {
+          subGraphName,
+          ...(writePreflightCallerAgentAddress ? { agentAddress: writePreflightCallerAgentAddress } : {}),
+        });
         // Parity with legacy discard: evict any cached extraction-status record
         // for this assertion so a re-import doesn't see a stale "completed".
         ctx.extractionStatus.delete(contextGraphAssertionUri(contextGraphId, requestAgentAddress, name, subGraphName));
@@ -1124,7 +1133,11 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         }
         const onConflict = parsed.onConflict === "replace" ? "replace" : "reject";
         try {
-          const result = await agent.assertion.pullFrom(contextGraphId, name, sourceLayer, { subGraphName, onConflict });
+          const result = await agent.assertion.pullFrom(contextGraphId, name, sourceLayer, {
+            subGraphName,
+            onConflict,
+            ...(writePreflightCallerAgentAddress ? { agentAddress: writePreflightCallerAgentAddress } : {}),
+          });
           return jsonResponse(res, 200, { wmDraft: "open", seededFrom: { layer: sourceLayer }, ...result });
         } catch (e: any) {
           if (e?.code === "WM_DRAFT_CONFLICT") {
@@ -1223,7 +1236,10 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       }
       try {
         const asyncShareAuthorLane = writePreflightCallerAgentAddress
-          ? { authorAgentAddress: writePreflightCallerAgentAddress }
+          ? {
+              agentAddress: writePreflightCallerAgentAddress,
+              authorAgentAddress: writePreflightCallerAgentAddress,
+            }
           : {};
         const result = await agent.assertion.promoteAsync(contextGraphId, name, {
           entities: entities ?? "all",

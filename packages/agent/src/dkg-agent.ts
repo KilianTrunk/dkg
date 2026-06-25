@@ -1896,17 +1896,19 @@ export class DKGAgent extends DKGAgentBase {
         return agent.publisher.assertionWrite(contextGraphId, name, writeAgentAddress, quads, opts?.subGraphName);
       },
 
-      async query(contextGraphId: string, name: string, opts?: { subGraphName?: string }): Promise<import('@origintrail-official/dkg-storage').Quad[]> {
-        return agent.publisher.assertionQuery(contextGraphId, name, agentAddress, opts?.subGraphName);
+      async query(contextGraphId: string, name: string, opts?: { subGraphName?: string; agentAddress?: string }): Promise<import('@origintrail-official/dkg-storage').Quad[]> {
+        const queryAgentAddress = opts?.agentAddress ?? agentAddress;
+        return agent.publisher.assertionQuery(contextGraphId, name, queryAgentAddress, opts?.subGraphName);
       },
       /** OT-RFC-43 §10.5.3 — seed a fresh WM draft from this file's SWM/VM state. */
       async pullFrom(
         contextGraphId: string,
         name: string,
         sourceLayer: 'swm' | 'vm',
-        opts?: { subGraphName?: string; onConflict?: 'reject' | 'replace' },
+        opts?: { subGraphName?: string; agentAddress?: string; onConflict?: 'reject' | 'replace' },
       ): Promise<{ seeded: number; fromLayer: 'swm' | 'vm'; entities: number }> {
-        return agent.publisher.assertionPullFrom(contextGraphId, name, agentAddress, sourceLayer, opts);
+        const pullAgentAddress = opts?.agentAddress ?? agentAddress;
+        return agent.publisher.assertionPullFrom(contextGraphId, name, pullAgentAddress, sourceLayer, opts);
       },
       async promote(contextGraphId: string, name: string, opts?: { entities?: string[] | 'all'; subGraphName?: string; agentAddress?: string; authorAgentAddress?: string; preSignedAuthorAttestation?: PreSignedAuthorAttestation; awaitCuratorAck?: boolean; curatorAckTimeoutMs?: number; skipSeal?: boolean }): Promise<{ promotedCount: number; sealed: boolean; publishReady: boolean }> {
         const promoteAgentAddress = opts?.agentAddress ?? agentAddress;
@@ -2075,8 +2077,9 @@ export class DKGAgent extends DKGAgentBase {
         const publishReady = promotingAllEntities && sealed && promotedAllRoots;
         return { promotedCount, sealed, publishReady };
       },
-      async discard(contextGraphId: string, name: string, opts?: { subGraphName?: string }): Promise<void> {
-        return agent.publisher.assertionDiscard(contextGraphId, name, agentAddress, opts?.subGraphName);
+      async discard(contextGraphId: string, name: string, opts?: { subGraphName?: string; agentAddress?: string }): Promise<void> {
+        const discardAgentAddress = opts?.agentAddress ?? agentAddress;
+        return agent.publisher.assertionDiscard(contextGraphId, name, discardAgentAddress, opts?.subGraphName);
       },
 
       /**
@@ -2468,13 +2471,14 @@ export class DKGAgent extends DKGAgentBase {
       async promoteAsync(
         contextGraphId: string,
         name: string,
-        opts?: { entities?: readonly string[] | 'all'; subGraphName?: string; authorAgentAddress?: string },
+        opts?: { entities?: readonly string[] | 'all'; subGraphName?: string; agentAddress?: string; authorAgentAddress?: string },
       ): Promise<{ jobId: string }> {
         const jobId = await agent.promoteQueue.enqueue({
           contextGraphId,
           assertionName: name,
           subGraphName: opts?.subGraphName,
           entities: opts?.entities ?? 'all',
+          ...(opts?.agentAddress ? { agentAddress: opts.agentAddress } : {}),
           ...(opts?.authorAgentAddress ? { authorAgentAddress: opts.authorAgentAddress } : {}),
         });
         return { jobId };

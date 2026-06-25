@@ -473,6 +473,9 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
     if (request.subGraphName !== undefined && typeof request.subGraphName !== 'string') {
       throw new Error('subGraphName must be a string when provided');
     }
+    if (request.agentAddress !== undefined && typeof request.agentAddress !== 'string') {
+      throw new Error('agentAddress must be a string when provided');
+    }
     if (request.authorAgentAddress !== undefined && typeof request.authorAgentAddress !== 'string') {
       throw new Error('authorAgentAddress must be a string when provided');
     }
@@ -512,6 +515,9 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
     };
     if (request.subGraphName !== undefined) {
       normalized.subGraphName = request.subGraphName;
+    }
+    if (request.agentAddress !== undefined) {
+      normalized.agentAddress = request.agentAddress;
     }
     if (request.authorAgentAddress !== undefined) {
       normalized.authorAgentAddress = request.authorAgentAddress;

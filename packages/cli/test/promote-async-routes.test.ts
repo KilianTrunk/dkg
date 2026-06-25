@@ -92,6 +92,7 @@ describe('async SWM-share queue daemon routes', () => {
           opts?: {
             entities?: readonly string[] | 'all';
             subGraphName?: string;
+            agentAddress?: string;
             authorAgentAddress?: string;
           },
         ): Promise<{ jobId: string }> {
@@ -100,6 +101,7 @@ describe('async SWM-share queue daemon routes', () => {
             assertionName: name,
             subGraphName: opts?.subGraphName,
             entities: opts?.entities ?? 'all',
+            ...(opts?.agentAddress ? { agentAddress: opts.agentAddress } : {}),
             ...(opts?.authorAgentAddress ? { authorAgentAddress: opts.authorAgentAddress } : {}),
           } as any);
           return { jobId };
@@ -280,6 +282,7 @@ describe('async SWM-share queue daemon routes', () => {
     );
     expect(r.status).toBe(200);
     const job = await queue.getStatus(r.body.jobId);
+    expect((job?.request as Record<string, unknown>).agentAddress).toBe(agentAddress);
     expect((job?.request as Record<string, unknown>).authorAgentAddress).toBe(agentAddress);
   });
 

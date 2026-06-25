@@ -6,6 +6,7 @@ export {
   decodeEvmError,
   enrichEvmError,
   isRetryableRpcError,
+  isKnownTransactionError,
   resolveRpcUrls,
   effectivePublishAllowance,
   computeApprovalAction,
@@ -16,6 +17,17 @@ export {
   type PublisherWalletBalance,
 } from './evm-adapter.js';
 export { NoChainAdapter } from './no-chain-adapter.js';
+export {
+  // Surfaced for the daemon /api/status counter + the CLI failover loop.
+  // Test-only hooks (_reset*/_set*Clock) and internal helpers
+  // (classifyRpcFailoverError/rpcHost) are intentionally NOT re-exported from
+  // the package barrel — import them directly from rpc-failover-log.js in tests
+  // so process-wide-singleton test hooks don't become public API.
+  getRpcFailoverStats,
+  type RpcFailoverStatsSnapshot,
+  noteRpcFailover,
+  noteRpcExhaustion,
+} from './rpc-failover-log.js';
 export {
   HubResolutionCache,
   type HubResolutionCacheOptions,

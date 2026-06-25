@@ -4,7 +4,7 @@
  */
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Interface, ethers } from 'ethers';
 import {
   computeApprovalAction,
@@ -25,6 +25,15 @@ import {
   DEFAULT_REFILL_BELOW_FRACTION,
   type ApprovalPolicy,
 } from '../src/chain-adapter.js';
+import { _resetRpcFailoverStatsForTest } from '../src/rpc-failover-log.js';
+
+// Isolate the process-wide RPC failover stats + dedup window before EVERY test
+// so a failover/exhaustion warning emitted by one test can't suppress (via the
+// shared dedup window) a `console.warn` assertion in another — and so the new
+// failover-log lines are observed against a clean slate (otReviewAgent #1329).
+beforeEach(() => {
+  _resetRpcFailoverStatsForTest();
+});
 
 const DEPLOYER_PK = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
 const OTHER_PK = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b63b91100';
@@ -637,8 +646,19 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
       expect(signSpy.calls[0][1].gasLimit).toBe(1_500_000n);
       // Signed against the BACKUP runner, not the rate-limited primary.
       expect(signSpy.calls[0][0].provider).toBe(backupProvider);
-      // Failover, not silent fallback — no "headroom not applied" warning.
-      expect(warnSpy.calls).toEqual([]);
+      // Failover, not silent fallback: the "headroom not applied" fallback
+      // warning must NOT fire (the buffer was applied on the healthy backup).
+      const headroomWarnings = warnSpy.calls.filter(
+        (c: unknown[]) => String(c[0]).includes('buffered gas estimation failed'),
+      );
+      expect(headroomWarnings).toEqual([]);
+      // The failover itself is now observable as exactly one dedup'd line (the
+      // W3 failover logger) — asserted separately from the gas-headroom concern
+      // so neither masks the other.
+      const failoverWarnings = warnSpy.calls.filter(
+        (c: unknown[]) => String(c[0]).includes('RPC failover'),
+      );
+      expect(failoverWarnings).toHaveLength(1);
     } finally {
       console.warn = origWarn;
     }
@@ -684,10 +704,17 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
 
     expect(thrown).toMatchObject({
       code: 'RPC_ENDPOINTS_EXHAUSTED',
+      // The structured rpcUrls property is the canonical config list (diagnostic;
+      // never serialized into an HTTP response body — only code/txHash/message
+      // reach clients).
       rpcUrls: ['https://primary.example', 'https://backup.example'],
     });
-    expect(thrown.message).toContain('https://primary.example');
-    expect(thrown.message).toContain('https://backup.example');
+    // The MESSAGE names the endpoints HOST-ONLY: a configured rpcUrl may carry
+    // an API key and err.message IS surfaced to HTTP clients via echoing paths
+    // (e.g. the create+publish 207 tail), so it must never embed full URLs.
+    expect(thrown.message).toContain('primary.example');
+    expect(thrown.message).toContain('backup.example');
+    expect(thrown.message).not.toContain('https://');
     expect(populateTransaction.calls).toHaveLength(2);
     expect(signPopulatedTransaction.calls).toEqual([]);
     expect(sendSignedTransactionAndWait.calls).toEqual([]);
@@ -771,6 +798,37 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     await expect((a as any).sendSignedTransactionAndWait(signedTx, txHash, 'unit write')).resolves.toBe(receipt);
     expect(primary.broadcastTransaction.calls).toContainEqual([signedTx]);
     expect(backup.broadcastTransaction.calls).toContainEqual([signedTx]);
+  });
+
+  it('stamps RPC_ENDPOINTS_EXHAUSTED when broadcast fails over EVERY endpoint (#1329 review R-1)', async () => {
+    // Without the code stamp, a broadcast-time exhaustion (after a provider
+    // populated/signed) surfaces code-less and the daemon maps it to a generic
+    // 500 instead of the intended retryable 503.
+    const a = new EVMChainAdapter(minimalConfig({
+      rpcUrl: 'https://primary.example',
+      rpcUrls: ['https://backup.example'],
+    }));
+    const signedTx = '0xdeadbeef';
+    const txHash = '0x' + '22'.repeat(32);
+    const throttled = (name: string) => ({
+      broadcastTransaction: recorder(async (_raw: string) => {
+        const err = new Error(`429 too many requests (${name})`);
+        (err as any).status = 429;
+        throw err;
+      }),
+    });
+    (a as any).providers = [throttled('primary'), throttled('backup')];
+    const origWarn = console.warn;
+    console.warn = (() => undefined) as typeof console.warn;
+    try {
+      await expect((a as any).broadcastSignedTransactionWithFailover(signedTx, txHash, 'unit write'))
+        .rejects.toMatchObject({
+          code: 'RPC_ENDPOINTS_EXHAUSTED',
+          rpcUrls: ['https://primary.example', 'https://backup.example'],
+        });
+    } finally {
+      console.warn = origWarn;
+    }
   });
 
   it('preserves the transaction hash when post-broadcast receipt lookup exhausts RPC endpoints', async () => {

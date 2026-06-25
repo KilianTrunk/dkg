@@ -800,6 +800,15 @@ describe('CLI-7 — SPARQL endpoint 4xx matrix', () => {
     }
   });
 
+  // NOTE: a direct-publish-route exhaustion is NOT exercised here. A
+  // local-only CG (created above) skips the on-chain publish entirely ("No
+  // positive on-chain context graph id resolved — skipping on-chain publish"),
+  // so a real 429-RPC daemon never reaches the mint, and a registered CG can't
+  // be created while the RPCs are rate-limited. The direct-publish 503 mapping
+  // is covered route-level by the shared-helper unit test + the PCA route
+  // transport tests (same classifyChainRpcTransportStatus), and the register
+  // route above proves the helper end-to-end through a real chain write.
+
   it('returns 504 when context graph register reports a bounded chain timeout', async () => {
     const contextGraphId = 'timeout-register-' + Math.random().toString(36).slice(2, 8);
     const txHash = '0x' + '77'.repeat(32);

@@ -39,6 +39,8 @@ import {
   isWritableQuad,
   validateQuadObjectTerms,
   respondIfReconcileUnavailable,
+  classifyChainRpcTransportStatus,
+  sanitizeRpcMessage,
   validateWritableQuadLiteralSizes,
   normalizeContextGraphIdOrUri,
   resolveRequiredWriteContextGraphId,
@@ -170,6 +172,17 @@ function respondAssertionError(res: RequestContext["res"], e: any): void {
   // KA-number-floor reconcile couldn't reach the chain (e.g. a rate-limited RPC
   // 429'd the one-time-per-author read) -> retryable 503, not 500.
   if (respondIfReconcileUnavailable(res, e)) return;
+  // Transient chain-RPC transport failure (all endpoints exhausted / receipt
+  // lookup failed / timeout) -> retryable 503/504, keyed on err.code so a
+  // genuine on-chain revert (no transport code) still falls through to the
+  // 4xx/500 mapping below. Code-keyed check precedes the message-keyed 400
+  // branch so an exhaustion message that happens to contain "not found"
+  // (e.g. "header not found") is not mis-mapped to a 400.
+  const transport = classifyChainRpcTransportStatus(e);
+  if (transport) {
+    jsonResponse(res, transport.status, transport.body);
+    return;
+  }
   const msg = e?.message ?? String(e);
   if (
     e?.name === "ReservedNamespaceError" ||
@@ -669,6 +682,11 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       }
       // Transient KA-number-floor reconcile failure (rate-limited RPC) -> 503.
       if (respondIfReconcileUnavailable(res, e)) return;
+      // A transient chain-RPC transport exhaustion on the direct explicit-quads
+      // mint is retryable (503/504), not a hard 500 — parity with /vm/publish
+      // and /api/context-graph/register. Code-keyed, so on-chain reverts stay 500.
+      const transport = classifyChainRpcTransportStatus(e);
+      if (transport) return jsonResponse(res, transport.status, transport.body);
       return jsonResponse(res, 500, { error: e?.message ?? String(e) });
     }
   }
@@ -847,7 +865,7 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
             recordActivityAndNotify(ctx, { contextGraphId: resolvedContextGraphId, kind: "promoted", actorAgentAddress: resolvedAuthorAgentAddress ?? requestAgentAddress, subGraphName, tripleCount: share.promotedCount });
           }
         } catch (e: any) {
-          errors.push({ phase: "swm-share", error: e?.message ?? String(e) });
+          errors.push({ phase: "swm-share", error: sanitizeRpcMessage(e?.message ?? String(e)) });
         }
       }
       if (alsoPublishVm === true || (typeof alsoPublishVm === "object" && alsoPublishVm !== null)) {
@@ -865,10 +883,10 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
             result.status = "vm-confirmed";
           } else {
             result.status = httpStatus === 207 ? "vm-partial" : "vm-failed";
-            errors.push({ phase: "vm-publish", error: reason ?? "VM publish did not confirm" });
+            errors.push({ phase: "vm-publish", error: sanitizeRpcMessage(reason ?? "VM publish did not confirm") });
           }
         } catch (e: any) {
-          errors.push({ phase: "vm-publish", error: e?.message ?? String(e) });
+          errors.push({ phase: "vm-publish", error: sanitizeRpcMessage(e?.message ?? String(e)) });
         }
       }
 
@@ -1262,6 +1280,13 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
           try {
             await agent.ensureRegisteredForPublish(contextGraphId, { callerAgentAddress: requestAgentAddress });
           } catch (regErr: any) {
+            // A transient RPC outage during the pre-publish auto-registration
+            // is retryable (503/504), NOT a permanent client error (400) — a
+            // 400 would tell retry-aware clients to give up on a flaky RPC.
+            const transport = classifyChainRpcTransportStatus(regErr);
+            if (transport) {
+              return jsonResponse(res, transport.status, transport.body);
+            }
             return jsonResponse(res, 400, buildAutoRegisterFailureBody(contextGraphId, regErr));
           }
           pub = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts });
@@ -1313,6 +1338,16 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         // publish routes cannot drift on the code/marker contract.
         if (isNoFundedPublisherWalletLike(e)) {
           return jsonResponse(res, 400, noFundedPublisherWalletBody(msg));
+        }
+        // A transient chain-RPC transport failure (all endpoints exhausted /
+        // receipt lookup failed / timeout) is retryable -> 503/504, matching
+        // /api/context-graph/register. Keyed strictly on err.code, so an
+        // on-chain revert (CALL_EXCEPTION, no transport code) still keeps the
+        // generic 500 below (the #988 "publish never down-classifies on-chain
+        // errors" parity contract).
+        const transport = classifyChainRpcTransportStatus(e);
+        if (transport) {
+          return jsonResponse(res, transport.status, transport.body);
         }
         return jsonResponse(res, 500, { error: msg });
       }

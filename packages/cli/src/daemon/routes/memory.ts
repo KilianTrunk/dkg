@@ -230,6 +230,7 @@ import {
   shortId,
   sleep,
   deriveBlockExplorerUrl,
+  classifyChainRpcTransportStatus,
 } from '../http-utils.js';
 import {
   normalizeRepo,
@@ -2123,6 +2124,12 @@ WHERE {
         // (insufficient TRAC, missing chain signer, etc.)
         // instead of a generic 500 from the publish leg later.
         tracker.fail(ctx, regErr);
+        // A transient RPC outage during pre-publish auto-registration is
+        // retryable (503/504), NOT a permanent client mistake (400).
+        const transport = classifyChainRpcTransportStatus(regErr);
+        if (transport) {
+          return jsonResponse(res, transport.status, transport.body);
+        }
         return jsonResponse(res, 400, buildAutoRegisterFailureBody(resolvedContextGraphId, regErr));
       }
       const basePublishOptions = {

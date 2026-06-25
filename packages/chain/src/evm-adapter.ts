@@ -41,6 +41,7 @@ export {
 export {
   resolveRpcUrls,
   isRetryableRpcError,
+  isKnownTransactionError,
 } from './evm-adapter-rpc.js';
 export {
   computeApprovalAction,

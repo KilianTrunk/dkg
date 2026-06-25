@@ -1059,6 +1059,31 @@ export function resolveAutoUpdateSource(
 }
 
 /**
+ * True for a loopback / local-host RPC URL (localhost, 127.0.0.0/8, ::1,
+ * 0.0.0.0). Such a primary is a LOCAL chain (Hardhat / devnet), so the
+ * network's PUBLIC backup endpoints must NOT be auto-attached behind it:
+ * ethers' FallbackProvider hard-rejects mixing providers on different chains
+ * ("cannot mix providers on different networks"), which would break chain
+ * init. A real operator's private RPC is non-loopback and still inherits the
+ * public backups for failover.
+ */
+function isLoopbackRpcUrl(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return (
+      host === 'localhost' ||
+      host.endsWith('.localhost') ||
+      host === '0.0.0.0' ||
+      host === '::1' ||
+      host === '[::1]' ||
+      /^127\./.test(host)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Field-level merge of the effective chain configuration.
  *
  * Precedence per field: `~/.dkg/config.json#chain` → `network/<env>.json#chain`.
@@ -1107,7 +1132,17 @@ export function resolveChainConfig(
     type: cfg?.type ?? net?.type ?? 'evm',
   };
   const primaryRpcUrl = cfg?.rpcUrl ?? net?.rpcUrl;
-  const backupRpcUrls = cfg?.rpcUrls ?? net?.rpcUrls ?? [];
+  // Don't inherit the network's PUBLIC backups behind an operator-pinned LOCAL
+  // (loopback) primary — that would build a cross-chain FallbackProvider
+  // (e.g. local Hardhat 31337 + public Base Sepolia 84532) which ethers
+  // rejects at init. Explicit operator rpcUrls always win; a non-loopback
+  // private primary still inherits the public backups for failover.
+  const operatorPinnedLoopbackPrimary =
+    cfg?.rpcUrls === undefined &&
+    typeof cfg?.rpcUrl === 'string' &&
+    isLoopbackRpcUrl(cfg.rpcUrl);
+  const backupRpcUrls =
+    cfg?.rpcUrls ?? (operatorPinnedLoopbackPrimary ? [] : net?.rpcUrls) ?? [];
   const orderedRpcUrls: string[] = [];
   for (const candidate of [primaryRpcUrl, ...backupRpcUrls]) {
     if (typeof candidate !== 'string') continue;

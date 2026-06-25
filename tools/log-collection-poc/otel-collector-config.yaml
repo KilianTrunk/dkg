@@ -32,3 +32,15 @@ service:
       receivers: [otlp]
       processors: [batch]
       exporters: [otlphttp/loki, debug]
+    # Traces + metrics from the node's OTel SDK. The `debug` exporter prints
+    # them to the collector log (docker compose logs otel-collector) so you can
+    # confirm export without a Tempo/Prometheus backend. Swap in otlphttp →
+    # Tempo (traces) and a prometheus exporter/remote-write (metrics) for prod.
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]

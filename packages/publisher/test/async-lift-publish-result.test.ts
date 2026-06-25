@@ -132,6 +132,25 @@ describe('async lift publish result mapping', () => {
     });
   });
 
+  it('classifies a NO_FUNDED_PUBLISHER_WALLET error as a TERMINAL insufficient_funds failure (not retryable)', () => {
+    // The funded-wallet-selection error message intentionally does NOT contain
+    // the literal "insufficient funds" substring; without code-based
+    // recognition it would fall through to the retryable rpc_unavailable
+    // default and retry an unfundable job forever.
+    const err = Object.assign(
+      new Error('No operational wallet has enough funds to publish to Verifiable Memory — fund a wallet and retry.'),
+      { code: 'NO_FUNDED_PUBLISHER_WALLET' },
+    );
+    const failure = mapPublishExceptionToLiftJobFailure({
+      error: err,
+      failedFromState: 'broadcast',
+      errorPayloadRef: 'urn:error:no-funded-wallet',
+    });
+
+    expect(failure.code).toBe('insufficient_funds');
+    expect(failure.retryable).toBe(false);
+  });
+
   it('classifies confirmation mismatches on included jobs', () => {
     const failure = mapPublishExceptionToLiftJobFailure({
       error: new Error('confirmation mismatch detected'),

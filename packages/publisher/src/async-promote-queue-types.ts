@@ -45,6 +45,13 @@ export type PromoteJobState = (typeof PROMOTE_JOB_STATES)[number];
 export const ASYNC_PROMOTE_QUEUE_FORMAT_VERSION = 3;
 
 /**
+ * Oldest persisted job format safe for automatic startup reclaim when the
+ * worker crashed before `promoteStarted=true`. Version 2 introduced the
+ * marker contract; version 3 only adds the optional storage-lane field.
+ */
+export const ASYNC_PROMOTE_QUEUE_MIN_AUTO_RECOVERABLE_FORMAT_VERSION = 2;
+
+/**
  * Classification of a promote failure, used by the queue's retry policy.
  * Set by the worker when calling `fail()` — the queue itself never inspects
  * the error message.
@@ -243,10 +250,11 @@ export class PromoteJobConflictError extends Error {
   override readonly name = 'PromoteJobConflictError';
   constructor(
     readonly existingJobId: string,
-    readonly key: { contextGraphId: string; subGraphName?: string; assertionName: string },
+    readonly key: { contextGraphId: string; subGraphName?: string; assertionName: string; agentAddress?: string },
   ) {
+    const lane = key.agentAddress ? `, agentAddress=${key.agentAddress}` : '';
     super(
-      `Promote job already active for (${key.contextGraphId}, ${key.subGraphName ?? '<no-sub>'}, ${key.assertionName}): ${existingJobId}`,
+      `Promote job already active for (${key.contextGraphId}, ${key.subGraphName ?? '<no-sub>'}, ${key.assertionName}${lane}): ${existingJobId}`,
     );
   }
 }

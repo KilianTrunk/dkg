@@ -1919,6 +1919,7 @@ WHERE {
           () =>
             agent.publishFromFinalizedAssertion(resolvedContextGraphId, bodyAssertionName, {
               ...(subGraphName ? { subGraphName } : {}),
+              ...(tokenAgentAddress ? { agentAddress: tokenAgentAddress } : {}),
               operationCtx: ctx2,
               ...(resolvedPublisherIdentityOverride !== undefined
                 ? { publisherNodeIdentityIdOverride: resolvedPublisherIdentityOverride }

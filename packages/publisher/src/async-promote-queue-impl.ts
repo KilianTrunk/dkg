@@ -20,6 +20,7 @@
 import type { TripleStore } from '@origintrail-official/dkg-storage';
 import {
   ASYNC_PROMOTE_QUEUE_FORMAT_VERSION,
+  ASYNC_PROMOTE_QUEUE_MIN_AUTO_RECOVERABLE_FORMAT_VERSION,
   PromoteJobConflictError,
   PromoteJobLeaseError,
   PROMOTE_JOB_STATES,
@@ -49,8 +50,10 @@ import {
   jobSubject,
   literal,
   parseJobPayload,
+  requestsShareUniquenessKey,
   serializeJob,
   uniquenessKey,
+  uniquenessLookupKeys,
 } from './async-promote-queue-utils.js';
 
 export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
@@ -213,8 +216,10 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
         return false;
       });
 
-      const runningKeys = await this.activeUniquenessKeys('running');
-      const eligible = candidates.filter((j) => !runningKeys.has(uniquenessKey(j.request)));
+      const running = await this.list({ state: ['running'] });
+      const eligible = candidates.filter((candidate) =>
+        !running.some((active) => active.jobId !== candidate.jobId && requestsShareUniquenessKey(active.request, candidate.request)),
+      );
       if (eligible.length === 0) return null;
 
       const next = eligible.sort(comparePromoteJobs)[0]!;
@@ -372,7 +377,7 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
       const expiresAt = job.lease?.expiresAt ?? 0;
       if (expiresAt > now) continue; // lease still valid; worker is fine
 
-      const conflicting = await this.findActiveByUniquenessKey(uniquenessKey(job.request), job.jobId);
+      const conflicting = await this.findActiveConflict(job.request, job.jobId);
       if (conflicting) {
         await this.abandonStartupRecovery(
           job,
@@ -395,8 +400,12 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
       // an explicit format-version marker; legacy rows fall through
       // to the manual-recovery path below.
       const formatVersion = job.formatVersion ?? 0;
-      const isCurrentFormat = formatVersion >= ASYNC_PROMOTE_QUEUE_FORMAT_VERSION;
-      if (isCurrentFormat && swmInserted === false && promoteStarted !== true) {
+      const hasRecoverableCommitMarker = formatVersion >= ASYNC_PROMOTE_QUEUE_MIN_AUTO_RECOVERABLE_FORMAT_VERSION;
+      const missingStorageLaneForAuthorOnlyJob =
+        formatVersion < ASYNC_PROMOTE_QUEUE_FORMAT_VERSION &&
+        job.request.agentAddress === undefined &&
+        job.request.authorAgentAddress !== undefined;
+      if (hasRecoverableCommitMarker && !missingStorageLaneForAuthorOnlyJob && swmInserted === false && promoteStarted !== true) {
         const reclaimedJob: PromoteJob = {
           ...job,
           state: 'queued',
@@ -420,11 +429,15 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
       // write but before our outer swmInserted marker. Without a stronger
       // store-side proof, expired running jobs past promoteStarted are not
       // safe to re-run automatically.
-      const legacyReason = !isCurrentFormat
-        ? `legacy promote job (formatVersion=${formatVersion}); needs operator inspection — recovery refuses to reclaim pre-v${ASYNC_PROMOTE_QUEUE_FORMAT_VERSION} rows that may have started promote without writing a marker`
+      const legacyReason = !hasRecoverableCommitMarker
+        ? `legacy promote job (formatVersion=${formatVersion}); needs operator inspection — recovery refuses to reclaim pre-v${ASYNC_PROMOTE_QUEUE_MIN_AUTO_RECOVERABLE_FORMAT_VERSION} rows that may have started promote without writing a marker`
+        : missingStorageLaneForAuthorOnlyJob
+          ? `missing storage lane for pre-v${ASYNC_PROMOTE_QUEUE_FORMAT_VERSION} author-scoped promote job; needs operator inspection`
         : null;
-      const legacyMessage = !isCurrentFormat
-        ? `Legacy promote job (formatVersion=${formatVersion}) found in recovery; daemon refuses automatic reclaim because pre-v${ASYNC_PROMOTE_QUEUE_FORMAT_VERSION} workers may have entered assertionPromote without recording promoteStarted`
+      const legacyMessage = !hasRecoverableCommitMarker
+        ? `Legacy promote job (formatVersion=${formatVersion}) found in recovery; daemon refuses automatic reclaim because pre-v${ASYNC_PROMOTE_QUEUE_MIN_AUTO_RECOVERABLE_FORMAT_VERSION} workers may have entered assertionPromote without recording promoteStarted`
+        : missingStorageLaneForAuthorOnlyJob
+          ? `Pre-v${ASYNC_PROMOTE_QUEUE_FORMAT_VERSION} promote job carries authorAgentAddress without agentAddress; daemon refuses automatic reclaim because it cannot prove the WM storage lane`
         : null;
       await this.abandonStartupRecovery(
         job,
@@ -568,28 +581,33 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
   }
 
   private async assertNoActiveConflict(
-    request: Pick<PromoteRequest, 'contextGraphId' | 'subGraphName' | 'assertionName'>,
+    request: Pick<PromoteRequest, 'contextGraphId' | 'subGraphName' | 'assertionName' | 'agentAddress'>,
     excludeJobId?: string,
   ): Promise<void> {
-    const existing = await this.findActiveByUniquenessKey(uniquenessKey(request), excludeJobId);
+    const existing = await this.findActiveConflict(request, excludeJobId);
     if (existing) {
       throw new PromoteJobConflictError(existing.jobId, {
         contextGraphId: request.contextGraphId,
         subGraphName: request.subGraphName,
         assertionName: request.assertionName,
+        agentAddress: request.agentAddress,
       });
     }
   }
 
-  private async findActiveByUniquenessKey(key: string, excludeJobId?: string): Promise<PromoteJob | null> {
+  private async findActiveConflict(
+    request: Pick<PromoteRequest, 'contextGraphId' | 'subGraphName' | 'assertionName' | 'agentAddress'>,
+    excludeJobId?: string,
+  ): Promise<PromoteJob | null> {
+    const keyFilter = uniquenessLookupKeys(request).map((key) => literal(key)).join(', ');
     const result = await this.store.query(
-      `SELECT ?payload WHERE { GRAPH <${this.graphUri}> { ?job <${PROMOTE_UNIQUENESS_KEY}> ${literal(key)} ; <${PROMOTE_PAYLOAD}> ?payload . } }`,
+      `SELECT ?payload WHERE { GRAPH <${this.graphUri}> { ?job <${PROMOTE_UNIQUENESS_KEY}> ?key ; <${PROMOTE_PAYLOAD}> ?payload . FILTER (?key IN (${keyFilter})) } }`,
     );
     const rows = expectBindings(result);
     for (const row of rows) {
       const job = parseJobPayload(row['payload']);
       if (job?.jobId === excludeJobId) continue;
-      if (job && ACTIVE_PROMOTE_STATES.includes(job.state)) return job;
+      if (job && ACTIVE_PROMOTE_STATES.includes(job.state) && requestsShareUniquenessKey(job.request, request)) return job;
     }
     return null;
   }
@@ -627,25 +645,6 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
       || lastError.includes('partial promote ambiguity')
       || reason.includes('legacy promote job')
       || lastError.includes('legacy promote job');
-  }
-
-  private async activeUniquenessKeys(state: PromoteJobState): Promise<Set<string>> {
-    const result = await this.store.query(
-      `SELECT ?key WHERE { GRAPH <${this.graphUri}> { ?job <${PROMOTE_STATE}> ${literal(state)} ; <${PROMOTE_UNIQUENESS_KEY}> ?key . } }`,
-    );
-    const out = new Set<string>();
-    for (const row of expectBindings(result)) {
-      const lit = row['key'];
-      if (!lit) continue;
-      try {
-        const parsed = JSON.parse(lit);
-        if (typeof parsed === 'string') out.add(parsed);
-      } catch {
-        // Corrupted row; skip rather than crash. The next writeJob will
-        // overwrite the row anyway.
-      }
-    }
-    return out;
   }
 
   /**

@@ -37,7 +37,11 @@ describe('#1116 share/seal route error mapping (fake agent)', () => {
     }
   });
 
-  async function startWith(assertion: Record<string, unknown>, agentOverrides: Record<string, unknown> = {}) {
+  async function startWith(
+    assertion: Record<string, unknown>,
+    agentOverrides: Record<string, unknown> = {},
+    routeOverrides: { requestToken?: string; requestAgentAddress?: string } = {},
+  ) {
     const agent = {
       async listContextGraphs() {
         return [{
@@ -88,8 +92,8 @@ describe('#1116 share/seal route error mapping (fake agent)', () => {
           apiPortRef: { value: 0 },
           url,
           path: url.pathname,
-          requestToken: undefined,
-          requestAgentAddress: 'did:dkg:agent:test',
+          requestToken: routeOverrides.requestToken,
+          requestAgentAddress: routeOverrides.requestAgentAddress ?? 'did:dkg:agent:test',
           emitMemoryGraphChanged: () => {},
           emitNotification: () => {},
         } as any);
@@ -261,6 +265,35 @@ describe('#1116 share/seal route error mapping (fake agent)', () => {
   // registers then fails-before-retry would still pass. This pins the exact
   // call order with a fake agent.
   describe('vm/publish auto-register retry sequence', () => {
+    it('passes the token-scoped storage lane into finalized publish calls', async () => {
+      const token = 'agent-token-a';
+      const tokenAgentAddress = `0x${'ab'.repeat(20)}`;
+      const seenOpts: unknown[] = [];
+
+      await startWith(
+        {},
+        {
+          resolveAgentByToken: (t?: string) => (t === token ? tokenAgentAddress : undefined),
+          async publishFromFinalizedAssertion(_cg: string, _name: string, opts: unknown) {
+            seenOpts.push(opts);
+            return {
+              status: 'confirmed',
+              ual: 'did:dkg:test/1/43',
+              kaId: '43',
+              seal: { authorAddress: tokenAgentAddress },
+            };
+          },
+        },
+        { requestToken: token, requestAgentAddress: tokenAgentAddress },
+      );
+
+      const res = await post('vm/publish', { contextGraphId: CG_ID });
+
+      expect(res.status).toBe(200);
+      expect(seenOpts).toHaveLength(1);
+      expect(seenOpts[0]).toMatchObject({ agentAddress: tokenAgentAddress });
+    });
+
     it('on CG_NOT_REGISTERED: registers ONCE between TWO publish calls and returns the retry result', async () => {
       const calls: string[] = [];
       let publishCount = 0;

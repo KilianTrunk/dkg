@@ -350,6 +350,16 @@ function resolveAuthorAgentAddressFromFinalizeOptions(
   return tokenAgentAddress;
 }
 
+function scopedTokenStorageLane(agentAddress?: string): { agentAddress?: string } {
+  return agentAddress ? { agentAddress } : {};
+}
+
+function scopedTokenPromoteLane(agentAddress?: string): { agentAddress?: string; authorAgentAddress?: string } {
+  return agentAddress
+    ? { agentAddress, authorAgentAddress: agentAddress }
+    : {};
+}
+
 // uint32 epoch ceiling (matches sibling routes memory.ts / publisher.ts). Not an
 // id encoder — the on-chain endEpoch is a uint40 but the publish API caps at uint32.
 const MAX_PUBLISH_EPOCHS = 0xffffffff;
@@ -1174,18 +1184,12 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         skipSeal = parsed.skipSeal;
       }
       try {
-        const shareAuthorLane = writePreflightCallerAgentAddress
-          ? {
-              agentAddress: writePreflightCallerAgentAddress,
-              authorAgentAddress: writePreflightCallerAgentAddress,
-            }
-          : {};
         const share = await agent.assertion.promote(contextGraphId, name, {
           entities: parsed.entities,
           subGraphName,
           awaitCuratorAck,
           skipSeal,
-          ...shareAuthorLane,
+          ...scopedTokenPromoteLane(writePreflightCallerAgentAddress),
         });
         if (share.promotedCount !== 0) {
           emitMemoryGraphChanged?.({ contextGraphId, layers: ["wm", "swm"], subGraphName, operation: "assertion_promoted", source: "api", counts: { triples: share.promotedCount } });
@@ -1235,16 +1239,10 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         }
       }
       try {
-        const asyncShareAuthorLane = writePreflightCallerAgentAddress
-          ? {
-              agentAddress: writePreflightCallerAgentAddress,
-              authorAgentAddress: writePreflightCallerAgentAddress,
-            }
-          : {};
         const result = await agent.assertion.promoteAsync(contextGraphId, name, {
           entities: entities ?? "all",
           subGraphName,
-          ...asyncShareAuthorLane,
+          ...scopedTokenPromoteLane(writePreflightCallerAgentAddress),
         });
         return jsonResponse(res, 200, { jobId: result.jobId, state: "queued" });
       } catch (err: any) {
@@ -1291,8 +1289,9 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         // transparently register and retry (idempotent). All other errors
         // propagate to the precondition/500 mapping below unchanged.
         let pub: any;
+        const publishStorageLane = scopedTokenStorageLane(writePreflightCallerAgentAddress);
         try {
-          pub = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts });
+          pub = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts, ...publishStorageLane });
         } catch (firstErr: any) {
           // #1116 (review B): code-first, message fallback. The publisher now
           // stamps `code: 'CG_NOT_REGISTERED'` on this throw; match on it and
@@ -1308,7 +1307,7 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
                 `${regErr?.message ?? String(regErr)}`,
             });
           }
-          pub = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts });
+          pub = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts, ...publishStorageLane });
         }
         const { httpStatus, reason } = classifyVmPublish(pub);
         if (httpStatus === 200) {

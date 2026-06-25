@@ -172,6 +172,19 @@ async function runSharedMemoryPublishRoute(params: {
     async getContextGraphOnChainId() {
       return '1';
     },
+    async publishFromFinalizedAssertion(contextGraphId: string, assertionName: string, opts: Record<string, unknown>) {
+      seen.push({ contextGraphId, assertionName, opts });
+      return {
+        kaId: 1n,
+        status: 'confirmed',
+        assertionUri: `did:dkg:assertion:${assertionName}`,
+        seal: {
+          authorAddress: params.tokenAgents?.[params.bearer ?? ''] ?? CALLER,
+          merkleRoot: new Uint8Array(32).fill(1),
+        },
+        kaManifest: [{ tokenId: 1n, rootEntity: 'urn:root' }],
+      };
+    },
     async publishFromSharedMemory(contextGraphId: string, selection: unknown, opts: Record<string, unknown>) {
       seen.push({ contextGraphId, selection, opts });
       return {
@@ -554,6 +567,22 @@ describe('context-graph write-path validation — real daemon route wiring', () 
     expect(String(res.body.error)).toContain(agentA.agentAddress);
     expect(String(res.body.error)).toContain(agentB.agentAddress);
     expect(String(res.body.error)).toContain('preSignedAuthorAttestation.address');
+  });
+
+  it('passes the token-scoped storage lane into shared-memory assertionName publish calls', async () => {
+    const { res, seen } = await runSharedMemoryPublishRoute({
+      bearer: 'agent-token',
+      tokenAgents: { 'agent-token': CALLER },
+      body: {
+        contextGraphId: 'cg',
+        assertionName: 'agent-owned-assertion',
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.assertionName).toBe('agent-owned-assertion');
+    expect(seen[0]?.opts).toMatchObject({ agentAddress: CALLER });
   });
 
   // ── a real locally-created graph (and its full DID) is accepted ──

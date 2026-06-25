@@ -7,6 +7,7 @@ import {
   POOLED_MESSAGE_PROTOCOL,
   type MessageStreamPoolOptions,
 } from './message-stream-pool.js';
+import { withSpan, getMetrics } from './telemetry-api.js';
 
 type AbortableByteStream = Stream | (AsyncIterable<Uint8Array> & { abort(reason?: unknown): void });
 
@@ -487,7 +488,34 @@ export class ProtocolRouter {
     }
   }
 
+  // Outbound P2P send — wrapped with a `protocol_router.send` span + the P2P
+  // send-duration metric. No-op when telemetry is disabled. The heavy
+  // pooled/one-shot logic lives in sendInner; this wrapper only measures.
   async send(
+    peerIdStr: string,
+    protocolId: string,
+    data: Uint8Array,
+    timeoutMsOrOpts: number | SendOptions = DEFAULT_SEND_TIMEOUT_MS,
+  ): Promise<Uint8Array> {
+    const startedAt = Date.now();
+    const m = getMetrics();
+    try {
+      const res = await withSpan(
+        'protocol_router.send',
+        () => this.sendInner(peerIdStr, protocolId, data, timeoutMsOrOpts),
+        { attributes: { 'dkg.protocol_id': protocolId, 'dkg.peer': peerIdStr.slice(0, 8) } },
+      );
+      m.protocolSendTotal.add(1, { protocol_id: protocolId, outcome: 'ok' });
+      return res;
+    } catch (err) {
+      m.protocolSendTotal.add(1, { protocol_id: protocolId, outcome: 'error' });
+      throw err;
+    } finally {
+      m.protocolSendDuration.record(Date.now() - startedAt, { protocol_id: protocolId });
+    }
+  }
+
+  private async sendInner(
     peerIdStr: string,
     protocolId: string,
     data: Uint8Array,

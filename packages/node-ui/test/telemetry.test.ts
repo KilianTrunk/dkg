@@ -103,6 +103,8 @@ describe('metrics — bounded, low-cardinality attributes only', () => {
     m.ackPeerTotal.add(1, { result: 'decline', decline_code: 'NO_DATA_IN_SWM' });
     m.ackQuorumTotal.add(1, { outcome: 'timeout', chain_id: 'base:8453' });
     m.syncRequestTotal.add(1, { outcome: 'ok', protocol_id: '/dkg/10.0.2/sync' });
+    m.protocolSendTotal.add(1, { outcome: 'ok', protocol_id: '/dkg/10.0.2/sync' });
+    m.protocolSendDuration.record(5, { protocol_id: '/dkg/10.0.2/sync' });
 
     await mp.forceFlush();
 

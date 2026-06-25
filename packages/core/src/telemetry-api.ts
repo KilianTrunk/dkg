@@ -142,6 +142,10 @@ export interface DkgMetrics {
   syncRequestTotal: Counter;
   /** outcome={ok|busy|limit|error} */
   syncResponseTotal: Counter;
+  /** outcome={ok|error}, protocol_id — outbound P2P protocol send */
+  protocolSendTotal: Counter;
+  /** ms; protocol_id — P2P protocol send duration */
+  protocolSendDuration: Histogram;
 }
 
 function buildMetrics(): DkgMetrics {
@@ -162,6 +166,10 @@ function buildMetrics(): DkgMetrics {
     chainRpcFailoverTotal: meter.createCounter('dkg.chain.rpc.failover.total', { description: 'Chain RPC endpoint failover events' }),
     syncRequestTotal: meter.createCounter('dkg.sync.request.total', { description: 'Outbound sync requests' }),
     syncResponseTotal: meter.createCounter('dkg.sync.response.total', { description: 'Inbound sync responses' }),
+    protocolSendTotal: meter.createCounter('dkg.protocol_router.send.total', { description: 'Outbound P2P protocol sends' }),
+    protocolSendDuration: meter.createHistogram('dkg.protocol_router.send.duration', {
+      unit: 'ms', description: 'P2P protocol send wall-time', advice: { explicitBucketBoundaries: RPC_DURATION_BUCKETS },
+    }),
   };
 }
 

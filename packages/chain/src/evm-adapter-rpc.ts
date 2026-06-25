@@ -9,6 +9,7 @@
  */
 import { ethers, FetchRequest } from 'ethers';
 import { enrichEvmError, errorCode, errorMessage, errorStatus } from './evm-adapter-errors.js';
+import { createRpcTimeoutError } from './chain-rpc-transport-error.js';
 
 /**
  * Per-request retry bound for ethers' built-in `FetchRequest`. ethers v6
@@ -46,9 +47,7 @@ export function withTimeout<T>(promise: Promise<T>, ms: number, label: string): 
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
-      const err = new Error(`${label} timed out after ${ms}ms`);
-      (err as any).code = 'TIMEOUT';
-      reject(err);
+      reject(createRpcTimeoutError(`${label} timed out after ${ms}ms`));
     }, ms);
   });
   return Promise.race([promise, timeout]).finally(() => {
@@ -116,7 +115,7 @@ export function isRetryableRpcError(err: unknown): boolean {
   }
 
   if (status === 429 || (typeof status === 'number' && status >= 500)) return true;
-  if (code === 'TIMEOUT' || code === 'TIMEOUT_ERROR' || code === 'SERVER_ERROR'
+  if (code === 'TIMEOUT' || code === 'RPC_TIMEOUT' || code === 'TIMEOUT_ERROR' || code === 'SERVER_ERROR'
     || code === 'NETWORK_ERROR' || code === 'ECONNRESET' || code === 'ECONNREFUSED'
     || code === 'ETIMEDOUT' || code === 'ENOTFOUND' || code === 'EAI_AGAIN'
     || code === 'UNKNOWN_ERROR' || code === 'BAD_DATA'

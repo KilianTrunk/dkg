@@ -714,6 +714,51 @@ describe('resolveChainConfig (field-level merge)', () => {
     expect(merged?.rpcUrls).toEqual(['http://127.0.0.1:8546']);
   });
 
+  it('does NOT inherit public backups when the operator pins a DIFFERENT chainId — even on a non-loopback host (#1329 review)', () => {
+    // A Docker/LAN devnet primary that overrides chainId to a different chain
+    // (e.g. local 31337 on the testnet base:84532 overlay) is NOT loopback, but
+    // inheriting the public Base-Sepolia backups would still build a cross-chain
+    // FallbackProvider that ethers rejects at init. Suppress on chain-identity
+    // mismatch, not only on loopback URLs.
+    const merged = resolveChainConfig(
+      { chain: { rpcUrl: 'http://hardhat:8545', chainId: 'evm:31337' } },
+      { chain: fullNetworkChain },
+    );
+    expect(merged?.rpcUrl).toBe('http://hardhat:8545');
+    expect(merged?.chainId).toBe('evm:31337');
+    expect(merged?.rpcUrls ?? []).toEqual([]);
+  });
+
+  it('STILL inherits public backups for a non-loopback private RPC on the SAME chain', () => {
+    // The intended operator case: a private/custom RPC on the overlay's own
+    // chain (chainId omitted, or explicitly equal) keeps the public backups for
+    // failover. Only a DIFFERENT chain (loopback or mismatched chainId) suppresses.
+    const omittedChainId = resolveChainConfig(
+      { chain: { rpcUrl: 'https://my-private-rpc.example/abc' } },
+      { chain: fullNetworkChain },
+    );
+    expect(omittedChainId?.rpcUrls).toEqual(fullNetworkChain.rpcUrls);
+
+    const sameChainId = resolveChainConfig(
+      { chain: { rpcUrl: 'https://my-private-rpc.example/abc', chainId: fullNetworkChain.chainId } },
+      { chain: fullNetworkChain },
+    );
+    expect(sameChainId?.rpcUrls).toEqual(fullNetworkChain.rpcUrls);
+  });
+
+  it('STILL inherits backups when only chainId differs and the operator did NOT pin an rpcUrl (#1332 review)', () => {
+    // A chainId override with NO custom rpcUrl leaves the primary as the network
+    // RPC (same chain as the backups) — there is no cross-chain FallbackProvider
+    // to avoid, so suppressing the backups would needlessly drop failover. The
+    // suppression must trigger only when the operator pins their OWN primary.
+    const merged = resolveChainConfig(
+      { chain: { chainId: 'evm:31337' } },
+      { chain: fullNetworkChain },
+    );
+    expect(merged?.rpcUrl).toBe(fullNetworkChain.rpcUrl);
+    expect(merged?.rpcUrls).toEqual(fullNetworkChain.rpcUrls);
+  });
+
   it('overrides hub independently of rpcUrl (multichain forward-compat)', () => {
     const merged = resolveChainConfig(
       { chain: { hubAddress: '0xOPERATORHUB0000000000000000000000000000' } },

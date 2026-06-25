@@ -15,7 +15,7 @@ import {
   NO_FUNDED_PUBLISHER_WALLET_CODE,
   messageIndicatesNoFundedPublisherWallet,
 } from '@origintrail-official/dkg-core';
-import { enrichEvmError } from '@origintrail-official/dkg-chain';
+import { enrichEvmError, isChainRpcTransportError } from '@origintrail-official/dkg-chain';
 import type { DKGAgent, ContextGraphWritePreflightProbe } from '@origintrail-official/dkg-agent';
 import type { DkgConfig } from '../config.js';
 import { enforceSignedRequestPostBody } from '../auth.js';
@@ -117,19 +117,15 @@ export function respondWithDaemonError(res: ServerResponse, err: any): void {
     // Funded-wallet selection found no operational wallet with gas + TRAC — a
     // user-actionable funding condition (4xx), not a server bug.
     jsonResponse(res, 400, noFundedPublisherWalletBody(typeof err?.message === 'string' ? err.message : String(err)));
-  } else {
-    // A transient chain-RPC transport exhaustion (RPC_ENDPOINTS_EXHAUSTED /
-    // RPC_RECEIPT_LOOKUP_FAILED → 503, TIMEOUT → 504) is retryable, so a route
+  } else if (respondIfChainRpcTransportError(res, err)) {
+    // Transient transport exhaustion (RPC_ENDPOINTS_EXHAUSTED /
+    // RPC_RECEIPT_LOOKUP_FAILED → 503, TIMEOUT → 504) is retryable — a route
     // that RE-THROWS to this top-level handler (e.g. the SWM→VM publish at
-    // /api/shared-memory/publish) gets the retryable status instead of a
-    // generic 500. Code-keyed, so on-chain reverts (no transport code) still 500.
-    const transport = classifyChainRpcTransportStatus(err);
-    if (transport) {
-      jsonResponse(res, transport.status, transport.body);
-    } else {
-      enrichEvmError(err);
-      jsonResponse(res, 500, { error: err?.message ?? String(err) });
-    }
+    // /api/shared-memory/publish) gets the retryable status instead of 500.
+    // Code-keyed, so on-chain reverts (no transport code) fall through to 500.
+  } else {
+    enrichEvmError(err);
+    jsonResponse(res, 500, { error: err?.message ?? String(err) });
   }
 }
 
@@ -316,46 +312,61 @@ export function sanitizeRpcMessage(msg: string): string {
 export function classifyChainRpcTransportStatus(
   err: unknown,
 ): { status: number; body: Record<string, unknown> } | undefined {
-  const code = err && typeof err === "object" && "code" in err
-    ? String((err as { code?: unknown }).code ?? "")
-    : "";
-  if (
-    code !== "RPC_ENDPOINTS_EXHAUSTED" &&
-    code !== "RPC_RECEIPT_LOOKUP_FAILED" &&
-    code !== "TIMEOUT"
-  ) {
-    return undefined;
+  if (!isChainRpcTransportError(err)) return undefined;
+  const { code } = err;
+  const msg = sanitizeRpcMessage(typeof err.message === "string" ? err.message : "");
+  const txHash = typeof err.txHash === "string" && err.txHash ? err.txHash : "";
+  // Exhaustive over ChainRpcTransportCode: a new code added to the boundary
+  // without a case here is a COMPILE error (the `never` default), so the
+  // classifier can never silently inherit timeout/504 semantics for a new code.
+  switch (code) {
+    case "RPC_ENDPOINTS_EXHAUSTED":
+      return { status: 503, body: { error: msg || "Configured chain RPC endpoints were exhausted.", code } };
+    case "RPC_RECEIPT_LOOKUP_FAILED":
+      return {
+        status: 503,
+        body: {
+          error: msg || "Transaction receipt lookup failed on all configured chain RPC endpoints.",
+          code,
+          ...(txHash ? { txHash } : {}),
+        },
+      };
+    case "RPC_TIMEOUT":
+      // Internal, chain-namespaced timeout code. Expose the public/legacy
+      // `code: "TIMEOUT"` in the 504 body (clients key on that), keeping the
+      // wire contract stable while the boundary stays namespaced internally.
+      return {
+        status: 504,
+        body: { error: msg || "Chain transaction timed out.", code: "TIMEOUT", ...(txHash ? { txHash } : {}) },
+      };
+    default: {
+      const _exhaustive: never = code;
+      return _exhaustive;
+    }
   }
-  const msg = sanitizeRpcMessage(
-    err && typeof err === "object" && "message" in err
-      ? String((err as { message?: unknown }).message ?? "")
-      : typeof err === "string" ? err : "",
-  );
-  const txHash = err && typeof err === "object" && "txHash" in err
-    ? String((err as { txHash?: unknown }).txHash ?? "")
-    : "";
-  if (code === "RPC_ENDPOINTS_EXHAUSTED") {
-    return { status: 503, body: { error: msg || "Configured chain RPC endpoints were exhausted.", code } };
-  }
-  if (code === "RPC_RECEIPT_LOOKUP_FAILED") {
-    return {
-      status: 503,
-      body: {
-        error: msg || "Transaction receipt lookup failed on all configured chain RPC endpoints.",
-        code,
-        ...(txHash ? { txHash } : {}),
-      },
-    };
-  }
-  // code === "TIMEOUT"
-  return {
-    status: 504,
-    body: {
-      error: msg || "Chain transaction timed out.",
-      code,
-      ...(txHash ? { txHash } : {}),
-    },
-  };
+}
+
+/**
+ * Single responder for a transient chain-RPC transport failure: maps it to a
+ * retryable 503/504 (via {@link classifyChainRpcTransportStatus}), writes the
+ * response, and returns true. Returns false (writing nothing) for any
+ * non-transport error so the caller falls through to its own mapping.
+ * `extraBody` adds route-specific fields to the response body (e.g. the identity
+ * route's `{ identityId, hasIdentity }`). The canonical transport fields
+ * (`error`, `code`, `txHash`) are merged LAST so a caller can never shadow them
+ * — `extraBody` may only ADD fields, keeping this responder the single source of
+ * truth for the transport response shape. Use this instead of repeating the
+ * classify→jsonResponse branch in every chain-write catch.
+ */
+export function respondIfChainRpcTransportError(
+  res: ServerResponse,
+  err: unknown,
+  extraBody?: Record<string, unknown>,
+): boolean {
+  const transport = classifyChainRpcTransportStatus(err);
+  if (!transport) return false;
+  jsonResponse(res, transport.status, extraBody ? { ...extraBody, ...transport.body } : transport.body);
+  return true;
 }
 
 export function parsePublishRequestBody(

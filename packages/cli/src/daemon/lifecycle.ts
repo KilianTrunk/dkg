@@ -131,6 +131,7 @@ import {
   exitOnStoreConfigErrors,
   validateNetworkConfigReadiness,
 } from '../config.js';
+import { resolveOtelSignals, resolveLogExporterMode } from '../telemetry-config.js';
 import { createPublicSnapshotStore, createPublisherControlFromStore, startPublisherRuntimeIfEnabled, type PublisherRuntime } from '../publisher-runner.js';
 import { createCatchupRunner, type CatchupJobResult, type CatchupRunner } from '../catchup-runner.js';
 import { loadTokens, httpAuthGuard } from '../auth.js';
@@ -2244,7 +2245,7 @@ export async function runDaemonInner(
   // unset (preserves prior behaviour); 'otlp' is the recommended path; 'none'
   // keeps logs local-only even while telemetry is enabled.
   function startTelemetry(): { ok: boolean; error?: string } {
-    const mode = config.telemetry?.logs?.exporter ?? "syslog";
+    const mode = resolveLogExporterMode(config.telemetry);
     if (mode === "none") return { ok: true };
     if (mode === "otlp") return startOtlpExporter();
     return startLogPusher();
@@ -2260,17 +2261,9 @@ export async function runDaemonInner(
   // config; a signal registers ONLY when its endpoint resolves — never a
   // guessed prod default. enabled=false ⇒ initTelemetry is a total no-op.
   if (config.telemetry?.enabled) {
-    const otelBase = process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.replace(/\/$/, "");
-    const tracesEndpoint =
-      process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT ||
-      (otelBase ? `${otelBase}/v1/traces` : undefined) ||
-      config.telemetry.traces?.endpoint;
-    const metricsEndpoint =
-      process.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT ||
-      (otelBase ? `${otelBase}/v1/metrics` : undefined) ||
-      config.telemetry.metrics?.endpoint;
-    const tracesOn = !!tracesEndpoint && config.telemetry.traces?.enabled !== false;
-    const metricsOn = !!metricsEndpoint && config.telemetry.metrics?.enabled !== false;
+    const { tracesEndpoint, metricsEndpoint, tracesOn, metricsOn } = resolveOtelSignals(
+      config.telemetry,
+    );
     try {
       initTelemetry({
         enabled: true,

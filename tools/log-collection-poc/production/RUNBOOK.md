@@ -21,7 +21,7 @@ Copy `config.alloy` + `docker-compose.alloy.yml` to the host, then:
 docker compose -f docker-compose.alloy.yml up -d
 docker logs <alloy-container> --tail 20   # should say "now listening", no errors
 ```
-Alloy now listens on `127.0.0.1:4318` (OTLP/HTTP) and writes to the local Loki. (Uses `network_mode: host` to reach `127.0.0.1:3100`.)
+Alloy now listens on `0.0.0.0:4318` (OTLP/HTTP) — as set in `config.alloy` — and writes to the local Loki. (Uses `network_mode: host` to reach `127.0.0.1:3100`.) **Firewall TCP 4318 from the public internet**; only `cloudflared` on localhost (Step 2) should reach it. Reverse-proxy/tunnel both connect to it via `localhost:4318`.
 
 ## Step 2 — expose an ingest hostname via Cloudflare (no Access)
 Nodes can't do interactive SSO, so this hostname must NOT have a Cloudflare Access policy. Recommended: a **Cloudflare Tunnel** (`cloudflared`) on the host:

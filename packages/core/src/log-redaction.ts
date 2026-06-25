@@ -94,6 +94,9 @@ function buildKeyRegex(keys: readonly string[]): RegExp {
       '"[^"]*"' + '|' +
       "'[^']*'" + '|' +
       '`[^`]*`' + '|' +
+      // auth-scheme + credential as ONE value, so `authorization: Bearer <token>`
+      // redacts the token too (not just the scheme word).
+      '(?:Bearer|Basic|Bot|Token|Digest|ApiKey)\\s+[^\\s,;}\\]\\)]+' + '|' +
       '[^\\s,;}\\]\\)]+' + // bare token
     ')',
     'gi',

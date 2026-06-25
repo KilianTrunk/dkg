@@ -172,15 +172,22 @@ describe('OtlpLogWorker — OTLP/HTTP log export', () => {
     expect(srv.received[0].headers['authorization']).toBe('Bearer sekret-token');
   });
 
-  it('drops oldest on buffer overflow (bounded memory)', async () => {
-    // Server that never gets hit (we inspect pending() before any flush by not starting).
+  it('on overflow keeps the NEWEST entries and drops the OLDEST (bounded memory)', async () => {
     const srv = await startServer(() => ({ status: 200 }));
     servers.push(srv.close);
     const w = new OtlpLogWorker(baseOpts(srv.url, { bufferMaxEntries: 3 }));
     workers.push(w);
-    // Do NOT start() — so nothing flushes; just exercise the bound.
+    // Overflow the bound by 10→3 BEFORE starting, then flush and inspect which survived.
     for (let i = 0; i < 10; i++) w.push(rec({ message: `m${i}` }));
-    expect(w.pending()).toBe(3);
+    expect(w.pending()).toBe(3); // capped
+    w.start();
+    await waitFor(() => srv.received.length >= 1);
+    await sleep(60);
+    const delivered = srv.received
+      .flatMap((r) => r.body.resourceLogs[0].scopeLogs[0].logRecords.map((lr: any) => lr.body.stringValue))
+      .sort();
+    // drop-OLDEST ⇒ the survivors are the last three pushed (m7,m8,m9), NOT m0..m2.
+    expect(delivered).toEqual(['m7', 'm8', 'm9']);
   });
 
   it('retries on a retryable 503 then succeeds (records not lost)', async () => {

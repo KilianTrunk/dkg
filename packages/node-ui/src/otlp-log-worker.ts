@@ -29,7 +29,8 @@ const OTEL_SEVERITY: Record<string, { num: number; text: string }> = {
   error: { num: 17, text: 'ERROR' },
 };
 
-const LEVEL_RANK: Record<string, number> = { debug: 0, info: 1, warn: 2, error: 3 };
+export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+const LEVEL_RANK: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 };
 
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 
@@ -41,7 +42,7 @@ const DEFAULTS = {
   baseBackoffMs: 1_000,
   maxBackoffMs: 60_000,
   serviceName: 'dkg-node',
-  minLevel: 'info',
+  minLevel: 'info' as LogLevel,
 };
 
 export interface OtlpLogWorkerOptions {
@@ -76,7 +77,7 @@ export interface OtlpLogWorkerOptions {
    */
   deploymentEnvironment?: string;
   /** Minimum level forwarded remotely. Default 'info' (debug stays local). */
-  minLevel?: string;
+  minLevel?: LogLevel;
   /** Bounded in-memory buffer; drop-oldest on overflow. Default 500. */
   bufferMaxEntries?: number;
   flushIntervalMs?: number;
@@ -153,7 +154,7 @@ export class OtlpLogWorker {
 
   /** Append a record. Filters below minLevel; never awaits the network. */
   push(record: LogRecord): void {
-    if ((LEVEL_RANK[record.level] ?? LEVEL_RANK.info) < this.minRank) return;
+    if ((LEVEL_RANK[record.level as LogLevel] ?? LEVEL_RANK.info) < this.minRank) return;
     if (this.buffer.length >= this.maxBuffer) this.buffer.shift();
     this.buffer.push({ r: record, tsMs: Date.now() });
   }
@@ -205,7 +206,10 @@ export class OtlpLogWorker {
         this.droppedNonRetryable += batch.length;
         if (!this.loggedNonRetryable) {
           this.loggedNonRetryable = true;
-          this.onError(`dropping logs — collector returned ${res.status} (non-retryable); check endpoint/token`);
+          this.onError(
+            `dropping logs — collector returned ${res.status} (non-retryable); check endpoint/token. ` +
+              `${this.droppedNonRetryable} record(s) dropped so far.`,
+          );
         }
       }
     } catch (err) {

@@ -37,6 +37,14 @@ describe('log redaction — secrets are scrubbed before logs leave the node', ()
     expect((out.message.match(/\[REDACTED\]/g) ?? []).length).toBeGreaterThanOrEqual(2);
   });
 
+  it('redacts the credential in a header-style "authorization: Bearer <token>" (not just the scheme word)', () => {
+    const out = redact(rec('GET /x authorization: Bearer sk_live_9f8e7d6c5b4a received'));
+    expect(out.message).toContain('authorization:');
+    expect(out.message).toContain(REDACTED);
+    expect(out.message).not.toContain('sk_live_9f8e7d6c5b4a');
+    expect(out.message).not.toContain('Bearer sk_live'); // scheme+token redacted as one
+  });
+
   it('redacts a JWT by shape even with no key name', () => {
     const jwt = 'eyJhbGciOiJIUzI1Ni1.eyJzdWIiOiIxMjM0NTY3.SflKxwRJSMeKKF2QT4';
     const out = redact(rec(`auth header ${jwt} received`));

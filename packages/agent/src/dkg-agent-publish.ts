@@ -1294,7 +1294,7 @@ export class PublishMethods extends DKGAgentBase {
     opts?: PublishOpts,
   ): Promise<PublishResult> {
    return withSpan('agent.publish', async (span) => {
-    const chainId = typeof this.chain.chainId === 'string' && this.chain.chainId !== 'none' ? this.chain.chainId : undefined;
+    const chainId = typeof this.chain?.chainId === 'string' && this.chain.chainId !== 'none' ? this.chain.chainId : undefined;
     const publishStartedAt = Date.now();
     span.setAttributes({
       'dkg.context_graph_id': contextGraphId,
@@ -4140,7 +4140,7 @@ export class PublishMethods extends DKGAgentBase {
     },
   ): Promise<PublishResult> {
    return withSpan('agent.publish_from_swm', async (span) => {
-    const chainId = typeof this.chain.chainId === 'string' && this.chain.chainId !== 'none' ? this.chain.chainId : undefined;
+    const chainId = typeof this.chain?.chainId === 'string' && this.chain.chainId !== 'none' ? this.chain.chainId : undefined;
     const publishStartedAt = Date.now();
     span.setAttributes({
       'dkg.context_graph_id': contextGraphId,

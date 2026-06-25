@@ -699,7 +699,7 @@ export class EVMChainAdapterBase {
    * synthetic `withTimeout` TIMEOUT code, else `error`. Used at the chain RPC
    * metric record sites so the `outcome` label stays bounded.
    */
-  private rpcOutcomeForError(err: unknown): 'error' | 'timeout' {
+  private _rpcOutcomeForError(err: unknown): 'error' | 'timeout' {
     return errorCode(err) === 'TIMEOUT' ? 'timeout' : 'error';
   }
 
@@ -746,7 +746,7 @@ export class EVMChainAdapterBase {
             }
             if (!isRetryableRpcError(err)) {
               metrics.chainRpcTotal.add(1, {
-                rpc_method: 'eth_sendRawTransaction', outcome: this.rpcOutcomeForError(err),
+                rpc_method: 'eth_sendRawTransaction', outcome: this._rpcOutcomeForError(err),
                 retryable: false, chain_id: this.chainId,
               });
               metrics.chainRpcDuration.record(Date.now() - startedAt, {
@@ -759,7 +759,7 @@ export class EVMChainAdapterBase {
         }
         // All configured endpoints exhausted.
         metrics.chainRpcTotal.add(1, {
-          rpc_method: 'eth_sendRawTransaction', outcome: this.rpcOutcomeForError(lastRetryable),
+          rpc_method: 'eth_sendRawTransaction', outcome: this._rpcOutcomeForError(lastRetryable),
           retryable: true, chain_id: this.chainId,
         });
         metrics.chainRpcDuration.record(Date.now() - startedAt, {
@@ -808,7 +808,7 @@ export class EVMChainAdapterBase {
           } catch (err) {
             if (!isRetryableRpcError(err)) {
               metrics.chainRpcTotal.add(1, {
-                rpc_method: 'eth_getTransactionReceipt', outcome: this.rpcOutcomeForError(err),
+                rpc_method: 'eth_getTransactionReceipt', outcome: this._rpcOutcomeForError(err),
                 retryable: false, chain_id: this.chainId,
               });
               metrics.chainRpcDuration.record(Date.now() - startedAt, {
@@ -822,7 +822,7 @@ export class EVMChainAdapterBase {
         if (lastRetryable && !sawNonErrorResponse) {
           // No backend could even answer the lookup → endpoints exhausted.
           metrics.chainRpcTotal.add(1, {
-            rpc_method: 'eth_getTransactionReceipt', outcome: this.rpcOutcomeForError(lastRetryable),
+            rpc_method: 'eth_getTransactionReceipt', outcome: this._rpcOutcomeForError(lastRetryable),
             retryable: true, chain_id: this.chainId,
           });
           metrics.chainRpcDuration.record(Date.now() - startedAt, {
@@ -1028,12 +1028,12 @@ export class EVMChainAdapterBase {
   ): Promise<ethers.TransactionReceipt> {
     return withSpan(
       'chain.tx_send',
-      async (span) => this.sendContractTransactionInner(span, contract, method, args, signer, label, opts),
+      async (span) => this._sendContractTransactionInner(span, contract, method, args, signer, label, opts),
       { attributes: { 'rpc.method': 'eth_sendRawTransaction', 'dkg.chain_id': this.chainId } },
     );
   }
 
-  private async sendContractTransactionInner(
+  private async _sendContractTransactionInner(
     span: Parameters<Parameters<typeof withSpan>[1]>[0],
     contract: Contract,
     method: string,
@@ -1175,7 +1175,7 @@ export class EVMChainAdapterBase {
           });
           return allowance;
         } catch (err) {
-          const outcome = this.rpcOutcomeForError(err);
+          const outcome = this._rpcOutcomeForError(err);
           metrics.chainRpcTotal.add(1, {
             rpc_method: 'eth_call', outcome, retryable: isRetryableRpcError(err), chain_id: this.chainId,
           });
@@ -1417,7 +1417,7 @@ export class EVMChainAdapterBase {
               });
               throw err;
             }
-            const outcome = this.rpcOutcomeForError(err);
+            const outcome = this._rpcOutcomeForError(err);
             metrics.chainRpcTotal.add(1, {
               rpc_method: 'eth_call', outcome, retryable: isRetryableRpcError(err), chain_id: this.chainId,
             });
@@ -1639,7 +1639,7 @@ export class EVMChainAdapterBase {
           });
           return id;
         } catch (err) {
-          const outcome = this.rpcOutcomeForError(err);
+          const outcome = this._rpcOutcomeForError(err);
           metrics.chainRpcTotal.add(1, {
             rpc_method: 'eth_call', outcome, retryable: isRetryableRpcError(err), chain_id: this.chainId,
           });
@@ -1883,7 +1883,7 @@ export class EVMChainAdapterBase {
           }
         }
         // Every eligible backend failed for this page → one error/timeout outcome.
-        const outcome = pageError ? this.rpcOutcomeForError(pageError) : 'error';
+        const outcome = pageError ? this._rpcOutcomeForError(pageError) : 'error';
         metrics.chainRpcTotal.add(1, {
           rpc_method: 'eth_getLogs', outcome, retryable: isRetryableRpcError(pageError), chain_id: this.chainId,
         });

@@ -123,6 +123,16 @@ describe('#1116 share/seal route error mapping (fake agent)', () => {
     return { status: res.status, body: json };
   }
 
+  async function postRoot(body: Record<string, unknown>) {
+    const res = await fetch(`${baseUrl}/api/knowledge-assets`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const json = await res.json().catch(() => null);
+    return { status: res.status, body: json };
+  }
+
   it('swm/share: UNSEALED_SHARE_BLOCKED → 409 { code, error, recovery }', async () => {
     await startWith({
       promote: async () => {
@@ -265,6 +275,59 @@ describe('#1116 share/seal route error mapping (fake agent)', () => {
   // registers then fails-before-retry would still pass. This pins the exact
   // call order with a fake agent.
   describe('vm/publish auto-register retry sequence', () => {
+    it('atomic create+alsoPublishVm passes the token-scoped storage lane into finalized publish', async () => {
+      const token = 'agent-token-atomic';
+      const tokenAgentAddress = `0x${'cd'.repeat(20)}`;
+      const seenOpts: unknown[] = [];
+
+      await startWith(
+        {
+          create: async () => 'did:dkg:assertion:atomic-agent-publish',
+          write: async () => undefined,
+          finalize: async () => ({
+            assertionUri: 'did:dkg:assertion:atomic-agent-publish',
+            merkleRoot: new Uint8Array(32),
+            authorAddress: tokenAgentAddress,
+            schemeVersion: 1,
+            chainId: 1n,
+            kav10Address: `0x${'ef'.repeat(20)}`,
+            eip712Digest: `0x${'12'.repeat(32)}`,
+          }),
+        },
+        {
+          resolveAgentByToken: (t?: string) => (t === token ? tokenAgentAddress : undefined),
+          async publishFromFinalizedAssertion(_cg: string, _name: string, opts: unknown) {
+            seenOpts.push(opts);
+            return {
+              status: 'confirmed',
+              ual: 'did:dkg:test/1/44',
+              kaId: '44',
+              seal: { authorAddress: tokenAgentAddress },
+            };
+          },
+        },
+        { requestToken: token, requestAgentAddress: tokenAgentAddress },
+      );
+
+      const res = await postRoot({
+        contextGraphId: CG_ID,
+        name: 'atomic-agent-publish',
+        quads: [{
+          subject: 'did:dkg:test:AtomicAgentPublish',
+          predicate: 'http://schema.org/name',
+          object: '"Atomic"',
+          graph: '',
+        }],
+        finalize: true,
+        alsoPublishVm: true,
+      });
+
+      expect(res.status).toBe(201);
+      expect(res.body.status).toBe('vm-confirmed');
+      expect(seenOpts).toHaveLength(1);
+      expect(seenOpts[0]).toMatchObject({ agentAddress: tokenAgentAddress });
+    });
+
     it('passes the token-scoped storage lane into finalized publish calls', async () => {
       const token = 'agent-token-a';
       const tokenAgentAddress = `0x${'ab'.repeat(20)}`;

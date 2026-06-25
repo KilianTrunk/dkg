@@ -341,6 +341,24 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     expect(claimedOther?.jobId).toBe(otherId);
   });
 
+  it('13b. claimNext() can claim the same assertion concurrently in different agent lanes', async () => {
+    const queue = createQueue();
+    const agentA = `0x${'aa'.repeat(20)}`;
+    const agentB = `0x${'bb'.repeat(20)}`;
+    const jobA = await queue.enqueue(makeRequest({ agentAddress: agentA }));
+    const jobB = await queue.enqueue(makeRequest({ agentAddress: agentB }));
+
+    const claimedA = await queue.claimNext('worker-1');
+    expect(claimedA?.jobId).toBe(jobA);
+    expect(claimedA?.request.agentAddress).toBe(agentA);
+
+    await expect(queue.enqueue(makeRequest({ agentAddress: agentA }))).rejects.toBeInstanceOf(PromoteJobConflictError);
+
+    const claimedB = await queue.claimNext('worker-2');
+    expect(claimedB?.jobId).toBe(jobB);
+    expect(claimedB?.request.agentAddress).toBe(agentB);
+  });
+
   it('14. heartbeat() extends the lease without changing state', async () => {
     const queue = createQueue({ leaseMs: 60_000 });
     const jobId = await queue.enqueue(makeRequest());

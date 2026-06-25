@@ -88,10 +88,7 @@ export function uniquenessLookupKeys(request: PromoteUniquenessInput): string[] 
 }
 
 export function requestsShareUniquenessKey(a: PromoteUniquenessInput, b: PromoteUniquenessInput): boolean {
-  return a.contextGraphId === b.contextGraphId
-    && (a.subGraphName ?? '') === (b.subGraphName ?? '')
-    && a.assertionName === b.assertionName
-    && normalizedAgentLane(a.agentAddress) === normalizedAgentLane(b.agentAddress);
+  return uniquenessKey(a) === uniquenessKey(b);
 }
 
 export function quad(subject: string, predicate: string, object: string, graph: string): Quad {

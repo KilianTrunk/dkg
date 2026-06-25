@@ -85,6 +85,10 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     await store.flush?.();
   }
 
+  async function rewriteStoredJob(job: PromoteJob): Promise<void> {
+    await (createQueue() as unknown as { writeJob(job: PromoteJob): Promise<void> }).writeJob(job);
+  }
+
   // ---------------------------------------------------------------------------
   // §3.1 enqueue
   // ---------------------------------------------------------------------------
@@ -177,6 +181,10 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     const queue = createQueue();
     const legacyRequest = makeRequest();
     const legacyJobId = await queue.enqueue(legacyRequest);
+    await rewriteStoredJob({
+      ...(await queue.getStatus(legacyJobId))!,
+      formatVersion: undefined,
+    });
     await rewriteStoredUniquenessKey(legacyJobId, legacyUniquenessKey(legacyRequest));
 
     await expect(queue.enqueue(makeRequest({ agentAddress: `0x${'aa'.repeat(20)}` }))).rejects.toMatchObject({
@@ -396,6 +404,10 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     await rewriteStoredUniquenessKey(legacyJobId, legacyUniquenessKey(legacyRequest));
     const legacyClaim = await queue.claimNext('worker-1');
     expect(legacyClaim?.jobId).toBe(legacyJobId);
+    await rewriteStoredJob({
+      ...legacyClaim!,
+      formatVersion: undefined,
+    });
 
     await store.insert(
       serializeJob(
@@ -413,6 +425,21 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     );
 
     expect(await queue.claimNext('worker-2')).toBeNull();
+  });
+
+  it('13d. claimNext() can claim a current default-lane job and explicit agent-lane job concurrently', async () => {
+    const queue = createQueue();
+    const agentA = `0x${'aa'.repeat(20)}`;
+    const defaultJob = await queue.enqueue(makeRequest());
+    const agentJob = await queue.enqueue(makeRequest({ agentAddress: agentA }));
+
+    const claimedDefault = await queue.claimNext('worker-default');
+    expect(claimedDefault?.jobId).toBe(defaultJob);
+    expect(claimedDefault?.request.agentAddress).toBeUndefined();
+
+    const claimedAgent = await queue.claimNext('worker-agent');
+    expect(claimedAgent?.jobId).toBe(agentJob);
+    expect(claimedAgent?.request.agentAddress).toBe(agentA);
   });
 
   it('14. heartbeat() extends the lease without changing state', async () => {
@@ -728,6 +755,30 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     expect(job?.state).toBe('queued');
     expect(job?.lease).toBeUndefined();
     expect(job?.reason).toBeUndefined();
+  });
+
+  it('26a. recoverOnStartup() reclaims an expired agent lane without conflicting with an active peer lane', async () => {
+    const queue = createQueue({ leaseMs: 10_000 });
+    const agentA = `0x${'aa'.repeat(20)}`;
+    const agentB = `0x${'bb'.repeat(20)}`;
+    const jobA = await queue.enqueue(makeRequest({ agentAddress: agentA }));
+    const jobB = await queue.enqueue(makeRequest({ agentAddress: agentB }));
+
+    await queue.claimNext('worker-a');
+    advance(1);
+    const claimB = await queue.claimNext('worker-b');
+    expect(claimB?.jobId).toBe(jobB);
+
+    advance(9_000);
+    await queue.heartbeat(jobB, claimB!.lease!.claimToken);
+    advance(2_000);
+
+    const summary = await queue.recoverOnStartup();
+
+    expect(summary.reclaimed).toBe(1);
+    expect(summary.abandoned).toBe(0);
+    expect((await queue.getStatus(jobA))?.state).toBe('queued');
+    expect((await queue.getStatus(jobB))?.state).toBe('running');
   });
 
   it('26b. recoverOnStartup() ABANDONS legacy running jobs without a formatVersion marker (Codex PR #665 id=3302135756)', async () => {

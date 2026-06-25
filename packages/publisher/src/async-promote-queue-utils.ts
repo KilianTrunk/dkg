@@ -83,11 +83,17 @@ export function uniquenessLookupKeys(request: PromoteUniquenessInput): string[] 
   return Array.from(new Set([uniquenessKey(request), legacyUniquenessKey(request)]));
 }
 
-export function requestsShareUniquenessKey(a: PromoteUniquenessInput, b: PromoteUniquenessInput): boolean {
+export function requestsShareUniquenessKey(
+  a: PromoteUniquenessInput,
+  b: PromoteUniquenessInput,
+  opts: { missingAgentAddressMatchesAnyLane?: boolean } = {},
+): boolean {
   if (legacyUniquenessKey(a) !== legacyUniquenessKey(b)) return false;
   const aLane = normalizedAgentLane(a.agentAddress);
   const bLane = normalizedAgentLane(b.agentAddress);
-  return aLane === '' || bLane === '' || aLane === bLane;
+  return opts.missingAgentAddressMatchesAnyLane
+    ? aLane === '' || bLane === '' || aLane === bLane
+    : aLane === bLane;
 }
 
 export function quad(subject: string, predicate: string, object: string, graph: string): Quad {

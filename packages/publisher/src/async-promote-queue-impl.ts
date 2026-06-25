@@ -218,7 +218,7 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
 
       const running = await this.list({ state: ['running'] });
       const eligible = candidates.filter((candidate) =>
-        !running.some((active) => active.jobId !== candidate.jobId && requestsShareUniquenessKey(active.request, candidate.request)),
+        !running.some((active) => active.jobId !== candidate.jobId && this.jobsShareClaimLane(active, candidate)),
       );
       if (eligible.length === 0) return null;
 
@@ -607,9 +607,29 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
     for (const row of rows) {
       const job = parseJobPayload(row['payload']);
       if (job?.jobId === excludeJobId) continue;
-      if (job && ACTIVE_PROMOTE_STATES.includes(job.state) && requestsShareUniquenessKey(job.request, request)) return job;
+      if (job && ACTIVE_PROMOTE_STATES.includes(job.state) && this.storedJobConflictsWithRequest(job, request)) return job;
     }
     return null;
+  }
+
+  private jobsShareClaimLane(active: PromoteJob, candidate: PromoteJob): boolean {
+    return requestsShareUniquenessKey(active.request, candidate.request, {
+      missingAgentAddressMatchesAnyLane:
+        this.usesLegacyWildcardLane(active) || this.usesLegacyWildcardLane(candidate),
+    });
+  }
+
+  private storedJobConflictsWithRequest(
+    job: PromoteJob,
+    request: Pick<PromoteRequest, 'contextGraphId' | 'subGraphName' | 'assertionName' | 'agentAddress'>,
+  ): boolean {
+    return requestsShareUniquenessKey(job.request, request, {
+      missingAgentAddressMatchesAnyLane: this.usesLegacyWildcardLane(job),
+    });
+  }
+
+  private usesLegacyWildcardLane(job: PromoteJob): boolean {
+    return (job.formatVersion ?? 0) < ASYNC_PROMOTE_QUEUE_FORMAT_VERSION && job.request.agentAddress === undefined;
   }
 
   private async abandonStartupRecovery(

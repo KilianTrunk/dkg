@@ -321,9 +321,7 @@ export function resolveFinalizeOptions(
   // (the on-chain author came out as the node's operational wallet).
   const explicitAuthorAgentAddress =
     typeof authorAgentAddress === "string"
-      ? tokenAgentAddress && isSameAgentAddress(tokenAgentAddress, authorAgentAddress)
-        ? tokenAgentAddress
-        : authorAgentAddress
+      ? authorAgentAddress
       : undefined;
   const effectiveAuthorAgentAddress =
     explicitAuthorAgentAddress ??
@@ -356,6 +354,47 @@ function resolveAuthorAgentAddressFromFinalizeOptions(
 
 function scopedTokenStorageLane(agentAddress?: string): { agentAddress?: string } {
   return agentAddress ? { agentAddress } : {};
+}
+
+async function resolveFinalizeStorageLane(
+  agent: RequestContext["agent"],
+  contextGraphId: string,
+  name: string,
+  finalizeOptions: Record<string, unknown>,
+  tokenAgentAddress?: string,
+): Promise<{ agentAddress?: string }> {
+  const tokenLane = scopedTokenStorageLane(tokenAgentAddress);
+  if (tokenLane.agentAddress) return tokenLane;
+
+  const explicitAuthorLane = resolveAuthorAgentAddressFromFinalizeOptions(finalizeOptions, undefined);
+  if (!explicitAuthorLane) return {};
+
+  const history = agent.assertion?.history;
+  if (typeof history !== "function") return {};
+
+  const subGraphName =
+    typeof finalizeOptions.subGraphName === "string"
+      ? finalizeOptions.subGraphName
+      : undefined;
+  const baseOptions = subGraphName ? { subGraphName } : {};
+
+  let defaultHistory: unknown;
+  try {
+    defaultHistory = await history.call(agent.assertion, contextGraphId, name, baseOptions);
+  } catch {
+    return {};
+  }
+  if (defaultHistory != null) return {};
+
+  try {
+    const authorHistory = await history.call(agent.assertion, contextGraphId, name, {
+      ...baseOptions,
+      agentAddress: explicitAuthorLane,
+    });
+    return authorHistory != null ? { agentAddress: explicitAuthorLane } : {};
+  } catch {
+    return {};
+  }
 }
 
 // uint32 epoch ceiling (matches sibling routes memory.ts / publisher.ts). Not an
@@ -1086,7 +1125,13 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       if (verb === "finalize") {
         const finalizeOptions = resolveFinalizeOptions(parsed, res, writePreflightCallerAgentAddress);
         if (finalizeOptions === null) return;
-        const finalizeStorageLane = scopedTokenStorageLane(writePreflightCallerAgentAddress);
+        const finalizeStorageLane = await resolveFinalizeStorageLane(
+          agent,
+          contextGraphId,
+          name,
+          finalizeOptions,
+          writePreflightCallerAgentAddress,
+        );
         let seal;
         try {
           seal = await agent.assertion.finalize(contextGraphId, name, {

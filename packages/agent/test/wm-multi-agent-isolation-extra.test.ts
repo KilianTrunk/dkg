@@ -281,6 +281,40 @@ describe('A-1: WM is per-agent — two agents co-hosted on one node', () => {
     expect(wm.some((q) => q.subject === 'urn:wm:bob:pull')).toBe(true);
   });
 
+  it('assertion.finalize(layer:swm) seals the explicitly selected non-default agent lane', async () => {
+    const cgId = freshCgId('wm-assertion-swm-finalize-b');
+    const assertionName = 'b-lane-swm-finalize';
+    await node!.createContextGraph({ id: cgId, name: 'WM assertion SWM finalize B', description: '' });
+
+    await node!.assertion.create(cgId, assertionName, { agentAddress: agentB.agentAddress });
+    await node!.assertion.write(cgId, assertionName, [
+      {
+        subject: 'urn:wm:bob:swm-finalize',
+        predicate: 'http://schema.org/description',
+        object: '"B lane SWM finalize"',
+        graph: '',
+      },
+    ], { agentAddress: agentB.agentAddress });
+    await node!.assertion.promote(cgId, assertionName, {
+      agentAddress: agentB.agentAddress,
+      authorAgentAddress: agentB.agentAddress,
+      skipSeal: true,
+    });
+
+    const seal = await node!.assertion.finalize(cgId, assertionName, {
+      layer: 'swm',
+      agentAddress: agentB.agentAddress,
+      authorAgentAddress: agentB.agentAddress,
+    });
+
+    expect(seal.assertionUri).toBe(contextGraphAssertionUri(cgId, agentB.agentAddress, assertionName));
+    const bHistory = await node!.assertion.history(cgId, assertionName, { agentAddress: agentB.agentAddress });
+    expect(bHistory?.swmCurrentAssertion).toBe(ethers.hexlify(seal.merkleRoot).slice(2));
+    await expect(node!.assertion.finalize(cgId, assertionName, { layer: 'swm' })).rejects.toMatchObject({
+      code: 'SWM_SUBSET_NOT_SEALABLE',
+    });
+  });
+
   it(
     'A-1 (Codex PR #242 iter-8): omitted agentAddress on an authenticated WM read defaults ' +
       'to callerAgentAddress — an agent-bound caller cannot escape isolation by just not ' +

@@ -215,7 +215,7 @@ describe('#1116 share/seal route error mapping (fake agent)', () => {
     expect(res.status).toBe(200);
     expect(finalizeCalls).toHaveLength(1);
     expect(finalizeCalls[0]?.opts?.agentAddress).toBe(tokenAgentAddress);
-    expect(finalizeCalls[0]?.opts?.authorAgentAddress).toBe(tokenAgentAddress);
+    expect(finalizeCalls[0]?.opts?.authorAgentAddress).toBe(mixedCaseAuthor);
   });
 
   it('wm/finalize: node/admin author signer does not change the storage lane', async () => {

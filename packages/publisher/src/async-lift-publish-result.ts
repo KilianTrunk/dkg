@@ -1,3 +1,4 @@
+import { NO_FUNDED_PUBLISHER_WALLET_CODE, messageIndicatesNoFundedPublisherWallet } from '@origintrail-official/dkg-core';
 import type { PublishResult } from './publisher.js';
 import {
   createLiftJobFailureMetadata,
@@ -131,7 +132,23 @@ export function mapPublishExceptionToLiftJobFailure(
   const message = input.error instanceof Error ? input.error.message : String(input.error);
   const lower = message.toLowerCase();
 
-  const code = classifyPublishFailureCode(lower, input.failedFromState);
+  // The funded-wallet-selection error (dkg-chain `InsufficientPublisherFundsError`,
+  // code `NO_FUNDED_PUBLISHER_WALLET`) carries a friendly "no operational wallet
+  // has enough funds" message that does NOT contain the literal "insufficient
+  // funds" substring `classifyPublishFailureCode` matches — so recognize it by
+  // its structured code (with a message-marker fallback, mirroring the daemon +
+  // node-ui, in case an intermediate re-wrap drops `.code`). Otherwise an
+  // unfundable publish would fall through to the retryable `rpc_unavailable`
+  // default and the queue would reset/retry a job that can never finalize (the
+  // same forever-retry trap #1013/#1121 fixed). `insufficient_funds` is only
+  // valid from the 'broadcast' state, so only force it there — funded selection
+  // is a broadcast-phase concern; any other state falls back to the classifier.
+  const errorCode = (input.error as { code?: unknown } | null | undefined)?.code;
+  const isNoFundedWallet = errorCode === NO_FUNDED_PUBLISHER_WALLET_CODE
+    || messageIndicatesNoFundedPublisherWallet(lower);
+  const code = isNoFundedWallet && input.failedFromState === 'broadcast'
+    ? 'insufficient_funds'
+    : classifyPublishFailureCode(lower, input.failedFromState);
 
   return createLiftJobFailureMetadata({
     failedFromState: input.failedFromState,

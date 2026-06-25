@@ -3,7 +3,7 @@ import type { ReactNode } from 'react';
 import { useFetch } from '../../../hooks.js';
 import { encodeDocTabId, resolveDocRef } from '../../../lib/doc-tab-id.js';
 import { truncateMiddle } from '../../../lib/truncate.js';
-import { listAssertions, promoteAssertion, describePromoteResult, describePromoteError, ensureContextGraphOnChain, knowledgeAssetFinalize, knowledgeAssetPublish, fetchAssertionUals, type AssertionInfo } from '../../../api.js';
+import { listAssertions, promoteAssertion, describePromoteResult, describePromoteError, describeInsufficientPublisherFunds, ensureContextGraphOnChain, knowledgeAssetFinalize, knowledgeAssetPublish, publishAssertionsToVm, describeBulkVmPublishResult, fetchAssertionUals, type AssertionInfo } from '../../../api.js';
 import { useMemoryEntities, type TrustLevel, type MemoryEntity, type Triple } from '../../../hooks/useMemoryEntities.js';
 import { useProjectProfileContext } from '../../../hooks/useProjectProfile.js';
 import { useAgentsContext } from '../../../hooks/useAgents.js';
@@ -459,7 +459,7 @@ export function AssertionsList({ contextGraphId, layer, onComplete, scrollKey }:
       onComplete();
     } catch (err: any) {
       const typed = describePromoteError(assertion.name, err);
-      setError(typed ? typed.message : (err?.message ?? 'Action failed'));
+      setError(typed?.message ?? describeInsufficientPublisherFunds(err) ?? (err?.message ?? 'Action failed'));
     } finally {
       setBusy(null);
     }
@@ -502,29 +502,24 @@ export function AssertionsList({ contextGraphId, layer, onComplete, scrollKey }:
         }
       } else {
         // Publish each shared assertion as its own Knowledge Asset (Design B).
-        let published = 0;
-        let lastErr: string | null = null;
-        for (const a of assertions) {
-          currentAssertion = a.name;
-          try {
-            await knowledgeAssetPublish(contextGraphId, a.name, a.subGraph ? { subGraphName: a.subGraph } : {});
-            published += 1;
-          } catch (e: any) {
-            lastErr = e?.message ?? 'publish failed';
-          }
-        }
-        if (published > 0) {
-          const tail = lastErr ? ' (some could not be published)' : '';
-          setResult(`Published ${published} knowledge asset${published !== 1 ? 's' : ''} to Verifiable Memory${tail}`);
+        // Shared loop + funds messaging — see publishAssertionsToVm in api.ts.
+        const outcome = await publishAssertionsToVm(
+          contextGraphId,
+          assertions,
+          (name) => { currentAssertion = name; },
+        );
+        const line = describeBulkVmPublishResult(outcome);
+        if (line) {
+          setResult(line);
         } else {
-          throw new Error(lastErr ?? 'Publish failed');
+          throw new Error(outcome.fundsErr ?? outcome.lastErr ?? 'Publish failed');
         }
       }
       refresh();
       onComplete();
     } catch (err: any) {
       const typed = describePromoteError(currentAssertion ?? 'selected assertion', err);
-      setError(typed ? typed.message : (err?.message ?? 'Action failed'));
+      setError(typed?.message ?? describeInsufficientPublisherFunds(err) ?? (err?.message ?? 'Action failed'));
     } finally {
       setBusy(null);
     }

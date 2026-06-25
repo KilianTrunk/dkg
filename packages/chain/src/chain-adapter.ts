@@ -1,5 +1,17 @@
 import type { ethers } from 'ethers';
 
+/**
+ * The Publishing-Conviction-Account read methods the funded-wallet selector
+ * needs from the conviction mixin. Declared as a shared interface so a rename or
+ * signature change in `ConvictionMethods` (which `implements ConvictionReader`)
+ * is caught at compile time, rather than only at runtime through the base-class
+ * structural cast in `isConvictionFundedAgent`.
+ */
+export interface ConvictionReader {
+  getConvictionAgentAccountId(agent: string): Promise<bigint>;
+  convictionAccountCanCover(accountId: bigint, baseCost: bigint): Promise<boolean>;
+}
+
 export interface IdentityProof {
   publicKey: Uint8Array;
   signature: Uint8Array;

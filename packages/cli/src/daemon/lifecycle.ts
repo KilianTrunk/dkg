@@ -64,7 +64,6 @@ const daemonRequire = createRequire(import.meta.url);
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 import {
-  enrichEvmError,
   MockChainAdapter,
   type ApprovalPolicy,
 } from '@origintrail-official/dkg-chain';
@@ -232,8 +231,6 @@ import {
   MAX_UPLOAD_BYTES,
   type ImportFileExtractionPayload,
   buildImportFileResponse,
-  isPayloadTooLargeError,
-  payloadTooLargeResponseBody,
   unregisteredSubGraphError,
   readBody,
   readBodyBuffer,
@@ -253,6 +250,7 @@ import {
   shortId,
   sleep,
   deriveBlockExplorerUrl,
+  respondWithDaemonError,
 } from './http-utils.js';
 import {
   normalizeRepo,
@@ -3021,25 +3019,11 @@ export async function runDaemonInner(
         emitNotification,
       );
     } catch (err: any) {
-      if (res.headersSent || res.writableEnded) return;
-      if (isPayloadTooLargeError(err)) {
-        jsonResponse(res, 413, payloadTooLargeResponseBody(err));
-      } else if (err instanceof SyntaxError) {
-        jsonResponse(res, 400, { error: err.message });
-      } else if (
-        // Round 9 Bug 25: user-authored quads with reserved URN prefixes
-        // map to 400 at the top-level catch so share/publish/conditionalShare
-        // routes (which rethrow for the top-level handler) get the correct
-        // status without each route having to match on the error shape.
-        err?.name === "ReservedNamespaceError" ||
-        (typeof err?.message === "string" &&
-          err.message.includes("reserved namespace"))
-      ) {
-        jsonResponse(res, 400, { error: err.message });
-      } else {
-        enrichEvmError(err);
-        jsonResponse(res, 500, { error: err.message });
-      }
+      // Single top-level error→HTTP mapping (extracted + unit-tested in
+      // shared-assertion-helpers.ts): 413 payload-too-large; 400 SyntaxError /
+      // reserved-namespace / NO_FUNDED_PUBLISHER_WALLET (so rethrowing routes
+      // like /api/shared-memory/publish get the structured funds code); else 500.
+      respondWithDaemonError(res, err);
     }
     // Note: the admission slot is released on the response's `close` event
     // (registered above), not in a finally here — see the comment at acquire.

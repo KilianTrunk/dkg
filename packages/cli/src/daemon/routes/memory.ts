@@ -66,6 +66,7 @@ import {
 import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, assertSafeRdfTerm, sparqlIri, contextGraphSharedMemoryUri, sharedMemoryReadBothFilter, contextGraphAssertionUri, contextGraphMetaUri, escapeDkgRdfLiteral, escapeSparqlLiteral, PROTOCOL_SYNC } from '@origintrail-official/dkg-core';
 import { skolemizeByEntity, findReservedSubjectPrefix, isSkolemizedUri, type PublishOptions, type PublishResult } from '@origintrail-official/dkg-publisher';
 import type { Quad } from '@origintrail-official/dkg-storage';
+import { buildAutoRegisterFailureBody } from "./shared-assertion-helpers.js";
 import {
   DashboardDB,
   MetricsCollector,
@@ -2122,11 +2123,7 @@ WHERE {
         // (insufficient TRAC, missing chain signer, etc.)
         // instead of a generic 500 from the publish leg later.
         tracker.fail(ctx, regErr);
-        return jsonResponse(res, 400, {
-          error:
-            `Context graph "${resolvedContextGraphId}" could not be auto-registered on-chain before publish: ` +
-            `${regErr?.message ?? String(regErr)}`,
-        });
+        return jsonResponse(res, 400, buildAutoRegisterFailureBody(resolvedContextGraphId, regErr));
       }
       const basePublishOptions = {
         operationCtx: ctx,

@@ -42,6 +42,8 @@ import {
   validateWritableQuadLiteralSizes,
   normalizeContextGraphIdOrUri,
   resolveRequiredWriteContextGraphId,
+  isNoFundedPublisherWalletLike,
+  noFundedPublisherWalletBody,
 } from "../http-utils.js";
 import { validatePreSignedAuthorAttestation } from "./memory.js";
 import { recordAssertionActivity } from "../activity-notification.js";
@@ -62,6 +64,7 @@ import {
 import {
   decodePromoteJobId,
   asyncPromoteUnavailable,
+  buildAutoRegisterFailureBody,
 } from "./shared-assertion-helpers.js";
 import { PromoteJobConflictError } from "@origintrail-official/dkg-publisher";
 import { deriveStatus } from "@origintrail-official/dkg-publisher";
@@ -1259,11 +1262,7 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
           try {
             await agent.ensureRegisteredForPublish(contextGraphId, { callerAgentAddress: requestAgentAddress });
           } catch (regErr: any) {
-            return jsonResponse(res, 400, {
-              error:
-                `Context graph "${contextGraphId}" could not be auto-registered on-chain before publish: ` +
-                `${regErr?.message ?? String(regErr)}`,
-            });
+            return jsonResponse(res, 400, buildAutoRegisterFailureBody(contextGraphId, regErr));
           }
           pub = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts });
         }
@@ -1306,6 +1305,14 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         // caller precondition; map it to the same 409 (code-first).
         if (e?.code === "PUBLISH_NOT_FULL_SHARE" || /is not finalized/.test(msg) || /No quads in shared memory/.test(msg) || /has no private payload/.test(msg)) {
           return jsonResponse(res, 409, { code: e?.code === "PUBLISH_NOT_FULL_SHARE" ? "PUBLISH_NOT_FULL_SHARE" : "VM_PUBLISH_PRECONDITION", error: msg });
+        }
+        // Funded-wallet selection found no operational wallet holding the
+        // gas + TRAC a publish needs. This is a user-actionable funding
+        // condition (4xx), not a server/on-chain bug. Classification + body are
+        // shared with the top-level daemon handler (lifecycle.ts) so the two
+        // publish routes cannot drift on the code/marker contract.
+        if (isNoFundedPublisherWalletLike(e)) {
+          return jsonResponse(res, 400, noFundedPublisherWalletBody(msg));
         }
         return jsonResponse(res, 500, { error: msg });
       }

@@ -1,6 +1,6 @@
 import React, { useMemo, useState, Suspense } from 'react';
 import { api } from '../../../api-wrapper.js';
-import { promoteAssertion, describePromoteResult, describePromoteError, publishSharedMemory, type PromoteOutcome, type PublishResult } from '../../../api.js';
+import { promoteAssertion, describePromoteResult, describePromoteError, describeInsufficientPublisherFunds, publishSharedMemory, type PromoteOutcome, type PublishResult } from '../../../api.js';
 import { useMemoryEntities, canonicalEntityUri, isFirstClassEntity, type MemoryEntity, type Triple } from '../../../hooks/useMemoryEntities.js';
 import { decodeRdfStringLiteral } from '../../../../rdf-literal.js';
 import { useProjectProfileContext } from '../../../hooks/useProjectProfile.js';
@@ -171,11 +171,14 @@ export function VerifyOnDkgButton({
       }
       onVerified();
     } catch (err: any) {
-      // Issue #864 — `ASSERTION_NOT_PERSISTED` (HTTP 409) gets a
-      // typed message that points the user at the re-import path
-      // instead of the raw backend error string.
+      // Issue #864 — `ASSERTION_NOT_PERSISTED` (HTTP 409) gets a typed promote
+      // message pointing the user at the re-import path. Publish funds failures
+      // (NO_FUNDED_PUBLISHER_WALLET) are surfaced via the dedicated
+      // describeInsufficientPublisherFunds helper — describePromoteError stays
+      // promote-focused.
       const typed = action.kind === 'promote' ? describePromoteError(assertionName, err) : null;
-      setError(typed ? typed.message : (err?.message ?? 'Action failed'));
+      const fundsMsg = action.kind === 'promote' ? null : describeInsufficientPublisherFunds(err);
+      setError(typed?.message ?? fundsMsg ?? (err?.message ?? 'Action failed'));
     } finally {
       setBusy(false);
     }

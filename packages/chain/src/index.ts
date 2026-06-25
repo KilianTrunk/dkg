@@ -10,6 +10,10 @@ export {
   effectivePublishAllowance,
   computeApprovalAction,
   V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE,
+  InsufficientPublisherFundsError,
+  isNoFundedPublisherWalletError,
+  NO_FUNDED_PUBLISHER_WALLET_CODE,
+  type PublisherWalletBalance,
 } from './evm-adapter.js';
 export { NoChainAdapter } from './no-chain-adapter.js';
 export {

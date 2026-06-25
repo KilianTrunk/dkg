@@ -1413,7 +1413,84 @@ export function describePromoteError(
       };
     }
   }
+  // NOTE: publish-only `NO_FUNDED_PUBLISHER_WALLET` failures are intentionally
+  // NOT classified here — this helper stays promote-focused. Publish paths call
+  // `describeInsufficientPublisherFunds` directly for the funds message.
   return null;
+}
+
+/**
+ * Extract the actionable "no operational wallet has funds" message from a
+ * publish error (code-first, message fallback), or null when `err` is not a
+ * funds error. Used by publish CTAs (separate from the promote-focused
+ * `describePromoteError`).
+ */
+export function describeInsufficientPublisherFunds(err: unknown): string | null {
+  // Mirrors the dkg-core funds contract (NO_FUNDED_PUBLISHER_WALLET code +
+  // NO_FUNDED_PUBLISHER_WALLET_MESSAGE_PREFIX). Kept as local literals because
+  // this browser module (Vite bundle) cannot import dkg-core's node module
+  // graph; a test in promote-outcome-helpers.test.ts pins them to the shared
+  // dkg-core values so they cannot drift silently. The structured `code` is the
+  // primary signal; the message marker is only a fallback for a code-stripped
+  // re-wrap.
+  const MARKER = /No operational wallet has enough funds/i;
+  if (err instanceof HttpError) {
+    const body = err.body as { code?: string; error?: string } | undefined;
+    if (body?.code === 'NO_FUNDED_PUBLISHER_WALLET') {
+      return body.error ?? err.message;
+    }
+    if (typeof body?.error === 'string' && MARKER.test(body.error)) return body.error;
+  }
+  const msg = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
+  return MARKER.test(msg) ? msg : null;
+}
+
+export interface BulkVmPublishOutcome {
+  published: number;
+  total: number;
+  lastErr: string | null;
+  fundsErr: string | null;
+}
+
+/**
+ * Publish each shared assertion as its own Knowledge Asset to Verifiable Memory,
+ * tracking partial success + the first funds failure (so the caller can surface
+ * "fund a wallet" even when some publishes succeeded). Shared by the publish-all
+ * flows in entities.tsx and layer-widgets.tsx so the loop and the funds messaging
+ * live in one place.
+ */
+export async function publishAssertionsToVm(
+  contextGraphId: string,
+  assertions: Array<{ name: string; subGraph?: string | null }>,
+  onProgress?: (name: string) => void,
+): Promise<BulkVmPublishOutcome> {
+  let published = 0;
+  let lastErr: string | null = null;
+  let fundsErr: string | null = null;
+  for (const a of assertions) {
+    onProgress?.(a.name);
+    try {
+      await knowledgeAssetPublish(contextGraphId, a.name, a.subGraph ? { subGraphName: a.subGraph } : {});
+      published += 1;
+    } catch (e) {
+      lastErr = (e as { message?: string })?.message ?? 'publish failed';
+      fundsErr = fundsErr ?? describeInsufficientPublisherFunds(e);
+    }
+  }
+  return { published, total: assertions.length, lastErr, fundsErr };
+}
+
+/**
+ * The partial-success result line for a bulk VM publish, with an explicit funds
+ * tail when any publish hit NO_FUNDED_PUBLISHER_WALLET. Returns null when nothing
+ * was published (the caller should throw `outcome.fundsErr ?? outcome.lastErr`).
+ */
+export function describeBulkVmPublishResult(outcome: BulkVmPublishOutcome): string | null {
+  if (outcome.published <= 0) return null;
+  const tail = outcome.fundsErr
+    ? ' — some failed: no operational wallet has enough funds (native gas + TRAC). Fund a wallet and retry.'
+    : (outcome.lastErr ? ' (some could not be published)' : '');
+  return `Published ${outcome.published} knowledge asset${outcome.published !== 1 ? 's' : ''} to Verifiable Memory${tail}`;
 }
 
 // --- File preview ---

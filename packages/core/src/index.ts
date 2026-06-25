@@ -222,6 +222,9 @@ export {
   SwmGossipPayloadTooLargeError,
   toErrorMessage,
   hasErrorCode,
+  NO_FUNDED_PUBLISHER_WALLET_CODE,
+  NO_FUNDED_PUBLISHER_WALLET_MESSAGE_PREFIX,
+  messageIndicatesNoFundedPublisherWallet,
 } from './errors.js';
 export {
   dkgHomeDir,

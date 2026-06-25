@@ -63,6 +63,8 @@ import {
   decodePromoteJobId,
   asyncPromoteUnavailable,
   buildAutoRegisterFailureBody,
+  isNoFundedPublisherWalletLike,
+  noFundedPublisherWalletBody,
 } from "./shared-assertion-helpers.js";
 import { PromoteJobConflictError } from "@origintrail-official/dkg-publisher";
 import { deriveStatus } from "@origintrail-official/dkg-publisher";
@@ -1306,11 +1308,11 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         }
         // Funded-wallet selection found no operational wallet holding the
         // gas + TRAC a publish needs. This is a user-actionable funding
-        // condition (4xx), not a server/on-chain bug — surface the structured
-        // code (code-first; message carries the per-wallet balances either way)
-        // so node-ui can render a friendly "fund a wallet and retry" message.
-        if (e?.code === "NO_FUNDED_PUBLISHER_WALLET" || /No operational wallet has enough funds/i.test(msg)) {
-          return jsonResponse(res, 400, { code: "NO_FUNDED_PUBLISHER_WALLET", error: msg });
+        // condition (4xx), not a server/on-chain bug. Classification + body are
+        // shared with the top-level daemon handler (lifecycle.ts) so the two
+        // publish routes cannot drift on the code/marker contract.
+        if (isNoFundedPublisherWalletLike(e)) {
+          return jsonResponse(res, 400, noFundedPublisherWalletBody(msg));
         }
         return jsonResponse(res, 500, { error: msg });
       }

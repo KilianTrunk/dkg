@@ -375,6 +375,7 @@ import {
 import { handleRequest } from './handle-request.js';
 import { loadRoutePlugins, countConfiguredPluginSpecs } from './plugin-loader.js';
 import type { MemoryGraphChangedEvent, MemoryGraphLayer } from './routes/context.js';
+import { isNoFundedPublisherWalletLike, noFundedPublisherWalletBody } from './routes/shared-assertion-helpers.js';
 import {
   createPromoteWorkerSupervisor,
   type PromoteWorkerConfig,
@@ -3036,18 +3037,14 @@ export async function runDaemonInner(
           err.message.includes("reserved namespace"))
       ) {
         jsonResponse(res, 400, { error: err.message });
-      } else if (
-        // Funded-wallet selection found no operational wallet holding the
-        // gas + TRAC a publish needs — a user-actionable funding condition
-        // (4xx), not a server bug. Routes that rethrow for the top-level
-        // handler (e.g. /api/shared-memory/publish) get the structured code +
-        // 400 here without each having to match the error shape (code-first,
-        // message-marker fallback for re-wrapped errors that lost the code).
-        err?.code === "NO_FUNDED_PUBLISHER_WALLET" ||
-        (typeof err?.message === "string" &&
-          /No operational wallet has enough funds/i.test(err.message))
-      ) {
-        jsonResponse(res, 400, { code: "NO_FUNDED_PUBLISHER_WALLET", error: err.message });
+      } else if (isNoFundedPublisherWalletLike(err)) {
+        // Funded-wallet selection found no operational wallet holding the gas +
+        // TRAC a publish needs — a user-actionable funding condition (4xx), not
+        // a server bug. Routes that rethrow for this top-level handler (e.g.
+        // /api/shared-memory/publish) get the structured code + 400 here.
+        // Classification + body are shared with the /vm/publish route catch
+        // (knowledge-assets.ts) so the two cannot drift.
+        jsonResponse(res, 400, noFundedPublisherWalletBody(err.message));
       } else {
         enrichEvmError(err);
         jsonResponse(res, 500, { error: err.message });

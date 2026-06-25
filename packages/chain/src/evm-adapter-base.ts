@@ -1405,19 +1405,13 @@ export class EVMChainAdapterBase {
         // (not an "insufficient funds" string). Only reclassify when the error
         // is a CHAIN REVERT (filtered by looksLikeFundsRevert — excludes
         // nonce / RPC / dropped-receipt / WAL-hook control-flow errors) AND the
-        // signing wallet cannot fund the publish: native gas is zero, OR own
-        // TRAC is zero / below the publish cost `requiredTracWei` AND the wallet
-        // is not a covering PCA agent (which pays from its conviction account).
-        // This avoids masking an unrelated revert on a wallet that can actually
-        // fund the publish.
+        // signing wallet cannot fund the publish. Reuse the SINGLE fundability
+        // predicate `isWalletPublishFundable` (native gas + own-TRAC vs the
+        // publish cost + the covering-PCA exception) so selection and error
+        // enrichment can never drift on the funding rules — a fresh balance read
+        // that is not fundable for this cost is the funds problem.
         const f = await this.getWalletFunding(signer.address, { forceRefresh: true });
-        const nativeShort = f.native === 0n;
-        let tracShort = f.trac !== null
-          && (f.trac === 0n || (requiredTracWei > 0n && f.trac < requiredTracWei));
-        if (tracShort && await this.isConvictionFundedAgent(signer.address, requiredTracWei)) {
-          tracShort = false; // PCA covers the cost; this is not a funds problem
-        }
-        fundsProblem = nativeShort || tracShort;
+        fundsProblem = !(await this.isWalletPublishFundable(signer.address, f, requiredTracWei));
       }
       if (fundsProblem) {
         const balances = await this.snapshotPublisherWalletBalances();

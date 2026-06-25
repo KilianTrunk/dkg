@@ -180,7 +180,7 @@ describe('#1116 share/seal route error mapping (fake agent)', () => {
     expect(finalizeCalls[0]?.contextGraphId).toBe(CG_ID);
   });
 
-  it('wm/finalize: uses the token-canonical storage lane when body author differs only by case', async () => {
+  it('wm/finalize: uses the token-canonical storage lane and author when body author differs only by case', async () => {
     const token = 'agent-token-finalize-case';
     const tokenAgentAddress = `0x${'cd'.repeat(20)}`;
     const mixedCaseAuthor = `0x${'CD'.repeat(20)}`;
@@ -215,7 +215,7 @@ describe('#1116 share/seal route error mapping (fake agent)', () => {
     expect(res.status).toBe(200);
     expect(finalizeCalls).toHaveLength(1);
     expect(finalizeCalls[0]?.opts?.agentAddress).toBe(tokenAgentAddress);
-    expect(finalizeCalls[0]?.opts?.authorAgentAddress).toBe(mixedCaseAuthor);
+    expect(finalizeCalls[0]?.opts?.authorAgentAddress).toBe(tokenAgentAddress);
   });
 
   it('wm/finalize: node/admin author signer does not change the storage lane', async () => {

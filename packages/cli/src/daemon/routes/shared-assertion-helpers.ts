@@ -25,6 +25,7 @@ import { daemonState } from '../state.js';
 import {
   jsonResponse,
   oversizedRdfLiteralResponseBody,
+  isNoFundedPublisherWalletLike,
   safeDecodeURIComponent,
   normalizeContextGraphIdOrUri,
   isValidContextGraphId,
@@ -55,7 +56,12 @@ export function buildAutoRegisterFailureBody(
 ): { code?: string; error: string } {
   const e = regErr as { message?: unknown; code?: unknown } | null | undefined;
   const regMsg = (typeof e?.message === 'string' ? e.message : undefined) ?? String(regErr);
-  const fundsHint = /insufficient funds|NO_FUNDED_PUBLISHER_WALLET/i.test(regMsg)
+  // The hint fires for any funding-related registration failure: a no-funded
+  // wallet error by CODE or the shared message marker (the structured
+  // "No operational wallet has enough funds…" message contains neither
+  // "insufficient funds" nor the literal code, so match the shared predicate —
+  // not just the message text), or a raw native-gas "insufficient funds" revert.
+  const fundsHint = (isNoFundedPublisherWalletLike(e) || /insufficient funds|NO_FUNDED_PUBLISHER_WALLET/i.test(regMsg))
     ? ' On-chain registration is signed by the PRIMARY operational wallet — fund it (native gas + TRAC) and retry.'
     : '';
   return {

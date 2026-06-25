@@ -2467,10 +2467,12 @@ describe('createKnowledgeAssets / updateKnowledgeCollectionV10 — approval sign
     allowanceByOwner: Map<string, bigint>,
     funding?: { native?: Map<string, bigint>; trac?: Map<string, bigint> },
     extraOperationalKeys: string[] = [],
+    configOverrides: Partial<EVMAdapterConfig> = {},
   ) {
     const a = new EVMChainAdapter(minimalConfig({
       privateKey: DEPLOYER_PK,
       additionalKeys: [OTHER_PK, ...extraOperationalKeys],
+      ...configOverrides,
     }));
     const signerPool = (a as any).signerPool as ethers.Wallet[];
     const [walletA, walletB] = signerPool;
@@ -3007,6 +3009,32 @@ describe('createKnowledgeAssets — funding-aware wallet selection', () => {
     tracByAddr.set(lc(walletA.address), ONE); tracByAddr.set(lc(walletB.address), ONE);
     const chosen = await (a as any).nextAuthorizedSigner(CG);
     expect(chosen.address).toBe(walletB.address); // A at exactly the native floor is NOT fundable
+  });
+
+  // The two tests above mutate the instance field AFTER construction, so they
+  // would pass even if the constructor stopped reading the config. These pin the
+  // CONSTRUCTOR path: the floor is injected via the adapter config and must be
+  // both stored on the instance and honored by selection.
+  it('reads minPublisherTracWei from the CONSTRUCTOR config (not a post-construction mutation)', async () => {
+    const FLOOR = 100n;
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } =
+      makeMultiWalletV10Adapter(makeAllowanceByOwner(), undefined, [], { minPublisherTracWei: FLOOR });
+    expect((a as any).minPublisherTracWei).toBe(FLOOR); // constructor consumed config.minPublisherTracWei
+    nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);
+    tracByAddr.set(lc(walletA.address), FLOOR); tracByAddr.set(lc(walletB.address), FLOOR + 1n);
+    const chosen = await (a as any).nextAuthorizedSigner(CG);
+    expect(chosen.address).toBe(walletB.address); // A at exactly the floor is skipped (strict >)
+  });
+
+  it('reads minPublisherNativeWei from the CONSTRUCTOR config (not a post-construction mutation)', async () => {
+    const FLOOR = 100n;
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } =
+      makeMultiWalletV10Adapter(makeAllowanceByOwner(), undefined, [], { minPublisherNativeWei: FLOOR });
+    expect((a as any).minPublisherNativeWei).toBe(FLOOR); // constructor consumed config.minPublisherNativeWei
+    nativeByAddr.set(lc(walletA.address), FLOOR); nativeByAddr.set(lc(walletB.address), FLOOR + 1n);
+    tracByAddr.set(lc(walletA.address), ONE); tracByAddr.set(lc(walletB.address), ONE);
+    const chosen = await (a as any).nextAuthorizedSigner(CG);
+    expect(chosen.address).toBe(walletB.address);
   });
 
   it('cost-aware fallback selection: skips a dust-TRAC wallet that cannot cover the publish cost', async () => {

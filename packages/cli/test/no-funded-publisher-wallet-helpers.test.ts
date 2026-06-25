@@ -15,6 +15,7 @@ import {
   noFundedPublisherWalletBody,
   respondWithDaemonError,
 } from '../src/daemon/http-utils.js';
+import { buildAutoRegisterFailureBody } from '../src/daemon/routes/shared-assertion-helpers.js';
 
 const FUNDS_MESSAGE =
   'No operational wallet has enough funds to publish to Verifiable Memory — fund a wallet and retry.';
@@ -96,5 +97,37 @@ describe('respondWithDaemonError', () => {
     respondWithDaemonError(res, new Error(FUNDS_MESSAGE));
     expect(res.statusCode).toBe(200);
     expect(res.body).toBeUndefined();
+  });
+});
+
+describe('buildAutoRegisterFailureBody', () => {
+  const CG = 'skills-catalog';
+
+  it('propagates the code AND the PRIMARY-wallet funding hint for a NO_FUNDED-coded registration error', () => {
+    // The real InsufficientPublisherFundsError message ("No operational wallet
+    // has enough funds…") contains neither "insufficient funds" nor the literal
+    // code, so the hint must be driven by the code/marker, not just message text.
+    const err = Object.assign(
+      new Error('No operational wallet has enough funds to publish to Verifiable Memory — fund a wallet.'),
+      { code: 'NO_FUNDED_PUBLISHER_WALLET' },
+    );
+    const body = buildAutoRegisterFailureBody(CG, err);
+    expect(body.code).toBe('NO_FUNDED_PUBLISHER_WALLET');
+    expect(body.error).toContain('could not be auto-registered on-chain');
+    expect(body.error).toContain('PRIMARY operational wallet');
+    expect(body.error).toContain('fund it (native gas + TRAC)');
+  });
+
+  it('adds the funding hint for a raw native-gas "insufficient funds" error (no code key)', () => {
+    const body = buildAutoRegisterFailureBody(CG, new Error('insufficient funds for intrinsic transaction cost'));
+    expect('code' in body).toBe(false);
+    expect(body.error).toContain('PRIMARY operational wallet');
+  });
+
+  it('omits the code key and the hint for a generic registration error (trailing period preserved once)', () => {
+    const body = buildAutoRegisterFailureBody(CG, new Error('RPC timeout.'));
+    expect('code' in body).toBe(false);
+    expect(body.error).not.toContain('PRIMARY operational wallet');
+    expect(body.error.endsWith('RPC timeout.')).toBe(true);
   });
 });

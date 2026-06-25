@@ -322,6 +322,7 @@ import {
   refreshLocalAgentIntegrationFromUi,
 } from '../local-agents.js';
 
+import { authorizeAgentScopedAuthorClaim } from './shared-assertion-helpers.js';
 import type { RequestContext } from './context.js';
 import type { PublishOptions } from '@origintrail-official/dkg-publisher';
 
@@ -329,8 +330,8 @@ function parsePrecomputedUpdateAttestation(
   raw: unknown,
   res: ServerResponse,
 ): PublishOptions['precomputedUpdateAttestation'] | undefined {
-  if (raw == null) return undefined;
-  if (typeof raw !== 'object') {
+  if (raw === undefined) return undefined;
+  if (raw === null || typeof raw !== 'object') {
     jsonResponse(res, 400, {
       error: '"precomputedUpdateAttestation" must be an object',
     });
@@ -966,7 +967,16 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
       parsed.precomputedUpdateAttestation,
       res,
     );
-    if (parsed.precomputedUpdateAttestation != null && !precomputedUpdateAttestation) {
+    if (parsed.precomputedUpdateAttestation !== undefined && !precomputedUpdateAttestation) {
+      return;
+    }
+    const tokenAgentAddress = requestToken ? agent.resolveAgentByToken(requestToken) : undefined;
+    if (!authorizeAgentScopedAuthorClaim(
+      res,
+      tokenAgentAddress,
+      precomputedUpdateAttestation?.authorAddress,
+      "precomputedUpdateAttestation.authorAddress",
+    )) {
       return;
     }
     if (!kaId || !contextGraphId || !quads?.length) {

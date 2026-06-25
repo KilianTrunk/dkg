@@ -18,6 +18,9 @@ import {
   DEFAULT_PROMOTE_CONTROL_GRAPH_URI,
   PROMOTE_PAYLOAD,
   PROMOTE_STATE,
+  PROMOTE_UNIQUENESS_KEY,
+  jobSubject,
+  legacyUniquenessKey,
   literal,
   serializeJob,
   uniquenessKey,
@@ -65,6 +68,25 @@ describe('TripleStoreAsyncPromoteQueue', () => {
 
   function advance(ms: number): void {
     now += ms;
+  }
+
+  async function rewriteStoredUniquenessKey(jobId: string, key: string): Promise<void> {
+    await store.deleteByPattern({
+      subject: jobSubject(jobId),
+      predicate: PROMOTE_UNIQUENESS_KEY,
+      graph: DEFAULT_PROMOTE_CONTROL_GRAPH_URI,
+    });
+    await store.insert([{
+      subject: jobSubject(jobId),
+      predicate: PROMOTE_UNIQUENESS_KEY,
+      object: literal(key),
+      graph: DEFAULT_PROMOTE_CONTROL_GRAPH_URI,
+    }]);
+    await store.flush?.();
+  }
+
+  async function rewriteStoredJob(job: PromoteJob): Promise<void> {
+    await (createQueue() as unknown as { writeJob(job: PromoteJob): Promise<void> }).writeJob(job);
   }
 
   // ---------------------------------------------------------------------------
@@ -130,6 +152,45 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     // Same assertion in different CG → allowed.
     const third = await queue.enqueue(makeRequest({ contextGraphId: 'other-cg' }));
     expect(third).toBe('job-3');
+  });
+
+  it('3c. enqueue() treats agentAddress as part of the active assertion identity', async () => {
+    const queue = createQueue();
+    const agentA = `0x${'aa'.repeat(20)}`;
+    const agentAUpper = `0x${'AA'.repeat(20)}`;
+    const agentB = `0x${'bb'.repeat(20)}`;
+
+    const first = await queue.enqueue(makeRequest({ agentAddress: agentA }));
+
+    // Same cg/subgraph/name, different storage lane -> independent work.
+    const second = await queue.enqueue(makeRequest({ agentAddress: agentB }));
+    expect(second).toBe('job-2');
+
+    // Same lane with different address casing -> same active resource.
+    await expect(queue.enqueue(makeRequest({ agentAddress: agentAUpper }))).rejects.toMatchObject({
+      name: 'PromoteJobConflictError',
+      existingJobId: first,
+    });
+
+    // Default daemon lane is also independent from explicit agent lanes.
+    const third = await queue.enqueue(makeRequest());
+    expect(third).toBe('job-3');
+  });
+
+  it('3d. enqueue() treats legacy no-agent active jobs as conflicting with explicit upgraded lanes', async () => {
+    const queue = createQueue();
+    const legacyRequest = makeRequest();
+    const legacyJobId = await queue.enqueue(legacyRequest);
+    await rewriteStoredJob({
+      ...(await queue.getStatus(legacyJobId))!,
+      formatVersion: undefined,
+    });
+    await rewriteStoredUniquenessKey(legacyJobId, legacyUniquenessKey(legacyRequest));
+
+    await expect(queue.enqueue(makeRequest({ agentAddress: `0x${'aa'.repeat(20)}` }))).rejects.toMatchObject({
+      name: 'PromoteJobConflictError',
+      existingJobId: legacyJobId,
+    });
   });
 
   it('3b. enqueue() serialises concurrent uniqueness checks for the same assertion', async () => {
@@ -316,6 +377,69 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     const otherId = await queue.enqueue(makeRequest({ assertionName: 'other' }));
     const claimedOther = await queue.claimNext('worker-2');
     expect(claimedOther?.jobId).toBe(otherId);
+  });
+
+  it('13b. claimNext() can claim the same assertion concurrently in different agent lanes', async () => {
+    const queue = createQueue();
+    const agentA = `0x${'aa'.repeat(20)}`;
+    const agentB = `0x${'bb'.repeat(20)}`;
+    const jobA = await queue.enqueue(makeRequest({ agentAddress: agentA }));
+    const jobB = await queue.enqueue(makeRequest({ agentAddress: agentB }));
+
+    const claimedA = await queue.claimNext('worker-1');
+    expect(claimedA?.jobId).toBe(jobA);
+    expect(claimedA?.request.agentAddress).toBe(agentA);
+
+    await expect(queue.enqueue(makeRequest({ agentAddress: agentA }))).rejects.toBeInstanceOf(PromoteJobConflictError);
+
+    const claimedB = await queue.claimNext('worker-2');
+    expect(claimedB?.jobId).toBe(jobB);
+    expect(claimedB?.request.agentAddress).toBe(agentB);
+  });
+
+  it('13c. claimNext() does not claim an explicit lane while a legacy no-agent job is running', async () => {
+    const queue = createQueue();
+    const legacyRequest = makeRequest();
+    const legacyJobId = await queue.enqueue(legacyRequest);
+    await rewriteStoredUniquenessKey(legacyJobId, legacyUniquenessKey(legacyRequest));
+    const legacyClaim = await queue.claimNext('worker-1');
+    expect(legacyClaim?.jobId).toBe(legacyJobId);
+    await rewriteStoredJob({
+      ...legacyClaim!,
+      formatVersion: undefined,
+    });
+
+    await store.insert(
+      serializeJob(
+        {
+          jobId: 'explicit-after-upgrade',
+          request: makeRequest({ agentAddress: `0x${'aa'.repeat(20)}` }),
+          state: 'queued',
+          enqueuedAt: now + 1,
+          updatedAt: now + 1,
+          attempt: { count: 0, maxRetries: 5 },
+          formatVersion: ASYNC_PROMOTE_QUEUE_FORMAT_VERSION,
+        },
+        DEFAULT_PROMOTE_CONTROL_GRAPH_URI,
+      ),
+    );
+
+    expect(await queue.claimNext('worker-2')).toBeNull();
+  });
+
+  it('13d. claimNext() can claim a current default-lane job and explicit agent-lane job concurrently', async () => {
+    const queue = createQueue();
+    const agentA = `0x${'aa'.repeat(20)}`;
+    const defaultJob = await queue.enqueue(makeRequest());
+    const agentJob = await queue.enqueue(makeRequest({ agentAddress: agentA }));
+
+    const claimedDefault = await queue.claimNext('worker-default');
+    expect(claimedDefault?.jobId).toBe(defaultJob);
+    expect(claimedDefault?.request.agentAddress).toBeUndefined();
+
+    const claimedAgent = await queue.claimNext('worker-agent');
+    expect(claimedAgent?.jobId).toBe(agentJob);
+    expect(claimedAgent?.request.agentAddress).toBe(agentA);
   });
 
   it('14. heartbeat() extends the lease without changing state', async () => {
@@ -633,6 +757,30 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     expect(job?.reason).toBeUndefined();
   });
 
+  it('26a. recoverOnStartup() reclaims an expired agent lane without conflicting with an active peer lane', async () => {
+    const queue = createQueue({ leaseMs: 10_000 });
+    const agentA = `0x${'aa'.repeat(20)}`;
+    const agentB = `0x${'bb'.repeat(20)}`;
+    const jobA = await queue.enqueue(makeRequest({ agentAddress: agentA }));
+    const jobB = await queue.enqueue(makeRequest({ agentAddress: agentB }));
+
+    await queue.claimNext('worker-a');
+    advance(1);
+    const claimB = await queue.claimNext('worker-b');
+    expect(claimB?.jobId).toBe(jobB);
+
+    advance(9_000);
+    await queue.heartbeat(jobB, claimB!.lease!.claimToken);
+    advance(2_000);
+
+    const summary = await queue.recoverOnStartup();
+
+    expect(summary.reclaimed).toBe(1);
+    expect(summary.abandoned).toBe(0);
+    expect((await queue.getStatus(jobA))?.state).toBe('queued');
+    expect((await queue.getStatus(jobB))?.state).toBe('running');
+  });
+
   it('26b. recoverOnStartup() ABANDONS legacy running jobs without a formatVersion marker (Codex PR #665 id=3302135756)', async () => {
     // The pre-v2 format had no `commitMarker.promoteStarted` field, so a
     // running row with `swmInserted: false` could mean either "worker
@@ -672,7 +820,7 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     await expect(queue.recover(jobId)).rejects.toThrow(/Cannot recover job .*legacy promote job/i);
   });
 
-  it('26c. recoverOnStartup() RECLAIMS v2 running jobs with promoteStarted=false', async () => {
+  it('26c. recoverOnStartup() RECLAIMS current-format running jobs with promoteStarted=false', async () => {
     const queue = createQueue({ leaseMs: 10_000 });
     const jobId = await queue.enqueue(makeRequest());
     const claimed = await queue.claimNext('worker-1');
@@ -693,7 +841,76 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     expect(job?.commitMarker).toBeUndefined();
   });
 
-  it('26d. recoverOnStartup() ABANDONS legacy running jobs even when promoteStarted=false is explicitly present', async () => {
+  it('26d. recoverOnStartup() RECLAIMS v2 default-lane running jobs with promoteStarted=false', async () => {
+    const queue = createQueue({ leaseMs: 10_000 });
+    const jobId = await queue.enqueue(makeRequest());
+    const claimed = await queue.claimNext('worker-1');
+    await (queue as unknown as { writeJob(job: PromoteJob): Promise<void> }).writeJob({
+      ...claimed!,
+      request: {
+        contextGraphId: claimed!.request.contextGraphId,
+        subGraphName: claimed!.request.subGraphName,
+        assertionName: claimed!.request.assertionName,
+        entities: claimed!.request.entities,
+      },
+      formatVersion: 2,
+      commitMarker: {
+        promoteStarted: false,
+        swmInserted: false,
+        wmCleaned: false,
+        lifecycleStamped: false,
+        gossiped: false,
+      },
+    });
+
+    advance(60_000);
+    const summary = await queue.recoverOnStartup();
+
+    expect(summary.reclaimed).toBe(1);
+    expect(summary.abandoned).toBe(0);
+    const job = await queue.getStatus(jobId);
+    expect(job?.state).toBe('queued');
+    expect(job?.formatVersion).toBe(ASYNC_PROMOTE_QUEUE_FORMAT_VERSION);
+    expect(job?.request.agentAddress).toBeUndefined();
+    expect(job?.lease).toBeUndefined();
+    expect(job?.commitMarker).toBeUndefined();
+  });
+
+  it('26e. recoverOnStartup() ABANDONS v2 author-only running jobs with no storage lane', async () => {
+    const queue = createQueue({ leaseMs: 10_000 });
+    const jobId = await queue.enqueue(makeRequest({ authorAgentAddress: `0x${'aa'.repeat(20)}` }));
+    const claimed = await queue.claimNext('worker-1');
+    await (queue as unknown as { writeJob(job: PromoteJob): Promise<void> }).writeJob({
+      ...claimed!,
+      request: {
+        contextGraphId: claimed!.request.contextGraphId,
+        subGraphName: claimed!.request.subGraphName,
+        assertionName: claimed!.request.assertionName,
+        entities: claimed!.request.entities,
+        authorAgentAddress: claimed!.request.authorAgentAddress,
+      },
+      formatVersion: 2,
+      commitMarker: {
+        promoteStarted: false,
+        swmInserted: false,
+        wmCleaned: false,
+        lifecycleStamped: false,
+        gossiped: false,
+      },
+    });
+
+    advance(60_000);
+    const summary = await queue.recoverOnStartup();
+
+    expect(summary.reclaimed).toBe(0);
+    expect(summary.abandoned).toBe(1);
+    const job = await queue.getStatus(jobId);
+    expect(job?.state).toBe('failed');
+    expect(job?.reason).toMatch(/missing storage lane/i);
+    await expect(queue.recover(jobId)).rejects.toThrow(/Cannot recover job .*missing storage lane/i);
+  });
+
+  it('26f. recoverOnStartup() ABANDONS legacy running jobs even when promoteStarted=false is explicitly present', async () => {
     // Belt-and-braces: even if a hypothetical legacy daemon happens to
     // have written `promoteStarted: false` into the marker, the version
     // gate still parks the job for manual inspection. The whole point of

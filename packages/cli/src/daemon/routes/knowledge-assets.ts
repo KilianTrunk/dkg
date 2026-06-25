@@ -66,7 +66,10 @@ import {
 import {
   decodePromoteJobId,
   asyncPromoteUnavailable,
+  authorizeAgentScopedAuthorClaim,
   buildAutoRegisterFailureBody,
+  isSameAgentAddress,
+  scopedTokenPromoteLane,
 } from "./shared-assertion-helpers.js";
 import { PromoteJobConflictError } from "@origintrail-official/dkg-publisher";
 import { deriveStatus } from "@origintrail-official/dkg-publisher";
@@ -328,6 +331,12 @@ export function resolveFinalizeOptions(
     jsonResponse(res, 400, { error: '"schemeVersion" must be a positive integer when supplied' });
     return null;
   }
+  if (!authorizeAgentScopedAuthorClaim(res, tokenAgentAddress, authorAgentAddress, "authorAgentAddress")) {
+    return null;
+  }
+  if (!authorizeAgentScopedAuthorClaim(res, tokenAgentAddress, resolvedPreSignedAttestation?.address, "preSignedAuthorAttestation.address")) {
+    return null;
+  }
   // Token attribution — parity with /api/shared-memory/publish (memory.ts).
   // An agent-scoped bearer token attributes authorship to that agent when the
   // body specified neither an explicit `authorAgentAddress` nor a pre-signed
@@ -337,12 +346,15 @@ export function resolveFinalizeOptions(
   // Without this, the create + finalize routes ignored the token and a custodial
   // agent's publish was sealed under the node's own signer instead of the agent
   // (the on-chain author came out as the node's operational wallet).
-  const effectiveAuthorAgentAddress =
+  const explicitAuthorAgentAddress =
     typeof authorAgentAddress === "string"
       ? authorAgentAddress
-      : resolvedPreSignedAttestation == null
-        ? tokenAgentAddress
-        : undefined;
+      : undefined;
+  const effectiveAuthorAgentAddress =
+    (explicitAuthorAgentAddress && tokenAgentAddress && isSameAgentAddress(tokenAgentAddress, explicitAuthorAgentAddress)
+      ? tokenAgentAddress
+      : explicitAuthorAgentAddress) ??
+    (resolvedPreSignedAttestation == null ? tokenAgentAddress : undefined);
   return {
     ...(subGraphName ? { subGraphName } : {}),
     ...(typeof effectiveAuthorAgentAddress === "string" ? { authorAgentAddress: effectiveAuthorAgentAddress } : {}),
@@ -354,6 +366,64 @@ export function resolveFinalizeOptions(
 
 function hasFinalizeOnlyCreateFields(raw: Record<string, unknown>): boolean {
   return FINALIZE_ONLY_CREATE_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(raw, field));
+}
+
+function resolveAuthorAgentAddressFromFinalizeOptions(
+  finalizeOptions: Record<string, unknown>,
+  tokenAgentAddress?: string,
+): string | undefined {
+  const finalizedAuthor = finalizeOptions.authorAgentAddress;
+  if (typeof finalizedAuthor === "string") {
+    return tokenAgentAddress && isSameAgentAddress(tokenAgentAddress, finalizedAuthor)
+      ? tokenAgentAddress
+      : finalizedAuthor;
+  }
+  return tokenAgentAddress;
+}
+
+function scopedTokenStorageLane(agentAddress?: string): { agentAddress?: string } {
+  return agentAddress ? { agentAddress } : {};
+}
+
+async function resolveFinalizeStorageLane(
+  agent: RequestContext["agent"],
+  contextGraphId: string,
+  name: string,
+  finalizeOptions: Record<string, unknown>,
+  tokenAgentAddress?: string,
+): Promise<{ agentAddress?: string }> {
+  const tokenLane = scopedTokenStorageLane(tokenAgentAddress);
+  if (tokenLane.agentAddress) return tokenLane;
+
+  const explicitAuthorLane = resolveAuthorAgentAddressFromFinalizeOptions(finalizeOptions, undefined);
+  if (!explicitAuthorLane) return {};
+
+  const history = agent.assertion?.history;
+  if (typeof history !== "function") return {};
+
+  const subGraphName =
+    typeof finalizeOptions.subGraphName === "string"
+      ? finalizeOptions.subGraphName
+      : undefined;
+  const baseOptions = subGraphName ? { subGraphName } : {};
+
+  let defaultHistory: unknown;
+  try {
+    defaultHistory = await history.call(agent.assertion, contextGraphId, name, baseOptions);
+  } catch {
+    return {};
+  }
+  if (defaultHistory != null) return {};
+
+  try {
+    const authorHistory = await history.call(agent.assertion, contextGraphId, name, {
+      ...baseOptions,
+      agentAddress: explicitAuthorLane,
+    });
+    return authorHistory != null ? { agentAddress: explicitAuthorLane } : {};
+  } catch {
+    return {};
+  }
 }
 
 // uint32 epoch ceiling (matches sibling routes memory.ts / publisher.ts). Not an
@@ -813,7 +883,13 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       // finalize throws KaIdNamespaceMismatch. So stamp under the same resolved
       // author the finalize uses: the body author, else the token's agent (else
       // undefined → the daemon's default agent for node/admin tokens).
-      const createAuthorAgentAddress = resolvedAuthorAgentAddress ?? writePreflightCallerAgentAddress;
+      const createAuthorAgentAddress = resolveAuthorAgentAddressFromFinalizeOptions(
+        finalizeOptions,
+        writePreflightCallerAgentAddress,
+      );
+      const atomicAuthorLane = createAuthorAgentAddress
+        ? { agentAddress: createAuthorAgentAddress }
+        : {};
       const assertionUri = await agent.assertion.create(resolvedContextGraphId, name, {
         subGraphName,
         ...(createAuthorAgentAddress ? { agentAddress: createAuthorAgentAddress } : {}),
@@ -826,12 +902,15 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       // explicit finalize:false leaves an editable WM draft and never touches
       // the chain (OT-RFC-43 §10.5.5). `also*` are opt-in transitions on top.
       if (hasQuads) {
-        await agent.assertion.write(resolvedContextGraphId, name, quads, { subGraphName });
+        await agent.assertion.write(resolvedContextGraphId, name, quads, { subGraphName, ...atomicAuthorLane });
         result.written = quads.length;
         emitMemoryGraphChanged?.({ contextGraphId: resolvedContextGraphId, layers: ["wm"], subGraphName, operation: "assertion_written", source: "api", counts: { triples: quads.length } });
       }
       if (shouldFinalize) {
-        const seal = await agent.assertion.finalize(resolvedContextGraphId, name, finalizeOptions);
+        const seal = await agent.assertion.finalize(resolvedContextGraphId, name, {
+          ...finalizeOptions,
+          ...atomicAuthorLane,
+        });
         result.merkleRoot = hex(seal.merkleRoot);
         // Surface the sealed author so clients (and tests) can confirm custodial
         // attribution on the atomic create+finalize path, mirroring the dedicated
@@ -850,6 +929,7 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
           // covers the seal-on-share path too.
           const share = await agent.assertion.promote(resolvedContextGraphId, name, {
             subGraphName,
+            ...atomicAuthorLane,
             ...(resolvedAuthorAgentAddress ? { authorAgentAddress: resolvedAuthorAgentAddress } : {}),
           });
           result.swmShared = true;
@@ -871,7 +951,11 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       if (alsoPublishVm === true || (typeof alsoPublishVm === "object" && alsoPublishVm !== null)) {
         try {
           const opts = typeof alsoPublishVm === "object" && alsoPublishVm ? alsoPublishVm : {};
-          const pub: any = await agent.publishFromFinalizedAssertion(resolvedContextGraphId, name, { subGraphName, ...opts });
+          const pub: any = await agent.publishFromFinalizedAssertion(resolvedContextGraphId, name, {
+            subGraphName,
+            ...opts,
+            ...atomicAuthorLane,
+          });
           result.kaId = pub?.kaId;
           result.ual = pub?.ual;
           result.txHash = pub?.onChainResult?.txHash;
@@ -936,18 +1020,21 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
   }
 
   // Shared GET preflight: decode/validate the :identifier, require + normalize
-  // contextGraphId, validate subGraphName, extract optional agentAddress.
+  // contextGraphId, validate subGraphName, extract optional agentAddress. For
+  // agent-scoped bearer tokens, omitted agentAddress defaults to the token's
+  // storage lane so GETs see the same draft the write routes created.
   function readGetParams(): { cg: string; subGraphName?: string; agentAddress?: string } | null {
     if (decodeAndValidateName(name, res) === null) return null;
     const rawCg = url.searchParams.get("contextGraphId");
     if (!validateRequiredContextGraphId(rawCg, res)) return null;
     const subGraphName = url.searchParams.get("subGraphName") ?? undefined;
     if (!validateOptionalSubGraphName(subGraphName, res)) return null;
-    const agentAddress = url.searchParams.get("agentAddress") ?? undefined;
-    if (agentAddress !== undefined && !/^0x[0-9a-fA-F]{40}$/.test(agentAddress)) {
+    const explicitAgentAddress = url.searchParams.get("agentAddress") ?? undefined;
+    if (explicitAgentAddress !== undefined && !/^0x[0-9a-fA-F]{40}$/.test(explicitAgentAddress)) {
       jsonResponse(res, 400, { error: '"agentAddress" must be a 0x-prefixed 20-byte EVM address' });
       return null;
     }
+    const agentAddress = explicitAgentAddress ?? writePreflightCallerAgentAddress;
     return { cg: normalizeContextGraphIdOrUri(rawCg as string), subGraphName, agentAddress };
   }
 
@@ -978,7 +1065,10 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       if (typeof hist.name === "string") resolvedName = hist.name;
     }
     try {
-      const quads = await agent.assertion.query(p.cg, resolvedName, p.subGraphName ? { subGraphName: p.subGraphName } : undefined);
+      const quads = await agent.assertion.query(p.cg, resolvedName, {
+        ...(p.subGraphName ? { subGraphName: p.subGraphName } : {}),
+        ...(p.agentAddress ? { agentAddress: p.agentAddress } : {}),
+      });
       const sorted = [...quads].sort((l, r) => JSON.stringify(l).localeCompare(JSON.stringify(r)));
       return jsonResponse(res, 200, { quads: sorted, count: sorted.length });
     } catch (e: any) {
@@ -1073,25 +1163,38 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         // corrupt an in-progress draft and — if the following write() throws —
         // leave that wipe behind. So gate it on an active-draft existence check:
         // brand-new or discarded names get created; existing drafts stay append-only.
-        const existing = await agent.assertion.history(contextGraphId, name, { subGraphName });
+        const writeAuthorLane = writePreflightCallerAgentAddress
+          ? { agentAddress: writePreflightCallerAgentAddress }
+          : {};
+        const existing = await agent.assertion.history(contextGraphId, name, { subGraphName, ...writeAuthorLane });
         if (!existing || existing.state === "discarded") {
           // Stamp the kaId under the request token's agent (OT-RFC-43 §F2) so a
           // later finalize as that agent doesn't hit KaIdNamespaceMismatch.
           await agent.assertion.create(contextGraphId, name, {
             subGraphName,
-            ...(writePreflightCallerAgentAddress ? { agentAddress: writePreflightCallerAgentAddress } : {}),
+            ...writeAuthorLane,
           });
         }
-        await agent.assertion.write(contextGraphId, name, parsed.quads, { subGraphName });
+        await agent.assertion.write(contextGraphId, name, parsed.quads, { subGraphName, ...writeAuthorLane });
         emitMemoryGraphChanged?.({ contextGraphId, layers: ["wm"], subGraphName, operation: "assertion_written", source: "api", counts: { triples: parsed.quads.length } });
         return jsonResponse(res, 200, { written: parsed.quads.length });
       }
       if (verb === "finalize") {
         const finalizeOptions = resolveFinalizeOptions(parsed, res, writePreflightCallerAgentAddress);
         if (finalizeOptions === null) return;
+        const finalizeStorageLane = await resolveFinalizeStorageLane(
+          agent,
+          contextGraphId,
+          name,
+          finalizeOptions,
+          writePreflightCallerAgentAddress,
+        );
         let seal;
         try {
-          seal = await agent.assertion.finalize(contextGraphId, name, finalizeOptions);
+          seal = await agent.assertion.finalize(contextGraphId, name, {
+            ...finalizeOptions,
+            ...finalizeStorageLane,
+          });
         } catch (e: any) {
           // #1116 (review A1): a finalize(layer:"swm") on an asset that was only
           // SUBSET-shared is rejected — subset shares are SWM-only, not
@@ -1118,7 +1221,10 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         });
       }
       if (verb === "discard") {
-        await agent.assertion.discard(contextGraphId, name, { subGraphName });
+        await agent.assertion.discard(contextGraphId, name, {
+          subGraphName,
+          ...(writePreflightCallerAgentAddress ? { agentAddress: writePreflightCallerAgentAddress } : {}),
+        });
         // Parity with legacy discard: evict any cached extraction-status record
         // for this assertion so a re-import doesn't see a stale "completed".
         ctx.extractionStatus.delete(contextGraphAssertionUri(contextGraphId, requestAgentAddress, name, subGraphName));
@@ -1134,7 +1240,11 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         }
         const onConflict = parsed.onConflict === "replace" ? "replace" : "reject";
         try {
-          const result = await agent.assertion.pullFrom(contextGraphId, name, sourceLayer, { subGraphName, onConflict });
+          const result = await agent.assertion.pullFrom(contextGraphId, name, sourceLayer, {
+            subGraphName,
+            onConflict,
+            ...(writePreflightCallerAgentAddress ? { agentAddress: writePreflightCallerAgentAddress } : {}),
+          });
           return jsonResponse(res, 200, { wmDraft: "open", seededFrom: { layer: sourceLayer }, ...result });
         } catch (e: any) {
           if (e?.code === "WM_DRAFT_CONFLICT") {
@@ -1171,7 +1281,13 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         skipSeal = parsed.skipSeal;
       }
       try {
-        const share = await agent.assertion.promote(contextGraphId, name, { entities: parsed.entities, subGraphName, awaitCuratorAck, skipSeal });
+        const share = await agent.assertion.promote(contextGraphId, name, {
+          entities: parsed.entities,
+          subGraphName,
+          awaitCuratorAck,
+          skipSeal,
+          ...scopedTokenPromoteLane(writePreflightCallerAgentAddress),
+        });
         if (share.promotedCount !== 0) {
           emitMemoryGraphChanged?.({ contextGraphId, layers: ["wm", "swm"], subGraphName, operation: "assertion_promoted", source: "api", counts: { triples: share.promotedCount } });
           recordActivityAndNotify(ctx, { contextGraphId, kind: "promoted", actorAgentAddress: requestAgentAddress, subGraphName, tripleCount: share.promotedCount });
@@ -1223,6 +1339,7 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         const result = await agent.assertion.promoteAsync(contextGraphId, name, {
           entities: entities ?? "all",
           subGraphName,
+          ...scopedTokenPromoteLane(writePreflightCallerAgentAddress),
         });
         return jsonResponse(res, 200, { jobId: result.jobId, state: "queued" });
       } catch (err: any) {
@@ -1269,8 +1386,9 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         // transparently register and retry (idempotent). All other errors
         // propagate to the precondition/500 mapping below unchanged.
         let pub: any;
+        const publishStorageLane = scopedTokenStorageLane(writePreflightCallerAgentAddress);
         try {
-          pub = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts });
+          pub = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts, ...publishStorageLane });
         } catch (firstErr: any) {
           // #1116 (review B): code-first, message fallback. The publisher now
           // stamps `code: 'CG_NOT_REGISTERED'` on this throw; match on it and
@@ -1289,7 +1407,7 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
             }
             return jsonResponse(res, 400, buildAutoRegisterFailureBody(contextGraphId, regErr));
           }
-          pub = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts });
+          pub = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts, ...publishStorageLane });
         }
         const { httpStatus, reason } = classifyVmPublish(pub);
         if (httpStatus === 200) {

@@ -44,10 +44,10 @@ export const PROMOTE_LEASE_EXPIRES_AT = 'urn:dkg:promote-queue:leaseExpiresAt';
 export const PROMOTE_CLAIM_TOKEN = 'urn:dkg:promote-queue:claimToken';
 /**
  * Stable string that pins the per-assertion uniqueness key. Stored as a
- * literal so the queue can `FILTER ?key = "..."` cheaply. Format:
- * `<contextGraphId>\x1f<subGraphName>\x1f<assertionName>` (subGraphName
- * is `""` when absent). The separator is RFC 9457 unit separator —
- * unlikely to appear in any of the three components.
+ * literal so the queue can `FILTER ?key = "..."` cheaply. Current format:
+ * `<contextGraphId>\x1f<subGraphName>\x1f<assertionName>\x1f<agentLane>`
+ * (subGraphName and agentLane are `""` when absent). The separator is
+ * RFC 9457 unit separator — unlikely to appear in any component.
  */
 export const PROMOTE_UNIQUENESS_KEY = 'urn:dkg:promote-queue:uniquenessKey';
 
@@ -62,11 +62,38 @@ export function jobSubject(jobId: string): string {
   return `urn:dkg:promote-queue:job:${jobId}`;
 }
 
-export function uniquenessKey(request: Pick<PromoteRequest, 'contextGraphId' | 'subGraphName' | 'assertionName'>): string {
+type PromoteUniquenessInput = Pick<PromoteRequest, 'contextGraphId' | 'subGraphName' | 'assertionName' | 'agentAddress'>;
+
+function normalizedAgentLane(agentAddress?: string): string {
+  return agentAddress?.trim().toLowerCase() ?? '';
+}
+
+export function legacyUniquenessKey(request: PromoteUniquenessInput): string {
   // Unit Separator U+001F — control char that's not legal in any of the
-  // three identifier components. Keeps the key a single literal for
+  // identifier components. Keeps the key a single literal for
   // simple SPARQL equality filtering.
   return `${request.contextGraphId}\u001f${request.subGraphName ?? ''}\u001f${request.assertionName}`;
+}
+
+export function uniquenessKey(request: PromoteUniquenessInput): string {
+  return `${legacyUniquenessKey(request)}\u001f${normalizedAgentLane(request.agentAddress)}`;
+}
+
+export function uniquenessLookupKeys(request: PromoteUniquenessInput): string[] {
+  return Array.from(new Set([uniquenessKey(request), legacyUniquenessKey(request)]));
+}
+
+export function requestsShareUniquenessKey(
+  a: PromoteUniquenessInput,
+  b: PromoteUniquenessInput,
+  opts: { missingAgentAddressMatchesAnyLane?: boolean } = {},
+): boolean {
+  if (legacyUniquenessKey(a) !== legacyUniquenessKey(b)) return false;
+  const aLane = normalizedAgentLane(a.agentAddress);
+  const bLane = normalizedAgentLane(b.agentAddress);
+  return opts.missingAgentAddressMatchesAnyLane
+    ? aLane === '' || bLane === '' || aLane === bLane
+    : aLane === bLane;
 }
 
 export function quad(subject: string, predicate: string, object: string, graph: string): Quad {
@@ -155,6 +182,8 @@ function isPromoteRequest(value: unknown): value is PromoteRequest {
   if (typeof value['contextGraphId'] !== 'string' || value['contextGraphId'].length === 0) return false;
   if (typeof value['assertionName'] !== 'string' || value['assertionName'].length === 0) return false;
   if (value['subGraphName'] !== undefined && typeof value['subGraphName'] !== 'string') return false;
+  if (value['agentAddress'] !== undefined && typeof value['agentAddress'] !== 'string') return false;
+  if (value['authorAgentAddress'] !== undefined && typeof value['authorAgentAddress'] !== 'string') return false;
   const entities = value['entities'];
   if (entities === 'all') return true;
   return Array.isArray(entities) && entities.every((e) => typeof e === 'string' && e.length > 0);

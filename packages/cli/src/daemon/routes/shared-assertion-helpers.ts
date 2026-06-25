@@ -138,6 +138,12 @@ export function decodePromoteJobId(encoded: string, res: ServerResponse): string
   return jobId;
 }
 
+export function scopedTokenPromoteLane(agentAddress?: string): { agentAddress?: string; authorAgentAddress?: string } {
+  return agentAddress
+    ? { agentAddress, authorAgentAddress: agentAddress }
+    : {};
+}
+
 // ── Async-promote wire schema (RFC §3.2 + §3.3) ──────────────────────────────
 //
 // The internal `PromoteJob` shape persisted by the queue carries
@@ -483,6 +489,22 @@ export function comparableAgentAddress(value: string): string {
 
 export function isSameAgentAddress(left: string, right: string): boolean {
   return left === right || comparableAgentAddress(left) === comparableAgentAddress(right);
+}
+
+export function authorizeAgentScopedAuthorClaim(
+  res: ServerResponse,
+  tokenAgentAddress: string | undefined,
+  claimedAuthorAddress: string | undefined,
+  claimField: string,
+): boolean {
+  if (!tokenAgentAddress || !claimedAuthorAddress) return true;
+  if (isSameAgentAddress(tokenAgentAddress, claimedAuthorAddress)) return true;
+  jsonResponse(res, 403, {
+    error:
+      `Author mismatch: authenticated as ${tokenAgentAddress} but request body claims ${claimedAuthorAddress}. ` +
+      `The author is resolved from the agent-scoped bearer token; omit ${claimField} or use the matching agent's token.`,
+  });
+  return false;
 }
 
 export function assertImportedArtifactOwnerAddress(

@@ -337,6 +337,7 @@ import {
 } from '../local-agents.js';
 
 import type { RequestContext } from './context.js';
+import { authorizeAgentScopedAuthorClaim, isSameAgentAddress } from './shared-assertion-helpers.js';
 
 /**
  * Validate a `preSignedAuthorAttestation` payload from a finalize request.
@@ -1837,6 +1838,7 @@ WHERE {
     const tokenAgentAddress = requestToken
       ? agent.resolveAgentByToken(requestToken)
       : undefined;
+    const hasAssertionName = typeof bodyAssertionName === 'string' && bodyAssertionName.length > 0;
     if (
       bodyAuthorAgentAddress != null &&
       bodyPreSignedAttestation != null
@@ -1851,6 +1853,17 @@ WHERE {
       const validated = validatePreSignedAuthorAttestation(bodyPreSignedAttestation, res);
       if (validated === undefined) return;
       resolvedPreSignedAttestation = validated;
+      if (
+        !hasAssertionName &&
+        !authorizeAgentScopedAuthorClaim(
+          res,
+          tokenAgentAddress,
+          resolvedPreSignedAttestation.address,
+          'preSignedAuthorAttestation.address',
+        )
+      ) {
+        return;
+      }
     }
     let resolvedAuthorAgentAddress: string | undefined;
     if (resolvedPreSignedAttestation == null) {
@@ -1861,7 +1874,16 @@ WHERE {
             error: '"authorAgentAddress" must be a 0x-prefixed 20-byte EVM address',
           });
         }
-        resolvedAuthorAgentAddress = bodyAuthorAgentAddress;
+        if (
+          !hasAssertionName &&
+          !authorizeAgentScopedAuthorClaim(res, tokenAgentAddress, bodyAuthorAgentAddress, 'authorAgentAddress')
+        ) {
+          return;
+        }
+        resolvedAuthorAgentAddress =
+          tokenAgentAddress && isSameAgentAddress(tokenAgentAddress, bodyAuthorAgentAddress)
+            ? tokenAgentAddress
+            : bodyAuthorAgentAddress;
       } else if (tokenAgentAddress != null) {
         resolvedAuthorAgentAddress = tokenAgentAddress;
       }
@@ -1878,7 +1900,7 @@ WHERE {
     // are illegal in this fork because the seal already encodes the
     // author. `selection` is forced to `'all'` because the seal is keyed
     // by the assertion's exact merkleRoot.
-    if (typeof bodyAssertionName === 'string' && bodyAssertionName.length > 0) {
+    if (hasAssertionName) {
       const nameVal = validateAssertionName(bodyAssertionName);
       if (!nameVal.valid) {
         return jsonResponse(res, 400, {
@@ -1916,6 +1938,7 @@ WHERE {
           () =>
             agent.publishFromFinalizedAssertion(resolvedContextGraphId, bodyAssertionName, {
               ...(subGraphName ? { subGraphName } : {}),
+              ...(tokenAgentAddress ? { agentAddress: tokenAgentAddress } : {}),
               operationCtx: ctx2,
               ...(resolvedPublisherIdentityOverride !== undefined
                 ? { publisherNodeIdentityIdOverride: resolvedPublisherIdentityOverride }

@@ -1908,7 +1908,10 @@ export class DKGAgent extends DKGAgentBase {
         opts?: { subGraphName?: string; agentAddress?: string; onConflict?: 'reject' | 'replace' },
       ): Promise<{ seeded: number; fromLayer: 'swm' | 'vm'; entities: number }> {
         const pullAgentAddress = opts?.agentAddress ?? agentAddress;
-        return agent.publisher.assertionPullFrom(contextGraphId, name, pullAgentAddress, sourceLayer, opts);
+        return agent.publisher.assertionPullFrom(contextGraphId, name, pullAgentAddress, sourceLayer, {
+          ...(opts?.subGraphName !== undefined ? { subGraphName: opts.subGraphName } : {}),
+          ...(opts?.onConflict !== undefined ? { onConflict: opts.onConflict } : {}),
+        });
       },
       async promote(contextGraphId: string, name: string, opts?: { entities?: string[] | 'all'; subGraphName?: string; agentAddress?: string; authorAgentAddress?: string; preSignedAuthorAttestation?: PreSignedAuthorAttestation; awaitCuratorAck?: boolean; curatorAckTimeoutMs?: number; skipSeal?: boolean }): Promise<{ promotedCount: number; sealed: boolean; publishReady: boolean }> {
         const promoteAgentAddress = opts?.agentAddress ?? agentAddress;

@@ -218,6 +218,36 @@ describe('#1116 share/seal route error mapping (fake agent)', () => {
     expect(finalizeCalls[0]?.opts?.authorAgentAddress).toBe(tokenAgentAddress);
   });
 
+  it('wm/finalize: node/admin author signer does not change the storage lane', async () => {
+    const authorAgentAddress = `0x${'ab'.repeat(20)}`;
+    const finalizeCalls: Array<{ contextGraphId: unknown; name: unknown; opts: any }> = [];
+
+    await startWith({
+      finalize: async (contextGraphId: unknown, name: unknown, opts: any) => {
+        finalizeCalls.push({ contextGraphId, name, opts });
+        return {
+          assertionUri: 'did:dkg:assertion:admin-author-finalize',
+          merkleRoot: new Uint8Array(32),
+          authorAddress: authorAgentAddress,
+          schemeVersion: 1,
+          chainId: 1n,
+          kav10Address: `0x${'ef'.repeat(20)}`,
+          eip712Digest: `0x${'12'.repeat(32)}`,
+        };
+      },
+    });
+
+    const res = await post('wm/finalize', {
+      contextGraphId: CG_ID,
+      authorAgentAddress,
+    });
+
+    expect(res.status).toBe(200);
+    expect(finalizeCalls).toHaveLength(1);
+    expect(finalizeCalls[0]?.opts?.agentAddress).toBeUndefined();
+    expect(finalizeCalls[0]?.opts?.authorAgentAddress).toBe(authorAgentAddress);
+  });
+
   it('wm/finalize: node/admin pre-signed author does not change the storage lane', async () => {
     const preSignedAuthor = `0x${'ab'.repeat(20)}`;
     const finalizeCalls: Array<{ contextGraphId: unknown; name: unknown; opts: any }> = [];

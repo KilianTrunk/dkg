@@ -60,6 +60,7 @@ import {
   asyncPromoteUnavailable,
   authorizeAgentScopedAuthorClaim,
   isSameAgentAddress,
+  scopedTokenPromoteLane,
 } from "./shared-assertion-helpers.js";
 import { PromoteJobConflictError } from "@origintrail-official/dkg-publisher";
 import { deriveStatus } from "@origintrail-official/dkg-publisher";
@@ -355,12 +356,6 @@ function resolveAuthorAgentAddressFromFinalizeOptions(
 
 function scopedTokenStorageLane(agentAddress?: string): { agentAddress?: string } {
   return agentAddress ? { agentAddress } : {};
-}
-
-function scopedTokenPromoteLane(agentAddress?: string): { agentAddress?: string; authorAgentAddress?: string } {
-  return agentAddress
-    ? { agentAddress, authorAgentAddress: agentAddress }
-    : {};
 }
 
 // uint32 epoch ceiling (matches sibling routes memory.ts / publisher.ts). Not an
@@ -1091,15 +1086,12 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       if (verb === "finalize") {
         const finalizeOptions = resolveFinalizeOptions(parsed, res, writePreflightCallerAgentAddress);
         if (finalizeOptions === null) return;
-        const finalizeAuthorAgentAddress = resolveAuthorAgentAddressFromFinalizeOptions(
-          finalizeOptions,
-          writePreflightCallerAgentAddress,
-        );
+        const finalizeStorageLane = scopedTokenStorageLane(writePreflightCallerAgentAddress);
         let seal;
         try {
           seal = await agent.assertion.finalize(contextGraphId, name, {
             ...finalizeOptions,
-            ...(finalizeAuthorAgentAddress ? { agentAddress: finalizeAuthorAgentAddress } : {}),
+            ...finalizeStorageLane,
           });
         } catch (e: any) {
           // #1116 (review A1): a finalize(layer:"swm") on an asset that was only

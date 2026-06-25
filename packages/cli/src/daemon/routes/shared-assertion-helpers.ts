@@ -104,6 +104,12 @@ export function decodePromoteJobId(encoded: string, res: ServerResponse): string
   return jobId;
 }
 
+export function scopedTokenPromoteLane(agentAddress?: string): { agentAddress?: string; authorAgentAddress?: string } {
+  return agentAddress
+    ? { agentAddress, authorAgentAddress: agentAddress }
+    : {};
+}
+
 // ── Async-promote wire schema (RFC §3.2 + §3.3) ──────────────────────────────
 //
 // The internal `PromoteJob` shape persisted by the queue carries

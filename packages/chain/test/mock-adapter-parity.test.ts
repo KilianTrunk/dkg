@@ -100,6 +100,7 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   'readNativeBalance',
   'readTracBalance',
   'snapshotPublisherWalletBalances',
+  'poolHasFundableSigner',
   'enrichInsufficientPublisherFundsError',
   'looksLikeFundsRevert',
   'walletKeyHash',

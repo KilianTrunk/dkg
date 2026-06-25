@@ -15,7 +15,7 @@ import { JsonRpcProvider, FallbackProvider, Wallet, Contract, ethers } from 'eth
 import { createFilterErrorSilencer, installFilterNotFoundConsoleSuppressor, formatProviderError } from './filter-error-silencer.js';
 import type { FilterErrorSilencer } from './filter-error-silencer.js';
 import { DEFAULT_APPROVAL_POLICY } from './chain-adapter.js';
-import type { ApprovalPolicy, V10PublishParams, OnChainPublishResult } from './chain-adapter.js';
+import type { ApprovalPolicy, V10PublishParams, OnChainPublishResult, ConvictionReader } from './chain-adapter.js';
 import { HubResolutionCache } from './hub-resolution-cache.js';
 import { KeyedSerializer } from './keyed-mutex.js';
 import { floorPublishTokenAmount } from '@origintrail-official/dkg-core';
@@ -1303,10 +1303,9 @@ export class EVMChainAdapterBase {
    */
   protected async isConvictionFundedAgent(address: string, requiredCostWei: bigint): Promise<boolean> {
     if (!this.contracts.dkgPublishingConvictionNFT) return false;
-    const conv = this as unknown as {
-      getConvictionAgentAccountId(agent: string): Promise<bigint>;
-      convictionAccountCanCover(accountId: bigint, baseCost: bigint): Promise<boolean>;
-    };
+    // Typed against the shared ConvictionReader interface that ConvictionMethods
+    // `implements`, so a rename/signature change in the mixin is a compile error.
+    const conv = this as unknown as ConvictionReader;
     try {
       const accountId = await withTimeout(
         conv.getConvictionAgentAccountId(address),
@@ -1399,21 +1398,25 @@ export class EVMChainAdapterBase {
     requiredTracWei: bigint = 0n,
   ): Promise<unknown> {
     try {
-      let fundsProblem = isInsufficientFundsError(err);
-      if (!fundsProblem && this.looksLikeFundsRevert(err)) {
-        // A TRAC-balance shortfall surfaces as a generic transferFrom revert
-        // (not an "insufficient funds" string). Only reclassify when the error
-        // is a CHAIN REVERT (filtered by looksLikeFundsRevert — excludes
-        // nonce / RPC / dropped-receipt / WAL-hook control-flow errors) AND the
-        // signing wallet cannot fund the publish. Reuse the SINGLE fundability
-        // predicate `isWalletPublishFundable` (native gas + own-TRAC vs the
-        // publish cost + the covering-PCA exception) so selection and error
-        // enrichment can never drift on the funding rules — a fresh balance read
-        // that is not fundable for this cost is the funds problem.
+      let selectedShort = isInsufficientFundsError(err);
+      if (!selectedShort && this.looksLikeFundsRevert(err)) {
+        // A TRAC shortfall surfaces as a token transferFrom revert (not an
+        // "insufficient funds" string). looksLikeFundsRevert is restricted to
+        // funds-SHAPED reverts (not any CALL_EXCEPTION), so an unrelated contract
+        // revert is never re-read as a funds problem. Reuse the SINGLE
+        // isWalletPublishFundable predicate so selection and enrichment can't
+        // drift on the funding rules.
         const f = await this.getWalletFunding(signer.address, { forceRefresh: true });
-        fundsProblem = !(await this.isWalletPublishFundable(signer.address, f, requiredTracWei));
+        selectedShort = !(await this.isWalletPublishFundable(signer.address, f, requiredTracWei));
       }
-      if (fundsProblem) {
+      // Only emit NO_FUNDED_PUBLISHER_WALLET — which asserts the WHOLE pool is
+      // unfunded and maps downstream to a TERMINAL insufficient_funds failure —
+      // when NO operational wallet can fund this cost. If the selected wallet was
+      // short but another wallet could cover it (a cost-blind pre-pin, an explicit
+      // pinned address, or a stale cached balance), preserve the original error so
+      // a retry can reroute to a funded wallet instead of being told no wallet is
+      // funded.
+      if (selectedShort && !(await this.poolHasFundableSigner(requiredTracWei))) {
         const balances = await this.snapshotPublisherWalletBalances();
         return new InsufficientPublisherFundsError(
           formatNoFundedPublisherWalletMessage(balances),
@@ -1428,20 +1431,35 @@ export class EVMChainAdapterBase {
   }
 
   /**
-   * True iff `err` is a CHAIN REVERT that could plausibly be a TRAC
-   * transfer/allowance shortfall — i.e. worth a balance re-read in
-   * {@link enrichInsufficientPublisherFundsError}. Excludes our own non-funds
-   * control-flow sentinels (null/dropped receipt, write-ahead-hook failure) and
-   * non-revert failures (nonce, RPC, timeout) so an unrelated failure is never
-   * masked as an insufficient-funds error.
+   * True iff ANY operational wallet in the pool is fundable for a publish costing
+   * `requiredTracWei` (own balance above floor+cost, or a covering PCA agent).
+   * Used to distinguish a whole-pool funding problem (→ NO_FUNDED, terminal) from
+   * the selected wallet merely being the wrong, recoverable pick. Cached reads;
+   * fail-open per wallet.
+   */
+  protected async poolHasFundableSigner(requiredTracWei: bigint): Promise<boolean> {
+    const checks = await Promise.all(
+      this.signerPool.map(async (s) =>
+        this.isWalletPublishFundable(s.address, await this.getWalletFunding(s.address), requiredTracWei),
+      ),
+    );
+    return checks.some(Boolean);
+  }
+
+  /**
+   * True iff `err` is a FUNDS-SHAPED chain revert (a TRAC transfer / allowance
+   * shortfall) worth a balance re-read in {@link enrichInsufficientPublisherFundsError}.
+   * Deliberately NOT every `CALL_EXCEPTION` / "execution reverted" — a generic
+   * contract revert (e.g. an InvalidAuthorAttestation) must never be re-read and
+   * masked as an insufficient-funds error. Also excludes our own control-flow
+   * sentinels (null/dropped receipt, write-ahead-hook failure).
    */
   protected looksLikeFundsRevert(err: unknown): boolean {
     const msg = errorMessage(err).toLowerCase();
     if (/receipt is null|receipt was null|replaced or dropped|write-?ahead/.test(msg)) {
       return false;
     }
-    if (errorCode(err) === 'CALL_EXCEPTION') return true;
-    return /execution reverted|call exception|transfer amount exceeds balance|erc20insufficientbalance|insufficient allowance|toolowallowance/.test(msg);
+    return /transfer amount exceeds balance|erc20insufficientbalance|insufficient allowance|toolowallowance|insufficient funds/.test(msg);
   }
 
   /** All operational wallet addresses (for display / funding). */

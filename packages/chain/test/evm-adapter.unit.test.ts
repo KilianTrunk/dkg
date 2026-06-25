@@ -2902,6 +2902,42 @@ describe('createKnowledgeAssets — funding-aware wallet selection', () => {
     expect(caught.code).toBe('NONCE_EXPIRED');
   });
 
+  it('does NOT wrap a non-funds contract revert on a zero-TRAC signer (no funds marker, not masked)', async () => {
+    const { a, walletA, walletB, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), 0n);
+    // A generic contract revert (CALL_EXCEPTION) on a short wallet must surface
+    // unchanged — NOT be converted to NO_FUNDED_PUBLISHER_WALLET.
+    (a as any).signPopulatedTransaction = recorder(async () => {
+      const e: any = new Error('execution reverted: InvalidAuthorAttestation');
+      e.code = 'CALL_EXCEPTION';
+      throw e;
+    });
+    let caught: any;
+    try { await a.createKnowledgeAssets(makeV10PublishParams()); } catch (e) { caught = e; }
+    expect(caught).not.toBeInstanceOf(InsufficientPublisherFundsError);
+    expect(caught.message).toContain('InvalidAuthorAttestation');
+  });
+
+  it('does NOT claim NO_FUNDED when the SELECTED wallet is short but another authorized wallet can cover the cost', async () => {
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    // Pin walletA (gas + ZERO TRAC); walletB is funded for the cost.
+    nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);
+    tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), ONE);
+    const params = makeV10PublishParams(walletA.address);
+    params.tokenAmount = 1000n;
+    (a as any).signPopulatedTransaction = recorder(async () => {
+      const e: any = new Error('execution reverted: ERC20: transfer amount exceeds balance');
+      e.code = 'CALL_EXCEPTION';
+      throw e;
+    });
+    let caught: any;
+    try { await a.createKnowledgeAssets(params); } catch (e) { caught = e; }
+    // Pool has a funded wallet → preserve the original error (retry can reroute),
+    // do NOT mislabel as "no operational wallet has funds".
+    expect(caught).not.toBeInstanceOf(InsufficientPublisherFundsError);
+    expect(caught.message).toContain('transfer amount exceeds balance');
+  });
+
   it('wraps a TRAC transferFrom revert on a zero-TRAC wallet that holds gas', async () => {
     const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
     nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);

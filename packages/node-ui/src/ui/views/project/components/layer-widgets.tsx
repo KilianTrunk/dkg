@@ -1,6 +1,6 @@
 import React, { useMemo, useState, useCallback, useEffect } from 'react';
 import type { ReactNode } from 'react';
-import { listAssertions, promoteAssertion, describePromoteError, describeInsufficientPublisherFunds, ensureContextGraphOnChain, knowledgeAssetFinalize, knowledgeAssetPublish } from '../../../api.js';
+import { listAssertions, promoteAssertion, describePromoteError, describeInsufficientPublisherFunds, ensureContextGraphOnChain, knowledgeAssetFinalize, publishAssertionsToVm, describeBulkVmPublishResult } from '../../../api.js';
 import type { MemoryEntity } from '../../../hooks/useMemoryEntities.js';
 import { useProjectProfileContext } from '../../../hooks/useProjectProfile.js';
 import { LAYER_CONFIG, entityMeta, layerNoun } from '../helpers.js';
@@ -172,30 +172,19 @@ export function LayerActionsWidget({ layer, count, contextGraphId, onComplete, o
         // since VM is the on-chain layer.
         await ensureContextGraphOnChain(contextGraphId);
         const assertions = await listAssertions(contextGraphId, 'swm');
-        let published = 0;
-        let lastErr: string | null = null;
-        let fundsErr: string | null = null;
-        for (const a of assertions) {
-          currentAssertion = a.name;
-          try {
-            await knowledgeAssetPublish(contextGraphId, a.name, a.subGraph ? { subGraphName: a.subGraph } : {});
-            published += 1;
-          } catch (e: any) {
-            lastErr = e?.message ?? 'publish failed';
-            fundsErr = fundsErr ?? describeInsufficientPublisherFunds(e);
-          }
-        }
-        if (published > 0) {
-          // Surface a funds failure explicitly even on partial success so the
-          // user knows to fund a wallet, not just that "some could not be published".
-          const tail = fundsErr
-            ? ' — some failed: no operational wallet has enough funds (native gas + TRAC). Fund a wallet and retry.'
-            : (lastErr ? ' (some assertions could not be published)' : '');
-          setResult(`Published ${published} knowledge asset${published !== 1 ? 's' : ''} to Verifiable Memory${tail}`);
+        // Shared loop + funds messaging — see publishAssertionsToVm in api.ts.
+        const outcome = await publishAssertionsToVm(
+          contextGraphId,
+          assertions,
+          (name) => { currentAssertion = name; },
+        );
+        const line = describeBulkVmPublishResult(outcome);
+        if (line) {
+          setResult(line);
         } else if (assertions.length === 0) {
           setResult('Nothing to publish — promote assertions to Shared Memory first.');
         } else {
-          throw new Error(fundsErr ?? lastErr ?? 'Publish failed');
+          throw new Error(outcome.fundsErr ?? outcome.lastErr ?? 'Publish failed');
         }
       }
       onComplete?.();

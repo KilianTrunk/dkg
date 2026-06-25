@@ -3,6 +3,7 @@ import {
   describePromoteResult,
   describePromoteError,
   describeInsufficientPublisherFunds,
+  describeBulkVmPublishResult,
   HttpError,
 } from '../src/ui/api.js';
 
@@ -25,6 +26,32 @@ const FUNDS_MSG =
  * contract stable so a future refactor of either helper doesn't
  * silently re-break that CTA.
  */
+// Pins the formatting extracted from the entities/layer-widgets publish-all
+// loops into the shared describeBulkVmPublishResult (api.ts) — the dedupe must
+// not change the partial-success / funds-tail / nothing-published behavior.
+describe('describeBulkVmPublishResult', () => {
+  it('returns null when nothing was published (caller throws the funds/last error)', () => {
+    expect(describeBulkVmPublishResult({ published: 0, total: 3, lastErr: 'boom', fundsErr: null })).toBeNull();
+  });
+
+  it('appends an explicit fund-a-wallet tail on a partial funds failure', () => {
+    const line = describeBulkVmPublishResult({ published: 2, total: 3, lastErr: 'x', fundsErr: 'No operational wallet has enough funds' });
+    expect(line).toContain('Published 2 knowledge assets to Verifiable Memory');
+    expect(line).toContain('no operational wallet has enough funds');
+  });
+
+  it('appends a generic partial tail on a non-funds failure', () => {
+    const line = describeBulkVmPublishResult({ published: 1, total: 2, lastErr: 'boom', fundsErr: null });
+    expect(line).toContain('Published 1 knowledge asset to Verifiable Memory');
+    expect(line).toContain('some could not be published');
+  });
+
+  it('has no tail on full success', () => {
+    expect(describeBulkVmPublishResult({ published: 3, total: 3, lastErr: null, fundsErr: null }))
+      .toBe('Published 3 knowledge assets to Verifiable Memory');
+  });
+});
+
 describe('describePromoteResult', () => {
   it('returns kind="success" with a positive triple count message when promotedCount > 0', () => {
     const out = describePromoteResult('character-sheet', { promotedCount: 7 });

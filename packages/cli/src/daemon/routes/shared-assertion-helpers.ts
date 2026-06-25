@@ -21,10 +21,13 @@ import {
   assertRdfLiteralMutf8Safe,
 } from '@origintrail-official/dkg-core';
 import { type PromoteJob, type PromoteJobState } from '@origintrail-official/dkg-publisher';
+import { NO_FUNDED_PUBLISHER_WALLET_CODE, enrichEvmError } from '@origintrail-official/dkg-chain';
 import { daemonState } from '../state.js';
 import {
   jsonResponse,
   oversizedRdfLiteralResponseBody,
+  isPayloadTooLargeError,
+  payloadTooLargeResponseBody,
   safeDecodeURIComponent,
   normalizeContextGraphIdOrUri,
   isValidContextGraphId,
@@ -54,7 +57,7 @@ export const NO_FUNDED_PUBLISHER_WALLET_MARKER = /No operational wallet has enou
  */
 export function isNoFundedPublisherWalletLike(err: unknown): boolean {
   const e = err as { code?: unknown; message?: unknown } | null | undefined;
-  if (e?.code === 'NO_FUNDED_PUBLISHER_WALLET') return true;
+  if (e?.code === NO_FUNDED_PUBLISHER_WALLET_CODE) return true;
   return typeof e?.message === 'string' && NO_FUNDED_PUBLISHER_WALLET_MARKER.test(e.message);
 }
 
@@ -62,7 +65,38 @@ export function isNoFundedPublisherWalletLike(err: unknown): boolean {
  *  structured `code` plus the actionable message (which lists per-wallet
  *  balances). Single source of truth for both publish routes. */
 export function noFundedPublisherWalletBody(message: string): { code: string; error: string } {
-  return { code: 'NO_FUNDED_PUBLISHER_WALLET', error: message };
+  return { code: NO_FUNDED_PUBLISHER_WALLET_CODE, error: message };
+}
+
+/**
+ * Map a thrown request error to the daemon's top-level HTTP response — the
+ * single place that rethrowing routes (e.g. `/api/shared-memory/publish`) and
+ * the lifecycle catch agree on status codes: 413 payload-too-large; 400 for
+ * SyntaxError / reserved-namespace / NO_FUNDED_PUBLISHER_WALLET; otherwise a 500
+ * with the EVM-decoded message. Extracted from `lifecycle.ts` so this contract
+ * (esp. the funds-error 400 for rethrowing routes) is unit-testable.
+ */
+export function respondWithDaemonError(res: ServerResponse, err: any): void {
+  if (res.headersSent || res.writableEnded) return;
+  if (isPayloadTooLargeError(err)) {
+    jsonResponse(res, 413, payloadTooLargeResponseBody(err));
+  } else if (err instanceof SyntaxError) {
+    jsonResponse(res, 400, { error: err.message });
+  } else if (
+    // Round 9 Bug 25: user-authored quads with reserved URN prefixes map to 400
+    // so share/publish routes that rethrow get the correct status.
+    err?.name === 'ReservedNamespaceError' ||
+    (typeof err?.message === 'string' && err.message.includes('reserved namespace'))
+  ) {
+    jsonResponse(res, 400, { error: err.message });
+  } else if (isNoFundedPublisherWalletLike(err)) {
+    // Funded-wallet selection found no operational wallet with gas + TRAC — a
+    // user-actionable funding condition (4xx), not a server bug.
+    jsonResponse(res, 400, noFundedPublisherWalletBody(typeof err?.message === 'string' ? err.message : String(err)));
+  } else {
+    enrichEvmError(err);
+    jsonResponse(res, 500, { error: err?.message ?? String(err) });
+  }
 }
 
 /**

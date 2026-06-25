@@ -18,7 +18,7 @@ import { DEFAULT_APPROVAL_POLICY } from './chain-adapter.js';
 import type { ApprovalPolicy, V10PublishParams, OnChainPublishResult } from './chain-adapter.js';
 import { HubResolutionCache } from './hub-resolution-cache.js';
 import { KeyedSerializer } from './keyed-mutex.js';
-import { floorPublishTokenAmount } from '@origintrail-official/dkg-core';
+import { floorPublishTokenAmount, withSpan, getMetrics } from '@origintrail-official/dkg-core';
 import { loadAbi } from './evm-adapter-abi.js';
 import { errorCode, errorMessage, errorStatus, isTooLowAllowanceError, enrichEvmError, HUB_STALE_ERROR_MARKERS } from './evm-adapter-errors.js';
 import { resolveRpcUrls, boundedRetryFetchRequest, withTimeout, isKnownTransactionError, isRetryableRpcError, assertSuccessfulReceipt, sleep } from './evm-adapter-rpc.js';
@@ -694,61 +694,160 @@ export class EVMChainAdapterBase {
     return this.signerPool.find((signer) => signer.address.toLowerCase() === normalized);
   }
 
+  /**
+   * Classify an RPC error for low-cardinality metric labels: `timeout` for the
+   * synthetic `withTimeout` TIMEOUT code, else `error`. Used at the chain RPC
+   * metric record sites so the `outcome` label stays bounded.
+   */
+  private rpcOutcomeForError(err: unknown): 'error' | 'timeout' {
+    return errorCode(err) === 'TIMEOUT' ? 'timeout' : 'error';
+  }
+
   protected async broadcastSignedTransactionWithFailover(
     signedTx: string,
     txHash: string,
     label: string,
   ): Promise<void> {
-    let lastRetryable: unknown;
-    for (let i = 0; i < this.providers.length; i += 1) {
-      const provider = this.providers[i];
-      try {
-        await withTimeout(
-          provider.broadcastTransaction(signedTx),
-          RPC_BROADCAST_ATTEMPT_TIMEOUT_MS,
-          `${label} broadcast via RPC #${i + 1}`,
+    return withSpan(
+      'chain.tx_submit',
+      async (span) => {
+        const metrics = getMetrics();
+        const startedAt = Date.now();
+        let lastRetryable: unknown;
+        for (let i = 0; i < this.providers.length; i += 1) {
+          const provider = this.providers[i];
+          span.addEvent('broadcast.attempt', { attempt: i + 1 });
+          try {
+            await withTimeout(
+              provider.broadcastTransaction(signedTx),
+              RPC_BROADCAST_ATTEMPT_TIMEOUT_MS,
+              `${label} broadcast via RPC #${i + 1}`,
+            );
+            span.setAttribute('dkg.tx_hash', txHash);
+            metrics.chainRpcTotal.add(1, {
+              rpc_method: 'eth_sendRawTransaction', outcome: 'ok', retryable: false, chain_id: this.chainId,
+            });
+            metrics.chainRpcDuration.record(Date.now() - startedAt, {
+              rpc_method: 'eth_sendRawTransaction', chain_id: this.chainId,
+            });
+            return;
+          } catch (err) {
+            if (isKnownTransactionError(err)) {
+              // Already-known / already-mined tx is success for our purposes.
+              span.setAttribute('dkg.tx_hash', txHash);
+              span.addEvent('broadcast.already_known', { attempt: i + 1 });
+              metrics.chainRpcTotal.add(1, {
+                rpc_method: 'eth_sendRawTransaction', outcome: 'ok', retryable: false, chain_id: this.chainId,
+              });
+              metrics.chainRpcDuration.record(Date.now() - startedAt, {
+                rpc_method: 'eth_sendRawTransaction', chain_id: this.chainId,
+              });
+              return;
+            }
+            if (!isRetryableRpcError(err)) {
+              metrics.chainRpcTotal.add(1, {
+                rpc_method: 'eth_sendRawTransaction', outcome: this.rpcOutcomeForError(err),
+                retryable: false, chain_id: this.chainId,
+              });
+              metrics.chainRpcDuration.record(Date.now() - startedAt, {
+                rpc_method: 'eth_sendRawTransaction', chain_id: this.chainId,
+              });
+              throw err;
+            }
+            lastRetryable = err;
+          }
+        }
+        // All configured endpoints exhausted.
+        metrics.chainRpcTotal.add(1, {
+          rpc_method: 'eth_sendRawTransaction', outcome: this.rpcOutcomeForError(lastRetryable),
+          retryable: true, chain_id: this.chainId,
+        });
+        metrics.chainRpcDuration.record(Date.now() - startedAt, {
+          rpc_method: 'eth_sendRawTransaction', chain_id: this.chainId,
+        });
+        metrics.chainRpcFailoverTotal.add(1, {
+          rpc_method: 'eth_sendRawTransaction', chain_id: this.chainId, reason: 'exhausted',
+        });
+        throw new Error(
+          `${label} broadcast failed on all configured RPC endpoints for tx ${txHash}: ${errorMessage(lastRetryable)}`,
+          { cause: lastRetryable },
         );
-        return;
-      } catch (err) {
-        if (isKnownTransactionError(err)) return;
-        if (!isRetryableRpcError(err)) throw err;
-        lastRetryable = err;
-      }
-    }
-    throw new Error(
-      `${label} broadcast failed on all configured RPC endpoints for tx ${txHash}: ${errorMessage(lastRetryable)}`,
-      { cause: lastRetryable },
+      },
+      { attributes: { 'rpc.method': 'eth_sendRawTransaction', 'dkg.chain_id': this.chainId } },
     );
   }
 
   protected async getTransactionReceiptWithFailover(txHash: string): Promise<ethers.TransactionReceipt | null> {
-    let lastRetryable: unknown;
-    let sawNonErrorResponse = false;
-    for (let i = 0; i < this.providers.length; i += 1) {
-      const provider = this.providers[i];
-      try {
-        const receipt = await withTimeout(
-          provider.getTransactionReceipt(txHash),
-          RPC_RECEIPT_ATTEMPT_TIMEOUT_MS,
-          `receipt lookup via RPC #${i + 1}`,
-        );
-        sawNonErrorResponse = true;
-        if (receipt) return receipt;
-      } catch (err) {
-        if (!isRetryableRpcError(err)) throw err;
-        lastRetryable = err;
-      }
-    }
-    if (lastRetryable && !sawNonErrorResponse) {
-      const err = new Error(
-        `Receipt lookup for tx ${txHash} failed on all configured RPC endpoints: ${errorMessage(lastRetryable)}`,
-        { cause: lastRetryable },
-      );
-      (err as any).code = 'RPC_RECEIPT_LOOKUP_FAILED';
-      (err as any).txHash = txHash;
-      throw err;
-    }
-    return null;
+    return withSpan(
+      'chain.tx_wait',
+      async (span) => {
+        const metrics = getMetrics();
+        const startedAt = Date.now();
+        let lastRetryable: unknown;
+        let sawNonErrorResponse = false;
+        for (let i = 0; i < this.providers.length; i += 1) {
+          const provider = this.providers[i];
+          span.addEvent('receipt.attempt', { attempt: i + 1 });
+          try {
+            const receipt = await withTimeout(
+              provider.getTransactionReceipt(txHash),
+              RPC_RECEIPT_ATTEMPT_TIMEOUT_MS,
+              `receipt lookup via RPC #${i + 1}`,
+            );
+            sawNonErrorResponse = true;
+            if (receipt) {
+              span.setAttribute('dkg.tx_hash', txHash);
+              metrics.chainRpcTotal.add(1, {
+                rpc_method: 'eth_getTransactionReceipt', outcome: 'ok', retryable: false, chain_id: this.chainId,
+              });
+              metrics.chainRpcDuration.record(Date.now() - startedAt, {
+                rpc_method: 'eth_getTransactionReceipt', chain_id: this.chainId,
+              });
+              return receipt;
+            }
+          } catch (err) {
+            if (!isRetryableRpcError(err)) {
+              metrics.chainRpcTotal.add(1, {
+                rpc_method: 'eth_getTransactionReceipt', outcome: this.rpcOutcomeForError(err),
+                retryable: false, chain_id: this.chainId,
+              });
+              metrics.chainRpcDuration.record(Date.now() - startedAt, {
+                rpc_method: 'eth_getTransactionReceipt', chain_id: this.chainId,
+              });
+              throw err;
+            }
+            lastRetryable = err;
+          }
+        }
+        if (lastRetryable && !sawNonErrorResponse) {
+          // No backend could even answer the lookup → endpoints exhausted.
+          metrics.chainRpcTotal.add(1, {
+            rpc_method: 'eth_getTransactionReceipt', outcome: this.rpcOutcomeForError(lastRetryable),
+            retryable: true, chain_id: this.chainId,
+          });
+          metrics.chainRpcDuration.record(Date.now() - startedAt, {
+            rpc_method: 'eth_getTransactionReceipt', chain_id: this.chainId,
+          });
+          metrics.chainRpcFailoverTotal.add(1, {
+            rpc_method: 'eth_getTransactionReceipt', chain_id: this.chainId, reason: 'exhausted',
+          });
+          const err = new Error(
+            `Receipt lookup for tx ${txHash} failed on all configured RPC endpoints: ${errorMessage(lastRetryable)}`,
+            { cause: lastRetryable },
+          );
+          (err as any).code = 'RPC_RECEIPT_LOOKUP_FAILED';
+          (err as any).txHash = txHash;
+          throw err;
+        }
+        // At least one backend answered but the tx is not yet mined (null
+        // receipt). This is a benign poll tick, not a terminal outcome, so we
+        // intentionally do NOT emit an outcome metric here (the surrounding
+        // poll loop calls this repeatedly until mined/timeout).
+        span.setAttribute('dkg.receipt_pending', true);
+        return null;
+      },
+      { attributes: { 'rpc.method': 'eth_getTransactionReceipt', 'dkg.chain_id': this.chainId } },
+    );
   }
 
   protected async waitForReceiptWithFailover(
@@ -927,10 +1026,28 @@ export class EVMChainAdapterBase {
     // the limit by `gasLimitBufferBps` basis points so the drift can't OOG.
     opts?: { gasLimitBufferBps?: number },
   ): Promise<ethers.TransactionReceipt> {
+    return withSpan(
+      'chain.tx_send',
+      async (span) => this.sendContractTransactionInner(span, contract, method, args, signer, label, opts),
+      { attributes: { 'rpc.method': 'eth_sendRawTransaction', 'dkg.chain_id': this.chainId } },
+    );
+  }
+
+  private async sendContractTransactionInner(
+    span: Parameters<Parameters<typeof withSpan>[1]>[0],
+    contract: Contract,
+    method: string,
+    args: readonly unknown[],
+    signer: Wallet,
+    label: string,
+    opts?: { gasLimitBufferBps?: number },
+  ): Promise<ethers.TransactionReceipt> {
+    const metrics = getMetrics();
     let lastRetryable: unknown;
     for (let i = 0; i < this.providers.length; i += 1) {
       const rpcSigner = signer.connect(this.providers[i]);
       let prepared: { signedTx: string; txHash: string } | undefined;
+      span.addEvent('tx.prepare.attempt', { attempt: i + 1 });
       try {
         const connected = contract.connect(rpcSigner) as any;
         const populated = await withTimeout<ethers.TransactionRequest>(
@@ -980,6 +1097,9 @@ export class EVMChainAdapterBase {
         continue;
       }
       if (!prepared) continue;
+      span.setAttribute('dkg.tx_hash', prepared.txHash);
+      // Broadcast + receipt-wait each open their own nested RPC spans/metrics
+      // (chain.tx_submit / chain.tx_wait); the tx_send span is the parent.
       return this.sendSignedTransactionAndWait(prepared.signedTx, prepared.txHash, label);
     }
     // A retryable error from the only configured RPC is still an "endpoints
@@ -999,6 +1119,10 @@ export class EVMChainAdapterBase {
       ? errorMessage(lastRetryable)
       : `${label} transaction preparation failed on all configured RPC endpoints ` +
         `(${this.rpcUrls.join(', ')}): ${errorMessage(lastRetryable)}`;
+    // Transaction preparation exhausted every configured RPC endpoint.
+    metrics.chainRpcFailoverTotal.add(1, {
+      rpc_method: 'eth_sendRawTransaction', chain_id: this.chainId, reason: 'exhausted',
+    });
     const err = new Error(message, { cause: lastRetryable });
     (err as any).code = 'RPC_ENDPOINTS_EXHAUSTED';
     (err as any).rpcUrls = [...this.rpcUrls];
@@ -1036,9 +1160,33 @@ export class EVMChainAdapterBase {
   ): Promise<void> {
     if (!this.contracts.token) return;
     const tokenWithSigner = this.contracts.token.connect(signer) as Contract;
-    const currentAllowance: bigint = await tokenWithSigner.allowance(
-      signer.address,
-      kav10Address,
+    const currentAllowance: bigint = await withSpan(
+      'chain.eth_call',
+      async (span) => {
+        const metrics = getMetrics();
+        const startedAt = Date.now();
+        try {
+          const allowance: bigint = await tokenWithSigner.allowance(
+            signer.address,
+            kav10Address,
+          );
+          metrics.chainRpcTotal.add(1, {
+            rpc_method: 'eth_call', outcome: 'ok', retryable: false, chain_id: this.chainId,
+          });
+          return allowance;
+        } catch (err) {
+          const outcome = this.rpcOutcomeForError(err);
+          metrics.chainRpcTotal.add(1, {
+            rpc_method: 'eth_call', outcome, retryable: isRetryableRpcError(err), chain_id: this.chainId,
+          });
+          throw err;
+        } finally {
+          metrics.chainRpcDuration.record(Date.now() - startedAt, {
+            rpc_method: 'eth_call', chain_id: this.chainId,
+          });
+        }
+      },
+      { attributes: { 'rpc.method': 'eth_call', 'dkg.chain_id': this.chainId, 'dkg.contract': 'Token' } },
     );
     const { needsApprove, targetAllowance } = computeApprovalAction(
       this.approvalPolicy,
@@ -1247,7 +1395,41 @@ export class EVMChainAdapterBase {
   protected async resolveContract(name: string, abiName?: string): Promise<Contract> {
     let address: string;
     try {
-      address = await this.contracts.hub.getContractAddress(name);
+      address = await withSpan(
+        'chain.eth_call',
+        async (span) => {
+          const metrics = getMetrics();
+          const startedAt = Date.now();
+          try {
+            const resolved: string = await this.contracts.hub.getContractAddress(name);
+            metrics.chainRpcTotal.add(1, {
+              rpc_method: 'eth_call', outcome: 'ok', retryable: false, chain_id: this.chainId,
+            });
+            return resolved;
+          } catch (err) {
+            // A "contract missing" Hub revert is an expected negative, not a
+            // transport failure — record it as an outcome but keep the span OK.
+            const expected = this.isContractMissingRevert(err);
+            if (expected) {
+              span.setAttribute('dkg.contract_missing', true);
+              metrics.chainRpcTotal.add(1, {
+                rpc_method: 'eth_call', outcome: 'ok', retryable: false, chain_id: this.chainId,
+              });
+              throw err;
+            }
+            const outcome = this.rpcOutcomeForError(err);
+            metrics.chainRpcTotal.add(1, {
+              rpc_method: 'eth_call', outcome, retryable: isRetryableRpcError(err), chain_id: this.chainId,
+            });
+            throw err;
+          } finally {
+            metrics.chainRpcDuration.record(Date.now() - startedAt, {
+              rpc_method: 'eth_call', chain_id: this.chainId,
+            });
+          }
+        },
+        { attributes: { 'rpc.method': 'eth_call', 'dkg.chain_id': this.chainId, 'dkg.contract': 'Hub' } },
+      );
     } catch (err) {
       if (this.isContractMissingRevert(err)) {
         throw new Error(`Contract "${name}" not found in Hub at ${this.hubAddress}`, { cause: err });
@@ -1445,8 +1627,31 @@ export class EVMChainAdapterBase {
   async getIdentityId(): Promise<bigint> {
     await this.init();
     const identityStorage = await this.getIdentityStorage();
-    const id: bigint = await identityStorage.getIdentityId(this.signer.address);
-    return id;
+    return withSpan(
+      'chain.eth_call',
+      async (span) => {
+        const metrics = getMetrics();
+        const startedAt = Date.now();
+        try {
+          const id: bigint = await identityStorage.getIdentityId(this.signer.address);
+          metrics.chainRpcTotal.add(1, {
+            rpc_method: 'eth_call', outcome: 'ok', retryable: false, chain_id: this.chainId,
+          });
+          return id;
+        } catch (err) {
+          const outcome = this.rpcOutcomeForError(err);
+          metrics.chainRpcTotal.add(1, {
+            rpc_method: 'eth_call', outcome, retryable: isRetryableRpcError(err), chain_id: this.chainId,
+          });
+          throw err;
+        } finally {
+          metrics.chainRpcDuration.record(Date.now() - startedAt, {
+            rpc_method: 'eth_call', chain_id: this.chainId,
+          });
+        }
+      },
+      { attributes: { 'rpc.method': 'eth_call', 'dkg.chain_id': this.chainId, 'dkg.contract': 'IdentityStorage' } },
+    );
   }
 
   // =====================================================================
@@ -1637,39 +1842,66 @@ export class EVMChainAdapterBase {
     label: string,
     preferred?: JsonRpcProvider,
   ): Promise<{ logs: ReadonlyArray<ethers.EventLog | ethers.Log>; provider: JsonRpcProvider }> {
-    // Eligible backends (tip covers the page), with the sticky preferred one moved
-    // to the front when it still qualifies; the remainder keep their freshest-first
-    // order from `scanProviders`.
-    const eligible = scanProviders.filter(({ backendHead }) => backendHead >= hi);
-    const ordered =
-      preferred && eligible.some(({ provider }) => provider === preferred)
-        ? [
-            ...eligible.filter(({ provider }) => provider === preferred),
-            ...eligible.filter(({ provider }) => provider !== preferred),
-          ]
-        : eligible;
-    let pageError: unknown;
-    for (const { provider } of ordered) {
-      let contract = connected.get(provider);
-      if (!contract) {
-        contract = baseContract.connect(provider) as Contract;
-        connected.set(provider, contract);
-      }
-      try {
-        const logs = await withTimeout(
-          contract.queryFilter(filter as any, lo, hi),
-          KA_HIGH_WATER_PAGE_TIMEOUT_MS,
-          `${label} getLogs [${lo}, ${hi}]`,
+    return withSpan(
+      'chain.eth_getLogs',
+      async (span) => {
+        const metrics = getMetrics();
+        const startedAt = Date.now();
+        // Eligible backends (tip covers the page), with the sticky preferred one moved
+        // to the front when it still qualifies; the remainder keep their freshest-first
+        // order from `scanProviders`.
+        const eligible = scanProviders.filter(({ backendHead }) => backendHead >= hi);
+        const ordered =
+          preferred && eligible.some(({ provider }) => provider === preferred)
+            ? [
+                ...eligible.filter(({ provider }) => provider === preferred),
+                ...eligible.filter(({ provider }) => provider !== preferred),
+              ]
+            : eligible;
+        let pageError: unknown;
+        for (const { provider } of ordered) {
+          let contract = connected.get(provider);
+          if (!contract) {
+            contract = baseContract.connect(provider) as Contract;
+            connected.set(provider, contract);
+          }
+          try {
+            const logs = await withTimeout(
+              contract.queryFilter(filter as any, lo, hi),
+              KA_HIGH_WATER_PAGE_TIMEOUT_MS,
+              `${label} getLogs [${lo}, ${hi}]`,
+            );
+            metrics.chainRpcTotal.add(1, {
+              rpc_method: 'eth_getLogs', outcome: 'ok', retryable: false, chain_id: this.chainId,
+            });
+            metrics.chainRpcDuration.record(Date.now() - startedAt, {
+              rpc_method: 'eth_getLogs', chain_id: this.chainId,
+            });
+            return { logs, provider };
+          } catch (err) {
+            pageError = err; // hung or errored — fail over to the next eligible backend
+          }
+        }
+        // Every eligible backend failed for this page → one error/timeout outcome.
+        const outcome = pageError ? this.rpcOutcomeForError(pageError) : 'error';
+        metrics.chainRpcTotal.add(1, {
+          rpc_method: 'eth_getLogs', outcome, retryable: isRetryableRpcError(pageError), chain_id: this.chainId,
+        });
+        metrics.chainRpcDuration.record(Date.now() - startedAt, {
+          rpc_method: 'eth_getLogs', chain_id: this.chainId,
+        });
+        throw new Error(
+          `${label}: no configured RPC could serve the log range [${lo}, ${hi}]` +
+            `${pageError ? `: ${errorMessage(pageError)}` : ''}.`,
+          pageError ? { cause: pageError } : undefined,
         );
-        return { logs, provider };
-      } catch (err) {
-        pageError = err; // hung or errored — fail over to the next eligible backend
-      }
-    }
-    throw new Error(
-      `${label}: no configured RPC could serve the log range [${lo}, ${hi}]` +
-        `${pageError ? `: ${errorMessage(pageError)}` : ''}.`,
-      pageError ? { cause: pageError } : undefined,
+      },
+      {
+        attributes: {
+          'rpc.method': 'eth_getLogs', 'dkg.chain_id': this.chainId,
+          'dkg.block_lo': lo, 'dkg.block_hi': hi,
+        },
+      },
     );
   }
 

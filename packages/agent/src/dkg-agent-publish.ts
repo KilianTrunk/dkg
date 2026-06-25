@@ -97,7 +97,10 @@ import {
   pickNetworkTunables,
   sharedMemoryReadBothFilter,
   partitionCatalogQuads,
+  withSpan,
+  getMetrics,
 } from '@origintrail-official/dkg-core';
+import { SpanStatusCode } from '@opentelemetry/api';
 import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad, type LargeLiteralStorageConfig } from '@origintrail-official/dkg-storage';
 import { EVMChainAdapter, NoChainAdapter, enrichEvmError, buildKnowledgeAssetUal, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
 import {
@@ -1269,6 +1272,15 @@ export class PublishMethods extends DKGAgentBase {
     privateQuads?: Quad[],
     opts?: PublishOpts,
   ): Promise<PublishResult> {
+   return withSpan('agent.publish', async (span) => {
+    const chainId = typeof this.chain.chainId === 'string' && this.chain.chainId !== 'none' ? this.chain.chainId : undefined;
+    const publishStartedAt = Date.now();
+    span.setAttributes({
+      'dkg.context_graph_id': contextGraphId,
+      'dkg.triple_count': quads.length,
+      'dkg.has_private': !!privateQuads && privateQuads.length > 0,
+      ...(chainId ? { 'dkg.chain_id': chainId } : {}),
+    });
     const ctx = opts?.operationCtx ?? createOperationContext('publish');
     const onPhase = opts?.onPhase;
     this.log.info(ctx, `Starting publish to context graph "${contextGraphId}" with ${quads.length} triples`);
@@ -1380,6 +1392,12 @@ export class PublishMethods extends DKGAgentBase {
       encryptInlineChunked,
     });
 
+    span.setAttribute('dkg.publish_status', result.status);
+    if (result.status === 'failed') {
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      span.addEvent('publish_failed', { error: String(result.contextGraphError ?? '') });
+    }
+
     onPhase?.('broadcast', 'start');
     this.log.info(ctx, `Local publish complete, broadcasting to peers`);
     await this.broadcastPublish(contextGraphId, result, ctx);
@@ -1391,7 +1409,12 @@ export class PublishMethods extends DKGAgentBase {
     // it can never affect the publish just completed.
     await this.emitPublicProjectionAfterPublish(contextGraphId, result, ctx);
 
+    const publishMetricAttrs = { outcome: result.status, source: 'direct', ...(chainId ? { chain_id: chainId } : {}) };
+    getMetrics().publishTotal.add(1, publishMetricAttrs);
+    getMetrics().publishDuration.record(Date.now() - publishStartedAt, publishMetricAttrs);
+
     return result;
+   });
   }
 
   /**
@@ -4047,6 +4070,14 @@ export class PublishMethods extends DKGAgentBase {
       schemeVersion?: number;
     },
   ): Promise<PublishResult> {
+   return withSpan('agent.publish_from_swm', async (span) => {
+    const chainId = typeof this.chain.chainId === 'string' && this.chain.chainId !== 'none' ? this.chain.chainId : undefined;
+    const publishStartedAt = Date.now();
+    span.setAttributes({
+      'dkg.context_graph_id': contextGraphId,
+      'dkg.selection': selection === 'all' ? 'all' : 'roots',
+      ...(chainId ? { 'dkg.chain_id': chainId } : {}),
+    });
     const ctx = options?.operationCtx ?? createOperationContext('publishFromSWM');
     const effectiveSubCG = options?.subContextGraphId ?? options?.contextGraphId;
     // `ctxGraphIdStr` doubles as `publishContextGraphId` for REMAP-flow
@@ -4172,6 +4203,12 @@ export class PublishMethods extends DKGAgentBase {
       encryptInlineChunked,
     });
 
+    span.setAttribute('dkg.publish_status', result.status);
+    if (result.status === 'failed') {
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      span.addEvent('publish_failed', { error: String(result.contextGraphError ?? '') });
+    }
+
     if (result.status === 'confirmed' && result.onChainResult) {
       const rootEntities = result.kaManifest.map(ka => ka.rootEntity);
 
@@ -4262,7 +4299,12 @@ export class PublishMethods extends DKGAgentBase {
       }
     }
 
+    const publishMetricAttrs = { outcome: result.status, source: 'swm', ...(chainId ? { chain_id: chainId } : {}) };
+    getMetrics().publishTotal.add(1, publishMetricAttrs);
+    getMetrics().publishDuration.record(Date.now() - publishStartedAt, publishMetricAttrs);
+
     return result;
+   });
   }
 
   /** @deprecated Use publishFromSharedMemory. Will be removed in V10.1. */

@@ -9,6 +9,8 @@ import {
   isStorageACKDecline,
   isTransientStorageACKDeclineCode,
   isSubscriptionSource,
+  withSpan,
+  getMetrics,
   type PublishIntentMsg,
   type UpdateIntentMsg,
   type StorageACKMsg,
@@ -114,6 +116,19 @@ function transientDeclineBackoffMs(retry: number): number {
 }
 const MAX_DECLINE_CODE_CHARS = 64;
 const MAX_DECLINE_MESSAGE_CHARS = 240;
+
+/**
+ * Map a terminal {@link QuorumUnmetError} to the low-cardinality
+ * `ackQuorumTotal` outcome label. The collector encodes the failure kind
+ * only in the embedded `legacyMessage` prefix (no structured `kind`
+ * field): `storage_ack_timeout*` ⇒ the round ran out of time, every other
+ * quorum-fail throw (`no connected core peers`, `quorum impossible`,
+ * `storage_ack_insufficient`) ⇒ quorum was/became impossible.
+ */
+function quorumOutcomeFromError(err: QuorumUnmetError): 'timeout' | 'impossible' {
+  const msg = err.legacyMessage ?? err.message ?? '';
+  return msg.includes('storage_ack_timeout') ? 'timeout' : 'impossible';
+}
 
 function sanitizeDeclineField(value: string, maxChars: number): string {
   const compacted = value.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
@@ -223,6 +238,66 @@ export class ACKCollector {
       kaCount, rootEntities, chainId, kav10Address,
     } = params;
     const REQUIRED_ACKS = params.requiredACKs ?? DEFAULT_REQUIRED_ACKS;
+    const chainIdLabel = chainId != null ? chainId.toString() : undefined;
+
+    return withSpan('publisher.ack_collect', async (span) => {
+      span.setAttributes({
+        'dkg.context_graph_id': contextGraphIdStr,
+        'dkg.required_acks': REQUIRED_ACKS,
+      });
+      try {
+        const result = await this.collectInner({
+          merkleRoot, contextGraphId, contextGraphIdStr,
+          publisherPeerId, publicByteSize, isPrivate,
+          kaCount, rootEntities, chainId, kav10Address,
+          REQUIRED_ACKS,
+          params,
+        });
+        span.setAttribute('dkg.collected_acks', result.acks.length);
+        getMetrics().ackQuorumTotal.add(1, {
+          outcome: 'reached',
+          ...(chainIdLabel ? { chain_id: chainIdLabel } : {}),
+        });
+        return result;
+      } catch (err) {
+        // QuorumUnmetError throw is auto-recorded by withSpan (ERROR status).
+        // Map its failure kind to the terminal quorum metric outcome.
+        if (err instanceof QuorumUnmetError) {
+          getMetrics().ackQuorumTotal.add(1, {
+            outcome: quorumOutcomeFromError(err),
+            ...(chainIdLabel ? { chain_id: chainIdLabel } : {}),
+          });
+        }
+        throw err;
+      }
+    });
+  }
+
+  /**
+   * Body of {@link collect}, split out so the public method is a thin
+   * `withSpan('publisher.ack_collect')` wrapper. Preserves the exact
+   * control flow + error propagation of the original method body.
+   */
+  private async collectInner(ctx: {
+    merkleRoot: Uint8Array;
+    contextGraphId: bigint;
+    contextGraphIdStr: string;
+    publisherPeerId: string;
+    publicByteSize: bigint;
+    isPrivate: boolean;
+    kaCount: number;
+    rootEntities: string[];
+    chainId: bigint;
+    kav10Address: string;
+    REQUIRED_ACKS: number;
+    params: Parameters<ACKCollector['collect']>[0];
+  }): Promise<ACKCollectionResult> {
+    const {
+      merkleRoot, contextGraphId, contextGraphIdStr,
+      publisherPeerId, publicByteSize, isPrivate,
+      kaCount, rootEntities, chainId, kav10Address,
+      REQUIRED_ACKS, params,
+    } = ctx;
 
     const log = this.deps.log ?? (() => {});
     if (!Number.isInteger(params.merkleLeafCount) || params.merkleLeafCount < 1) {
@@ -636,8 +711,37 @@ export class ACKCollector {
       let declineRetries = 0;
       for (;;) {
         try {
-          const response = await this.deps.sendP2P(peerId, ackProtocolId, intentBytes);
-          const ack: StorageACKMsg = decodeStorageACK(response);
+          // publisher.ack_peer_request — one per-peer sendP2P attempt.
+          // Transport throw → withSpan auto-records ERROR; the catch below
+          // tags ackPeerTotal{result:'transport_error'}. A decline response
+          // is an expected negative (status stays OK, dkg.decline_code set).
+          const ack: StorageACKMsg = await withSpan(
+            'publisher.ack_peer_request',
+            async (span) => {
+              const response = await this.deps.sendP2P(peerId, ackProtocolId, intentBytes);
+              const decoded: StorageACKMsg = decodeStorageACK(response);
+              if (isStorageACKDecline(decoded)) {
+                const declineCode = sanitizeDeclineField(
+                  decoded.declineCode ?? 'UNKNOWN',
+                  MAX_DECLINE_CODE_CHARS,
+                ) || 'UNKNOWN';
+                span.setAttribute('dkg.decline_code', declineCode);
+                getMetrics().ackPeerTotal.add(1, {
+                  result: 'decline',
+                  decline_code: declineCode,
+                });
+              } else {
+                getMetrics().ackPeerTotal.add(1, { result: 'ack' });
+              }
+              return decoded;
+            },
+            {
+              attributes: {
+                'dkg.protocol_id': ackProtocolId,
+                'dkg.peer': peerId.slice(0, 8),
+              },
+            },
+          );
 
           if (isStorageACKDecline(ack)) {
             const code = sanitizeDeclineField(
@@ -724,7 +828,20 @@ export class ACKCollector {
           // the chain to check" (infra-side, retryable). Pre-PR every
           // failure surfaced as the same "not registered" string.
           if (this.deps.verifyIdentityDetailed) {
-            const verdict = await this.deps.verifyIdentityDetailed(recoveredAddress, identityId);
+            const verdict = await withSpan(
+              'publisher.ack_verify_identity',
+              async (span) => {
+                const v = await this.deps.verifyIdentityDetailed!(recoveredAddress, identityId);
+                // A rejected identity is an expected negative, not a span
+                // error (status stays OK). withSpan only flips ERROR on throw.
+                span.setAttribute('dkg.verify_result', v.valid ? 'valid' : (v.reason ?? 'unknown'));
+                getMetrics().ackVerifyTotal.add(1, {
+                  result: v.valid ? 'valid' : (v.reason ?? 'key-not-registered'),
+                });
+                return v;
+              },
+              { attributes: { 'dkg.identity_id': String(identityId) } },
+            );
             if (!verdict.valid) {
               const reason = verdict.reason ?? 'unknown';
               log(
@@ -734,7 +851,20 @@ export class ACKCollector {
               return null;
             }
           } else if (this.deps.verifyIdentity) {
-            const valid = await this.deps.verifyIdentity(recoveredAddress, identityId);
+            const valid = await withSpan(
+              'publisher.ack_verify_identity',
+              async (span) => {
+                const ok = await this.deps.verifyIdentity!(recoveredAddress, identityId);
+                // Legacy boolean verifier surfaces no structured reason; an
+                // invalid result maps to the generic registration gate.
+                span.setAttribute('dkg.verify_result', ok ? 'valid' : 'key-not-registered');
+                getMetrics().ackVerifyTotal.add(1, {
+                  result: ok ? 'valid' : 'key-not-registered',
+                });
+                return ok;
+              },
+              { attributes: { 'dkg.identity_id': String(identityId) } },
+            );
             if (!valid) {
               log(`[ACKCollector] Signer ${recoveredAddress.slice(0, 10)}... not registered for identity ${identityId} — rejecting ACK from ${peerId.slice(-8)}`);
               return null;
@@ -768,6 +898,7 @@ export class ACKCollector {
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           transportAttempts += 1;
+          getMetrics().ackPeerTotal.add(1, { result: 'transport_error' });
           if (transportAttempts < MAX_RETRIES) {
             if (roundIsOver()) {
               log(

@@ -1,6 +1,8 @@
 import {
   createOperationContext,
   QuietRetryableHandlerError,
+  withSpan,
+  getMetrics,
   type OperationContext,
 } from '@origintrail-official/dkg-core';
 import type { TripleStore } from '@origintrail-official/dkg-storage';
@@ -297,7 +299,8 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
     };
   };
 
-  register(protocolSync, async (data, peerId, options) => {
+  register(protocolSync, async (data, peerId, options) => withSpan('sync.response', async (span) => {
+    span.setAttribute('dkg.protocol_id', protocolSync);
     const signal = options?.signal;
     const handlerStartedAt = Date.now();
     const request = parseSyncRequest(data);
@@ -495,12 +498,19 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
         logDebug(createOperationContext('sync'), `Sync responder total for "${contextGraphId}" (phase=${phase}, workspace=${isWorkspace}): ${totalDurationMs}ms`);
       }
       return new TextEncoder().encode(nquads.join('\n'));
+    }).then((res) => {
+      getMetrics().syncResponseTotal.add(1, { outcome: 'ok' });
+      return res;
     }).catch((err) => {
       if (err instanceof SyncResponderBusyError) {
+        getMetrics().syncResponseTotal.add(1, { outcome: 'busy' });
+        span.setAttribute('dkg.sync_response_outcome', 'busy');
         logDebug(createOperationContext('sync'), `Sync responder busy for "${contextGraphId}" from peer ${peerId} (phase=${phase}): ${err.message}`);
         throw new QuietRetryableHandlerError(err.message);
       }
       if (err instanceof SyncRowSnapshotLimitError) {
+        getMetrics().syncResponseTotal.add(1, { outcome: 'limit' });
+        span.setAttribute('dkg.sync_response_outcome', 'limit');
         logWarn(
           createOperationContext('sync'),
           `Sync responder snapshot limit for "${contextGraphId}" from peer ${peerId} (phase=${phase}, workspace=${isWorkspace}): active=${err.activeEntries}/${err.maxEntries} cached=${err.cachedEntries} inflight=${err.inflightEntries} key=${err.key}`,
@@ -509,7 +519,8 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
           `sync responder snapshot limit exceeded (active=${err.activeEntries}/${err.maxEntries})`,
         );
       }
+      getMetrics().syncResponseTotal.add(1, { outcome: 'error' });
       throw err;
     });
-  });
+  }));
 }

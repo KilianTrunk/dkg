@@ -263,6 +263,9 @@ importers:
       '@noble/hashes':
         specifier: ^2.2.0
         version: 2.2.0
+      '@opentelemetry/api':
+        specifier: ^1.9.1
+        version: 1.9.1
       '@origintrail-official/dkg-chain':
         specifier: workspace:*
         version: link:../chain

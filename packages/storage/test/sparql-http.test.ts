@@ -102,6 +102,19 @@ describe('SparqlHttpStore (test server)', () => {
     expect(insertedQuads.some(q => q.includes('INSERT'))).toBe(true);
   });
 
+  it('rejects RDF literals above the Java MUTF-8 hard limit before update POST', async () => {
+    insertedQuads.length = 0;
+    await expect(store.insert([{
+      subject: 'http://ex.org/s',
+      predicate: 'http://schema.org/text',
+      object: `"${'x'.repeat(70_000)}"`,
+      graph: 'http://ex.org/g',
+    }])).rejects.toMatchObject({
+      code: 'OVERSIZED_RDF_LITERAL',
+    });
+    expect(insertedQuads).toHaveLength(0);
+  });
+
   it('query SELECT sends query to query endpoint and parses bindings', async () => {
     const result = await store.query(
       'SELECT ?name WHERE { GRAPH <http://ex.org/g1> { <http://ex.org/alice> <http://schema.org/name> ?name } }',

@@ -331,6 +331,56 @@ describe('StorageACKHandler', () => {
     expect(decoded.declineMessage).toContain('urn:entity:1');
   });
 
+  it('calls the decline hook with typed, bounded details when returning a decline', async () => {
+    const onDecline = vi.fn();
+    const handler = await createHandler([], { onDecline });
+    const intent = encodePublishIntent({
+      merkleRoot,
+      contextGraphId,
+      publisherPeerId: 'publisher-0',
+      publicByteSize: 300,
+      isPrivate: false,
+      kaCount: 1,
+      rootEntities: ['urn:entity:1'],
+    });
+
+    const response = await handler.handler(intent, fakePeerId);
+    const decoded = decodeStorageACK(response);
+
+    expect(isStorageACKDecline(decoded)).toBe(true);
+    expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM);
+    expect(onDecline).toHaveBeenCalledOnce();
+    expect(onDecline).toHaveBeenCalledWith({
+      code: STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM,
+      contextGraphId,
+      message: expect.stringContaining('No data found in SWM'),
+    });
+    const details = onDecline.mock.calls[0]?.[0];
+    expect(details.message.length).toBeLessThanOrEqual(240);
+  });
+
+  it('ignores decline hook failures and preserves the encoded decline', async () => {
+    const handler = await createHandler([], {
+      onDecline: async () => { throw new Error('logger unavailable'); },
+    });
+    const intent = encodePublishIntent({
+      merkleRoot,
+      contextGraphId,
+      publisherPeerId: 'publisher-0',
+      publicByteSize: 300,
+      isPrivate: false,
+      kaCount: 1,
+      rootEntities: ['urn:entity:1'],
+    });
+
+    const response = await handler.handler(intent, fakePeerId);
+    const decoded = decodeStorageACK(response);
+
+    expect(isStorageACKDecline(decoded)).toBe(true);
+    expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM);
+    expect(decoded.declineMessage).toContain('No data found in SWM');
+  });
+
   it('declines (MERKLE_MISMATCH_IN_SWM) when SWM data does not match the publisher merkle root', async () => {
     const differentQuads = [makeQuad('urn:other', 'urn:p', 'urn:val')];
     const handler = await createHandler(differentQuads);

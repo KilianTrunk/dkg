@@ -198,6 +198,9 @@ import {
   resolveNameToPeerId,
   isPublishQuad,
   isWritableQuad,
+  validateQuadObjectTerms,
+  validateWritableQuadLiteralSizes,
+  oversizedRdfLiteralResponseBody,
   parsePublishRequestBody,
   jsonResponse,
   safeDecodeURIComponent,
@@ -664,6 +667,8 @@ export async function handleMemoryRoutes(ctx: RequestContext): Promise<void> {
         };
       });
 
+      const literalSize = validateWritableQuadLiteralSizes("quads", normalized);
+      if (!literalSize.ok) return jsonResponse(res, 400, literalSize.body);
       await agent.store.insert(normalized);
       return jsonResponse(res, 200, {
         ok: true,
@@ -1646,6 +1651,15 @@ WHERE {
     // of crashing the SWM write path with a TypeError (HTTP 500).
     if (!Array.isArray(quads) || !quads.every(isWritableQuad))
       return jsonResponse(res, 400, { error: '"quads" must be an array of { subject, predicate, object } objects (graph optional); string-shaped quads are not accepted' });
+    // GH #306/#787 (follow-up) — also reject objects that are neither a quoted
+    // literal nor an absolute IRI; otherwise they slip past the shape guard and
+    // crash the RDF parser ("No scheme found in an absolute IRI") with HTTP 500.
+    {
+      const objErr = validateQuadObjectTerms("quads", quads);
+      if (objErr) return jsonResponse(res, 400, { error: objErr });
+    }
+    const literalSize = validateWritableQuadLiteralSizes("quads", quads);
+    if (!literalSize.ok) return jsonResponse(res, 400, literalSize.body);
     const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
       agent,
       contextGraphId,
@@ -2220,6 +2234,15 @@ WHERE {
     // GH #787 / #306 — reject string-shaped / malformed quads (4xx, not a 500 crash).
     if (!Array.isArray(quads) || !quads.every(isWritableQuad))
       return jsonResponse(res, 400, { error: '"quads" must be an array of { subject, predicate, object } objects (graph optional); string-shaped quads are not accepted' });
+    // GH #306/#787 (follow-up) — also reject objects that are neither a quoted
+    // literal nor an absolute IRI; otherwise they slip past the shape guard and
+    // crash the RDF parser ("No scheme found in an absolute IRI") with HTTP 500.
+    {
+      const objErr = validateQuadObjectTerms("quads", quads);
+      if (objErr) return jsonResponse(res, 400, { error: objErr });
+    }
+    const literalSize = validateWritableQuadLiteralSizes("quads", quads);
+    if (!literalSize.ok) return jsonResponse(res, 400, literalSize.body);
     const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
       agent,
       contextGraphId,
@@ -2415,6 +2438,9 @@ WHERE {
       });
     }
 
+    const literalSize = validateWritableQuadLiteralSizes("quads", quads);
+    if (!literalSize.ok) return jsonResponse(res, 400, literalSize.body);
+
     // 5. Write to target layer
     try {
       if (targetLayer === 'swm') {
@@ -2440,6 +2466,9 @@ WHERE {
         await agent.store.insert(quads);
       }
     } catch (err: any) {
+      if (err?.code === "OVERSIZED_RDF_LITERAL") {
+        return jsonResponse(res, 400, oversizedRdfLiteralResponseBody(err));
+      }
       return jsonResponse(res, 500, { error: `Failed to write turn to ${targetLayer}: ${err.message}` });
     }
     emitMemoryGraphChanged?.({

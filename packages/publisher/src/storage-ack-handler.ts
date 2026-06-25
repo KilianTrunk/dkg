@@ -28,6 +28,8 @@ type PeerId = { toString(): string };
 
 const MAX_DECLINE_ENTITY_COUNT = 5;
 const MAX_DECLINE_ENTITY_CHARS = 120;
+const MAX_DECLINE_LOG_CG_ID_CHARS = 160;
+const MAX_DECLINE_LOG_MESSAGE_CHARS = 240;
 
 function compactDeclineText(value: string, maxChars: number): string {
   const compacted = value.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
@@ -96,6 +98,16 @@ export interface StorageACKHandlerConfig {
    * registered on-chain at signing time.
    */
   onSignerRegistrationLookupFailed?: (err: unknown) => void | Promise<void>;
+  /**
+   * Called whenever the handler returns a typed StorageACK decline. The hook
+   * receives bounded, log-safe text; the wire decline message is encoded
+   * unchanged below so publisher-visible behavior stays stable.
+   */
+  onDecline?: (details: {
+    code: StorageACKDeclineCode;
+    contextGraphId: string;
+    message: string;
+  }) => void | Promise<void>;
   /**
    * Codex PR #608: independent curation oracle. The handler MUST verify a
    * publisher's `isEncryptedPayload=true` claim against the CG's real
@@ -266,6 +278,18 @@ export class StorageACKHandler {
     code: StorageACKDeclineCode,
     message: string,
   ): Uint8Array {
+    if (this.config.onDecline) {
+      const details = {
+        code,
+        contextGraphId: compactDeclineText(cgId, MAX_DECLINE_LOG_CG_ID_CHARS),
+        message: compactDeclineText(message, MAX_DECLINE_LOG_MESSAGE_CHARS),
+      };
+      try {
+        void Promise.resolve(this.config.onDecline(details)).catch(() => undefined);
+      } catch {
+        // Logging must never change ACK wire behavior.
+      }
+    }
     return encodeStorageACK({
       merkleRoot: new Uint8Array(0),
       coreNodeSignatureR: new Uint8Array(0),

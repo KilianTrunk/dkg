@@ -622,6 +622,17 @@ export class ACKCollector {
     // and follow the legacy retry path below — declines are strictly
     // additive on the wire.
     const declines = new Map<string, { code: string; message: string }>();
+    // ACKs that arrived over the protocol but failed publisher-side validation
+    // are not "no response". Track them separately so QuorumUnmetError can
+    // distinguish transport silence from an ACK the publisher rejected locally
+    // (signature, merkle root, or chain/RPC identity verification).
+    const ackFailures = new Map<string, { reason: string }>();
+    const recordACKFailure = (peerId: string, reason: string): void => {
+      ackFailures.set(peerId, { reason });
+      // A later terminal ACK-validation failure is more actionable than an
+      // earlier transient decline from the same peer.
+      declines.delete(peerId);
+    };
 
     const formatDeclineDetail = (): string => {
       if (declines.size === 0) return '';
@@ -666,6 +677,15 @@ export class ACKCollector {
             protocolSupported: true,
             ...(advertised !== undefined ? { swmHostModeAdvertised: advertised } : {}),
             reason: ack.subscriptionSource ? `ACK:${ack.subscriptionSource}` : 'ACK',
+          };
+        }
+        const ackFailure = ackFailures.get(peerId);
+        if (ackFailure) {
+          return {
+            peerId,
+            dialOk: true,
+            protocolSupported: true,
+            reason: ackFailure.reason,
           };
         }
         const decline = declines.get(peerId);
@@ -757,6 +777,7 @@ export class ACKCollector {
             // prior entry is intentional — operators care most about
             // why the peer ultimately could not ACK.
             declines.set(peerId, { code, message: declineMessage });
+            ackFailures.delete(peerId);
 
             // Transient declines (SWM replication catching up via
             // gossip) can resolve on a retry, so re-send with backoff
@@ -807,11 +828,13 @@ export class ACKCollector {
 
           const recoveredAddress = this.recoverACKSigner(ack, ackDigest);
           if (!recoveredAddress) {
+            recordACKFailure(peerId, 'INVALID_SIGNATURE');
             log(`[ACKCollector] Invalid ACK signature from ${peerId.slice(-8)}`);
             return null;
           }
 
           if (!this.merkleRootsMatch(ack.merkleRoot, merkleRoot)) {
+            recordACKFailure(peerId, 'MERKLE_ROOT_MISMATCH');
             log(`[ACKCollector] Merkle root mismatch from ${peerId.slice(-8)}`);
             return null;
           }
@@ -843,7 +866,8 @@ export class ACKCollector {
               { attributes: { 'dkg.identity_id': String(identityId) } },
             );
             if (!verdict.valid) {
-              const reason = verdict.reason ?? 'unknown';
+              const reason = sanitizeDeclineField(verdict.reason ?? 'unknown', MAX_DECLINE_CODE_CHARS) || 'unknown';
+              recordACKFailure(peerId, `ACK_VERIFY:${reason}`);
               log(
                 `[ACKCollector] ACK from ${peerId.slice(-8)} rejected: ${reason}` +
                 ` (signer=${recoveredAddress.slice(0, 10)}..., identity=${identityId})`,
@@ -866,6 +890,7 @@ export class ACKCollector {
               { attributes: { 'dkg.identity_id': String(identityId) } },
             );
             if (!valid) {
+              recordACKFailure(peerId, 'ACK_VERIFY:key-not-registered');
               log(`[ACKCollector] Signer ${recoveredAddress.slice(0, 10)}... not registered for identity ${identityId} — rejecting ACK from ${peerId.slice(-8)}`);
               return null;
             }
@@ -876,6 +901,7 @@ export class ACKCollector {
           // stale decline would still appear in `storage_ack_insufficient`
           // if quorum fails for unrelated reasons.
           declines.delete(peerId);
+          ackFailures.delete(peerId);
 
           // PR5: capture the peer-reported ACK-provenance source if
           // present. Pre-PR5 cores never set the field; treat any

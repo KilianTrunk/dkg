@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { StorageACKHandler, type StorageACKHandlerConfig } from '../src/storage-ack-handler.js';
 import { ACKCollector, type ACKCollectorDeps } from '../src/ack-collector.js';
 import {
@@ -51,7 +51,11 @@ describe('V10 UPDATE StorageACK — peer handler + collector quorum', () => {
 
   const fakePeerId = { toString: () => 'publisher-peer' };
 
-  function makeConfig(wallet: ethers.Wallet, identityId: bigint): StorageACKHandlerConfig {
+  function makeConfig(
+    wallet: ethers.Wallet,
+    identityId: bigint,
+    overrides: Partial<StorageACKHandlerConfig> = {},
+  ): StorageACKHandlerConfig {
     return {
       nodeRole: 'core',
       nodeIdentityId: identityId,
@@ -61,6 +65,7 @@ describe('V10 UPDATE StorageACK — peer handler + collector quorum', () => {
       chainId: TEST_CHAIN_ID,
       kav10Address: TEST_KAV10_ADDR,
       isCgCurated: async () => true,
+      ...overrides,
     };
   }
 
@@ -261,6 +266,39 @@ describe('V10 UPDATE StorageACK — peer handler + collector quorum', () => {
     const ack = decodeStorageACK(await handler.updateHandler(intent, fakePeerId));
     expect(isStorageACKDecline(ack)).toBe(true);
     expect(ack.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM);
+  });
+
+  it('calls the decline hook for UPDATE typed declines', async () => {
+    const wallet = ethers.Wallet.createRandom();
+    const onDecline = vi.fn();
+    const handler = new StorageACKHandler(
+      new OxigraphStore() as any,
+      makeConfig(wallet, 42n, { onDecline }),
+      new TypedEventBus() as any,
+    );
+    const intent = encodeUpdateIntent({
+      kaId: kaId.toString(),
+      contextGraphId,
+      preUpdateMerkleRootCount: Number(preUpdateMerkleRootCount),
+      newMerkleRoot,
+      newByteSize: Number(newByteSize),
+      newTokenAmount: newTokenAmount.toString(),
+      mintAmount: Number(mintAmount),
+      burnTokenIds: burnTokenIds.map((b) => b.toString()),
+      newMerkleLeafCount,
+      publisherPeerId: 'publisher-0',
+    });
+
+    const ack = decodeStorageACK(await handler.updateHandler(intent, fakePeerId));
+
+    expect(isStorageACKDecline(ack)).toBe(true);
+    expect(ack.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM);
+    expect(onDecline).toHaveBeenCalledOnce();
+    expect(onDecline).toHaveBeenCalledWith({
+      code: STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM,
+      contextGraphId,
+      message: expect.stringContaining('UpdateStorageACK: no data found in SWM graph'),
+    });
   });
 
   // #1283 — PUBLIC-update byteSize floor. The pre-fix updateHandler verified

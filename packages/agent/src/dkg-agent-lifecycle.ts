@@ -1204,6 +1204,13 @@ export class LifecycleSyncMethods extends DKGAgentBase {
                   `keeping handler active: ${err instanceof Error ? err.message : String(err)}`,
                 );
               },
+              onDecline: (details) => {
+                this.log.warn(
+                  attemptCtx,
+                  `V10 StorageACK declined: code=${details.code} ` +
+                  `cg=${details.contextGraphId} reason=${details.message}`,
+                );
+              },
               // PR5 ACK-provenance — bind to the agent's host-mode
               // bookkeeping so every signed ACK carries which of the
               // four LU-6 Phase B discovery paths brought this CG's

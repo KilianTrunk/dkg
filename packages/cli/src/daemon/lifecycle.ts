@@ -777,6 +777,44 @@ export async function runDaemon(foreground: boolean): Promise<void> {
   }
 }
 
+export async function resolveDaemonPublishEncryption(
+  agent: DKGAgent,
+  publishOptions: {
+    contextGraphId: string;
+    subGraphName?: string;
+    publishContextGraphId?: string;
+  },
+): Promise<{
+  encryptInlinePayload: Awaited<ReturnType<DKGAgent['_resolveEncryptInlinePayload']>>;
+  encryptInlineChunked: Awaited<ReturnType<DKGAgent['_resolveEncryptInlineChunked']>>;
+}> {
+  const requestedTarget = publishOptions.publishContextGraphId?.trim();
+  // Async lift resolves this from the source workspace slice before it reaches
+  // generic PublishOptions. Treat it as binding-only; future explicit async
+  // remaps need a separate provenance field.
+  const bindingOptions = requestedTarget
+    ? { aeadBindingContextGraphId: requestedTarget }
+    : undefined;
+  const encryptInlinePayload = await agent._resolveEncryptInlinePayload(
+    publishOptions.contextGraphId,
+    publishOptions.subGraphName,
+    undefined,
+    undefined,
+    bindingOptions,
+  );
+  const encryptInlineChunked = await agent._resolveEncryptInlineChunked(
+    publishOptions.contextGraphId,
+    publishOptions.subGraphName,
+    undefined,
+    undefined,
+    bindingOptions,
+  );
+  return {
+    encryptInlinePayload,
+    encryptInlineChunked,
+  };
+}
+
 export async function runDaemonInner(
   foreground: boolean,
   config: Awaited<ReturnType<typeof loadConfig>>,
@@ -1756,24 +1794,7 @@ export async function runDaemonInner(
               },
               log,
             }),
-            publishEncryptionFactory: async (publishOptions) => {
-              const encryptInlinePayload = await agent._resolveEncryptInlinePayload(
-                publishOptions.contextGraphId,
-                publishOptions.subGraphName,
-                undefined,
-                publishOptions.publishContextGraphId,
-              );
-              const encryptInlineChunked = await agent._resolveEncryptInlineChunked(
-                publishOptions.contextGraphId,
-                publishOptions.subGraphName,
-                undefined,
-                publishOptions.publishContextGraphId,
-              );
-              return {
-                encryptInlinePayload,
-                encryptInlineChunked,
-              };
-            },
+            publishEncryptionFactory: (publishOptions) => resolveDaemonPublishEncryption(agent, publishOptions),
             log,
           });
           publisherRuntime = runtime;

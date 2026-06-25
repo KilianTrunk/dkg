@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { currentTraceIds } from './telemetry-api.js';
 
 export type OperationName = 'publish' | 'update' | 'query' | 'resolve' | 'connect' | 'sync' | 'system' | 'share' | 'publishFromSWM' | 'gossip' | 'ka-update' | 'reconstruct' | 'init' | 'verify' | 'migrate-swm-attr';
 
@@ -22,6 +23,9 @@ export interface LogRecord {
   sourceOperationId?: string;
   module: string;
   message: string;
+  /** Hex W3C trace/span id of the active span when logged (when a span is recording), for trace↔log correlation. */
+  traceId?: string;
+  spanId?: string;
 }
 
 export type LogSink = (entry: LogRecord) => void;
@@ -44,23 +48,41 @@ export class Logger {
     this.prefix = moduleName;
   }
 
+  /**
+   * Build the structured record and hand it to the sink. Attaches the active
+   * span's trace/span id when one is recording (no-op/empty otherwise), so logs
+   * emitted inside an instrumented boundary correlate to its trace.
+   */
+  private emit(level: string, ctx: OperationContext, message: string): void {
+    if (!Logger.sink) return;
+    Logger.sink({
+      level,
+      operationName: ctx.operationName,
+      operationId: ctx.operationId,
+      sourceOperationId: ctx.sourceOperationId,
+      module: this.moduleName,
+      message,
+      ...currentTraceIds(),
+    });
+  }
+
   debug(ctx: OperationContext, message: string): void {
-    Logger.sink?.({ level: 'debug', operationName: ctx.operationName, operationId: ctx.operationId, sourceOperationId: ctx.sourceOperationId, module: this.moduleName, message });
+    this.emit('debug', ctx, message);
   }
 
   info(ctx: OperationContext, message: string): void {
     process.stdout.write(`${this.format(ctx, message)}\n`);
-    Logger.sink?.({ level: 'info', operationName: ctx.operationName, operationId: ctx.operationId, sourceOperationId: ctx.sourceOperationId, module: this.moduleName, message });
+    this.emit('info', ctx, message);
   }
 
   warn(ctx: OperationContext, message: string): void {
     process.stderr.write(`${this.format(ctx, message)} [WARN]\n`);
-    Logger.sink?.({ level: 'warn', operationName: ctx.operationName, operationId: ctx.operationId, sourceOperationId: ctx.sourceOperationId, module: this.moduleName, message });
+    this.emit('warn', ctx, message);
   }
 
   error(ctx: OperationContext, message: string): void {
     process.stderr.write(`${this.format(ctx, message)} [ERROR]\n`);
-    Logger.sink?.({ level: 'error', operationName: ctx.operationName, operationId: ctx.operationId, sourceOperationId: ctx.sourceOperationId, module: this.moduleName, message });
+    this.emit('error', ctx, message);
   }
 
   private format(ctx: OperationContext, message: string): string {

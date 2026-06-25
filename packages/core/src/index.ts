@@ -10,6 +10,10 @@ export * from './imported-artifact-metadata.js';
 export * from './event-bus.js';
 export { Logger, createOperationContext, type OperationContext, type OperationName, type LogSink, type LogRecord } from './logger.js';
 export { createLogRedactor, redactLogEntry, redactMessage, DEFAULT_SENSITIVE_KEYS, REDACTED } from './log-redaction.js';
+export {
+  getTracer, withSpan, linkedSpan, currentTraceIds, activeSpanContext,
+  getMetrics, rebuildMetrics, type WithSpanOpts, type DkgMetrics,
+} from './telemetry-api.js';
 export * from './crypto/index.js';
 export * from './proto/index.js';
 export {

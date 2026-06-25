@@ -1,0 +1,717 @@
+{
+  "address": "0x3C1Cb427D20F15563aDa8C249E71db76d7183B6c",
+  "abi": [
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "hubAddress",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "constructor"
+    },
+    {
+      "inputs": [],
+      "name": "BackfillForbidden",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "FutureOrCurrentEpoch",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "NegativeCumulative",
+      "type": "error"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "value",
+          "type": "uint256"
+        }
+      ],
+      "name": "SafeCastOverflowedUintToInt",
+      "type": "error"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "string",
+          "name": "msg",
+          "type": "string"
+        }
+      ],
+      "name": "UnauthorizedAccess",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "ZeroAddressHub",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "ZeroLifetime",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "ZeroValue",
+      "type": "error"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "uint256",
+          "name": "cgId",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "startEpoch",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "endEpoch",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "lifetime",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "value",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "perEpoch",
+          "type": "uint256"
+        }
+      ],
+      "name": "CGValueAddedForEpochRange",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "uint256",
+          "name": "cgId",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "startEpoch",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "endEpoch",
+          "type": "uint256"
+        }
+      ],
+      "name": "CGValueFinalized",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "startEpoch",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "endEpoch",
+          "type": "uint256"
+        }
+      ],
+      "name": "GlobalValueFinalized",
+      "type": "event"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "cgId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "startEpoch",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "lifetime",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "value",
+          "type": "uint256"
+        }
+      ],
+      "name": "addCGValueForEpochRange",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "cgId",
+          "type": "uint256"
+        }
+      ],
+      "name": "cgLastFinalizedEpoch",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "cgId",
+          "type": "uint256"
+        }
+      ],
+      "name": "cgShard",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "cgId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "epoch",
+          "type": "uint256"
+        }
+      ],
+      "name": "cgValueCumulative",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "cgId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "epoch",
+          "type": "uint256"
+        }
+      ],
+      "name": "cgValueDiff",
+      "outputs": [
+        {
+          "internalType": "int256",
+          "name": "",
+          "type": "int256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "chronos",
+      "outputs": [
+        {
+          "internalType": "contract Chronos",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "cgId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "epoch",
+          "type": "uint256"
+        }
+      ],
+      "name": "finalizeCGValueUpTo",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "epoch",
+          "type": "uint256"
+        }
+      ],
+      "name": "finalizeGlobalValueUpTo",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "cgId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "epoch",
+          "type": "uint256"
+        }
+      ],
+      "name": "getCGValueAtEpoch",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "cgId",
+          "type": "uint256"
+        }
+      ],
+      "name": "getCurrentCGValue",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "getCurrentTotalValue",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "epoch",
+          "type": "uint256"
+        }
+      ],
+      "name": "getTotalValueAtEpoch",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "globalLastFinalizedEpoch",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "hub",
+      "outputs": [
+        {
+          "internalType": "contract Hub",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "initialize",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "name",
+      "outputs": [
+        {
+          "internalType": "string",
+          "name": "",
+          "type": "string"
+        }
+      ],
+      "stateMutability": "pure",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "shardId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "epoch",
+          "type": "uint256"
+        }
+      ],
+      "name": "shardKnowledgeValue",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "epoch",
+          "type": "uint256"
+        }
+      ],
+      "name": "totalValueCumulative",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "epoch",
+          "type": "uint256"
+        }
+      ],
+      "name": "totalValueDiff",
+      "outputs": [
+        {
+          "internalType": "int256",
+          "name": "",
+          "type": "int256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "version",
+      "outputs": [
+        {
+          "internalType": "string",
+          "name": "",
+          "type": "string"
+        }
+      ],
+      "stateMutability": "pure",
+      "type": "function"
+    }
+  ],
+  "transactionHash": "0xa5bca57d0b468904c91c50dedde59d49eb931a47694455ed52c47e7fcf97dab8",
+  "receipt": {
+    "to": null,
+    "from": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    "contractAddress": "0x3C1Cb427D20F15563aDa8C249E71db76d7183B6c",
+    "transactionIndex": 0,
+    "gasUsed": "955292",
+    "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "blockHash": "0x12950f9f8b24dea109b83f75d619715f4a0e821829b3e40dc87b24ae5ef095a0",
+    "transactionHash": "0xa5bca57d0b468904c91c50dedde59d49eb931a47694455ed52c47e7fcf97dab8",
+    "logs": [],
+    "blockNumber": 257,
+    "cumulativeGasUsed": "955292",
+    "status": 1,
+    "byzantium": true
+  },
+  "args": [
+    "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+  ],
+  "numDeployments": 1,
+  "solcInputHash": "25f7b97326fdffc4ccdb60a7767831e0",
+  "metadata": "{\"compiler\":{\"version\":\"0.8.20+commit.a1b79de6\"},\"language\":\"Solidity\",\"output\":{\"abi\":[{\"inputs\":[{\"internalType\":\"address\",\"name\":\"hubAddress\",\"type\":\"address\"}],\"stateMutability\":\"nonpayable\",\"type\":\"constructor\"},{\"inputs\":[],\"name\":\"BackfillForbidden\",\"type\":\"error\"},{\"inputs\":[],\"name\":\"FutureOrCurrentEpoch\",\"type\":\"error\"},{\"inputs\":[],\"name\":\"NegativeCumulative\",\"type\":\"error\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"value\",\"type\":\"uint256\"}],\"name\":\"SafeCastOverflowedUintToInt\",\"type\":\"error\"},{\"inputs\":[{\"internalType\":\"string\",\"name\":\"msg\",\"type\":\"string\"}],\"name\":\"UnauthorizedAccess\",\"type\":\"error\"},{\"inputs\":[],\"name\":\"ZeroAddressHub\",\"type\":\"error\"},{\"inputs\":[],\"name\":\"ZeroLifetime\",\"type\":\"error\"},{\"inputs\":[],\"name\":\"ZeroValue\",\"type\":\"error\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"uint256\",\"name\":\"cgId\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"startEpoch\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"endEpoch\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"lifetime\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"value\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"perEpoch\",\"type\":\"uint256\"}],\"name\":\"CGValueAddedForEpochRange\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"uint256\",\"name\":\"cgId\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"startEpoch\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"endEpoch\",\"type\":\"uint256\"}],\"name\":\"CGValueFinalized\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"startEpoch\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"endEpoch\",\"type\":\"uint256\"}],\"name\":\"GlobalValueFinalized\",\"type\":\"event\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"cgId\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"startEpoch\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"lifetime\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"value\",\"type\":\"uint256\"}],\"name\":\"addCGValueForEpochRange\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"cgId\",\"type\":\"uint256\"}],\"name\":\"cgLastFinalizedEpoch\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"cgId\",\"type\":\"uint256\"}],\"name\":\"cgShard\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"cgId\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"epoch\",\"type\":\"uint256\"}],\"name\":\"cgValueCumulative\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"cgId\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"epoch\",\"type\":\"uint256\"}],\"name\":\"cgValueDiff\",\"outputs\":[{\"internalType\":\"int256\",\"name\":\"\",\"type\":\"int256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"chronos\",\"outputs\":[{\"internalType\":\"contract Chronos\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"cgId\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"epoch\",\"type\":\"uint256\"}],\"name\":\"finalizeCGValueUpTo\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"epoch\",\"type\":\"uint256\"}],\"name\":\"finalizeGlobalValueUpTo\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"cgId\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"epoch\",\"type\":\"uint256\"}],\"name\":\"getCGValueAtEpoch\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"cgId\",\"type\":\"uint256\"}],\"name\":\"getCurrentCGValue\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"getCurrentTotalValue\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"epoch\",\"type\":\"uint256\"}],\"name\":\"getTotalValueAtEpoch\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"globalLastFinalizedEpoch\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"hub\",\"outputs\":[{\"internalType\":\"contract Hub\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"initialize\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"name\",\"outputs\":[{\"internalType\":\"string\",\"name\":\"\",\"type\":\"string\"}],\"stateMutability\":\"pure\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"shardId\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"epoch\",\"type\":\"uint256\"}],\"name\":\"shardKnowledgeValue\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"epoch\",\"type\":\"uint256\"}],\"name\":\"totalValueCumulative\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"epoch\",\"type\":\"uint256\"}],\"name\":\"totalValueDiff\",\"outputs\":[{\"internalType\":\"int256\",\"name\":\"\",\"type\":\"int256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"version\",\"outputs\":[{\"internalType\":\"string\",\"name\":\"\",\"type\":\"string\"}],\"stateMutability\":\"pure\",\"type\":\"function\"}],\"devdoc\":{\"errors\":{\"SafeCastOverflowedUintToInt(uint256)\":[{\"details\":\"An uint value doesn't fit in an int of `bits` size.\"}]},\"kind\":\"dev\",\"methods\":{\"addCGValueForEpochRange(uint256,uint256,uint256,uint256)\":{\"details\":\"Mirrors `EpochStorage.addTokensToEpochRange`. Finalizes per-CG and      global ledgers up to `currentEpoch - 1` after the diff writes so      stale epochs are crystallized before the next read. Rounding dust is      discarded per the spec (challenge weighting, not reward payout).      Invariant: `startEpoch >= currentEpoch`. Backfilling into an      already-finalized epoch would corrupt `cgValueCumulative` silently      because the cumulative at that epoch has already been crystallized      and subsequent reads hit the fast path. Reverts `BackfillForbidden`      if the caller tries.      Retraction / expiry is automatic via the paired negative diff      written at `startEpoch + lifetime`. There is no removal function      by design: Phase 8 value-changing ops (CREATE, byte-size-grow      UPDATE, lifetime extension) are all positive deltas, and natural      expiry is handled by the diff ledger itself.\"},\"finalizeCGValueUpTo(uint256,uint256)\":{\"details\":\"Intended to be called by RandomSampling before a challenge draw      (see V10_CONTRACTS_REDESIGN_v2 \\\"On challenge generation\\\"), but any      Hub-registered contract may call it. Reads stay pure `view`; this      is the state-changing half of the \\\"finalize then read\\\" pattern.Reverts FutureOrCurrentEpoch if `epoch` is at or beyond the current      epoch. Only past epochs may be finalized; current-epoch reads always      take the simulation path to reflect in-flight diff writes.\"},\"finalizeGlobalValueUpTo(uint256)\":{\"details\":\"Reverts FutureOrCurrentEpoch if `epoch` is at or beyond the current      epoch. Only past epochs may be finalized; current-epoch reads always      take the simulation path to reflect in-flight diff writes.\"}},\"stateVariables\":{\"cgShard\":{\"details\":\"Reserved storage slots for future V11 sharding. Setters will be      added alongside the V11 logic contracts; no API exists today.\"}},\"title\":\"ContextGraphValueStorage\",\"version\":1},\"userdoc\":{\"kind\":\"user\",\"methods\":{\"addCGValueForEpochRange(uint256,uint256,uint256,uint256)\":{\"notice\":\"Record that `value` TRAC will be paid for `cgId` spread evenly         across `lifetime` epochs starting at `startEpoch`. Each epoch in         [startEpoch, startEpoch + lifetime - 1] receives `value/lifetime`.\"},\"finalizeCGValueUpTo(uint256,uint256)\":{\"notice\":\"Crystallizes `cgValueCumulative[cgId]` up to `epoch` so         subsequent reads at or below `epoch` become O(1). Safe to call         repeatedly: a call with `epoch <= cgLastFinalizedEpoch[cgId]`         is a no-op.\"},\"finalizeGlobalValueUpTo(uint256)\":{\"notice\":\"Crystallizes `totalValueCumulative` up to `epoch`. See         {finalizeCGValueUpTo} for semantics.\"},\"getCGValueAtEpoch(uint256,uint256)\":{\"notice\":\"Active per-epoch contribution of `cgId` at `epoch` (sum of all         active KAs' per-epoch values at that epoch). Returns the         simulated value if the epoch has not been finalized yet.\"},\"getTotalValueAtEpoch(uint256)\":{\"notice\":\"Global sum across all CGs of active per-epoch contributions at `epoch`.\"}},\"notice\":\"Lightweight per-CG and global per-epoch TRAC value tracker for V10         value-weighted challenges. Mirrors `EpochStorage.sol` diff/cumulative         finalize pattern at lines 149-174 / 279-310 exactly, but scaled to         int256/uint256 because publish values are wei-of-TRAC and exceed uint96. Design rationale (see V10_CONTRACTS_REDESIGN_v2.md \\u00a7\\\"Data in ContextGraphValueStorage\\\"): a KA published with value `V` for `lifetime` epochs contributes `V / lifetime` per epoch during its active window [startEpoch, startEpoch + lifetime - 1]. Expiry is handled implicitly by the negative diff written at `startEpoch + lifetime`. No cleanup, no keeper. `addCGValueForEpochRange` uses plain integer division per the spec. A couple wei of rounding dust per publish is acceptable \\u2014 this mapping is used for challenge weighting, not reward distribution. The dormant shard mappings (`cgShard`, `shardKnowledgeValue`) are reserved storage slots for future V11 sharding. Setters will be added alongside the V11 logic contracts; no API exists today.\",\"version\":1}},\"settings\":{\"compilationTarget\":{\"contracts/storage/ContextGraphValueStorage.sol\":\"ContextGraphValueStorage\"},\"evmVersion\":\"london\",\"libraries\":{},\"metadata\":{\"bytecodeHash\":\"ipfs\",\"useLiteralContent\":true},\"optimizer\":{\"enabled\":true,\"runs\":200},\"remappings\":[],\"viaIR\":true},\"sources\":{\"@openzeppelin/contracts/access/Ownable.sol\":{\"content\":\"// SPDX-License-Identifier: MIT\\n// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)\\n\\npragma solidity ^0.8.20;\\n\\nimport {Context} from \\\"../utils/Context.sol\\\";\\n\\n/**\\n * @dev Contract module which provides a basic access control mechanism, where\\n * there is an account (an owner) that can be granted exclusive access to\\n * specific functions.\\n *\\n * The initial owner is set to the address provided by the deployer. This can\\n * later be changed with {transferOwnership}.\\n *\\n * This module is used through inheritance. It will make available the modifier\\n * `onlyOwner`, which can be applied to your functions to restrict their use to\\n * the owner.\\n */\\nabstract contract Ownable is Context {\\n    address private _owner;\\n\\n    /**\\n     * @dev The caller account is not authorized to perform an operation.\\n     */\\n    error OwnableUnauthorizedAccount(address account);\\n\\n    /**\\n     * @dev The owner is not a valid owner account. (eg. `address(0)`)\\n     */\\n    error OwnableInvalidOwner(address owner);\\n\\n    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);\\n\\n    /**\\n     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.\\n     */\\n    constructor(address initialOwner) {\\n        if (initialOwner == address(0)) {\\n            revert OwnableInvalidOwner(address(0));\\n        }\\n        _transferOwnership(initialOwner);\\n    }\\n\\n    /**\\n     * @dev Throws if called by any account other than the owner.\\n     */\\n    modifier onlyOwner() {\\n        _checkOwner();\\n        _;\\n    }\\n\\n    /**\\n     * @dev Returns the address of the current owner.\\n     */\\n    function owner() public view virtual returns (address) {\\n        return _owner;\\n    }\\n\\n    /**\\n     * @dev Throws if the sender is not the owner.\\n     */\\n    function _checkOwner() internal view virtual {\\n        if (owner() != _msgSender()) {\\n            revert OwnableUnauthorizedAccount(_msgSender());\\n        }\\n    }\\n\\n    /**\\n     * @dev Leaves the contract without owner. It will not be possible to call\\n     * `onlyOwner` functions. Can only be called by the current owner.\\n     *\\n     * NOTE: Renouncing ownership will leave the contract without an owner,\\n     * thereby disabling any functionality that is only available to the owner.\\n     */\\n    function renounceOwnership() public virtual onlyOwner {\\n        _transferOwnership(address(0));\\n    }\\n\\n    /**\\n     * @dev Transfers ownership of the contract to a new account (`newOwner`).\\n     * Can only be called by the current owner.\\n     */\\n    function transferOwnership(address newOwner) public virtual onlyOwner {\\n        if (newOwner == address(0)) {\\n            revert OwnableInvalidOwner(address(0));\\n        }\\n        _transferOwnership(newOwner);\\n    }\\n\\n    /**\\n     * @dev Transfers ownership of the contract to a new account (`newOwner`).\\n     * Internal function without access restriction.\\n     */\\n    function _transferOwnership(address newOwner) internal virtual {\\n        address oldOwner = _owner;\\n        _owner = newOwner;\\n        emit OwnershipTransferred(oldOwner, newOwner);\\n    }\\n}\\n\",\"keccak256\":\"0xff6d0bb2e285473e5311d9d3caacb525ae3538a80758c10649a4d61029b017bb\",\"license\":\"MIT\"},\"@openzeppelin/contracts/utils/Context.sol\":{\"content\":\"// SPDX-License-Identifier: MIT\\n// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)\\n\\npragma solidity ^0.8.20;\\n\\n/**\\n * @dev Provides information about the current execution context, including the\\n * sender of the transaction and its data. While these are generally available\\n * via msg.sender and msg.data, they should not be accessed in such a direct\\n * manner, since when dealing with meta-transactions the account sending and\\n * paying for execution may not be the actual sender (as far as an application\\n * is concerned).\\n *\\n * This contract is only required for intermediate, library-like contracts.\\n */\\nabstract contract Context {\\n    function _msgSender() internal view virtual returns (address) {\\n        return msg.sender;\\n    }\\n\\n    function _msgData() internal view virtual returns (bytes calldata) {\\n        return msg.data;\\n    }\\n\\n    function _contextSuffixLength() internal view virtual returns (uint256) {\\n        return 0;\\n    }\\n}\\n\",\"keccak256\":\"0x493033a8d1b176a037b2cc6a04dad01a5c157722049bbecf632ca876224dd4b2\",\"license\":\"MIT\"},\"@openzeppelin/contracts/utils/math/SafeCast.sol\":{\"content\":\"// SPDX-License-Identifier: MIT\\n// OpenZeppelin Contracts (last updated v5.1.0) (utils/math/SafeCast.sol)\\n// This file was procedurally generated from scripts/generate/templates/SafeCast.js.\\n\\npragma solidity ^0.8.20;\\n\\n/**\\n * @dev Wrappers over Solidity's uintXX/intXX/bool casting operators with added overflow\\n * checks.\\n *\\n * Downcasting from uint256/int256 in Solidity does not revert on overflow. This can\\n * easily result in undesired exploitation or bugs, since developers usually\\n * assume that overflows raise errors. `SafeCast` restores this intuition by\\n * reverting the transaction when such an operation overflows.\\n *\\n * Using this library instead of the unchecked operations eliminates an entire\\n * class of bugs, so it's recommended to use it always.\\n */\\nlibrary SafeCast {\\n    /**\\n     * @dev Value doesn't fit in an uint of `bits` size.\\n     */\\n    error SafeCastOverflowedUintDowncast(uint8 bits, uint256 value);\\n\\n    /**\\n     * @dev An int value doesn't fit in an uint of `bits` size.\\n     */\\n    error SafeCastOverflowedIntToUint(int256 value);\\n\\n    /**\\n     * @dev Value doesn't fit in an int of `bits` size.\\n     */\\n    error SafeCastOverflowedIntDowncast(uint8 bits, int256 value);\\n\\n    /**\\n     * @dev An uint value doesn't fit in an int of `bits` size.\\n     */\\n    error SafeCastOverflowedUintToInt(uint256 value);\\n\\n    /**\\n     * @dev Returns the downcasted uint248 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint248).\\n     *\\n     * Counterpart to Solidity's `uint248` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 248 bits\\n     */\\n    function toUint248(uint256 value) internal pure returns (uint248) {\\n        if (value > type(uint248).max) {\\n            revert SafeCastOverflowedUintDowncast(248, value);\\n        }\\n        return uint248(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint240 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint240).\\n     *\\n     * Counterpart to Solidity's `uint240` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 240 bits\\n     */\\n    function toUint240(uint256 value) internal pure returns (uint240) {\\n        if (value > type(uint240).max) {\\n            revert SafeCastOverflowedUintDowncast(240, value);\\n        }\\n        return uint240(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint232 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint232).\\n     *\\n     * Counterpart to Solidity's `uint232` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 232 bits\\n     */\\n    function toUint232(uint256 value) internal pure returns (uint232) {\\n        if (value > type(uint232).max) {\\n            revert SafeCastOverflowedUintDowncast(232, value);\\n        }\\n        return uint232(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint224 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint224).\\n     *\\n     * Counterpart to Solidity's `uint224` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 224 bits\\n     */\\n    function toUint224(uint256 value) internal pure returns (uint224) {\\n        if (value > type(uint224).max) {\\n            revert SafeCastOverflowedUintDowncast(224, value);\\n        }\\n        return uint224(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint216 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint216).\\n     *\\n     * Counterpart to Solidity's `uint216` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 216 bits\\n     */\\n    function toUint216(uint256 value) internal pure returns (uint216) {\\n        if (value > type(uint216).max) {\\n            revert SafeCastOverflowedUintDowncast(216, value);\\n        }\\n        return uint216(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint208 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint208).\\n     *\\n     * Counterpart to Solidity's `uint208` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 208 bits\\n     */\\n    function toUint208(uint256 value) internal pure returns (uint208) {\\n        if (value > type(uint208).max) {\\n            revert SafeCastOverflowedUintDowncast(208, value);\\n        }\\n        return uint208(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint200 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint200).\\n     *\\n     * Counterpart to Solidity's `uint200` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 200 bits\\n     */\\n    function toUint200(uint256 value) internal pure returns (uint200) {\\n        if (value > type(uint200).max) {\\n            revert SafeCastOverflowedUintDowncast(200, value);\\n        }\\n        return uint200(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint192 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint192).\\n     *\\n     * Counterpart to Solidity's `uint192` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 192 bits\\n     */\\n    function toUint192(uint256 value) internal pure returns (uint192) {\\n        if (value > type(uint192).max) {\\n            revert SafeCastOverflowedUintDowncast(192, value);\\n        }\\n        return uint192(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint184 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint184).\\n     *\\n     * Counterpart to Solidity's `uint184` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 184 bits\\n     */\\n    function toUint184(uint256 value) internal pure returns (uint184) {\\n        if (value > type(uint184).max) {\\n            revert SafeCastOverflowedUintDowncast(184, value);\\n        }\\n        return uint184(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint176 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint176).\\n     *\\n     * Counterpart to Solidity's `uint176` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 176 bits\\n     */\\n    function toUint176(uint256 value) internal pure returns (uint176) {\\n        if (value > type(uint176).max) {\\n            revert SafeCastOverflowedUintDowncast(176, value);\\n        }\\n        return uint176(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint168 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint168).\\n     *\\n     * Counterpart to Solidity's `uint168` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 168 bits\\n     */\\n    function toUint168(uint256 value) internal pure returns (uint168) {\\n        if (value > type(uint168).max) {\\n            revert SafeCastOverflowedUintDowncast(168, value);\\n        }\\n        return uint168(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint160 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint160).\\n     *\\n     * Counterpart to Solidity's `uint160` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 160 bits\\n     */\\n    function toUint160(uint256 value) internal pure returns (uint160) {\\n        if (value > type(uint160).max) {\\n            revert SafeCastOverflowedUintDowncast(160, value);\\n        }\\n        return uint160(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint152 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint152).\\n     *\\n     * Counterpart to Solidity's `uint152` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 152 bits\\n     */\\n    function toUint152(uint256 value) internal pure returns (uint152) {\\n        if (value > type(uint152).max) {\\n            revert SafeCastOverflowedUintDowncast(152, value);\\n        }\\n        return uint152(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint144 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint144).\\n     *\\n     * Counterpart to Solidity's `uint144` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 144 bits\\n     */\\n    function toUint144(uint256 value) internal pure returns (uint144) {\\n        if (value > type(uint144).max) {\\n            revert SafeCastOverflowedUintDowncast(144, value);\\n        }\\n        return uint144(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint136 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint136).\\n     *\\n     * Counterpart to Solidity's `uint136` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 136 bits\\n     */\\n    function toUint136(uint256 value) internal pure returns (uint136) {\\n        if (value > type(uint136).max) {\\n            revert SafeCastOverflowedUintDowncast(136, value);\\n        }\\n        return uint136(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint128 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint128).\\n     *\\n     * Counterpart to Solidity's `uint128` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 128 bits\\n     */\\n    function toUint128(uint256 value) internal pure returns (uint128) {\\n        if (value > type(uint128).max) {\\n            revert SafeCastOverflowedUintDowncast(128, value);\\n        }\\n        return uint128(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint120 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint120).\\n     *\\n     * Counterpart to Solidity's `uint120` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 120 bits\\n     */\\n    function toUint120(uint256 value) internal pure returns (uint120) {\\n        if (value > type(uint120).max) {\\n            revert SafeCastOverflowedUintDowncast(120, value);\\n        }\\n        return uint120(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint112 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint112).\\n     *\\n     * Counterpart to Solidity's `uint112` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 112 bits\\n     */\\n    function toUint112(uint256 value) internal pure returns (uint112) {\\n        if (value > type(uint112).max) {\\n            revert SafeCastOverflowedUintDowncast(112, value);\\n        }\\n        return uint112(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint104 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint104).\\n     *\\n     * Counterpart to Solidity's `uint104` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 104 bits\\n     */\\n    function toUint104(uint256 value) internal pure returns (uint104) {\\n        if (value > type(uint104).max) {\\n            revert SafeCastOverflowedUintDowncast(104, value);\\n        }\\n        return uint104(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint96 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint96).\\n     *\\n     * Counterpart to Solidity's `uint96` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 96 bits\\n     */\\n    function toUint96(uint256 value) internal pure returns (uint96) {\\n        if (value > type(uint96).max) {\\n            revert SafeCastOverflowedUintDowncast(96, value);\\n        }\\n        return uint96(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint88 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint88).\\n     *\\n     * Counterpart to Solidity's `uint88` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 88 bits\\n     */\\n    function toUint88(uint256 value) internal pure returns (uint88) {\\n        if (value > type(uint88).max) {\\n            revert SafeCastOverflowedUintDowncast(88, value);\\n        }\\n        return uint88(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint80 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint80).\\n     *\\n     * Counterpart to Solidity's `uint80` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 80 bits\\n     */\\n    function toUint80(uint256 value) internal pure returns (uint80) {\\n        if (value > type(uint80).max) {\\n            revert SafeCastOverflowedUintDowncast(80, value);\\n        }\\n        return uint80(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint72 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint72).\\n     *\\n     * Counterpart to Solidity's `uint72` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 72 bits\\n     */\\n    function toUint72(uint256 value) internal pure returns (uint72) {\\n        if (value > type(uint72).max) {\\n            revert SafeCastOverflowedUintDowncast(72, value);\\n        }\\n        return uint72(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint64 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint64).\\n     *\\n     * Counterpart to Solidity's `uint64` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 64 bits\\n     */\\n    function toUint64(uint256 value) internal pure returns (uint64) {\\n        if (value > type(uint64).max) {\\n            revert SafeCastOverflowedUintDowncast(64, value);\\n        }\\n        return uint64(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint56 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint56).\\n     *\\n     * Counterpart to Solidity's `uint56` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 56 bits\\n     */\\n    function toUint56(uint256 value) internal pure returns (uint56) {\\n        if (value > type(uint56).max) {\\n            revert SafeCastOverflowedUintDowncast(56, value);\\n        }\\n        return uint56(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint48 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint48).\\n     *\\n     * Counterpart to Solidity's `uint48` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 48 bits\\n     */\\n    function toUint48(uint256 value) internal pure returns (uint48) {\\n        if (value > type(uint48).max) {\\n            revert SafeCastOverflowedUintDowncast(48, value);\\n        }\\n        return uint48(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint40 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint40).\\n     *\\n     * Counterpart to Solidity's `uint40` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 40 bits\\n     */\\n    function toUint40(uint256 value) internal pure returns (uint40) {\\n        if (value > type(uint40).max) {\\n            revert SafeCastOverflowedUintDowncast(40, value);\\n        }\\n        return uint40(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint32 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint32).\\n     *\\n     * Counterpart to Solidity's `uint32` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 32 bits\\n     */\\n    function toUint32(uint256 value) internal pure returns (uint32) {\\n        if (value > type(uint32).max) {\\n            revert SafeCastOverflowedUintDowncast(32, value);\\n        }\\n        return uint32(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint24 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint24).\\n     *\\n     * Counterpart to Solidity's `uint24` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 24 bits\\n     */\\n    function toUint24(uint256 value) internal pure returns (uint24) {\\n        if (value > type(uint24).max) {\\n            revert SafeCastOverflowedUintDowncast(24, value);\\n        }\\n        return uint24(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint16 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint16).\\n     *\\n     * Counterpart to Solidity's `uint16` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 16 bits\\n     */\\n    function toUint16(uint256 value) internal pure returns (uint16) {\\n        if (value > type(uint16).max) {\\n            revert SafeCastOverflowedUintDowncast(16, value);\\n        }\\n        return uint16(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted uint8 from uint256, reverting on\\n     * overflow (when the input is greater than largest uint8).\\n     *\\n     * Counterpart to Solidity's `uint8` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 8 bits\\n     */\\n    function toUint8(uint256 value) internal pure returns (uint8) {\\n        if (value > type(uint8).max) {\\n            revert SafeCastOverflowedUintDowncast(8, value);\\n        }\\n        return uint8(value);\\n    }\\n\\n    /**\\n     * @dev Converts a signed int256 into an unsigned uint256.\\n     *\\n     * Requirements:\\n     *\\n     * - input must be greater than or equal to 0.\\n     */\\n    function toUint256(int256 value) internal pure returns (uint256) {\\n        if (value < 0) {\\n            revert SafeCastOverflowedIntToUint(value);\\n        }\\n        return uint256(value);\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int248 from int256, reverting on\\n     * overflow (when the input is less than smallest int248 or\\n     * greater than largest int248).\\n     *\\n     * Counterpart to Solidity's `int248` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 248 bits\\n     */\\n    function toInt248(int256 value) internal pure returns (int248 downcasted) {\\n        downcasted = int248(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(248, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int240 from int256, reverting on\\n     * overflow (when the input is less than smallest int240 or\\n     * greater than largest int240).\\n     *\\n     * Counterpart to Solidity's `int240` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 240 bits\\n     */\\n    function toInt240(int256 value) internal pure returns (int240 downcasted) {\\n        downcasted = int240(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(240, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int232 from int256, reverting on\\n     * overflow (when the input is less than smallest int232 or\\n     * greater than largest int232).\\n     *\\n     * Counterpart to Solidity's `int232` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 232 bits\\n     */\\n    function toInt232(int256 value) internal pure returns (int232 downcasted) {\\n        downcasted = int232(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(232, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int224 from int256, reverting on\\n     * overflow (when the input is less than smallest int224 or\\n     * greater than largest int224).\\n     *\\n     * Counterpart to Solidity's `int224` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 224 bits\\n     */\\n    function toInt224(int256 value) internal pure returns (int224 downcasted) {\\n        downcasted = int224(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(224, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int216 from int256, reverting on\\n     * overflow (when the input is less than smallest int216 or\\n     * greater than largest int216).\\n     *\\n     * Counterpart to Solidity's `int216` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 216 bits\\n     */\\n    function toInt216(int256 value) internal pure returns (int216 downcasted) {\\n        downcasted = int216(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(216, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int208 from int256, reverting on\\n     * overflow (when the input is less than smallest int208 or\\n     * greater than largest int208).\\n     *\\n     * Counterpart to Solidity's `int208` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 208 bits\\n     */\\n    function toInt208(int256 value) internal pure returns (int208 downcasted) {\\n        downcasted = int208(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(208, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int200 from int256, reverting on\\n     * overflow (when the input is less than smallest int200 or\\n     * greater than largest int200).\\n     *\\n     * Counterpart to Solidity's `int200` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 200 bits\\n     */\\n    function toInt200(int256 value) internal pure returns (int200 downcasted) {\\n        downcasted = int200(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(200, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int192 from int256, reverting on\\n     * overflow (when the input is less than smallest int192 or\\n     * greater than largest int192).\\n     *\\n     * Counterpart to Solidity's `int192` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 192 bits\\n     */\\n    function toInt192(int256 value) internal pure returns (int192 downcasted) {\\n        downcasted = int192(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(192, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int184 from int256, reverting on\\n     * overflow (when the input is less than smallest int184 or\\n     * greater than largest int184).\\n     *\\n     * Counterpart to Solidity's `int184` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 184 bits\\n     */\\n    function toInt184(int256 value) internal pure returns (int184 downcasted) {\\n        downcasted = int184(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(184, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int176 from int256, reverting on\\n     * overflow (when the input is less than smallest int176 or\\n     * greater than largest int176).\\n     *\\n     * Counterpart to Solidity's `int176` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 176 bits\\n     */\\n    function toInt176(int256 value) internal pure returns (int176 downcasted) {\\n        downcasted = int176(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(176, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int168 from int256, reverting on\\n     * overflow (when the input is less than smallest int168 or\\n     * greater than largest int168).\\n     *\\n     * Counterpart to Solidity's `int168` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 168 bits\\n     */\\n    function toInt168(int256 value) internal pure returns (int168 downcasted) {\\n        downcasted = int168(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(168, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int160 from int256, reverting on\\n     * overflow (when the input is less than smallest int160 or\\n     * greater than largest int160).\\n     *\\n     * Counterpart to Solidity's `int160` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 160 bits\\n     */\\n    function toInt160(int256 value) internal pure returns (int160 downcasted) {\\n        downcasted = int160(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(160, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int152 from int256, reverting on\\n     * overflow (when the input is less than smallest int152 or\\n     * greater than largest int152).\\n     *\\n     * Counterpart to Solidity's `int152` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 152 bits\\n     */\\n    function toInt152(int256 value) internal pure returns (int152 downcasted) {\\n        downcasted = int152(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(152, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int144 from int256, reverting on\\n     * overflow (when the input is less than smallest int144 or\\n     * greater than largest int144).\\n     *\\n     * Counterpart to Solidity's `int144` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 144 bits\\n     */\\n    function toInt144(int256 value) internal pure returns (int144 downcasted) {\\n        downcasted = int144(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(144, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int136 from int256, reverting on\\n     * overflow (when the input is less than smallest int136 or\\n     * greater than largest int136).\\n     *\\n     * Counterpart to Solidity's `int136` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 136 bits\\n     */\\n    function toInt136(int256 value) internal pure returns (int136 downcasted) {\\n        downcasted = int136(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(136, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int128 from int256, reverting on\\n     * overflow (when the input is less than smallest int128 or\\n     * greater than largest int128).\\n     *\\n     * Counterpart to Solidity's `int128` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 128 bits\\n     */\\n    function toInt128(int256 value) internal pure returns (int128 downcasted) {\\n        downcasted = int128(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(128, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int120 from int256, reverting on\\n     * overflow (when the input is less than smallest int120 or\\n     * greater than largest int120).\\n     *\\n     * Counterpart to Solidity's `int120` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 120 bits\\n     */\\n    function toInt120(int256 value) internal pure returns (int120 downcasted) {\\n        downcasted = int120(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(120, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int112 from int256, reverting on\\n     * overflow (when the input is less than smallest int112 or\\n     * greater than largest int112).\\n     *\\n     * Counterpart to Solidity's `int112` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 112 bits\\n     */\\n    function toInt112(int256 value) internal pure returns (int112 downcasted) {\\n        downcasted = int112(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(112, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int104 from int256, reverting on\\n     * overflow (when the input is less than smallest int104 or\\n     * greater than largest int104).\\n     *\\n     * Counterpart to Solidity's `int104` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 104 bits\\n     */\\n    function toInt104(int256 value) internal pure returns (int104 downcasted) {\\n        downcasted = int104(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(104, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int96 from int256, reverting on\\n     * overflow (when the input is less than smallest int96 or\\n     * greater than largest int96).\\n     *\\n     * Counterpart to Solidity's `int96` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 96 bits\\n     */\\n    function toInt96(int256 value) internal pure returns (int96 downcasted) {\\n        downcasted = int96(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(96, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int88 from int256, reverting on\\n     * overflow (when the input is less than smallest int88 or\\n     * greater than largest int88).\\n     *\\n     * Counterpart to Solidity's `int88` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 88 bits\\n     */\\n    function toInt88(int256 value) internal pure returns (int88 downcasted) {\\n        downcasted = int88(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(88, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int80 from int256, reverting on\\n     * overflow (when the input is less than smallest int80 or\\n     * greater than largest int80).\\n     *\\n     * Counterpart to Solidity's `int80` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 80 bits\\n     */\\n    function toInt80(int256 value) internal pure returns (int80 downcasted) {\\n        downcasted = int80(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(80, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int72 from int256, reverting on\\n     * overflow (when the input is less than smallest int72 or\\n     * greater than largest int72).\\n     *\\n     * Counterpart to Solidity's `int72` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 72 bits\\n     */\\n    function toInt72(int256 value) internal pure returns (int72 downcasted) {\\n        downcasted = int72(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(72, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int64 from int256, reverting on\\n     * overflow (when the input is less than smallest int64 or\\n     * greater than largest int64).\\n     *\\n     * Counterpart to Solidity's `int64` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 64 bits\\n     */\\n    function toInt64(int256 value) internal pure returns (int64 downcasted) {\\n        downcasted = int64(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(64, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int56 from int256, reverting on\\n     * overflow (when the input is less than smallest int56 or\\n     * greater than largest int56).\\n     *\\n     * Counterpart to Solidity's `int56` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 56 bits\\n     */\\n    function toInt56(int256 value) internal pure returns (int56 downcasted) {\\n        downcasted = int56(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(56, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int48 from int256, reverting on\\n     * overflow (when the input is less than smallest int48 or\\n     * greater than largest int48).\\n     *\\n     * Counterpart to Solidity's `int48` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 48 bits\\n     */\\n    function toInt48(int256 value) internal pure returns (int48 downcasted) {\\n        downcasted = int48(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(48, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int40 from int256, reverting on\\n     * overflow (when the input is less than smallest int40 or\\n     * greater than largest int40).\\n     *\\n     * Counterpart to Solidity's `int40` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 40 bits\\n     */\\n    function toInt40(int256 value) internal pure returns (int40 downcasted) {\\n        downcasted = int40(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(40, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int32 from int256, reverting on\\n     * overflow (when the input is less than smallest int32 or\\n     * greater than largest int32).\\n     *\\n     * Counterpart to Solidity's `int32` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 32 bits\\n     */\\n    function toInt32(int256 value) internal pure returns (int32 downcasted) {\\n        downcasted = int32(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(32, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int24 from int256, reverting on\\n     * overflow (when the input is less than smallest int24 or\\n     * greater than largest int24).\\n     *\\n     * Counterpart to Solidity's `int24` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 24 bits\\n     */\\n    function toInt24(int256 value) internal pure returns (int24 downcasted) {\\n        downcasted = int24(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(24, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int16 from int256, reverting on\\n     * overflow (when the input is less than smallest int16 or\\n     * greater than largest int16).\\n     *\\n     * Counterpart to Solidity's `int16` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 16 bits\\n     */\\n    function toInt16(int256 value) internal pure returns (int16 downcasted) {\\n        downcasted = int16(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(16, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Returns the downcasted int8 from int256, reverting on\\n     * overflow (when the input is less than smallest int8 or\\n     * greater than largest int8).\\n     *\\n     * Counterpart to Solidity's `int8` operator.\\n     *\\n     * Requirements:\\n     *\\n     * - input must fit into 8 bits\\n     */\\n    function toInt8(int256 value) internal pure returns (int8 downcasted) {\\n        downcasted = int8(value);\\n        if (downcasted != value) {\\n            revert SafeCastOverflowedIntDowncast(8, value);\\n        }\\n    }\\n\\n    /**\\n     * @dev Converts an unsigned uint256 into a signed int256.\\n     *\\n     * Requirements:\\n     *\\n     * - input must be less than or equal to maxInt256.\\n     */\\n    function toInt256(uint256 value) internal pure returns (int256) {\\n        // Note: Unsafe cast below is okay because `type(int256).max` is guaranteed to be positive\\n        if (value > uint256(type(int256).max)) {\\n            revert SafeCastOverflowedUintToInt(value);\\n        }\\n        return int256(value);\\n    }\\n\\n    /**\\n     * @dev Cast a boolean (false or true) to a uint256 (0 or 1) with no jump.\\n     */\\n    function toUint(bool b) internal pure returns (uint256 u) {\\n        assembly (\\\"memory-safe\\\") {\\n            u := iszero(iszero(b))\\n        }\\n    }\\n}\\n\",\"keccak256\":\"0x195533c86d0ef72bcc06456a4f66a9b941f38eb403739b00f21fd7c1abd1ae54\",\"license\":\"MIT\"},\"contracts/abstract/HubDependent.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nimport {Hub} from \\\"../storage/Hub.sol\\\";\\nimport {HubLib} from \\\"../libraries/HubLib.sol\\\";\\n\\nabstract contract HubDependent {\\n    Hub public hub;\\n\\n    constructor(address hubAddress) {\\n        if (hubAddress == address(0)) {\\n            revert HubLib.ZeroAddressHub();\\n        }\\n\\n        hub = Hub(hubAddress);\\n    }\\n\\n    modifier onlyHub() {\\n        _checkHub();\\n        _;\\n    }\\n\\n    modifier onlyHubOwner() {\\n        _checkHubOwner();\\n        _;\\n    }\\n\\n    modifier onlyContracts() {\\n        _checkHubContract();\\n        _;\\n    }\\n\\n    function _checkHub() internal view virtual {\\n        if (msg.sender != address(hub) && msg.sender != hub.owner()) {\\n            revert HubLib.UnauthorizedAccess(\\\"Only Hub\\\");\\n        }\\n    }\\n\\n    function _checkHubOwner() internal view virtual {\\n        if (msg.sender != hub.owner()) {\\n            revert HubLib.UnauthorizedAccess(\\\"Only Hub Owner\\\");\\n        }\\n    }\\n\\n    function _checkHubContract() internal view virtual {\\n        if (!hub.isContract(msg.sender) && msg.sender != hub.owner()) {\\n            revert HubLib.UnauthorizedAccess(\\\"Only Contracts in Hub\\\");\\n        }\\n    }\\n}\\n\",\"keccak256\":\"0x643f4dcb2699e967c2ffbfb7c412e0973abc1409e0753a35f75c4661b89f977d\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/IContractStatus.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface IContractStatus {\\n    function setStatus(bool _status) external;\\n}\\n\",\"keccak256\":\"0x0eaaee7100a88d51de69ac7ec4d5e58d9bdd2582537476631a0717379ca16c40\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/ICustodian.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface ICustodian {\\n    function getOwners() external view returns (address[] memory);\\n}\\n\",\"keccak256\":\"0x513e0babede5cc394427a5fb941c80c255be8716e24ff5ee4ea7a6e18335e0b0\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/IInitializable.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface IInitializable {\\n    function initialize() external;\\n}\\n\",\"keccak256\":\"0xad07f8f7bb2bad96f3d5c97ef6673e15574ad11701be1ac9feb94f750c0dee51\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/INamed.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface INamed {\\n    function name() external view returns (string memory);\\n}\\n\",\"keccak256\":\"0x111fc7e3f1b6c9e9da05cecf65d9985177bcface705870536fe409089b89a27c\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/IVersioned.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface IVersioned {\\n    function version() external view returns (string memory);\\n}\\n\",\"keccak256\":\"0x5e104c26deb107969a5bc1f38614f11af0261fc84f1ebbd2ab3bd064b4795de0\",\"license\":\"Apache-2.0\"},\"contracts/libraries/HubLib.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nlibrary HubLib {\\n    struct Contract {\\n        string name;\\n        address addr;\\n    }\\n\\n    struct ForwardCallInputArgs {\\n        string contractName;\\n        bytes[] encodedData;\\n    }\\n\\n    error ZeroAddressHub();\\n    error UnauthorizedAccess(string msg);\\n    error InvalidTargetContract(address addr);\\n    error ContractNotRegistered(string contractName);\\n}\\n\",\"keccak256\":\"0xcb693696568e706c95ff32538831d177d379e28f7fd0518b787c1d7a5334d71b\",\"license\":\"Apache-2.0\"},\"contracts/libraries/UnorderedNamedContractDynamicSet.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nlibrary UnorderedNamedContractDynamicSet {\\n    struct Contract {\\n        string name;\\n        address addr;\\n    }\\n\\n    struct Set {\\n        mapping(string => uint256) stringIndexPointers;\\n        mapping(address => uint256) addressIndexPointers;\\n        Contract[] contractList;\\n    }\\n\\n    error EmptyName();\\n    error ZeroAddress();\\n    error ContractAlreadyExists(string name);\\n    error AddressAlreadyInSet(address addr);\\n    error ContractDoesNotExist(string name);\\n    error AddressDoesNotExist(address addr);\\n\\n    function append(UnorderedNamedContractDynamicSet.Set storage self, string calldata name, address addr) internal {\\n        if (keccak256(abi.encodePacked(name)) == keccak256(abi.encodePacked(\\\"\\\"))) revert EmptyName();\\n        if (addr == address(0)) revert ZeroAddress();\\n        if (exists(self, name)) revert ContractAlreadyExists(name);\\n        if (self.contractList.length > 0 && (self.addressIndexPointers[addr] != 0 || self.contractList[0].addr == addr))\\n            revert AddressAlreadyInSet(addr);\\n\\n        self.stringIndexPointers[name] = size(self);\\n        self.addressIndexPointers[addr] = size(self);\\n        self.contractList.push(UnorderedNamedContractDynamicSet.Contract(name, addr));\\n    }\\n\\n    function update(UnorderedNamedContractDynamicSet.Set storage self, string calldata name, address addr) internal {\\n        if (addr == address(0)) revert ZeroAddress();\\n        if (!exists(self, name)) revert ContractDoesNotExist(name);\\n\\n        address currentAddr = self.contractList[self.stringIndexPointers[name]].addr;\\n        if (currentAddr == addr) {\\n            // Idempotent: same address already registered for this name (e.g. re-run deploy in tests).\\n            return;\\n        }\\n        if (self.contractList.length > 0 && (self.addressIndexPointers[addr] != 0 || self.contractList[0].addr == addr))\\n            revert AddressAlreadyInSet(addr);\\n\\n        delete self.addressIndexPointers[currentAddr];\\n        self.addressIndexPointers[addr] = self.stringIndexPointers[name];\\n        self.contractList[self.stringIndexPointers[name]].addr = addr;\\n    }\\n\\n    function remove(UnorderedNamedContractDynamicSet.Set storage self, string calldata name) internal {\\n        if (!exists(self, name)) revert ContractDoesNotExist(name);\\n\\n        uint256 contractToRemoveIndex = self.stringIndexPointers[name];\\n\\n        delete self.addressIndexPointers[self.contractList[contractToRemoveIndex].addr];\\n\\n        UnorderedNamedContractDynamicSet.Contract memory contractToMove = self.contractList[size(self) - 1];\\n\\n        self.stringIndexPointers[contractToMove.name] = contractToRemoveIndex;\\n        self.addressIndexPointers[contractToMove.addr] = contractToRemoveIndex;\\n        self.contractList[contractToRemoveIndex] = contractToMove;\\n\\n        delete self.stringIndexPointers[name];\\n        self.contractList.pop();\\n    }\\n\\n    function remove(UnorderedNamedContractDynamicSet.Set storage self, address addr) internal {\\n        if (!exists(self, addr)) revert AddressDoesNotExist(addr);\\n\\n        uint256 contractToRemoveIndex = self.addressIndexPointers[addr];\\n\\n        delete self.stringIndexPointers[self.contractList[contractToRemoveIndex].name];\\n\\n        UnorderedNamedContractDynamicSet.Contract memory contractToMove = self.contractList[size(self) - 1];\\n\\n        self.stringIndexPointers[contractToMove.name] = contractToRemoveIndex;\\n        self.addressIndexPointers[contractToMove.addr] = contractToRemoveIndex;\\n        self.contractList[contractToRemoveIndex] = contractToMove;\\n\\n        delete self.addressIndexPointers[addr];\\n        self.contractList.pop();\\n    }\\n\\n    function get(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        string calldata name\\n    ) internal view returns (UnorderedNamedContractDynamicSet.Contract memory) {\\n        if (!exists(self, name)) revert ContractDoesNotExist(name);\\n\\n        return self.contractList[self.stringIndexPointers[name]];\\n    }\\n\\n    function get(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        address addr\\n    ) internal view returns (UnorderedNamedContractDynamicSet.Contract memory) {\\n        if (!exists(self, addr)) revert AddressDoesNotExist(addr);\\n\\n        return self.contractList[self.addressIndexPointers[addr]];\\n    }\\n\\n    function get(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        uint256 index\\n    ) internal view returns (UnorderedNamedContractDynamicSet.Contract memory) {\\n        return self.contractList[index];\\n    }\\n\\n    function getAll(\\n        UnorderedNamedContractDynamicSet.Set storage self\\n    ) internal view returns (UnorderedNamedContractDynamicSet.Contract[] memory) {\\n        return self.contractList;\\n    }\\n\\n    function getIndex(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        string calldata name\\n    ) internal view returns (uint256) {\\n        return self.stringIndexPointers[name];\\n    }\\n\\n    function getIndex(UnorderedNamedContractDynamicSet.Set storage self, address addr) internal view returns (uint256) {\\n        return self.addressIndexPointers[addr];\\n    }\\n\\n    function exists(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        string calldata name\\n    ) internal view returns (bool) {\\n        if (size(self) == 0) {\\n            return false;\\n        }\\n        return\\n            keccak256(abi.encodePacked(self.contractList[self.stringIndexPointers[name]].name)) ==\\n            keccak256(abi.encodePacked(name));\\n    }\\n\\n    function exists(UnorderedNamedContractDynamicSet.Set storage self, address addr) internal view returns (bool) {\\n        if (size(self) == 0) {\\n            return false;\\n        }\\n        return addr == self.contractList[self.addressIndexPointers[addr]].addr;\\n    }\\n\\n    function size(UnorderedNamedContractDynamicSet.Set storage self) internal view returns (uint256) {\\n        return self.contractList.length;\\n    }\\n}\\n\",\"keccak256\":\"0x51b09c4bc2d3342e78c0a77eceff9ba5a7e694ba663535abec0e859c5e32b5ab\",\"license\":\"Apache-2.0\"},\"contracts/storage/Chronos.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ncontract Chronos {\\n    uint256 public immutable START_TIME;\\n    uint256 public immutable EPOCH_LENGTH;\\n\\n    error InvalidStartTime();\\n    error InvalidEpochLength();\\n\\n    constructor(uint256 _startTime, uint256 _epochLength) {\\n        if (_startTime <= 0) {\\n            revert InvalidStartTime();\\n        }\\n        if (_epochLength <= 0) {\\n            revert InvalidEpochLength();\\n        }\\n\\n        START_TIME = _startTime;\\n        EPOCH_LENGTH = _epochLength;\\n    }\\n\\n    function startTime() external view returns (uint256) {\\n        return START_TIME;\\n    }\\n\\n    function epochLength() external view returns (uint256) {\\n        return EPOCH_LENGTH;\\n    }\\n\\n    function getCurrentEpoch() external view returns (uint256) {\\n        if (block.timestamp < START_TIME) {\\n            return 1;\\n        }\\n        return ((block.timestamp - START_TIME) / EPOCH_LENGTH) + 1;\\n    }\\n\\n    function epochAtTimestamp(uint256 timestamp) external view returns (uint256) {\\n        if (timestamp < START_TIME) {\\n            return 1;\\n        }\\n        return ((timestamp - START_TIME) / EPOCH_LENGTH) + 1;\\n    }\\n\\n    function timeUntilNextEpoch() external view returns (uint256) {\\n        if (block.timestamp < START_TIME) {\\n            return START_TIME + EPOCH_LENGTH - block.timestamp;\\n        }\\n        // Slither: `block.timestamp % EPOCH_LENGTH` is flagged as weak-PRNG\\n        // because miners can nudge `block.timestamp` within a small window.\\n        // This is deterministic time math, NOT randomness \\u2014 the modulo\\n        // computes \\\"seconds elapsed since the start of the current epoch\\\",\\n        // which has the same minor miner-influence as `block.timestamp`\\n        // itself does (already trusted protocol-wide for epoch advancement).\\n        // No randomness derivation, no PRNG semantics.\\n        // slither-disable-next-line weak-prng\\n        uint256 elapsed = (block.timestamp - START_TIME) % EPOCH_LENGTH;\\n        return EPOCH_LENGTH - elapsed;\\n    }\\n\\n    function hasEpochElapsed(uint256 epochNumber) external view returns (bool) {\\n        return block.timestamp >= (START_TIME + (epochNumber - 1) * EPOCH_LENGTH);\\n    }\\n\\n    function timestampForEpoch(uint256 epochNumber) external view returns (uint256) {\\n        if (epochNumber == 0) {\\n            return 0;\\n        }\\n        return START_TIME + (epochNumber - 1) * EPOCH_LENGTH;\\n    }\\n\\n    function elapsedTimeInCurrentEpoch() external view returns (uint256) {\\n        if (block.timestamp < START_TIME) {\\n            return 0;\\n        }\\n        // Slither weak-prng \\u2014 deterministic time math, not randomness.\\n        // See `timeUntilNextEpoch` above for the long-form rationale.\\n        // slither-disable-next-line weak-prng\\n        return (block.timestamp - START_TIME) % EPOCH_LENGTH;\\n    }\\n\\n    function totalElapsedTime() external view returns (uint256) {\\n        if (block.timestamp < START_TIME) {\\n            return 0;\\n        }\\n        return block.timestamp - START_TIME;\\n    }\\n\\n    function isChronosActive() external view returns (bool) {\\n        return block.timestamp >= START_TIME;\\n    }\\n}\\n\",\"keccak256\":\"0x1c1fa02e0ea347116b72bf3d9df60a3fedce60a02f4c0f7b6ebdf9379cf68ced\",\"license\":\"Apache-2.0\"},\"contracts/storage/ContextGraphValueStorage.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nimport {SafeCast} from \\\"@openzeppelin/contracts/utils/math/SafeCast.sol\\\";\\n\\nimport {Chronos} from \\\"./Chronos.sol\\\";\\nimport {HubDependent} from \\\"../abstract/HubDependent.sol\\\";\\nimport {INamed} from \\\"../interfaces/INamed.sol\\\";\\nimport {IVersioned} from \\\"../interfaces/IVersioned.sol\\\";\\n\\n/**\\n * @title ContextGraphValueStorage\\n * @notice Lightweight per-CG and global per-epoch TRAC value tracker for V10\\n *         value-weighted challenges. Mirrors `EpochStorage.sol` diff/cumulative\\n *         finalize pattern at lines 149-174 / 279-310 exactly, but scaled to\\n *         int256/uint256 because publish values are wei-of-TRAC and exceed uint96.\\n *\\n * Design rationale (see V10_CONTRACTS_REDESIGN_v2.md \\u00a7\\\"Data in\\n * ContextGraphValueStorage\\\"): a KA published with value `V` for `lifetime`\\n * epochs contributes `V / lifetime` per epoch during its active window\\n * [startEpoch, startEpoch + lifetime - 1]. Expiry is handled implicitly by the\\n * negative diff written at `startEpoch + lifetime`. No cleanup, no keeper.\\n *\\n * `addCGValueForEpochRange` uses plain integer division per the spec. A couple\\n * wei of rounding dust per publish is acceptable \\u2014 this mapping is used for\\n * challenge weighting, not reward distribution.\\n *\\n * The dormant shard mappings (`cgShard`, `shardKnowledgeValue`) are reserved\\n * storage slots for future V11 sharding. Setters will be added alongside the\\n * V11 logic contracts; no API exists today.\\n */\\ncontract ContextGraphValueStorage is INamed, IVersioned, HubDependent {\\n    string private constant _NAME = \\\"ContextGraphValueStorage\\\";\\n    string private constant _VERSION = \\\"10.0.2\\\";\\n\\n    event CGValueAddedForEpochRange(\\n        uint256 indexed cgId,\\n        uint256 startEpoch,\\n        uint256 endEpoch,\\n        uint256 lifetime,\\n        uint256 value,\\n        uint256 perEpoch\\n    );\\n    event CGValueFinalized(uint256 indexed cgId, uint256 startEpoch, uint256 endEpoch);\\n    event GlobalValueFinalized(uint256 startEpoch, uint256 endEpoch);\\n\\n    error ZeroLifetime();\\n    error ZeroValue();\\n    error NegativeCumulative();\\n    error BackfillForbidden();\\n    error FutureOrCurrentEpoch();\\n\\n    Chronos public chronos;\\n\\n    // Per-CG diff/cumulative ledgers.\\n    mapping(uint256 cgId => mapping(uint256 epoch => int256)) public cgValueDiff;\\n    mapping(uint256 cgId => mapping(uint256 epoch => uint256)) public cgValueCumulative;\\n    mapping(uint256 cgId => uint256) public cgLastFinalizedEpoch;\\n\\n    // Global diff/cumulative ledgers (sum across all CGs).\\n    mapping(uint256 epoch => int256) public totalValueDiff;\\n    mapping(uint256 epoch => uint256) public totalValueCumulative;\\n    uint256 public globalLastFinalizedEpoch;\\n\\n    /// @dev Reserved storage slots for future V11 sharding. Setters will be\\n    ///      added alongside the V11 logic contracts; no API exists today.\\n    mapping(uint256 cgId => uint256) public cgShard;\\n    mapping(uint256 shardId => mapping(uint256 epoch => uint256)) public shardKnowledgeValue;\\n\\n    constructor(address hubAddress) HubDependent(hubAddress) {}\\n\\n    function initialize() public onlyHub {\\n        chronos = Chronos(hub.getContractAddress(\\\"Chronos\\\"));\\n    }\\n\\n    function name() external pure virtual override returns (string memory) {\\n        return _NAME;\\n    }\\n\\n    function version() external pure virtual override returns (string memory) {\\n        return _VERSION;\\n    }\\n\\n    // -------------------------------------------------------------------------\\n    // State mutators\\n    // -------------------------------------------------------------------------\\n\\n    /**\\n     * @notice Record that `value` TRAC will be paid for `cgId` spread evenly\\n     *         across `lifetime` epochs starting at `startEpoch`. Each epoch in\\n     *         [startEpoch, startEpoch + lifetime - 1] receives `value/lifetime`.\\n     * @dev Mirrors `EpochStorage.addTokensToEpochRange`. Finalizes per-CG and\\n     *      global ledgers up to `currentEpoch - 1` after the diff writes so\\n     *      stale epochs are crystallized before the next read. Rounding dust is\\n     *      discarded per the spec (challenge weighting, not reward payout).\\n     *\\n     *      Invariant: `startEpoch >= currentEpoch`. Backfilling into an\\n     *      already-finalized epoch would corrupt `cgValueCumulative` silently\\n     *      because the cumulative at that epoch has already been crystallized\\n     *      and subsequent reads hit the fast path. Reverts `BackfillForbidden`\\n     *      if the caller tries.\\n     *\\n     *      Retraction / expiry is automatic via the paired negative diff\\n     *      written at `startEpoch + lifetime`. There is no removal function\\n     *      by design: Phase 8 value-changing ops (CREATE, byte-size-grow\\n     *      UPDATE, lifetime extension) are all positive deltas, and natural\\n     *      expiry is handled by the diff ledger itself.\\n     */\\n    function addCGValueForEpochRange(\\n        uint256 cgId,\\n        uint256 startEpoch,\\n        uint256 lifetime,\\n        uint256 value\\n    ) external onlyContracts {\\n        if (lifetime == 0) {\\n            revert ZeroLifetime();\\n        }\\n        if (value == 0) {\\n            revert ZeroValue();\\n        }\\n\\n        uint256 currentEpoch = chronos.getCurrentEpoch();\\n        if (startEpoch < currentEpoch) {\\n            revert BackfillForbidden();\\n        }\\n\\n        uint256 perEpoch = value / lifetime;\\n        int256 perEpochSigned = SafeCast.toInt256(perEpoch);\\n\\n        cgValueDiff[cgId][startEpoch] += perEpochSigned;\\n        cgValueDiff[cgId][startEpoch + lifetime] -= perEpochSigned;\\n\\n        totalValueDiff[startEpoch] += perEpochSigned;\\n        totalValueDiff[startEpoch + lifetime] -= perEpochSigned;\\n\\n        if (currentEpoch > 1) {\\n            _finalizeCGValueUpTo(cgId, currentEpoch - 1);\\n            _finalizeGlobalValueUpTo(currentEpoch - 1);\\n        }\\n\\n        emit CGValueAddedForEpochRange(\\n            cgId,\\n            startEpoch,\\n            startEpoch + lifetime - 1,\\n            lifetime,\\n            value,\\n            perEpoch\\n        );\\n    }\\n\\n    /**\\n     * @notice Crystallizes `cgValueCumulative[cgId]` up to `epoch` so\\n     *         subsequent reads at or below `epoch` become O(1). Safe to call\\n     *         repeatedly: a call with `epoch <= cgLastFinalizedEpoch[cgId]`\\n     *         is a no-op.\\n     * @dev Intended to be called by RandomSampling before a challenge draw\\n     *      (see V10_CONTRACTS_REDESIGN_v2 \\\"On challenge generation\\\"), but any\\n     *      Hub-registered contract may call it. Reads stay pure `view`; this\\n     *      is the state-changing half of the \\\"finalize then read\\\" pattern.\\n     * @dev Reverts FutureOrCurrentEpoch if `epoch` is at or beyond the current\\n     *      epoch. Only past epochs may be finalized; current-epoch reads always\\n     *      take the simulation path to reflect in-flight diff writes.\\n     */\\n    function finalizeCGValueUpTo(uint256 cgId, uint256 epoch) external onlyContracts {\\n        if (epoch >= chronos.getCurrentEpoch()) {\\n            revert FutureOrCurrentEpoch();\\n        }\\n        if (epoch <= cgLastFinalizedEpoch[cgId]) {\\n            return;\\n        }\\n        _finalizeCGValueUpTo(cgId, epoch);\\n    }\\n\\n    /**\\n     * @notice Crystallizes `totalValueCumulative` up to `epoch`. See\\n     *         {finalizeCGValueUpTo} for semantics.\\n     * @dev Reverts FutureOrCurrentEpoch if `epoch` is at or beyond the current\\n     *      epoch. Only past epochs may be finalized; current-epoch reads always\\n     *      take the simulation path to reflect in-flight diff writes.\\n     */\\n    function finalizeGlobalValueUpTo(uint256 epoch) external onlyContracts {\\n        if (epoch >= chronos.getCurrentEpoch()) {\\n            revert FutureOrCurrentEpoch();\\n        }\\n        if (epoch <= globalLastFinalizedEpoch) {\\n            return;\\n        }\\n        _finalizeGlobalValueUpTo(epoch);\\n    }\\n\\n    // -------------------------------------------------------------------------\\n    // Read helpers\\n    // -------------------------------------------------------------------------\\n\\n    /// @notice Active per-epoch contribution of `cgId` at `epoch` (sum of all\\n    ///         active KAs' per-epoch values at that epoch). Returns the\\n    ///         simulated value if the epoch has not been finalized yet.\\n    function getCGValueAtEpoch(uint256 cgId, uint256 epoch) public view returns (uint256) {\\n        if (epoch <= cgLastFinalizedEpoch[cgId]) {\\n            return cgValueCumulative[cgId][epoch];\\n        }\\n        return _simulateCGValueFinalization(cgId, epoch);\\n    }\\n\\n    /// @notice Global sum across all CGs of active per-epoch contributions at `epoch`.\\n    function getTotalValueAtEpoch(uint256 epoch) public view returns (uint256) {\\n        if (epoch <= globalLastFinalizedEpoch) {\\n            return totalValueCumulative[epoch];\\n        }\\n        return _simulateGlobalValueFinalization(epoch);\\n    }\\n\\n    function getCurrentCGValue(uint256 cgId) external view returns (uint256) {\\n        return getCGValueAtEpoch(cgId, chronos.getCurrentEpoch());\\n    }\\n\\n    function getCurrentTotalValue() external view returns (uint256) {\\n        return getTotalValueAtEpoch(chronos.getCurrentEpoch());\\n    }\\n\\n    // -------------------------------------------------------------------------\\n    // Internal finalization\\n    // -------------------------------------------------------------------------\\n\\n    function _finalizeCGValueUpTo(uint256 cgId, uint256 epoch) internal {\\n        uint256 lastFinalized = cgLastFinalizedEpoch[cgId];\\n        if (epoch <= lastFinalized) {\\n            return;\\n        }\\n\\n        uint256 startEpoch = lastFinalized + 1;\\n        int256 running;\\n        if (lastFinalized > 0) {\\n            running = int256(cgValueCumulative[cgId][lastFinalized]);\\n        }\\n\\n        for (uint256 e = startEpoch; e <= epoch; e++) {\\n            running += cgValueDiff[cgId][e];\\n            // Cumulative values are non-negative by construction (positive diffs\\n            // at startEpoch are always matched by negative diffs at\\n            // startEpoch+lifetime). Revert defensively on underflow.\\n            if (running < 0) {\\n                revert NegativeCumulative();\\n            }\\n            cgValueCumulative[cgId][e] = uint256(running);\\n        }\\n\\n        cgLastFinalizedEpoch[cgId] = epoch;\\n\\n        emit CGValueFinalized(cgId, startEpoch, epoch);\\n    }\\n\\n    function _finalizeGlobalValueUpTo(uint256 epoch) internal {\\n        uint256 lastFinalized = globalLastFinalizedEpoch;\\n        if (epoch <= lastFinalized) {\\n            return;\\n        }\\n\\n        uint256 startEpoch = lastFinalized + 1;\\n        int256 running;\\n        if (lastFinalized > 0) {\\n            running = int256(totalValueCumulative[lastFinalized]);\\n        }\\n\\n        for (uint256 e = startEpoch; e <= epoch; e++) {\\n            running += totalValueDiff[e];\\n            if (running < 0) {\\n                revert NegativeCumulative();\\n            }\\n            totalValueCumulative[e] = uint256(running);\\n        }\\n\\n        globalLastFinalizedEpoch = epoch;\\n\\n        emit GlobalValueFinalized(startEpoch, epoch);\\n    }\\n\\n    function _simulateCGValueFinalization(uint256 cgId, uint256 epoch) internal view returns (uint256) {\\n        uint256 lastFinalized = cgLastFinalizedEpoch[cgId];\\n        if (epoch <= lastFinalized) {\\n            return cgValueCumulative[cgId][epoch];\\n        }\\n\\n        int256 running;\\n        if (lastFinalized > 0) {\\n            running = int256(cgValueCumulative[cgId][lastFinalized]);\\n        }\\n\\n        for (uint256 e = lastFinalized + 1; e <= epoch; e++) {\\n            running += cgValueDiff[cgId][e];\\n            // Unify policy with the mutate path (`_finalizeCGValueUpTo`): a\\n            // negative running total would signal ledger corruption and is an\\n            // unrecoverable invariant break. Reverting here \\u2014 even from a view\\n            // function \\u2014 gives RPC clients immediate visibility instead of\\n            // silently clamping to zero.\\n            if (running < 0) {\\n                revert NegativeCumulative();\\n            }\\n        }\\n\\n        return uint256(running);\\n    }\\n\\n    function _simulateGlobalValueFinalization(uint256 epoch) internal view returns (uint256) {\\n        uint256 lastFinalized = globalLastFinalizedEpoch;\\n        if (epoch <= lastFinalized) {\\n            return totalValueCumulative[epoch];\\n        }\\n\\n        int256 running;\\n        if (lastFinalized > 0) {\\n            running = int256(totalValueCumulative[lastFinalized]);\\n        }\\n\\n        for (uint256 e = lastFinalized + 1; e <= epoch; e++) {\\n            running += totalValueDiff[e];\\n            if (running < 0) {\\n                revert NegativeCumulative();\\n            }\\n        }\\n\\n        return uint256(running);\\n    }\\n}\\n\",\"keccak256\":\"0x672a3540bac7f8d4f74a2dca2610d6254f800e6f468ce8ea4d1f5a8738ee092c\",\"license\":\"Apache-2.0\"},\"contracts/storage/Hub.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nimport {IContractStatus} from \\\"../interfaces/IContractStatus.sol\\\";\\nimport {ICustodian} from \\\"../interfaces/ICustodian.sol\\\";\\nimport {IInitializable} from \\\"../interfaces/IInitializable.sol\\\";\\nimport {INamed} from \\\"../interfaces/INamed.sol\\\";\\nimport {IVersioned} from \\\"../interfaces/IVersioned.sol\\\";\\nimport {HubLib} from \\\"../libraries/HubLib.sol\\\";\\nimport {UnorderedNamedContractDynamicSet} from \\\"../libraries/UnorderedNamedContractDynamicSet.sol\\\";\\nimport {Ownable} from \\\"@openzeppelin/contracts/access/Ownable.sol\\\";\\n\\ncontract Hub is INamed, IVersioned, Ownable {\\n    using UnorderedNamedContractDynamicSet for UnorderedNamedContractDynamicSet.Set;\\n\\n    event NewContract(string contractName, address newContractAddress);\\n    event ContractChanged(string contractName, address newContractAddress);\\n    event NewAssetStorage(string contractName, address newContractAddress);\\n    event AssetStorageChanged(string contractName, address newContractAddress);\\n    event ContractRemoved(string contractName, address contractAddress);\\n    event AssetStorageRemoved(string contractName, address contractAddress);\\n\\n    string private constant _NAME = \\\"Hub\\\";\\n    string private constant _VERSION = \\\"1.0.0\\\";\\n\\n    UnorderedNamedContractDynamicSet.Set internal contractSet;\\n    UnorderedNamedContractDynamicSet.Set internal assetStorageSet;\\n\\n    constructor() Ownable(msg.sender) {}\\n\\n    // @dev Only transactions by HubController owner or one of the owners of the MultiSig Wallet\\n    modifier onlyOwnerOrMultiSigOwner() {\\n        _checkOwnerOrMultiSigOwner();\\n        _;\\n    }\\n\\n    function name() external pure virtual override returns (string memory) {\\n        return _NAME;\\n    }\\n\\n    function version() external pure virtual override returns (string memory) {\\n        return _VERSION;\\n    }\\n\\n    function setContractAddress(\\n        string calldata contractName,\\n        address newContractAddress\\n    ) external onlyOwnerOrMultiSigOwner {\\n        _setContractAddress(contractName, newContractAddress);\\n    }\\n\\n    function setAssetStorageAddress(string calldata assetStorageName, address assetStorageAddress) external onlyOwner {\\n        _setAssetStorageAddress(assetStorageName, assetStorageAddress);\\n    }\\n\\n    function removeContractByName(string calldata contractName) external onlyOwner {\\n        if (contractSet.exists(contractName)) {\\n            address contractAddress = contractSet.get(contractName).addr;\\n\\n            contractSet.remove(contractName);\\n\\n            emit ContractRemoved(contractName, contractAddress);\\n        }\\n    }\\n\\n    function removeContractByAddress(address contractAddress) external onlyOwner {\\n        if (contractSet.exists(contractAddress)) {\\n            string memory contractName = contractSet.get(contractAddress).name;\\n\\n            contractSet.remove(contractAddress);\\n\\n            emit ContractRemoved(contractName, contractAddress);\\n        }\\n    }\\n\\n    function removeAssetStorageByName(string calldata assetStorageName) external onlyOwner {\\n        if (assetStorageSet.exists(assetStorageName)) {\\n            address assetStorageAddress = assetStorageSet.get(assetStorageName).addr;\\n\\n            assetStorageSet.remove(assetStorageName);\\n\\n            emit AssetStorageRemoved(assetStorageName, assetStorageAddress);\\n        }\\n    }\\n\\n    function removeAssetStorageByAddress(address assetStorageAddress) external onlyOwner {\\n        if (assetStorageSet.exists(assetStorageAddress)) {\\n            string memory assetStorageName = assetStorageSet.get(assetStorageAddress).name;\\n\\n            assetStorageSet.remove(assetStorageAddress);\\n\\n            emit AssetStorageRemoved(assetStorageName, assetStorageAddress);\\n        }\\n    }\\n\\n    function getContractAddress(string calldata contractName) external view returns (address) {\\n        return contractSet.get(contractName).addr;\\n    }\\n\\n    function getAssetStorageAddress(string calldata assetStorageName) external view returns (address) {\\n        return assetStorageSet.get(assetStorageName).addr;\\n    }\\n\\n    function getAllContracts() external view returns (UnorderedNamedContractDynamicSet.Contract[] memory) {\\n        return contractSet.getAll();\\n    }\\n\\n    function getAllAssetStorages() external view returns (UnorderedNamedContractDynamicSet.Contract[] memory) {\\n        return assetStorageSet.getAll();\\n    }\\n\\n    function isContract(string calldata contractName) external view returns (bool) {\\n        return contractSet.exists(contractName);\\n    }\\n\\n    function isContract(address selectedContractAddress) external view returns (bool) {\\n        return contractSet.exists(selectedContractAddress);\\n    }\\n\\n    function isAssetStorage(string calldata assetStorageName) external view returns (bool) {\\n        return assetStorageSet.exists(assetStorageName);\\n    }\\n\\n    function isAssetStorage(address assetStorageAddress) external view returns (bool) {\\n        return assetStorageSet.exists(assetStorageAddress);\\n    }\\n\\n    /**\\n     * @dev Forwards a function call to a specified target contract.\\n     * @notice This function can only be called by the contract owner or a multisig owner.\\n     * @param target The address of the target contract.\\n     * @param data The calldata containing the function signature and arguments for the target contract's function.\\n     * @return result The return data of the target contract's function call.\\n     */\\n    function forwardCall(address target, bytes calldata data) public onlyOwnerOrMultiSigOwner returns (bytes memory) {\\n        // Check if the target contract is registered in the Hub\\n        if (!contractSet.exists(target) && !assetStorageSet.exists(target)) {\\n            revert HubLib.InvalidTargetContract(target);\\n        }\\n\\n        // Perform the function call to the target contract with the specified calldata\\n        (bool success, bytes memory result) = target.call{value: 0}(data);\\n\\n        // If the call is unsuccessful, revert the transaction with the original revert reason\\n        if (!success) {\\n            assembly {\\n                // Load the free memory pointer from memory slot 0x40\\n                // Memory slot 0x40 is conventionally used to store the free memory pointer in Solidity, which points\\n                // to the next available memory slot for storing data during the execution of a contract function.\\n                let ptr := mload(0x40)\\n                // Get the size of the return data from the unsuccessful call\\n                let size := returndatasize()\\n                // Copy the return data to the memory location pointed to by ptr\\n                returndatacopy(ptr, 0, size)\\n                // Revert the transaction with the return data as the revert reason\\n                revert(ptr, size)\\n            }\\n        }\\n\\n        return result;\\n    }\\n\\n    function setAndReinitializeContracts(\\n        HubLib.Contract[] calldata newContracts,\\n        HubLib.Contract[] calldata newAssetStorageContracts,\\n        address[] calldata contractsToReinitialize,\\n        HubLib.ForwardCallInputArgs[] calldata forwardCallsData\\n    ) external onlyOwnerOrMultiSigOwner {\\n        _setContracts(newContracts);\\n        _setAssetStorageContracts(newAssetStorageContracts);\\n        _reinitializeContracts(contractsToReinitialize);\\n        _forwardCalls(forwardCallsData);\\n    }\\n\\n    function _setContractAddress(string calldata contractName, address newContractAddress) internal {\\n        if (contractSet.exists(contractName)) {\\n            contractSet.update(contractName, newContractAddress);\\n\\n            address oldContractAddress = contractSet.get(contractName).addr;\\n            if (_isContract(oldContractAddress)) {\\n                try IContractStatus(oldContractAddress).setStatus(false) {\\n                    // success\\n                } catch {\\n                    // Best-effort: contract may not implement IContractStatus; ignore.\\n                }\\n            }\\n\\n            emit ContractChanged(contractName, newContractAddress);\\n        } else {\\n            contractSet.append(contractName, newContractAddress);\\n\\n            emit NewContract(contractName, newContractAddress);\\n        }\\n\\n        if (_isContract(newContractAddress)) {\\n            try IContractStatus(newContractAddress).setStatus(true) {\\n                // success\\n            } catch {\\n                // Best-effort: contract may not implement IContractStatus; ignore.\\n            }\\n        }\\n\\n        emit NewContract(contractName, newContractAddress);\\n    }\\n\\n    function _setContracts(HubLib.Contract[] calldata newContracts) internal {\\n        for (uint256 i; i < newContracts.length; ) {\\n            _setContractAddress(newContracts[i].name, newContracts[i].addr);\\n\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _setAssetStorageAddress(string calldata assetStorageName, address assetStorageAddress) internal {\\n        if (assetStorageSet.exists(assetStorageName)) {\\n            emit AssetStorageChanged(assetStorageName, assetStorageAddress);\\n            assetStorageSet.update(assetStorageName, assetStorageAddress);\\n        } else {\\n            emit NewAssetStorage(assetStorageName, assetStorageAddress);\\n            assetStorageSet.append(assetStorageName, assetStorageAddress);\\n        }\\n    }\\n\\n    function _setAssetStorageContracts(HubLib.Contract[] calldata newAssetStorageContracts) internal {\\n        for (uint256 i; i < newAssetStorageContracts.length; ) {\\n            _setAssetStorageAddress(newAssetStorageContracts[i].name, newAssetStorageContracts[i].addr);\\n\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _reinitializeContracts(address[] calldata contractsToReinitialize) internal {\\n        for (uint256 i; i < contractsToReinitialize.length; ) {\\n            IInitializable(contractsToReinitialize[i]).initialize();\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _forwardCalls(HubLib.ForwardCallInputArgs[] calldata forwardCallsData) internal {\\n        for (uint256 i; i < forwardCallsData.length; ) {\\n            address contractAddress;\\n\\n            // Try to get the contract address using getContractAddress\\n            try this.getContractAddress(forwardCallsData[i].contractName) returns (address addr) {\\n                contractAddress = addr;\\n            } catch {\\n                // If getContractAddress fails, try getAssetStorageAddress\\n                try this.getAssetStorageAddress(forwardCallsData[i].contractName) returns (address addr) {\\n                    contractAddress = addr;\\n                } catch {\\n                    revert HubLib.ContractNotRegistered(forwardCallsData[i].contractName);\\n                }\\n            }\\n            for (uint256 j; j < forwardCallsData[i].encodedData.length; ) {\\n                forwardCall(contractAddress, forwardCallsData[i].encodedData[j]);\\n                unchecked {\\n                    j++;\\n                }\\n            }\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _isContract(address addr) internal view returns (bool) {\\n        uint256 size;\\n        assembly {\\n            size := extcodesize(addr)\\n        }\\n        return size > 0;\\n    }\\n\\n    function _isMultiSigOwner(address multiSigAddress) internal view returns (bool) {\\n        try ICustodian(multiSigAddress).getOwners() returns (address[] memory multiSigOwners) {\\n            for (uint256 i = 0; i < multiSigOwners.length; i++) {\\n                if (msg.sender == multiSigOwners[i]) {\\n                    return true;\\n                }\\n            }\\n        } catch {\\n            // Not a multisig or call reverted; treat as not owner.\\n        }\\n\\n        return false;\\n    }\\n\\n    function _checkOwnerOrMultiSigOwner() internal view virtual {\\n        address hubOwner = owner();\\n        if (msg.sender != hubOwner && !_isMultiSigOwner(hubOwner)) {\\n            revert HubLib.UnauthorizedAccess(\\\"Only Hub Owner or Multisig Owner\\\");\\n        }\\n    }\\n}\\n\",\"keccak256\":\"0x732252bb857277a35ab314beef2dbaceb5f96ce2f6d3b83a224927e503609def\",\"license\":\"Apache-2.0\"}},\"version\":1}",
+  "bytecode": "0x60803461008c57601f61108238819003918201601f19168301916001600160401b038311848410176100915780849260209460405283398101031261008c57516001600160a01b0381169081900361008c57801561007a57600080546001600160a01b031916919091179055604051610fda90816100a88239f35b60405163a10d827b60e01b8152600490fd5b600080fd5b634e487b7160e01b600052604160045260246000fdfe6080604081815260048036101561001557600080fd5b600092833560e01c908163035573f8146108285750806306fdde03146107d35780632e9280f2146105a55780633059261014610585578063365a86fc1461055d578063496f6e751461053657806354fd4d50146104f45780635f0d5a23146104d857806365774548146104af5780637dcdcb9c1461048f5780637df04b171461047057806380708f44146104485780638129fc1c146102fc5780638bf8bc1f146102d65780638e461a67146102aa578063b217b99e1461027a578063cfbe58d014610253578063d9939f4c1461022c578063dfc6c3da1461019a5763e4879c38146100ff57600080fd5b346101965760209283600319360112610181576001548351635cbeecf160e11b81529085908290859082906001600160a01b03165afa91821561018b578092610156575b505061014f9135610be9565b9051908152f35b9091508482813d8311610184575b61016e81836108e7565b8101031261018157505161014f38610143565b80fd5b503d610164565b8451903d90823e3d90fd5b8280fd5b50346101965782600319360112610196576001548251635cbeecf160e11b81529160209183919082906001600160a01b03165afa9283156102215780936101e8575b60208361014f86610c27565b9092506020833d8211610219575b81610203602093836108e7565b81010312610181575061014f60209251926101dc565b3d91506101f6565b8251903d90823e3d90fd5b50346101965760203660031901126101965760209282913581526005845220549051908152f35b50346101965760203660031901126101965760209282913581526006845220549051908152f35b5050346102a6578060209261028e36610851565b90825260038552828220908252845220549051908152f35b5080fd5b5050346102a657806020926102be36610851565b90825260028552828220908252845220549051908152f35b503461019657602036600319011261019657602092818392358252845220549051908152f35b50903461019657826003193601126101965782546001600160a01b03929083169033821415806103f0575b6103c15760206064819285519485938492630110ceef60e21b845283015260076024830152664368726f6e6f7360c81b60448301525afa9182156103b85750839161038a575b50166bffffffffffffffffffffffff60a01b600154161760015580f35b6103ab915060203d81116103b1575b6103a381836108e7565b810190610909565b3861036d565b503d610399565b513d85823e3d90fd5b606490602084519163f0b1bddb60e01b8352820152600860248201526727b7363c90243ab160c11b6044820152fd5b508251638da5cb5b60e01b81526020818381865afa90811561043e579085918791610420575b5016331415610327565b610438915060203d81116103b1576103a381836108e7565b38610416565b84513d88823e3d90fd5b8382346102a65760203660031901126102a65761046d90610467610980565b35610b65565b80f35b5050346102a657816003193601126102a6576020906007549051908152f35b509134610181576020366003190112610181575061014f60209235610c27565b5050346102a657816003193601126102a65760015490516001600160a01b039091168152602090f35b5050346102a65760209061014f6104ee36610851565b90610be9565b5050346102a657816003193601126102a657805161053291610515826108b5565b600682526518981718171960d11b6020830152519182918261086c565b0390f35b50346101965760203660031901126101965760209282913581526008845220549051908152f35b5050346102a657816003193601126102a657905490516001600160a01b039091168152602090f35b83346101815761046d61059736610851565b906105a0610980565b610ab1565b5090346101965760803660031901126101965781359160243591604435606435916105ce610980565b81156107c45782156107b5576001548151635cbeecf160e11b8152949060209081908790849082906001600160a01b03165afa9586156107ab578996610778575b5085871061076957838504956001600160ff1b03871161075257888a5260028252838a20888b528252838a20610646888254610928565b9055888a5260028252838a2061065c868a61095a565b8b528252838a2061066e888254610967565b9055878a5260058252838a20610685888254610928565b9055610691858961095a565b8a5260058252838a206106a5888254610967565b90556001811161071a575b506106bb848861095a565b60001981019290831161070757508251968752860152840152606083015260808201527f3c1de1d035b82693ac13fcc9b1c52e32b7c96067da8c230a6bd0115f34973e599060a090a280f35b634e487b7160e01b8a5260119052602489fd5b600019810190811161073f5780610734610739928b610c5a565b610d65565b386106b0565b634e487b7160e01b8a526011835260248afd5b835163123baf0360e11b8152808401889052602490fd5b5090516344693c9360e11b8152fd5b9080965081813d83116107a4575b61079081836108e7565b810103126107a05751943861060f565b8880fd5b503d610786565b83513d8b823e3d90fd5b51637c946ed760e01b81528390fd5b5163a018cc3b60e01b81528390fd5b5050346102a657816003193601126102a6578051610532916107f4826108b5565b601882527f436f6e74657874477261706856616c756553746f7261676500000000000000006020830152519182918261086c565b849084346101965760209261083c36610851565b90825260098552828220908252845220548152f35b6040906003190112610867576004359060243590565b600080fd5b6020808252825181830181905290939260005b8281106108a157505060409293506000838284010152601f8019910116010190565b81810186015184820160400152850161087f565b6040810190811067ffffffffffffffff8211176108d157604052565b634e487b7160e01b600052604160045260246000fd5b90601f8019910116810190811067ffffffffffffffff8211176108d157604052565b9081602091031261086757516001600160a01b03811681036108675790565b9190916000838201938412911290801582169115161761094457565b634e487b7160e01b600052601160045260246000fd5b9190820180921161094457565b8181039291600013801582851316918412161761094457565b60008054604051631627905560e01b81523360048201526020926001600160a01b0392831692918481602481875afa908115610aa6579085918391610a6e575b50159384610a11575b505050506109d45750565b6064906040519063f0b1bddb60e01b82526004820152601560248201527427b7363c9021b7b73a3930b1ba399034b710243ab160591b6044820152fd5b60049293945060405192838092638da5cb5b60e01b82525afa918215610a625791610a45575b5016331415388083816109c9565b610a5c9150833d85116103b1576103a381836108e7565b38610a37565b604051903d90823e3d90fd5b82819392503d8311610a9f575b610a8581836108e7565b810103126102a6575180151581036102a6578490386109c0565b503d610a7b565b6040513d84823e3d90fd5b600154604051635cbeecf160e11b815291929190602090829060049082906001600160a01b03165afa908115610b5957600091610b28575b50811015610b1657816000526004602052604060002054811115610b1257610b1091610c5a565b565b5050565b6040516336dd3d1560e11b8152600490fd5b906020823d8211610b51575b81610b41602093836108e7565b8101031261018157505138610ae9565b3d9150610b34565b6040513d6000823e3d90fd5b600154604051635cbeecf160e11b815290602090829060049082906001600160a01b03165afa908115610b5957600091610bb8575b50811015610b1657600754811115610bb557610b1090610d65565b50565b906020823d8211610be1575b81610bd1602093836108e7565b8101031261018157505138610b9a565b3d9150610bc4565b806000526004602052604060002054821115610c0c5790610c0991610e2d565b90565b50600360205260406000209060005260205260406000205490565b600754811115610c3a57610c0990610f0d565b600052600660205260406000205490565b60001981146109445760010190565b919091600092818452600493602091858352604092838320549283831115610d5b576001840193848111610d4857819080610d2e575b5084905b84821115610cd757505084818798997f73ae0cb867649b1d23379e31e281e3d67c11098b645cfed1e6d9643185ba695b98869452845220558351928352820152a2565b87835260028452868320828452845286832054610cf391610928565b90828212610d1e57610d18908884526003855287842081855285528288852055610c4b565b90610c94565b86516320e7ab6560e01b81528a90fd5b878352600384528683209083528352508481205438610c90565b634e487b7160e01b825260118952602482fd5b5050505050509050565b6007549081811115610b125760018201918281116109445760009080610e1b575b50825b82811115610dc95750507f69f52cb2fb6d6f344039390b3d79c2d3adc42581712f15d2bd3ad2abce8794bc918160409260075582519182526020820152a1565b8060005260209160058352610de5604091826000205490610928565b9260008412610e0a57829160068592610e05956000525260002055610c4b565b610d89565b81516320e7ab6560e01b8152600490fd5b81526006602052604090205438610d86565b90600090828252600491602090838252604091828220549586851115610ef657829680610edc575b60018101809111610ec9579594939291905b84871115610e79575050505050505090565b90919293949596610e9d908285526002845285852089865284528585205490610928565b96838812610eb957610eae90610c4b565b959493929190610e67565b84516320e7ab6560e01b81528790fd5b634e487b7160e01b845260118752602484fd5b818452600383528484208185528352848420549750610e55565b508092955060039194505283832091835252205490565b6007549081811115610f915760009180610f7d575b60018101809111610944575b81811115610f3b57505090565b806000526005602052610f55604093846000205490610928565b9260008412610f6d5750610f6890610c4b565b610f2e565b516320e7ab6560e01b8152600490fd5b918083604092526006602052205491610f22565b905060005260066020526040600020549056fea264697066735822122066204caa041e275fcefae02921931d678faf79b29b9c685c12bfeeb27003d16b64736f6c63430008140033",
+  "deployedBytecode": "0x6080604081815260048036101561001557600080fd5b600092833560e01c908163035573f8146108285750806306fdde03146107d35780632e9280f2146105a55780633059261014610585578063365a86fc1461055d578063496f6e751461053657806354fd4d50146104f45780635f0d5a23146104d857806365774548146104af5780637dcdcb9c1461048f5780637df04b171461047057806380708f44146104485780638129fc1c146102fc5780638bf8bc1f146102d65780638e461a67146102aa578063b217b99e1461027a578063cfbe58d014610253578063d9939f4c1461022c578063dfc6c3da1461019a5763e4879c38146100ff57600080fd5b346101965760209283600319360112610181576001548351635cbeecf160e11b81529085908290859082906001600160a01b03165afa91821561018b578092610156575b505061014f9135610be9565b9051908152f35b9091508482813d8311610184575b61016e81836108e7565b8101031261018157505161014f38610143565b80fd5b503d610164565b8451903d90823e3d90fd5b8280fd5b50346101965782600319360112610196576001548251635cbeecf160e11b81529160209183919082906001600160a01b03165afa9283156102215780936101e8575b60208361014f86610c27565b9092506020833d8211610219575b81610203602093836108e7565b81010312610181575061014f60209251926101dc565b3d91506101f6565b8251903d90823e3d90fd5b50346101965760203660031901126101965760209282913581526005845220549051908152f35b50346101965760203660031901126101965760209282913581526006845220549051908152f35b5050346102a6578060209261028e36610851565b90825260038552828220908252845220549051908152f35b5080fd5b5050346102a657806020926102be36610851565b90825260028552828220908252845220549051908152f35b503461019657602036600319011261019657602092818392358252845220549051908152f35b50903461019657826003193601126101965782546001600160a01b03929083169033821415806103f0575b6103c15760206064819285519485938492630110ceef60e21b845283015260076024830152664368726f6e6f7360c81b60448301525afa9182156103b85750839161038a575b50166bffffffffffffffffffffffff60a01b600154161760015580f35b6103ab915060203d81116103b1575b6103a381836108e7565b810190610909565b3861036d565b503d610399565b513d85823e3d90fd5b606490602084519163f0b1bddb60e01b8352820152600860248201526727b7363c90243ab160c11b6044820152fd5b508251638da5cb5b60e01b81526020818381865afa90811561043e579085918791610420575b5016331415610327565b610438915060203d81116103b1576103a381836108e7565b38610416565b84513d88823e3d90fd5b8382346102a65760203660031901126102a65761046d90610467610980565b35610b65565b80f35b5050346102a657816003193601126102a6576020906007549051908152f35b509134610181576020366003190112610181575061014f60209235610c27565b5050346102a657816003193601126102a65760015490516001600160a01b039091168152602090f35b5050346102a65760209061014f6104ee36610851565b90610be9565b5050346102a657816003193601126102a657805161053291610515826108b5565b600682526518981718171960d11b6020830152519182918261086c565b0390f35b50346101965760203660031901126101965760209282913581526008845220549051908152f35b5050346102a657816003193601126102a657905490516001600160a01b039091168152602090f35b83346101815761046d61059736610851565b906105a0610980565b610ab1565b5090346101965760803660031901126101965781359160243591604435606435916105ce610980565b81156107c45782156107b5576001548151635cbeecf160e11b8152949060209081908790849082906001600160a01b03165afa9586156107ab578996610778575b5085871061076957838504956001600160ff1b03871161075257888a5260028252838a20888b528252838a20610646888254610928565b9055888a5260028252838a2061065c868a61095a565b8b528252838a2061066e888254610967565b9055878a5260058252838a20610685888254610928565b9055610691858961095a565b8a5260058252838a206106a5888254610967565b90556001811161071a575b506106bb848861095a565b60001981019290831161070757508251968752860152840152606083015260808201527f3c1de1d035b82693ac13fcc9b1c52e32b7c96067da8c230a6bd0115f34973e599060a090a280f35b634e487b7160e01b8a5260119052602489fd5b600019810190811161073f5780610734610739928b610c5a565b610d65565b386106b0565b634e487b7160e01b8a526011835260248afd5b835163123baf0360e11b8152808401889052602490fd5b5090516344693c9360e11b8152fd5b9080965081813d83116107a4575b61079081836108e7565b810103126107a05751943861060f565b8880fd5b503d610786565b83513d8b823e3d90fd5b51637c946ed760e01b81528390fd5b5163a018cc3b60e01b81528390fd5b5050346102a657816003193601126102a6578051610532916107f4826108b5565b601882527f436f6e74657874477261706856616c756553746f7261676500000000000000006020830152519182918261086c565b849084346101965760209261083c36610851565b90825260098552828220908252845220548152f35b6040906003190112610867576004359060243590565b600080fd5b6020808252825181830181905290939260005b8281106108a157505060409293506000838284010152601f8019910116010190565b81810186015184820160400152850161087f565b6040810190811067ffffffffffffffff8211176108d157604052565b634e487b7160e01b600052604160045260246000fd5b90601f8019910116810190811067ffffffffffffffff8211176108d157604052565b9081602091031261086757516001600160a01b03811681036108675790565b9190916000838201938412911290801582169115161761094457565b634e487b7160e01b600052601160045260246000fd5b9190820180921161094457565b8181039291600013801582851316918412161761094457565b60008054604051631627905560e01b81523360048201526020926001600160a01b0392831692918481602481875afa908115610aa6579085918391610a6e575b50159384610a11575b505050506109d45750565b6064906040519063f0b1bddb60e01b82526004820152601560248201527427b7363c9021b7b73a3930b1ba399034b710243ab160591b6044820152fd5b60049293945060405192838092638da5cb5b60e01b82525afa918215610a625791610a45575b5016331415388083816109c9565b610a5c9150833d85116103b1576103a381836108e7565b38610a37565b604051903d90823e3d90fd5b82819392503d8311610a9f575b610a8581836108e7565b810103126102a6575180151581036102a6578490386109c0565b503d610a7b565b6040513d84823e3d90fd5b600154604051635cbeecf160e11b815291929190602090829060049082906001600160a01b03165afa908115610b5957600091610b28575b50811015610b1657816000526004602052604060002054811115610b1257610b1091610c5a565b565b5050565b6040516336dd3d1560e11b8152600490fd5b906020823d8211610b51575b81610b41602093836108e7565b8101031261018157505138610ae9565b3d9150610b34565b6040513d6000823e3d90fd5b600154604051635cbeecf160e11b815290602090829060049082906001600160a01b03165afa908115610b5957600091610bb8575b50811015610b1657600754811115610bb557610b1090610d65565b50565b906020823d8211610be1575b81610bd1602093836108e7565b8101031261018157505138610b9a565b3d9150610bc4565b806000526004602052604060002054821115610c0c5790610c0991610e2d565b90565b50600360205260406000209060005260205260406000205490565b600754811115610c3a57610c0990610f0d565b600052600660205260406000205490565b60001981146109445760010190565b919091600092818452600493602091858352604092838320549283831115610d5b576001840193848111610d4857819080610d2e575b5084905b84821115610cd757505084818798997f73ae0cb867649b1d23379e31e281e3d67c11098b645cfed1e6d9643185ba695b98869452845220558351928352820152a2565b87835260028452868320828452845286832054610cf391610928565b90828212610d1e57610d18908884526003855287842081855285528288852055610c4b565b90610c94565b86516320e7ab6560e01b81528a90fd5b878352600384528683209083528352508481205438610c90565b634e487b7160e01b825260118952602482fd5b5050505050509050565b6007549081811115610b125760018201918281116109445760009080610e1b575b50825b82811115610dc95750507f69f52cb2fb6d6f344039390b3d79c2d3adc42581712f15d2bd3ad2abce8794bc918160409260075582519182526020820152a1565b8060005260209160058352610de5604091826000205490610928565b9260008412610e0a57829160068592610e05956000525260002055610c4b565b610d89565b81516320e7ab6560e01b8152600490fd5b81526006602052604090205438610d86565b90600090828252600491602090838252604091828220549586851115610ef657829680610edc575b60018101809111610ec9579594939291905b84871115610e79575050505050505090565b90919293949596610e9d908285526002845285852089865284528585205490610928565b96838812610eb957610eae90610c4b565b959493929190610e67565b84516320e7ab6560e01b81528790fd5b634e487b7160e01b845260118752602484fd5b818452600383528484208185528352848420549750610e55565b508092955060039194505283832091835252205490565b6007549081811115610f915760009180610f7d575b60018101809111610944575b81811115610f3b57505090565b806000526005602052610f55604093846000205490610928565b9260008412610f6d5750610f6890610c4b565b610f2e565b516320e7ab6560e01b8152600490fd5b918083604092526006602052205491610f22565b905060005260066020526040600020549056fea264697066735822122066204caa041e275fcefae02921931d678faf79b29b9c685c12bfeeb27003d16b64736f6c63430008140033",
+  "devdoc": {
+    "errors": {
+      "SafeCastOverflowedUintToInt(uint256)": [
+        {
+          "details": "An uint value doesn't fit in an int of `bits` size."
+        }
+      ]
+    },
+    "kind": "dev",
+    "methods": {
+      "addCGValueForEpochRange(uint256,uint256,uint256,uint256)": {
+        "details": "Mirrors `EpochStorage.addTokensToEpochRange`. Finalizes per-CG and      global ledgers up to `currentEpoch - 1` after the diff writes so      stale epochs are crystallized before the next read. Rounding dust is      discarded per the spec (challenge weighting, not reward payout).      Invariant: `startEpoch >= currentEpoch`. Backfilling into an      already-finalized epoch would corrupt `cgValueCumulative` silently      because the cumulative at that epoch has already been crystallized      and subsequent reads hit the fast path. Reverts `BackfillForbidden`      if the caller tries.      Retraction / expiry is automatic via the paired negative diff      written at `startEpoch + lifetime`. There is no removal function      by design: Phase 8 value-changing ops (CREATE, byte-size-grow      UPDATE, lifetime extension) are all positive deltas, and natural      expiry is handled by the diff ledger itself."
+      },
+      "finalizeCGValueUpTo(uint256,uint256)": {
+        "details": "Intended to be called by RandomSampling before a challenge draw      (see V10_CONTRACTS_REDESIGN_v2 \"On challenge generation\"), but any      Hub-registered contract may call it. Reads stay pure `view`; this      is the state-changing half of the \"finalize then read\" pattern.Reverts FutureOrCurrentEpoch if `epoch` is at or beyond the current      epoch. Only past epochs may be finalized; current-epoch reads always      take the simulation path to reflect in-flight diff writes."
+      },
+      "finalizeGlobalValueUpTo(uint256)": {
+        "details": "Reverts FutureOrCurrentEpoch if `epoch` is at or beyond the current      epoch. Only past epochs may be finalized; current-epoch reads always      take the simulation path to reflect in-flight diff writes."
+      }
+    },
+    "stateVariables": {
+      "cgShard": {
+        "details": "Reserved storage slots for future V11 sharding. Setters will be      added alongside the V11 logic contracts; no API exists today."
+      }
+    },
+    "title": "ContextGraphValueStorage",
+    "version": 1
+  },
+  "userdoc": {
+    "kind": "user",
+    "methods": {
+      "addCGValueForEpochRange(uint256,uint256,uint256,uint256)": {
+        "notice": "Record that `value` TRAC will be paid for `cgId` spread evenly         across `lifetime` epochs starting at `startEpoch`. Each epoch in         [startEpoch, startEpoch + lifetime - 1] receives `value/lifetime`."
+      },
+      "finalizeCGValueUpTo(uint256,uint256)": {
+        "notice": "Crystallizes `cgValueCumulative[cgId]` up to `epoch` so         subsequent reads at or below `epoch` become O(1). Safe to call         repeatedly: a call with `epoch <= cgLastFinalizedEpoch[cgId]`         is a no-op."
+      },
+      "finalizeGlobalValueUpTo(uint256)": {
+        "notice": "Crystallizes `totalValueCumulative` up to `epoch`. See         {finalizeCGValueUpTo} for semantics."
+      },
+      "getCGValueAtEpoch(uint256,uint256)": {
+        "notice": "Active per-epoch contribution of `cgId` at `epoch` (sum of all         active KAs' per-epoch values at that epoch). Returns the         simulated value if the epoch has not been finalized yet."
+      },
+      "getTotalValueAtEpoch(uint256)": {
+        "notice": "Global sum across all CGs of active per-epoch contributions at `epoch`."
+      }
+    },
+    "notice": "Lightweight per-CG and global per-epoch TRAC value tracker for V10         value-weighted challenges. Mirrors `EpochStorage.sol` diff/cumulative         finalize pattern at lines 149-174 / 279-310 exactly, but scaled to         int256/uint256 because publish values are wei-of-TRAC and exceed uint96. Design rationale (see V10_CONTRACTS_REDESIGN_v2.md §\"Data in ContextGraphValueStorage\"): a KA published with value `V` for `lifetime` epochs contributes `V / lifetime` per epoch during its active window [startEpoch, startEpoch + lifetime - 1]. Expiry is handled implicitly by the negative diff written at `startEpoch + lifetime`. No cleanup, no keeper. `addCGValueForEpochRange` uses plain integer division per the spec. A couple wei of rounding dust per publish is acceptable — this mapping is used for challenge weighting, not reward distribution. The dormant shard mappings (`cgShard`, `shardKnowledgeValue`) are reserved storage slots for future V11 sharding. Setters will be added alongside the V11 logic contracts; no API exists today.",
+    "version": 1
+  },
+  "storageLayout": {
+    "storage": [
+      {
+        "astId": 27334,
+        "contract": "contracts/storage/ContextGraphValueStorage.sol:ContextGraphValueStorage",
+        "label": "hub",
+        "offset": 0,
+        "slot": "0",
+        "type": "t_contract(Hub)46218"
+      },
+      {
+        "astId": 37600,
+        "contract": "contracts/storage/ContextGraphValueStorage.sol:ContextGraphValueStorage",
+        "label": "chronos",
+        "offset": 0,
+        "slot": "1",
+        "type": "t_contract(Chronos)35934"
+      },
+      {
+        "astId": 37606,
+        "contract": "contracts/storage/ContextGraphValueStorage.sol:ContextGraphValueStorage",
+        "label": "cgValueDiff",
+        "offset": 0,
+        "slot": "2",
+        "type": "t_mapping(t_uint256,t_mapping(t_uint256,t_int256))"
+      },
+      {
+        "astId": 37612,
+        "contract": "contracts/storage/ContextGraphValueStorage.sol:ContextGraphValueStorage",
+        "label": "cgValueCumulative",
+        "offset": 0,
+        "slot": "3",
+        "type": "t_mapping(t_uint256,t_mapping(t_uint256,t_uint256))"
+      },
+      {
+        "astId": 37616,
+        "contract": "contracts/storage/ContextGraphValueStorage.sol:ContextGraphValueStorage",
+        "label": "cgLastFinalizedEpoch",
+        "offset": 0,
+        "slot": "4",
+        "type": "t_mapping(t_uint256,t_uint256)"
+      },
+      {
+        "astId": 37620,
+        "contract": "contracts/storage/ContextGraphValueStorage.sol:ContextGraphValueStorage",
+        "label": "totalValueDiff",
+        "offset": 0,
+        "slot": "5",
+        "type": "t_mapping(t_uint256,t_int256)"
+      },
+      {
+        "astId": 37624,
+        "contract": "contracts/storage/ContextGraphValueStorage.sol:ContextGraphValueStorage",
+        "label": "totalValueCumulative",
+        "offset": 0,
+        "slot": "6",
+        "type": "t_mapping(t_uint256,t_uint256)"
+      },
+      {
+        "astId": 37626,
+        "contract": "contracts/storage/ContextGraphValueStorage.sol:ContextGraphValueStorage",
+        "label": "globalLastFinalizedEpoch",
+        "offset": 0,
+        "slot": "7",
+        "type": "t_uint256"
+      },
+      {
+        "astId": 37631,
+        "contract": "contracts/storage/ContextGraphValueStorage.sol:ContextGraphValueStorage",
+        "label": "cgShard",
+        "offset": 0,
+        "slot": "8",
+        "type": "t_mapping(t_uint256,t_uint256)"
+      },
+      {
+        "astId": 37637,
+        "contract": "contracts/storage/ContextGraphValueStorage.sol:ContextGraphValueStorage",
+        "label": "shardKnowledgeValue",
+        "offset": 0,
+        "slot": "9",
+        "type": "t_mapping(t_uint256,t_mapping(t_uint256,t_uint256))"
+      }
+    ],
+    "types": {
+      "t_contract(Chronos)35934": {
+        "encoding": "inplace",
+        "label": "contract Chronos",
+        "numberOfBytes": "20"
+      },
+      "t_contract(Hub)46218": {
+        "encoding": "inplace",
+        "label": "contract Hub",
+        "numberOfBytes": "20"
+      },
+      "t_int256": {
+        "encoding": "inplace",
+        "label": "int256",
+        "numberOfBytes": "32"
+      },
+      "t_mapping(t_uint256,t_int256)": {
+        "encoding": "mapping",
+        "key": "t_uint256",
+        "label": "mapping(uint256 => int256)",
+        "numberOfBytes": "32",
+        "value": "t_int256"
+      },
+      "t_mapping(t_uint256,t_mapping(t_uint256,t_int256))": {
+        "encoding": "mapping",
+        "key": "t_uint256",
+        "label": "mapping(uint256 => mapping(uint256 => int256))",
+        "numberOfBytes": "32",
+        "value": "t_mapping(t_uint256,t_int256)"
+      },
+      "t_mapping(t_uint256,t_mapping(t_uint256,t_uint256))": {
+        "encoding": "mapping",
+        "key": "t_uint256",
+        "label": "mapping(uint256 => mapping(uint256 => uint256))",
+        "numberOfBytes": "32",
+        "value": "t_mapping(t_uint256,t_uint256)"
+      },
+      "t_mapping(t_uint256,t_uint256)": {
+        "encoding": "mapping",
+        "key": "t_uint256",
+        "label": "mapping(uint256 => uint256)",
+        "numberOfBytes": "32",
+        "value": "t_uint256"
+      },
+      "t_uint256": {
+        "encoding": "inplace",
+        "label": "uint256",
+        "numberOfBytes": "32"
+      }
+    }
+  }
+}

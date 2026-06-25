@@ -569,6 +569,33 @@ export interface DkgConfig {
       /** Bounded in-memory buffer; drop-oldest on overflow. Default 500. */
       bufferMaxEntries?: number;
     };
+    /**
+     * OTel trace export (opt-in, independent of logs). Registers the tracer
+     * ONLY when an endpoint resolves (config or OTEL_EXPORTER_OTLP_* env);
+     * never falls back to a guessed prod URL.
+     */
+    traces?: {
+      enabled?: boolean;
+      /** OTLP traces endpoint, e.g. http://localhost:4318/v1/traces. */
+      endpoint?: string;
+      /** Bearer credential. Treated as a secret. */
+      token?: string;
+      /** Parent-based ratio sampler 0..1. Default 1.0. */
+      sampleRatio?: number;
+    };
+    /**
+     * OTel metric export (opt-in, independent of logs). Registers the meter
+     * ONLY when an endpoint resolves (config or OTEL_EXPORTER_OTLP_* env).
+     */
+    metrics?: {
+      enabled?: boolean;
+      /** OTLP metrics endpoint, e.g. http://localhost:4318/v1/metrics. */
+      endpoint?: string;
+      /** Bearer credential. Treated as a secret. */
+      token?: string;
+      /** PeriodicExportingMetricReader interval. Default 30000ms. */
+      exportIntervalMs?: number;
+    };
   };
   /** Shared memory (workspace) data TTL in milliseconds. Default: 30 days (2592000000). Set to 0 to disable cleanup. */
   sharedMemoryTtlMs?: number;

@@ -1,0 +1,820 @@
+{
+  "address": "0xAdE429ba898c34722e722415D722A70a297cE3a2",
+  "abi": [
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "hubAddress",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "constructor"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "string",
+          "name": "msg",
+          "type": "string"
+        }
+      ],
+      "name": "UnauthorizedAccess",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "ZeroAddressHub",
+      "type": "error"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint72",
+          "name": "index",
+          "type": "uint72"
+        }
+      ],
+      "name": "IdentityIdIndexSet",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint72",
+          "name": "newIndex",
+          "type": "uint72"
+        }
+      ],
+      "name": "NodeIndexDecremented",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint72",
+          "name": "newIndex",
+          "type": "uint72"
+        }
+      ],
+      "name": "NodeIndexIncremented",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        },
+        {
+          "indexed": false,
+          "internalType": "bytes",
+          "name": "nodeId",
+          "type": "bytes"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "hashRingPosition",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint72",
+          "name": "index",
+          "type": "uint72"
+        }
+      ],
+      "name": "NodeObjectCreated",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        }
+      ],
+      "name": "NodeObjectDeleted",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": false,
+          "internalType": "uint72",
+          "name": "newCount",
+          "type": "uint72"
+        }
+      ],
+      "name": "NodesCountDecremented",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": false,
+          "internalType": "uint72",
+          "name": "newCount",
+          "type": "uint72"
+        }
+      ],
+      "name": "NodesCountIncremented",
+      "type": "event"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "hashRingPosition",
+          "type": "uint256"
+        },
+        {
+          "internalType": "bytes",
+          "name": "nodeId",
+          "type": "bytes"
+        },
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        },
+        {
+          "internalType": "uint72",
+          "name": "index",
+          "type": "uint72"
+        }
+      ],
+      "name": "createNodeObject",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        }
+      ],
+      "name": "decrementNodeIndex",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "decrementNodesCount",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        }
+      ],
+      "name": "deleteNodeObject",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "index",
+          "type": "uint72"
+        }
+      ],
+      "name": "getAdjacentIdentityIdsByIndex",
+      "outputs": [
+        {
+          "internalType": "uint72",
+          "name": "",
+          "type": "uint72"
+        },
+        {
+          "internalType": "uint72",
+          "name": "",
+          "type": "uint72"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        }
+      ],
+      "name": "getHashRingPosition",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "index",
+          "type": "uint72"
+        }
+      ],
+      "name": "getHashRingPositionByIndex",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "firstIdentityId",
+          "type": "uint72"
+        },
+        {
+          "internalType": "uint16",
+          "name": "nodesNumber",
+          "type": "uint16"
+        }
+      ],
+      "name": "getMultipleNodes",
+      "outputs": [
+        {
+          "components": [
+            {
+              "internalType": "uint256",
+              "name": "hashRingPosition",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "nodeId",
+              "type": "bytes"
+            },
+            {
+              "internalType": "uint72",
+              "name": "index",
+              "type": "uint72"
+            },
+            {
+              "internalType": "uint72",
+              "name": "identityId",
+              "type": "uint72"
+            }
+          ],
+          "internalType": "struct ShardingTableLib.Node[]",
+          "name": "",
+          "type": "tuple[]"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "leftEdgeIndex",
+          "type": "uint72"
+        },
+        {
+          "internalType": "uint72",
+          "name": "closestNodeIndex",
+          "type": "uint72"
+        },
+        {
+          "internalType": "uint72",
+          "name": "rightEdgeIndex",
+          "type": "uint72"
+        }
+      ],
+      "name": "getNeighborhoodBoundaryByIndexes",
+      "outputs": [
+        {
+          "components": [
+            {
+              "internalType": "uint256",
+              "name": "hashRingPosition",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "nodeId",
+              "type": "bytes"
+            },
+            {
+              "internalType": "uint72",
+              "name": "index",
+              "type": "uint72"
+            },
+            {
+              "internalType": "uint72",
+              "name": "identityId",
+              "type": "uint72"
+            }
+          ],
+          "internalType": "struct ShardingTableLib.Node",
+          "name": "",
+          "type": "tuple"
+        },
+        {
+          "components": [
+            {
+              "internalType": "uint256",
+              "name": "hashRingPosition",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "nodeId",
+              "type": "bytes"
+            },
+            {
+              "internalType": "uint72",
+              "name": "index",
+              "type": "uint72"
+            },
+            {
+              "internalType": "uint72",
+              "name": "identityId",
+              "type": "uint72"
+            }
+          ],
+          "internalType": "struct ShardingTableLib.Node",
+          "name": "",
+          "type": "tuple"
+        },
+        {
+          "components": [
+            {
+              "internalType": "uint256",
+              "name": "hashRingPosition",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "nodeId",
+              "type": "bytes"
+            },
+            {
+              "internalType": "uint72",
+              "name": "index",
+              "type": "uint72"
+            },
+            {
+              "internalType": "uint72",
+              "name": "identityId",
+              "type": "uint72"
+            }
+          ],
+          "internalType": "struct ShardingTableLib.Node",
+          "name": "",
+          "type": "tuple"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        }
+      ],
+      "name": "getNode",
+      "outputs": [
+        {
+          "components": [
+            {
+              "internalType": "uint256",
+              "name": "hashRingPosition",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "nodeId",
+              "type": "bytes"
+            },
+            {
+              "internalType": "uint72",
+              "name": "index",
+              "type": "uint72"
+            },
+            {
+              "internalType": "uint72",
+              "name": "identityId",
+              "type": "uint72"
+            }
+          ],
+          "internalType": "struct ShardingTableLib.Node",
+          "name": "",
+          "type": "tuple"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "index",
+          "type": "uint72"
+        }
+      ],
+      "name": "getNodeByIndex",
+      "outputs": [
+        {
+          "components": [
+            {
+              "internalType": "uint256",
+              "name": "hashRingPosition",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "nodeId",
+              "type": "bytes"
+            },
+            {
+              "internalType": "uint72",
+              "name": "index",
+              "type": "uint72"
+            },
+            {
+              "internalType": "uint72",
+              "name": "identityId",
+              "type": "uint72"
+            }
+          ],
+          "internalType": "struct ShardingTableLib.Node",
+          "name": "",
+          "type": "tuple"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "head",
+      "outputs": [
+        {
+          "internalType": "uint72",
+          "name": "",
+          "type": "uint72"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "hub",
+      "outputs": [
+        {
+          "internalType": "contract Hub",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        }
+      ],
+      "name": "incrementNodeIndex",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "incrementNodesCount",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "",
+          "type": "uint72"
+        }
+      ],
+      "name": "indexToIdentityId",
+      "outputs": [
+        {
+          "internalType": "uint72",
+          "name": "",
+          "type": "uint72"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "name",
+      "outputs": [
+        {
+          "internalType": "string",
+          "name": "",
+          "type": "string"
+        }
+      ],
+      "stateMutability": "pure",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        }
+      ],
+      "name": "nodeExists",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "index",
+          "type": "uint72"
+        }
+      ],
+      "name": "nodeExistsByIndex",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "nodesCount",
+      "outputs": [
+        {
+          "internalType": "uint72",
+          "name": "",
+          "type": "uint72"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "index",
+          "type": "uint72"
+        },
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        }
+      ],
+      "name": "setIdentityId",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "version",
+      "outputs": [
+        {
+          "internalType": "string",
+          "name": "",
+          "type": "string"
+        }
+      ],
+      "stateMutability": "pure",
+      "type": "function"
+    }
+  ],
+  "transactionHash": "0x72ec054b805ade98b690f0cc410129cb6dff5e49c98775d92f65e4271eb2c3b6",
+  "receipt": {
+    "to": null,
+    "from": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    "contractAddress": "0xAdE429ba898c34722e722415D722A70a297cE3a2",
+    "transactionIndex": 0,
+    "gasUsed": "1111606",
+    "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "blockHash": "0xbf524d5f5283b734b21f2470533dc5fb38b71291e83fbde4df34343e3f9bb779",
+    "transactionHash": "0x72ec054b805ade98b690f0cc410129cb6dff5e49c98775d92f65e4271eb2c3b6",
+    "logs": [],
+    "blockNumber": 215,
+    "cumulativeGasUsed": "1111606",
+    "status": 1,
+    "byzantium": true
+  },
+  "args": [
+    "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+  ],
+  "numDeployments": 1,
+  "solcInputHash": "25f7b97326fdffc4ccdb60a7767831e0",
+  "metadata": "{\"compiler\":{\"version\":\"0.8.20+commit.a1b79de6\"},\"language\":\"Solidity\",\"output\":{\"abi\":[{\"inputs\":[{\"internalType\":\"address\",\"name\":\"hubAddress\",\"type\":\"address\"}],\"stateMutability\":\"nonpayable\",\"type\":\"constructor\"},{\"inputs\":[{\"internalType\":\"string\",\"name\":\"msg\",\"type\":\"string\"}],\"name\":\"UnauthorizedAccess\",\"type\":\"error\"},{\"inputs\":[],\"name\":\"ZeroAddressHub\",\"type\":\"error\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"},{\"indexed\":false,\"internalType\":\"uint72\",\"name\":\"index\",\"type\":\"uint72\"}],\"name\":\"IdentityIdIndexSet\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"},{\"indexed\":false,\"internalType\":\"uint72\",\"name\":\"newIndex\",\"type\":\"uint72\"}],\"name\":\"NodeIndexDecremented\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"},{\"indexed\":false,\"internalType\":\"uint72\",\"name\":\"newIndex\",\"type\":\"uint72\"}],\"name\":\"NodeIndexIncremented\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"},{\"indexed\":false,\"internalType\":\"bytes\",\"name\":\"nodeId\",\"type\":\"bytes\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"hashRingPosition\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint72\",\"name\":\"index\",\"type\":\"uint72\"}],\"name\":\"NodeObjectCreated\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"}],\"name\":\"NodeObjectDeleted\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":false,\"internalType\":\"uint72\",\"name\":\"newCount\",\"type\":\"uint72\"}],\"name\":\"NodesCountDecremented\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":false,\"internalType\":\"uint72\",\"name\":\"newCount\",\"type\":\"uint72\"}],\"name\":\"NodesCountIncremented\",\"type\":\"event\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"hashRingPosition\",\"type\":\"uint256\"},{\"internalType\":\"bytes\",\"name\":\"nodeId\",\"type\":\"bytes\"},{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"},{\"internalType\":\"uint72\",\"name\":\"index\",\"type\":\"uint72\"}],\"name\":\"createNodeObject\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"}],\"name\":\"decrementNodeIndex\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"decrementNodesCount\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"}],\"name\":\"deleteNodeObject\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"index\",\"type\":\"uint72\"}],\"name\":\"getAdjacentIdentityIdsByIndex\",\"outputs\":[{\"internalType\":\"uint72\",\"name\":\"\",\"type\":\"uint72\"},{\"internalType\":\"uint72\",\"name\":\"\",\"type\":\"uint72\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"}],\"name\":\"getHashRingPosition\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"index\",\"type\":\"uint72\"}],\"name\":\"getHashRingPositionByIndex\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"firstIdentityId\",\"type\":\"uint72\"},{\"internalType\":\"uint16\",\"name\":\"nodesNumber\",\"type\":\"uint16\"}],\"name\":\"getMultipleNodes\",\"outputs\":[{\"components\":[{\"internalType\":\"uint256\",\"name\":\"hashRingPosition\",\"type\":\"uint256\"},{\"internalType\":\"bytes\",\"name\":\"nodeId\",\"type\":\"bytes\"},{\"internalType\":\"uint72\",\"name\":\"index\",\"type\":\"uint72\"},{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"}],\"internalType\":\"struct ShardingTableLib.Node[]\",\"name\":\"\",\"type\":\"tuple[]\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"leftEdgeIndex\",\"type\":\"uint72\"},{\"internalType\":\"uint72\",\"name\":\"closestNodeIndex\",\"type\":\"uint72\"},{\"internalType\":\"uint72\",\"name\":\"rightEdgeIndex\",\"type\":\"uint72\"}],\"name\":\"getNeighborhoodBoundaryByIndexes\",\"outputs\":[{\"components\":[{\"internalType\":\"uint256\",\"name\":\"hashRingPosition\",\"type\":\"uint256\"},{\"internalType\":\"bytes\",\"name\":\"nodeId\",\"type\":\"bytes\"},{\"internalType\":\"uint72\",\"name\":\"index\",\"type\":\"uint72\"},{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"}],\"internalType\":\"struct ShardingTableLib.Node\",\"name\":\"\",\"type\":\"tuple\"},{\"components\":[{\"internalType\":\"uint256\",\"name\":\"hashRingPosition\",\"type\":\"uint256\"},{\"internalType\":\"bytes\",\"name\":\"nodeId\",\"type\":\"bytes\"},{\"internalType\":\"uint72\",\"name\":\"index\",\"type\":\"uint72\"},{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"}],\"internalType\":\"struct ShardingTableLib.Node\",\"name\":\"\",\"type\":\"tuple\"},{\"components\":[{\"internalType\":\"uint256\",\"name\":\"hashRingPosition\",\"type\":\"uint256\"},{\"internalType\":\"bytes\",\"name\":\"nodeId\",\"type\":\"bytes\"},{\"internalType\":\"uint72\",\"name\":\"index\",\"type\":\"uint72\"},{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"}],\"internalType\":\"struct ShardingTableLib.Node\",\"name\":\"\",\"type\":\"tuple\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"}],\"name\":\"getNode\",\"outputs\":[{\"components\":[{\"internalType\":\"uint256\",\"name\":\"hashRingPosition\",\"type\":\"uint256\"},{\"internalType\":\"bytes\",\"name\":\"nodeId\",\"type\":\"bytes\"},{\"internalType\":\"uint72\",\"name\":\"index\",\"type\":\"uint72\"},{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"}],\"internalType\":\"struct ShardingTableLib.Node\",\"name\":\"\",\"type\":\"tuple\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"index\",\"type\":\"uint72\"}],\"name\":\"getNodeByIndex\",\"outputs\":[{\"components\":[{\"internalType\":\"uint256\",\"name\":\"hashRingPosition\",\"type\":\"uint256\"},{\"internalType\":\"bytes\",\"name\":\"nodeId\",\"type\":\"bytes\"},{\"internalType\":\"uint72\",\"name\":\"index\",\"type\":\"uint72\"},{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"}],\"internalType\":\"struct ShardingTableLib.Node\",\"name\":\"\",\"type\":\"tuple\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"head\",\"outputs\":[{\"internalType\":\"uint72\",\"name\":\"\",\"type\":\"uint72\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"hub\",\"outputs\":[{\"internalType\":\"contract Hub\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"}],\"name\":\"incrementNodeIndex\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"incrementNodesCount\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"\",\"type\":\"uint72\"}],\"name\":\"indexToIdentityId\",\"outputs\":[{\"internalType\":\"uint72\",\"name\":\"\",\"type\":\"uint72\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"name\",\"outputs\":[{\"internalType\":\"string\",\"name\":\"\",\"type\":\"string\"}],\"stateMutability\":\"pure\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"}],\"name\":\"nodeExists\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"index\",\"type\":\"uint72\"}],\"name\":\"nodeExistsByIndex\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"nodesCount\",\"outputs\":[{\"internalType\":\"uint72\",\"name\":\"\",\"type\":\"uint72\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"index\",\"type\":\"uint72\"},{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"}],\"name\":\"setIdentityId\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"version\",\"outputs\":[{\"internalType\":\"string\",\"name\":\"\",\"type\":\"string\"}],\"stateMutability\":\"pure\",\"type\":\"function\"}],\"devdoc\":{\"kind\":\"dev\",\"methods\":{},\"version\":1},\"userdoc\":{\"kind\":\"user\",\"methods\":{},\"version\":1}},\"settings\":{\"compilationTarget\":{\"contracts/storage/ShardingTableStorage.sol\":\"ShardingTableStorage\"},\"evmVersion\":\"london\",\"libraries\":{},\"metadata\":{\"bytecodeHash\":\"ipfs\",\"useLiteralContent\":true},\"optimizer\":{\"enabled\":true,\"runs\":200},\"remappings\":[],\"viaIR\":true},\"sources\":{\"@openzeppelin/contracts/access/Ownable.sol\":{\"content\":\"// SPDX-License-Identifier: MIT\\n// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)\\n\\npragma solidity ^0.8.20;\\n\\nimport {Context} from \\\"../utils/Context.sol\\\";\\n\\n/**\\n * @dev Contract module which provides a basic access control mechanism, where\\n * there is an account (an owner) that can be granted exclusive access to\\n * specific functions.\\n *\\n * The initial owner is set to the address provided by the deployer. This can\\n * later be changed with {transferOwnership}.\\n *\\n * This module is used through inheritance. It will make available the modifier\\n * `onlyOwner`, which can be applied to your functions to restrict their use to\\n * the owner.\\n */\\nabstract contract Ownable is Context {\\n    address private _owner;\\n\\n    /**\\n     * @dev The caller account is not authorized to perform an operation.\\n     */\\n    error OwnableUnauthorizedAccount(address account);\\n\\n    /**\\n     * @dev The owner is not a valid owner account. (eg. `address(0)`)\\n     */\\n    error OwnableInvalidOwner(address owner);\\n\\n    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);\\n\\n    /**\\n     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.\\n     */\\n    constructor(address initialOwner) {\\n        if (initialOwner == address(0)) {\\n            revert OwnableInvalidOwner(address(0));\\n        }\\n        _transferOwnership(initialOwner);\\n    }\\n\\n    /**\\n     * @dev Throws if called by any account other than the owner.\\n     */\\n    modifier onlyOwner() {\\n        _checkOwner();\\n        _;\\n    }\\n\\n    /**\\n     * @dev Returns the address of the current owner.\\n     */\\n    function owner() public view virtual returns (address) {\\n        return _owner;\\n    }\\n\\n    /**\\n     * @dev Throws if the sender is not the owner.\\n     */\\n    function _checkOwner() internal view virtual {\\n        if (owner() != _msgSender()) {\\n            revert OwnableUnauthorizedAccount(_msgSender());\\n        }\\n    }\\n\\n    /**\\n     * @dev Leaves the contract without owner. It will not be possible to call\\n     * `onlyOwner` functions. Can only be called by the current owner.\\n     *\\n     * NOTE: Renouncing ownership will leave the contract without an owner,\\n     * thereby disabling any functionality that is only available to the owner.\\n     */\\n    function renounceOwnership() public virtual onlyOwner {\\n        _transferOwnership(address(0));\\n    }\\n\\n    /**\\n     * @dev Transfers ownership of the contract to a new account (`newOwner`).\\n     * Can only be called by the current owner.\\n     */\\n    function transferOwnership(address newOwner) public virtual onlyOwner {\\n        if (newOwner == address(0)) {\\n            revert OwnableInvalidOwner(address(0));\\n        }\\n        _transferOwnership(newOwner);\\n    }\\n\\n    /**\\n     * @dev Transfers ownership of the contract to a new account (`newOwner`).\\n     * Internal function without access restriction.\\n     */\\n    function _transferOwnership(address newOwner) internal virtual {\\n        address oldOwner = _owner;\\n        _owner = newOwner;\\n        emit OwnershipTransferred(oldOwner, newOwner);\\n    }\\n}\\n\",\"keccak256\":\"0xff6d0bb2e285473e5311d9d3caacb525ae3538a80758c10649a4d61029b017bb\",\"license\":\"MIT\"},\"@openzeppelin/contracts/utils/Context.sol\":{\"content\":\"// SPDX-License-Identifier: MIT\\n// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)\\n\\npragma solidity ^0.8.20;\\n\\n/**\\n * @dev Provides information about the current execution context, including the\\n * sender of the transaction and its data. While these are generally available\\n * via msg.sender and msg.data, they should not be accessed in such a direct\\n * manner, since when dealing with meta-transactions the account sending and\\n * paying for execution may not be the actual sender (as far as an application\\n * is concerned).\\n *\\n * This contract is only required for intermediate, library-like contracts.\\n */\\nabstract contract Context {\\n    function _msgSender() internal view virtual returns (address) {\\n        return msg.sender;\\n    }\\n\\n    function _msgData() internal view virtual returns (bytes calldata) {\\n        return msg.data;\\n    }\\n\\n    function _contextSuffixLength() internal view virtual returns (uint256) {\\n        return 0;\\n    }\\n}\\n\",\"keccak256\":\"0x493033a8d1b176a037b2cc6a04dad01a5c157722049bbecf632ca876224dd4b2\",\"license\":\"MIT\"},\"contracts/abstract/HubDependent.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nimport {Hub} from \\\"../storage/Hub.sol\\\";\\nimport {HubLib} from \\\"../libraries/HubLib.sol\\\";\\n\\nabstract contract HubDependent {\\n    Hub public hub;\\n\\n    constructor(address hubAddress) {\\n        if (hubAddress == address(0)) {\\n            revert HubLib.ZeroAddressHub();\\n        }\\n\\n        hub = Hub(hubAddress);\\n    }\\n\\n    modifier onlyHub() {\\n        _checkHub();\\n        _;\\n    }\\n\\n    modifier onlyHubOwner() {\\n        _checkHubOwner();\\n        _;\\n    }\\n\\n    modifier onlyContracts() {\\n        _checkHubContract();\\n        _;\\n    }\\n\\n    function _checkHub() internal view virtual {\\n        if (msg.sender != address(hub) && msg.sender != hub.owner()) {\\n            revert HubLib.UnauthorizedAccess(\\\"Only Hub\\\");\\n        }\\n    }\\n\\n    function _checkHubOwner() internal view virtual {\\n        if (msg.sender != hub.owner()) {\\n            revert HubLib.UnauthorizedAccess(\\\"Only Hub Owner\\\");\\n        }\\n    }\\n\\n    function _checkHubContract() internal view virtual {\\n        if (!hub.isContract(msg.sender) && msg.sender != hub.owner()) {\\n            revert HubLib.UnauthorizedAccess(\\\"Only Contracts in Hub\\\");\\n        }\\n    }\\n}\\n\",\"keccak256\":\"0x643f4dcb2699e967c2ffbfb7c412e0973abc1409e0753a35f75c4661b89f977d\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/IContractStatus.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface IContractStatus {\\n    function setStatus(bool _status) external;\\n}\\n\",\"keccak256\":\"0x0eaaee7100a88d51de69ac7ec4d5e58d9bdd2582537476631a0717379ca16c40\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/ICustodian.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface ICustodian {\\n    function getOwners() external view returns (address[] memory);\\n}\\n\",\"keccak256\":\"0x513e0babede5cc394427a5fb941c80c255be8716e24ff5ee4ea7a6e18335e0b0\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/IInitializable.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface IInitializable {\\n    function initialize() external;\\n}\\n\",\"keccak256\":\"0xad07f8f7bb2bad96f3d5c97ef6673e15574ad11701be1ac9feb94f750c0dee51\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/INamed.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface INamed {\\n    function name() external view returns (string memory);\\n}\\n\",\"keccak256\":\"0x111fc7e3f1b6c9e9da05cecf65d9985177bcface705870536fe409089b89a27c\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/IVersioned.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface IVersioned {\\n    function version() external view returns (string memory);\\n}\\n\",\"keccak256\":\"0x5e104c26deb107969a5bc1f38614f11af0261fc84f1ebbd2ab3bd064b4795de0\",\"license\":\"Apache-2.0\"},\"contracts/libraries/HubLib.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nlibrary HubLib {\\n    struct Contract {\\n        string name;\\n        address addr;\\n    }\\n\\n    struct ForwardCallInputArgs {\\n        string contractName;\\n        bytes[] encodedData;\\n    }\\n\\n    error ZeroAddressHub();\\n    error UnauthorizedAccess(string msg);\\n    error InvalidTargetContract(address addr);\\n    error ContractNotRegistered(string contractName);\\n}\\n\",\"keccak256\":\"0xcb693696568e706c95ff32538831d177d379e28f7fd0518b787c1d7a5334d71b\",\"license\":\"Apache-2.0\"},\"contracts/libraries/ShardingTableLib.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nlibrary ShardingTableLib {\\n    uint72 public constant NULL = 0;\\n\\n    struct Node {\\n        uint256 hashRingPosition;\\n        bytes nodeId;\\n        uint72 index;\\n        uint72 identityId;\\n    }\\n\\n    struct NodeInfo {\\n        bytes nodeId;\\n        uint72 identityId;\\n        uint96 ask;\\n        uint96 stake;\\n    }\\n\\n    error NodeAlreadyInTheShardingTable(uint72 identityId);\\n    error InvalidIndexWithRespectToPreviousNode(\\n        uint72 identityId,\\n        uint256 hashRingPosition,\\n        uint256 prevHashRingPosition\\n    );\\n    error InvalidIndexWithRespectToNextNode(uint72 identityId, uint256 hashRingPosition, uint256 nextHashRingPosition);\\n    error InvalidStartingIdentityId(uint72 identityId);\\n    error ShardingTableIsFull();\\n}\\n\",\"keccak256\":\"0xeccd6d0951876538bc7976def5f0f3fd6eec07bbf0e3d535a027cfbac9bf410f\",\"license\":\"Apache-2.0\"},\"contracts/libraries/UnorderedNamedContractDynamicSet.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nlibrary UnorderedNamedContractDynamicSet {\\n    struct Contract {\\n        string name;\\n        address addr;\\n    }\\n\\n    struct Set {\\n        mapping(string => uint256) stringIndexPointers;\\n        mapping(address => uint256) addressIndexPointers;\\n        Contract[] contractList;\\n    }\\n\\n    error EmptyName();\\n    error ZeroAddress();\\n    error ContractAlreadyExists(string name);\\n    error AddressAlreadyInSet(address addr);\\n    error ContractDoesNotExist(string name);\\n    error AddressDoesNotExist(address addr);\\n\\n    function append(UnorderedNamedContractDynamicSet.Set storage self, string calldata name, address addr) internal {\\n        if (keccak256(abi.encodePacked(name)) == keccak256(abi.encodePacked(\\\"\\\"))) revert EmptyName();\\n        if (addr == address(0)) revert ZeroAddress();\\n        if (exists(self, name)) revert ContractAlreadyExists(name);\\n        if (self.contractList.length > 0 && (self.addressIndexPointers[addr] != 0 || self.contractList[0].addr == addr))\\n            revert AddressAlreadyInSet(addr);\\n\\n        self.stringIndexPointers[name] = size(self);\\n        self.addressIndexPointers[addr] = size(self);\\n        self.contractList.push(UnorderedNamedContractDynamicSet.Contract(name, addr));\\n    }\\n\\n    function update(UnorderedNamedContractDynamicSet.Set storage self, string calldata name, address addr) internal {\\n        if (addr == address(0)) revert ZeroAddress();\\n        if (!exists(self, name)) revert ContractDoesNotExist(name);\\n\\n        address currentAddr = self.contractList[self.stringIndexPointers[name]].addr;\\n        if (currentAddr == addr) {\\n            // Idempotent: same address already registered for this name (e.g. re-run deploy in tests).\\n            return;\\n        }\\n        if (self.contractList.length > 0 && (self.addressIndexPointers[addr] != 0 || self.contractList[0].addr == addr))\\n            revert AddressAlreadyInSet(addr);\\n\\n        delete self.addressIndexPointers[currentAddr];\\n        self.addressIndexPointers[addr] = self.stringIndexPointers[name];\\n        self.contractList[self.stringIndexPointers[name]].addr = addr;\\n    }\\n\\n    function remove(UnorderedNamedContractDynamicSet.Set storage self, string calldata name) internal {\\n        if (!exists(self, name)) revert ContractDoesNotExist(name);\\n\\n        uint256 contractToRemoveIndex = self.stringIndexPointers[name];\\n\\n        delete self.addressIndexPointers[self.contractList[contractToRemoveIndex].addr];\\n\\n        UnorderedNamedContractDynamicSet.Contract memory contractToMove = self.contractList[size(self) - 1];\\n\\n        self.stringIndexPointers[contractToMove.name] = contractToRemoveIndex;\\n        self.addressIndexPointers[contractToMove.addr] = contractToRemoveIndex;\\n        self.contractList[contractToRemoveIndex] = contractToMove;\\n\\n        delete self.stringIndexPointers[name];\\n        self.contractList.pop();\\n    }\\n\\n    function remove(UnorderedNamedContractDynamicSet.Set storage self, address addr) internal {\\n        if (!exists(self, addr)) revert AddressDoesNotExist(addr);\\n\\n        uint256 contractToRemoveIndex = self.addressIndexPointers[addr];\\n\\n        delete self.stringIndexPointers[self.contractList[contractToRemoveIndex].name];\\n\\n        UnorderedNamedContractDynamicSet.Contract memory contractToMove = self.contractList[size(self) - 1];\\n\\n        self.stringIndexPointers[contractToMove.name] = contractToRemoveIndex;\\n        self.addressIndexPointers[contractToMove.addr] = contractToRemoveIndex;\\n        self.contractList[contractToRemoveIndex] = contractToMove;\\n\\n        delete self.addressIndexPointers[addr];\\n        self.contractList.pop();\\n    }\\n\\n    function get(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        string calldata name\\n    ) internal view returns (UnorderedNamedContractDynamicSet.Contract memory) {\\n        if (!exists(self, name)) revert ContractDoesNotExist(name);\\n\\n        return self.contractList[self.stringIndexPointers[name]];\\n    }\\n\\n    function get(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        address addr\\n    ) internal view returns (UnorderedNamedContractDynamicSet.Contract memory) {\\n        if (!exists(self, addr)) revert AddressDoesNotExist(addr);\\n\\n        return self.contractList[self.addressIndexPointers[addr]];\\n    }\\n\\n    function get(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        uint256 index\\n    ) internal view returns (UnorderedNamedContractDynamicSet.Contract memory) {\\n        return self.contractList[index];\\n    }\\n\\n    function getAll(\\n        UnorderedNamedContractDynamicSet.Set storage self\\n    ) internal view returns (UnorderedNamedContractDynamicSet.Contract[] memory) {\\n        return self.contractList;\\n    }\\n\\n    function getIndex(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        string calldata name\\n    ) internal view returns (uint256) {\\n        return self.stringIndexPointers[name];\\n    }\\n\\n    function getIndex(UnorderedNamedContractDynamicSet.Set storage self, address addr) internal view returns (uint256) {\\n        return self.addressIndexPointers[addr];\\n    }\\n\\n    function exists(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        string calldata name\\n    ) internal view returns (bool) {\\n        if (size(self) == 0) {\\n            return false;\\n        }\\n        return\\n            keccak256(abi.encodePacked(self.contractList[self.stringIndexPointers[name]].name)) ==\\n            keccak256(abi.encodePacked(name));\\n    }\\n\\n    function exists(UnorderedNamedContractDynamicSet.Set storage self, address addr) internal view returns (bool) {\\n        if (size(self) == 0) {\\n            return false;\\n        }\\n        return addr == self.contractList[self.addressIndexPointers[addr]].addr;\\n    }\\n\\n    function size(UnorderedNamedContractDynamicSet.Set storage self) internal view returns (uint256) {\\n        return self.contractList.length;\\n    }\\n}\\n\",\"keccak256\":\"0x51b09c4bc2d3342e78c0a77eceff9ba5a7e694ba663535abec0e859c5e32b5ab\",\"license\":\"Apache-2.0\"},\"contracts/storage/Hub.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nimport {IContractStatus} from \\\"../interfaces/IContractStatus.sol\\\";\\nimport {ICustodian} from \\\"../interfaces/ICustodian.sol\\\";\\nimport {IInitializable} from \\\"../interfaces/IInitializable.sol\\\";\\nimport {INamed} from \\\"../interfaces/INamed.sol\\\";\\nimport {IVersioned} from \\\"../interfaces/IVersioned.sol\\\";\\nimport {HubLib} from \\\"../libraries/HubLib.sol\\\";\\nimport {UnorderedNamedContractDynamicSet} from \\\"../libraries/UnorderedNamedContractDynamicSet.sol\\\";\\nimport {Ownable} from \\\"@openzeppelin/contracts/access/Ownable.sol\\\";\\n\\ncontract Hub is INamed, IVersioned, Ownable {\\n    using UnorderedNamedContractDynamicSet for UnorderedNamedContractDynamicSet.Set;\\n\\n    event NewContract(string contractName, address newContractAddress);\\n    event ContractChanged(string contractName, address newContractAddress);\\n    event NewAssetStorage(string contractName, address newContractAddress);\\n    event AssetStorageChanged(string contractName, address newContractAddress);\\n    event ContractRemoved(string contractName, address contractAddress);\\n    event AssetStorageRemoved(string contractName, address contractAddress);\\n\\n    string private constant _NAME = \\\"Hub\\\";\\n    string private constant _VERSION = \\\"1.0.0\\\";\\n\\n    UnorderedNamedContractDynamicSet.Set internal contractSet;\\n    UnorderedNamedContractDynamicSet.Set internal assetStorageSet;\\n\\n    constructor() Ownable(msg.sender) {}\\n\\n    // @dev Only transactions by HubController owner or one of the owners of the MultiSig Wallet\\n    modifier onlyOwnerOrMultiSigOwner() {\\n        _checkOwnerOrMultiSigOwner();\\n        _;\\n    }\\n\\n    function name() external pure virtual override returns (string memory) {\\n        return _NAME;\\n    }\\n\\n    function version() external pure virtual override returns (string memory) {\\n        return _VERSION;\\n    }\\n\\n    function setContractAddress(\\n        string calldata contractName,\\n        address newContractAddress\\n    ) external onlyOwnerOrMultiSigOwner {\\n        _setContractAddress(contractName, newContractAddress);\\n    }\\n\\n    function setAssetStorageAddress(string calldata assetStorageName, address assetStorageAddress) external onlyOwner {\\n        _setAssetStorageAddress(assetStorageName, assetStorageAddress);\\n    }\\n\\n    function removeContractByName(string calldata contractName) external onlyOwner {\\n        if (contractSet.exists(contractName)) {\\n            address contractAddress = contractSet.get(contractName).addr;\\n\\n            contractSet.remove(contractName);\\n\\n            emit ContractRemoved(contractName, contractAddress);\\n        }\\n    }\\n\\n    function removeContractByAddress(address contractAddress) external onlyOwner {\\n        if (contractSet.exists(contractAddress)) {\\n            string memory contractName = contractSet.get(contractAddress).name;\\n\\n            contractSet.remove(contractAddress);\\n\\n            emit ContractRemoved(contractName, contractAddress);\\n        }\\n    }\\n\\n    function removeAssetStorageByName(string calldata assetStorageName) external onlyOwner {\\n        if (assetStorageSet.exists(assetStorageName)) {\\n            address assetStorageAddress = assetStorageSet.get(assetStorageName).addr;\\n\\n            assetStorageSet.remove(assetStorageName);\\n\\n            emit AssetStorageRemoved(assetStorageName, assetStorageAddress);\\n        }\\n    }\\n\\n    function removeAssetStorageByAddress(address assetStorageAddress) external onlyOwner {\\n        if (assetStorageSet.exists(assetStorageAddress)) {\\n            string memory assetStorageName = assetStorageSet.get(assetStorageAddress).name;\\n\\n            assetStorageSet.remove(assetStorageAddress);\\n\\n            emit AssetStorageRemoved(assetStorageName, assetStorageAddress);\\n        }\\n    }\\n\\n    function getContractAddress(string calldata contractName) external view returns (address) {\\n        return contractSet.get(contractName).addr;\\n    }\\n\\n    function getAssetStorageAddress(string calldata assetStorageName) external view returns (address) {\\n        return assetStorageSet.get(assetStorageName).addr;\\n    }\\n\\n    function getAllContracts() external view returns (UnorderedNamedContractDynamicSet.Contract[] memory) {\\n        return contractSet.getAll();\\n    }\\n\\n    function getAllAssetStorages() external view returns (UnorderedNamedContractDynamicSet.Contract[] memory) {\\n        return assetStorageSet.getAll();\\n    }\\n\\n    function isContract(string calldata contractName) external view returns (bool) {\\n        return contractSet.exists(contractName);\\n    }\\n\\n    function isContract(address selectedContractAddress) external view returns (bool) {\\n        return contractSet.exists(selectedContractAddress);\\n    }\\n\\n    function isAssetStorage(string calldata assetStorageName) external view returns (bool) {\\n        return assetStorageSet.exists(assetStorageName);\\n    }\\n\\n    function isAssetStorage(address assetStorageAddress) external view returns (bool) {\\n        return assetStorageSet.exists(assetStorageAddress);\\n    }\\n\\n    /**\\n     * @dev Forwards a function call to a specified target contract.\\n     * @notice This function can only be called by the contract owner or a multisig owner.\\n     * @param target The address of the target contract.\\n     * @param data The calldata containing the function signature and arguments for the target contract's function.\\n     * @return result The return data of the target contract's function call.\\n     */\\n    function forwardCall(address target, bytes calldata data) public onlyOwnerOrMultiSigOwner returns (bytes memory) {\\n        // Check if the target contract is registered in the Hub\\n        if (!contractSet.exists(target) && !assetStorageSet.exists(target)) {\\n            revert HubLib.InvalidTargetContract(target);\\n        }\\n\\n        // Perform the function call to the target contract with the specified calldata\\n        (bool success, bytes memory result) = target.call{value: 0}(data);\\n\\n        // If the call is unsuccessful, revert the transaction with the original revert reason\\n        if (!success) {\\n            assembly {\\n                // Load the free memory pointer from memory slot 0x40\\n                // Memory slot 0x40 is conventionally used to store the free memory pointer in Solidity, which points\\n                // to the next available memory slot for storing data during the execution of a contract function.\\n                let ptr := mload(0x40)\\n                // Get the size of the return data from the unsuccessful call\\n                let size := returndatasize()\\n                // Copy the return data to the memory location pointed to by ptr\\n                returndatacopy(ptr, 0, size)\\n                // Revert the transaction with the return data as the revert reason\\n                revert(ptr, size)\\n            }\\n        }\\n\\n        return result;\\n    }\\n\\n    function setAndReinitializeContracts(\\n        HubLib.Contract[] calldata newContracts,\\n        HubLib.Contract[] calldata newAssetStorageContracts,\\n        address[] calldata contractsToReinitialize,\\n        HubLib.ForwardCallInputArgs[] calldata forwardCallsData\\n    ) external onlyOwnerOrMultiSigOwner {\\n        _setContracts(newContracts);\\n        _setAssetStorageContracts(newAssetStorageContracts);\\n        _reinitializeContracts(contractsToReinitialize);\\n        _forwardCalls(forwardCallsData);\\n    }\\n\\n    function _setContractAddress(string calldata contractName, address newContractAddress) internal {\\n        if (contractSet.exists(contractName)) {\\n            contractSet.update(contractName, newContractAddress);\\n\\n            address oldContractAddress = contractSet.get(contractName).addr;\\n            if (_isContract(oldContractAddress)) {\\n                try IContractStatus(oldContractAddress).setStatus(false) {\\n                    // success\\n                } catch {\\n                    // Best-effort: contract may not implement IContractStatus; ignore.\\n                }\\n            }\\n\\n            emit ContractChanged(contractName, newContractAddress);\\n        } else {\\n            contractSet.append(contractName, newContractAddress);\\n\\n            emit NewContract(contractName, newContractAddress);\\n        }\\n\\n        if (_isContract(newContractAddress)) {\\n            try IContractStatus(newContractAddress).setStatus(true) {\\n                // success\\n            } catch {\\n                // Best-effort: contract may not implement IContractStatus; ignore.\\n            }\\n        }\\n\\n        emit NewContract(contractName, newContractAddress);\\n    }\\n\\n    function _setContracts(HubLib.Contract[] calldata newContracts) internal {\\n        for (uint256 i; i < newContracts.length; ) {\\n            _setContractAddress(newContracts[i].name, newContracts[i].addr);\\n\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _setAssetStorageAddress(string calldata assetStorageName, address assetStorageAddress) internal {\\n        if (assetStorageSet.exists(assetStorageName)) {\\n            emit AssetStorageChanged(assetStorageName, assetStorageAddress);\\n            assetStorageSet.update(assetStorageName, assetStorageAddress);\\n        } else {\\n            emit NewAssetStorage(assetStorageName, assetStorageAddress);\\n            assetStorageSet.append(assetStorageName, assetStorageAddress);\\n        }\\n    }\\n\\n    function _setAssetStorageContracts(HubLib.Contract[] calldata newAssetStorageContracts) internal {\\n        for (uint256 i; i < newAssetStorageContracts.length; ) {\\n            _setAssetStorageAddress(newAssetStorageContracts[i].name, newAssetStorageContracts[i].addr);\\n\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _reinitializeContracts(address[] calldata contractsToReinitialize) internal {\\n        for (uint256 i; i < contractsToReinitialize.length; ) {\\n            IInitializable(contractsToReinitialize[i]).initialize();\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _forwardCalls(HubLib.ForwardCallInputArgs[] calldata forwardCallsData) internal {\\n        for (uint256 i; i < forwardCallsData.length; ) {\\n            address contractAddress;\\n\\n            // Try to get the contract address using getContractAddress\\n            try this.getContractAddress(forwardCallsData[i].contractName) returns (address addr) {\\n                contractAddress = addr;\\n            } catch {\\n                // If getContractAddress fails, try getAssetStorageAddress\\n                try this.getAssetStorageAddress(forwardCallsData[i].contractName) returns (address addr) {\\n                    contractAddress = addr;\\n                } catch {\\n                    revert HubLib.ContractNotRegistered(forwardCallsData[i].contractName);\\n                }\\n            }\\n            for (uint256 j; j < forwardCallsData[i].encodedData.length; ) {\\n                forwardCall(contractAddress, forwardCallsData[i].encodedData[j]);\\n                unchecked {\\n                    j++;\\n                }\\n            }\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _isContract(address addr) internal view returns (bool) {\\n        uint256 size;\\n        assembly {\\n            size := extcodesize(addr)\\n        }\\n        return size > 0;\\n    }\\n\\n    function _isMultiSigOwner(address multiSigAddress) internal view returns (bool) {\\n        try ICustodian(multiSigAddress).getOwners() returns (address[] memory multiSigOwners) {\\n            for (uint256 i = 0; i < multiSigOwners.length; i++) {\\n                if (msg.sender == multiSigOwners[i]) {\\n                    return true;\\n                }\\n            }\\n        } catch {\\n            // Not a multisig or call reverted; treat as not owner.\\n        }\\n\\n        return false;\\n    }\\n\\n    function _checkOwnerOrMultiSigOwner() internal view virtual {\\n        address hubOwner = owner();\\n        if (msg.sender != hubOwner && !_isMultiSigOwner(hubOwner)) {\\n            revert HubLib.UnauthorizedAccess(\\\"Only Hub Owner or Multisig Owner\\\");\\n        }\\n    }\\n}\\n\",\"keccak256\":\"0x732252bb857277a35ab314beef2dbaceb5f96ce2f6d3b83a224927e503609def\",\"license\":\"Apache-2.0\"},\"contracts/storage/ShardingTableStorage.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nimport {HubDependent} from \\\"../abstract/HubDependent.sol\\\";\\nimport {INamed} from \\\"../interfaces/INamed.sol\\\";\\nimport {IVersioned} from \\\"../interfaces/IVersioned.sol\\\";\\nimport {ShardingTableLib} from \\\"../libraries/ShardingTableLib.sol\\\";\\n\\ncontract ShardingTableStorage is INamed, IVersioned, HubDependent {\\n    string private constant _NAME = \\\"ShardingTableStorage\\\";\\n    string private constant _VERSION = \\\"10.0.2\\\";\\n\\n    event NodesCountIncremented(uint72 newCount);\\n    event NodesCountDecremented(uint72 newCount);\\n    event NodeObjectCreated(uint72 indexed identityId, bytes nodeId, uint256 hashRingPosition, uint72 index);\\n    event NodeObjectDeleted(uint72 indexed identityId);\\n    event NodeIndexIncremented(uint72 indexed identityId, uint72 newIndex);\\n    event NodeIndexDecremented(uint72 indexed identityId, uint72 newIndex);\\n    event IdentityIdIndexSet(uint72 indexed identityId, uint72 index);\\n\\n    uint72 public nodesCount;\\n\\n    // identityId => Node\\n    mapping(uint72 => ShardingTableLib.Node) internal nodes;\\n    // index => identityId\\n    mapping(uint72 => uint72) public indexToIdentityId;\\n\\n    // solhint-disable-next-line no-empty-blocks\\n    constructor(address hubAddress) HubDependent(hubAddress) {}\\n\\n    function name() external pure virtual override returns (string memory) {\\n        return _NAME;\\n    }\\n\\n    function version() external pure virtual override returns (string memory) {\\n        return _VERSION;\\n    }\\n\\n    function incrementNodesCount() external onlyContracts {\\n        nodesCount++;\\n\\n        emit NodesCountIncremented(nodesCount);\\n    }\\n\\n    function decrementNodesCount() external onlyContracts {\\n        nodesCount--;\\n\\n        emit NodesCountDecremented(nodesCount);\\n    }\\n\\n    function createNodeObject(\\n        uint256 hashRingPosition,\\n        bytes calldata nodeId,\\n        uint72 identityId,\\n        uint72 index\\n    ) external onlyContracts {\\n        nodes[identityId] = ShardingTableLib.Node({\\n            hashRingPosition: hashRingPosition,\\n            index: index,\\n            nodeId: nodeId,\\n            identityId: identityId\\n        });\\n\\n        emit NodeObjectCreated(identityId, nodeId, hashRingPosition, index);\\n    }\\n\\n    function getNode(uint72 identityId) external view returns (ShardingTableLib.Node memory) {\\n        return nodes[identityId];\\n    }\\n\\n    function deleteNodeObject(uint72 identityId) external onlyContracts {\\n        delete nodes[identityId];\\n\\n        emit NodeObjectDeleted(identityId);\\n    }\\n\\n    function nodeExists(uint72 identityId) external view returns (bool) {\\n        return nodes[identityId].identityId != 0;\\n    }\\n\\n    function head() external view returns (uint72) {\\n        return indexToIdentityId[0];\\n    }\\n\\n    function getHashRingPosition(uint72 identityId) external view returns (uint256) {\\n        return nodes[identityId].hashRingPosition;\\n    }\\n\\n    function incrementNodeIndex(uint72 identityId) external onlyContracts {\\n        nodes[identityId].index += 1;\\n\\n        emit NodeIndexIncremented(identityId, nodes[identityId].index);\\n    }\\n\\n    function decrementNodeIndex(uint72 identityId) external onlyContracts {\\n        nodes[identityId].index -= 1;\\n\\n        emit NodeIndexDecremented(identityId, nodes[identityId].index);\\n    }\\n\\n    function setIdentityId(uint72 index, uint72 identityId) external onlyContracts {\\n        indexToIdentityId[index] = identityId;\\n\\n        emit IdentityIdIndexSet(identityId, index);\\n    }\\n\\n    function getNodeByIndex(uint72 index) external view returns (ShardingTableLib.Node memory) {\\n        return nodes[indexToIdentityId[index]];\\n    }\\n\\n    function getNeighborhoodBoundaryByIndexes(\\n        uint72 leftEdgeIndex,\\n        uint72 closestNodeIndex,\\n        uint72 rightEdgeIndex\\n    ) external view returns (ShardingTableLib.Node memory, ShardingTableLib.Node memory, ShardingTableLib.Node memory) {\\n        return (\\n            nodes[indexToIdentityId[leftEdgeIndex]],\\n            nodes[indexToIdentityId[closestNodeIndex]],\\n            nodes[indexToIdentityId[rightEdgeIndex]]\\n        );\\n    }\\n\\n    function getAdjacentIdentityIdsByIndex(uint72 index) external view returns (uint72, uint72) {\\n        if (index == 0) {\\n            return (ShardingTableLib.NULL, nodes[indexToIdentityId[index + 1]].identityId);\\n        }\\n\\n        return (nodes[indexToIdentityId[index - 1]].identityId, nodes[indexToIdentityId[index + 1]].identityId);\\n    }\\n\\n    function getHashRingPositionByIndex(uint72 index) external view returns (uint256) {\\n        return nodes[indexToIdentityId[index]].hashRingPosition;\\n    }\\n\\n    function nodeExistsByIndex(uint72 index) external view returns (bool) {\\n        return nodes[indexToIdentityId[index]].identityId != 0;\\n    }\\n\\n    function getMultipleNodes(\\n        uint72 firstIdentityId,\\n        uint16 nodesNumber\\n    ) external view returns (ShardingTableLib.Node[] memory) {\\n        ShardingTableLib.Node[] memory nodesPage = new ShardingTableLib.Node[](nodesNumber);\\n\\n        ShardingTableLib.Node memory currentNode = nodes[firstIdentityId];\\n        for (uint256 i; i < nodesNumber; ) {\\n            nodesPage[i] = currentNode;\\n            currentNode = nodes[indexToIdentityId[currentNode.index + 1]];\\n            unchecked {\\n                i++;\\n            }\\n        }\\n\\n        return nodesPage;\\n    }\\n}\\n\",\"keccak256\":\"0x029cd19f31b1fd4656b53c9ab62e63549b6a52429385f7630c027a6395582c07\",\"license\":\"Apache-2.0\"}},\"version\":1}",
+  "bytecode": "0x60803461008c57601f61135938819003918201601f19168301916001600160401b038311848410176100915780849260209460405283398101031261008c57516001600160a01b0381169081900361008c57801561007a57600080546001600160a01b0319169190911790556040516112b190816100a88239f35b60405163a10d827b60e01b8152600490fd5b600080fd5b634e487b7160e01b600052604160045260246000fdfe60808060405260048036101561001457600080fd5b60003560e01c91826306fdde0314610d225750816311e2bb1a14610ca05781631335899b14610c66578163162929e914610c235781631d2d3a2f14610bb557816320309bce14610b7a578163365a86fc14610b515781633ce8f96014610b165781634f3ae9ee14610a8257816354fd4d5014610a3b57816357f0514f146109f15781635d68479c146109ae578163653b106f146108b15781636e8d2bf11461059757816376d03c2f1461042f5781638a9e65dc146103975781638f7dcfa314610364578163ba624e84146102a9578163cb28cfad1461023d578163d9b654631461019457508063f1a3c5b31461016a5763f8c9fcc71461011357600080fd5b346101655760203660031901126101655760206001600160481b0380610137610db1565b166000526002825280604060002054166000526001825260026040600020015460481c161515604051908152f35b600080fd5b346101655760003660031901126101655760206001600160481b0360005460a01c16604051908152f35b34610165576000366003190112610165576101ad610ea3565b6000546001600160481b0391828260a01c169081156102285768ffffffffffffffffff60a01b198316600019830160a090811b68ffffffffffffffffff60a01b16919091176000819055604051911c851681527fff8d8bf03d5604d67bd29e36bf83ab7fc87580c16d17eef87c7cb5bdd4c2589590602090a1005b601190634e487b7160e01b6000525260246000fd5b3461016557602036600319011261016557610256610db1565b61025e61104c565b506001600160481b0380911660005260026020526040600020541660005260016020526102a56102916040600020611071565b604051918291602083526020830190610df3565b0390f35b34610165576020366003190112610165576001600160481b036102ca610db1565b6102d2610ea3565b168060005260016020526000600260408220828155600181016102f58154610ffb565b9081610327575b505001557f2972a9d48919c3e7018e4436f4195941dc265d23ee59bc71fddaf5b9e73fdb6b600080a2005b81601f86931160011461033e5750555b84806102fc565b90808391825261035d601f60208420940160051c840160018501611035565b5555610337565b346101655760003660031901126101655760008052600260205260206001600160481b0360406000205416604051908152f35b34610165576020366003190112610165576103b0610db1565b6103b8610ea3565b7f9ba7102917c182590bee88b7a4999bf62b739bf5e62e4439f8e5c02acde0fb0a60206001600160481b03809316928360005260018252600260406000200180548261040581831661117f565b16906001600160481b031916179055836000526001825260026040600020015416604051908152a2005b3461016557604036600319011261016557610448610db1565b6024359061ffff82168092036101655761046182611239565b9161046f6040519384610e81565b808352601f1961047e82611239565b0160005b81811061057a5750506001600160481b038092166000526001906020928284526104af6040600020611071565b6000905b83821061051d575050505060405191808301818452845180915260408401918060408360051b8701019601926000905b8382106104f05786880387f35b9091929394838061050c839a603f198b82030186528951610df3565b9997019594939190910191016104e3565b908261054981604085899b999796610535878c611251565b52610540868b611251565b50015116611151565b166000526002865281604060002054166000528286528261056d6040600020611071565b91019192509593956104b3565b60209061058895939561104c565b82828601015201939193610482565b34610165576080366003190112610165576024359067ffffffffffffffff821161016557366023830112156101655767ffffffffffffffff8282013511610165573660248383013584010111610165576105ef610ddd565b90606435916001600160481b03831683036101655761060c610ea3565b60405161061881610e33565b8235815260405161063686850135601f01601f191660200182610e81565b83860135808252602487016020830137600060208786013583010152602082019081526001600160481b03851660408301526001600160481b03831660608301526001600160481b0383166000526001602052604060002090825182555180519067ffffffffffffffff821161089c576106b36001840154610ffb565b601f811161085c575b50602090601f83116001146107b857947f351949e84e28b58642183aa76cc54a233323f30816e0a59d4e8f692c5b8e87ec979460026001600160481b03989585601f968b9660809b6000926107ad575b50508160011b916000199060031b1c19161760018201555b01908360408201511671ffffffffffffffffff0000000000000000006060845493015160481b169171ffffffffffffffffffffffffffffffffffff191617179055604051968795606087528a86013560608801528a86013560248c01898901376000888c88013589010152853560208801521660408601521696811992013501168101030190a2005b015190508e8061070c565b906001840160005260206000209160005b601f198516811061084457509460026001600160481b0398956001868b9660809b967f351949e84e28b58642183aa76cc54a233323f30816e0a59d4e8f692c5b8e87ec9e9b601f9a8b1981161061082b575b505050811b016001820155610724565b015160001960f88460031b161c191690558e808061081b565b919260206001819286850151815501940192016107c9565b61088c90600185016000526020600020601f850160051c81019160208610610892575b601f0160051c0190611035565b886106bc565b909150819061087f565b604186634e487b7160e01b6000525260246000fd5b34610165576060366003190112610165576109936108cd610db1565b6102a56108d8610dc7565b6109a06108e3610ddd565b936108ec61104c565b506108f561104c565b506108fe61104c565b506001600160481b0380911660005260209060028252806040600020541660005260018252806040600020941660005260028252806040600020541660005260018252806040600020961660005260028252604060002054166000526001815261097e610978610972604060002095611071565b96611071565b93611071565b92604051968796606088526060880190610df3565b9186830390870152610df3565b908382036040850152610df3565b346101655760203660031901126101655760206001600160481b03806109d2610db1565b166000526001825260026040600020015460481c161515604051908152f35b34610165576020366003190112610165576001600160481b0380610a13610db1565b1660005260026020526040600020541660005260016020526020604060002054604051908152f35b34610165576000366003190112610165576102a5604051610a5b81610e65565b600681526518981718171960d11b6020820152604051918291602083526020830190610d71565b3461016557600036600319011261016557610a9b610ea3565b6000546001600160481b0391828260a01c16908382146102285768ffffffffffffffffff60a01b1983166001830160a090811b68ffffffffffffffffff60a01b16919091176000819055604051911c851681527fc0a54bb1830712a78cb34c91c7c363cd0c300e16ed87bedb31f1af6575cd478990602090a1005b346101655760203660031901126101655760206001600160481b0380610b3a610db1565b166000526002825260406000205416604051908152f35b34610165576000366003190112610165576000546040516001600160a01b039091168152602090f35b34610165576020366003190112610165576040610b9d610b98610db1565b611198565b82516001600160481b03928316815291166020820152f35b3461016557602036600319011261016557610bce610db1565b610bd6610ea3565b7f16d9469d05114ec05448350b0981f3260b0b96bf65d3ce5372c6274e1b43b52660206001600160481b038093169283600052600182526002604060002001805482610405818316611151565b34610165576020366003190112610165576001600160481b03610c44610db1565b610c4c61104c565b501660005260016020526102a56102916040600020611071565b34610165576020366003190112610165576001600160481b03610c87610db1565b1660005260016020526020604060002054604051908152f35b3461016557604036600319011261016557610cb9610db1565b7f9dbb2411a2adcb1a5a27df434778cb7c05f013d52cb938d09ef5be2b7f1f26e66020610ce4610dc7565b92610ced610ea3565b6001600160481b038091169081600052600283526040600020941693846001600160481b0319825416179055604051908152a2005b346101655760003660031901126101655780610d406102a592610e65565b60148152735368617264696e675461626c6553746f7261676560601b60208201526040519182916020835260208301905b919082519283825260005b848110610d9d575050826000602080949584010152601f8019910116010190565b602081830181015184830182015201610d7c565b600435906001600160481b038216820361016557565b602435906001600160481b038216820361016557565b604435906001600160481b038216820361016557565b90815181526060610e136020840151608060208501526080840190610d71565b92816001600160481b039182604082015116604086015201511691015290565b6080810190811067ffffffffffffffff821117610e4f57604052565b634e487b7160e01b600052604160045260246000fd5b6040810190811067ffffffffffffffff821117610e4f57604052565b90601f8019910116810190811067ffffffffffffffff821117610e4f57604052565b60008054604051631627905560e01b81523360048201526020926001600160a01b0392831692918481602481875afa908115610ff0579085918391610fb8575b50159384610f34575b50505050610ef75750565b6064906040519063f0b1bddb60e01b82526004820152601560248201527427b7363c9021b7b73a3930b1ba399034b710243ab160591b6044820152fd5b604051638da5cb5b60e01b8152939450839060049082905afa918215610fab578192610f6a575b50501633141538808381610eec565b9091508381813d8311610fa4575b610f828183610e81565b81010312610fa05751908282168203610f9d57503880610f5b565b80fd5b5080fd5b503d610f78565b50604051903d90823e3d90fd5b82819392503d8311610fe9575b610fcf8183610e81565b81010312610fa057518015158103610fa057849038610ee3565b503d610fc5565b6040513d84823e3d90fd5b90600182811c9216801561102b575b602083101461101557565b634e487b7160e01b600052602260045260246000fd5b91607f169161100a565b818110611040575050565b60008155600101611035565b6040519061105982610e33565b60006060838281528160208201528260408201520152565b9060405161107e81610e33565b80928054825260018082016040519160009180549061109c82610ffb565b8086529183811690811561112657506001146110e9575b50505091816110c86002936060950382610e81565b602085015201546001600160481b0390818116604085015260481c16910152565b90925060005260209182600020916000925b82841061111357505050820101816110c860026110b3565b80548685018601529284019281016110fb565b60ff191660208088019190915292151560051b860190920193508492506110c89150600290506110b3565b9060016001600160481b038093160191821161116957565b634e487b7160e01b600052601160045260246000fd5b6001600160481b03908116600019019190821161116957565b906001600160481b03808316156112015760026040826111b78661117f565b1660009081528260205283828220541681526001602052836111e38185858520015460481c1697611151565b168152826020528382822054168152600160205220015460481c1690565b61120c819293611151565b1660005260026020528060406000205416600052600160205260026040600020015460481c169060009190565b67ffffffffffffffff8111610e4f5760051b60200190565b80518210156112655760209160051b010190565b634e487b7160e01b600052603260045260246000fdfea264697066735822122054746c11803adf2655f3cbf0ae64634c70b32ea4f8d1ef58044d4fa96741f7b664736f6c63430008140033",
+  "deployedBytecode": "0x60808060405260048036101561001457600080fd5b60003560e01c91826306fdde0314610d225750816311e2bb1a14610ca05781631335899b14610c66578163162929e914610c235781631d2d3a2f14610bb557816320309bce14610b7a578163365a86fc14610b515781633ce8f96014610b165781634f3ae9ee14610a8257816354fd4d5014610a3b57816357f0514f146109f15781635d68479c146109ae578163653b106f146108b15781636e8d2bf11461059757816376d03c2f1461042f5781638a9e65dc146103975781638f7dcfa314610364578163ba624e84146102a9578163cb28cfad1461023d578163d9b654631461019457508063f1a3c5b31461016a5763f8c9fcc71461011357600080fd5b346101655760203660031901126101655760206001600160481b0380610137610db1565b166000526002825280604060002054166000526001825260026040600020015460481c161515604051908152f35b600080fd5b346101655760003660031901126101655760206001600160481b0360005460a01c16604051908152f35b34610165576000366003190112610165576101ad610ea3565b6000546001600160481b0391828260a01c169081156102285768ffffffffffffffffff60a01b198316600019830160a090811b68ffffffffffffffffff60a01b16919091176000819055604051911c851681527fff8d8bf03d5604d67bd29e36bf83ab7fc87580c16d17eef87c7cb5bdd4c2589590602090a1005b601190634e487b7160e01b6000525260246000fd5b3461016557602036600319011261016557610256610db1565b61025e61104c565b506001600160481b0380911660005260026020526040600020541660005260016020526102a56102916040600020611071565b604051918291602083526020830190610df3565b0390f35b34610165576020366003190112610165576001600160481b036102ca610db1565b6102d2610ea3565b168060005260016020526000600260408220828155600181016102f58154610ffb565b9081610327575b505001557f2972a9d48919c3e7018e4436f4195941dc265d23ee59bc71fddaf5b9e73fdb6b600080a2005b81601f86931160011461033e5750555b84806102fc565b90808391825261035d601f60208420940160051c840160018501611035565b5555610337565b346101655760003660031901126101655760008052600260205260206001600160481b0360406000205416604051908152f35b34610165576020366003190112610165576103b0610db1565b6103b8610ea3565b7f9ba7102917c182590bee88b7a4999bf62b739bf5e62e4439f8e5c02acde0fb0a60206001600160481b03809316928360005260018252600260406000200180548261040581831661117f565b16906001600160481b031916179055836000526001825260026040600020015416604051908152a2005b3461016557604036600319011261016557610448610db1565b6024359061ffff82168092036101655761046182611239565b9161046f6040519384610e81565b808352601f1961047e82611239565b0160005b81811061057a5750506001600160481b038092166000526001906020928284526104af6040600020611071565b6000905b83821061051d575050505060405191808301818452845180915260408401918060408360051b8701019601926000905b8382106104f05786880387f35b9091929394838061050c839a603f198b82030186528951610df3565b9997019594939190910191016104e3565b908261054981604085899b999796610535878c611251565b52610540868b611251565b50015116611151565b166000526002865281604060002054166000528286528261056d6040600020611071565b91019192509593956104b3565b60209061058895939561104c565b82828601015201939193610482565b34610165576080366003190112610165576024359067ffffffffffffffff821161016557366023830112156101655767ffffffffffffffff8282013511610165573660248383013584010111610165576105ef610ddd565b90606435916001600160481b03831683036101655761060c610ea3565b60405161061881610e33565b8235815260405161063686850135601f01601f191660200182610e81565b83860135808252602487016020830137600060208786013583010152602082019081526001600160481b03851660408301526001600160481b03831660608301526001600160481b0383166000526001602052604060002090825182555180519067ffffffffffffffff821161089c576106b36001840154610ffb565b601f811161085c575b50602090601f83116001146107b857947f351949e84e28b58642183aa76cc54a233323f30816e0a59d4e8f692c5b8e87ec979460026001600160481b03989585601f968b9660809b6000926107ad575b50508160011b916000199060031b1c19161760018201555b01908360408201511671ffffffffffffffffff0000000000000000006060845493015160481b169171ffffffffffffffffffffffffffffffffffff191617179055604051968795606087528a86013560608801528a86013560248c01898901376000888c88013589010152853560208801521660408601521696811992013501168101030190a2005b015190508e8061070c565b906001840160005260206000209160005b601f198516811061084457509460026001600160481b0398956001868b9660809b967f351949e84e28b58642183aa76cc54a233323f30816e0a59d4e8f692c5b8e87ec9e9b601f9a8b1981161061082b575b505050811b016001820155610724565b015160001960f88460031b161c191690558e808061081b565b919260206001819286850151815501940192016107c9565b61088c90600185016000526020600020601f850160051c81019160208610610892575b601f0160051c0190611035565b886106bc565b909150819061087f565b604186634e487b7160e01b6000525260246000fd5b34610165576060366003190112610165576109936108cd610db1565b6102a56108d8610dc7565b6109a06108e3610ddd565b936108ec61104c565b506108f561104c565b506108fe61104c565b506001600160481b0380911660005260209060028252806040600020541660005260018252806040600020941660005260028252806040600020541660005260018252806040600020961660005260028252604060002054166000526001815261097e610978610972604060002095611071565b96611071565b93611071565b92604051968796606088526060880190610df3565b9186830390870152610df3565b908382036040850152610df3565b346101655760203660031901126101655760206001600160481b03806109d2610db1565b166000526001825260026040600020015460481c161515604051908152f35b34610165576020366003190112610165576001600160481b0380610a13610db1565b1660005260026020526040600020541660005260016020526020604060002054604051908152f35b34610165576000366003190112610165576102a5604051610a5b81610e65565b600681526518981718171960d11b6020820152604051918291602083526020830190610d71565b3461016557600036600319011261016557610a9b610ea3565b6000546001600160481b0391828260a01c16908382146102285768ffffffffffffffffff60a01b1983166001830160a090811b68ffffffffffffffffff60a01b16919091176000819055604051911c851681527fc0a54bb1830712a78cb34c91c7c363cd0c300e16ed87bedb31f1af6575cd478990602090a1005b346101655760203660031901126101655760206001600160481b0380610b3a610db1565b166000526002825260406000205416604051908152f35b34610165576000366003190112610165576000546040516001600160a01b039091168152602090f35b34610165576020366003190112610165576040610b9d610b98610db1565b611198565b82516001600160481b03928316815291166020820152f35b3461016557602036600319011261016557610bce610db1565b610bd6610ea3565b7f16d9469d05114ec05448350b0981f3260b0b96bf65d3ce5372c6274e1b43b52660206001600160481b038093169283600052600182526002604060002001805482610405818316611151565b34610165576020366003190112610165576001600160481b03610c44610db1565b610c4c61104c565b501660005260016020526102a56102916040600020611071565b34610165576020366003190112610165576001600160481b03610c87610db1565b1660005260016020526020604060002054604051908152f35b3461016557604036600319011261016557610cb9610db1565b7f9dbb2411a2adcb1a5a27df434778cb7c05f013d52cb938d09ef5be2b7f1f26e66020610ce4610dc7565b92610ced610ea3565b6001600160481b038091169081600052600283526040600020941693846001600160481b0319825416179055604051908152a2005b346101655760003660031901126101655780610d406102a592610e65565b60148152735368617264696e675461626c6553746f7261676560601b60208201526040519182916020835260208301905b919082519283825260005b848110610d9d575050826000602080949584010152601f8019910116010190565b602081830181015184830182015201610d7c565b600435906001600160481b038216820361016557565b602435906001600160481b038216820361016557565b604435906001600160481b038216820361016557565b90815181526060610e136020840151608060208501526080840190610d71565b92816001600160481b039182604082015116604086015201511691015290565b6080810190811067ffffffffffffffff821117610e4f57604052565b634e487b7160e01b600052604160045260246000fd5b6040810190811067ffffffffffffffff821117610e4f57604052565b90601f8019910116810190811067ffffffffffffffff821117610e4f57604052565b60008054604051631627905560e01b81523360048201526020926001600160a01b0392831692918481602481875afa908115610ff0579085918391610fb8575b50159384610f34575b50505050610ef75750565b6064906040519063f0b1bddb60e01b82526004820152601560248201527427b7363c9021b7b73a3930b1ba399034b710243ab160591b6044820152fd5b604051638da5cb5b60e01b8152939450839060049082905afa918215610fab578192610f6a575b50501633141538808381610eec565b9091508381813d8311610fa4575b610f828183610e81565b81010312610fa05751908282168203610f9d57503880610f5b565b80fd5b5080fd5b503d610f78565b50604051903d90823e3d90fd5b82819392503d8311610fe9575b610fcf8183610e81565b81010312610fa057518015158103610fa057849038610ee3565b503d610fc5565b6040513d84823e3d90fd5b90600182811c9216801561102b575b602083101461101557565b634e487b7160e01b600052602260045260246000fd5b91607f169161100a565b818110611040575050565b60008155600101611035565b6040519061105982610e33565b60006060838281528160208201528260408201520152565b9060405161107e81610e33565b80928054825260018082016040519160009180549061109c82610ffb565b8086529183811690811561112657506001146110e9575b50505091816110c86002936060950382610e81565b602085015201546001600160481b0390818116604085015260481c16910152565b90925060005260209182600020916000925b82841061111357505050820101816110c860026110b3565b80548685018601529284019281016110fb565b60ff191660208088019190915292151560051b860190920193508492506110c89150600290506110b3565b9060016001600160481b038093160191821161116957565b634e487b7160e01b600052601160045260246000fd5b6001600160481b03908116600019019190821161116957565b906001600160481b03808316156112015760026040826111b78661117f565b1660009081528260205283828220541681526001602052836111e38185858520015460481c1697611151565b168152826020528382822054168152600160205220015460481c1690565b61120c819293611151565b1660005260026020528060406000205416600052600160205260026040600020015460481c169060009190565b67ffffffffffffffff8111610e4f5760051b60200190565b80518210156112655760209160051b010190565b634e487b7160e01b600052603260045260246000fdfea264697066735822122054746c11803adf2655f3cbf0ae64634c70b32ea4f8d1ef58044d4fa96741f7b664736f6c63430008140033",
+  "devdoc": {
+    "kind": "dev",
+    "methods": {},
+    "version": 1
+  },
+  "userdoc": {
+    "kind": "user",
+    "methods": {},
+    "version": 1
+  },
+  "storageLayout": {
+    "storage": [
+      {
+        "astId": 27334,
+        "contract": "contracts/storage/ShardingTableStorage.sol:ShardingTableStorage",
+        "label": "hub",
+        "offset": 0,
+        "slot": "0",
+        "type": "t_contract(Hub)46218"
+      },
+      {
+        "astId": 50812,
+        "contract": "contracts/storage/ShardingTableStorage.sol:ShardingTableStorage",
+        "label": "nodesCount",
+        "offset": 20,
+        "slot": "0",
+        "type": "t_uint72"
+      },
+      {
+        "astId": 50817,
+        "contract": "contracts/storage/ShardingTableStorage.sol:ShardingTableStorage",
+        "label": "nodes",
+        "offset": 0,
+        "slot": "1",
+        "type": "t_mapping(t_uint72,t_struct(Node)33670_storage)"
+      },
+      {
+        "astId": 50821,
+        "contract": "contracts/storage/ShardingTableStorage.sol:ShardingTableStorage",
+        "label": "indexToIdentityId",
+        "offset": 0,
+        "slot": "2",
+        "type": "t_mapping(t_uint72,t_uint72)"
+      }
+    ],
+    "types": {
+      "t_bytes_storage": {
+        "encoding": "bytes",
+        "label": "bytes",
+        "numberOfBytes": "32"
+      },
+      "t_contract(Hub)46218": {
+        "encoding": "inplace",
+        "label": "contract Hub",
+        "numberOfBytes": "20"
+      },
+      "t_mapping(t_uint72,t_struct(Node)33670_storage)": {
+        "encoding": "mapping",
+        "key": "t_uint72",
+        "label": "mapping(uint72 => struct ShardingTableLib.Node)",
+        "numberOfBytes": "32",
+        "value": "t_struct(Node)33670_storage"
+      },
+      "t_mapping(t_uint72,t_uint72)": {
+        "encoding": "mapping",
+        "key": "t_uint72",
+        "label": "mapping(uint72 => uint72)",
+        "numberOfBytes": "32",
+        "value": "t_uint72"
+      },
+      "t_struct(Node)33670_storage": {
+        "encoding": "inplace",
+        "label": "struct ShardingTableLib.Node",
+        "members": [
+          {
+            "astId": 33663,
+            "contract": "contracts/storage/ShardingTableStorage.sol:ShardingTableStorage",
+            "label": "hashRingPosition",
+            "offset": 0,
+            "slot": "0",
+            "type": "t_uint256"
+          },
+          {
+            "astId": 33665,
+            "contract": "contracts/storage/ShardingTableStorage.sol:ShardingTableStorage",
+            "label": "nodeId",
+            "offset": 0,
+            "slot": "1",
+            "type": "t_bytes_storage"
+          },
+          {
+            "astId": 33667,
+            "contract": "contracts/storage/ShardingTableStorage.sol:ShardingTableStorage",
+            "label": "index",
+            "offset": 0,
+            "slot": "2",
+            "type": "t_uint72"
+          },
+          {
+            "astId": 33669,
+            "contract": "contracts/storage/ShardingTableStorage.sol:ShardingTableStorage",
+            "label": "identityId",
+            "offset": 9,
+            "slot": "2",
+            "type": "t_uint72"
+          }
+        ],
+        "numberOfBytes": "96"
+      },
+      "t_uint256": {
+        "encoding": "inplace",
+        "label": "uint256",
+        "numberOfBytes": "32"
+      },
+      "t_uint72": {
+        "encoding": "inplace",
+        "label": "uint72",
+        "numberOfBytes": "9"
+      }
+    }
+  }
+}

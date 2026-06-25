@@ -1,54 +1,162 @@
 /**
- * Optional OpenTelemetry integration for the Node UI.
- * When enabled (via config), exports metrics and optionally traces to an OTLP endpoint.
- * operationId is set as the trace/span attribute for correlation with the dashboard.
+ * OpenTelemetry SDK bootstrap for a DKG node (boot side, daemon-only consumer).
  *
- * To enable: add @opentelemetry/api, @opentelemetry/sdk-metrics, and
- * @opentelemetry/exporter-metrics-otlp-http; then implement registerMeter() and
- * use the same metric names below. For traces, use @opentelemetry/sdk-trace-base
- * and set span attributes { 'dkg.operation_id': operationId }.
+ * Registers the global Tracer + Meter providers ONCE at daemon startup so that
+ * the call-site facade in `@origintrail-official/dkg-core` (getTracer/withSpan/
+ * getMetrics) — used across agent/publisher/chain/sync — produces real spans and
+ * metrics. When telemetry is disabled, or a signal has no endpoint, this
+ * registers NOTHING: the core facade then talks to the API's built-in no-op
+ * providers (zero cost, no outbound calls).
+ *
+ * Logs are NOT handled here — they stay on the hand-rolled `OtlpLogWorker`
+ * (bounded buffer + retry + at-source redaction); the OTel Logs SDK is still
+ * "Development". This module only wires traces + metrics, and shares ONE
+ * Resource with the log worker so all three signals describe the same node.
+ *
+ * This file is server-only (it pulls the Node OTel SDK). It must never be
+ * imported into the browser UI bundle.
  */
 
-export interface TelemetryConfig {
-  enabled?: boolean;
-  /** OTLP HTTP endpoint for metrics (e.g. http://localhost:4318/v1/metrics) */
-  metricsEndpoint?: string;
-  /** Service name for resource attributes */
-  serviceName?: string;
+import { metrics as otelMetrics } from '@opentelemetry/api';
+import { resourceFromAttributes } from '@opentelemetry/resources';
+import {
+  NodeTracerProvider,
+  BatchSpanProcessor,
+  ParentBasedSampler,
+  TraceIdRatioBasedSampler,
+} from '@opentelemetry/sdk-trace-node';
+import { MeterProvider, PeriodicExportingMetricReader } from '@opentelemetry/sdk-metrics';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
+import { OTLPMetricExporter } from '@opentelemetry/exporter-metrics-otlp-proto';
+import { rebuildMetrics } from '@origintrail-official/dkg-core';
+
+/** Stable resource identity, shared by logs + traces + metrics. */
+export interface TelemetryResource {
+  serviceName?: string; // default 'dkg-node'
+  serviceVersion?: string;
+  /** Per-node id → service.instance.id (the Grafana node selector). */
+  serviceInstanceId?: string;
+  /** testnet | mainnet | devnet → deployment.environment + dkg.network */
+  network?: string;
+  peerId?: string;
+  nodeName?: string;
+  nodeRole?: string;
+  commit?: string;
+  /** e.g. 'base:8453' → dkg.chain */
+  chainId?: string;
 }
 
+export interface OtlpSignalConfig {
+  endpoint?: string; // full signal URL, e.g. http://localhost:4318/v1/traces
+  /** Bearer token → Authorization header. */
+  token?: string;
+  headers?: Record<string, string>;
+}
+
+export interface TelemetryInitConfig {
+  /** Master gate. When false, nothing is registered. */
+  enabled?: boolean;
+  resource?: TelemetryResource;
+  traces?: OtlpSignalConfig & { sampleRatio?: number };
+  metrics?: OtlpSignalConfig & { exportIntervalMs?: number };
+}
+
+let tracerProvider: NodeTracerProvider | null = null;
+let meterProvider: MeterProvider | null = null;
 let configured = false;
 
-/**
- * Initialize telemetry. No-op if disabled or OTel packages not installed.
- * Call once at daemon startup.
- */
-export function initTelemetry(_config: TelemetryConfig): void {
-  if (!_config.enabled || !_config.metricsEndpoint) return;
-  configured = true;
-  // When OTel is added: create MeterProvider, OTLP exporter, register gauges
-  // meter.createObservableGauge('dkg.network.peers', ...), etc.
+function buildResource(r: TelemetryResource = {}) {
+  const attrs: Record<string, string> = {
+    'service.name': r.serviceName ?? 'dkg-node',
+  };
+  if (r.serviceVersion) attrs['service.version'] = r.serviceVersion;
+  if (r.serviceInstanceId) attrs['service.instance.id'] = r.serviceInstanceId;
+  if (r.network) {
+    attrs['deployment.environment'] = r.network;
+    attrs['dkg.network'] = r.network;
+  }
+  if (r.peerId) attrs['dkg.peer_id'] = r.peerId;
+  if (r.nodeName) attrs['dkg.node.name'] = r.nodeName;
+  if (r.nodeRole) attrs['dkg.node.role'] = r.nodeRole;
+  if (r.commit) attrs['dkg.commit'] = r.commit;
+  if (r.chainId) attrs['dkg.chain'] = r.chainId;
+  return resourceFromAttributes(attrs);
+}
+
+function authHeaders(sig: OtlpSignalConfig): Record<string, string> | undefined {
+  const headers = { ...(sig.headers ?? {}) };
+  if (sig.token) headers['Authorization'] = `Bearer ${sig.token}`;
+  return Object.keys(headers).length ? headers : undefined;
 }
 
 /**
- * Record a gauge value for export. No-op when telemetry is disabled.
- * Metric names match dashboard: dkg.network.peers, dkg.knowledge.triples, dkg.system.cpu_percent, etc.
+ * Initialize traces + metrics. No-op when disabled or when a signal has no
+ * endpoint. Safe to call once at daemon boot. Idempotent (subsequent calls are
+ * ignored once configured).
  */
-export function recordGauge(_name: string, _value: number): void {
-  if (!configured) return;
-  // When OTel is added: update the observable gauge callback or record value
-}
+export function initTelemetry(cfg: TelemetryInitConfig): void {
+  if (configured) return;
+  if (!cfg.enabled) return;
 
-/**
- * Start a span for an operation (for trace correlation).
- * operationId should be set as span attribute so traces match the Operations panel.
- * No-op when telemetry is disabled.
- */
-export function setOperationSpan(_operationId: string, _operationName: string): void {
-  if (!configured) return;
-  // When OTel is added: tracer.startSpan(operationName, { attributes: { 'dkg.operation_id': operationId } })
+  const resource = buildResource(cfg.resource);
+
+  // ── Traces ──
+  if (cfg.traces?.endpoint) {
+    const exporter = new OTLPTraceExporter({
+      url: cfg.traces.endpoint,
+      headers: authHeaders(cfg.traces),
+    });
+    const ratio = cfg.traces.sampleRatio ?? 1;
+    tracerProvider = new NodeTracerProvider({
+      resource,
+      sampler: new ParentBasedSampler({ root: new TraceIdRatioBasedSampler(ratio) }),
+      spanProcessors: [new BatchSpanProcessor(exporter)],
+    });
+    // register() installs the global tracer provider + an AsyncLocalStorage
+    // context manager (so spans flow across awaits) + W3C trace-context propagator.
+    tracerProvider.register();
+    configured = true;
+  }
+
+  // ── Metrics ──
+  if (cfg.metrics?.endpoint) {
+    const exporter = new OTLPMetricExporter({
+      url: cfg.metrics.endpoint,
+      headers: authHeaders(cfg.metrics),
+    });
+    meterProvider = new MeterProvider({
+      resource,
+      readers: [
+        new PeriodicExportingMetricReader({
+          exporter,
+          exportIntervalMillis: cfg.metrics.exportIntervalMs ?? 30_000,
+        }),
+      ],
+    });
+    otelMetrics.setGlobalMeterProvider(meterProvider);
+    // Re-bind the core facade's instrument cache to the real meter.
+    rebuildMetrics();
+    configured = true;
+  }
 }
 
 export function isTelemetryConfigured(): boolean {
   return configured;
+}
+
+/** Flush + shut down providers at daemon teardown. Safe if never initialized. */
+export async function shutdownTelemetry(): Promise<void> {
+  const tasks: Promise<void>[] = [];
+  if (tracerProvider) {
+    tasks.push(tracerProvider.forceFlush().catch(() => {}));
+    tasks.push(tracerProvider.shutdown().catch(() => {}));
+  }
+  if (meterProvider) {
+    tasks.push(meterProvider.forceFlush().catch(() => {}));
+    tasks.push(meterProvider.shutdown().catch(() => {}));
+  }
+  await Promise.all(tasks);
+  tracerProvider = null;
+  meterProvider = null;
+  configured = false;
 }

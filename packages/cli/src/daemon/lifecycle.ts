@@ -80,6 +80,8 @@ import {
   ChatMemoryManager,
   LogPushWorker,
   OtlpLogWorker,
+  initTelemetry,
+  shutdownTelemetry,
   LlmClient,
   SqliteMessageIdempotencyStore,
   SqliteProtocolOutboxStore,
@@ -2253,6 +2255,62 @@ export async function runDaemonInner(
     stopOtlpExporter();
   }
 
+  // OTel traces + metrics SDK (independent of the log-exporter path above).
+  // Endpoints resolve env-first (standard OTEL_EXPORTER_OTLP_* names) then
+  // config; a signal registers ONLY when its endpoint resolves — never a
+  // guessed prod default. enabled=false ⇒ initTelemetry is a total no-op.
+  if (config.telemetry?.enabled) {
+    const otelBase = process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.replace(/\/$/, "");
+    const tracesEndpoint =
+      process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT ||
+      (otelBase ? `${otelBase}/v1/traces` : undefined) ||
+      config.telemetry.traces?.endpoint;
+    const metricsEndpoint =
+      process.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT ||
+      (otelBase ? `${otelBase}/v1/metrics` : undefined) ||
+      config.telemetry.metrics?.endpoint;
+    const tracesOn = !!tracesEndpoint && config.telemetry.traces?.enabled !== false;
+    const metricsOn = !!metricsEndpoint && config.telemetry.metrics?.enabled !== false;
+    try {
+      initTelemetry({
+        enabled: true,
+        resource: {
+          serviceName: "dkg-node",
+          serviceVersion: nodeVersion,
+          serviceInstanceId: config.name,
+          network: networkKey,
+          peerId: agent.peerId,
+          nodeName: config.name,
+          nodeRole: config.nodeRole ?? "edge",
+          commit: nodeCommit,
+          chainId: config.chain?.chainId,
+        },
+        traces: tracesOn
+          ? {
+              endpoint: tracesEndpoint,
+              token: config.telemetry.traces?.token,
+              sampleRatio: config.telemetry.traces?.sampleRatio,
+            }
+          : undefined,
+        metrics: metricsOn
+          ? {
+              endpoint: metricsEndpoint,
+              token: config.telemetry.metrics?.token,
+              exportIntervalMs: config.telemetry.metrics?.exportIntervalMs,
+            }
+          : undefined,
+      });
+      if (tracesOn || metricsOn) {
+        log(
+          `Telemetry: OTel SDK registered (traces=${tracesOn ? tracesEndpoint : "off"}, metrics=${metricsOn ? metricsEndpoint : "off"})`,
+        );
+      }
+    } catch (err) {
+      // Telemetry must never block startup.
+      log(`Telemetry: OTel init failed (non-fatal): ${String(err)}`);
+    }
+  }
+
   if (config.telemetry?.enabled) {
     const r = startTelemetry();
     if (!r.ok) {
@@ -3170,6 +3228,9 @@ export async function runDaemonInner(
         clearInterval(pruneTimer);
         rateLimiter.destroy();
         metricsCollector.stop();
+        stopTelemetry();
+        // Flush + shut down the OTel SDK (no-op if never registered).
+        await shutdownTelemetry().catch(() => {});
         natStatusWatcherStop?.();
         resetNatStatus();
         await publisherRuntime

@@ -62,5 +62,5 @@ export type {
 export { LlmClient, LlmRequestError } from './llm/client.js';
 export { resolveCapabilities } from './llm/capability-resolver.js';
 export type { LlmConfig, LlmChatRequest, LlmChatMessage, LlmStreamEvent, LlmCompletionResult, LlmCapabilities } from './llm/types.js';
-export { initTelemetry, recordGauge, setOperationSpan, isTelemetryConfigured } from './telemetry.js';
-export type { TelemetryConfig } from './telemetry.js';
+export { initTelemetry, shutdownTelemetry, isTelemetryConfigured } from './telemetry.js';
+export type { TelemetryInitConfig, TelemetryResource, OtlpSignalConfig } from './telemetry.js';

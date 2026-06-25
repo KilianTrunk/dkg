@@ -265,6 +265,10 @@ export class OtlpLogWorker {
         severityNumber: sev.num,
         severityText: sev.text,
         body: { stringValue: r.message },
+        // W3C trace correlation — OTLP top-level fields (hex), not attributes.
+        // Present only when the log was emitted inside a recording span.
+        ...(r.traceId ? { traceId: r.traceId } : {}),
+        ...(r.spanId ? { spanId: r.spanId } : {}),
         attributes: [
           attr('dkg.operation_id', r.operationId),
           attr('dkg.operation_name', r.operationName),

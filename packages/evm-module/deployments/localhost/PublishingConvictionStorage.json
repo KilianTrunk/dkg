@@ -1,0 +1,1117 @@
+{
+  "address": "0xd3FFD73C53F139cEBB80b6A524bE280955b3f4db",
+  "abi": [
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "hubAddress",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "constructor"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "accountId",
+          "type": "uint256"
+        }
+      ],
+      "name": "AccountAlreadyExists",
+      "type": "error"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "agent",
+          "type": "address"
+        },
+        {
+          "internalType": "uint256",
+          "name": "existingAccountId",
+          "type": "uint256"
+        }
+      ],
+      "name": "AgentAlreadyRegistered",
+      "type": "error"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "accountId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "address",
+          "name": "agent",
+          "type": "address"
+        }
+      ],
+      "name": "AgentNotRegistered",
+      "type": "error"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "accountId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint96",
+          "name": "amount",
+          "type": "uint96"
+        },
+        {
+          "internalType": "uint96",
+          "name": "balance",
+          "type": "uint96"
+        }
+      ],
+      "name": "TopUpUnderflow",
+      "type": "error"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "string",
+          "name": "msg",
+          "type": "string"
+        }
+      ],
+      "name": "UnauthorizedAccess",
+      "type": "error"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "accountId",
+          "type": "uint256"
+        }
+      ],
+      "name": "UnknownAccount",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "ZeroAddressHub",
+      "type": "error"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "oldCap",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "newCap",
+          "type": "uint256"
+        }
+      ],
+      "name": "MaxAgentsPerAccountUpdated",
+      "type": "event"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "accountId",
+          "type": "uint256"
+        }
+      ],
+      "name": "accountExists",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "name": "accounts",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "committedTRAC",
+          "type": "uint96"
+        },
+        {
+          "internalType": "uint40",
+          "name": "createdAtEpoch",
+          "type": "uint40"
+        },
+        {
+          "internalType": "uint40",
+          "name": "expiresAtEpoch",
+          "type": "uint40"
+        },
+        {
+          "internalType": "uint40",
+          "name": "createdAtTimestamp",
+          "type": "uint40"
+        },
+        {
+          "internalType": "uint40",
+          "name": "expiresAtTimestamp",
+          "type": "uint40"
+        },
+        {
+          "internalType": "uint16",
+          "name": "lockDurationEpochs",
+          "type": "uint16"
+        },
+        {
+          "internalType": "uint16",
+          "name": "discountBps",
+          "type": "uint16"
+        },
+        {
+          "internalType": "uint16",
+          "name": "lastSettledWindow",
+          "type": "uint16"
+        },
+        {
+          "internalType": "bool",
+          "name": "fullySwept",
+          "type": "bool"
+        },
+        {
+          "internalType": "uint72",
+          "name": "primaryNode",
+          "type": "uint72"
+        },
+        {
+          "internalType": "uint40",
+          "name": "lastPrimaryNodeChangeEpoch",
+          "type": "uint40"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "accountId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "address",
+          "name": "agent",
+          "type": "address"
+        }
+      ],
+      "name": "addAgent",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "accountId",
+          "type": "uint256"
+        }
+      ],
+      "name": "agentCount",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "name": "agentToAccountId",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "accountId",
+          "type": "uint256"
+        }
+      ],
+      "name": "clearAgents",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "accountId",
+          "type": "uint256"
+        }
+      ],
+      "name": "clearTopUpBalance",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "accountId",
+          "type": "uint256"
+        },
+        {
+          "components": [
+            {
+              "internalType": "uint96",
+              "name": "committedTRAC",
+              "type": "uint96"
+            },
+            {
+              "internalType": "uint40",
+              "name": "createdAtEpoch",
+              "type": "uint40"
+            },
+            {
+              "internalType": "uint40",
+              "name": "expiresAtEpoch",
+              "type": "uint40"
+            },
+            {
+              "internalType": "uint40",
+              "name": "createdAtTimestamp",
+              "type": "uint40"
+            },
+            {
+              "internalType": "uint40",
+              "name": "expiresAtTimestamp",
+              "type": "uint40"
+            },
+            {
+              "internalType": "uint16",
+              "name": "lockDurationEpochs",
+              "type": "uint16"
+            },
+            {
+              "internalType": "uint16",
+              "name": "discountBps",
+              "type": "uint16"
+            },
+            {
+              "internalType": "uint16",
+              "name": "lastSettledWindow",
+              "type": "uint16"
+            },
+            {
+              "internalType": "bool",
+              "name": "fullySwept",
+              "type": "bool"
+            },
+            {
+              "internalType": "uint72",
+              "name": "primaryNode",
+              "type": "uint72"
+            },
+            {
+              "internalType": "uint40",
+              "name": "lastPrimaryNodeChangeEpoch",
+              "type": "uint40"
+            }
+          ],
+          "internalType": "struct PublishingConvictionStorage.Account",
+          "name": "acct",
+          "type": "tuple"
+        }
+      ],
+      "name": "createAccount",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "accountId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint96",
+          "name": "amount",
+          "type": "uint96"
+        }
+      ],
+      "name": "decreaseTopUpBalance",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "accountId",
+          "type": "uint256"
+        }
+      ],
+      "name": "getAccount",
+      "outputs": [
+        {
+          "components": [
+            {
+              "internalType": "uint96",
+              "name": "committedTRAC",
+              "type": "uint96"
+            },
+            {
+              "internalType": "uint40",
+              "name": "createdAtEpoch",
+              "type": "uint40"
+            },
+            {
+              "internalType": "uint40",
+              "name": "expiresAtEpoch",
+              "type": "uint40"
+            },
+            {
+              "internalType": "uint40",
+              "name": "createdAtTimestamp",
+              "type": "uint40"
+            },
+            {
+              "internalType": "uint40",
+              "name": "expiresAtTimestamp",
+              "type": "uint40"
+            },
+            {
+              "internalType": "uint16",
+              "name": "lockDurationEpochs",
+              "type": "uint16"
+            },
+            {
+              "internalType": "uint16",
+              "name": "discountBps",
+              "type": "uint16"
+            },
+            {
+              "internalType": "uint16",
+              "name": "lastSettledWindow",
+              "type": "uint16"
+            },
+            {
+              "internalType": "bool",
+              "name": "fullySwept",
+              "type": "bool"
+            },
+            {
+              "internalType": "uint72",
+              "name": "primaryNode",
+              "type": "uint72"
+            },
+            {
+              "internalType": "uint40",
+              "name": "lastPrimaryNodeChangeEpoch",
+              "type": "uint40"
+            }
+          ],
+          "internalType": "struct PublishingConvictionStorage.Account",
+          "name": "",
+          "type": "tuple"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "accountId",
+          "type": "uint256"
+        }
+      ],
+      "name": "getRegisteredAgents",
+      "outputs": [
+        {
+          "internalType": "address[]",
+          "name": "",
+          "type": "address[]"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "hub",
+      "outputs": [
+        {
+          "internalType": "contract Hub",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "accountId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint96",
+          "name": "amount",
+          "type": "uint96"
+        }
+      ],
+      "name": "increaseTopUpBalance",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "accountId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint40",
+          "name": "w",
+          "type": "uint40"
+        },
+        {
+          "internalType": "uint96",
+          "name": "amount",
+          "type": "uint96"
+        }
+      ],
+      "name": "increaseWindowSpent",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "initialize",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "accountId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "address",
+          "name": "agent",
+          "type": "address"
+        }
+      ],
+      "name": "isRegisteredAgent",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "maxAgentsPerAccount",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "name",
+      "outputs": [
+        {
+          "internalType": "string",
+          "name": "",
+          "type": "string"
+        }
+      ],
+      "stateMutability": "pure",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "accountId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "address",
+          "name": "agent",
+          "type": "address"
+        }
+      ],
+      "name": "removeAgent",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "accountId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "bool",
+          "name": "v",
+          "type": "bool"
+        }
+      ],
+      "name": "setFullySwept",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "accountId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint16",
+          "name": "w",
+          "type": "uint16"
+        }
+      ],
+      "name": "setLastSettledWindow",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "cap",
+          "type": "uint256"
+        }
+      ],
+      "name": "setMaxAgentsPerAccount",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "accountId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint72",
+          "name": "node",
+          "type": "uint72"
+        },
+        {
+          "internalType": "uint40",
+          "name": "changeEpoch",
+          "type": "uint40"
+        }
+      ],
+      "name": "setPrimaryNodeData",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "name": "topUpBalance",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "version",
+      "outputs": [
+        {
+          "internalType": "string",
+          "name": "",
+          "type": "string"
+        }
+      ],
+      "stateMutability": "pure",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint40",
+          "name": "",
+          "type": "uint40"
+        }
+      ],
+      "name": "windowSpent",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    }
+  ],
+  "transactionHash": "0x895c8e739b510913ba018d7dedd4f40ab51cf6d7aabf570d38e9214a8838edc5",
+  "receipt": {
+    "to": null,
+    "from": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    "contractAddress": "0xd3FFD73C53F139cEBB80b6A524bE280955b3f4db",
+    "transactionIndex": 0,
+    "gasUsed": "1139565",
+    "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "blockHash": "0x1b93928cb662824e73c374879e4473155fdc933893cd7be6a7c079c2ee58fbd4",
+    "transactionHash": "0x895c8e739b510913ba018d7dedd4f40ab51cf6d7aabf570d38e9214a8838edc5",
+    "logs": [],
+    "blockNumber": 269,
+    "cumulativeGasUsed": "1139565",
+    "status": 1,
+    "byzantium": true
+  },
+  "args": [
+    "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+  ],
+  "numDeployments": 1,
+  "solcInputHash": "25f7b97326fdffc4ccdb60a7767831e0",
+  "metadata": "{\"compiler\":{\"version\":\"0.8.20+commit.a1b79de6\"},\"language\":\"Solidity\",\"output\":{\"abi\":[{\"inputs\":[{\"internalType\":\"address\",\"name\":\"hubAddress\",\"type\":\"address\"}],\"stateMutability\":\"nonpayable\",\"type\":\"constructor\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"accountId\",\"type\":\"uint256\"}],\"name\":\"AccountAlreadyExists\",\"type\":\"error\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"agent\",\"type\":\"address\"},{\"internalType\":\"uint256\",\"name\":\"existingAccountId\",\"type\":\"uint256\"}],\"name\":\"AgentAlreadyRegistered\",\"type\":\"error\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"accountId\",\"type\":\"uint256\"},{\"internalType\":\"address\",\"name\":\"agent\",\"type\":\"address\"}],\"name\":\"AgentNotRegistered\",\"type\":\"error\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"accountId\",\"type\":\"uint256\"},{\"internalType\":\"uint96\",\"name\":\"amount\",\"type\":\"uint96\"},{\"internalType\":\"uint96\",\"name\":\"balance\",\"type\":\"uint96\"}],\"name\":\"TopUpUnderflow\",\"type\":\"error\"},{\"inputs\":[{\"internalType\":\"string\",\"name\":\"msg\",\"type\":\"string\"}],\"name\":\"UnauthorizedAccess\",\"type\":\"error\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"accountId\",\"type\":\"uint256\"}],\"name\":\"UnknownAccount\",\"type\":\"error\"},{\"inputs\":[],\"name\":\"ZeroAddressHub\",\"type\":\"error\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"oldCap\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"newCap\",\"type\":\"uint256\"}],\"name\":\"MaxAgentsPerAccountUpdated\",\"type\":\"event\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"accountId\",\"type\":\"uint256\"}],\"name\":\"accountExists\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"name\":\"accounts\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"committedTRAC\",\"type\":\"uint96\"},{\"internalType\":\"uint40\",\"name\":\"createdAtEpoch\",\"type\":\"uint40\"},{\"internalType\":\"uint40\",\"name\":\"expiresAtEpoch\",\"type\":\"uint40\"},{\"internalType\":\"uint40\",\"name\":\"createdAtTimestamp\",\"type\":\"uint40\"},{\"internalType\":\"uint40\",\"name\":\"expiresAtTimestamp\",\"type\":\"uint40\"},{\"internalType\":\"uint16\",\"name\":\"lockDurationEpochs\",\"type\":\"uint16\"},{\"internalType\":\"uint16\",\"name\":\"discountBps\",\"type\":\"uint16\"},{\"internalType\":\"uint16\",\"name\":\"lastSettledWindow\",\"type\":\"uint16\"},{\"internalType\":\"bool\",\"name\":\"fullySwept\",\"type\":\"bool\"},{\"internalType\":\"uint72\",\"name\":\"primaryNode\",\"type\":\"uint72\"},{\"internalType\":\"uint40\",\"name\":\"lastPrimaryNodeChangeEpoch\",\"type\":\"uint40\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"accountId\",\"type\":\"uint256\"},{\"internalType\":\"address\",\"name\":\"agent\",\"type\":\"address\"}],\"name\":\"addAgent\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"accountId\",\"type\":\"uint256\"}],\"name\":\"agentCount\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"name\":\"agentToAccountId\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"accountId\",\"type\":\"uint256\"}],\"name\":\"clearAgents\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"accountId\",\"type\":\"uint256\"}],\"name\":\"clearTopUpBalance\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"accountId\",\"type\":\"uint256\"},{\"components\":[{\"internalType\":\"uint96\",\"name\":\"committedTRAC\",\"type\":\"uint96\"},{\"internalType\":\"uint40\",\"name\":\"createdAtEpoch\",\"type\":\"uint40\"},{\"internalType\":\"uint40\",\"name\":\"expiresAtEpoch\",\"type\":\"uint40\"},{\"internalType\":\"uint40\",\"name\":\"createdAtTimestamp\",\"type\":\"uint40\"},{\"internalType\":\"uint40\",\"name\":\"expiresAtTimestamp\",\"type\":\"uint40\"},{\"internalType\":\"uint16\",\"name\":\"lockDurationEpochs\",\"type\":\"uint16\"},{\"internalType\":\"uint16\",\"name\":\"discountBps\",\"type\":\"uint16\"},{\"internalType\":\"uint16\",\"name\":\"lastSettledWindow\",\"type\":\"uint16\"},{\"internalType\":\"bool\",\"name\":\"fullySwept\",\"type\":\"bool\"},{\"internalType\":\"uint72\",\"name\":\"primaryNode\",\"type\":\"uint72\"},{\"internalType\":\"uint40\",\"name\":\"lastPrimaryNodeChangeEpoch\",\"type\":\"uint40\"}],\"internalType\":\"struct PublishingConvictionStorage.Account\",\"name\":\"acct\",\"type\":\"tuple\"}],\"name\":\"createAccount\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"accountId\",\"type\":\"uint256\"},{\"internalType\":\"uint96\",\"name\":\"amount\",\"type\":\"uint96\"}],\"name\":\"decreaseTopUpBalance\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"accountId\",\"type\":\"uint256\"}],\"name\":\"getAccount\",\"outputs\":[{\"components\":[{\"internalType\":\"uint96\",\"name\":\"committedTRAC\",\"type\":\"uint96\"},{\"internalType\":\"uint40\",\"name\":\"createdAtEpoch\",\"type\":\"uint40\"},{\"internalType\":\"uint40\",\"name\":\"expiresAtEpoch\",\"type\":\"uint40\"},{\"internalType\":\"uint40\",\"name\":\"createdAtTimestamp\",\"type\":\"uint40\"},{\"internalType\":\"uint40\",\"name\":\"expiresAtTimestamp\",\"type\":\"uint40\"},{\"internalType\":\"uint16\",\"name\":\"lockDurationEpochs\",\"type\":\"uint16\"},{\"internalType\":\"uint16\",\"name\":\"discountBps\",\"type\":\"uint16\"},{\"internalType\":\"uint16\",\"name\":\"lastSettledWindow\",\"type\":\"uint16\"},{\"internalType\":\"bool\",\"name\":\"fullySwept\",\"type\":\"bool\"},{\"internalType\":\"uint72\",\"name\":\"primaryNode\",\"type\":\"uint72\"},{\"internalType\":\"uint40\",\"name\":\"lastPrimaryNodeChangeEpoch\",\"type\":\"uint40\"}],\"internalType\":\"struct PublishingConvictionStorage.Account\",\"name\":\"\",\"type\":\"tuple\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"accountId\",\"type\":\"uint256\"}],\"name\":\"getRegisteredAgents\",\"outputs\":[{\"internalType\":\"address[]\",\"name\":\"\",\"type\":\"address[]\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"hub\",\"outputs\":[{\"internalType\":\"contract Hub\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"accountId\",\"type\":\"uint256\"},{\"internalType\":\"uint96\",\"name\":\"amount\",\"type\":\"uint96\"}],\"name\":\"increaseTopUpBalance\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"accountId\",\"type\":\"uint256\"},{\"internalType\":\"uint40\",\"name\":\"w\",\"type\":\"uint40\"},{\"internalType\":\"uint96\",\"name\":\"amount\",\"type\":\"uint96\"}],\"name\":\"increaseWindowSpent\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"initialize\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"accountId\",\"type\":\"uint256\"},{\"internalType\":\"address\",\"name\":\"agent\",\"type\":\"address\"}],\"name\":\"isRegisteredAgent\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"maxAgentsPerAccount\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"name\",\"outputs\":[{\"internalType\":\"string\",\"name\":\"\",\"type\":\"string\"}],\"stateMutability\":\"pure\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"accountId\",\"type\":\"uint256\"},{\"internalType\":\"address\",\"name\":\"agent\",\"type\":\"address\"}],\"name\":\"removeAgent\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"accountId\",\"type\":\"uint256\"},{\"internalType\":\"bool\",\"name\":\"v\",\"type\":\"bool\"}],\"name\":\"setFullySwept\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"accountId\",\"type\":\"uint256\"},{\"internalType\":\"uint16\",\"name\":\"w\",\"type\":\"uint16\"}],\"name\":\"setLastSettledWindow\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"cap\",\"type\":\"uint256\"}],\"name\":\"setMaxAgentsPerAccount\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"accountId\",\"type\":\"uint256\"},{\"internalType\":\"uint72\",\"name\":\"node\",\"type\":\"uint72\"},{\"internalType\":\"uint40\",\"name\":\"changeEpoch\",\"type\":\"uint40\"}],\"name\":\"setPrimaryNodeData\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"name\":\"topUpBalance\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"version\",\"outputs\":[{\"internalType\":\"string\",\"name\":\"\",\"type\":\"string\"}],\"stateMutability\":\"pure\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"},{\"internalType\":\"uint40\",\"name\":\"\",\"type\":\"uint40\"}],\"name\":\"windowSpent\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"}],\"devdoc\":{\"kind\":\"dev\",\"methods\":{\"initialize()\":{\"details\":\"`initialize()` is idempotent across redeploys: the first call      seeds `maxAgentsPerAccount` to the default; subsequent calls      (e.g. post-upgrade) preserve whatever value the HubOwner has      tuned it to.\"}},\"title\":\"PublishingConvictionStorage\",\"version\":1},\"userdoc\":{\"events\":{\"MaxAgentsPerAccountUpdated(uint256,uint256)\":{\"notice\":\"Emitted when the governance-tunable agent cap changes.\"}},\"kind\":\"user\",\"methods\":{\"accountExists(uint256)\":{\"notice\":\"Existence check used by callers that only need to know         whether an account record is populated (e.g. the public         `settle()` short-circuit). Returns `false` for any         accountId that has never been minted.\"},\"addAgent(uint256,address)\":{\"notice\":\"Append `agent` under `accountId`. Reverts if `agent` is         already registered anywhere (the reverse map is global \\u2014         a single agent address may pay for at most one account).         The cap (`maxAgentsPerAccount`) is enforced by the logic         contract, NOT here, because storage stays policy-free.\"},\"agentCount(uint256)\":{\"notice\":\"Number of agents registered under `accountId`. Useful for         the public `getAccountInfo` view on the NFT wrapper.\"},\"agentToAccountId(address)\":{\"notice\":\"Reverse map exposed publicly so external callers         (`KnowledgeAssetsV10`, `ContextGraphs`) can resolve a         publishing-agent address to its paying account id without         caller-supplied authorization. The \\\"not registered\\\"         sentinel is `0`, which is why `_nextAccountId` on the NFT         starts at 1.\"},\"clearAgents(uint256)\":{\"notice\":\"Bulk-clear every agent registration under `accountId`.         Used by the NFT wrapper's transfer hook so the new owner         starts with a clean agent slate (no inherited authorities         from the prior owner). Idempotent on accounts with no         registered agents.\"},\"clearTopUpBalance(uint256)\":{\"notice\":\"Zero the top-up buffer in a single SSTORE; used by the         post-expiry final sweep before crediting the staker pool.\"},\"createAccount(uint256,(uint96,uint40,uint40,uint40,uint40,uint16,uint16,uint16,bool,uint72,uint40))\":{\"notice\":\"Persist a brand-new `Account` record. Used by         `PublishingConviction.createAccount` after the NFT         wrapper has allocated `accountId` from its mint counter.         Reverts if a record at `accountId` already exists, so a         logic-side bug or replay cannot silently overwrite an         active account.\"},\"decreaseTopUpBalance(uint256,uint96)\":{\"notice\":\"Drain `amount` from the top-up buffer. Reverts on         underflow so callers cannot silently overdraw \\u2014 this is         a defensive guard; logic-side `coverPublishingCost`         already rejects insufficient-allowance combinations         with a richer error.\"},\"getAccount(uint256)\":{\"notice\":\"Return the full `Account` record by id. Reverts if the         account has never been created (sentinel:         `lockDurationEpochs == 0` because every real account         carries at least one billing window).\"},\"getRegisteredAgents(uint256)\":{\"notice\":\"Read the registered-agent array for an account. Returns         an empty array for unknown accounts so callers can         iterate safely on accounts that never registered an agent.\"},\"increaseTopUpBalance(uint256,uint96)\":{\"notice\":\"Add to the persistent top-up buffer (publisher pays in         to extend allowance beyond the base budget).\"},\"increaseWindowSpent(uint256,uint40,uint96)\":{\"notice\":\"Add `amount` to `windowSpent[accountId][w]`. Logic-side         callers are responsible for never exceeding the per-window         base allowance (`committedTRAC / lockDurationEpochs`); the         storage contract just records.\"},\"isRegisteredAgent(uint256,address)\":{\"notice\":\"O(1) membership check used by `coverPublishingCost` and         `deregisterAgent` to validate (accountId, agent) pairs         without scanning the array.\"},\"maxAgentsPerAccount()\":{\"notice\":\"Governance-tunable cap on `_registeredAgents[accountId].length`.         Initialized to `_DEFAULT_MAX_AGENTS_PER_ACCOUNT` on the         first `initialize()`; a HubOwner can retune via         `setMaxAgentsPerAccount`.\"},\"removeAgent(uint256,address)\":{\"notice\":\"Remove `agent` from `accountId`. Reverts if not registered.         The array is compacted via swap-and-pop; the reverse map         and membership index are both cleared so the         agent address can be re-registered later (against the         same or a different account).\"},\"setFullySwept(uint256,bool)\":{\"notice\":\"Mark the account as fully swept. Called once by the         post-expiry final-sweep path; subsequent settle calls         observe `fullySwept == true` and short-circuit.\"},\"setLastSettledWindow(uint256,uint16)\":{\"notice\":\"Advance the lazy-settlement cursor. Caller (logic) is         responsible for never moving it past `lockDurationEpochs`.\"},\"setMaxAgentsPerAccount(uint256)\":{\"notice\":\"Tune the per-account agent cap. `onlyContracts` here so         the NFT wrapper's `setMaxAgentsPerAccount` forwarder can         drive the write \\u2014 the wrapper enforces the `onlyHubOwner`         user-facing gate. Direct PCS callers from outside the         Hub-registered contract set are rejected. Setting the         cap below an existing account's registered count does         NOT retroactively unregister anyone \\u2014 it only blocks         further `addAgent` calls until the count drops.\"},\"setPrimaryNodeData(uint256,uint72,uint40)\":{\"notice\":\"OT-RFC-51: persist the designated `primaryNode` and the         `lastPrimaryNodeChangeEpoch` rate-limit cursor. Logic-side         (`PublishingConviction.setPrimaryNode`) is responsible for         the once-per-epoch gate and for `nodeExists` validation;         storage just records.\"},\"topUpBalance(uint256)\":{\"notice\":\"Persistent top-up buffer per account (NOT per-window).         Drained only when the current window's base allowance is         exhausted. Any non-zero balance at account expiry is swept         to the staker pool by the final-sweep path.\"},\"windowSpent(uint256,uint40)\":{\"notice\":\"Per-billing-window TRAC drawn against the current         account's base allowance. Second key is the billing-window         index (0-based, relative to `Account.createdAtTimestamp`);         it is NOT a chain-epoch number. The base allowance per         window is `committedTRAC / lockDurationEpochs`; a window's         entry is bounded by that value.\"}},\"notice\":\"Single source of truth for V10 publisher conviction account state. Architecture (mirrors the V10 staking split \\u2014 `ConvictionStakingStorage` holds positions, `StakingV10` is stateless logic, `DKGStakingConvictionNFT` is a thin ERC-721 wrapper):   - `PublishingConvictionStorage` (this contract) owns every byte of     application state for publisher conviction accounts: the `Account`     struct keyed by `accountId`, per-billing-window TRAC accounting     (`windowSpent`), the persistent top-up buffer (`topUpBalance`), the     agent registration tables, and the governance-tunable     `maxAgentsPerAccount` cap.     This is a fresh-state contract: it ships EMPTY at deploy time     and there is NO automated migration path that copies state out     of the legacy combined `DKGPublishingConvictionNFT` v2.x. PCA     accounts opened against the v2.x contract are NOT readable here     after the upgrade. This is intentional and matches how the V10     line has handled prior storage-split redeploys     (`ProfileStorage`, `ParametersStorage`): network operators bump     `chainResetMarker` in the network config so daemons auto-wipe     their derived chain state on next start, the on-chain Hub     re-points consumers (`KnowledgeAssetsV10`, `ContextGraphs`) at     this contract, and the publisher fleet re-creates conviction     accounts under the new wrapper. PR #650 ships the     `chainResetMarker` bump alongside this storage contract; do     NOT deploy the new PCA stack against a network without the     accompanying marker bump. See `network/testnet.json` and the     PR body's \\\"Migration / fresh-state reset\\\" section.   - `PublishingConviction` (the new logic contract) holds zero     application state \\u2014 only Hub-resolved contract references and     metadata. It reads/writes here via `onlyContracts`-gated mutators     and runs every business rule (account creation, billing-window     settlement, lazy passive-sink sweeps, post-expiry final sweep, and     active-sink epoch distribution).   - `DKGPublishingConvictionNFT` keeps only the ERC-721 surface     (mint/burn, transfer hook, ownership checks), the     `_nextAccountId` mint counter, and the publisher-facing TRAC     `transferFrom` paths. Every state read/write goes through this     storage contract. Storage independence (the architectural goal):   - The logic contract can be redeployed without touching account or     agent state \\u2014 Hub re-registers the new logic address, the storage     keeps every existing `accounts[id]`, `topUpBalance[id]`,     `windowSpent[id][w]`, and agent registration intact.   - The NFT wrapper can also be redeployed (e.g. ERC-721 metadata     surface change), at the cost of resetting `_nextAccountId` \\u2014     existing accounts keep their state but new mints would clash if     the counter resets, so this is an upgrade path that requires care. State boundaries (what does NOT live here):   - `_nextAccountId` \\u2014 stays on the NFT wrapper because it is tightly     coupled to ERC-721 mint ordering; the wrapper increments and     supplies the new id to the logic contract on each `createAccount`     forward (mirrors `DKGStakingConvictionNFT.nextTokenId`).   - TRAC vault custody \\u2014 TRAC sits in `ConvictionStakingStorage`     (the V10 vault, post-v4.0.0 consolidation). This storage contract     never holds TRAC and never moves it. The NFT wrapper drives     `transferFrom(publisher \\u2192 CSS)` directly on `createAccount` /     `topUp`; this storage only updates the bookkeeping that controls     how that escrowed TRAC eventually flows to staker pools via     `EpochStorage.addTokensToEpochRange`. Caller gates:   - Mutating functions are `onlyContracts` \\u2014 only Hub-registered     contracts (in practice `PublishingConviction`, with the NFT     wrapper as a fallback for direct-write paths if ever needed) can     invoke them.   - `setMaxAgentsPerAccount` is `onlyHubOwner` because it is a     governance-side parameter (mirrors `setStatus` / parameter     setters on other V10 storage contracts). Invariants enforced inside this contract:   - `agentToAccountId[agent] == accountId` iff     `_isRegisteredAgent[accountId][agent] == true`. Agent register /     deregister / clear-all paths flip both flags atomically so the     two views never drift.   - `_registeredAgents[accountId]` always equals the set of `agent`s     for which `_isRegisteredAgent[accountId][agent] == true`. The     swap-and-pop in `removeAgent` keeps the array in sync.\",\"version\":1}},\"settings\":{\"compilationTarget\":{\"contracts/storage/PublishingConvictionStorage.sol\":\"PublishingConvictionStorage\"},\"evmVersion\":\"london\",\"libraries\":{},\"metadata\":{\"bytecodeHash\":\"ipfs\",\"useLiteralContent\":true},\"optimizer\":{\"enabled\":true,\"runs\":200},\"remappings\":[],\"viaIR\":true},\"sources\":{\"@openzeppelin/contracts/access/Ownable.sol\":{\"content\":\"// SPDX-License-Identifier: MIT\\n// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)\\n\\npragma solidity ^0.8.20;\\n\\nimport {Context} from \\\"../utils/Context.sol\\\";\\n\\n/**\\n * @dev Contract module which provides a basic access control mechanism, where\\n * there is an account (an owner) that can be granted exclusive access to\\n * specific functions.\\n *\\n * The initial owner is set to the address provided by the deployer. This can\\n * later be changed with {transferOwnership}.\\n *\\n * This module is used through inheritance. It will make available the modifier\\n * `onlyOwner`, which can be applied to your functions to restrict their use to\\n * the owner.\\n */\\nabstract contract Ownable is Context {\\n    address private _owner;\\n\\n    /**\\n     * @dev The caller account is not authorized to perform an operation.\\n     */\\n    error OwnableUnauthorizedAccount(address account);\\n\\n    /**\\n     * @dev The owner is not a valid owner account. (eg. `address(0)`)\\n     */\\n    error OwnableInvalidOwner(address owner);\\n\\n    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);\\n\\n    /**\\n     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.\\n     */\\n    constructor(address initialOwner) {\\n        if (initialOwner == address(0)) {\\n            revert OwnableInvalidOwner(address(0));\\n        }\\n        _transferOwnership(initialOwner);\\n    }\\n\\n    /**\\n     * @dev Throws if called by any account other than the owner.\\n     */\\n    modifier onlyOwner() {\\n        _checkOwner();\\n        _;\\n    }\\n\\n    /**\\n     * @dev Returns the address of the current owner.\\n     */\\n    function owner() public view virtual returns (address) {\\n        return _owner;\\n    }\\n\\n    /**\\n     * @dev Throws if the sender is not the owner.\\n     */\\n    function _checkOwner() internal view virtual {\\n        if (owner() != _msgSender()) {\\n            revert OwnableUnauthorizedAccount(_msgSender());\\n        }\\n    }\\n\\n    /**\\n     * @dev Leaves the contract without owner. It will not be possible to call\\n     * `onlyOwner` functions. Can only be called by the current owner.\\n     *\\n     * NOTE: Renouncing ownership will leave the contract without an owner,\\n     * thereby disabling any functionality that is only available to the owner.\\n     */\\n    function renounceOwnership() public virtual onlyOwner {\\n        _transferOwnership(address(0));\\n    }\\n\\n    /**\\n     * @dev Transfers ownership of the contract to a new account (`newOwner`).\\n     * Can only be called by the current owner.\\n     */\\n    function transferOwnership(address newOwner) public virtual onlyOwner {\\n        if (newOwner == address(0)) {\\n            revert OwnableInvalidOwner(address(0));\\n        }\\n        _transferOwnership(newOwner);\\n    }\\n\\n    /**\\n     * @dev Transfers ownership of the contract to a new account (`newOwner`).\\n     * Internal function without access restriction.\\n     */\\n    function _transferOwnership(address newOwner) internal virtual {\\n        address oldOwner = _owner;\\n        _owner = newOwner;\\n        emit OwnershipTransferred(oldOwner, newOwner);\\n    }\\n}\\n\",\"keccak256\":\"0xff6d0bb2e285473e5311d9d3caacb525ae3538a80758c10649a4d61029b017bb\",\"license\":\"MIT\"},\"@openzeppelin/contracts/utils/Context.sol\":{\"content\":\"// SPDX-License-Identifier: MIT\\n// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)\\n\\npragma solidity ^0.8.20;\\n\\n/**\\n * @dev Provides information about the current execution context, including the\\n * sender of the transaction and its data. While these are generally available\\n * via msg.sender and msg.data, they should not be accessed in such a direct\\n * manner, since when dealing with meta-transactions the account sending and\\n * paying for execution may not be the actual sender (as far as an application\\n * is concerned).\\n *\\n * This contract is only required for intermediate, library-like contracts.\\n */\\nabstract contract Context {\\n    function _msgSender() internal view virtual returns (address) {\\n        return msg.sender;\\n    }\\n\\n    function _msgData() internal view virtual returns (bytes calldata) {\\n        return msg.data;\\n    }\\n\\n    function _contextSuffixLength() internal view virtual returns (uint256) {\\n        return 0;\\n    }\\n}\\n\",\"keccak256\":\"0x493033a8d1b176a037b2cc6a04dad01a5c157722049bbecf632ca876224dd4b2\",\"license\":\"MIT\"},\"contracts/abstract/HubDependent.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nimport {Hub} from \\\"../storage/Hub.sol\\\";\\nimport {HubLib} from \\\"../libraries/HubLib.sol\\\";\\n\\nabstract contract HubDependent {\\n    Hub public hub;\\n\\n    constructor(address hubAddress) {\\n        if (hubAddress == address(0)) {\\n            revert HubLib.ZeroAddressHub();\\n        }\\n\\n        hub = Hub(hubAddress);\\n    }\\n\\n    modifier onlyHub() {\\n        _checkHub();\\n        _;\\n    }\\n\\n    modifier onlyHubOwner() {\\n        _checkHubOwner();\\n        _;\\n    }\\n\\n    modifier onlyContracts() {\\n        _checkHubContract();\\n        _;\\n    }\\n\\n    function _checkHub() internal view virtual {\\n        if (msg.sender != address(hub) && msg.sender != hub.owner()) {\\n            revert HubLib.UnauthorizedAccess(\\\"Only Hub\\\");\\n        }\\n    }\\n\\n    function _checkHubOwner() internal view virtual {\\n        if (msg.sender != hub.owner()) {\\n            revert HubLib.UnauthorizedAccess(\\\"Only Hub Owner\\\");\\n        }\\n    }\\n\\n    function _checkHubContract() internal view virtual {\\n        if (!hub.isContract(msg.sender) && msg.sender != hub.owner()) {\\n            revert HubLib.UnauthorizedAccess(\\\"Only Contracts in Hub\\\");\\n        }\\n    }\\n}\\n\",\"keccak256\":\"0x643f4dcb2699e967c2ffbfb7c412e0973abc1409e0753a35f75c4661b89f977d\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/IContractStatus.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface IContractStatus {\\n    function setStatus(bool _status) external;\\n}\\n\",\"keccak256\":\"0x0eaaee7100a88d51de69ac7ec4d5e58d9bdd2582537476631a0717379ca16c40\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/ICustodian.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface ICustodian {\\n    function getOwners() external view returns (address[] memory);\\n}\\n\",\"keccak256\":\"0x513e0babede5cc394427a5fb941c80c255be8716e24ff5ee4ea7a6e18335e0b0\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/IInitializable.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface IInitializable {\\n    function initialize() external;\\n}\\n\",\"keccak256\":\"0xad07f8f7bb2bad96f3d5c97ef6673e15574ad11701be1ac9feb94f750c0dee51\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/INamed.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface INamed {\\n    function name() external view returns (string memory);\\n}\\n\",\"keccak256\":\"0x111fc7e3f1b6c9e9da05cecf65d9985177bcface705870536fe409089b89a27c\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/IVersioned.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface IVersioned {\\n    function version() external view returns (string memory);\\n}\\n\",\"keccak256\":\"0x5e104c26deb107969a5bc1f38614f11af0261fc84f1ebbd2ab3bd064b4795de0\",\"license\":\"Apache-2.0\"},\"contracts/libraries/HubLib.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nlibrary HubLib {\\n    struct Contract {\\n        string name;\\n        address addr;\\n    }\\n\\n    struct ForwardCallInputArgs {\\n        string contractName;\\n        bytes[] encodedData;\\n    }\\n\\n    error ZeroAddressHub();\\n    error UnauthorizedAccess(string msg);\\n    error InvalidTargetContract(address addr);\\n    error ContractNotRegistered(string contractName);\\n}\\n\",\"keccak256\":\"0xcb693696568e706c95ff32538831d177d379e28f7fd0518b787c1d7a5334d71b\",\"license\":\"Apache-2.0\"},\"contracts/libraries/UnorderedNamedContractDynamicSet.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nlibrary UnorderedNamedContractDynamicSet {\\n    struct Contract {\\n        string name;\\n        address addr;\\n    }\\n\\n    struct Set {\\n        mapping(string => uint256) stringIndexPointers;\\n        mapping(address => uint256) addressIndexPointers;\\n        Contract[] contractList;\\n    }\\n\\n    error EmptyName();\\n    error ZeroAddress();\\n    error ContractAlreadyExists(string name);\\n    error AddressAlreadyInSet(address addr);\\n    error ContractDoesNotExist(string name);\\n    error AddressDoesNotExist(address addr);\\n\\n    function append(UnorderedNamedContractDynamicSet.Set storage self, string calldata name, address addr) internal {\\n        if (keccak256(abi.encodePacked(name)) == keccak256(abi.encodePacked(\\\"\\\"))) revert EmptyName();\\n        if (addr == address(0)) revert ZeroAddress();\\n        if (exists(self, name)) revert ContractAlreadyExists(name);\\n        if (self.contractList.length > 0 && (self.addressIndexPointers[addr] != 0 || self.contractList[0].addr == addr))\\n            revert AddressAlreadyInSet(addr);\\n\\n        self.stringIndexPointers[name] = size(self);\\n        self.addressIndexPointers[addr] = size(self);\\n        self.contractList.push(UnorderedNamedContractDynamicSet.Contract(name, addr));\\n    }\\n\\n    function update(UnorderedNamedContractDynamicSet.Set storage self, string calldata name, address addr) internal {\\n        if (addr == address(0)) revert ZeroAddress();\\n        if (!exists(self, name)) revert ContractDoesNotExist(name);\\n\\n        address currentAddr = self.contractList[self.stringIndexPointers[name]].addr;\\n        if (currentAddr == addr) {\\n            // Idempotent: same address already registered for this name (e.g. re-run deploy in tests).\\n            return;\\n        }\\n        if (self.contractList.length > 0 && (self.addressIndexPointers[addr] != 0 || self.contractList[0].addr == addr))\\n            revert AddressAlreadyInSet(addr);\\n\\n        delete self.addressIndexPointers[currentAddr];\\n        self.addressIndexPointers[addr] = self.stringIndexPointers[name];\\n        self.contractList[self.stringIndexPointers[name]].addr = addr;\\n    }\\n\\n    function remove(UnorderedNamedContractDynamicSet.Set storage self, string calldata name) internal {\\n        if (!exists(self, name)) revert ContractDoesNotExist(name);\\n\\n        uint256 contractToRemoveIndex = self.stringIndexPointers[name];\\n\\n        delete self.addressIndexPointers[self.contractList[contractToRemoveIndex].addr];\\n\\n        UnorderedNamedContractDynamicSet.Contract memory contractToMove = self.contractList[size(self) - 1];\\n\\n        self.stringIndexPointers[contractToMove.name] = contractToRemoveIndex;\\n        self.addressIndexPointers[contractToMove.addr] = contractToRemoveIndex;\\n        self.contractList[contractToRemoveIndex] = contractToMove;\\n\\n        delete self.stringIndexPointers[name];\\n        self.contractList.pop();\\n    }\\n\\n    function remove(UnorderedNamedContractDynamicSet.Set storage self, address addr) internal {\\n        if (!exists(self, addr)) revert AddressDoesNotExist(addr);\\n\\n        uint256 contractToRemoveIndex = self.addressIndexPointers[addr];\\n\\n        delete self.stringIndexPointers[self.contractList[contractToRemoveIndex].name];\\n\\n        UnorderedNamedContractDynamicSet.Contract memory contractToMove = self.contractList[size(self) - 1];\\n\\n        self.stringIndexPointers[contractToMove.name] = contractToRemoveIndex;\\n        self.addressIndexPointers[contractToMove.addr] = contractToRemoveIndex;\\n        self.contractList[contractToRemoveIndex] = contractToMove;\\n\\n        delete self.addressIndexPointers[addr];\\n        self.contractList.pop();\\n    }\\n\\n    function get(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        string calldata name\\n    ) internal view returns (UnorderedNamedContractDynamicSet.Contract memory) {\\n        if (!exists(self, name)) revert ContractDoesNotExist(name);\\n\\n        return self.contractList[self.stringIndexPointers[name]];\\n    }\\n\\n    function get(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        address addr\\n    ) internal view returns (UnorderedNamedContractDynamicSet.Contract memory) {\\n        if (!exists(self, addr)) revert AddressDoesNotExist(addr);\\n\\n        return self.contractList[self.addressIndexPointers[addr]];\\n    }\\n\\n    function get(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        uint256 index\\n    ) internal view returns (UnorderedNamedContractDynamicSet.Contract memory) {\\n        return self.contractList[index];\\n    }\\n\\n    function getAll(\\n        UnorderedNamedContractDynamicSet.Set storage self\\n    ) internal view returns (UnorderedNamedContractDynamicSet.Contract[] memory) {\\n        return self.contractList;\\n    }\\n\\n    function getIndex(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        string calldata name\\n    ) internal view returns (uint256) {\\n        return self.stringIndexPointers[name];\\n    }\\n\\n    function getIndex(UnorderedNamedContractDynamicSet.Set storage self, address addr) internal view returns (uint256) {\\n        return self.addressIndexPointers[addr];\\n    }\\n\\n    function exists(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        string calldata name\\n    ) internal view returns (bool) {\\n        if (size(self) == 0) {\\n            return false;\\n        }\\n        return\\n            keccak256(abi.encodePacked(self.contractList[self.stringIndexPointers[name]].name)) ==\\n            keccak256(abi.encodePacked(name));\\n    }\\n\\n    function exists(UnorderedNamedContractDynamicSet.Set storage self, address addr) internal view returns (bool) {\\n        if (size(self) == 0) {\\n            return false;\\n        }\\n        return addr == self.contractList[self.addressIndexPointers[addr]].addr;\\n    }\\n\\n    function size(UnorderedNamedContractDynamicSet.Set storage self) internal view returns (uint256) {\\n        return self.contractList.length;\\n    }\\n}\\n\",\"keccak256\":\"0x51b09c4bc2d3342e78c0a77eceff9ba5a7e694ba663535abec0e859c5e32b5ab\",\"license\":\"Apache-2.0\"},\"contracts/storage/Hub.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nimport {IContractStatus} from \\\"../interfaces/IContractStatus.sol\\\";\\nimport {ICustodian} from \\\"../interfaces/ICustodian.sol\\\";\\nimport {IInitializable} from \\\"../interfaces/IInitializable.sol\\\";\\nimport {INamed} from \\\"../interfaces/INamed.sol\\\";\\nimport {IVersioned} from \\\"../interfaces/IVersioned.sol\\\";\\nimport {HubLib} from \\\"../libraries/HubLib.sol\\\";\\nimport {UnorderedNamedContractDynamicSet} from \\\"../libraries/UnorderedNamedContractDynamicSet.sol\\\";\\nimport {Ownable} from \\\"@openzeppelin/contracts/access/Ownable.sol\\\";\\n\\ncontract Hub is INamed, IVersioned, Ownable {\\n    using UnorderedNamedContractDynamicSet for UnorderedNamedContractDynamicSet.Set;\\n\\n    event NewContract(string contractName, address newContractAddress);\\n    event ContractChanged(string contractName, address newContractAddress);\\n    event NewAssetStorage(string contractName, address newContractAddress);\\n    event AssetStorageChanged(string contractName, address newContractAddress);\\n    event ContractRemoved(string contractName, address contractAddress);\\n    event AssetStorageRemoved(string contractName, address contractAddress);\\n\\n    string private constant _NAME = \\\"Hub\\\";\\n    string private constant _VERSION = \\\"1.0.0\\\";\\n\\n    UnorderedNamedContractDynamicSet.Set internal contractSet;\\n    UnorderedNamedContractDynamicSet.Set internal assetStorageSet;\\n\\n    constructor() Ownable(msg.sender) {}\\n\\n    // @dev Only transactions by HubController owner or one of the owners of the MultiSig Wallet\\n    modifier onlyOwnerOrMultiSigOwner() {\\n        _checkOwnerOrMultiSigOwner();\\n        _;\\n    }\\n\\n    function name() external pure virtual override returns (string memory) {\\n        return _NAME;\\n    }\\n\\n    function version() external pure virtual override returns (string memory) {\\n        return _VERSION;\\n    }\\n\\n    function setContractAddress(\\n        string calldata contractName,\\n        address newContractAddress\\n    ) external onlyOwnerOrMultiSigOwner {\\n        _setContractAddress(contractName, newContractAddress);\\n    }\\n\\n    function setAssetStorageAddress(string calldata assetStorageName, address assetStorageAddress) external onlyOwner {\\n        _setAssetStorageAddress(assetStorageName, assetStorageAddress);\\n    }\\n\\n    function removeContractByName(string calldata contractName) external onlyOwner {\\n        if (contractSet.exists(contractName)) {\\n            address contractAddress = contractSet.get(contractName).addr;\\n\\n            contractSet.remove(contractName);\\n\\n            emit ContractRemoved(contractName, contractAddress);\\n        }\\n    }\\n\\n    function removeContractByAddress(address contractAddress) external onlyOwner {\\n        if (contractSet.exists(contractAddress)) {\\n            string memory contractName = contractSet.get(contractAddress).name;\\n\\n            contractSet.remove(contractAddress);\\n\\n            emit ContractRemoved(contractName, contractAddress);\\n        }\\n    }\\n\\n    function removeAssetStorageByName(string calldata assetStorageName) external onlyOwner {\\n        if (assetStorageSet.exists(assetStorageName)) {\\n            address assetStorageAddress = assetStorageSet.get(assetStorageName).addr;\\n\\n            assetStorageSet.remove(assetStorageName);\\n\\n            emit AssetStorageRemoved(assetStorageName, assetStorageAddress);\\n        }\\n    }\\n\\n    function removeAssetStorageByAddress(address assetStorageAddress) external onlyOwner {\\n        if (assetStorageSet.exists(assetStorageAddress)) {\\n            string memory assetStorageName = assetStorageSet.get(assetStorageAddress).name;\\n\\n            assetStorageSet.remove(assetStorageAddress);\\n\\n            emit AssetStorageRemoved(assetStorageName, assetStorageAddress);\\n        }\\n    }\\n\\n    function getContractAddress(string calldata contractName) external view returns (address) {\\n        return contractSet.get(contractName).addr;\\n    }\\n\\n    function getAssetStorageAddress(string calldata assetStorageName) external view returns (address) {\\n        return assetStorageSet.get(assetStorageName).addr;\\n    }\\n\\n    function getAllContracts() external view returns (UnorderedNamedContractDynamicSet.Contract[] memory) {\\n        return contractSet.getAll();\\n    }\\n\\n    function getAllAssetStorages() external view returns (UnorderedNamedContractDynamicSet.Contract[] memory) {\\n        return assetStorageSet.getAll();\\n    }\\n\\n    function isContract(string calldata contractName) external view returns (bool) {\\n        return contractSet.exists(contractName);\\n    }\\n\\n    function isContract(address selectedContractAddress) external view returns (bool) {\\n        return contractSet.exists(selectedContractAddress);\\n    }\\n\\n    function isAssetStorage(string calldata assetStorageName) external view returns (bool) {\\n        return assetStorageSet.exists(assetStorageName);\\n    }\\n\\n    function isAssetStorage(address assetStorageAddress) external view returns (bool) {\\n        return assetStorageSet.exists(assetStorageAddress);\\n    }\\n\\n    /**\\n     * @dev Forwards a function call to a specified target contract.\\n     * @notice This function can only be called by the contract owner or a multisig owner.\\n     * @param target The address of the target contract.\\n     * @param data The calldata containing the function signature and arguments for the target contract's function.\\n     * @return result The return data of the target contract's function call.\\n     */\\n    function forwardCall(address target, bytes calldata data) public onlyOwnerOrMultiSigOwner returns (bytes memory) {\\n        // Check if the target contract is registered in the Hub\\n        if (!contractSet.exists(target) && !assetStorageSet.exists(target)) {\\n            revert HubLib.InvalidTargetContract(target);\\n        }\\n\\n        // Perform the function call to the target contract with the specified calldata\\n        (bool success, bytes memory result) = target.call{value: 0}(data);\\n\\n        // If the call is unsuccessful, revert the transaction with the original revert reason\\n        if (!success) {\\n            assembly {\\n                // Load the free memory pointer from memory slot 0x40\\n                // Memory slot 0x40 is conventionally used to store the free memory pointer in Solidity, which points\\n                // to the next available memory slot for storing data during the execution of a contract function.\\n                let ptr := mload(0x40)\\n                // Get the size of the return data from the unsuccessful call\\n                let size := returndatasize()\\n                // Copy the return data to the memory location pointed to by ptr\\n                returndatacopy(ptr, 0, size)\\n                // Revert the transaction with the return data as the revert reason\\n                revert(ptr, size)\\n            }\\n        }\\n\\n        return result;\\n    }\\n\\n    function setAndReinitializeContracts(\\n        HubLib.Contract[] calldata newContracts,\\n        HubLib.Contract[] calldata newAssetStorageContracts,\\n        address[] calldata contractsToReinitialize,\\n        HubLib.ForwardCallInputArgs[] calldata forwardCallsData\\n    ) external onlyOwnerOrMultiSigOwner {\\n        _setContracts(newContracts);\\n        _setAssetStorageContracts(newAssetStorageContracts);\\n        _reinitializeContracts(contractsToReinitialize);\\n        _forwardCalls(forwardCallsData);\\n    }\\n\\n    function _setContractAddress(string calldata contractName, address newContractAddress) internal {\\n        if (contractSet.exists(contractName)) {\\n            contractSet.update(contractName, newContractAddress);\\n\\n            address oldContractAddress = contractSet.get(contractName).addr;\\n            if (_isContract(oldContractAddress)) {\\n                try IContractStatus(oldContractAddress).setStatus(false) {\\n                    // success\\n                } catch {\\n                    // Best-effort: contract may not implement IContractStatus; ignore.\\n                }\\n            }\\n\\n            emit ContractChanged(contractName, newContractAddress);\\n        } else {\\n            contractSet.append(contractName, newContractAddress);\\n\\n            emit NewContract(contractName, newContractAddress);\\n        }\\n\\n        if (_isContract(newContractAddress)) {\\n            try IContractStatus(newContractAddress).setStatus(true) {\\n                // success\\n            } catch {\\n                // Best-effort: contract may not implement IContractStatus; ignore.\\n            }\\n        }\\n\\n        emit NewContract(contractName, newContractAddress);\\n    }\\n\\n    function _setContracts(HubLib.Contract[] calldata newContracts) internal {\\n        for (uint256 i; i < newContracts.length; ) {\\n            _setContractAddress(newContracts[i].name, newContracts[i].addr);\\n\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _setAssetStorageAddress(string calldata assetStorageName, address assetStorageAddress) internal {\\n        if (assetStorageSet.exists(assetStorageName)) {\\n            emit AssetStorageChanged(assetStorageName, assetStorageAddress);\\n            assetStorageSet.update(assetStorageName, assetStorageAddress);\\n        } else {\\n            emit NewAssetStorage(assetStorageName, assetStorageAddress);\\n            assetStorageSet.append(assetStorageName, assetStorageAddress);\\n        }\\n    }\\n\\n    function _setAssetStorageContracts(HubLib.Contract[] calldata newAssetStorageContracts) internal {\\n        for (uint256 i; i < newAssetStorageContracts.length; ) {\\n            _setAssetStorageAddress(newAssetStorageContracts[i].name, newAssetStorageContracts[i].addr);\\n\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _reinitializeContracts(address[] calldata contractsToReinitialize) internal {\\n        for (uint256 i; i < contractsToReinitialize.length; ) {\\n            IInitializable(contractsToReinitialize[i]).initialize();\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _forwardCalls(HubLib.ForwardCallInputArgs[] calldata forwardCallsData) internal {\\n        for (uint256 i; i < forwardCallsData.length; ) {\\n            address contractAddress;\\n\\n            // Try to get the contract address using getContractAddress\\n            try this.getContractAddress(forwardCallsData[i].contractName) returns (address addr) {\\n                contractAddress = addr;\\n            } catch {\\n                // If getContractAddress fails, try getAssetStorageAddress\\n                try this.getAssetStorageAddress(forwardCallsData[i].contractName) returns (address addr) {\\n                    contractAddress = addr;\\n                } catch {\\n                    revert HubLib.ContractNotRegistered(forwardCallsData[i].contractName);\\n                }\\n            }\\n            for (uint256 j; j < forwardCallsData[i].encodedData.length; ) {\\n                forwardCall(contractAddress, forwardCallsData[i].encodedData[j]);\\n                unchecked {\\n                    j++;\\n                }\\n            }\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _isContract(address addr) internal view returns (bool) {\\n        uint256 size;\\n        assembly {\\n            size := extcodesize(addr)\\n        }\\n        return size > 0;\\n    }\\n\\n    function _isMultiSigOwner(address multiSigAddress) internal view returns (bool) {\\n        try ICustodian(multiSigAddress).getOwners() returns (address[] memory multiSigOwners) {\\n            for (uint256 i = 0; i < multiSigOwners.length; i++) {\\n                if (msg.sender == multiSigOwners[i]) {\\n                    return true;\\n                }\\n            }\\n        } catch {\\n            // Not a multisig or call reverted; treat as not owner.\\n        }\\n\\n        return false;\\n    }\\n\\n    function _checkOwnerOrMultiSigOwner() internal view virtual {\\n        address hubOwner = owner();\\n        if (msg.sender != hubOwner && !_isMultiSigOwner(hubOwner)) {\\n            revert HubLib.UnauthorizedAccess(\\\"Only Hub Owner or Multisig Owner\\\");\\n        }\\n    }\\n}\\n\",\"keccak256\":\"0x732252bb857277a35ab314beef2dbaceb5f96ce2f6d3b83a224927e503609def\",\"license\":\"Apache-2.0\"},\"contracts/storage/PublishingConvictionStorage.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nimport {INamed} from \\\"../interfaces/INamed.sol\\\";\\nimport {IVersioned} from \\\"../interfaces/IVersioned.sol\\\";\\nimport {IInitializable} from \\\"../interfaces/IInitializable.sol\\\";\\nimport {HubDependent} from \\\"../abstract/HubDependent.sol\\\";\\n\\n/**\\n * @title PublishingConvictionStorage\\n * @notice Single source of truth for V10 publisher conviction account state.\\n *\\n * Architecture (mirrors the V10 staking split \\u2014 `ConvictionStakingStorage`\\n * holds positions, `StakingV10` is stateless logic, `DKGStakingConvictionNFT`\\n * is a thin ERC-721 wrapper):\\n *\\n *   - `PublishingConvictionStorage` (this contract) owns every byte of\\n *     application state for publisher conviction accounts: the `Account`\\n *     struct keyed by `accountId`, per-billing-window TRAC accounting\\n *     (`windowSpent`), the persistent top-up buffer (`topUpBalance`), the\\n *     agent registration tables, and the governance-tunable\\n *     `maxAgentsPerAccount` cap.\\n *\\n *     This is a fresh-state contract: it ships EMPTY at deploy time\\n *     and there is NO automated migration path that copies state out\\n *     of the legacy combined `DKGPublishingConvictionNFT` v2.x. PCA\\n *     accounts opened against the v2.x contract are NOT readable here\\n *     after the upgrade. This is intentional and matches how the V10\\n *     line has handled prior storage-split redeploys\\n *     (`ProfileStorage`, `ParametersStorage`): network operators bump\\n *     `chainResetMarker` in the network config so daemons auto-wipe\\n *     their derived chain state on next start, the on-chain Hub\\n *     re-points consumers (`KnowledgeAssetsV10`, `ContextGraphs`) at\\n *     this contract, and the publisher fleet re-creates conviction\\n *     accounts under the new wrapper. PR #650 ships the\\n *     `chainResetMarker` bump alongside this storage contract; do\\n *     NOT deploy the new PCA stack against a network without the\\n *     accompanying marker bump. See `network/testnet.json` and the\\n *     PR body's \\\"Migration / fresh-state reset\\\" section.\\n *   - `PublishingConviction` (the new logic contract) holds zero\\n *     application state \\u2014 only Hub-resolved contract references and\\n *     metadata. It reads/writes here via `onlyContracts`-gated mutators\\n *     and runs every business rule (account creation, billing-window\\n *     settlement, lazy passive-sink sweeps, post-expiry final sweep, and\\n *     active-sink epoch distribution).\\n *   - `DKGPublishingConvictionNFT` keeps only the ERC-721 surface\\n *     (mint/burn, transfer hook, ownership checks), the\\n *     `_nextAccountId` mint counter, and the publisher-facing TRAC\\n *     `transferFrom` paths. Every state read/write goes through this\\n *     storage contract.\\n *\\n * Storage independence (the architectural goal):\\n *   - The logic contract can be redeployed without touching account or\\n *     agent state \\u2014 Hub re-registers the new logic address, the storage\\n *     keeps every existing `accounts[id]`, `topUpBalance[id]`,\\n *     `windowSpent[id][w]`, and agent registration intact.\\n *   - The NFT wrapper can also be redeployed (e.g. ERC-721 metadata\\n *     surface change), at the cost of resetting `_nextAccountId` \\u2014\\n *     existing accounts keep their state but new mints would clash if\\n *     the counter resets, so this is an upgrade path that requires care.\\n *\\n * State boundaries (what does NOT live here):\\n *   - `_nextAccountId` \\u2014 stays on the NFT wrapper because it is tightly\\n *     coupled to ERC-721 mint ordering; the wrapper increments and\\n *     supplies the new id to the logic contract on each `createAccount`\\n *     forward (mirrors `DKGStakingConvictionNFT.nextTokenId`).\\n *   - TRAC vault custody \\u2014 TRAC sits in `ConvictionStakingStorage`\\n *     (the V10 vault, post-v4.0.0 consolidation). This storage contract\\n *     never holds TRAC and never moves it. The NFT wrapper drives\\n *     `transferFrom(publisher \\u2192 CSS)` directly on `createAccount` /\\n *     `topUp`; this storage only updates the bookkeeping that controls\\n *     how that escrowed TRAC eventually flows to staker pools via\\n *     `EpochStorage.addTokensToEpochRange`.\\n *\\n * Caller gates:\\n *   - Mutating functions are `onlyContracts` \\u2014 only Hub-registered\\n *     contracts (in practice `PublishingConviction`, with the NFT\\n *     wrapper as a fallback for direct-write paths if ever needed) can\\n *     invoke them.\\n *   - `setMaxAgentsPerAccount` is `onlyHubOwner` because it is a\\n *     governance-side parameter (mirrors `setStatus` / parameter\\n *     setters on other V10 storage contracts).\\n *\\n * Invariants enforced inside this contract:\\n *   - `agentToAccountId[agent] == accountId` iff\\n *     `_isRegisteredAgent[accountId][agent] == true`. Agent register /\\n *     deregister / clear-all paths flip both flags atomically so the\\n *     two views never drift.\\n *   - `_registeredAgents[accountId]` always equals the set of `agent`s\\n *     for which `_isRegisteredAgent[accountId][agent] == true`. The\\n *     swap-and-pop in `removeAgent` keeps the array in sync.\\n */\\ncontract PublishingConvictionStorage is INamed, IVersioned, HubDependent, IInitializable {\\n    string private constant _NAME = \\\"PublishingConvictionStorage\\\";\\n    // 1.0.0 \\u2014 initial split-out from `DKGPublishingConvictionNFT` v2.0.0.\\n    //         Identical state shape; no semantic changes.\\n    // 10.0.3 \\u2014 OT-RFC-51 \\\"Publishing Allocation\\\": `Account` gains\\n    //          `primaryNode` + `lastPrimaryNodeChangeEpoch`, with the\\n    //          `setPrimaryNodeData` onlyContracts setter.\\n    string private constant _VERSION = \\\"10.0.3\\\";\\n\\n    /// @notice Default cap on registered agents per account, applied on\\n    ///         first `initialize()` so a fresh deploy has a sane bound\\n    ///         even before a HubOwner explicitly tunes it.\\n    uint256 internal constant _DEFAULT_MAX_AGENTS_PER_ACCOUNT = 100;\\n\\n    // ============================================================\\n    //                     Account record\\n    // ============================================================\\n    //\\n    // Field semantics (mirrors the legacy v2.x struct exactly so account\\n    // state migrates 1:1 from the NFT):\\n    //   - committedTRAC          : original commit at creation. Never\\n    //                              changes after `createAccount`.\\n    //   - createdAtEpoch         : Chronos epoch the account was created\\n    //                              in (informational; not used for math).\\n    //   - expiresAtEpoch         : first chain epoch past the account's\\n    //                              lock (exclusive upper bound for\\n    //                              `getRemainingAllowance`).\\n    //   - createdAtTimestamp     : wall-clock anchor; billing windows\\n    //                              are computed relative to this.\\n    //   - expiresAtTimestamp     : `createdAtTimestamp +\\n    //                              lockDurationEpochs * epochLength`.\\n    //   - lockDurationEpochs     : number of billing windows the account\\n    //                              spans (also the number of base-budget\\n    //                              slices `committedTRAC` is divided into).\\n    //   - discountBps            : 6-tier discount fixed at creation;\\n    //                              top-ups do NOT change it.\\n    //   - lastSettledWindow      : next unsettled billing-window index\\n    //                              (exclusive of the highest already-swept\\n    //                              window). Drives the lazy-settlement loop.\\n    //   - fullySwept             : terminal flag. True once the post-expiry\\n    //                              final sweep has accounted leftover\\n    //                              top-up + dust to the staker pool. Acts\\n    //                              as a re-entry guard.\\n    struct Account {\\n        uint96 committedTRAC;\\n        uint40 createdAtEpoch;\\n        uint40 expiresAtEpoch;\\n        uint40 createdAtTimestamp;\\n        uint40 expiresAtTimestamp;\\n        uint16 lockDurationEpochs;\\n        uint16 discountBps;\\n        uint16 lastSettledWindow;\\n        bool fullySwept;\\n        // OT-RFC-51 \\\"Publishing Allocation\\\": the node this account's\\n        // committed PCA budget is credited to as publishing allocation\\n        // (K_n). `0` means no designated node (no allocation seeded).\\n        uint72 primaryNode; // designated node identityId; 0 = none\\n        // Rate-limit cursor for `setPrimaryNode`: re-designation is allowed\\n        // at most once per chain epoch (require currentEpoch > this value).\\n        uint40 lastPrimaryNodeChangeEpoch; // re-designation rate-limit cursor\\n    }\\n\\n    // ============================================================\\n    //                       Events\\n    // ============================================================\\n\\n    /// @notice Emitted when the governance-tunable agent cap changes.\\n    event MaxAgentsPerAccountUpdated(uint256 oldCap, uint256 newCap);\\n\\n    // ============================================================\\n    //                        Errors\\n    // ============================================================\\n\\n    error AccountAlreadyExists(uint256 accountId);\\n    error UnknownAccount(uint256 accountId);\\n    error AgentAlreadyRegistered(address agent, uint256 existingAccountId);\\n    error AgentNotRegistered(uint256 accountId, address agent);\\n    error TopUpUnderflow(uint256 accountId, uint96 amount, uint96 balance);\\n\\n    // ============================================================\\n    //                       State\\n    // ============================================================\\n\\n    mapping(uint256 => Account) public accounts;\\n\\n    /// @notice Per-billing-window TRAC drawn against the current\\n    ///         account's base allowance. Second key is the billing-window\\n    ///         index (0-based, relative to `Account.createdAtTimestamp`);\\n    ///         it is NOT a chain-epoch number. The base allowance per\\n    ///         window is `committedTRAC / lockDurationEpochs`; a window's\\n    ///         entry is bounded by that value.\\n    mapping(uint256 => mapping(uint40 => uint96)) public windowSpent;\\n\\n    /// @notice Persistent top-up buffer per account (NOT per-window).\\n    ///         Drained only when the current window's base allowance is\\n    ///         exhausted. Any non-zero balance at account expiry is swept\\n    ///         to the staker pool by the final-sweep path.\\n    mapping(uint256 => uint96) public topUpBalance;\\n\\n    /// @notice Per-account agent enumeration. Kept as an array so the\\n    ///         transfer hook on the NFT wrapper can iterate and clear\\n    ///         every registration in one call. The agent-side reverse\\n    ///         map is `agentToAccountId`.\\n    mapping(uint256 => address[]) internal _registeredAgents;\\n\\n    /// @notice Reverse map exposed publicly so external callers\\n    ///         (`KnowledgeAssetsV10`, `ContextGraphs`) can resolve a\\n    ///         publishing-agent address to its paying account id without\\n    ///         caller-supplied authorization. The \\\"not registered\\\"\\n    ///         sentinel is `0`, which is why `_nextAccountId` on the NFT\\n    ///         starts at 1.\\n    mapping(address => uint256) public agentToAccountId;\\n\\n    /// @notice Membership index that lets `coverPublishingCost` /\\n    ///         `deregisterAgent` decide whether an `agent` is registered\\n    ///         under `accountId` in O(1) without scanning\\n    ///         `_registeredAgents[accountId]`.\\n    mapping(uint256 => mapping(address => bool)) internal _isRegisteredAgent;\\n\\n    /// @notice Governance-tunable cap on `_registeredAgents[accountId].length`.\\n    ///         Initialized to `_DEFAULT_MAX_AGENTS_PER_ACCOUNT` on the\\n    ///         first `initialize()`; a HubOwner can retune via\\n    ///         `setMaxAgentsPerAccount`.\\n    uint256 public maxAgentsPerAccount;\\n\\n    constructor(address hubAddress) HubDependent(hubAddress) {}\\n\\n    /// @dev `initialize()` is idempotent across redeploys: the first call\\n    ///      seeds `maxAgentsPerAccount` to the default; subsequent calls\\n    ///      (e.g. post-upgrade) preserve whatever value the HubOwner has\\n    ///      tuned it to.\\n    function initialize() external onlyHub {\\n        if (maxAgentsPerAccount == 0) {\\n            maxAgentsPerAccount = _DEFAULT_MAX_AGENTS_PER_ACCOUNT;\\n        }\\n    }\\n\\n    function name() external pure virtual override returns (string memory) {\\n        return _NAME;\\n    }\\n\\n    function version() external pure virtual override returns (string memory) {\\n        return _VERSION;\\n    }\\n\\n    // ============================================================\\n    //                  Account read helpers\\n    // ============================================================\\n\\n    /// @notice Return the full `Account` record by id. Reverts if the\\n    ///         account has never been created (sentinel:\\n    ///         `lockDurationEpochs == 0` because every real account\\n    ///         carries at least one billing window).\\n    function getAccount(uint256 accountId) external view returns (Account memory) {\\n        Account memory a = accounts[accountId];\\n        if (a.lockDurationEpochs == 0) revert UnknownAccount(accountId);\\n        return a;\\n    }\\n\\n    /// @notice Existence check used by callers that only need to know\\n    ///         whether an account record is populated (e.g. the public\\n    ///         `settle()` short-circuit). Returns `false` for any\\n    ///         accountId that has never been minted.\\n    function accountExists(uint256 accountId) external view returns (bool) {\\n        return accounts[accountId].lockDurationEpochs != 0;\\n    }\\n\\n    // ============================================================\\n    //                  Account write helpers\\n    // ============================================================\\n\\n    /// @notice Persist a brand-new `Account` record. Used by\\n    ///         `PublishingConviction.createAccount` after the NFT\\n    ///         wrapper has allocated `accountId` from its mint counter.\\n    ///         Reverts if a record at `accountId` already exists, so a\\n    ///         logic-side bug or replay cannot silently overwrite an\\n    ///         active account.\\n    function createAccount(uint256 accountId, Account calldata acct) external onlyContracts {\\n        if (accounts[accountId].lockDurationEpochs != 0) revert AccountAlreadyExists(accountId);\\n        accounts[accountId] = acct;\\n    }\\n\\n    /// @notice Advance the lazy-settlement cursor. Caller (logic) is\\n    ///         responsible for never moving it past `lockDurationEpochs`.\\n    function setLastSettledWindow(uint256 accountId, uint16 w) external onlyContracts {\\n        accounts[accountId].lastSettledWindow = w;\\n    }\\n\\n    /// @notice Mark the account as fully swept. Called once by the\\n    ///         post-expiry final-sweep path; subsequent settle calls\\n    ///         observe `fullySwept == true` and short-circuit.\\n    function setFullySwept(uint256 accountId, bool v) external onlyContracts {\\n        accounts[accountId].fullySwept = v;\\n    }\\n\\n    /// @notice OT-RFC-51: persist the designated `primaryNode` and the\\n    ///         `lastPrimaryNodeChangeEpoch` rate-limit cursor. Logic-side\\n    ///         (`PublishingConviction.setPrimaryNode`) is responsible for\\n    ///         the once-per-epoch gate and for `nodeExists` validation;\\n    ///         storage just records.\\n    function setPrimaryNodeData(\\n        uint256 accountId,\\n        uint72 node,\\n        uint40 changeEpoch\\n    ) external onlyContracts {\\n        accounts[accountId].primaryNode = node;\\n        accounts[accountId].lastPrimaryNodeChangeEpoch = changeEpoch;\\n    }\\n\\n    // ============================================================\\n    //                  Window-spent write helpers\\n    // ============================================================\\n\\n    /// @notice Add `amount` to `windowSpent[accountId][w]`. Logic-side\\n    ///         callers are responsible for never exceeding the per-window\\n    ///         base allowance (`committedTRAC / lockDurationEpochs`); the\\n    ///         storage contract just records.\\n    function increaseWindowSpent(\\n        uint256 accountId,\\n        uint40 w,\\n        uint96 amount\\n    ) external onlyContracts {\\n        windowSpent[accountId][w] += amount;\\n    }\\n\\n    // ============================================================\\n    //                  Top-up balance write helpers\\n    // ============================================================\\n\\n    /// @notice Add to the persistent top-up buffer (publisher pays in\\n    ///         to extend allowance beyond the base budget).\\n    function increaseTopUpBalance(uint256 accountId, uint96 amount) external onlyContracts {\\n        topUpBalance[accountId] += amount;\\n    }\\n\\n    /// @notice Drain `amount` from the top-up buffer. Reverts on\\n    ///         underflow so callers cannot silently overdraw \\u2014 this is\\n    ///         a defensive guard; logic-side `coverPublishingCost`\\n    ///         already rejects insufficient-allowance combinations\\n    ///         with a richer error.\\n    function decreaseTopUpBalance(uint256 accountId, uint96 amount) external onlyContracts {\\n        uint96 bal = topUpBalance[accountId];\\n        if (amount > bal) revert TopUpUnderflow(accountId, amount, bal);\\n        unchecked {\\n            topUpBalance[accountId] = bal - amount;\\n        }\\n    }\\n\\n    /// @notice Zero the top-up buffer in a single SSTORE; used by the\\n    ///         post-expiry final sweep before crediting the staker pool.\\n    function clearTopUpBalance(uint256 accountId) external onlyContracts {\\n        if (topUpBalance[accountId] != 0) {\\n            topUpBalance[accountId] = 0;\\n        }\\n    }\\n\\n    // ============================================================\\n    //                  Agent registry helpers\\n    // ============================================================\\n\\n    /// @notice Read the registered-agent array for an account. Returns\\n    ///         an empty array for unknown accounts so callers can\\n    ///         iterate safely on accounts that never registered an agent.\\n    function getRegisteredAgents(uint256 accountId) external view returns (address[] memory) {\\n        return _registeredAgents[accountId];\\n    }\\n\\n    /// @notice O(1) membership check used by `coverPublishingCost` and\\n    ///         `deregisterAgent` to validate (accountId, agent) pairs\\n    ///         without scanning the array.\\n    function isRegisteredAgent(uint256 accountId, address agent) external view returns (bool) {\\n        return _isRegisteredAgent[accountId][agent];\\n    }\\n\\n    /// @notice Number of agents registered under `accountId`. Useful for\\n    ///         the public `getAccountInfo` view on the NFT wrapper.\\n    function agentCount(uint256 accountId) external view returns (uint256) {\\n        return _registeredAgents[accountId].length;\\n    }\\n\\n    /// @notice Append `agent` under `accountId`. Reverts if `agent` is\\n    ///         already registered anywhere (the reverse map is global \\u2014\\n    ///         a single agent address may pay for at most one account).\\n    ///         The cap (`maxAgentsPerAccount`) is enforced by the logic\\n    ///         contract, NOT here, because storage stays policy-free.\\n    function addAgent(uint256 accountId, address agent) external onlyContracts {\\n        if (agentToAccountId[agent] != 0) {\\n            revert AgentAlreadyRegistered(agent, agentToAccountId[agent]);\\n        }\\n        _registeredAgents[accountId].push(agent);\\n        _isRegisteredAgent[accountId][agent] = true;\\n        agentToAccountId[agent] = accountId;\\n    }\\n\\n    /// @notice Remove `agent` from `accountId`. Reverts if not registered.\\n    ///         The array is compacted via swap-and-pop; the reverse map\\n    ///         and membership index are both cleared so the\\n    ///         agent address can be re-registered later (against the\\n    ///         same or a different account).\\n    function removeAgent(uint256 accountId, address agent) external onlyContracts {\\n        if (!_isRegisteredAgent[accountId][agent]) {\\n            revert AgentNotRegistered(accountId, agent);\\n        }\\n\\n        _isRegisteredAgent[accountId][agent] = false;\\n        agentToAccountId[agent] = 0;\\n\\n        address[] storage agents = _registeredAgents[accountId];\\n        uint256 len = agents.length;\\n        for (uint256 i; i < len; i++) {\\n            if (agents[i] == agent) {\\n                agents[i] = agents[len - 1];\\n                agents.pop();\\n                break;\\n            }\\n        }\\n    }\\n\\n    /// @notice Bulk-clear every agent registration under `accountId`.\\n    ///         Used by the NFT wrapper's transfer hook so the new owner\\n    ///         starts with a clean agent slate (no inherited authorities\\n    ///         from the prior owner). Idempotent on accounts with no\\n    ///         registered agents.\\n    function clearAgents(uint256 accountId) external onlyContracts {\\n        address[] storage agents = _registeredAgents[accountId];\\n        uint256 len = agents.length;\\n        for (uint256 i; i < len; i++) {\\n            _isRegisteredAgent[accountId][agents[i]] = false;\\n            agentToAccountId[agents[i]] = 0;\\n        }\\n        if (len != 0) {\\n            delete _registeredAgents[accountId];\\n        }\\n    }\\n\\n    // ============================================================\\n    //                  Governance \\u2014 agent cap\\n    // ============================================================\\n\\n    /// @notice Tune the per-account agent cap. `onlyContracts` here so\\n    ///         the NFT wrapper's `setMaxAgentsPerAccount` forwarder can\\n    ///         drive the write \\u2014 the wrapper enforces the `onlyHubOwner`\\n    ///         user-facing gate. Direct PCS callers from outside the\\n    ///         Hub-registered contract set are rejected. Setting the\\n    ///         cap below an existing account's registered count does\\n    ///         NOT retroactively unregister anyone \\u2014 it only blocks\\n    ///         further `addAgent` calls until the count drops.\\n    function setMaxAgentsPerAccount(uint256 cap) external onlyContracts {\\n        uint256 old = maxAgentsPerAccount;\\n        maxAgentsPerAccount = cap;\\n        emit MaxAgentsPerAccountUpdated(old, cap);\\n    }\\n}\\n\",\"keccak256\":\"0x2d6e6b42e0cb69f31b1e517cad8c3462e41288006cff4d281c85dd8d6426b3a0\",\"license\":\"Apache-2.0\"}},\"version\":1}",
+  "bytecode": "0x60803461008c57601f6113d738819003918201601f19168301916001600160401b038311848410176100915780849260209460405283398101031261008c57516001600160a01b0381169081900361008c57801561007a57600080546001600160a01b03191691909117905560405161132f90816100a88239f35b60405163a10d827b60e01b8152600490fd5b600080fd5b634e487b7160e01b600052604160045260246000fdfe6080604052600436101561001257600080fd5b6000803560e01c8062bf381714610f6357806306fdde0314610f0d5780630f584d4314610ec3578063120f2ed614610e3657806313abae1014610dee57806314b7d2c814610da5578063365a86fc14610d7e5780633df45e5614610cd557806347bc31c714610b5957806354fd4d5014610b16578063575f689514610ac05780636f725b1c14610a4957806373de342f1461099757806377e519c41461095a57806379a5eac6146109305780638129fc1c1461084d5780639a46207d146107f6578063a635392d146107c3578063b03c1bc914610770578063b20907eb14610715578063b30d1dce14610506578063b9f192a9146104e8578063c219563f146104b6578063ce88b145146102d7578063ebe7d8fa146101f75763f2a40db81461013a57600080fd5b346101f45760203660031901126101f45760406101609160043581526001602052206001815491015490604051916001600160601b038216835264ffffffffff91828160601c166020850152828160881c166040850152828160b01c16606085015260d81c608084015261ffff80821660a0850152808260101c1660c08501528160201c1660e084015260ff8160301c16151561010084015268ffffffffffffffffff8160381c1661012084015260801c16610140820152f35b80fd5b50346101f4576020806003193601126102d35760043561021561115a565b8083526004825260408320805490845b828110610270575050610236578280f35b82526004815260408220908154918381558261025157508280f35b83528220908101905b818110610265578280f35b82815560010161025a565b6102ce90848752600686526040872061028982856112bc565b9054600391821b1c6001600160a01b039081168a5291885260408920805460ff191690556102b783866112bc565b9054911b1c168752600586528660408120556112ea565b610225565b5080fd5b50346101f45760203660031901126101f4578060409161014083516102fb816110ca565b82815282602082015282858201528260608201528260808201528260a08201528260c08201528260e082015282610100820152826101208201520152600435815260016020522061ffff600160405192610354846110ca565b80546001600160601b038116855264ffffffffff8160601c16602086015264ffffffffff8160881c16604086015264ffffffffff8160b01c16606086015260d81c6080850152015481811660a0840152818160101c1660c0840152818160201c1660e084015260ff8160301c16151561010084015268ffffffffffffffffff8160381c1661012084015264ffffffffff8160801c16610140840152161561049d576101609064ffffffffff610140604051926001600160601b03815116845282602082015116602085015282604082015116604085015282606082015116606085015282608082015116608085015261ffff60a08201511660a085015261ffff60c08201511660c085015261ffff60e08201511660e0850152610100810151151561010085015268ffffffffffffffffff61012082015116610120850152015116610140820152f35b60246040516367a763eb60e11b81526004356004820152fd5b50346101f45760203660031901126101f45761ffff600160406020936004358152828552200154161515604051908152f35b50346101f457806003193601126101f4576020600754604051908152f35b50346101f4576101803660031901126101f4576004356101603660231901126102d35761053161115a565b808252600160205261ffff90816001604085200154166106fd5782526001602052604082206024356001600160601b0381168091036106e55764ffffffffff9160443583811681036106f95760643584811681036106e9576084359085821682036106f55760a4359486861686036106f15760019564ffffffffff60d81b9060d81b169364ffffffffff60601b9060601b16179064ffffffffff60881b9060881b16179064ffffffffff60b01b9060b01b1617178155019160c4358181168091036106ed5783549060e43583811681036106e95763ffff00009060101b169163ffffffff1916171783556101043590811681036106e557825465ffff00000000191660209190911b65ffff00000000161782556101243580151581036106e557825466ff000000000000191690151560301b60ff60301b161782556101443568ffffffffffffffffff811681036106e55782546fffffffffffffffffff00000000000000191660389190911b68ffffffffffffffffff60381b161782556101643590811681036106e157815464ffffffffff60801b191660809190911b64ffffffffff60801b1617905580f35b80f35b8280fd5b8380fd5b8680fd5b8480fd5b8880fd5b8780fd5b8580fd5b60249060405190638be1f3fb60e01b82526004820152fd5b50346101f45760403660031901126101f45760243561ffff811681036102d3576106de9061074161115a565b60043583526001602052600160408420019065ffff0000000082549160201b169065ffff000000001916179055565b50346101f45760203660031901126101f45761078a61115a565b600435815260036020526040812080546001600160601b0381166107ac578280f35b6bffffffffffffffffffffffff1916905538808280f35b50346101f45760203660031901126101f4576001600160601b036040602092600435815260038452205416604051908152f35b50346101f45760403660031901126101f45760243580151581036102d3576106de9061082061115a565b60043583526001602052600160408420019060ff60301b825491151560301b169060ff60301b1916179055565b50346101f457806003193601126101f45780546001600160a01b03908116338114159190826108c1575b505061089057600754156108885780f35b606460075580f35b60405163f0b1bddb60e01b815260206004820152600860248201526727b7363c90243ab160c11b6044820152606490fd5b604051638da5cb5b60e01b8152919250602090829060049082905afa9081156109255783916108f7575b50163314153880610877565b610918915060203d811161091e575b6109108183611119565b81019061113b565b386108eb565b503d610906565b6040513d85823e3d90fd5b50346101f45760203660031901126101f45760406020916004358152600483522054604051908152f35b50346101f45760203660031901126101f4576004356001600160a01b038116908190036102d3578160409160209352600583522054604051908152f35b50346101f4576020806003193601126102d3576004358252600481526040822060405192838383549182815201908193835284832090835b818110610a2c57505050846109e5910385611119565b60405193838594850191818652518092526040850193925b828110610a0c57505050500390f35b83516001600160a01b0316855286955093810193928101926001016109fd565b82546001600160a01b0316845292860192600192830192016109cf565b50346101f45760603660031901126101f457610a636110a0565b6044356001600160601b039182821682036106e557610a8061115a565b6004358452600260205264ffffffffff60408520911684526020526040832091610aae83549282841661128b565b16906001600160601b03191617905580f35b50346101f45760203660031901126101f4577f851890a54b43f9bc04a1d91212b8e2737661c1d0ed17b1b2b4e362904f56a3816040600435610b0061115a565b600754908060075582519182526020820152a180f35b50346101f457806003193601126101f457610b55604051610b36816110fd565b600681526531302e302e3360d01b602082015260405191829182611057565b0390f35b50346101f45760403660031901126101f457600435610b7661103c565b610b7e61115a565b818352602060068152604084209260018060a01b0380931693848652825260ff60408620541615610cb75790816004928652600682526040862085875282526040862060ff1981541690556005825285604081205585525260408320805492845b848110610bea578580f35b8382610bf683866112bc565b929054600393841b1c1614610c145750610c0f906112ea565b610bdf565b949293926000199250828101908111610ca35790610c4784610c39610c6694886112bc565b905490891b1c1691866112bc565b90919082549060031b9160018060a01b03809116831b921b1916179055565b82548015610c8f570192610c7a84846112bc565b81939154921b1b191690555538808080808580f35b634e487b7160e01b86526031600452602486fd5b634e487b7160e01b87526011600452602487fd5b604490846040519163398b319d60e11b835260048301526024820152fd5b50346101f45760603660031901126101f45760243568ffffffffffffffffff811681036102d35760443564ffffffffff811681036106e1576106de91610d1961115a565b60043584526001602052610d596001604086200191829068ffffffffffffffffff60381b82549160381b169068ffffffffffffffffff60381b1916179055565b805464ffffffffff60801b191660809290921b64ffffffffff60801b16919091179055565b50346101f457806003193601126101f457546040516001600160a01b039091168152602090f35b50346101f45760403660031901126101f45760ff6040602092610dc661103c565b6004358252600685528282206001600160a01b03909116825284522054604051911615158152f35b50346101f45760403660031901126101f457610e086110b4565b610e1061115a565b600435825260036020526040822090815490610aae6001600160601b039182841661128b565b50346101f45760403660031901126101f457600435610e536110b4565b610e5b61115a565b81835260036020526001600160601b03908160408520541692828216848111610e9f575084526003602052604084209203166001600160601b031982541617905580f35b90846064926040519263074d79eb60e41b8452600484015260248301526044820152fd5b50346101f45760403660031901126101f4576001600160601b036040602092610eea6110a0565b60043582526002855264ffffffffff838320911682528452205416604051908152f35b50346101f457806003193601126101f457610b55604051610f2d816110fd565b601b81527f5075626c697368696e67436f6e76696374696f6e53746f726167650000000000602082015260405191829182611057565b50346101f45760403660031901126101f457600435610f8061103c565b610f8861115a565b6001600160a01b038116808452600560205260408420549091908061101e57508284526004602052604084208054906801000000000000000082101561100a5781610c47916001610fdc95940181556112bc565b81835260066020526040832090835260205260408220600160ff198254161790556005602052604082205580f35b634e487b7160e01b86526041600452602486fd5b82604491604051916358b49d9d60e11b835260048301526024820152fd5b602435906001600160a01b038216820361105257565b600080fd5b6020808252825181830181905290939260005b82811061108c57505060409293506000838284010152601f8019910116010190565b81810186015184820160400152850161106a565b6024359064ffffffffff8216820361105257565b602435906001600160601b038216820361105257565b610160810190811067ffffffffffffffff8211176110e757604052565b634e487b7160e01b600052604160045260246000fd5b6040810190811067ffffffffffffffff8211176110e757604052565b90601f8019910116810190811067ffffffffffffffff8211176110e757604052565b9081602091031261105257516001600160a01b03811681036110525790565b60008054604051631627905560e01b81523360048201526020926001600160a01b0392831692918481602481875afa908115611280579085918391611248575b501593846111eb575b505050506111ae5750565b6064906040519063f0b1bddb60e01b82526004820152601560248201527427b7363c9021b7b73a3930b1ba399034b710243ab160591b6044820152fd5b60049293945060405192838092638da5cb5b60e01b82525afa91821561123c579161121f575b5016331415388083816111a3565b6112369150833d851161091e576109108183611119565b38611211565b604051903d90823e3d90fd5b82819392503d8311611279575b61125f8183611119565b810103126102d3575180151581036102d35784903861119a565b503d611255565b6040513d84823e3d90fd5b9190916001600160601b03808094169116019182116112a657565b634e487b7160e01b600052601160045260246000fd5b80548210156112d45760005260206000200190600090565b634e487b7160e01b600052603260045260246000fd5b60001981146112a6576001019056fea264697066735822122094bb371a0d89da4516cbc145fe99fc899e75c8345aac9724e1911183c1cd4f6b64736f6c63430008140033",
+  "deployedBytecode": "0x6080604052600436101561001257600080fd5b6000803560e01c8062bf381714610f6357806306fdde0314610f0d5780630f584d4314610ec3578063120f2ed614610e3657806313abae1014610dee57806314b7d2c814610da5578063365a86fc14610d7e5780633df45e5614610cd557806347bc31c714610b5957806354fd4d5014610b16578063575f689514610ac05780636f725b1c14610a4957806373de342f1461099757806377e519c41461095a57806379a5eac6146109305780638129fc1c1461084d5780639a46207d146107f6578063a635392d146107c3578063b03c1bc914610770578063b20907eb14610715578063b30d1dce14610506578063b9f192a9146104e8578063c219563f146104b6578063ce88b145146102d7578063ebe7d8fa146101f75763f2a40db81461013a57600080fd5b346101f45760203660031901126101f45760406101609160043581526001602052206001815491015490604051916001600160601b038216835264ffffffffff91828160601c166020850152828160881c166040850152828160b01c16606085015260d81c608084015261ffff80821660a0850152808260101c1660c08501528160201c1660e084015260ff8160301c16151561010084015268ffffffffffffffffff8160381c1661012084015260801c16610140820152f35b80fd5b50346101f4576020806003193601126102d35760043561021561115a565b8083526004825260408320805490845b828110610270575050610236578280f35b82526004815260408220908154918381558261025157508280f35b83528220908101905b818110610265578280f35b82815560010161025a565b6102ce90848752600686526040872061028982856112bc565b9054600391821b1c6001600160a01b039081168a5291885260408920805460ff191690556102b783866112bc565b9054911b1c168752600586528660408120556112ea565b610225565b5080fd5b50346101f45760203660031901126101f4578060409161014083516102fb816110ca565b82815282602082015282858201528260608201528260808201528260a08201528260c08201528260e082015282610100820152826101208201520152600435815260016020522061ffff600160405192610354846110ca565b80546001600160601b038116855264ffffffffff8160601c16602086015264ffffffffff8160881c16604086015264ffffffffff8160b01c16606086015260d81c6080850152015481811660a0840152818160101c1660c0840152818160201c1660e084015260ff8160301c16151561010084015268ffffffffffffffffff8160381c1661012084015264ffffffffff8160801c16610140840152161561049d576101609064ffffffffff610140604051926001600160601b03815116845282602082015116602085015282604082015116604085015282606082015116606085015282608082015116608085015261ffff60a08201511660a085015261ffff60c08201511660c085015261ffff60e08201511660e0850152610100810151151561010085015268ffffffffffffffffff61012082015116610120850152015116610140820152f35b60246040516367a763eb60e11b81526004356004820152fd5b50346101f45760203660031901126101f45761ffff600160406020936004358152828552200154161515604051908152f35b50346101f457806003193601126101f4576020600754604051908152f35b50346101f4576101803660031901126101f4576004356101603660231901126102d35761053161115a565b808252600160205261ffff90816001604085200154166106fd5782526001602052604082206024356001600160601b0381168091036106e55764ffffffffff9160443583811681036106f95760643584811681036106e9576084359085821682036106f55760a4359486861686036106f15760019564ffffffffff60d81b9060d81b169364ffffffffff60601b9060601b16179064ffffffffff60881b9060881b16179064ffffffffff60b01b9060b01b1617178155019160c4358181168091036106ed5783549060e43583811681036106e95763ffff00009060101b169163ffffffff1916171783556101043590811681036106e557825465ffff00000000191660209190911b65ffff00000000161782556101243580151581036106e557825466ff000000000000191690151560301b60ff60301b161782556101443568ffffffffffffffffff811681036106e55782546fffffffffffffffffff00000000000000191660389190911b68ffffffffffffffffff60381b161782556101643590811681036106e157815464ffffffffff60801b191660809190911b64ffffffffff60801b1617905580f35b80f35b8280fd5b8380fd5b8680fd5b8480fd5b8880fd5b8780fd5b8580fd5b60249060405190638be1f3fb60e01b82526004820152fd5b50346101f45760403660031901126101f45760243561ffff811681036102d3576106de9061074161115a565b60043583526001602052600160408420019065ffff0000000082549160201b169065ffff000000001916179055565b50346101f45760203660031901126101f45761078a61115a565b600435815260036020526040812080546001600160601b0381166107ac578280f35b6bffffffffffffffffffffffff1916905538808280f35b50346101f45760203660031901126101f4576001600160601b036040602092600435815260038452205416604051908152f35b50346101f45760403660031901126101f45760243580151581036102d3576106de9061082061115a565b60043583526001602052600160408420019060ff60301b825491151560301b169060ff60301b1916179055565b50346101f457806003193601126101f45780546001600160a01b03908116338114159190826108c1575b505061089057600754156108885780f35b606460075580f35b60405163f0b1bddb60e01b815260206004820152600860248201526727b7363c90243ab160c11b6044820152606490fd5b604051638da5cb5b60e01b8152919250602090829060049082905afa9081156109255783916108f7575b50163314153880610877565b610918915060203d811161091e575b6109108183611119565b81019061113b565b386108eb565b503d610906565b6040513d85823e3d90fd5b50346101f45760203660031901126101f45760406020916004358152600483522054604051908152f35b50346101f45760203660031901126101f4576004356001600160a01b038116908190036102d3578160409160209352600583522054604051908152f35b50346101f4576020806003193601126102d3576004358252600481526040822060405192838383549182815201908193835284832090835b818110610a2c57505050846109e5910385611119565b60405193838594850191818652518092526040850193925b828110610a0c57505050500390f35b83516001600160a01b0316855286955093810193928101926001016109fd565b82546001600160a01b0316845292860192600192830192016109cf565b50346101f45760603660031901126101f457610a636110a0565b6044356001600160601b039182821682036106e557610a8061115a565b6004358452600260205264ffffffffff60408520911684526020526040832091610aae83549282841661128b565b16906001600160601b03191617905580f35b50346101f45760203660031901126101f4577f851890a54b43f9bc04a1d91212b8e2737661c1d0ed17b1b2b4e362904f56a3816040600435610b0061115a565b600754908060075582519182526020820152a180f35b50346101f457806003193601126101f457610b55604051610b36816110fd565b600681526531302e302e3360d01b602082015260405191829182611057565b0390f35b50346101f45760403660031901126101f457600435610b7661103c565b610b7e61115a565b818352602060068152604084209260018060a01b0380931693848652825260ff60408620541615610cb75790816004928652600682526040862085875282526040862060ff1981541690556005825285604081205585525260408320805492845b848110610bea578580f35b8382610bf683866112bc565b929054600393841b1c1614610c145750610c0f906112ea565b610bdf565b949293926000199250828101908111610ca35790610c4784610c39610c6694886112bc565b905490891b1c1691866112bc565b90919082549060031b9160018060a01b03809116831b921b1916179055565b82548015610c8f570192610c7a84846112bc565b81939154921b1b191690555538808080808580f35b634e487b7160e01b86526031600452602486fd5b634e487b7160e01b87526011600452602487fd5b604490846040519163398b319d60e11b835260048301526024820152fd5b50346101f45760603660031901126101f45760243568ffffffffffffffffff811681036102d35760443564ffffffffff811681036106e1576106de91610d1961115a565b60043584526001602052610d596001604086200191829068ffffffffffffffffff60381b82549160381b169068ffffffffffffffffff60381b1916179055565b805464ffffffffff60801b191660809290921b64ffffffffff60801b16919091179055565b50346101f457806003193601126101f457546040516001600160a01b039091168152602090f35b50346101f45760403660031901126101f45760ff6040602092610dc661103c565b6004358252600685528282206001600160a01b03909116825284522054604051911615158152f35b50346101f45760403660031901126101f457610e086110b4565b610e1061115a565b600435825260036020526040822090815490610aae6001600160601b039182841661128b565b50346101f45760403660031901126101f457600435610e536110b4565b610e5b61115a565b81835260036020526001600160601b03908160408520541692828216848111610e9f575084526003602052604084209203166001600160601b031982541617905580f35b90846064926040519263074d79eb60e41b8452600484015260248301526044820152fd5b50346101f45760403660031901126101f4576001600160601b036040602092610eea6110a0565b60043582526002855264ffffffffff838320911682528452205416604051908152f35b50346101f457806003193601126101f457610b55604051610f2d816110fd565b601b81527f5075626c697368696e67436f6e76696374696f6e53746f726167650000000000602082015260405191829182611057565b50346101f45760403660031901126101f457600435610f8061103c565b610f8861115a565b6001600160a01b038116808452600560205260408420549091908061101e57508284526004602052604084208054906801000000000000000082101561100a5781610c47916001610fdc95940181556112bc565b81835260066020526040832090835260205260408220600160ff198254161790556005602052604082205580f35b634e487b7160e01b86526041600452602486fd5b82604491604051916358b49d9d60e11b835260048301526024820152fd5b602435906001600160a01b038216820361105257565b600080fd5b6020808252825181830181905290939260005b82811061108c57505060409293506000838284010152601f8019910116010190565b81810186015184820160400152850161106a565b6024359064ffffffffff8216820361105257565b602435906001600160601b038216820361105257565b610160810190811067ffffffffffffffff8211176110e757604052565b634e487b7160e01b600052604160045260246000fd5b6040810190811067ffffffffffffffff8211176110e757604052565b90601f8019910116810190811067ffffffffffffffff8211176110e757604052565b9081602091031261105257516001600160a01b03811681036110525790565b60008054604051631627905560e01b81523360048201526020926001600160a01b0392831692918481602481875afa908115611280579085918391611248575b501593846111eb575b505050506111ae5750565b6064906040519063f0b1bddb60e01b82526004820152601560248201527427b7363c9021b7b73a3930b1ba399034b710243ab160591b6044820152fd5b60049293945060405192838092638da5cb5b60e01b82525afa91821561123c579161121f575b5016331415388083816111a3565b6112369150833d851161091e576109108183611119565b38611211565b604051903d90823e3d90fd5b82819392503d8311611279575b61125f8183611119565b810103126102d3575180151581036102d35784903861119a565b503d611255565b6040513d84823e3d90fd5b9190916001600160601b03808094169116019182116112a657565b634e487b7160e01b600052601160045260246000fd5b80548210156112d45760005260206000200190600090565b634e487b7160e01b600052603260045260246000fd5b60001981146112a6576001019056fea264697066735822122094bb371a0d89da4516cbc145fe99fc899e75c8345aac9724e1911183c1cd4f6b64736f6c63430008140033",
+  "devdoc": {
+    "kind": "dev",
+    "methods": {
+      "initialize()": {
+        "details": "`initialize()` is idempotent across redeploys: the first call      seeds `maxAgentsPerAccount` to the default; subsequent calls      (e.g. post-upgrade) preserve whatever value the HubOwner has      tuned it to."
+      }
+    },
+    "title": "PublishingConvictionStorage",
+    "version": 1
+  },
+  "userdoc": {
+    "events": {
+      "MaxAgentsPerAccountUpdated(uint256,uint256)": {
+        "notice": "Emitted when the governance-tunable agent cap changes."
+      }
+    },
+    "kind": "user",
+    "methods": {
+      "accountExists(uint256)": {
+        "notice": "Existence check used by callers that only need to know         whether an account record is populated (e.g. the public         `settle()` short-circuit). Returns `false` for any         accountId that has never been minted."
+      },
+      "addAgent(uint256,address)": {
+        "notice": "Append `agent` under `accountId`. Reverts if `agent` is         already registered anywhere (the reverse map is global —         a single agent address may pay for at most one account).         The cap (`maxAgentsPerAccount`) is enforced by the logic         contract, NOT here, because storage stays policy-free."
+      },
+      "agentCount(uint256)": {
+        "notice": "Number of agents registered under `accountId`. Useful for         the public `getAccountInfo` view on the NFT wrapper."
+      },
+      "agentToAccountId(address)": {
+        "notice": "Reverse map exposed publicly so external callers         (`KnowledgeAssetsV10`, `ContextGraphs`) can resolve a         publishing-agent address to its paying account id without         caller-supplied authorization. The \"not registered\"         sentinel is `0`, which is why `_nextAccountId` on the NFT         starts at 1."
+      },
+      "clearAgents(uint256)": {
+        "notice": "Bulk-clear every agent registration under `accountId`.         Used by the NFT wrapper's transfer hook so the new owner         starts with a clean agent slate (no inherited authorities         from the prior owner). Idempotent on accounts with no         registered agents."
+      },
+      "clearTopUpBalance(uint256)": {
+        "notice": "Zero the top-up buffer in a single SSTORE; used by the         post-expiry final sweep before crediting the staker pool."
+      },
+      "createAccount(uint256,(uint96,uint40,uint40,uint40,uint40,uint16,uint16,uint16,bool,uint72,uint40))": {
+        "notice": "Persist a brand-new `Account` record. Used by         `PublishingConviction.createAccount` after the NFT         wrapper has allocated `accountId` from its mint counter.         Reverts if a record at `accountId` already exists, so a         logic-side bug or replay cannot silently overwrite an         active account."
+      },
+      "decreaseTopUpBalance(uint256,uint96)": {
+        "notice": "Drain `amount` from the top-up buffer. Reverts on         underflow so callers cannot silently overdraw — this is         a defensive guard; logic-side `coverPublishingCost`         already rejects insufficient-allowance combinations         with a richer error."
+      },
+      "getAccount(uint256)": {
+        "notice": "Return the full `Account` record by id. Reverts if the         account has never been created (sentinel:         `lockDurationEpochs == 0` because every real account         carries at least one billing window)."
+      },
+      "getRegisteredAgents(uint256)": {
+        "notice": "Read the registered-agent array for an account. Returns         an empty array for unknown accounts so callers can         iterate safely on accounts that never registered an agent."
+      },
+      "increaseTopUpBalance(uint256,uint96)": {
+        "notice": "Add to the persistent top-up buffer (publisher pays in         to extend allowance beyond the base budget)."
+      },
+      "increaseWindowSpent(uint256,uint40,uint96)": {
+        "notice": "Add `amount` to `windowSpent[accountId][w]`. Logic-side         callers are responsible for never exceeding the per-window         base allowance (`committedTRAC / lockDurationEpochs`); the         storage contract just records."
+      },
+      "isRegisteredAgent(uint256,address)": {
+        "notice": "O(1) membership check used by `coverPublishingCost` and         `deregisterAgent` to validate (accountId, agent) pairs         without scanning the array."
+      },
+      "maxAgentsPerAccount()": {
+        "notice": "Governance-tunable cap on `_registeredAgents[accountId].length`.         Initialized to `_DEFAULT_MAX_AGENTS_PER_ACCOUNT` on the         first `initialize()`; a HubOwner can retune via         `setMaxAgentsPerAccount`."
+      },
+      "removeAgent(uint256,address)": {
+        "notice": "Remove `agent` from `accountId`. Reverts if not registered.         The array is compacted via swap-and-pop; the reverse map         and membership index are both cleared so the         agent address can be re-registered later (against the         same or a different account)."
+      },
+      "setFullySwept(uint256,bool)": {
+        "notice": "Mark the account as fully swept. Called once by the         post-expiry final-sweep path; subsequent settle calls         observe `fullySwept == true` and short-circuit."
+      },
+      "setLastSettledWindow(uint256,uint16)": {
+        "notice": "Advance the lazy-settlement cursor. Caller (logic) is         responsible for never moving it past `lockDurationEpochs`."
+      },
+      "setMaxAgentsPerAccount(uint256)": {
+        "notice": "Tune the per-account agent cap. `onlyContracts` here so         the NFT wrapper's `setMaxAgentsPerAccount` forwarder can         drive the write — the wrapper enforces the `onlyHubOwner`         user-facing gate. Direct PCS callers from outside the         Hub-registered contract set are rejected. Setting the         cap below an existing account's registered count does         NOT retroactively unregister anyone — it only blocks         further `addAgent` calls until the count drops."
+      },
+      "setPrimaryNodeData(uint256,uint72,uint40)": {
+        "notice": "OT-RFC-51: persist the designated `primaryNode` and the         `lastPrimaryNodeChangeEpoch` rate-limit cursor. Logic-side         (`PublishingConviction.setPrimaryNode`) is responsible for         the once-per-epoch gate and for `nodeExists` validation;         storage just records."
+      },
+      "topUpBalance(uint256)": {
+        "notice": "Persistent top-up buffer per account (NOT per-window).         Drained only when the current window's base allowance is         exhausted. Any non-zero balance at account expiry is swept         to the staker pool by the final-sweep path."
+      },
+      "windowSpent(uint256,uint40)": {
+        "notice": "Per-billing-window TRAC drawn against the current         account's base allowance. Second key is the billing-window         index (0-based, relative to `Account.createdAtTimestamp`);         it is NOT a chain-epoch number. The base allowance per         window is `committedTRAC / lockDurationEpochs`; a window's         entry is bounded by that value."
+      }
+    },
+    "notice": "Single source of truth for V10 publisher conviction account state. Architecture (mirrors the V10 staking split — `ConvictionStakingStorage` holds positions, `StakingV10` is stateless logic, `DKGStakingConvictionNFT` is a thin ERC-721 wrapper):   - `PublishingConvictionStorage` (this contract) owns every byte of     application state for publisher conviction accounts: the `Account`     struct keyed by `accountId`, per-billing-window TRAC accounting     (`windowSpent`), the persistent top-up buffer (`topUpBalance`), the     agent registration tables, and the governance-tunable     `maxAgentsPerAccount` cap.     This is a fresh-state contract: it ships EMPTY at deploy time     and there is NO automated migration path that copies state out     of the legacy combined `DKGPublishingConvictionNFT` v2.x. PCA     accounts opened against the v2.x contract are NOT readable here     after the upgrade. This is intentional and matches how the V10     line has handled prior storage-split redeploys     (`ProfileStorage`, `ParametersStorage`): network operators bump     `chainResetMarker` in the network config so daemons auto-wipe     their derived chain state on next start, the on-chain Hub     re-points consumers (`KnowledgeAssetsV10`, `ContextGraphs`) at     this contract, and the publisher fleet re-creates conviction     accounts under the new wrapper. PR #650 ships the     `chainResetMarker` bump alongside this storage contract; do     NOT deploy the new PCA stack against a network without the     accompanying marker bump. See `network/testnet.json` and the     PR body's \"Migration / fresh-state reset\" section.   - `PublishingConviction` (the new logic contract) holds zero     application state — only Hub-resolved contract references and     metadata. It reads/writes here via `onlyContracts`-gated mutators     and runs every business rule (account creation, billing-window     settlement, lazy passive-sink sweeps, post-expiry final sweep, and     active-sink epoch distribution).   - `DKGPublishingConvictionNFT` keeps only the ERC-721 surface     (mint/burn, transfer hook, ownership checks), the     `_nextAccountId` mint counter, and the publisher-facing TRAC     `transferFrom` paths. Every state read/write goes through this     storage contract. Storage independence (the architectural goal):   - The logic contract can be redeployed without touching account or     agent state — Hub re-registers the new logic address, the storage     keeps every existing `accounts[id]`, `topUpBalance[id]`,     `windowSpent[id][w]`, and agent registration intact.   - The NFT wrapper can also be redeployed (e.g. ERC-721 metadata     surface change), at the cost of resetting `_nextAccountId` —     existing accounts keep their state but new mints would clash if     the counter resets, so this is an upgrade path that requires care. State boundaries (what does NOT live here):   - `_nextAccountId` — stays on the NFT wrapper because it is tightly     coupled to ERC-721 mint ordering; the wrapper increments and     supplies the new id to the logic contract on each `createAccount`     forward (mirrors `DKGStakingConvictionNFT.nextTokenId`).   - TRAC vault custody — TRAC sits in `ConvictionStakingStorage`     (the V10 vault, post-v4.0.0 consolidation). This storage contract     never holds TRAC and never moves it. The NFT wrapper drives     `transferFrom(publisher → CSS)` directly on `createAccount` /     `topUp`; this storage only updates the bookkeeping that controls     how that escrowed TRAC eventually flows to staker pools via     `EpochStorage.addTokensToEpochRange`. Caller gates:   - Mutating functions are `onlyContracts` — only Hub-registered     contracts (in practice `PublishingConviction`, with the NFT     wrapper as a fallback for direct-write paths if ever needed) can     invoke them.   - `setMaxAgentsPerAccount` is `onlyHubOwner` because it is a     governance-side parameter (mirrors `setStatus` / parameter     setters on other V10 storage contracts). Invariants enforced inside this contract:   - `agentToAccountId[agent] == accountId` iff     `_isRegisteredAgent[accountId][agent] == true`. Agent register /     deregister / clear-all paths flip both flags atomically so the     two views never drift.   - `_registeredAgents[accountId]` always equals the set of `agent`s     for which `_isRegisteredAgent[accountId][agent] == true`. The     swap-and-pop in `removeAgent` keeps the array in sync.",
+    "version": 1
+  },
+  "storageLayout": {
+    "storage": [
+      {
+        "astId": 27334,
+        "contract": "contracts/storage/PublishingConvictionStorage.sol:PublishingConvictionStorage",
+        "label": "hub",
+        "offset": 0,
+        "slot": "0",
+        "type": "t_contract(Hub)46218"
+      },
+      {
+        "astId": 48496,
+        "contract": "contracts/storage/PublishingConvictionStorage.sol:PublishingConvictionStorage",
+        "label": "accounts",
+        "offset": 0,
+        "slot": "1",
+        "type": "t_mapping(t_uint256,t_struct(Account)48456_storage)"
+      },
+      {
+        "astId": 48503,
+        "contract": "contracts/storage/PublishingConvictionStorage.sol:PublishingConvictionStorage",
+        "label": "windowSpent",
+        "offset": 0,
+        "slot": "2",
+        "type": "t_mapping(t_uint256,t_mapping(t_uint40,t_uint96))"
+      },
+      {
+        "astId": 48508,
+        "contract": "contracts/storage/PublishingConvictionStorage.sol:PublishingConvictionStorage",
+        "label": "topUpBalance",
+        "offset": 0,
+        "slot": "3",
+        "type": "t_mapping(t_uint256,t_uint96)"
+      },
+      {
+        "astId": 48514,
+        "contract": "contracts/storage/PublishingConvictionStorage.sol:PublishingConvictionStorage",
+        "label": "_registeredAgents",
+        "offset": 0,
+        "slot": "4",
+        "type": "t_mapping(t_uint256,t_array(t_address)dyn_storage)"
+      },
+      {
+        "astId": 48519,
+        "contract": "contracts/storage/PublishingConvictionStorage.sol:PublishingConvictionStorage",
+        "label": "agentToAccountId",
+        "offset": 0,
+        "slot": "5",
+        "type": "t_mapping(t_address,t_uint256)"
+      },
+      {
+        "astId": 48526,
+        "contract": "contracts/storage/PublishingConvictionStorage.sol:PublishingConvictionStorage",
+        "label": "_isRegisteredAgent",
+        "offset": 0,
+        "slot": "6",
+        "type": "t_mapping(t_uint256,t_mapping(t_address,t_bool))"
+      },
+      {
+        "astId": 48529,
+        "contract": "contracts/storage/PublishingConvictionStorage.sol:PublishingConvictionStorage",
+        "label": "maxAgentsPerAccount",
+        "offset": 0,
+        "slot": "7",
+        "type": "t_uint256"
+      }
+    ],
+    "types": {
+      "t_address": {
+        "encoding": "inplace",
+        "label": "address",
+        "numberOfBytes": "20"
+      },
+      "t_array(t_address)dyn_storage": {
+        "base": "t_address",
+        "encoding": "dynamic_array",
+        "label": "address[]",
+        "numberOfBytes": "32"
+      },
+      "t_bool": {
+        "encoding": "inplace",
+        "label": "bool",
+        "numberOfBytes": "1"
+      },
+      "t_contract(Hub)46218": {
+        "encoding": "inplace",
+        "label": "contract Hub",
+        "numberOfBytes": "20"
+      },
+      "t_mapping(t_address,t_bool)": {
+        "encoding": "mapping",
+        "key": "t_address",
+        "label": "mapping(address => bool)",
+        "numberOfBytes": "32",
+        "value": "t_bool"
+      },
+      "t_mapping(t_address,t_uint256)": {
+        "encoding": "mapping",
+        "key": "t_address",
+        "label": "mapping(address => uint256)",
+        "numberOfBytes": "32",
+        "value": "t_uint256"
+      },
+      "t_mapping(t_uint256,t_array(t_address)dyn_storage)": {
+        "encoding": "mapping",
+        "key": "t_uint256",
+        "label": "mapping(uint256 => address[])",
+        "numberOfBytes": "32",
+        "value": "t_array(t_address)dyn_storage"
+      },
+      "t_mapping(t_uint256,t_mapping(t_address,t_bool))": {
+        "encoding": "mapping",
+        "key": "t_uint256",
+        "label": "mapping(uint256 => mapping(address => bool))",
+        "numberOfBytes": "32",
+        "value": "t_mapping(t_address,t_bool)"
+      },
+      "t_mapping(t_uint256,t_mapping(t_uint40,t_uint96))": {
+        "encoding": "mapping",
+        "key": "t_uint256",
+        "label": "mapping(uint256 => mapping(uint40 => uint96))",
+        "numberOfBytes": "32",
+        "value": "t_mapping(t_uint40,t_uint96)"
+      },
+      "t_mapping(t_uint256,t_struct(Account)48456_storage)": {
+        "encoding": "mapping",
+        "key": "t_uint256",
+        "label": "mapping(uint256 => struct PublishingConvictionStorage.Account)",
+        "numberOfBytes": "32",
+        "value": "t_struct(Account)48456_storage"
+      },
+      "t_mapping(t_uint256,t_uint96)": {
+        "encoding": "mapping",
+        "key": "t_uint256",
+        "label": "mapping(uint256 => uint96)",
+        "numberOfBytes": "32",
+        "value": "t_uint96"
+      },
+      "t_mapping(t_uint40,t_uint96)": {
+        "encoding": "mapping",
+        "key": "t_uint40",
+        "label": "mapping(uint40 => uint96)",
+        "numberOfBytes": "32",
+        "value": "t_uint96"
+      },
+      "t_struct(Account)48456_storage": {
+        "encoding": "inplace",
+        "label": "struct PublishingConvictionStorage.Account",
+        "members": [
+          {
+            "astId": 48435,
+            "contract": "contracts/storage/PublishingConvictionStorage.sol:PublishingConvictionStorage",
+            "label": "committedTRAC",
+            "offset": 0,
+            "slot": "0",
+            "type": "t_uint96"
+          },
+          {
+            "astId": 48437,
+            "contract": "contracts/storage/PublishingConvictionStorage.sol:PublishingConvictionStorage",
+            "label": "createdAtEpoch",
+            "offset": 12,
+            "slot": "0",
+            "type": "t_uint40"
+          },
+          {
+            "astId": 48439,
+            "contract": "contracts/storage/PublishingConvictionStorage.sol:PublishingConvictionStorage",
+            "label": "expiresAtEpoch",
+            "offset": 17,
+            "slot": "0",
+            "type": "t_uint40"
+          },
+          {
+            "astId": 48441,
+            "contract": "contracts/storage/PublishingConvictionStorage.sol:PublishingConvictionStorage",
+            "label": "createdAtTimestamp",
+            "offset": 22,
+            "slot": "0",
+            "type": "t_uint40"
+          },
+          {
+            "astId": 48443,
+            "contract": "contracts/storage/PublishingConvictionStorage.sol:PublishingConvictionStorage",
+            "label": "expiresAtTimestamp",
+            "offset": 27,
+            "slot": "0",
+            "type": "t_uint40"
+          },
+          {
+            "astId": 48445,
+            "contract": "contracts/storage/PublishingConvictionStorage.sol:PublishingConvictionStorage",
+            "label": "lockDurationEpochs",
+            "offset": 0,
+            "slot": "1",
+            "type": "t_uint16"
+          },
+          {
+            "astId": 48447,
+            "contract": "contracts/storage/PublishingConvictionStorage.sol:PublishingConvictionStorage",
+            "label": "discountBps",
+            "offset": 2,
+            "slot": "1",
+            "type": "t_uint16"
+          },
+          {
+            "astId": 48449,
+            "contract": "contracts/storage/PublishingConvictionStorage.sol:PublishingConvictionStorage",
+            "label": "lastSettledWindow",
+            "offset": 4,
+            "slot": "1",
+            "type": "t_uint16"
+          },
+          {
+            "astId": 48451,
+            "contract": "contracts/storage/PublishingConvictionStorage.sol:PublishingConvictionStorage",
+            "label": "fullySwept",
+            "offset": 6,
+            "slot": "1",
+            "type": "t_bool"
+          },
+          {
+            "astId": 48453,
+            "contract": "contracts/storage/PublishingConvictionStorage.sol:PublishingConvictionStorage",
+            "label": "primaryNode",
+            "offset": 7,
+            "slot": "1",
+            "type": "t_uint72"
+          },
+          {
+            "astId": 48455,
+            "contract": "contracts/storage/PublishingConvictionStorage.sol:PublishingConvictionStorage",
+            "label": "lastPrimaryNodeChangeEpoch",
+            "offset": 16,
+            "slot": "1",
+            "type": "t_uint40"
+          }
+        ],
+        "numberOfBytes": "64"
+      },
+      "t_uint16": {
+        "encoding": "inplace",
+        "label": "uint16",
+        "numberOfBytes": "2"
+      },
+      "t_uint256": {
+        "encoding": "inplace",
+        "label": "uint256",
+        "numberOfBytes": "32"
+      },
+      "t_uint40": {
+        "encoding": "inplace",
+        "label": "uint40",
+        "numberOfBytes": "5"
+      },
+      "t_uint72": {
+        "encoding": "inplace",
+        "label": "uint72",
+        "numberOfBytes": "9"
+      },
+      "t_uint96": {
+        "encoding": "inplace",
+        "label": "uint96",
+        "numberOfBytes": "12"
+      }
+    }
+  }
+}

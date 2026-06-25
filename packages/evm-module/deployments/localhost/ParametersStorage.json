@@ -1,0 +1,767 @@
+{
+  "address": "0xe70f935c32dA4dB13e7876795f1e175465e6458e",
+  "abi": [
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "hubAddress",
+          "type": "address"
+        },
+        {
+          "internalType": "uint256",
+          "name": "_v81ReleaseEpoch",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "constructor"
+    },
+    {
+      "inputs": [],
+      "name": "ZeroAddressHub",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "ZeroShardingTableSizeLimit",
+      "type": "error"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": false,
+          "internalType": "string",
+          "name": "parameterName",
+          "type": "string"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "parameterValue",
+          "type": "uint256"
+        }
+      ],
+      "name": "ParameterChanged",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "treasury",
+          "type": "address"
+        }
+      ],
+      "name": "ProtocolTreasurySet",
+      "type": "event"
+    },
+    {
+      "inputs": [],
+      "name": "MAX_PROTOCOL_TREASURY_FEE",
+      "outputs": [
+        {
+          "internalType": "uint16",
+          "name": "",
+          "type": "uint16"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "MAX_PUBLISHING_CONVICTION_EPOCHS",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "askLowerBoundFactor",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "askUpperBoundFactor",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "contextGraphRegistrationDeposit",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "hub",
+      "outputs": [
+        {
+          "internalType": "contract Hub",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "maxOperatorFee",
+      "outputs": [
+        {
+          "internalType": "uint16",
+          "name": "",
+          "type": "uint16"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "maximumStake",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "minimumRequiredSignatures",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "minimumStake",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "name",
+      "outputs": [
+        {
+          "internalType": "string",
+          "name": "",
+          "type": "string"
+        }
+      ],
+      "stateMutability": "pure",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "nodeAskUpdateDelay",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "opWalletsLimitOnProfileCreation",
+      "outputs": [
+        {
+          "internalType": "uint16",
+          "name": "",
+          "type": "uint16"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "operatorFeeUpdateDelay",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "protocolTreasury",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "protocolTreasuryFee",
+      "outputs": [
+        {
+          "internalType": "uint16",
+          "name": "",
+          "type": "uint16"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "publishingConvictionEpochs",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "_askLowerBoundFactor",
+          "type": "uint256"
+        }
+      ],
+      "name": "setAskLowerBoundFactor",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "_askUpperBoundFactor",
+          "type": "uint256"
+        }
+      ],
+      "name": "setAskUpperBoundFactor",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint96",
+          "name": "amount",
+          "type": "uint96"
+        }
+      ],
+      "name": "setContextGraphRegistrationDeposit",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint16",
+          "name": "maxOperatorFee_",
+          "type": "uint16"
+        }
+      ],
+      "name": "setMaxOperatorFee",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint96",
+          "name": "newMaximumStake",
+          "type": "uint96"
+        }
+      ],
+      "name": "setMaximumStake",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "_minimumRequiredSignatures",
+          "type": "uint256"
+        }
+      ],
+      "name": "setMinimumRequiredSignatures",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint96",
+          "name": "newMinimumStake",
+          "type": "uint96"
+        }
+      ],
+      "name": "setMinimumStake",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "newNodeAskUpdateDelay",
+          "type": "uint256"
+        }
+      ],
+      "name": "setNodeAskUpdateDelay",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint16",
+          "name": "opWalletsLimitOnProfileCreation_",
+          "type": "uint16"
+        }
+      ],
+      "name": "setOpWalletsLimitOnProfileCreation",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "newOperatorFeeUpdateDelay",
+          "type": "uint256"
+        }
+      ],
+      "name": "setOperatorFeeUpdateDelay",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "protocolTreasury_",
+          "type": "address"
+        }
+      ],
+      "name": "setProtocolTreasury",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint16",
+          "name": "protocolTreasuryFee_",
+          "type": "uint16"
+        }
+      ],
+      "name": "setProtocolTreasuryFee",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "_publishingConvictionEpochs",
+          "type": "uint256"
+        }
+      ],
+      "name": "setPublishingConvictionEpochs",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint16",
+          "name": "shardingTableSizeLimit_",
+          "type": "uint16"
+        }
+      ],
+      "name": "setShardingTableSizeLimit",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "newStakeWithdrawalDelay",
+          "type": "uint256"
+        }
+      ],
+      "name": "setStakeWithdrawalDelay",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "_v81ReleaseEpoch",
+          "type": "uint256"
+        }
+      ],
+      "name": "setV81ReleaseEpoch",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "shardingTableSizeLimit",
+      "outputs": [
+        {
+          "internalType": "uint16",
+          "name": "",
+          "type": "uint16"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "stakeWithdrawalDelay",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "v81ReleaseEpoch",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "version",
+      "outputs": [
+        {
+          "internalType": "string",
+          "name": "",
+          "type": "string"
+        }
+      ],
+      "stateMutability": "pure",
+      "type": "function"
+    }
+  ],
+  "transactionHash": "0x52d0abe57c7384cde59e37baf6d34f87efa6fedc08d23746ef78a6f4fed9e109",
+  "receipt": {
+    "to": null,
+    "from": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    "contractAddress": "0xe70f935c32dA4dB13e7876795f1e175465e6458e",
+    "transactionIndex": 0,
+    "gasUsed": "1233847",
+    "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "blockHash": "0x57c8fa3c66ecd917d91aeea5257ea365ee9bceaa6d52e422515e4e745b236652",
+    "transactionHash": "0x52d0abe57c7384cde59e37baf6d34f87efa6fedc08d23746ef78a6f4fed9e109",
+    "logs": [],
+    "blockNumber": 205,
+    "cumulativeGasUsed": "1233847",
+    "status": 1,
+    "byzantium": true
+  },
+  "args": [
+    "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+    "1"
+  ],
+  "numDeployments": 1,
+  "solcInputHash": "25f7b97326fdffc4ccdb60a7767831e0",
+  "metadata": "{\"compiler\":{\"version\":\"0.8.20+commit.a1b79de6\"},\"language\":\"Solidity\",\"output\":{\"abi\":[{\"inputs\":[{\"internalType\":\"address\",\"name\":\"hubAddress\",\"type\":\"address\"},{\"internalType\":\"uint256\",\"name\":\"_v81ReleaseEpoch\",\"type\":\"uint256\"}],\"stateMutability\":\"nonpayable\",\"type\":\"constructor\"},{\"inputs\":[],\"name\":\"ZeroAddressHub\",\"type\":\"error\"},{\"inputs\":[],\"name\":\"ZeroShardingTableSizeLimit\",\"type\":\"error\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":false,\"internalType\":\"string\",\"name\":\"parameterName\",\"type\":\"string\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"parameterValue\",\"type\":\"uint256\"}],\"name\":\"ParameterChanged\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"address\",\"name\":\"treasury\",\"type\":\"address\"}],\"name\":\"ProtocolTreasurySet\",\"type\":\"event\"},{\"inputs\":[],\"name\":\"MAX_PROTOCOL_TREASURY_FEE\",\"outputs\":[{\"internalType\":\"uint16\",\"name\":\"\",\"type\":\"uint16\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"MAX_PUBLISHING_CONVICTION_EPOCHS\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"askLowerBoundFactor\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"askUpperBoundFactor\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"contextGraphRegistrationDeposit\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"hub\",\"outputs\":[{\"internalType\":\"contract Hub\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"maxOperatorFee\",\"outputs\":[{\"internalType\":\"uint16\",\"name\":\"\",\"type\":\"uint16\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"maximumStake\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"minimumRequiredSignatures\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"minimumStake\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"name\",\"outputs\":[{\"internalType\":\"string\",\"name\":\"\",\"type\":\"string\"}],\"stateMutability\":\"pure\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"nodeAskUpdateDelay\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"opWalletsLimitOnProfileCreation\",\"outputs\":[{\"internalType\":\"uint16\",\"name\":\"\",\"type\":\"uint16\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"operatorFeeUpdateDelay\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"protocolTreasury\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"protocolTreasuryFee\",\"outputs\":[{\"internalType\":\"uint16\",\"name\":\"\",\"type\":\"uint16\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"publishingConvictionEpochs\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"_askLowerBoundFactor\",\"type\":\"uint256\"}],\"name\":\"setAskLowerBoundFactor\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"_askUpperBoundFactor\",\"type\":\"uint256\"}],\"name\":\"setAskUpperBoundFactor\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint96\",\"name\":\"amount\",\"type\":\"uint96\"}],\"name\":\"setContextGraphRegistrationDeposit\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint16\",\"name\":\"maxOperatorFee_\",\"type\":\"uint16\"}],\"name\":\"setMaxOperatorFee\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint96\",\"name\":\"newMaximumStake\",\"type\":\"uint96\"}],\"name\":\"setMaximumStake\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"_minimumRequiredSignatures\",\"type\":\"uint256\"}],\"name\":\"setMinimumRequiredSignatures\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint96\",\"name\":\"newMinimumStake\",\"type\":\"uint96\"}],\"name\":\"setMinimumStake\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"newNodeAskUpdateDelay\",\"type\":\"uint256\"}],\"name\":\"setNodeAskUpdateDelay\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint16\",\"name\":\"opWalletsLimitOnProfileCreation_\",\"type\":\"uint16\"}],\"name\":\"setOpWalletsLimitOnProfileCreation\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"newOperatorFeeUpdateDelay\",\"type\":\"uint256\"}],\"name\":\"setOperatorFeeUpdateDelay\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"protocolTreasury_\",\"type\":\"address\"}],\"name\":\"setProtocolTreasury\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint16\",\"name\":\"protocolTreasuryFee_\",\"type\":\"uint16\"}],\"name\":\"setProtocolTreasuryFee\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"_publishingConvictionEpochs\",\"type\":\"uint256\"}],\"name\":\"setPublishingConvictionEpochs\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint16\",\"name\":\"shardingTableSizeLimit_\",\"type\":\"uint16\"}],\"name\":\"setShardingTableSizeLimit\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"newStakeWithdrawalDelay\",\"type\":\"uint256\"}],\"name\":\"setStakeWithdrawalDelay\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"_v81ReleaseEpoch\",\"type\":\"uint256\"}],\"name\":\"setV81ReleaseEpoch\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"shardingTableSizeLimit\",\"outputs\":[{\"internalType\":\"uint16\",\"name\":\"\",\"type\":\"uint16\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"stakeWithdrawalDelay\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"v81ReleaseEpoch\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"version\",\"outputs\":[{\"internalType\":\"string\",\"name\":\"\",\"type\":\"string\"}],\"stateMutability\":\"pure\",\"type\":\"function\"}],\"devdoc\":{\"kind\":\"dev\",\"methods\":{},\"version\":1},\"userdoc\":{\"events\":{\"ProtocolTreasurySet(address)\":{\"notice\":\"Emitted when the protocol treasury recipient changes. The         address is carried in its own event (rather than the         `uint256`-valued `ParameterChanged`) so off-chain indexers get a         typed `address` field.\"}},\"kind\":\"user\",\"methods\":{\"MAX_PROTOCOL_TREASURY_FEE()\":{\"notice\":\"Hard upper bound on `protocolTreasuryFee` (10%). Bounds         governance so the fee can never be set to an extractive level         that would starve the staker reward pool.\"},\"MAX_PUBLISHING_CONVICTION_EPOCHS()\":{\"notice\":\"Hard upper bound on `publishingConvictionEpochs`. `DKGPublishingConvictionNFT._settleElapsed` / `_finalSweep` loop `lockDurationEpochs` times in the worst case (dormant account settled at expiry). Each iteration costs ~30\\u201350k gas (`windowSpent` SLOAD + one or two `epochStorage.addTokensToEpochRange` writes + a `WindowSettled` event), so an unbounded `publishingConvictionEpochs` (the previous cap was `uint16.max`) would let governance brick PCAs by setting the parameter past the block-gas budget. 60 chain epochs \\u2248 5 years at a 1-month epoch length and worst-cases at ~3M gas \\u2014 comfortably below the block limit while leaving room for the surrounding `publish` / `topUp` / NFT-transfer work.\"},\"contextGraphRegistrationDeposit()\":{\"notice\":\"Minimum TRAC deposit required to register a Context Graph         on-chain (`ContextGraphs.createContextGraph`). The deposit is         held as the CG's prepaid publishing escrow \\u2014 spendable by the         CG owner on publish/update/extend into that CG \\u2014 and is never         cash-refundable (residue sweeps to the staker reward pool on         deactivation). Anti-spam for the unbounded-CG-creation DoS         (OT-RFC-53). Setting it to 0 disables the deposit (dormant).\"},\"protocolTreasury()\":{\"notice\":\"Recipient of the protocol treasury fee. The zero address         disables the fee entirely regardless of `protocolTreasuryFee`.\"},\"protocolTreasuryFee()\":{\"notice\":\"Protocol treasury fee in basis points (out of 10_000) skimmed         from the staker-bound TRAC on every paid publish / update /         lifetime-extension. The fee is taken out of the amount that         would otherwise flow to the staker reward pool \\u2014 it does NOT         change the price a publisher pays. Default 300 (3%).         The fee is a no-op while `protocolTreasury == address(0)`         (the full amount flows to stakers), so it stays dormant until         governance wires a treasury recipient via `setProtocolTreasury`.\"}},\"version\":1}},\"settings\":{\"compilationTarget\":{\"contracts/storage/ParametersStorage.sol\":\"ParametersStorage\"},\"evmVersion\":\"london\",\"libraries\":{},\"metadata\":{\"bytecodeHash\":\"ipfs\",\"useLiteralContent\":true},\"optimizer\":{\"enabled\":true,\"runs\":200},\"remappings\":[],\"viaIR\":true},\"sources\":{\"@openzeppelin/contracts/access/Ownable.sol\":{\"content\":\"// SPDX-License-Identifier: MIT\\n// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)\\n\\npragma solidity ^0.8.20;\\n\\nimport {Context} from \\\"../utils/Context.sol\\\";\\n\\n/**\\n * @dev Contract module which provides a basic access control mechanism, where\\n * there is an account (an owner) that can be granted exclusive access to\\n * specific functions.\\n *\\n * The initial owner is set to the address provided by the deployer. This can\\n * later be changed with {transferOwnership}.\\n *\\n * This module is used through inheritance. It will make available the modifier\\n * `onlyOwner`, which can be applied to your functions to restrict their use to\\n * the owner.\\n */\\nabstract contract Ownable is Context {\\n    address private _owner;\\n\\n    /**\\n     * @dev The caller account is not authorized to perform an operation.\\n     */\\n    error OwnableUnauthorizedAccount(address account);\\n\\n    /**\\n     * @dev The owner is not a valid owner account. (eg. `address(0)`)\\n     */\\n    error OwnableInvalidOwner(address owner);\\n\\n    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);\\n\\n    /**\\n     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.\\n     */\\n    constructor(address initialOwner) {\\n        if (initialOwner == address(0)) {\\n            revert OwnableInvalidOwner(address(0));\\n        }\\n        _transferOwnership(initialOwner);\\n    }\\n\\n    /**\\n     * @dev Throws if called by any account other than the owner.\\n     */\\n    modifier onlyOwner() {\\n        _checkOwner();\\n        _;\\n    }\\n\\n    /**\\n     * @dev Returns the address of the current owner.\\n     */\\n    function owner() public view virtual returns (address) {\\n        return _owner;\\n    }\\n\\n    /**\\n     * @dev Throws if the sender is not the owner.\\n     */\\n    function _checkOwner() internal view virtual {\\n        if (owner() != _msgSender()) {\\n            revert OwnableUnauthorizedAccount(_msgSender());\\n        }\\n    }\\n\\n    /**\\n     * @dev Leaves the contract without owner. It will not be possible to call\\n     * `onlyOwner` functions. Can only be called by the current owner.\\n     *\\n     * NOTE: Renouncing ownership will leave the contract without an owner,\\n     * thereby disabling any functionality that is only available to the owner.\\n     */\\n    function renounceOwnership() public virtual onlyOwner {\\n        _transferOwnership(address(0));\\n    }\\n\\n    /**\\n     * @dev Transfers ownership of the contract to a new account (`newOwner`).\\n     * Can only be called by the current owner.\\n     */\\n    function transferOwnership(address newOwner) public virtual onlyOwner {\\n        if (newOwner == address(0)) {\\n            revert OwnableInvalidOwner(address(0));\\n        }\\n        _transferOwnership(newOwner);\\n    }\\n\\n    /**\\n     * @dev Transfers ownership of the contract to a new account (`newOwner`).\\n     * Internal function without access restriction.\\n     */\\n    function _transferOwnership(address newOwner) internal virtual {\\n        address oldOwner = _owner;\\n        _owner = newOwner;\\n        emit OwnershipTransferred(oldOwner, newOwner);\\n    }\\n}\\n\",\"keccak256\":\"0xff6d0bb2e285473e5311d9d3caacb525ae3538a80758c10649a4d61029b017bb\",\"license\":\"MIT\"},\"@openzeppelin/contracts/utils/Context.sol\":{\"content\":\"// SPDX-License-Identifier: MIT\\n// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)\\n\\npragma solidity ^0.8.20;\\n\\n/**\\n * @dev Provides information about the current execution context, including the\\n * sender of the transaction and its data. While these are generally available\\n * via msg.sender and msg.data, they should not be accessed in such a direct\\n * manner, since when dealing with meta-transactions the account sending and\\n * paying for execution may not be the actual sender (as far as an application\\n * is concerned).\\n *\\n * This contract is only required for intermediate, library-like contracts.\\n */\\nabstract contract Context {\\n    function _msgSender() internal view virtual returns (address) {\\n        return msg.sender;\\n    }\\n\\n    function _msgData() internal view virtual returns (bytes calldata) {\\n        return msg.data;\\n    }\\n\\n    function _contextSuffixLength() internal view virtual returns (uint256) {\\n        return 0;\\n    }\\n}\\n\",\"keccak256\":\"0x493033a8d1b176a037b2cc6a04dad01a5c157722049bbecf632ca876224dd4b2\",\"license\":\"MIT\"},\"contracts/abstract/HubDependent.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nimport {Hub} from \\\"../storage/Hub.sol\\\";\\nimport {HubLib} from \\\"../libraries/HubLib.sol\\\";\\n\\nabstract contract HubDependent {\\n    Hub public hub;\\n\\n    constructor(address hubAddress) {\\n        if (hubAddress == address(0)) {\\n            revert HubLib.ZeroAddressHub();\\n        }\\n\\n        hub = Hub(hubAddress);\\n    }\\n\\n    modifier onlyHub() {\\n        _checkHub();\\n        _;\\n    }\\n\\n    modifier onlyHubOwner() {\\n        _checkHubOwner();\\n        _;\\n    }\\n\\n    modifier onlyContracts() {\\n        _checkHubContract();\\n        _;\\n    }\\n\\n    function _checkHub() internal view virtual {\\n        if (msg.sender != address(hub) && msg.sender != hub.owner()) {\\n            revert HubLib.UnauthorizedAccess(\\\"Only Hub\\\");\\n        }\\n    }\\n\\n    function _checkHubOwner() internal view virtual {\\n        if (msg.sender != hub.owner()) {\\n            revert HubLib.UnauthorizedAccess(\\\"Only Hub Owner\\\");\\n        }\\n    }\\n\\n    function _checkHubContract() internal view virtual {\\n        if (!hub.isContract(msg.sender) && msg.sender != hub.owner()) {\\n            revert HubLib.UnauthorizedAccess(\\\"Only Contracts in Hub\\\");\\n        }\\n    }\\n}\\n\",\"keccak256\":\"0x643f4dcb2699e967c2ffbfb7c412e0973abc1409e0753a35f75c4661b89f977d\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/IContractStatus.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface IContractStatus {\\n    function setStatus(bool _status) external;\\n}\\n\",\"keccak256\":\"0x0eaaee7100a88d51de69ac7ec4d5e58d9bdd2582537476631a0717379ca16c40\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/ICustodian.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface ICustodian {\\n    function getOwners() external view returns (address[] memory);\\n}\\n\",\"keccak256\":\"0x513e0babede5cc394427a5fb941c80c255be8716e24ff5ee4ea7a6e18335e0b0\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/IInitializable.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface IInitializable {\\n    function initialize() external;\\n}\\n\",\"keccak256\":\"0xad07f8f7bb2bad96f3d5c97ef6673e15574ad11701be1ac9feb94f750c0dee51\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/INamed.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface INamed {\\n    function name() external view returns (string memory);\\n}\\n\",\"keccak256\":\"0x111fc7e3f1b6c9e9da05cecf65d9985177bcface705870536fe409089b89a27c\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/IVersioned.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface IVersioned {\\n    function version() external view returns (string memory);\\n}\\n\",\"keccak256\":\"0x5e104c26deb107969a5bc1f38614f11af0261fc84f1ebbd2ab3bd064b4795de0\",\"license\":\"Apache-2.0\"},\"contracts/libraries/HubLib.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nlibrary HubLib {\\n    struct Contract {\\n        string name;\\n        address addr;\\n    }\\n\\n    struct ForwardCallInputArgs {\\n        string contractName;\\n        bytes[] encodedData;\\n    }\\n\\n    error ZeroAddressHub();\\n    error UnauthorizedAccess(string msg);\\n    error InvalidTargetContract(address addr);\\n    error ContractNotRegistered(string contractName);\\n}\\n\",\"keccak256\":\"0xcb693696568e706c95ff32538831d177d379e28f7fd0518b787c1d7a5334d71b\",\"license\":\"Apache-2.0\"},\"contracts/libraries/UnorderedNamedContractDynamicSet.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nlibrary UnorderedNamedContractDynamicSet {\\n    struct Contract {\\n        string name;\\n        address addr;\\n    }\\n\\n    struct Set {\\n        mapping(string => uint256) stringIndexPointers;\\n        mapping(address => uint256) addressIndexPointers;\\n        Contract[] contractList;\\n    }\\n\\n    error EmptyName();\\n    error ZeroAddress();\\n    error ContractAlreadyExists(string name);\\n    error AddressAlreadyInSet(address addr);\\n    error ContractDoesNotExist(string name);\\n    error AddressDoesNotExist(address addr);\\n\\n    function append(UnorderedNamedContractDynamicSet.Set storage self, string calldata name, address addr) internal {\\n        if (keccak256(abi.encodePacked(name)) == keccak256(abi.encodePacked(\\\"\\\"))) revert EmptyName();\\n        if (addr == address(0)) revert ZeroAddress();\\n        if (exists(self, name)) revert ContractAlreadyExists(name);\\n        if (self.contractList.length > 0 && (self.addressIndexPointers[addr] != 0 || self.contractList[0].addr == addr))\\n            revert AddressAlreadyInSet(addr);\\n\\n        self.stringIndexPointers[name] = size(self);\\n        self.addressIndexPointers[addr] = size(self);\\n        self.contractList.push(UnorderedNamedContractDynamicSet.Contract(name, addr));\\n    }\\n\\n    function update(UnorderedNamedContractDynamicSet.Set storage self, string calldata name, address addr) internal {\\n        if (addr == address(0)) revert ZeroAddress();\\n        if (!exists(self, name)) revert ContractDoesNotExist(name);\\n\\n        address currentAddr = self.contractList[self.stringIndexPointers[name]].addr;\\n        if (currentAddr == addr) {\\n            // Idempotent: same address already registered for this name (e.g. re-run deploy in tests).\\n            return;\\n        }\\n        if (self.contractList.length > 0 && (self.addressIndexPointers[addr] != 0 || self.contractList[0].addr == addr))\\n            revert AddressAlreadyInSet(addr);\\n\\n        delete self.addressIndexPointers[currentAddr];\\n        self.addressIndexPointers[addr] = self.stringIndexPointers[name];\\n        self.contractList[self.stringIndexPointers[name]].addr = addr;\\n    }\\n\\n    function remove(UnorderedNamedContractDynamicSet.Set storage self, string calldata name) internal {\\n        if (!exists(self, name)) revert ContractDoesNotExist(name);\\n\\n        uint256 contractToRemoveIndex = self.stringIndexPointers[name];\\n\\n        delete self.addressIndexPointers[self.contractList[contractToRemoveIndex].addr];\\n\\n        UnorderedNamedContractDynamicSet.Contract memory contractToMove = self.contractList[size(self) - 1];\\n\\n        self.stringIndexPointers[contractToMove.name] = contractToRemoveIndex;\\n        self.addressIndexPointers[contractToMove.addr] = contractToRemoveIndex;\\n        self.contractList[contractToRemoveIndex] = contractToMove;\\n\\n        delete self.stringIndexPointers[name];\\n        self.contractList.pop();\\n    }\\n\\n    function remove(UnorderedNamedContractDynamicSet.Set storage self, address addr) internal {\\n        if (!exists(self, addr)) revert AddressDoesNotExist(addr);\\n\\n        uint256 contractToRemoveIndex = self.addressIndexPointers[addr];\\n\\n        delete self.stringIndexPointers[self.contractList[contractToRemoveIndex].name];\\n\\n        UnorderedNamedContractDynamicSet.Contract memory contractToMove = self.contractList[size(self) - 1];\\n\\n        self.stringIndexPointers[contractToMove.name] = contractToRemoveIndex;\\n        self.addressIndexPointers[contractToMove.addr] = contractToRemoveIndex;\\n        self.contractList[contractToRemoveIndex] = contractToMove;\\n\\n        delete self.addressIndexPointers[addr];\\n        self.contractList.pop();\\n    }\\n\\n    function get(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        string calldata name\\n    ) internal view returns (UnorderedNamedContractDynamicSet.Contract memory) {\\n        if (!exists(self, name)) revert ContractDoesNotExist(name);\\n\\n        return self.contractList[self.stringIndexPointers[name]];\\n    }\\n\\n    function get(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        address addr\\n    ) internal view returns (UnorderedNamedContractDynamicSet.Contract memory) {\\n        if (!exists(self, addr)) revert AddressDoesNotExist(addr);\\n\\n        return self.contractList[self.addressIndexPointers[addr]];\\n    }\\n\\n    function get(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        uint256 index\\n    ) internal view returns (UnorderedNamedContractDynamicSet.Contract memory) {\\n        return self.contractList[index];\\n    }\\n\\n    function getAll(\\n        UnorderedNamedContractDynamicSet.Set storage self\\n    ) internal view returns (UnorderedNamedContractDynamicSet.Contract[] memory) {\\n        return self.contractList;\\n    }\\n\\n    function getIndex(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        string calldata name\\n    ) internal view returns (uint256) {\\n        return self.stringIndexPointers[name];\\n    }\\n\\n    function getIndex(UnorderedNamedContractDynamicSet.Set storage self, address addr) internal view returns (uint256) {\\n        return self.addressIndexPointers[addr];\\n    }\\n\\n    function exists(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        string calldata name\\n    ) internal view returns (bool) {\\n        if (size(self) == 0) {\\n            return false;\\n        }\\n        return\\n            keccak256(abi.encodePacked(self.contractList[self.stringIndexPointers[name]].name)) ==\\n            keccak256(abi.encodePacked(name));\\n    }\\n\\n    function exists(UnorderedNamedContractDynamicSet.Set storage self, address addr) internal view returns (bool) {\\n        if (size(self) == 0) {\\n            return false;\\n        }\\n        return addr == self.contractList[self.addressIndexPointers[addr]].addr;\\n    }\\n\\n    function size(UnorderedNamedContractDynamicSet.Set storage self) internal view returns (uint256) {\\n        return self.contractList.length;\\n    }\\n}\\n\",\"keccak256\":\"0x51b09c4bc2d3342e78c0a77eceff9ba5a7e694ba663535abec0e859c5e32b5ab\",\"license\":\"Apache-2.0\"},\"contracts/storage/Hub.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nimport {IContractStatus} from \\\"../interfaces/IContractStatus.sol\\\";\\nimport {ICustodian} from \\\"../interfaces/ICustodian.sol\\\";\\nimport {IInitializable} from \\\"../interfaces/IInitializable.sol\\\";\\nimport {INamed} from \\\"../interfaces/INamed.sol\\\";\\nimport {IVersioned} from \\\"../interfaces/IVersioned.sol\\\";\\nimport {HubLib} from \\\"../libraries/HubLib.sol\\\";\\nimport {UnorderedNamedContractDynamicSet} from \\\"../libraries/UnorderedNamedContractDynamicSet.sol\\\";\\nimport {Ownable} from \\\"@openzeppelin/contracts/access/Ownable.sol\\\";\\n\\ncontract Hub is INamed, IVersioned, Ownable {\\n    using UnorderedNamedContractDynamicSet for UnorderedNamedContractDynamicSet.Set;\\n\\n    event NewContract(string contractName, address newContractAddress);\\n    event ContractChanged(string contractName, address newContractAddress);\\n    event NewAssetStorage(string contractName, address newContractAddress);\\n    event AssetStorageChanged(string contractName, address newContractAddress);\\n    event ContractRemoved(string contractName, address contractAddress);\\n    event AssetStorageRemoved(string contractName, address contractAddress);\\n\\n    string private constant _NAME = \\\"Hub\\\";\\n    string private constant _VERSION = \\\"1.0.0\\\";\\n\\n    UnorderedNamedContractDynamicSet.Set internal contractSet;\\n    UnorderedNamedContractDynamicSet.Set internal assetStorageSet;\\n\\n    constructor() Ownable(msg.sender) {}\\n\\n    // @dev Only transactions by HubController owner or one of the owners of the MultiSig Wallet\\n    modifier onlyOwnerOrMultiSigOwner() {\\n        _checkOwnerOrMultiSigOwner();\\n        _;\\n    }\\n\\n    function name() external pure virtual override returns (string memory) {\\n        return _NAME;\\n    }\\n\\n    function version() external pure virtual override returns (string memory) {\\n        return _VERSION;\\n    }\\n\\n    function setContractAddress(\\n        string calldata contractName,\\n        address newContractAddress\\n    ) external onlyOwnerOrMultiSigOwner {\\n        _setContractAddress(contractName, newContractAddress);\\n    }\\n\\n    function setAssetStorageAddress(string calldata assetStorageName, address assetStorageAddress) external onlyOwner {\\n        _setAssetStorageAddress(assetStorageName, assetStorageAddress);\\n    }\\n\\n    function removeContractByName(string calldata contractName) external onlyOwner {\\n        if (contractSet.exists(contractName)) {\\n            address contractAddress = contractSet.get(contractName).addr;\\n\\n            contractSet.remove(contractName);\\n\\n            emit ContractRemoved(contractName, contractAddress);\\n        }\\n    }\\n\\n    function removeContractByAddress(address contractAddress) external onlyOwner {\\n        if (contractSet.exists(contractAddress)) {\\n            string memory contractName = contractSet.get(contractAddress).name;\\n\\n            contractSet.remove(contractAddress);\\n\\n            emit ContractRemoved(contractName, contractAddress);\\n        }\\n    }\\n\\n    function removeAssetStorageByName(string calldata assetStorageName) external onlyOwner {\\n        if (assetStorageSet.exists(assetStorageName)) {\\n            address assetStorageAddress = assetStorageSet.get(assetStorageName).addr;\\n\\n            assetStorageSet.remove(assetStorageName);\\n\\n            emit AssetStorageRemoved(assetStorageName, assetStorageAddress);\\n        }\\n    }\\n\\n    function removeAssetStorageByAddress(address assetStorageAddress) external onlyOwner {\\n        if (assetStorageSet.exists(assetStorageAddress)) {\\n            string memory assetStorageName = assetStorageSet.get(assetStorageAddress).name;\\n\\n            assetStorageSet.remove(assetStorageAddress);\\n\\n            emit AssetStorageRemoved(assetStorageName, assetStorageAddress);\\n        }\\n    }\\n\\n    function getContractAddress(string calldata contractName) external view returns (address) {\\n        return contractSet.get(contractName).addr;\\n    }\\n\\n    function getAssetStorageAddress(string calldata assetStorageName) external view returns (address) {\\n        return assetStorageSet.get(assetStorageName).addr;\\n    }\\n\\n    function getAllContracts() external view returns (UnorderedNamedContractDynamicSet.Contract[] memory) {\\n        return contractSet.getAll();\\n    }\\n\\n    function getAllAssetStorages() external view returns (UnorderedNamedContractDynamicSet.Contract[] memory) {\\n        return assetStorageSet.getAll();\\n    }\\n\\n    function isContract(string calldata contractName) external view returns (bool) {\\n        return contractSet.exists(contractName);\\n    }\\n\\n    function isContract(address selectedContractAddress) external view returns (bool) {\\n        return contractSet.exists(selectedContractAddress);\\n    }\\n\\n    function isAssetStorage(string calldata assetStorageName) external view returns (bool) {\\n        return assetStorageSet.exists(assetStorageName);\\n    }\\n\\n    function isAssetStorage(address assetStorageAddress) external view returns (bool) {\\n        return assetStorageSet.exists(assetStorageAddress);\\n    }\\n\\n    /**\\n     * @dev Forwards a function call to a specified target contract.\\n     * @notice This function can only be called by the contract owner or a multisig owner.\\n     * @param target The address of the target contract.\\n     * @param data The calldata containing the function signature and arguments for the target contract's function.\\n     * @return result The return data of the target contract's function call.\\n     */\\n    function forwardCall(address target, bytes calldata data) public onlyOwnerOrMultiSigOwner returns (bytes memory) {\\n        // Check if the target contract is registered in the Hub\\n        if (!contractSet.exists(target) && !assetStorageSet.exists(target)) {\\n            revert HubLib.InvalidTargetContract(target);\\n        }\\n\\n        // Perform the function call to the target contract with the specified calldata\\n        (bool success, bytes memory result) = target.call{value: 0}(data);\\n\\n        // If the call is unsuccessful, revert the transaction with the original revert reason\\n        if (!success) {\\n            assembly {\\n                // Load the free memory pointer from memory slot 0x40\\n                // Memory slot 0x40 is conventionally used to store the free memory pointer in Solidity, which points\\n                // to the next available memory slot for storing data during the execution of a contract function.\\n                let ptr := mload(0x40)\\n                // Get the size of the return data from the unsuccessful call\\n                let size := returndatasize()\\n                // Copy the return data to the memory location pointed to by ptr\\n                returndatacopy(ptr, 0, size)\\n                // Revert the transaction with the return data as the revert reason\\n                revert(ptr, size)\\n            }\\n        }\\n\\n        return result;\\n    }\\n\\n    function setAndReinitializeContracts(\\n        HubLib.Contract[] calldata newContracts,\\n        HubLib.Contract[] calldata newAssetStorageContracts,\\n        address[] calldata contractsToReinitialize,\\n        HubLib.ForwardCallInputArgs[] calldata forwardCallsData\\n    ) external onlyOwnerOrMultiSigOwner {\\n        _setContracts(newContracts);\\n        _setAssetStorageContracts(newAssetStorageContracts);\\n        _reinitializeContracts(contractsToReinitialize);\\n        _forwardCalls(forwardCallsData);\\n    }\\n\\n    function _setContractAddress(string calldata contractName, address newContractAddress) internal {\\n        if (contractSet.exists(contractName)) {\\n            contractSet.update(contractName, newContractAddress);\\n\\n            address oldContractAddress = contractSet.get(contractName).addr;\\n            if (_isContract(oldContractAddress)) {\\n                try IContractStatus(oldContractAddress).setStatus(false) {\\n                    // success\\n                } catch {\\n                    // Best-effort: contract may not implement IContractStatus; ignore.\\n                }\\n            }\\n\\n            emit ContractChanged(contractName, newContractAddress);\\n        } else {\\n            contractSet.append(contractName, newContractAddress);\\n\\n            emit NewContract(contractName, newContractAddress);\\n        }\\n\\n        if (_isContract(newContractAddress)) {\\n            try IContractStatus(newContractAddress).setStatus(true) {\\n                // success\\n            } catch {\\n                // Best-effort: contract may not implement IContractStatus; ignore.\\n            }\\n        }\\n\\n        emit NewContract(contractName, newContractAddress);\\n    }\\n\\n    function _setContracts(HubLib.Contract[] calldata newContracts) internal {\\n        for (uint256 i; i < newContracts.length; ) {\\n            _setContractAddress(newContracts[i].name, newContracts[i].addr);\\n\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _setAssetStorageAddress(string calldata assetStorageName, address assetStorageAddress) internal {\\n        if (assetStorageSet.exists(assetStorageName)) {\\n            emit AssetStorageChanged(assetStorageName, assetStorageAddress);\\n            assetStorageSet.update(assetStorageName, assetStorageAddress);\\n        } else {\\n            emit NewAssetStorage(assetStorageName, assetStorageAddress);\\n            assetStorageSet.append(assetStorageName, assetStorageAddress);\\n        }\\n    }\\n\\n    function _setAssetStorageContracts(HubLib.Contract[] calldata newAssetStorageContracts) internal {\\n        for (uint256 i; i < newAssetStorageContracts.length; ) {\\n            _setAssetStorageAddress(newAssetStorageContracts[i].name, newAssetStorageContracts[i].addr);\\n\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _reinitializeContracts(address[] calldata contractsToReinitialize) internal {\\n        for (uint256 i; i < contractsToReinitialize.length; ) {\\n            IInitializable(contractsToReinitialize[i]).initialize();\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _forwardCalls(HubLib.ForwardCallInputArgs[] calldata forwardCallsData) internal {\\n        for (uint256 i; i < forwardCallsData.length; ) {\\n            address contractAddress;\\n\\n            // Try to get the contract address using getContractAddress\\n            try this.getContractAddress(forwardCallsData[i].contractName) returns (address addr) {\\n                contractAddress = addr;\\n            } catch {\\n                // If getContractAddress fails, try getAssetStorageAddress\\n                try this.getAssetStorageAddress(forwardCallsData[i].contractName) returns (address addr) {\\n                    contractAddress = addr;\\n                } catch {\\n                    revert HubLib.ContractNotRegistered(forwardCallsData[i].contractName);\\n                }\\n            }\\n            for (uint256 j; j < forwardCallsData[i].encodedData.length; ) {\\n                forwardCall(contractAddress, forwardCallsData[i].encodedData[j]);\\n                unchecked {\\n                    j++;\\n                }\\n            }\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _isContract(address addr) internal view returns (bool) {\\n        uint256 size;\\n        assembly {\\n            size := extcodesize(addr)\\n        }\\n        return size > 0;\\n    }\\n\\n    function _isMultiSigOwner(address multiSigAddress) internal view returns (bool) {\\n        try ICustodian(multiSigAddress).getOwners() returns (address[] memory multiSigOwners) {\\n            for (uint256 i = 0; i < multiSigOwners.length; i++) {\\n                if (msg.sender == multiSigOwners[i]) {\\n                    return true;\\n                }\\n            }\\n        } catch {\\n            // Not a multisig or call reverted; treat as not owner.\\n        }\\n\\n        return false;\\n    }\\n\\n    function _checkOwnerOrMultiSigOwner() internal view virtual {\\n        address hubOwner = owner();\\n        if (msg.sender != hubOwner && !_isMultiSigOwner(hubOwner)) {\\n            revert HubLib.UnauthorizedAccess(\\\"Only Hub Owner or Multisig Owner\\\");\\n        }\\n    }\\n}\\n\",\"keccak256\":\"0x732252bb857277a35ab314beef2dbaceb5f96ce2f6d3b83a224927e503609def\",\"license\":\"Apache-2.0\"},\"contracts/storage/ParametersStorage.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nimport {HubDependent} from \\\"../abstract/HubDependent.sol\\\";\\nimport {INamed} from \\\"../interfaces/INamed.sol\\\";\\nimport {IVersioned} from \\\"../interfaces/IVersioned.sol\\\";\\nimport {ICustodian} from \\\"../interfaces/ICustodian.sol\\\";\\n\\ncontract ParametersStorage is INamed, IVersioned, HubDependent {\\n    event ParameterChanged(string parameterName, uint256 parameterValue);\\n    /// @notice Emitted when the protocol treasury recipient changes. The\\n    ///         address is carried in its own event (rather than the\\n    ///         `uint256`-valued `ParameterChanged`) so off-chain indexers get a\\n    ///         typed `address` field.\\n    event ProtocolTreasurySet(address indexed treasury);\\n\\n    error ZeroShardingTableSizeLimit();\\n\\n    string private constant _NAME = \\\"ParametersStorage\\\";\\n    // protocol treasury fee (`protocolTreasuryFee`, `protocolTreasury`,\\n    // `MAX_PROTOCOL_TREASURY_FEE`) skimmed from the staker-bound TRAC on\\n    // every paid publish / update / lifetime-extension.\\n    string private constant _VERSION = \\\"10.0.4\\\";\\n\\n    uint96 public minimumStake;\\n    uint96 public maximumStake;\\n\\n    uint256 public stakeWithdrawalDelay;\\n    uint256 public nodeAskUpdateDelay;\\n    uint256 public operatorFeeUpdateDelay;\\n\\n    uint16 public opWalletsLimitOnProfileCreation;\\n    uint16 public shardingTableSizeLimit;\\n\\n    uint256 public minimumRequiredSignatures;\\n\\n    uint256 public askUpperBoundFactor;\\n    uint256 public askLowerBoundFactor;\\n\\n    uint16 public maxOperatorFee;\\n\\n    uint256 public v81ReleaseEpoch;\\n    uint256 public publishingConvictionEpochs;\\n\\n    /// @notice Protocol treasury fee in basis points (out of 10_000) skimmed\\n    ///         from the staker-bound TRAC on every paid publish / update /\\n    ///         lifetime-extension. The fee is taken out of the amount that\\n    ///         would otherwise flow to the staker reward pool \\u2014 it does NOT\\n    ///         change the price a publisher pays. Default 300 (3%).\\n    ///\\n    ///         The fee is a no-op while `protocolTreasury == address(0)`\\n    ///         (the full amount flows to stakers), so it stays dormant until\\n    ///         governance wires a treasury recipient via `setProtocolTreasury`.\\n    uint16 public protocolTreasuryFee;\\n\\n    /// @notice Recipient of the protocol treasury fee. The zero address\\n    ///         disables the fee entirely regardless of `protocolTreasuryFee`.\\n    address public protocolTreasury;\\n\\n    /// @notice Minimum TRAC deposit required to register a Context Graph\\n    ///         on-chain (`ContextGraphs.createContextGraph`). The deposit is\\n    ///         held as the CG's prepaid publishing escrow \\u2014 spendable by the\\n    ///         CG owner on publish/update/extend into that CG \\u2014 and is never\\n    ///         cash-refundable (residue sweeps to the staker reward pool on\\n    ///         deactivation). Anti-spam for the unbounded-CG-creation DoS\\n    ///         (OT-RFC-53). Setting it to 0 disables the deposit (dormant).\\n    uint96 public contextGraphRegistrationDeposit;\\n\\n    /// @notice Hard upper bound on `protocolTreasuryFee` (10%). Bounds\\n    ///         governance so the fee can never be set to an extractive level\\n    ///         that would starve the staker reward pool.\\n    uint16 public constant MAX_PROTOCOL_TREASURY_FEE = 1_000;\\n\\n    /// @notice Hard upper bound on `publishingConvictionEpochs`.\\n    ///\\n    /// `DKGPublishingConvictionNFT._settleElapsed` / `_finalSweep` loop\\n    /// `lockDurationEpochs` times in the worst case (dormant account\\n    /// settled at expiry). Each iteration costs ~30\\u201350k gas\\n    /// (`windowSpent` SLOAD + one or two `epochStorage.addTokensToEpochRange`\\n    /// writes + a `WindowSettled` event), so an unbounded\\n    /// `publishingConvictionEpochs` (the previous cap was `uint16.max`)\\n    /// would let governance brick PCAs by setting the parameter past\\n    /// the block-gas budget. 60 chain epochs \\u2248 5 years at a 1-month\\n    /// epoch length and worst-cases at ~3M gas \\u2014 comfortably below\\n    /// the block limit while leaving room for the surrounding\\n    /// `publish` / `topUp` / NFT-transfer work.\\n    uint256 public constant MAX_PUBLISHING_CONVICTION_EPOCHS = 60;\\n\\n    // @dev Only transactions by HubController owner or one of the owners of the MultiSig Wallet\\n    modifier onlyOwnerOrMultiSigOwner() {\\n        _checkOwnerOrMultiSigOwner();\\n        _;\\n    }\\n\\n    constructor(address hubAddress, uint256 _v81ReleaseEpoch) HubDependent(hubAddress) {\\n        minimumStake = 50_000 ether;\\n        maximumStake = 10_000_000 ether;\\n\\n        stakeWithdrawalDelay = 28 days;\\n        nodeAskUpdateDelay = 1 days;\\n        operatorFeeUpdateDelay = 28 days;\\n\\n        opWalletsLimitOnProfileCreation = 50;\\n        shardingTableSizeLimit = 500;\\n\\n        minimumRequiredSignatures = 3;\\n\\n        askUpperBoundFactor = 1467000000000000000;\\n        askLowerBoundFactor = 533000000000000000;\\n\\n        maxOperatorFee = 10_000;\\n\\n        // Epoch when v8.1 was released on mainnet/testnet\\n        // Change if you ever redeploy delegatorsInfo contract on either network\\n        v81ReleaseEpoch = _v81ReleaseEpoch;\\n        publishingConvictionEpochs = 12;\\n\\n        // 3% default. Dormant until `protocolTreasury` is set (defaults to\\n        // the zero address), so a fresh deploy behaves exactly as before\\n        // until governance opts in.\\n        protocolTreasuryFee = 300;\\n\\n        // OT-RFC-53: constructor leaves the registration deposit at 0; the\\n        // standard deploy sets the live value (100 TRAC) via a post-deploy\\n        // script that calls `setContextGraphRegistrationDeposit`. This protects\\n        // production automatically (no manual step, no silent-off) while keeping\\n        // test fixtures \\u2014 which don't run that script \\u2014 unaffected. Governance\\n        // can retune or disable it anytime.\\n    }\\n\\n    function name() external pure virtual override returns (string memory) {\\n        return _NAME;\\n    }\\n\\n    function version() external pure virtual override returns (string memory) {\\n        return _VERSION;\\n    }\\n\\n    function setAskUpperBoundFactor(uint256 _askUpperBoundFactor) external onlyOwnerOrMultiSigOwner {\\n        askUpperBoundFactor = _askUpperBoundFactor;\\n    }\\n\\n    function setAskLowerBoundFactor(uint256 _askLowerBoundFactor) external onlyOwnerOrMultiSigOwner {\\n        askLowerBoundFactor = _askLowerBoundFactor;\\n    }\\n\\n    function setMinimumRequiredSignatures(uint256 _minimumRequiredSignatures) external onlyOwnerOrMultiSigOwner {\\n        minimumRequiredSignatures = _minimumRequiredSignatures;\\n\\n        emit ParameterChanged(\\\"minimumRequiredSignatures\\\", _minimumRequiredSignatures);\\n    }\\n\\n    function setMinimumStake(uint96 newMinimumStake) external onlyOwnerOrMultiSigOwner {\\n        minimumStake = newMinimumStake;\\n\\n        emit ParameterChanged(\\\"minimumStake\\\", newMinimumStake);\\n    }\\n\\n    function setMaximumStake(uint96 newMaximumStake) external onlyOwnerOrMultiSigOwner {\\n        maximumStake = newMaximumStake;\\n\\n        emit ParameterChanged(\\\"maximumStake\\\", newMaximumStake);\\n    }\\n\\n    function setStakeWithdrawalDelay(uint256 newStakeWithdrawalDelay) external onlyOwnerOrMultiSigOwner {\\n        stakeWithdrawalDelay = newStakeWithdrawalDelay;\\n\\n        emit ParameterChanged(\\\"stakeWithdrawalDelay\\\", newStakeWithdrawalDelay);\\n    }\\n\\n    function setNodeAskUpdateDelay(uint256 newNodeAskUpdateDelay) external onlyOwnerOrMultiSigOwner {\\n        nodeAskUpdateDelay = newNodeAskUpdateDelay;\\n\\n        emit ParameterChanged(\\\"nodeAskUpdateDelay\\\", newNodeAskUpdateDelay);\\n    }\\n\\n    function setOperatorFeeUpdateDelay(uint256 newOperatorFeeUpdateDelay) external onlyOwnerOrMultiSigOwner {\\n        operatorFeeUpdateDelay = newOperatorFeeUpdateDelay;\\n\\n        emit ParameterChanged(\\\"operatorFeeUpdateDelay\\\", newOperatorFeeUpdateDelay);\\n    }\\n\\n    function setOpWalletsLimitOnProfileCreation(\\n        uint16 opWalletsLimitOnProfileCreation_\\n    ) external onlyOwnerOrMultiSigOwner {\\n        opWalletsLimitOnProfileCreation = opWalletsLimitOnProfileCreation_;\\n\\n        emit ParameterChanged(\\\"opWalletsLimitOnProfileCreation\\\", opWalletsLimitOnProfileCreation);\\n    }\\n\\n    function setShardingTableSizeLimit(uint16 shardingTableSizeLimit_) external onlyOwnerOrMultiSigOwner {\\n        // Reject 0: ShardingTable._insertNode now enforces this cap\\n        // (`nodesCount >= limit` reverts ShardingTableIsFull), so a 0 limit would\\n        // freeze ALL node admission (even the first insert), bricking staking. 0\\n        // is never a meaningful table size \\u2014 reject it rather than let it act as\\n        // an implicit pause switch.\\n        if (shardingTableSizeLimit_ == 0) revert ZeroShardingTableSizeLimit();\\n        shardingTableSizeLimit = shardingTableSizeLimit_;\\n\\n        emit ParameterChanged(\\\"shardingTableSizeLimit\\\", shardingTableSizeLimit);\\n    }\\n\\n    function setMaxOperatorFee(uint16 maxOperatorFee_) external onlyOwnerOrMultiSigOwner {\\n        maxOperatorFee = maxOperatorFee_;\\n\\n        emit ParameterChanged(\\\"maxOperatorFee\\\", maxOperatorFee);\\n    }\\n\\n    function setV81ReleaseEpoch(uint256 _v81ReleaseEpoch) external onlyOwnerOrMultiSigOwner {\\n        v81ReleaseEpoch = _v81ReleaseEpoch;\\n\\n        emit ParameterChanged(\\\"v81ReleaseEpoch\\\", _v81ReleaseEpoch);\\n    }\\n\\n    function setPublishingConvictionEpochs(\\n        uint256 _publishingConvictionEpochs\\n    ) external onlyOwnerOrMultiSigOwner {\\n        require(_publishingConvictionEpochs > 0, \\\"publishingConvictionEpochs must be > 0\\\");\\n        // See `MAX_PUBLISHING_CONVICTION_EPOCHS` for the gas-budget\\n        // rationale. The previous `<= type(uint16).max` bound permitted\\n        // values that would gas-out PCA settlement.\\n        require(\\n            _publishingConvictionEpochs <= MAX_PUBLISHING_CONVICTION_EPOCHS,\\n            \\\"publishingConvictionEpochs too large\\\"\\n        );\\n        publishingConvictionEpochs = _publishingConvictionEpochs;\\n\\n        emit ParameterChanged(\\\"publishingConvictionEpochs\\\", _publishingConvictionEpochs);\\n    }\\n\\n    function setContextGraphRegistrationDeposit(uint96 amount) external onlyOwnerOrMultiSigOwner {\\n        contextGraphRegistrationDeposit = amount;\\n\\n        emit ParameterChanged(\\\"contextGraphRegistrationDeposit\\\", amount);\\n    }\\n\\n    function setProtocolTreasuryFee(uint16 protocolTreasuryFee_) external onlyOwnerOrMultiSigOwner {\\n        // See `MAX_PROTOCOL_TREASURY_FEE` for the rationale on the upper\\n        // bound. 0 is allowed (disables the fee while keeping the recipient\\n        // wired) \\u2014 the floor is enforced implicitly by the unsigned type.\\n        require(protocolTreasuryFee_ <= MAX_PROTOCOL_TREASURY_FEE, \\\"protocolTreasuryFee too large\\\");\\n        protocolTreasuryFee = protocolTreasuryFee_;\\n\\n        emit ParameterChanged(\\\"protocolTreasuryFee\\\", protocolTreasuryFee_);\\n    }\\n\\n    function setProtocolTreasury(address protocolTreasury_) external onlyOwnerOrMultiSigOwner {\\n        protocolTreasury = protocolTreasury_;\\n\\n        emit ProtocolTreasurySet(protocolTreasury_);\\n    }\\n\\n    function _isMultiSigOwner(address multiSigAddress) internal view returns (bool) {\\n        // First check if the address has contract code\\n        uint256 size;\\n        assembly {\\n            size := extcodesize(multiSigAddress)\\n        }\\n\\n        // If no contract code, it's an EOA, not a multisig\\n        if (size == 0) {\\n            return false;\\n        }\\n\\n        try ICustodian(multiSigAddress).getOwners() returns (address[] memory multiSigOwners) {\\n            for (uint256 i = 0; i < multiSigOwners.length; i++) {\\n                if (msg.sender == multiSigOwners[i]) {\\n                    return true;\\n                }\\n            }\\n        } catch {\\n            // Not a multisig or call reverted; treat as not owner.\\n        }\\n\\n        return false;\\n    }\\n\\n    function _checkOwnerOrMultiSigOwner() internal view virtual {\\n        address hubOwner = hub.owner();\\n        if (msg.sender != hubOwner && msg.sender != address(hub) && !_isMultiSigOwner(hubOwner)) {\\n            revert(\\\"Only Hub Owner, Hub, or Multisig Owner can call\\\");\\n        }\\n    }\\n}\\n\",\"keccak256\":\"0xcfa8ee19dacc2be0de28973802d18037bfac66537db226afc21d259611c5bac2\",\"license\":\"Apache-2.0\"}},\"version\":1}",
+  "bytecode": "0x60803461010f57601f61113838819003918201601f19168301916001600160401b0383118484101761011457808492604094855283398101031261010f5780516001600160a01b038116919082900361010f576020015181156100fd5761012c91662a5a058fc295ed60b61b176000556a084595161401484a00000060018060601b031960015416176001556224ea0080600255620151806003556004556301f4003263ffffffff196005541617600555600360065567145bd4ba3d7f800060075567076598ad1148800060085561ffff1990612710826009541617600955600a55600c600b55600c541617600c5560405161100d908161012b8239f35b60405163a10d827b60e01b8152600490fd5b600080fd5b634e487b7160e01b600052604160045260246000fdfe6080604081815260048036101561001557600080fd5b600092833560e01c90816306fdde0314610c4a575080630c5a61f814610bce5780630e6a052d14610bac578063151db1b914610b8d5780631eaf77e014610b6a5780631fcb831c14610b4b5780632d0d0e6a14610b285780632e08788e14610ac5578063324cc7da14610a9f578063365a86fc14610a7757806338e7687214610a195780633a19ed36146109725780633e656a07146108e7578063472eda45146108bf5780634fcae33e1461083e57806354fd4d50146107fc5780636ad79ad3146107d95780637aff88b3146106bb578063803db96d1461068e5780638a805f84146106715780639667343e1461065557806396acc087146106365780639d28202e146105d15780639d50e111146105b2578063b13a8c0714610528578063b5c6b45314610500578063be2dc87314610436578063be770f2414610414578063ca8bd277146103b3578063d7a6735014610394578063e28dcb1d1461031a578063e35d1653146102fb578063e8a47ba8146102dc578063ec5ffac2146102b8578063f7ae9b6e1461024c578063f87cda11146101da5763fb2dbdad146101ba57600080fd5b346101d657826003193601126101d65760209250549051908152f35b8280fd5b50346101d65760203660031901126101d6573561ffff81168091036101d657600080516020610fb883398151915291608091610214610d45565b8061ffff196009541617600955600e8251928084528301526d6d61784f70657261746f7246656560901b60608301526020820152a180f35b50346101d65760203660031901126101d657600080516020610fb8833981519152916080913561027a610d45565b8060065560198251928084528301527f6d696e696d756d52657175697265645369676e6174757265730000000000000060608301526020820152a180f35b5050346102d857816003193601126102d8576020915460a01c9051908152f35b5080fd5b5050346102d857816003193601126102d857602090600b549051908152f35b5050346102d857816003193601126102d8576020906006549051908152f35b50346101d65760203660031901126101d657356001600160601b0381168091036101d657600080516020610fb883398151915291608091610359610d45565b806001600160601b03196001541617600155600c8251928084528301526b6d6178696d756d5374616b6560a01b60608301526020820152a180f35b5050346102d857816003193601126102d857602090600a549051908152f35b50346101d65760203660031901126101d657600080516020610fb883398151915291608091356103e1610d45565b806003556012825192808452830152716e6f646541736b55706461746544656c617960701b60608301526020820152a180f35b8382346102d85760203660031901126102d85761042f610d45565b3560075580f35b50346101d65760203660031901126101d65780359061ffff82168092036104fc5761045f610d45565b6103e882116104b95750600080516020610fb8833981519152918160809261ffff19600c541617600c5560138251928084528301527270726f746f636f6c547265617375727946656560681b60608301526020820152a180f35b606490602084519162461bcd60e51b8352820152601d60248201527f70726f746f636f6c547265617375727946656520746f6f206c617267650000006044820152fd5b8380fd5b5050346102d857816003193601126102d8576020906001600160601b03600154169051908152f35b50346101d65760203660031901126101d657356001600160601b038116918282036104fc57600080516020610fb883398151915292608092610568610d45565b85546001600160a01b031660a09190911b6001600160a01b0319161785558151828152600c928101929092526b6d696e696d756d5374616b6560a01b60608301526020820152a180f35b5050346102d857816003193601126102d8576020906007549051908152f35b50346101d65760203660031901126101d657600080516020610fb88339815191529181608092358091610602610d45565b556016825192808452830152756f70657261746f7246656555706461746544656c617960501b60608301526020820152a180f35b5050346102d857816003193601126102d8576020906003549051908152f35b5050346102d857816003193601126102d85760209051603c8152f35b5050346102d857816003193601126102d857602090516103e88152f35b5050346102d857816003193601126102d857600c54905160109190911c6001600160a01b03168152602090f35b50346101d65760203660031901126101d6578035906106d8610d45565b811561078757603c82116107385750600080516020610fb88339815191529181608092600b55601a8251928084528301527f7075626c697368696e67436f6e76696374696f6e45706f63687300000000000060608301526020820152a180f35b608490602084519162461bcd60e51b83528201526024808201527f7075626c697368696e67436f6e76696374696f6e45706f63687320746f6f206c6044820152636172676560e01b6064820152fd5b608490602084519162461bcd60e51b8352820152602660248201527f7075626c697368696e67436f6e76696374696f6e45706f636873206d7573742060448201526506265203e20360d41b6064820152fd5b5050346102d857816003193601126102d85760209061ffff600c54169051908152f35b5050346102d857816003193601126102d857805161083a9161081d82610cd8565b60068252650c4c0b8c0b8d60d21b60208301525191829182610c8f565b0390f35b50346101d65760203660031901126101d6573561ffff81168091036101d657600080516020610fb883398151915291608091610878610d45565b8061ffff196005541617600555601f8251928084528301527f6f7057616c6c6574734c696d69744f6e50726f66696c654372656174696f6e0060608301526020820152a180f35b5050346102d857816003193601126102d8576020906001600160601b03600d54169051908152f35b50346101d65760203660031901126101d657356001600160601b0381168091036101d657600080516020610fb883398151915291608091610926610d45565b806001600160601b0319600d541617600d55601f8251928084528301527f636f6e746578744772617068526567697374726174696f6e4465706f7369740060608301526020820152a180f35b50346101d65760203660031901126101d657803561ffff91828216808303610a155761099c610d45565b15610a07575091608091600080516020610fb88339815191529363ffff00006005549160101b169063ffff0000191617806005556016835193808552840152751cda185c991a5b99d518589b1954da5e99531a5b5a5d60521b606084015260101c166020820152a180f35b835163cd9e95bb60e01b8152fd5b8580fd5b50346101d65760203660031901126101d657600080516020610fb88339815191529160809135610a47610d45565b80600a55600f8251928084528301526e0ec7062a4cad8cac2e6ca8ae0dec6d608b1b60608301526020820152a180f35b5050346102d857816003193601126102d857905490516001600160a01b039091168152602090f35b5050346102d857816003193601126102d85760209061ffff60055460101c169051908152f35b50346101d65760203660031901126101d657600080516020610fb88339815191529160809135610af3610d45565b806002556014825192808452830152737374616b655769746864726177616c44656c617960601b60608301526020820152a180f35b5050346102d857816003193601126102d85760209061ffff600554169051908152f35b5050346102d857816003193601126102d8576020906008549051908152f35b5050346102d857816003193601126102d85760209061ffff600954169051908152f35b5050346102d857816003193601126102d8576020906002549051908152f35b8382346102d85760203660031901126102d857610bc7610d45565b3560085580f35b8382346102d85760203660031901126102d857356001600160a01b038116908181036101d657610bfc610d45565b600c805462010000600160b01b03191660109290921b62010000600160b01b03169190911790557f6f1811d5b64d07afe73e3049cb2b17e23f84fc82374da2eb1e8ef0e6109c12d08280a280f35b849084346101d657826003193601126101d65761083a9250610c6b82610cd8565b6011825270506172616d657465727353746f7261676560781b602083015251918291825b6020808252825181830181905290939260005b828110610cc457505060409293506000838284010152601f8019910116010190565b818101860151848201604001528501610ca2565b6040810190811067ffffffffffffffff821117610cf457604052565b634e487b7160e01b600052604160045260246000fd5b90601f8019910116810190811067ffffffffffffffff821117610cf457604052565b51906001600160a01b0382168203610d4057565b600080fd5b600054604051638da5cb5b60e01b81526001600160a01b0391821691602082600481865afa918215610e4b57600092610e0d575b5081163314159182610e02575b5081610df1575b50610d9457565b60405162461bcd60e51b815260206004820152602f60248201527f4f6e6c7920487562204f776e65722c204875622c206f72204d756c746973696760448201526e0813dddb995c8818d85b8818d85b1b608a1b6064820152608490fd5b610dfb9150610e57565b1538610d8d565b331415915038610d86565b90916020823d8211610e43575b81610e2760209383610d0a565b81010312610e405750610e3990610d2c565b9038610d79565b80fd5b3d9150610e1a565b6040513d6000823e3d90fd5b803b15610fb15760405163a0e67e2b60e01b81526000916004906001600160a01b0390849084908490829085165afa849381610ef7575b50610e9a575b50505090565b83949192945b8551811015610eea578160208260051b88010151163314610edf576000198114610ecc57600101610ea0565b634e487b7160e01b855260118452602485fd5b505092505050600190565b5050925050388080610e94565b9093503d8086833e610f098183610d0a565b81016020908183820312610fad57825167ffffffffffffffff93848211610f92570181601f82011215610fa9578051938411610f96578360051b9060405194610f5485840187610d0a565b85528380860192820101928311610f92578301905b828210610f7b57505050509238610e8e565b838091610f8784610d2c565b815201910190610f69565b8880fd5b634e487b7160e01b885260418652602488fd5b8780fd5b8680fd5b5060009056fe18af1c2db06558764ef7e5f81f429c1ec57050d7b3eb7c0cdd985ce6257ec972a264697066735822122057286166595bb430b506f1180316b0d76ab8aeccc373ee3889d9f10974935f2664736f6c63430008140033",
+  "deployedBytecode": "0x6080604081815260048036101561001557600080fd5b600092833560e01c90816306fdde0314610c4a575080630c5a61f814610bce5780630e6a052d14610bac578063151db1b914610b8d5780631eaf77e014610b6a5780631fcb831c14610b4b5780632d0d0e6a14610b285780632e08788e14610ac5578063324cc7da14610a9f578063365a86fc14610a7757806338e7687214610a195780633a19ed36146109725780633e656a07146108e7578063472eda45146108bf5780634fcae33e1461083e57806354fd4d50146107fc5780636ad79ad3146107d95780637aff88b3146106bb578063803db96d1461068e5780638a805f84146106715780639667343e1461065557806396acc087146106365780639d28202e146105d15780639d50e111146105b2578063b13a8c0714610528578063b5c6b45314610500578063be2dc87314610436578063be770f2414610414578063ca8bd277146103b3578063d7a6735014610394578063e28dcb1d1461031a578063e35d1653146102fb578063e8a47ba8146102dc578063ec5ffac2146102b8578063f7ae9b6e1461024c578063f87cda11146101da5763fb2dbdad146101ba57600080fd5b346101d657826003193601126101d65760209250549051908152f35b8280fd5b50346101d65760203660031901126101d6573561ffff81168091036101d657600080516020610fb883398151915291608091610214610d45565b8061ffff196009541617600955600e8251928084528301526d6d61784f70657261746f7246656560901b60608301526020820152a180f35b50346101d65760203660031901126101d657600080516020610fb8833981519152916080913561027a610d45565b8060065560198251928084528301527f6d696e696d756d52657175697265645369676e6174757265730000000000000060608301526020820152a180f35b5050346102d857816003193601126102d8576020915460a01c9051908152f35b5080fd5b5050346102d857816003193601126102d857602090600b549051908152f35b5050346102d857816003193601126102d8576020906006549051908152f35b50346101d65760203660031901126101d657356001600160601b0381168091036101d657600080516020610fb883398151915291608091610359610d45565b806001600160601b03196001541617600155600c8251928084528301526b6d6178696d756d5374616b6560a01b60608301526020820152a180f35b5050346102d857816003193601126102d857602090600a549051908152f35b50346101d65760203660031901126101d657600080516020610fb883398151915291608091356103e1610d45565b806003556012825192808452830152716e6f646541736b55706461746544656c617960701b60608301526020820152a180f35b8382346102d85760203660031901126102d85761042f610d45565b3560075580f35b50346101d65760203660031901126101d65780359061ffff82168092036104fc5761045f610d45565b6103e882116104b95750600080516020610fb8833981519152918160809261ffff19600c541617600c5560138251928084528301527270726f746f636f6c547265617375727946656560681b60608301526020820152a180f35b606490602084519162461bcd60e51b8352820152601d60248201527f70726f746f636f6c547265617375727946656520746f6f206c617267650000006044820152fd5b8380fd5b5050346102d857816003193601126102d8576020906001600160601b03600154169051908152f35b50346101d65760203660031901126101d657356001600160601b038116918282036104fc57600080516020610fb883398151915292608092610568610d45565b85546001600160a01b031660a09190911b6001600160a01b0319161785558151828152600c928101929092526b6d696e696d756d5374616b6560a01b60608301526020820152a180f35b5050346102d857816003193601126102d8576020906007549051908152f35b50346101d65760203660031901126101d657600080516020610fb88339815191529181608092358091610602610d45565b556016825192808452830152756f70657261746f7246656555706461746544656c617960501b60608301526020820152a180f35b5050346102d857816003193601126102d8576020906003549051908152f35b5050346102d857816003193601126102d85760209051603c8152f35b5050346102d857816003193601126102d857602090516103e88152f35b5050346102d857816003193601126102d857600c54905160109190911c6001600160a01b03168152602090f35b50346101d65760203660031901126101d6578035906106d8610d45565b811561078757603c82116107385750600080516020610fb88339815191529181608092600b55601a8251928084528301527f7075626c697368696e67436f6e76696374696f6e45706f63687300000000000060608301526020820152a180f35b608490602084519162461bcd60e51b83528201526024808201527f7075626c697368696e67436f6e76696374696f6e45706f63687320746f6f206c6044820152636172676560e01b6064820152fd5b608490602084519162461bcd60e51b8352820152602660248201527f7075626c697368696e67436f6e76696374696f6e45706f636873206d7573742060448201526506265203e20360d41b6064820152fd5b5050346102d857816003193601126102d85760209061ffff600c54169051908152f35b5050346102d857816003193601126102d857805161083a9161081d82610cd8565b60068252650c4c0b8c0b8d60d21b60208301525191829182610c8f565b0390f35b50346101d65760203660031901126101d6573561ffff81168091036101d657600080516020610fb883398151915291608091610878610d45565b8061ffff196005541617600555601f8251928084528301527f6f7057616c6c6574734c696d69744f6e50726f66696c654372656174696f6e0060608301526020820152a180f35b5050346102d857816003193601126102d8576020906001600160601b03600d54169051908152f35b50346101d65760203660031901126101d657356001600160601b0381168091036101d657600080516020610fb883398151915291608091610926610d45565b806001600160601b0319600d541617600d55601f8251928084528301527f636f6e746578744772617068526567697374726174696f6e4465706f7369740060608301526020820152a180f35b50346101d65760203660031901126101d657803561ffff91828216808303610a155761099c610d45565b15610a07575091608091600080516020610fb88339815191529363ffff00006005549160101b169063ffff0000191617806005556016835193808552840152751cda185c991a5b99d518589b1954da5e99531a5b5a5d60521b606084015260101c166020820152a180f35b835163cd9e95bb60e01b8152fd5b8580fd5b50346101d65760203660031901126101d657600080516020610fb88339815191529160809135610a47610d45565b80600a55600f8251928084528301526e0ec7062a4cad8cac2e6ca8ae0dec6d608b1b60608301526020820152a180f35b5050346102d857816003193601126102d857905490516001600160a01b039091168152602090f35b5050346102d857816003193601126102d85760209061ffff60055460101c169051908152f35b50346101d65760203660031901126101d657600080516020610fb88339815191529160809135610af3610d45565b806002556014825192808452830152737374616b655769746864726177616c44656c617960601b60608301526020820152a180f35b5050346102d857816003193601126102d85760209061ffff600554169051908152f35b5050346102d857816003193601126102d8576020906008549051908152f35b5050346102d857816003193601126102d85760209061ffff600954169051908152f35b5050346102d857816003193601126102d8576020906002549051908152f35b8382346102d85760203660031901126102d857610bc7610d45565b3560085580f35b8382346102d85760203660031901126102d857356001600160a01b038116908181036101d657610bfc610d45565b600c805462010000600160b01b03191660109290921b62010000600160b01b03169190911790557f6f1811d5b64d07afe73e3049cb2b17e23f84fc82374da2eb1e8ef0e6109c12d08280a280f35b849084346101d657826003193601126101d65761083a9250610c6b82610cd8565b6011825270506172616d657465727353746f7261676560781b602083015251918291825b6020808252825181830181905290939260005b828110610cc457505060409293506000838284010152601f8019910116010190565b818101860151848201604001528501610ca2565b6040810190811067ffffffffffffffff821117610cf457604052565b634e487b7160e01b600052604160045260246000fd5b90601f8019910116810190811067ffffffffffffffff821117610cf457604052565b51906001600160a01b0382168203610d4057565b600080fd5b600054604051638da5cb5b60e01b81526001600160a01b0391821691602082600481865afa918215610e4b57600092610e0d575b5081163314159182610e02575b5081610df1575b50610d9457565b60405162461bcd60e51b815260206004820152602f60248201527f4f6e6c7920487562204f776e65722c204875622c206f72204d756c746973696760448201526e0813dddb995c8818d85b8818d85b1b608a1b6064820152608490fd5b610dfb9150610e57565b1538610d8d565b331415915038610d86565b90916020823d8211610e43575b81610e2760209383610d0a565b81010312610e405750610e3990610d2c565b9038610d79565b80fd5b3d9150610e1a565b6040513d6000823e3d90fd5b803b15610fb15760405163a0e67e2b60e01b81526000916004906001600160a01b0390849084908490829085165afa849381610ef7575b50610e9a575b50505090565b83949192945b8551811015610eea578160208260051b88010151163314610edf576000198114610ecc57600101610ea0565b634e487b7160e01b855260118452602485fd5b505092505050600190565b5050925050388080610e94565b9093503d8086833e610f098183610d0a565b81016020908183820312610fad57825167ffffffffffffffff93848211610f92570181601f82011215610fa9578051938411610f96578360051b9060405194610f5485840187610d0a565b85528380860192820101928311610f92578301905b828210610f7b57505050509238610e8e565b838091610f8784610d2c565b815201910190610f69565b8880fd5b634e487b7160e01b885260418652602488fd5b8780fd5b8680fd5b5060009056fe18af1c2db06558764ef7e5f81f429c1ec57050d7b3eb7c0cdd985ce6257ec972a264697066735822122057286166595bb430b506f1180316b0d76ab8aeccc373ee3889d9f10974935f2664736f6c63430008140033",
+  "devdoc": {
+    "kind": "dev",
+    "methods": {},
+    "version": 1
+  },
+  "userdoc": {
+    "events": {
+      "ProtocolTreasurySet(address)": {
+        "notice": "Emitted when the protocol treasury recipient changes. The         address is carried in its own event (rather than the         `uint256`-valued `ParameterChanged`) so off-chain indexers get a         typed `address` field."
+      }
+    },
+    "kind": "user",
+    "methods": {
+      "MAX_PROTOCOL_TREASURY_FEE()": {
+        "notice": "Hard upper bound on `protocolTreasuryFee` (10%). Bounds         governance so the fee can never be set to an extractive level         that would starve the staker reward pool."
+      },
+      "MAX_PUBLISHING_CONVICTION_EPOCHS()": {
+        "notice": "Hard upper bound on `publishingConvictionEpochs`. `DKGPublishingConvictionNFT._settleElapsed` / `_finalSweep` loop `lockDurationEpochs` times in the worst case (dormant account settled at expiry). Each iteration costs ~30–50k gas (`windowSpent` SLOAD + one or two `epochStorage.addTokensToEpochRange` writes + a `WindowSettled` event), so an unbounded `publishingConvictionEpochs` (the previous cap was `uint16.max`) would let governance brick PCAs by setting the parameter past the block-gas budget. 60 chain epochs ≈ 5 years at a 1-month epoch length and worst-cases at ~3M gas — comfortably below the block limit while leaving room for the surrounding `publish` / `topUp` / NFT-transfer work."
+      },
+      "contextGraphRegistrationDeposit()": {
+        "notice": "Minimum TRAC deposit required to register a Context Graph         on-chain (`ContextGraphs.createContextGraph`). The deposit is         held as the CG's prepaid publishing escrow — spendable by the         CG owner on publish/update/extend into that CG — and is never         cash-refundable (residue sweeps to the staker reward pool on         deactivation). Anti-spam for the unbounded-CG-creation DoS         (OT-RFC-53). Setting it to 0 disables the deposit (dormant)."
+      },
+      "protocolTreasury()": {
+        "notice": "Recipient of the protocol treasury fee. The zero address         disables the fee entirely regardless of `protocolTreasuryFee`."
+      },
+      "protocolTreasuryFee()": {
+        "notice": "Protocol treasury fee in basis points (out of 10_000) skimmed         from the staker-bound TRAC on every paid publish / update /         lifetime-extension. The fee is taken out of the amount that         would otherwise flow to the staker reward pool — it does NOT         change the price a publisher pays. Default 300 (3%).         The fee is a no-op while `protocolTreasury == address(0)`         (the full amount flows to stakers), so it stays dormant until         governance wires a treasury recipient via `setProtocolTreasury`."
+      }
+    },
+    "version": 1
+  },
+  "storageLayout": {
+    "storage": [
+      {
+        "astId": 27334,
+        "contract": "contracts/storage/ParametersStorage.sol:ParametersStorage",
+        "label": "hub",
+        "offset": 0,
+        "slot": "0",
+        "type": "t_contract(Hub)46218"
+      },
+      {
+        "astId": 46680,
+        "contract": "contracts/storage/ParametersStorage.sol:ParametersStorage",
+        "label": "minimumStake",
+        "offset": 20,
+        "slot": "0",
+        "type": "t_uint96"
+      },
+      {
+        "astId": 46682,
+        "contract": "contracts/storage/ParametersStorage.sol:ParametersStorage",
+        "label": "maximumStake",
+        "offset": 0,
+        "slot": "1",
+        "type": "t_uint96"
+      },
+      {
+        "astId": 46684,
+        "contract": "contracts/storage/ParametersStorage.sol:ParametersStorage",
+        "label": "stakeWithdrawalDelay",
+        "offset": 0,
+        "slot": "2",
+        "type": "t_uint256"
+      },
+      {
+        "astId": 46686,
+        "contract": "contracts/storage/ParametersStorage.sol:ParametersStorage",
+        "label": "nodeAskUpdateDelay",
+        "offset": 0,
+        "slot": "3",
+        "type": "t_uint256"
+      },
+      {
+        "astId": 46688,
+        "contract": "contracts/storage/ParametersStorage.sol:ParametersStorage",
+        "label": "operatorFeeUpdateDelay",
+        "offset": 0,
+        "slot": "4",
+        "type": "t_uint256"
+      },
+      {
+        "astId": 46690,
+        "contract": "contracts/storage/ParametersStorage.sol:ParametersStorage",
+        "label": "opWalletsLimitOnProfileCreation",
+        "offset": 0,
+        "slot": "5",
+        "type": "t_uint16"
+      },
+      {
+        "astId": 46692,
+        "contract": "contracts/storage/ParametersStorage.sol:ParametersStorage",
+        "label": "shardingTableSizeLimit",
+        "offset": 2,
+        "slot": "5",
+        "type": "t_uint16"
+      },
+      {
+        "astId": 46694,
+        "contract": "contracts/storage/ParametersStorage.sol:ParametersStorage",
+        "label": "minimumRequiredSignatures",
+        "offset": 0,
+        "slot": "6",
+        "type": "t_uint256"
+      },
+      {
+        "astId": 46696,
+        "contract": "contracts/storage/ParametersStorage.sol:ParametersStorage",
+        "label": "askUpperBoundFactor",
+        "offset": 0,
+        "slot": "7",
+        "type": "t_uint256"
+      },
+      {
+        "astId": 46698,
+        "contract": "contracts/storage/ParametersStorage.sol:ParametersStorage",
+        "label": "askLowerBoundFactor",
+        "offset": 0,
+        "slot": "8",
+        "type": "t_uint256"
+      },
+      {
+        "astId": 46700,
+        "contract": "contracts/storage/ParametersStorage.sol:ParametersStorage",
+        "label": "maxOperatorFee",
+        "offset": 0,
+        "slot": "9",
+        "type": "t_uint16"
+      },
+      {
+        "astId": 46702,
+        "contract": "contracts/storage/ParametersStorage.sol:ParametersStorage",
+        "label": "v81ReleaseEpoch",
+        "offset": 0,
+        "slot": "10",
+        "type": "t_uint256"
+      },
+      {
+        "astId": 46704,
+        "contract": "contracts/storage/ParametersStorage.sol:ParametersStorage",
+        "label": "publishingConvictionEpochs",
+        "offset": 0,
+        "slot": "11",
+        "type": "t_uint256"
+      },
+      {
+        "astId": 46707,
+        "contract": "contracts/storage/ParametersStorage.sol:ParametersStorage",
+        "label": "protocolTreasuryFee",
+        "offset": 0,
+        "slot": "12",
+        "type": "t_uint16"
+      },
+      {
+        "astId": 46710,
+        "contract": "contracts/storage/ParametersStorage.sol:ParametersStorage",
+        "label": "protocolTreasury",
+        "offset": 2,
+        "slot": "12",
+        "type": "t_address"
+      },
+      {
+        "astId": 46713,
+        "contract": "contracts/storage/ParametersStorage.sol:ParametersStorage",
+        "label": "contextGraphRegistrationDeposit",
+        "offset": 0,
+        "slot": "13",
+        "type": "t_uint96"
+      }
+    ],
+    "types": {
+      "t_address": {
+        "encoding": "inplace",
+        "label": "address",
+        "numberOfBytes": "20"
+      },
+      "t_contract(Hub)46218": {
+        "encoding": "inplace",
+        "label": "contract Hub",
+        "numberOfBytes": "20"
+      },
+      "t_uint16": {
+        "encoding": "inplace",
+        "label": "uint16",
+        "numberOfBytes": "2"
+      },
+      "t_uint256": {
+        "encoding": "inplace",
+        "label": "uint256",
+        "numberOfBytes": "32"
+      },
+      "t_uint96": {
+        "encoding": "inplace",
+        "label": "uint96",
+        "numberOfBytes": "12"
+      }
+    }
+  }
+}

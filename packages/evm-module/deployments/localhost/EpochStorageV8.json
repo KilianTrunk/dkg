@@ -1,0 +1,1195 @@
+{
+  "address": "0xc9952Fc93Fa9bE383ccB39008c786b9f94eAc95d",
+  "abi": [
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "hubAddress",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "constructor"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "string",
+          "name": "msg",
+          "type": "string"
+        }
+      ],
+      "name": "UnauthorizedAccess",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "ZeroAddressHub",
+      "type": "error"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        },
+        {
+          "indexed": true,
+          "internalType": "uint256",
+          "name": "epoch",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint96",
+          "name": "amount",
+          "type": "uint96"
+        }
+      ],
+      "name": "EpochPublishingAllocationAdded",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "uint256",
+          "name": "shardId",
+          "type": "uint256"
+        },
+        {
+          "indexed": true,
+          "internalType": "uint256",
+          "name": "epoch",
+          "type": "uint256"
+        },
+        {
+          "indexed": true,
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint96",
+          "name": "amount",
+          "type": "uint96"
+        }
+      ],
+      "name": "EpochTokensPaidOut",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "uint256",
+          "name": "shardId",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "startEpoch",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "endEpoch",
+          "type": "uint256"
+        }
+      ],
+      "name": "EpochsFinalized",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "uint256",
+          "name": "shardId",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "startEpoch",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "endEpoch",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint96",
+          "name": "tokenAmount",
+          "type": "uint96"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint96",
+          "name": "remainder",
+          "type": "uint96"
+        }
+      ],
+      "name": "TokensAddedToEpochRange",
+      "type": "event"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "name": "accumulatedRemainder",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        },
+        {
+          "internalType": "uint256",
+          "name": "epoch",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint96",
+          "name": "amount",
+          "type": "uint96"
+        }
+      ],
+      "name": "addEpochPublishingAllocation",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "shardId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "startEpoch",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "endEpoch",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint96",
+          "name": "tokenAmount",
+          "type": "uint96"
+        }
+      ],
+      "name": "addTokensToEpochRange",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "chronos",
+      "outputs": [
+        {
+          "internalType": "contract Chronos",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "name": "cumulative",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "name": "diff",
+      "outputs": [
+        {
+          "internalType": "int96",
+          "name": "",
+          "type": "int96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "name": "distributed",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "name": "epochNodeMaxPublishingAllocation",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "name": "epochPublishingAllocation",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "getCurrentEpochNodeMaxPublishingAllocation",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "shardId",
+          "type": "uint256"
+        }
+      ],
+      "name": "getCurrentEpochPool",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "getCurrentEpochPublishingAllocation",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "shardId",
+          "type": "uint256"
+        }
+      ],
+      "name": "getCurrentEpochRemainingPool",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "shardId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "epoch",
+          "type": "uint256"
+        }
+      ],
+      "name": "getEpochDistributedPool",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "epoch",
+          "type": "uint256"
+        }
+      ],
+      "name": "getEpochNodeMaxPublishingAllocation",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "shardId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "epoch",
+          "type": "uint256"
+        }
+      ],
+      "name": "getEpochPool",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "epoch",
+          "type": "uint256"
+        }
+      ],
+      "name": "getEpochPublishingAllocation",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "shardId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "startEpoch",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "endEpoch",
+          "type": "uint256"
+        }
+      ],
+      "name": "getEpochRangePool",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "shardId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "epoch",
+          "type": "uint256"
+        }
+      ],
+      "name": "getEpochRemainingPool",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        }
+      ],
+      "name": "getNodeCurrentEpochPublishingAllocation",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        }
+      ],
+      "name": "getNodeCurrentEpochPublishingAllocationPercentage",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "shardId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        },
+        {
+          "internalType": "uint256",
+          "name": "epoch",
+          "type": "uint256"
+        }
+      ],
+      "name": "getNodeEpochPaidOut",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        },
+        {
+          "internalType": "uint256",
+          "name": "epoch",
+          "type": "uint256"
+        }
+      ],
+      "name": "getNodeEpochPublishingAllocation",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        },
+        {
+          "internalType": "uint256",
+          "name": "epoch",
+          "type": "uint256"
+        }
+      ],
+      "name": "getNodeEpochPublishingAllocationPercentage",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "shardId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        }
+      ],
+      "name": "getNodePreviousEpochPaidOut",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        }
+      ],
+      "name": "getNodePreviousEpochPublishingAllocation",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        }
+      ],
+      "name": "getNodePreviousEpochPublishingAllocationPercentage",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "shardId",
+          "type": "uint256"
+        }
+      ],
+      "name": "getPreviousEpochDistributedPool",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "getPreviousEpochNodeMaxPublishingAllocation",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "shardId",
+          "type": "uint256"
+        }
+      ],
+      "name": "getPreviousEpochPool",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "getPreviousEpochPublishingAllocation",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "shardId",
+          "type": "uint256"
+        }
+      ],
+      "name": "getPreviousEpochRemainingPool",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "hub",
+      "outputs": [
+        {
+          "internalType": "contract Hub",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "initialize",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "name": "lastFinalizedEpoch",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "fromId",
+          "type": "uint72"
+        },
+        {
+          "internalType": "uint72",
+          "name": "toId",
+          "type": "uint72"
+        },
+        {
+          "internalType": "uint256",
+          "name": "epoch",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint96",
+          "name": "amount",
+          "type": "uint96"
+        }
+      ],
+      "name": "moveEpochPublishingAllocation",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "name",
+      "outputs": [
+        {
+          "internalType": "string",
+          "name": "",
+          "type": "string"
+        }
+      ],
+      "stateMutability": "pure",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "",
+          "type": "uint72"
+        },
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "name": "nodesEpochPublishingAllocation",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint72",
+          "name": "",
+          "type": "uint72"
+        },
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "name": "nodesPaidOut",
+      "outputs": [
+        {
+          "internalType": "uint96",
+          "name": "",
+          "type": "uint96"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "shardId",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "epoch",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint72",
+          "name": "identityId",
+          "type": "uint72"
+        },
+        {
+          "internalType": "uint96",
+          "name": "amount",
+          "type": "uint96"
+        }
+      ],
+      "name": "payOutEpochTokens",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "version",
+      "outputs": [
+        {
+          "internalType": "string",
+          "name": "",
+          "type": "string"
+        }
+      ],
+      "stateMutability": "pure",
+      "type": "function"
+    }
+  ],
+  "transactionHash": "0x9ddeb454426ec7555c66765e71be98cd36da4366692d76f5a60bb0df59eac898",
+  "receipt": {
+    "to": null,
+    "from": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    "contractAddress": "0xc9952Fc93Fa9bE383ccB39008c786b9f94eAc95d",
+    "transactionIndex": 0,
+    "gasUsed": "1859919",
+    "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "blockHash": "0x43ad94f796ac0595a4790e22ae4d429e53e87d594931e1eeb731e8780f6f1b93",
+    "transactionHash": "0x9ddeb454426ec7555c66765e71be98cd36da4366692d76f5a60bb0df59eac898",
+    "logs": [],
+    "blockNumber": 224,
+    "cumulativeGasUsed": "1859919",
+    "status": 1,
+    "byzantium": true
+  },
+  "args": [
+    "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+  ],
+  "numDeployments": 1,
+  "solcInputHash": "25f7b97326fdffc4ccdb60a7767831e0",
+  "metadata": "{\"compiler\":{\"version\":\"0.8.20+commit.a1b79de6\"},\"language\":\"Solidity\",\"output\":{\"abi\":[{\"inputs\":[{\"internalType\":\"address\",\"name\":\"hubAddress\",\"type\":\"address\"}],\"stateMutability\":\"nonpayable\",\"type\":\"constructor\"},{\"inputs\":[{\"internalType\":\"string\",\"name\":\"msg\",\"type\":\"string\"}],\"name\":\"UnauthorizedAccess\",\"type\":\"error\"},{\"inputs\":[],\"name\":\"ZeroAddressHub\",\"type\":\"error\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"},{\"indexed\":true,\"internalType\":\"uint256\",\"name\":\"epoch\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint96\",\"name\":\"amount\",\"type\":\"uint96\"}],\"name\":\"EpochPublishingAllocationAdded\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"uint256\",\"name\":\"shardId\",\"type\":\"uint256\"},{\"indexed\":true,\"internalType\":\"uint256\",\"name\":\"epoch\",\"type\":\"uint256\"},{\"indexed\":true,\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"},{\"indexed\":false,\"internalType\":\"uint96\",\"name\":\"amount\",\"type\":\"uint96\"}],\"name\":\"EpochTokensPaidOut\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"uint256\",\"name\":\"shardId\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"startEpoch\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"endEpoch\",\"type\":\"uint256\"}],\"name\":\"EpochsFinalized\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"uint256\",\"name\":\"shardId\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"startEpoch\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"endEpoch\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint96\",\"name\":\"tokenAmount\",\"type\":\"uint96\"},{\"indexed\":false,\"internalType\":\"uint96\",\"name\":\"remainder\",\"type\":\"uint96\"}],\"name\":\"TokensAddedToEpochRange\",\"type\":\"event\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"name\":\"accumulatedRemainder\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"},{\"internalType\":\"uint256\",\"name\":\"epoch\",\"type\":\"uint256\"},{\"internalType\":\"uint96\",\"name\":\"amount\",\"type\":\"uint96\"}],\"name\":\"addEpochPublishingAllocation\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"shardId\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"startEpoch\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"endEpoch\",\"type\":\"uint256\"},{\"internalType\":\"uint96\",\"name\":\"tokenAmount\",\"type\":\"uint96\"}],\"name\":\"addTokensToEpochRange\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"chronos\",\"outputs\":[{\"internalType\":\"contract Chronos\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"name\":\"cumulative\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"name\":\"diff\",\"outputs\":[{\"internalType\":\"int96\",\"name\":\"\",\"type\":\"int96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"name\":\"distributed\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"name\":\"epochNodeMaxPublishingAllocation\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"name\":\"epochPublishingAllocation\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"getCurrentEpochNodeMaxPublishingAllocation\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"shardId\",\"type\":\"uint256\"}],\"name\":\"getCurrentEpochPool\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"getCurrentEpochPublishingAllocation\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"shardId\",\"type\":\"uint256\"}],\"name\":\"getCurrentEpochRemainingPool\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"shardId\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"epoch\",\"type\":\"uint256\"}],\"name\":\"getEpochDistributedPool\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"epoch\",\"type\":\"uint256\"}],\"name\":\"getEpochNodeMaxPublishingAllocation\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"shardId\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"epoch\",\"type\":\"uint256\"}],\"name\":\"getEpochPool\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"epoch\",\"type\":\"uint256\"}],\"name\":\"getEpochPublishingAllocation\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"shardId\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"startEpoch\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"endEpoch\",\"type\":\"uint256\"}],\"name\":\"getEpochRangePool\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"shardId\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"epoch\",\"type\":\"uint256\"}],\"name\":\"getEpochRemainingPool\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"}],\"name\":\"getNodeCurrentEpochPublishingAllocation\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"}],\"name\":\"getNodeCurrentEpochPublishingAllocationPercentage\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"shardId\",\"type\":\"uint256\"},{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"},{\"internalType\":\"uint256\",\"name\":\"epoch\",\"type\":\"uint256\"}],\"name\":\"getNodeEpochPaidOut\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"},{\"internalType\":\"uint256\",\"name\":\"epoch\",\"type\":\"uint256\"}],\"name\":\"getNodeEpochPublishingAllocation\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"},{\"internalType\":\"uint256\",\"name\":\"epoch\",\"type\":\"uint256\"}],\"name\":\"getNodeEpochPublishingAllocationPercentage\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"shardId\",\"type\":\"uint256\"},{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"}],\"name\":\"getNodePreviousEpochPaidOut\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"}],\"name\":\"getNodePreviousEpochPublishingAllocation\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"}],\"name\":\"getNodePreviousEpochPublishingAllocationPercentage\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"shardId\",\"type\":\"uint256\"}],\"name\":\"getPreviousEpochDistributedPool\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"getPreviousEpochNodeMaxPublishingAllocation\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"shardId\",\"type\":\"uint256\"}],\"name\":\"getPreviousEpochPool\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"getPreviousEpochPublishingAllocation\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"shardId\",\"type\":\"uint256\"}],\"name\":\"getPreviousEpochRemainingPool\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"hub\",\"outputs\":[{\"internalType\":\"contract Hub\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"initialize\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"name\":\"lastFinalizedEpoch\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"fromId\",\"type\":\"uint72\"},{\"internalType\":\"uint72\",\"name\":\"toId\",\"type\":\"uint72\"},{\"internalType\":\"uint256\",\"name\":\"epoch\",\"type\":\"uint256\"},{\"internalType\":\"uint96\",\"name\":\"amount\",\"type\":\"uint96\"}],\"name\":\"moveEpochPublishingAllocation\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"name\",\"outputs\":[{\"internalType\":\"string\",\"name\":\"\",\"type\":\"string\"}],\"stateMutability\":\"pure\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"\",\"type\":\"uint72\"},{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"name\":\"nodesEpochPublishingAllocation\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint72\",\"name\":\"\",\"type\":\"uint72\"},{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"name\":\"nodesPaidOut\",\"outputs\":[{\"internalType\":\"uint96\",\"name\":\"\",\"type\":\"uint96\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"shardId\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"epoch\",\"type\":\"uint256\"},{\"internalType\":\"uint72\",\"name\":\"identityId\",\"type\":\"uint72\"},{\"internalType\":\"uint96\",\"name\":\"amount\",\"type\":\"uint96\"}],\"name\":\"payOutEpochTokens\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"version\",\"outputs\":[{\"internalType\":\"string\",\"name\":\"\",\"type\":\"string\"}],\"stateMutability\":\"pure\",\"type\":\"function\"}],\"devdoc\":{\"kind\":\"dev\",\"methods\":{\"moveEpochPublishingAllocation(uint72,uint72,uint256,uint96)\":{\"details\":\"`epochNodeMaxPublishingAllocation` is a per-epoch HIGH-WATER         MARK, maintained identically on the add and move paths: it is         only ever RAISED (when the destination's new value exceeds it),         never lowered by the `fromId` decrement \\u2014 computing the true         current max after a decrement would need an O(nodes) scan.         Nothing on-chain reads it (scoring reads only         get(Node)EpochPublishingAllocation); it exists for off-chain         observability, for which the high-water-mark semantic is correct.\"}},\"version\":1},\"userdoc\":{\"kind\":\"user\",\"methods\":{\"moveEpochPublishingAllocation(uint72,uint72,uint256,uint96)\":{\"notice\":\"OT-RFC-51: move `amount` of publishing allocation from one         node to another within a single `epoch`. Used when a PCA         re-designates its primary node \\u2014 the epoch total         (`epochPublishingAllocation`, i.e. K_total) is intentionally         NOT touched, so the move is net-zero on the denominator of         every node's publishing factor.\"}},\"version\":1}},\"settings\":{\"compilationTarget\":{\"contracts/storage/EpochStorage.sol\":\"EpochStorage\"},\"evmVersion\":\"london\",\"libraries\":{},\"metadata\":{\"bytecodeHash\":\"ipfs\",\"useLiteralContent\":true},\"optimizer\":{\"enabled\":true,\"runs\":200},\"remappings\":[],\"viaIR\":true},\"sources\":{\"@openzeppelin/contracts/access/Ownable.sol\":{\"content\":\"// SPDX-License-Identifier: MIT\\n// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)\\n\\npragma solidity ^0.8.20;\\n\\nimport {Context} from \\\"../utils/Context.sol\\\";\\n\\n/**\\n * @dev Contract module which provides a basic access control mechanism, where\\n * there is an account (an owner) that can be granted exclusive access to\\n * specific functions.\\n *\\n * The initial owner is set to the address provided by the deployer. This can\\n * later be changed with {transferOwnership}.\\n *\\n * This module is used through inheritance. It will make available the modifier\\n * `onlyOwner`, which can be applied to your functions to restrict their use to\\n * the owner.\\n */\\nabstract contract Ownable is Context {\\n    address private _owner;\\n\\n    /**\\n     * @dev The caller account is not authorized to perform an operation.\\n     */\\n    error OwnableUnauthorizedAccount(address account);\\n\\n    /**\\n     * @dev The owner is not a valid owner account. (eg. `address(0)`)\\n     */\\n    error OwnableInvalidOwner(address owner);\\n\\n    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);\\n\\n    /**\\n     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.\\n     */\\n    constructor(address initialOwner) {\\n        if (initialOwner == address(0)) {\\n            revert OwnableInvalidOwner(address(0));\\n        }\\n        _transferOwnership(initialOwner);\\n    }\\n\\n    /**\\n     * @dev Throws if called by any account other than the owner.\\n     */\\n    modifier onlyOwner() {\\n        _checkOwner();\\n        _;\\n    }\\n\\n    /**\\n     * @dev Returns the address of the current owner.\\n     */\\n    function owner() public view virtual returns (address) {\\n        return _owner;\\n    }\\n\\n    /**\\n     * @dev Throws if the sender is not the owner.\\n     */\\n    function _checkOwner() internal view virtual {\\n        if (owner() != _msgSender()) {\\n            revert OwnableUnauthorizedAccount(_msgSender());\\n        }\\n    }\\n\\n    /**\\n     * @dev Leaves the contract without owner. It will not be possible to call\\n     * `onlyOwner` functions. Can only be called by the current owner.\\n     *\\n     * NOTE: Renouncing ownership will leave the contract without an owner,\\n     * thereby disabling any functionality that is only available to the owner.\\n     */\\n    function renounceOwnership() public virtual onlyOwner {\\n        _transferOwnership(address(0));\\n    }\\n\\n    /**\\n     * @dev Transfers ownership of the contract to a new account (`newOwner`).\\n     * Can only be called by the current owner.\\n     */\\n    function transferOwnership(address newOwner) public virtual onlyOwner {\\n        if (newOwner == address(0)) {\\n            revert OwnableInvalidOwner(address(0));\\n        }\\n        _transferOwnership(newOwner);\\n    }\\n\\n    /**\\n     * @dev Transfers ownership of the contract to a new account (`newOwner`).\\n     * Internal function without access restriction.\\n     */\\n    function _transferOwnership(address newOwner) internal virtual {\\n        address oldOwner = _owner;\\n        _owner = newOwner;\\n        emit OwnershipTransferred(oldOwner, newOwner);\\n    }\\n}\\n\",\"keccak256\":\"0xff6d0bb2e285473e5311d9d3caacb525ae3538a80758c10649a4d61029b017bb\",\"license\":\"MIT\"},\"@openzeppelin/contracts/utils/Context.sol\":{\"content\":\"// SPDX-License-Identifier: MIT\\n// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)\\n\\npragma solidity ^0.8.20;\\n\\n/**\\n * @dev Provides information about the current execution context, including the\\n * sender of the transaction and its data. While these are generally available\\n * via msg.sender and msg.data, they should not be accessed in such a direct\\n * manner, since when dealing with meta-transactions the account sending and\\n * paying for execution may not be the actual sender (as far as an application\\n * is concerned).\\n *\\n * This contract is only required for intermediate, library-like contracts.\\n */\\nabstract contract Context {\\n    function _msgSender() internal view virtual returns (address) {\\n        return msg.sender;\\n    }\\n\\n    function _msgData() internal view virtual returns (bytes calldata) {\\n        return msg.data;\\n    }\\n\\n    function _contextSuffixLength() internal view virtual returns (uint256) {\\n        return 0;\\n    }\\n}\\n\",\"keccak256\":\"0x493033a8d1b176a037b2cc6a04dad01a5c157722049bbecf632ca876224dd4b2\",\"license\":\"MIT\"},\"contracts/abstract/HubDependent.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nimport {Hub} from \\\"../storage/Hub.sol\\\";\\nimport {HubLib} from \\\"../libraries/HubLib.sol\\\";\\n\\nabstract contract HubDependent {\\n    Hub public hub;\\n\\n    constructor(address hubAddress) {\\n        if (hubAddress == address(0)) {\\n            revert HubLib.ZeroAddressHub();\\n        }\\n\\n        hub = Hub(hubAddress);\\n    }\\n\\n    modifier onlyHub() {\\n        _checkHub();\\n        _;\\n    }\\n\\n    modifier onlyHubOwner() {\\n        _checkHubOwner();\\n        _;\\n    }\\n\\n    modifier onlyContracts() {\\n        _checkHubContract();\\n        _;\\n    }\\n\\n    function _checkHub() internal view virtual {\\n        if (msg.sender != address(hub) && msg.sender != hub.owner()) {\\n            revert HubLib.UnauthorizedAccess(\\\"Only Hub\\\");\\n        }\\n    }\\n\\n    function _checkHubOwner() internal view virtual {\\n        if (msg.sender != hub.owner()) {\\n            revert HubLib.UnauthorizedAccess(\\\"Only Hub Owner\\\");\\n        }\\n    }\\n\\n    function _checkHubContract() internal view virtual {\\n        if (!hub.isContract(msg.sender) && msg.sender != hub.owner()) {\\n            revert HubLib.UnauthorizedAccess(\\\"Only Contracts in Hub\\\");\\n        }\\n    }\\n}\\n\",\"keccak256\":\"0x643f4dcb2699e967c2ffbfb7c412e0973abc1409e0753a35f75c4661b89f977d\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/IContractStatus.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface IContractStatus {\\n    function setStatus(bool _status) external;\\n}\\n\",\"keccak256\":\"0x0eaaee7100a88d51de69ac7ec4d5e58d9bdd2582537476631a0717379ca16c40\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/ICustodian.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface ICustodian {\\n    function getOwners() external view returns (address[] memory);\\n}\\n\",\"keccak256\":\"0x513e0babede5cc394427a5fb941c80c255be8716e24ff5ee4ea7a6e18335e0b0\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/IInitializable.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface IInitializable {\\n    function initialize() external;\\n}\\n\",\"keccak256\":\"0xad07f8f7bb2bad96f3d5c97ef6673e15574ad11701be1ac9feb94f750c0dee51\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/INamed.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface INamed {\\n    function name() external view returns (string memory);\\n}\\n\",\"keccak256\":\"0x111fc7e3f1b6c9e9da05cecf65d9985177bcface705870536fe409089b89a27c\",\"license\":\"Apache-2.0\"},\"contracts/interfaces/IVersioned.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ninterface IVersioned {\\n    function version() external view returns (string memory);\\n}\\n\",\"keccak256\":\"0x5e104c26deb107969a5bc1f38614f11af0261fc84f1ebbd2ab3bd064b4795de0\",\"license\":\"Apache-2.0\"},\"contracts/libraries/HubLib.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nlibrary HubLib {\\n    struct Contract {\\n        string name;\\n        address addr;\\n    }\\n\\n    struct ForwardCallInputArgs {\\n        string contractName;\\n        bytes[] encodedData;\\n    }\\n\\n    error ZeroAddressHub();\\n    error UnauthorizedAccess(string msg);\\n    error InvalidTargetContract(address addr);\\n    error ContractNotRegistered(string contractName);\\n}\\n\",\"keccak256\":\"0xcb693696568e706c95ff32538831d177d379e28f7fd0518b787c1d7a5334d71b\",\"license\":\"Apache-2.0\"},\"contracts/libraries/UnorderedNamedContractDynamicSet.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nlibrary UnorderedNamedContractDynamicSet {\\n    struct Contract {\\n        string name;\\n        address addr;\\n    }\\n\\n    struct Set {\\n        mapping(string => uint256) stringIndexPointers;\\n        mapping(address => uint256) addressIndexPointers;\\n        Contract[] contractList;\\n    }\\n\\n    error EmptyName();\\n    error ZeroAddress();\\n    error ContractAlreadyExists(string name);\\n    error AddressAlreadyInSet(address addr);\\n    error ContractDoesNotExist(string name);\\n    error AddressDoesNotExist(address addr);\\n\\n    function append(UnorderedNamedContractDynamicSet.Set storage self, string calldata name, address addr) internal {\\n        if (keccak256(abi.encodePacked(name)) == keccak256(abi.encodePacked(\\\"\\\"))) revert EmptyName();\\n        if (addr == address(0)) revert ZeroAddress();\\n        if (exists(self, name)) revert ContractAlreadyExists(name);\\n        if (self.contractList.length > 0 && (self.addressIndexPointers[addr] != 0 || self.contractList[0].addr == addr))\\n            revert AddressAlreadyInSet(addr);\\n\\n        self.stringIndexPointers[name] = size(self);\\n        self.addressIndexPointers[addr] = size(self);\\n        self.contractList.push(UnorderedNamedContractDynamicSet.Contract(name, addr));\\n    }\\n\\n    function update(UnorderedNamedContractDynamicSet.Set storage self, string calldata name, address addr) internal {\\n        if (addr == address(0)) revert ZeroAddress();\\n        if (!exists(self, name)) revert ContractDoesNotExist(name);\\n\\n        address currentAddr = self.contractList[self.stringIndexPointers[name]].addr;\\n        if (currentAddr == addr) {\\n            // Idempotent: same address already registered for this name (e.g. re-run deploy in tests).\\n            return;\\n        }\\n        if (self.contractList.length > 0 && (self.addressIndexPointers[addr] != 0 || self.contractList[0].addr == addr))\\n            revert AddressAlreadyInSet(addr);\\n\\n        delete self.addressIndexPointers[currentAddr];\\n        self.addressIndexPointers[addr] = self.stringIndexPointers[name];\\n        self.contractList[self.stringIndexPointers[name]].addr = addr;\\n    }\\n\\n    function remove(UnorderedNamedContractDynamicSet.Set storage self, string calldata name) internal {\\n        if (!exists(self, name)) revert ContractDoesNotExist(name);\\n\\n        uint256 contractToRemoveIndex = self.stringIndexPointers[name];\\n\\n        delete self.addressIndexPointers[self.contractList[contractToRemoveIndex].addr];\\n\\n        UnorderedNamedContractDynamicSet.Contract memory contractToMove = self.contractList[size(self) - 1];\\n\\n        self.stringIndexPointers[contractToMove.name] = contractToRemoveIndex;\\n        self.addressIndexPointers[contractToMove.addr] = contractToRemoveIndex;\\n        self.contractList[contractToRemoveIndex] = contractToMove;\\n\\n        delete self.stringIndexPointers[name];\\n        self.contractList.pop();\\n    }\\n\\n    function remove(UnorderedNamedContractDynamicSet.Set storage self, address addr) internal {\\n        if (!exists(self, addr)) revert AddressDoesNotExist(addr);\\n\\n        uint256 contractToRemoveIndex = self.addressIndexPointers[addr];\\n\\n        delete self.stringIndexPointers[self.contractList[contractToRemoveIndex].name];\\n\\n        UnorderedNamedContractDynamicSet.Contract memory contractToMove = self.contractList[size(self) - 1];\\n\\n        self.stringIndexPointers[contractToMove.name] = contractToRemoveIndex;\\n        self.addressIndexPointers[contractToMove.addr] = contractToRemoveIndex;\\n        self.contractList[contractToRemoveIndex] = contractToMove;\\n\\n        delete self.addressIndexPointers[addr];\\n        self.contractList.pop();\\n    }\\n\\n    function get(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        string calldata name\\n    ) internal view returns (UnorderedNamedContractDynamicSet.Contract memory) {\\n        if (!exists(self, name)) revert ContractDoesNotExist(name);\\n\\n        return self.contractList[self.stringIndexPointers[name]];\\n    }\\n\\n    function get(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        address addr\\n    ) internal view returns (UnorderedNamedContractDynamicSet.Contract memory) {\\n        if (!exists(self, addr)) revert AddressDoesNotExist(addr);\\n\\n        return self.contractList[self.addressIndexPointers[addr]];\\n    }\\n\\n    function get(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        uint256 index\\n    ) internal view returns (UnorderedNamedContractDynamicSet.Contract memory) {\\n        return self.contractList[index];\\n    }\\n\\n    function getAll(\\n        UnorderedNamedContractDynamicSet.Set storage self\\n    ) internal view returns (UnorderedNamedContractDynamicSet.Contract[] memory) {\\n        return self.contractList;\\n    }\\n\\n    function getIndex(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        string calldata name\\n    ) internal view returns (uint256) {\\n        return self.stringIndexPointers[name];\\n    }\\n\\n    function getIndex(UnorderedNamedContractDynamicSet.Set storage self, address addr) internal view returns (uint256) {\\n        return self.addressIndexPointers[addr];\\n    }\\n\\n    function exists(\\n        UnorderedNamedContractDynamicSet.Set storage self,\\n        string calldata name\\n    ) internal view returns (bool) {\\n        if (size(self) == 0) {\\n            return false;\\n        }\\n        return\\n            keccak256(abi.encodePacked(self.contractList[self.stringIndexPointers[name]].name)) ==\\n            keccak256(abi.encodePacked(name));\\n    }\\n\\n    function exists(UnorderedNamedContractDynamicSet.Set storage self, address addr) internal view returns (bool) {\\n        if (size(self) == 0) {\\n            return false;\\n        }\\n        return addr == self.contractList[self.addressIndexPointers[addr]].addr;\\n    }\\n\\n    function size(UnorderedNamedContractDynamicSet.Set storage self) internal view returns (uint256) {\\n        return self.contractList.length;\\n    }\\n}\\n\",\"keccak256\":\"0x51b09c4bc2d3342e78c0a77eceff9ba5a7e694ba663535abec0e859c5e32b5ab\",\"license\":\"Apache-2.0\"},\"contracts/storage/Chronos.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\ncontract Chronos {\\n    uint256 public immutable START_TIME;\\n    uint256 public immutable EPOCH_LENGTH;\\n\\n    error InvalidStartTime();\\n    error InvalidEpochLength();\\n\\n    constructor(uint256 _startTime, uint256 _epochLength) {\\n        if (_startTime <= 0) {\\n            revert InvalidStartTime();\\n        }\\n        if (_epochLength <= 0) {\\n            revert InvalidEpochLength();\\n        }\\n\\n        START_TIME = _startTime;\\n        EPOCH_LENGTH = _epochLength;\\n    }\\n\\n    function startTime() external view returns (uint256) {\\n        return START_TIME;\\n    }\\n\\n    function epochLength() external view returns (uint256) {\\n        return EPOCH_LENGTH;\\n    }\\n\\n    function getCurrentEpoch() external view returns (uint256) {\\n        if (block.timestamp < START_TIME) {\\n            return 1;\\n        }\\n        return ((block.timestamp - START_TIME) / EPOCH_LENGTH) + 1;\\n    }\\n\\n    function epochAtTimestamp(uint256 timestamp) external view returns (uint256) {\\n        if (timestamp < START_TIME) {\\n            return 1;\\n        }\\n        return ((timestamp - START_TIME) / EPOCH_LENGTH) + 1;\\n    }\\n\\n    function timeUntilNextEpoch() external view returns (uint256) {\\n        if (block.timestamp < START_TIME) {\\n            return START_TIME + EPOCH_LENGTH - block.timestamp;\\n        }\\n        // Slither: `block.timestamp % EPOCH_LENGTH` is flagged as weak-PRNG\\n        // because miners can nudge `block.timestamp` within a small window.\\n        // This is deterministic time math, NOT randomness \\u2014 the modulo\\n        // computes \\\"seconds elapsed since the start of the current epoch\\\",\\n        // which has the same minor miner-influence as `block.timestamp`\\n        // itself does (already trusted protocol-wide for epoch advancement).\\n        // No randomness derivation, no PRNG semantics.\\n        // slither-disable-next-line weak-prng\\n        uint256 elapsed = (block.timestamp - START_TIME) % EPOCH_LENGTH;\\n        return EPOCH_LENGTH - elapsed;\\n    }\\n\\n    function hasEpochElapsed(uint256 epochNumber) external view returns (bool) {\\n        return block.timestamp >= (START_TIME + (epochNumber - 1) * EPOCH_LENGTH);\\n    }\\n\\n    function timestampForEpoch(uint256 epochNumber) external view returns (uint256) {\\n        if (epochNumber == 0) {\\n            return 0;\\n        }\\n        return START_TIME + (epochNumber - 1) * EPOCH_LENGTH;\\n    }\\n\\n    function elapsedTimeInCurrentEpoch() external view returns (uint256) {\\n        if (block.timestamp < START_TIME) {\\n            return 0;\\n        }\\n        // Slither weak-prng \\u2014 deterministic time math, not randomness.\\n        // See `timeUntilNextEpoch` above for the long-form rationale.\\n        // slither-disable-next-line weak-prng\\n        return (block.timestamp - START_TIME) % EPOCH_LENGTH;\\n    }\\n\\n    function totalElapsedTime() external view returns (uint256) {\\n        if (block.timestamp < START_TIME) {\\n            return 0;\\n        }\\n        return block.timestamp - START_TIME;\\n    }\\n\\n    function isChronosActive() external view returns (bool) {\\n        return block.timestamp >= START_TIME;\\n    }\\n}\\n\",\"keccak256\":\"0x1c1fa02e0ea347116b72bf3d9df60a3fedce60a02f4c0f7b6ebdf9379cf68ced\",\"license\":\"Apache-2.0\"},\"contracts/storage/EpochStorage.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nimport {Chronos} from \\\"./Chronos.sol\\\";\\nimport {HubDependent} from \\\"../abstract/HubDependent.sol\\\";\\nimport {INamed} from \\\"../interfaces/INamed.sol\\\";\\nimport {IVersioned} from \\\"../interfaces/IVersioned.sol\\\";\\n\\ncontract EpochStorage is INamed, IVersioned, HubDependent {\\n    string private constant _NAME = \\\"EpochStorage\\\";\\n    // 10.0.4 \\u2014 OT-RFC-51 \\\"Publishing Allocation\\\": the per-node\\n    //          produced-knowledge-value accounting is repurposed as\\n    //          committed PCA \\\"publishing allocation\\\". The mappings,\\n    //          mutator, event, and getters are renamed\\n    //          (`*ProducedKnowledgeValue*` -> `*PublishingAllocation*`)\\n    //          and a net-zero `moveEpochPublishingAllocation` mutator is\\n    //          added so a PCA can re-designate its primary node without\\n    //          changing the epoch total (K_total).\\n    string private constant _VERSION = \\\"10.0.4\\\";\\n\\n    event EpochPublishingAllocationAdded(uint72 indexed identityId, uint256 indexed epoch, uint96 amount);\\n    event TokensAddedToEpochRange(\\n        uint256 indexed shardId,\\n        uint256 startEpoch,\\n        uint256 endEpoch,\\n        uint96 tokenAmount,\\n        uint96 remainder\\n    );\\n    event EpochTokensPaidOut(uint256 indexed shardId, uint256 indexed epoch, uint72 indexed identityId, uint96 amount);\\n    event EpochsFinalized(uint256 indexed shardId, uint256 startEpoch, uint256 endEpoch);\\n\\n    Chronos public chronos;\\n\\n    mapping(uint256 => uint256) public lastFinalizedEpoch;\\n    mapping(uint256 => uint96) public accumulatedRemainder;\\n\\n    mapping(uint256 => mapping(uint256 => int96)) public diff;\\n    mapping(uint256 => mapping(uint256 => uint96)) public cumulative;\\n    mapping(uint256 => mapping(uint256 => uint96)) public distributed;\\n\\n    mapping(uint72 => mapping(uint256 => uint96)) public nodesEpochPublishingAllocation;\\n    mapping(uint256 => uint96) public epochPublishingAllocation;\\n    mapping(uint256 => uint96) public epochNodeMaxPublishingAllocation;\\n\\n    mapping(uint72 => mapping(uint256 => mapping(uint256 => uint96))) public nodesPaidOut;\\n\\n    constructor(address hubAddress) HubDependent(hubAddress) {}\\n\\n    function initialize() public onlyHub {\\n        chronos = Chronos(hub.getContractAddress(\\\"Chronos\\\"));\\n    }\\n\\n    function name() external pure virtual override returns (string memory) {\\n        return _NAME;\\n    }\\n\\n    function version() external pure virtual override returns (string memory) {\\n        return _VERSION;\\n    }\\n\\n    function addEpochPublishingAllocation(\\n        uint72 identityId,\\n        uint256 epoch,\\n        uint96 amount\\n    ) external onlyContracts {\\n        nodesEpochPublishingAllocation[identityId][epoch] += amount;\\n        epochPublishingAllocation[epoch] += amount;\\n\\n        // Maintain the per-epoch node max so its (public) getters stay\\n        // consistent. The OT-RFC-51 scoring path does NOT read it\\n        // (RandomSampling reads only getNodeEpochPublishingAllocation /\\n        // getEpochPublishingAllocation), but the mapping cannot be removed \\u2014\\n        // it precedes `nodesPaidOut` in this persistent (non-fresh-state)\\n        // storage layout \\u2014 and leaving it written-nowhere/read-in-getters\\n        // trips Slither's uninitialized-state finding. The compare/SSTORE is\\n        // negligible against the surrounding accounting.\\n        if (nodesEpochPublishingAllocation[identityId][epoch] > epochNodeMaxPublishingAllocation[epoch]) {\\n            epochNodeMaxPublishingAllocation[epoch] = nodesEpochPublishingAllocation[identityId][epoch];\\n        }\\n\\n        emit EpochPublishingAllocationAdded(identityId, epoch, amount);\\n    }\\n\\n    /// @notice OT-RFC-51: move `amount` of publishing allocation from one\\n    ///         node to another within a single `epoch`. Used when a PCA\\n    ///         re-designates its primary node \\u2014 the epoch total\\n    ///         (`epochPublishingAllocation`, i.e. K_total) is intentionally\\n    ///         NOT touched, so the move is net-zero on the denominator of\\n    ///         every node's publishing factor.\\n    /// @dev    `epochNodeMaxPublishingAllocation` is a per-epoch HIGH-WATER\\n    ///         MARK, maintained identically on the add and move paths: it is\\n    ///         only ever RAISED (when the destination's new value exceeds it),\\n    ///         never lowered by the `fromId` decrement \\u2014 computing the true\\n    ///         current max after a decrement would need an O(nodes) scan.\\n    ///         Nothing on-chain reads it (scoring reads only\\n    ///         get(Node)EpochPublishingAllocation); it exists for off-chain\\n    ///         observability, for which the high-water-mark semantic is correct.\\n    function moveEpochPublishingAllocation(\\n        uint72 fromId,\\n        uint72 toId,\\n        uint256 epoch,\\n        uint96 amount\\n    ) external onlyContracts {\\n        nodesEpochPublishingAllocation[fromId][epoch] -= amount;\\n        nodesEpochPublishingAllocation[toId][epoch] += amount; // epoch total unchanged -> K_total net-zero\\n\\n        if (nodesEpochPublishingAllocation[toId][epoch] > epochNodeMaxPublishingAllocation[epoch]) {\\n            epochNodeMaxPublishingAllocation[epoch] = nodesEpochPublishingAllocation[toId][epoch];\\n        }\\n    }\\n\\n    function getEpochPublishingAllocation(uint256 epoch) external view returns (uint96) {\\n        return epochPublishingAllocation[epoch];\\n    }\\n\\n    function getCurrentEpochPublishingAllocation() external view returns (uint96) {\\n        return epochPublishingAllocation[chronos.getCurrentEpoch()];\\n    }\\n\\n    function getPreviousEpochPublishingAllocation() external view returns (uint96) {\\n        uint256 currentEpoch = chronos.getCurrentEpoch();\\n        if (currentEpoch <= 1) {\\n            return 0;\\n        }\\n        return epochPublishingAllocation[currentEpoch - 1];\\n    }\\n\\n    function getNodeEpochPublishingAllocation(uint72 identityId, uint256 epoch) external view returns (uint96) {\\n        return nodesEpochPublishingAllocation[identityId][epoch];\\n    }\\n\\n    function getNodeCurrentEpochPublishingAllocation(uint72 identityId) external view returns (uint96) {\\n        return nodesEpochPublishingAllocation[identityId][chronos.getCurrentEpoch()];\\n    }\\n\\n    function getNodePreviousEpochPublishingAllocation(uint72 identityId) external view returns (uint96) {\\n        uint256 currentEpoch = chronos.getCurrentEpoch();\\n        if (currentEpoch <= 1) {\\n            return 0;\\n        }\\n        return nodesEpochPublishingAllocation[identityId][currentEpoch - 1];\\n    }\\n\\n    function getEpochNodeMaxPublishingAllocation(uint256 epoch) external view returns (uint96) {\\n        return epochNodeMaxPublishingAllocation[epoch];\\n    }\\n\\n    function getCurrentEpochNodeMaxPublishingAllocation() external view returns (uint96) {\\n        return epochNodeMaxPublishingAllocation[chronos.getCurrentEpoch()];\\n    }\\n\\n    function getPreviousEpochNodeMaxPublishingAllocation() external view returns (uint96) {\\n        uint256 currentEpoch = chronos.getCurrentEpoch();\\n        if (currentEpoch <= 1) {\\n            return 0;\\n        }\\n        return epochNodeMaxPublishingAllocation[currentEpoch - 1];\\n    }\\n\\n    function getNodeEpochPublishingAllocationPercentage(\\n        uint72 identityId,\\n        uint256 epoch\\n    ) external view returns (uint256) {\\n        if (epochPublishingAllocation[epoch] == 0) {\\n            return 0;\\n        }\\n\\n        return\\n            (uint256(nodesEpochPublishingAllocation[identityId][epoch]) * 1e18) / epochPublishingAllocation[epoch];\\n    }\\n\\n    function getNodeCurrentEpochPublishingAllocationPercentage(uint72 identityId) external view returns (uint256) {\\n        uint256 currentEpoch = chronos.getCurrentEpoch();\\n\\n        if (epochPublishingAllocation[currentEpoch] == 0) {\\n            return 0;\\n        }\\n\\n        return ((uint256(nodesEpochPublishingAllocation[identityId][currentEpoch]) * 1e18) /\\n            epochPublishingAllocation[currentEpoch]);\\n    }\\n\\n    function getNodePreviousEpochPublishingAllocationPercentage(uint72 identityId) external view returns (uint256) {\\n        uint256 currentEpoch = chronos.getCurrentEpoch();\\n        if (currentEpoch <= 1 || epochPublishingAllocation[currentEpoch - 1] == 0) {\\n            return 0;\\n        }\\n        return ((uint256(nodesEpochPublishingAllocation[identityId][currentEpoch - 1]) * 1e18) /\\n            epochPublishingAllocation[currentEpoch - 1]);\\n    }\\n\\n    function addTokensToEpochRange(\\n        uint256 shardId,\\n        uint256 startEpoch,\\n        uint256 endEpoch,\\n        uint96 tokenAmount\\n    ) external onlyContracts {\\n        // SECURITY FIX: a credit whose startEpoch is already FINALIZED is\\n        // otherwise lost forever. `_finalizeEpochsUpTo` only folds `diff` for\\n        // `(lastFinalizedEpoch, currentEpoch-1]` and never revisits a finalized\\n        // epoch, so `diff[startEpoch] += p` at `startEpoch <= lastFinalizedEpoch`\\n        // is never folded into `cumulative` (the tokens vanish \\u2014 stranded in the\\n        // contract with no payable pool entry) and the paired\\n        // `diff[endEpoch+1] -= p` later under-credits an unrelated future epoch.\\n        //\\n        // Clamp the range up to `lastFinalizedEpoch + 1` \\u2014 the first epoch NOT\\n        // yet folded into `cumulative`, and therefore still payable (epochs above\\n        // `lastFinalizedEpoch` are read via on-the-fly simulation in\\n        // `getEpochPool`). This is the minimal correction: it rescues only the\\n        // credits that were genuinely lost (finalized epochs) and lands them in\\n        // the CLOSEST still-creditable epoch, preserving the caller's intended\\n        // attribution as much as possible \\u2014 PublishingConviction deliberately\\n        // attributes a closed billing window to the chain epochs it overlapped,\\n        // so forcing `currentEpoch` here would misattribute/delay those rewards\\n        // on an idle shard. Any stricter \\\"settle into the current epoch\\\" policy\\n        // belongs at the specific caller, not in this shared primitive. Clamp,\\n        // don't revert: lazy past-window settlement is an intended pattern.\\n        uint256 firstOpenEpoch = lastFinalizedEpoch[shardId] + 1;\\n        if (startEpoch < firstOpenEpoch) {\\n            startEpoch = firstOpenEpoch;\\n            if (endEpoch < startEpoch) {\\n                endEpoch = startEpoch;\\n            }\\n        }\\n\\n        uint256 numEpochs = endEpoch - startEpoch + 1;\\n\\n        uint96 totalTokens = tokenAmount + accumulatedRemainder[shardId];\\n        uint96 tokensPerEpochU = uint96(totalTokens / numEpochs);\\n        uint96 remainder = uint96(totalTokens % numEpochs);\\n\\n        accumulatedRemainder[shardId] = remainder;\\n\\n        int96 tokensPerEpoch = int96(tokensPerEpochU);\\n\\n        diff[shardId][startEpoch] += tokensPerEpoch;\\n        diff[shardId][endEpoch + 1] -= tokensPerEpoch;\\n\\n        uint256 currentEpoch = chronos.getCurrentEpoch();\\n        if (currentEpoch > 1) {\\n            _finalizeEpochsUpTo(shardId, currentEpoch - 1);\\n        }\\n\\n        emit TokensAddedToEpochRange(shardId, startEpoch, endEpoch, tokenAmount, remainder);\\n    }\\n\\n    function payOutEpochTokens(\\n        uint256 shardId,\\n        uint256 epoch,\\n        uint72 identityId,\\n        uint96 amount\\n    ) external onlyContracts {\\n        uint256 currentEpoch = chronos.getCurrentEpoch();\\n        if (currentEpoch > 1) {\\n            _finalizeEpochsUpTo(shardId, currentEpoch - 1);\\n        }\\n\\n        distributed[shardId][epoch] += amount;\\n        nodesPaidOut[identityId][shardId][epoch] += amount;\\n\\n        emit EpochTokensPaidOut(shardId, epoch, identityId, amount);\\n    }\\n\\n    function getEpochPool(uint256 shardId, uint256 epoch) public view returns (uint96) {\\n        if (epoch <= lastFinalizedEpoch[shardId]) {\\n            return cumulative[shardId][epoch];\\n        } else {\\n            return _simulateEpochFinalization(shardId, epoch);\\n        }\\n    }\\n\\n    function getEpochRemainingPool(uint256 shardId, uint256 epoch) public view returns (uint96) {\\n        if (epoch <= lastFinalizedEpoch[shardId]) {\\n            return cumulative[shardId][epoch] - distributed[shardId][epoch];\\n        } else {\\n            return _simulateEpochFinalization(shardId, epoch) - distributed[shardId][epoch];\\n        }\\n    }\\n\\n    function getCurrentEpochPool(uint256 shardId) external view returns (uint96) {\\n        return getEpochPool(shardId, chronos.getCurrentEpoch());\\n    }\\n\\n    function getCurrentEpochRemainingPool(uint256 shardId) external view returns (uint96) {\\n        return getEpochRemainingPool(shardId, chronos.getCurrentEpoch());\\n    }\\n\\n    function getPreviousEpochPool(uint256 shardId) external view returns (uint96) {\\n        uint256 currentEpoch = chronos.getCurrentEpoch();\\n        if (currentEpoch <= 1) {\\n            return 0;\\n        }\\n        return getEpochPool(shardId, currentEpoch - 1);\\n    }\\n\\n    function getPreviousEpochRemainingPool(uint256 shardId) external view returns (uint96) {\\n        uint256 currentEpoch = chronos.getCurrentEpoch();\\n        if (currentEpoch <= 1) {\\n            return 0;\\n        }\\n        return getEpochRemainingPool(shardId, currentEpoch - 1);\\n    }\\n\\n    function getEpochRangePool(uint256 shardId, uint256 startEpoch, uint256 endEpoch) external view returns (uint96) {\\n        uint256 lastFinalized = lastFinalizedEpoch[shardId];\\n        uint96 totalPool = 0;\\n\\n        if (startEpoch <= lastFinalized) {\\n            for (uint256 epoch = startEpoch; epoch <= lastFinalized && epoch <= endEpoch; epoch++) {\\n                totalPool += cumulative[shardId][epoch];\\n            }\\n        }\\n\\n        uint96 simulatedCumulative = lastFinalized > 0 ? cumulative[shardId][lastFinalized] : cumulative[shardId][1];\\n        for (uint256 epoch = lastFinalized + 1; epoch <= endEpoch; epoch++) {\\n            int96 tmp = int96(simulatedCumulative) + diff[shardId][epoch];\\n            simulatedCumulative = uint96(tmp);\\n            if (epoch >= startEpoch) {\\n                totalPool += simulatedCumulative;\\n            }\\n        }\\n\\n        return totalPool;\\n    }\\n\\n    function getEpochDistributedPool(uint256 shardId, uint256 epoch) external view returns (uint96) {\\n        return distributed[shardId][epoch];\\n    }\\n\\n    function getPreviousEpochDistributedPool(uint256 shardId) external view returns (uint96) {\\n        uint256 currentEpoch = chronos.getCurrentEpoch();\\n        if (currentEpoch <= 1) {\\n            return 0;\\n        }\\n        return distributed[shardId][currentEpoch - 1];\\n    }\\n\\n    function getNodeEpochPaidOut(uint256 shardId, uint72 identityId, uint256 epoch) external view returns (uint96) {\\n        return nodesPaidOut[identityId][shardId][epoch];\\n    }\\n\\n    function getNodePreviousEpochPaidOut(uint256 shardId, uint72 identityId) external view returns (uint96) {\\n        uint256 currentEpoch = chronos.getCurrentEpoch();\\n        if (currentEpoch <= 1) {\\n            return 0;\\n        }\\n        return nodesPaidOut[identityId][shardId][currentEpoch - 1];\\n    }\\n\\n    function _finalizeEpochsUpTo(uint256 shardId, uint256 epoch) internal {\\n        uint256 startEpoch = lastFinalizedEpoch[shardId] + 1;\\n        for (uint256 e = startEpoch; e <= epoch; e++) {\\n            int96 prev = 0;\\n            if (e > 1) {\\n                prev = int96(cumulative[shardId][e - 1]);\\n            }\\n            cumulative[shardId][e] = uint96(prev + diff[shardId][e]);\\n        }\\n        lastFinalizedEpoch[shardId] = epoch;\\n\\n        emit EpochsFinalized(shardId, startEpoch, epoch);\\n    }\\n\\n    function _simulateEpochFinalization(uint256 shardId, uint256 epoch) internal view returns (uint96) {\\n        if (epoch <= lastFinalizedEpoch[shardId]) {\\n            return cumulative[shardId][epoch];\\n        }\\n\\n        uint96 simulatedCumulative = 0;\\n        if (lastFinalizedEpoch[shardId] > 0) {\\n            simulatedCumulative = cumulative[shardId][lastFinalizedEpoch[shardId]];\\n        }\\n\\n        for (uint256 e = lastFinalizedEpoch[shardId] + 1; e <= epoch; e++) {\\n            int96 prev = int96(simulatedCumulative);\\n            int96 result = prev + diff[shardId][e];\\n            simulatedCumulative = uint96(result);\\n        }\\n\\n        return simulatedCumulative;\\n    }\\n}\\n\",\"keccak256\":\"0x74fd4c074d1dbe46453f8ffb5ed1cf3db3ca100604d631b46f5be40860bd0835\",\"license\":\"Apache-2.0\"},\"contracts/storage/Hub.sol\":{\"content\":\"// SPDX-License-Identifier: Apache-2.0\\n\\npragma solidity ^0.8.20;\\n\\nimport {IContractStatus} from \\\"../interfaces/IContractStatus.sol\\\";\\nimport {ICustodian} from \\\"../interfaces/ICustodian.sol\\\";\\nimport {IInitializable} from \\\"../interfaces/IInitializable.sol\\\";\\nimport {INamed} from \\\"../interfaces/INamed.sol\\\";\\nimport {IVersioned} from \\\"../interfaces/IVersioned.sol\\\";\\nimport {HubLib} from \\\"../libraries/HubLib.sol\\\";\\nimport {UnorderedNamedContractDynamicSet} from \\\"../libraries/UnorderedNamedContractDynamicSet.sol\\\";\\nimport {Ownable} from \\\"@openzeppelin/contracts/access/Ownable.sol\\\";\\n\\ncontract Hub is INamed, IVersioned, Ownable {\\n    using UnorderedNamedContractDynamicSet for UnorderedNamedContractDynamicSet.Set;\\n\\n    event NewContract(string contractName, address newContractAddress);\\n    event ContractChanged(string contractName, address newContractAddress);\\n    event NewAssetStorage(string contractName, address newContractAddress);\\n    event AssetStorageChanged(string contractName, address newContractAddress);\\n    event ContractRemoved(string contractName, address contractAddress);\\n    event AssetStorageRemoved(string contractName, address contractAddress);\\n\\n    string private constant _NAME = \\\"Hub\\\";\\n    string private constant _VERSION = \\\"1.0.0\\\";\\n\\n    UnorderedNamedContractDynamicSet.Set internal contractSet;\\n    UnorderedNamedContractDynamicSet.Set internal assetStorageSet;\\n\\n    constructor() Ownable(msg.sender) {}\\n\\n    // @dev Only transactions by HubController owner or one of the owners of the MultiSig Wallet\\n    modifier onlyOwnerOrMultiSigOwner() {\\n        _checkOwnerOrMultiSigOwner();\\n        _;\\n    }\\n\\n    function name() external pure virtual override returns (string memory) {\\n        return _NAME;\\n    }\\n\\n    function version() external pure virtual override returns (string memory) {\\n        return _VERSION;\\n    }\\n\\n    function setContractAddress(\\n        string calldata contractName,\\n        address newContractAddress\\n    ) external onlyOwnerOrMultiSigOwner {\\n        _setContractAddress(contractName, newContractAddress);\\n    }\\n\\n    function setAssetStorageAddress(string calldata assetStorageName, address assetStorageAddress) external onlyOwner {\\n        _setAssetStorageAddress(assetStorageName, assetStorageAddress);\\n    }\\n\\n    function removeContractByName(string calldata contractName) external onlyOwner {\\n        if (contractSet.exists(contractName)) {\\n            address contractAddress = contractSet.get(contractName).addr;\\n\\n            contractSet.remove(contractName);\\n\\n            emit ContractRemoved(contractName, contractAddress);\\n        }\\n    }\\n\\n    function removeContractByAddress(address contractAddress) external onlyOwner {\\n        if (contractSet.exists(contractAddress)) {\\n            string memory contractName = contractSet.get(contractAddress).name;\\n\\n            contractSet.remove(contractAddress);\\n\\n            emit ContractRemoved(contractName, contractAddress);\\n        }\\n    }\\n\\n    function removeAssetStorageByName(string calldata assetStorageName) external onlyOwner {\\n        if (assetStorageSet.exists(assetStorageName)) {\\n            address assetStorageAddress = assetStorageSet.get(assetStorageName).addr;\\n\\n            assetStorageSet.remove(assetStorageName);\\n\\n            emit AssetStorageRemoved(assetStorageName, assetStorageAddress);\\n        }\\n    }\\n\\n    function removeAssetStorageByAddress(address assetStorageAddress) external onlyOwner {\\n        if (assetStorageSet.exists(assetStorageAddress)) {\\n            string memory assetStorageName = assetStorageSet.get(assetStorageAddress).name;\\n\\n            assetStorageSet.remove(assetStorageAddress);\\n\\n            emit AssetStorageRemoved(assetStorageName, assetStorageAddress);\\n        }\\n    }\\n\\n    function getContractAddress(string calldata contractName) external view returns (address) {\\n        return contractSet.get(contractName).addr;\\n    }\\n\\n    function getAssetStorageAddress(string calldata assetStorageName) external view returns (address) {\\n        return assetStorageSet.get(assetStorageName).addr;\\n    }\\n\\n    function getAllContracts() external view returns (UnorderedNamedContractDynamicSet.Contract[] memory) {\\n        return contractSet.getAll();\\n    }\\n\\n    function getAllAssetStorages() external view returns (UnorderedNamedContractDynamicSet.Contract[] memory) {\\n        return assetStorageSet.getAll();\\n    }\\n\\n    function isContract(string calldata contractName) external view returns (bool) {\\n        return contractSet.exists(contractName);\\n    }\\n\\n    function isContract(address selectedContractAddress) external view returns (bool) {\\n        return contractSet.exists(selectedContractAddress);\\n    }\\n\\n    function isAssetStorage(string calldata assetStorageName) external view returns (bool) {\\n        return assetStorageSet.exists(assetStorageName);\\n    }\\n\\n    function isAssetStorage(address assetStorageAddress) external view returns (bool) {\\n        return assetStorageSet.exists(assetStorageAddress);\\n    }\\n\\n    /**\\n     * @dev Forwards a function call to a specified target contract.\\n     * @notice This function can only be called by the contract owner or a multisig owner.\\n     * @param target The address of the target contract.\\n     * @param data The calldata containing the function signature and arguments for the target contract's function.\\n     * @return result The return data of the target contract's function call.\\n     */\\n    function forwardCall(address target, bytes calldata data) public onlyOwnerOrMultiSigOwner returns (bytes memory) {\\n        // Check if the target contract is registered in the Hub\\n        if (!contractSet.exists(target) && !assetStorageSet.exists(target)) {\\n            revert HubLib.InvalidTargetContract(target);\\n        }\\n\\n        // Perform the function call to the target contract with the specified calldata\\n        (bool success, bytes memory result) = target.call{value: 0}(data);\\n\\n        // If the call is unsuccessful, revert the transaction with the original revert reason\\n        if (!success) {\\n            assembly {\\n                // Load the free memory pointer from memory slot 0x40\\n                // Memory slot 0x40 is conventionally used to store the free memory pointer in Solidity, which points\\n                // to the next available memory slot for storing data during the execution of a contract function.\\n                let ptr := mload(0x40)\\n                // Get the size of the return data from the unsuccessful call\\n                let size := returndatasize()\\n                // Copy the return data to the memory location pointed to by ptr\\n                returndatacopy(ptr, 0, size)\\n                // Revert the transaction with the return data as the revert reason\\n                revert(ptr, size)\\n            }\\n        }\\n\\n        return result;\\n    }\\n\\n    function setAndReinitializeContracts(\\n        HubLib.Contract[] calldata newContracts,\\n        HubLib.Contract[] calldata newAssetStorageContracts,\\n        address[] calldata contractsToReinitialize,\\n        HubLib.ForwardCallInputArgs[] calldata forwardCallsData\\n    ) external onlyOwnerOrMultiSigOwner {\\n        _setContracts(newContracts);\\n        _setAssetStorageContracts(newAssetStorageContracts);\\n        _reinitializeContracts(contractsToReinitialize);\\n        _forwardCalls(forwardCallsData);\\n    }\\n\\n    function _setContractAddress(string calldata contractName, address newContractAddress) internal {\\n        if (contractSet.exists(contractName)) {\\n            contractSet.update(contractName, newContractAddress);\\n\\n            address oldContractAddress = contractSet.get(contractName).addr;\\n            if (_isContract(oldContractAddress)) {\\n                try IContractStatus(oldContractAddress).setStatus(false) {\\n                    // success\\n                } catch {\\n                    // Best-effort: contract may not implement IContractStatus; ignore.\\n                }\\n            }\\n\\n            emit ContractChanged(contractName, newContractAddress);\\n        } else {\\n            contractSet.append(contractName, newContractAddress);\\n\\n            emit NewContract(contractName, newContractAddress);\\n        }\\n\\n        if (_isContract(newContractAddress)) {\\n            try IContractStatus(newContractAddress).setStatus(true) {\\n                // success\\n            } catch {\\n                // Best-effort: contract may not implement IContractStatus; ignore.\\n            }\\n        }\\n\\n        emit NewContract(contractName, newContractAddress);\\n    }\\n\\n    function _setContracts(HubLib.Contract[] calldata newContracts) internal {\\n        for (uint256 i; i < newContracts.length; ) {\\n            _setContractAddress(newContracts[i].name, newContracts[i].addr);\\n\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _setAssetStorageAddress(string calldata assetStorageName, address assetStorageAddress) internal {\\n        if (assetStorageSet.exists(assetStorageName)) {\\n            emit AssetStorageChanged(assetStorageName, assetStorageAddress);\\n            assetStorageSet.update(assetStorageName, assetStorageAddress);\\n        } else {\\n            emit NewAssetStorage(assetStorageName, assetStorageAddress);\\n            assetStorageSet.append(assetStorageName, assetStorageAddress);\\n        }\\n    }\\n\\n    function _setAssetStorageContracts(HubLib.Contract[] calldata newAssetStorageContracts) internal {\\n        for (uint256 i; i < newAssetStorageContracts.length; ) {\\n            _setAssetStorageAddress(newAssetStorageContracts[i].name, newAssetStorageContracts[i].addr);\\n\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _reinitializeContracts(address[] calldata contractsToReinitialize) internal {\\n        for (uint256 i; i < contractsToReinitialize.length; ) {\\n            IInitializable(contractsToReinitialize[i]).initialize();\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _forwardCalls(HubLib.ForwardCallInputArgs[] calldata forwardCallsData) internal {\\n        for (uint256 i; i < forwardCallsData.length; ) {\\n            address contractAddress;\\n\\n            // Try to get the contract address using getContractAddress\\n            try this.getContractAddress(forwardCallsData[i].contractName) returns (address addr) {\\n                contractAddress = addr;\\n            } catch {\\n                // If getContractAddress fails, try getAssetStorageAddress\\n                try this.getAssetStorageAddress(forwardCallsData[i].contractName) returns (address addr) {\\n                    contractAddress = addr;\\n                } catch {\\n                    revert HubLib.ContractNotRegistered(forwardCallsData[i].contractName);\\n                }\\n            }\\n            for (uint256 j; j < forwardCallsData[i].encodedData.length; ) {\\n                forwardCall(contractAddress, forwardCallsData[i].encodedData[j]);\\n                unchecked {\\n                    j++;\\n                }\\n            }\\n            unchecked {\\n                i++;\\n            }\\n        }\\n    }\\n\\n    function _isContract(address addr) internal view returns (bool) {\\n        uint256 size;\\n        assembly {\\n            size := extcodesize(addr)\\n        }\\n        return size > 0;\\n    }\\n\\n    function _isMultiSigOwner(address multiSigAddress) internal view returns (bool) {\\n        try ICustodian(multiSigAddress).getOwners() returns (address[] memory multiSigOwners) {\\n            for (uint256 i = 0; i < multiSigOwners.length; i++) {\\n                if (msg.sender == multiSigOwners[i]) {\\n                    return true;\\n                }\\n            }\\n        } catch {\\n            // Not a multisig or call reverted; treat as not owner.\\n        }\\n\\n        return false;\\n    }\\n\\n    function _checkOwnerOrMultiSigOwner() internal view virtual {\\n        address hubOwner = owner();\\n        if (msg.sender != hubOwner && !_isMultiSigOwner(hubOwner)) {\\n            revert HubLib.UnauthorizedAccess(\\\"Only Hub Owner or Multisig Owner\\\");\\n        }\\n    }\\n}\\n\",\"keccak256\":\"0x732252bb857277a35ab314beef2dbaceb5f96ce2f6d3b83a224927e503609def\",\"license\":\"Apache-2.0\"}},\"version\":1}",
+  "bytecode": "0x60803461008c57601f6120db38819003918201601f19168301916001600160401b038311848410176100915780849260209460405283398101031261008c57516001600160a01b0381169081900361008c57801561007a57600080546001600160a01b03191691909117905560405161203390816100a88239f35b60405163a10d827b60e01b8152600490fd5b600080fd5b634e487b7160e01b600052604160045260246000fdfe6040608081526004908136101561001557600080fd5b600090813560e01c8063032043c71461132057806306fdde03146112dd57806308b1cc8414610cbc57806314395ee414610c385780631764bbfc146112425780632761c9f914610a455780633051db701461121a578063365a86fc146111f3578063387f6bda14610f445780634005ca7514610f2057806341ffd20614610ecc5780634dead86614610d5257806354fd4d5014610d115780635abcaf8614610ced578063629a495114610cbc5780636577454814610c945780636626858514610c6c578063679b656f14610c3857806370f699d414610bab578063775b98a814610a8d57806377ee656014610a455780638129fc1c146108fd5780638687e10e146108d55780638f5e514a146108a65780639400dc261461087e578063942eaa421461084d578063959357661461084d578063a800e0d51461081c578063a863a0fb146107ef578063b00a19f9146106f0578063b7341e3214610632578063b875164c1461060f578063baef9afb146105bc578063bb3de87f14610594578063bd1c66a014610571578063c3eb495014610545578063caf8cffe14610511578063d89d0dd8146104e1578063e26667821461043d578063ed6021b0146103955763eedc022c146101e457600080fd5b3461039157608036600319011261039157823560243590604435926001600160481b03841680940361038d576102186113d5565b61022061148f565b6001548251635cbeecf160e11b815260209391849082908b9082906001600160a01b03165afa908115610383578891610352575b50600181116102f8575b50907fb2eec04f54e8feeca5bfd4500dc3e07bd1fdb20c6a4f71bc54386fbf1c79fc6492918488526006835280882086895283528088209081546001600160601b0392836102ae8682851661145e565b166001600160601b0319809316179055888a52600a8552818a20878b528552818a20888b528552818a2090815490846102e98782851661145e565b1691161790555191168152a480f35b600019810190811161033f57849596979850610335907fb2eec04f54e8feeca5bfd4500dc3e07bd1fdb20c6a4f71bc54386fbf1c79fc6495611de8565b879695949361025e565b634e487b7160e01b885260118952602488fd5b90508381813d831161037c575b610369818361141d565b81010312610378575138610254565b8780fd5b503d61035f565b82513d8a823e3d90fd5b8480fd5b5080fd5b50903461043a578060031936011261043a576001548251635cbeecf160e11b815260209490918591839182906001600160a01b03165afa9081156104305790839183916103f8575b50916001600160601b03928152600885522054169051908152f35b809250858092503d8311610429575b610411818361141d565b81010312610391575182906001600160601b036103dd565b503d610407565b83513d84823e3d90fd5b80fd5b5082346104dd576020928360031936011261043a576001548351635cbeecf160e11b81529085908290859082906001600160a01b03165afa9182156104d25780926104a0575b5050610498906001600160601b039235611af1565b915191168152f35b9091508482813d83116104cb575b6104b8818361141d565b8101031261043a57505181610498610483565b503d6104ae565b8451903d90823e3d90fd5b8280fd5b50903461043a578160031936011261043a57506001600160601b0361049860209361050a611360565b9035611d34565b5034610391576001600160601b038160209361052c366113bf565b9082526005865282822090825285522054169051908152f35b50346103915760203660031901126103915760209061056a610565611345565b611969565b9051908152f35b5034610391576020906001600160601b0361049861058e366113bf565b90611aab565b503461039157806003193601126103915760209061056a6105b3611345565b602435906117e7565b5034610391576060366003190112610391576001600160601b03816020936001600160481b036105ea611345565b168152600a855281812060243582528552818120604435825285522054169051908152f35b5034610391576020906001600160601b0361049861062c366113bf565b90611af1565b5082346104dd576020928360031936011261043a576001600160481b03610657611345565b168152600784528281206001548451635cbeecf160e11b815293869185919082906001600160a01b03165afa80156106e6579082918593906106ac575b6001600160601b039450825285522054169051908152f35b509150918481813d83116106df575b6106c5818361141d565b810103126104dd579183916001600160601b039351610694565b503d6106bb565b84513d84823e3d90fd5b50346103915760803660031901126103915761070a611345565b610712611360565b916044359161071f6113d5565b9061072861148f565b6001600160481b038091168652602093600785528387208188528552838720918254966001600160601b03938461076187828c166115c0565b166001600160601b0319809a16179055169283885260078652848820828952865284882090878461079684549382851661145e565b16911617905582875260078552838720818852855281848820541660098652828589205416106107c4578680f35b6009928752600785528387209087528452828620541692528320918254161790558180808080808680f35b5034610391576020366003190112610391576020906001600160601b03610498610817611345565b611681565b5082346104dd5760203660031901126104dd57816020936001600160601b0392358152600385522054169051908152f35b5082346104dd5760203660031901126104dd57816020936001600160601b0392358152600885522054169051908152f35b5082346104dd5760203660031901126104dd5760209282913581526002845220549051908152f35b5082346104dd5760209282916108bb366113bf565b91908352855282822090825284522054600b0b9051908152f35b50903461043a57602036600319011261043a57506001600160601b0361049860209335611b75565b508290346104dd57826003193601126104dd5782546001600160a01b03929083169033821415806109ed575b6109be5760206064819285519485938492630110ceef60e21b845283015260076024830152664368726f6e6f7360c81b60448301525afa9182156109b557508391610987575b50166001600160601b0360a01b600154161760015580f35b6109a8915060203d81116109ae575b6109a0818361141d565b81019061143f565b8361096f565b503d610996565b513d85823e3d90fd5b606490602084519163f0b1bddb60e01b8352820152600860248201526727b7363c90243ab160c11b6044820152fd5b508251638da5cb5b60e01b81526020818381865afa908115610a3b579085918791610a1d575b5016331415610929565b610a35915060203d81116109ae576109a0818361141d565b87610a13565b84513d88823e3d90fd5b50346103915780600319360112610391576001600160601b03816020936001600160481b03610a72611345565b16815260078552818120602435825285522054169051908152f35b503461039157606036600319011261039157610aa7611345565b9060243591604435916001600160601b039081841690818503610ba7576001600160481b037fbac4036437803eb8141c458622d0f7fd52497d3ac5c965c19d86713c9810c99b94610af661148f565b169485885260209360078552828920888a5285528289209182549282610b1e8382871661145e565b166001600160601b0319809516179055888a5260088652838a20908383610b4984549382851661145e565b16911617905586895260078552828920888a52855280838a2054166009865281848b20541610610b7e575b505051908152a380f35b86895260078552828920888a528552828920541660098552828920918254161790558780610b74565b8680fd5b5082346104dd576020928360031936011261043a576001548351635cbeecf160e11b81529085908290859082906001600160a01b03165afa9182156104d2578092610c06575b5050610498906001600160601b039235611aab565b9091508482813d8311610c31575b610c1e818361141d565b8101031261043a57505181610498610bf1565b503d610c14565b5034610391576001600160601b0381602093610c53366113bf565b9082526006865282822090825285522054169051908152f35b50903461043a57602036600319011261043a57506001600160601b0361049860209335611c95565b503461039157816003193601126103915760015490516001600160a01b039091168152602090f35b5082346104dd5760203660031901126104dd57816020936001600160601b0392358152600985522054169051908152f35b50346103915781600319360112610391576020906001600160601b036104986115d9565b50346103915781600319360112610391578051610d4e91610d31826113eb565b60068252650c4c0b8c0b8d60d21b60208301525191829182611376565b0390f35b508290346104dd5760603660031901126104dd5781359160243560443591848652602095600287528481205491819683851115610e67575b8315610e45578083526005895286832084845289526001600160601b0387842054165b9360018101809111610e3257935b86851115610dd55789896001600160601b038a5191168152f35b818452828a528784208585528a52610e028885205491600b6001600160601b038094820b9216900b611a85565b169385811015610e1c575b610e1690611c86565b93610dbb565b97610e2a85610e169261145e565b989050610e0d565b634e487b7160e01b845260118352602484fd5b808352600589528683206001845289526001600160601b038784205416610dad565b9284919796959294965b8188111580610ec2575b15610eb557610ea9610eaf9186885260058c528888208a89528c526001600160601b0389892054169061145e565b97611c86565b96610e71565b9791949295965092610d8a565b5083881115610e7b565b5082346104dd5760603660031901126104dd57816020936001600160601b03926001600160481b03610efc611360565b168252600a8652828220903582528552818120604435825285522054169051908152f35b50346103915781600319360112610391576020906001600160601b03610498611731565b503461039157608036600319011261039157823590602493843591604435610f6a6113d5565b90610f7361148f565b848187895260209160028352858a205490600182018092116111e15781116111c7575b5050858203948286116111b557600186018096116111b557889988869798999a52600383528a610fd46001600160601b03809881932054168761145e565b169786610fe1828b6117c7565b169881156111a3579087910616978a8c5260038452878c20906001600160601b0319918a83825416179055600b0b8385528c8b8a822091528552888d2080548361102e8483600b0b611a85565b8b1691161790558b8d52838552888d2060018701808811611191578e528552888d209182549182600b0b0360016001605f1b03811360016001605f1b031982121761119157891691161790556001548751635cbeecf160e11b8152929084908490839082906001600160a01b03165afa928315611187578c93611154575b50600183116110f4575b5050855197885250860152169083015260608201527f679556c38f879ccbda2d639d678eca41e35e15a12d0aa372b3589e913090503790608090a280f35b6000198301928311611143575050917f679556c38f879ccbda2d639d678eca41e35e15a12d0aa372b3589e91309050379795939161113660809896948b611de8565b91939597819395976110b6565b634e487b7160e01b8c52601190528afd5b9092508381813d8311611180575b61116c818361141d565b8101031261117c575191386110ac565b8b80fd5b503d611162565b88513d8e823e3d90fd5b634e487b7160e01b8f5260118652848ffd5b634e487b7160e01b8d5260128452828dfd5b634e487b7160e01b8952601190528888fd5b808092985097106111d9575b80610f96565b9150386111d3565b634e487b7160e01b8b52601188528b8bfd5b5034610391578160031936011261039157905490516001600160a01b039091168152602090f35b50903461043a57602036600319011261043a57506001600160601b0361049860209335611c01565b50903461043a578060031936011261043a576001548251635cbeecf160e11b815260209490918591839182906001600160a01b03165afa9081156104305790839183916112a5575b50916001600160601b03928152600985522054169051908152f35b809250858092503d83116112d6575b6112be818361141d565b81010312610391575182906001600160601b0361128a565b503d6112b4565b50346103915781600319360112610391578051610d4e916112fd826113eb565b600c82526b45706f636853746f7261676560a01b60208301525191829182611376565b50346103915760203660031901126103915760209061056a611340611345565b611879565b600435906001600160481b038216820361135b57565b600080fd5b602435906001600160481b038216820361135b57565b6020808252825181830181905290939260005b8281106113ab57505060409293506000838284010152601f8019910116010190565b818101860151848201604001528501611389565b604090600319011261135b576004359060243590565b606435906001600160601b038216820361135b57565b6040810190811067ffffffffffffffff82111761140757604052565b634e487b7160e01b600052604160045260246000fd5b90601f8019910116810190811067ffffffffffffffff82111761140757604052565b9081602091031261135b57516001600160a01b038116810361135b5790565b9190916001600160601b038080941691160191821161147957565b634e487b7160e01b600052601160045260246000fd5b60008054604051631627905560e01b81523360048201526020926001600160a01b0392831692918481602481875afa9081156115b557908591839161157d575b50159384611520575b505050506114e35750565b6064906040519063f0b1bddb60e01b82526004820152601560248201527427b7363c9021b7b73a3930b1ba399034b710243ab160591b6044820152fd5b60049293945060405192838092638da5cb5b60e01b82525afa9182156115715791611554575b5016331415388083816114d8565b61156b9150833d85116109ae576109a0818361141d565b38611546565b604051903d90823e3d90fd5b82819392503d83116115ae575b611594818361141d565b8101031261039157518015158103610391578490386114cf565b503d61158a565b6040513d84823e3d90fd5b6001600160601b03918216908216039190821161147957565b600154604051635cbeecf160e11b815290602090829060049082906001600160a01b03165afa90811561167557600091611644575b50600181111561163e5760001981019081116114795760005260086020526001600160601b036040600020541690565b50600090565b906020823d821161166d575b8161165d6020938361141d565b8101031261043a5750513861160e565b3d9150611650565b6040513d6000823e3d90fd5b600154604051635cbeecf160e11b8152916020918290849060049082906001600160a01b03165afa92831561167557600093611702575b5060018311156116fa576001600160481b031660005260078152604060002091600019810190811161147957600052526001600160601b036040600020541690565b505050600090565b90928282813d831161172a575b611719818361141d565b8101031261043a57505191386116b8565b503d61170f565b600154604051635cbeecf160e11b815290602090829060049082906001600160a01b03165afa90811561167557600091611796575b50600181111561163e5760001981019081116114795760005260096020526001600160601b036040600020541690565b906020823d82116117bf575b816117af6020938361141d565b8101031261043a57505138611766565b3d91506117a2565b81156117d1570490565b634e487b7160e01b600052601260045260246000fd5b919060009281845260086020526001600160601b03908160408620541615611874576001600160481b031684526007602052604084208285526020528060408520541691670de0b6b3a764000092838102938185041490151715611860578460409161185d9596526008602052205416906117c7565b90565b634e487b7160e01b85526011600452602485fd5b505050565b60015460408051635cbeecf160e11b815260209390929091908490849060049082906001600160a01b03165afa92831561195e5760009361192f575b5082600052600884526001600160601b03918282600020541615611925576001600160481b031660005260078452806000208360005284528181600020541692670de0b6b3a7640000938481029481860414901517156114795761185d94600891600052526000205416906117c7565b5050505050600090565b90928482813d8311611957575b611946818361141d565b8101031261043a57505191386118b5565b503d61193c565b50513d6000823e3d90fd5b60015460408051635cbeecf160e11b815260209390928490849060049082906001600160a01b03165afa928315611a7a57600093611a4b575b5060018311801590611a23575b611a1a576001600160481b031660005260078352806000206000198301928311611479578260005283526001600160601b03908181600020541692670de0b6b3a7640000938481029481860414901517156114795761185d94600891600052526000205416906117c7565b50505050600090565b50600019830183811161147957600052600884526001600160601b03826000205416156119af565b90928482813d8311611a73575b611a62818361141d565b8101031261043a57505191386119a2565b503d611a58565b82513d6000823e3d90fd5b90600b0b90600b0b019060016001605f1b0319821260016001605f1b0383131761147957565b600081815260026020526040812054909291908211611ae757916040916001600160601b03938252600560205282822090825260205220541690565b61185d9250611ef9565b60008181526020906002825260409081812054851115600014611b475761185d948482526005845282822081835284526001600160601b03938484842054169583526006815283832091835252205416906115c0565b846001600160601b0393611b5e61185d9787611ef9565b9583526006815283832091835252205416906115c0565b600154604051635cbeecf160e11b815290602090829060049082906001600160a01b03165afa90811561167557600091611bd0575b506001811115611bc95760001981019081116114795761185d91611aab565b5050600090565b906020823d8211611bf9575b81611be96020938361141d565b8101031261043a57505138611baa565b3d9150611bdc565b600154604051635cbeecf160e11b815290602090829060049082906001600160a01b03165afa90811561167557600091611c55575b506001811115611bc95760001981019081116114795761185d91611af1565b906020823d8211611c7e575b81611c6e6020938361141d565b8101031261043a57505138611c36565b3d9150611c61565b60001981146114795760010190565b600154604051635cbeecf160e11b8152916020918290849060049082906001600160a01b03165afa92831561167557600093611d05575b5060018311156116fa5760005260068152604060002091600019810190811161147957600052526001600160601b036040600020541690565b90928282813d8311611d2d575b611d1c818361141d565b8101031261043a5750519138611ccc565b503d611d12565b600154604051635cbeecf160e11b815292602092918390859060049082906001600160a01b03165afa93841561167557600094611db9575b506001841115611a1a576001600160481b0316600052600a82526040600020906000528152604060002091600019810190811161147957600052526001600160601b036040600020541690565b90938382813d8311611de1575b611dd0818361141d565b8101031261043a5750519238611d6c565b503d611dc6565b9190916000928184526020936002855260409182822054916001808401809411611ee557835b83811115611e5357505095818488877ff5e0b76446dcb61b7b71f2105da35440aaa94ff21ef805e3bc2e6c1bee73b51b98999a526002845220558351928352820152a2565b82828211611eb5575b90611e80611eb09289865260048c528886208387528c5288862054600b0b90611a85565b6001600160601b031688855260058b528785208286528b52878520906001600160601b0319825416179055611c86565b611e0e565b508683526005895285832060001982018281116118605784528952858320546001600160601b0316600b0b611e5c565b634e487b7160e01b82526011600452602482fd5b91906000908382526020916002835260409081812054831115611fe05780938682526002815282822054611fb9575b868252600281528282205460018101809111611fa55796949596939291905b83851115611f585750505050505090565b90919293949695611f9890888452600483528484208785528352611f918585205491600b6001600160601b038094820b9216900b611a85565b1695611c86565b9392919096949596611f47565b634e487b7160e01b83526011600452602483fd5b60058152828220600282528383205483528152828220546001600160601b03169450611f28565b600584528181209281529190925220546001600160601b0316915056fea26469706673582212203677ed4dc49edf40baa66c7820693b299236a0dea2bded9a663d2ff05caed21f64736f6c63430008140033",
+  "deployedBytecode": "0x6040608081526004908136101561001557600080fd5b600090813560e01c8063032043c71461132057806306fdde03146112dd57806308b1cc8414610cbc57806314395ee414610c385780631764bbfc146112425780632761c9f914610a455780633051db701461121a578063365a86fc146111f3578063387f6bda14610f445780634005ca7514610f2057806341ffd20614610ecc5780634dead86614610d5257806354fd4d5014610d115780635abcaf8614610ced578063629a495114610cbc5780636577454814610c945780636626858514610c6c578063679b656f14610c3857806370f699d414610bab578063775b98a814610a8d57806377ee656014610a455780638129fc1c146108fd5780638687e10e146108d55780638f5e514a146108a65780639400dc261461087e578063942eaa421461084d578063959357661461084d578063a800e0d51461081c578063a863a0fb146107ef578063b00a19f9146106f0578063b7341e3214610632578063b875164c1461060f578063baef9afb146105bc578063bb3de87f14610594578063bd1c66a014610571578063c3eb495014610545578063caf8cffe14610511578063d89d0dd8146104e1578063e26667821461043d578063ed6021b0146103955763eedc022c146101e457600080fd5b3461039157608036600319011261039157823560243590604435926001600160481b03841680940361038d576102186113d5565b61022061148f565b6001548251635cbeecf160e11b815260209391849082908b9082906001600160a01b03165afa908115610383578891610352575b50600181116102f8575b50907fb2eec04f54e8feeca5bfd4500dc3e07bd1fdb20c6a4f71bc54386fbf1c79fc6492918488526006835280882086895283528088209081546001600160601b0392836102ae8682851661145e565b166001600160601b0319809316179055888a52600a8552818a20878b528552818a20888b528552818a2090815490846102e98782851661145e565b1691161790555191168152a480f35b600019810190811161033f57849596979850610335907fb2eec04f54e8feeca5bfd4500dc3e07bd1fdb20c6a4f71bc54386fbf1c79fc6495611de8565b879695949361025e565b634e487b7160e01b885260118952602488fd5b90508381813d831161037c575b610369818361141d565b81010312610378575138610254565b8780fd5b503d61035f565b82513d8a823e3d90fd5b8480fd5b5080fd5b50903461043a578060031936011261043a576001548251635cbeecf160e11b815260209490918591839182906001600160a01b03165afa9081156104305790839183916103f8575b50916001600160601b03928152600885522054169051908152f35b809250858092503d8311610429575b610411818361141d565b81010312610391575182906001600160601b036103dd565b503d610407565b83513d84823e3d90fd5b80fd5b5082346104dd576020928360031936011261043a576001548351635cbeecf160e11b81529085908290859082906001600160a01b03165afa9182156104d25780926104a0575b5050610498906001600160601b039235611af1565b915191168152f35b9091508482813d83116104cb575b6104b8818361141d565b8101031261043a57505181610498610483565b503d6104ae565b8451903d90823e3d90fd5b8280fd5b50903461043a578160031936011261043a57506001600160601b0361049860209361050a611360565b9035611d34565b5034610391576001600160601b038160209361052c366113bf565b9082526005865282822090825285522054169051908152f35b50346103915760203660031901126103915760209061056a610565611345565b611969565b9051908152f35b5034610391576020906001600160601b0361049861058e366113bf565b90611aab565b503461039157806003193601126103915760209061056a6105b3611345565b602435906117e7565b5034610391576060366003190112610391576001600160601b03816020936001600160481b036105ea611345565b168152600a855281812060243582528552818120604435825285522054169051908152f35b5034610391576020906001600160601b0361049861062c366113bf565b90611af1565b5082346104dd576020928360031936011261043a576001600160481b03610657611345565b168152600784528281206001548451635cbeecf160e11b815293869185919082906001600160a01b03165afa80156106e6579082918593906106ac575b6001600160601b039450825285522054169051908152f35b509150918481813d83116106df575b6106c5818361141d565b810103126104dd579183916001600160601b039351610694565b503d6106bb565b84513d84823e3d90fd5b50346103915760803660031901126103915761070a611345565b610712611360565b916044359161071f6113d5565b9061072861148f565b6001600160481b038091168652602093600785528387208188528552838720918254966001600160601b03938461076187828c166115c0565b166001600160601b0319809a16179055169283885260078652848820828952865284882090878461079684549382851661145e565b16911617905582875260078552838720818852855281848820541660098652828589205416106107c4578680f35b6009928752600785528387209087528452828620541692528320918254161790558180808080808680f35b5034610391576020366003190112610391576020906001600160601b03610498610817611345565b611681565b5082346104dd5760203660031901126104dd57816020936001600160601b0392358152600385522054169051908152f35b5082346104dd5760203660031901126104dd57816020936001600160601b0392358152600885522054169051908152f35b5082346104dd5760203660031901126104dd5760209282913581526002845220549051908152f35b5082346104dd5760209282916108bb366113bf565b91908352855282822090825284522054600b0b9051908152f35b50903461043a57602036600319011261043a57506001600160601b0361049860209335611b75565b508290346104dd57826003193601126104dd5782546001600160a01b03929083169033821415806109ed575b6109be5760206064819285519485938492630110ceef60e21b845283015260076024830152664368726f6e6f7360c81b60448301525afa9182156109b557508391610987575b50166001600160601b0360a01b600154161760015580f35b6109a8915060203d81116109ae575b6109a0818361141d565b81019061143f565b8361096f565b503d610996565b513d85823e3d90fd5b606490602084519163f0b1bddb60e01b8352820152600860248201526727b7363c90243ab160c11b6044820152fd5b508251638da5cb5b60e01b81526020818381865afa908115610a3b579085918791610a1d575b5016331415610929565b610a35915060203d81116109ae576109a0818361141d565b87610a13565b84513d88823e3d90fd5b50346103915780600319360112610391576001600160601b03816020936001600160481b03610a72611345565b16815260078552818120602435825285522054169051908152f35b503461039157606036600319011261039157610aa7611345565b9060243591604435916001600160601b039081841690818503610ba7576001600160481b037fbac4036437803eb8141c458622d0f7fd52497d3ac5c965c19d86713c9810c99b94610af661148f565b169485885260209360078552828920888a5285528289209182549282610b1e8382871661145e565b166001600160601b0319809516179055888a5260088652838a20908383610b4984549382851661145e565b16911617905586895260078552828920888a52855280838a2054166009865281848b20541610610b7e575b505051908152a380f35b86895260078552828920888a528552828920541660098552828920918254161790558780610b74565b8680fd5b5082346104dd576020928360031936011261043a576001548351635cbeecf160e11b81529085908290859082906001600160a01b03165afa9182156104d2578092610c06575b5050610498906001600160601b039235611aab565b9091508482813d8311610c31575b610c1e818361141d565b8101031261043a57505181610498610bf1565b503d610c14565b5034610391576001600160601b0381602093610c53366113bf565b9082526006865282822090825285522054169051908152f35b50903461043a57602036600319011261043a57506001600160601b0361049860209335611c95565b503461039157816003193601126103915760015490516001600160a01b039091168152602090f35b5082346104dd5760203660031901126104dd57816020936001600160601b0392358152600985522054169051908152f35b50346103915781600319360112610391576020906001600160601b036104986115d9565b50346103915781600319360112610391578051610d4e91610d31826113eb565b60068252650c4c0b8c0b8d60d21b60208301525191829182611376565b0390f35b508290346104dd5760603660031901126104dd5781359160243560443591848652602095600287528481205491819683851115610e67575b8315610e45578083526005895286832084845289526001600160601b0387842054165b9360018101809111610e3257935b86851115610dd55789896001600160601b038a5191168152f35b818452828a528784208585528a52610e028885205491600b6001600160601b038094820b9216900b611a85565b169385811015610e1c575b610e1690611c86565b93610dbb565b97610e2a85610e169261145e565b989050610e0d565b634e487b7160e01b845260118352602484fd5b808352600589528683206001845289526001600160601b038784205416610dad565b9284919796959294965b8188111580610ec2575b15610eb557610ea9610eaf9186885260058c528888208a89528c526001600160601b0389892054169061145e565b97611c86565b96610e71565b9791949295965092610d8a565b5083881115610e7b565b5082346104dd5760603660031901126104dd57816020936001600160601b03926001600160481b03610efc611360565b168252600a8652828220903582528552818120604435825285522054169051908152f35b50346103915781600319360112610391576020906001600160601b03610498611731565b503461039157608036600319011261039157823590602493843591604435610f6a6113d5565b90610f7361148f565b848187895260209160028352858a205490600182018092116111e15781116111c7575b5050858203948286116111b557600186018096116111b557889988869798999a52600383528a610fd46001600160601b03809881932054168761145e565b169786610fe1828b6117c7565b169881156111a3579087910616978a8c5260038452878c20906001600160601b0319918a83825416179055600b0b8385528c8b8a822091528552888d2080548361102e8483600b0b611a85565b8b1691161790558b8d52838552888d2060018701808811611191578e528552888d209182549182600b0b0360016001605f1b03811360016001605f1b031982121761119157891691161790556001548751635cbeecf160e11b8152929084908490839082906001600160a01b03165afa928315611187578c93611154575b50600183116110f4575b5050855197885250860152169083015260608201527f679556c38f879ccbda2d639d678eca41e35e15a12d0aa372b3589e913090503790608090a280f35b6000198301928311611143575050917f679556c38f879ccbda2d639d678eca41e35e15a12d0aa372b3589e91309050379795939161113660809896948b611de8565b91939597819395976110b6565b634e487b7160e01b8c52601190528afd5b9092508381813d8311611180575b61116c818361141d565b8101031261117c575191386110ac565b8b80fd5b503d611162565b88513d8e823e3d90fd5b634e487b7160e01b8f5260118652848ffd5b634e487b7160e01b8d5260128452828dfd5b634e487b7160e01b8952601190528888fd5b808092985097106111d9575b80610f96565b9150386111d3565b634e487b7160e01b8b52601188528b8bfd5b5034610391578160031936011261039157905490516001600160a01b039091168152602090f35b50903461043a57602036600319011261043a57506001600160601b0361049860209335611c01565b50903461043a578060031936011261043a576001548251635cbeecf160e11b815260209490918591839182906001600160a01b03165afa9081156104305790839183916112a5575b50916001600160601b03928152600985522054169051908152f35b809250858092503d83116112d6575b6112be818361141d565b81010312610391575182906001600160601b0361128a565b503d6112b4565b50346103915781600319360112610391578051610d4e916112fd826113eb565b600c82526b45706f636853746f7261676560a01b60208301525191829182611376565b50346103915760203660031901126103915760209061056a611340611345565b611879565b600435906001600160481b038216820361135b57565b600080fd5b602435906001600160481b038216820361135b57565b6020808252825181830181905290939260005b8281106113ab57505060409293506000838284010152601f8019910116010190565b818101860151848201604001528501611389565b604090600319011261135b576004359060243590565b606435906001600160601b038216820361135b57565b6040810190811067ffffffffffffffff82111761140757604052565b634e487b7160e01b600052604160045260246000fd5b90601f8019910116810190811067ffffffffffffffff82111761140757604052565b9081602091031261135b57516001600160a01b038116810361135b5790565b9190916001600160601b038080941691160191821161147957565b634e487b7160e01b600052601160045260246000fd5b60008054604051631627905560e01b81523360048201526020926001600160a01b0392831692918481602481875afa9081156115b557908591839161157d575b50159384611520575b505050506114e35750565b6064906040519063f0b1bddb60e01b82526004820152601560248201527427b7363c9021b7b73a3930b1ba399034b710243ab160591b6044820152fd5b60049293945060405192838092638da5cb5b60e01b82525afa9182156115715791611554575b5016331415388083816114d8565b61156b9150833d85116109ae576109a0818361141d565b38611546565b604051903d90823e3d90fd5b82819392503d83116115ae575b611594818361141d565b8101031261039157518015158103610391578490386114cf565b503d61158a565b6040513d84823e3d90fd5b6001600160601b03918216908216039190821161147957565b600154604051635cbeecf160e11b815290602090829060049082906001600160a01b03165afa90811561167557600091611644575b50600181111561163e5760001981019081116114795760005260086020526001600160601b036040600020541690565b50600090565b906020823d821161166d575b8161165d6020938361141d565b8101031261043a5750513861160e565b3d9150611650565b6040513d6000823e3d90fd5b600154604051635cbeecf160e11b8152916020918290849060049082906001600160a01b03165afa92831561167557600093611702575b5060018311156116fa576001600160481b031660005260078152604060002091600019810190811161147957600052526001600160601b036040600020541690565b505050600090565b90928282813d831161172a575b611719818361141d565b8101031261043a57505191386116b8565b503d61170f565b600154604051635cbeecf160e11b815290602090829060049082906001600160a01b03165afa90811561167557600091611796575b50600181111561163e5760001981019081116114795760005260096020526001600160601b036040600020541690565b906020823d82116117bf575b816117af6020938361141d565b8101031261043a57505138611766565b3d91506117a2565b81156117d1570490565b634e487b7160e01b600052601260045260246000fd5b919060009281845260086020526001600160601b03908160408620541615611874576001600160481b031684526007602052604084208285526020528060408520541691670de0b6b3a764000092838102938185041490151715611860578460409161185d9596526008602052205416906117c7565b90565b634e487b7160e01b85526011600452602485fd5b505050565b60015460408051635cbeecf160e11b815260209390929091908490849060049082906001600160a01b03165afa92831561195e5760009361192f575b5082600052600884526001600160601b03918282600020541615611925576001600160481b031660005260078452806000208360005284528181600020541692670de0b6b3a7640000938481029481860414901517156114795761185d94600891600052526000205416906117c7565b5050505050600090565b90928482813d8311611957575b611946818361141d565b8101031261043a57505191386118b5565b503d61193c565b50513d6000823e3d90fd5b60015460408051635cbeecf160e11b815260209390928490849060049082906001600160a01b03165afa928315611a7a57600093611a4b575b5060018311801590611a23575b611a1a576001600160481b031660005260078352806000206000198301928311611479578260005283526001600160601b03908181600020541692670de0b6b3a7640000938481029481860414901517156114795761185d94600891600052526000205416906117c7565b50505050600090565b50600019830183811161147957600052600884526001600160601b03826000205416156119af565b90928482813d8311611a73575b611a62818361141d565b8101031261043a57505191386119a2565b503d611a58565b82513d6000823e3d90fd5b90600b0b90600b0b019060016001605f1b0319821260016001605f1b0383131761147957565b600081815260026020526040812054909291908211611ae757916040916001600160601b03938252600560205282822090825260205220541690565b61185d9250611ef9565b60008181526020906002825260409081812054851115600014611b475761185d948482526005845282822081835284526001600160601b03938484842054169583526006815283832091835252205416906115c0565b846001600160601b0393611b5e61185d9787611ef9565b9583526006815283832091835252205416906115c0565b600154604051635cbeecf160e11b815290602090829060049082906001600160a01b03165afa90811561167557600091611bd0575b506001811115611bc95760001981019081116114795761185d91611aab565b5050600090565b906020823d8211611bf9575b81611be96020938361141d565b8101031261043a57505138611baa565b3d9150611bdc565b600154604051635cbeecf160e11b815290602090829060049082906001600160a01b03165afa90811561167557600091611c55575b506001811115611bc95760001981019081116114795761185d91611af1565b906020823d8211611c7e575b81611c6e6020938361141d565b8101031261043a57505138611c36565b3d9150611c61565b60001981146114795760010190565b600154604051635cbeecf160e11b8152916020918290849060049082906001600160a01b03165afa92831561167557600093611d05575b5060018311156116fa5760005260068152604060002091600019810190811161147957600052526001600160601b036040600020541690565b90928282813d8311611d2d575b611d1c818361141d565b8101031261043a5750519138611ccc565b503d611d12565b600154604051635cbeecf160e11b815292602092918390859060049082906001600160a01b03165afa93841561167557600094611db9575b506001841115611a1a576001600160481b0316600052600a82526040600020906000528152604060002091600019810190811161147957600052526001600160601b036040600020541690565b90938382813d8311611de1575b611dd0818361141d565b8101031261043a5750519238611d6c565b503d611dc6565b9190916000928184526020936002855260409182822054916001808401809411611ee557835b83811115611e5357505095818488877ff5e0b76446dcb61b7b71f2105da35440aaa94ff21ef805e3bc2e6c1bee73b51b98999a526002845220558351928352820152a2565b82828211611eb5575b90611e80611eb09289865260048c528886208387528c5288862054600b0b90611a85565b6001600160601b031688855260058b528785208286528b52878520906001600160601b0319825416179055611c86565b611e0e565b508683526005895285832060001982018281116118605784528952858320546001600160601b0316600b0b611e5c565b634e487b7160e01b82526011600452602482fd5b91906000908382526020916002835260409081812054831115611fe05780938682526002815282822054611fb9575b868252600281528282205460018101809111611fa55796949596939291905b83851115611f585750505050505090565b90919293949695611f9890888452600483528484208785528352611f918585205491600b6001600160601b038094820b9216900b611a85565b1695611c86565b9392919096949596611f47565b634e487b7160e01b83526011600452602483fd5b60058152828220600282528383205483528152828220546001600160601b03169450611f28565b600584528181209281529190925220546001600160601b0316915056fea26469706673582212203677ed4dc49edf40baa66c7820693b299236a0dea2bded9a663d2ff05caed21f64736f6c63430008140033",
+  "devdoc": {
+    "kind": "dev",
+    "methods": {
+      "moveEpochPublishingAllocation(uint72,uint72,uint256,uint96)": {
+        "details": "`epochNodeMaxPublishingAllocation` is a per-epoch HIGH-WATER         MARK, maintained identically on the add and move paths: it is         only ever RAISED (when the destination's new value exceeds it),         never lowered by the `fromId` decrement — computing the true         current max after a decrement would need an O(nodes) scan.         Nothing on-chain reads it (scoring reads only         get(Node)EpochPublishingAllocation); it exists for off-chain         observability, for which the high-water-mark semantic is correct."
+      }
+    },
+    "version": 1
+  },
+  "userdoc": {
+    "kind": "user",
+    "methods": {
+      "moveEpochPublishingAllocation(uint72,uint72,uint256,uint96)": {
+        "notice": "OT-RFC-51: move `amount` of publishing allocation from one         node to another within a single `epoch`. Used when a PCA         re-designates its primary node — the epoch total         (`epochPublishingAllocation`, i.e. K_total) is intentionally         NOT touched, so the move is net-zero on the denominator of         every node's publishing factor."
+      }
+    },
+    "version": 1
+  },
+  "storageLayout": {
+    "storage": [
+      {
+        "astId": 27334,
+        "contract": "contracts/storage/EpochStorage.sol:EpochStorage",
+        "label": "hub",
+        "offset": 0,
+        "slot": "0",
+        "type": "t_contract(Hub)46218"
+      },
+      {
+        "astId": 44154,
+        "contract": "contracts/storage/EpochStorage.sol:EpochStorage",
+        "label": "chronos",
+        "offset": 0,
+        "slot": "1",
+        "type": "t_contract(Chronos)35934"
+      },
+      {
+        "astId": 44158,
+        "contract": "contracts/storage/EpochStorage.sol:EpochStorage",
+        "label": "lastFinalizedEpoch",
+        "offset": 0,
+        "slot": "2",
+        "type": "t_mapping(t_uint256,t_uint256)"
+      },
+      {
+        "astId": 44162,
+        "contract": "contracts/storage/EpochStorage.sol:EpochStorage",
+        "label": "accumulatedRemainder",
+        "offset": 0,
+        "slot": "3",
+        "type": "t_mapping(t_uint256,t_uint96)"
+      },
+      {
+        "astId": 44168,
+        "contract": "contracts/storage/EpochStorage.sol:EpochStorage",
+        "label": "diff",
+        "offset": 0,
+        "slot": "4",
+        "type": "t_mapping(t_uint256,t_mapping(t_uint256,t_int96))"
+      },
+      {
+        "astId": 44174,
+        "contract": "contracts/storage/EpochStorage.sol:EpochStorage",
+        "label": "cumulative",
+        "offset": 0,
+        "slot": "5",
+        "type": "t_mapping(t_uint256,t_mapping(t_uint256,t_uint96))"
+      },
+      {
+        "astId": 44180,
+        "contract": "contracts/storage/EpochStorage.sol:EpochStorage",
+        "label": "distributed",
+        "offset": 0,
+        "slot": "6",
+        "type": "t_mapping(t_uint256,t_mapping(t_uint256,t_uint96))"
+      },
+      {
+        "astId": 44186,
+        "contract": "contracts/storage/EpochStorage.sol:EpochStorage",
+        "label": "nodesEpochPublishingAllocation",
+        "offset": 0,
+        "slot": "7",
+        "type": "t_mapping(t_uint72,t_mapping(t_uint256,t_uint96))"
+      },
+      {
+        "astId": 44190,
+        "contract": "contracts/storage/EpochStorage.sol:EpochStorage",
+        "label": "epochPublishingAllocation",
+        "offset": 0,
+        "slot": "8",
+        "type": "t_mapping(t_uint256,t_uint96)"
+      },
+      {
+        "astId": 44194,
+        "contract": "contracts/storage/EpochStorage.sol:EpochStorage",
+        "label": "epochNodeMaxPublishingAllocation",
+        "offset": 0,
+        "slot": "9",
+        "type": "t_mapping(t_uint256,t_uint96)"
+      },
+      {
+        "astId": 44202,
+        "contract": "contracts/storage/EpochStorage.sol:EpochStorage",
+        "label": "nodesPaidOut",
+        "offset": 0,
+        "slot": "10",
+        "type": "t_mapping(t_uint72,t_mapping(t_uint256,t_mapping(t_uint256,t_uint96)))"
+      }
+    ],
+    "types": {
+      "t_contract(Chronos)35934": {
+        "encoding": "inplace",
+        "label": "contract Chronos",
+        "numberOfBytes": "20"
+      },
+      "t_contract(Hub)46218": {
+        "encoding": "inplace",
+        "label": "contract Hub",
+        "numberOfBytes": "20"
+      },
+      "t_int96": {
+        "encoding": "inplace",
+        "label": "int96",
+        "numberOfBytes": "12"
+      },
+      "t_mapping(t_uint256,t_int96)": {
+        "encoding": "mapping",
+        "key": "t_uint256",
+        "label": "mapping(uint256 => int96)",
+        "numberOfBytes": "32",
+        "value": "t_int96"
+      },
+      "t_mapping(t_uint256,t_mapping(t_uint256,t_int96))": {
+        "encoding": "mapping",
+        "key": "t_uint256",
+        "label": "mapping(uint256 => mapping(uint256 => int96))",
+        "numberOfBytes": "32",
+        "value": "t_mapping(t_uint256,t_int96)"
+      },
+      "t_mapping(t_uint256,t_mapping(t_uint256,t_uint96))": {
+        "encoding": "mapping",
+        "key": "t_uint256",
+        "label": "mapping(uint256 => mapping(uint256 => uint96))",
+        "numberOfBytes": "32",
+        "value": "t_mapping(t_uint256,t_uint96)"
+      },
+      "t_mapping(t_uint256,t_uint256)": {
+        "encoding": "mapping",
+        "key": "t_uint256",
+        "label": "mapping(uint256 => uint256)",
+        "numberOfBytes": "32",
+        "value": "t_uint256"
+      },
+      "t_mapping(t_uint256,t_uint96)": {
+        "encoding": "mapping",
+        "key": "t_uint256",
+        "label": "mapping(uint256 => uint96)",
+        "numberOfBytes": "32",
+        "value": "t_uint96"
+      },
+      "t_mapping(t_uint72,t_mapping(t_uint256,t_mapping(t_uint256,t_uint96)))": {
+        "encoding": "mapping",
+        "key": "t_uint72",
+        "label": "mapping(uint72 => mapping(uint256 => mapping(uint256 => uint96)))",
+        "numberOfBytes": "32",
+        "value": "t_mapping(t_uint256,t_mapping(t_uint256,t_uint96))"
+      },
+      "t_mapping(t_uint72,t_mapping(t_uint256,t_uint96))": {
+        "encoding": "mapping",
+        "key": "t_uint72",
+        "label": "mapping(uint72 => mapping(uint256 => uint96))",
+        "numberOfBytes": "32",
+        "value": "t_mapping(t_uint256,t_uint96)"
+      },
+      "t_uint256": {
+        "encoding": "inplace",
+        "label": "uint256",
+        "numberOfBytes": "32"
+      },
+      "t_uint72": {
+        "encoding": "inplace",
+        "label": "uint72",
+        "numberOfBytes": "9"
+      },
+      "t_uint96": {
+        "encoding": "inplace",
+        "label": "uint96",
+        "numberOfBytes": "12"
+      }
+    }
+  }
+}

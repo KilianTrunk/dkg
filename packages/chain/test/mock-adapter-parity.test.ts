@@ -95,6 +95,8 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   // and selects from its single signerAddress, so there is nothing to mirror.
   'selectFundedSigner',
   'isWalletFundable',
+  'isWalletPublishFundable',
+  'isConvictionFundedAgent',
   'getWalletFunding',
   'readNativeBalance',
   'readTracBalance',

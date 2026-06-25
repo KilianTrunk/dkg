@@ -1241,8 +1241,17 @@ export class EVMChainAdapterBase {
    */
   protected async selectFundedSigner(authorized: Wallet[]): Promise<Wallet> {
     const fundings = await Promise.all(authorized.map((s) => this.getWalletFunding(s.address)));
+    // Fundability is own-balance first (cheap), with a Publishing Conviction
+    // Account (PCA) fallback: a registered+covering PCA agent wallet pays the
+    // publish from its conviction account, NOT its own TRAC (the contract only
+    // `transferFrom`s the wallet on the direct-spend branch). Such a wallet
+    // legitimately holds gas + zero own-TRAC, so without this fallback the
+    // funding gate would skip it and lose the conviction discount.
+    const fundable = await Promise.all(
+      authorized.map((s, i) => this.isWalletPublishFundable(s.address, fundings[i])),
+    );
     for (let i = 0; i < authorized.length; i += 1) {
-      if (this.isWalletFundable(fundings[i])) return authorized[i];
+      if (fundable[i]) return authorized[i];
     }
     let bestIdx = 0;
     for (let i = 1; i < authorized.length; i += 1) {
@@ -1257,11 +1266,67 @@ export class EVMChainAdapterBase {
 
   /** A wallet is fundable when native > floor AND TRAC > floor. A `null`
    *  metric (read failed / no token contract) is treated as satisfied so the
-   *  selector fails open. */
+   *  selector fails open. (Sync; does not consider the PCA fallback — use
+   *  {@link isWalletPublishFundable} for selection.) */
   protected isWalletFundable(f: { native: bigint | null; trac: bigint | null }): boolean {
     const nativeOk = f.native === null || f.native > this.minPublisherNativeWei;
     const tracOk = f.trac === null || f.trac > this.minPublisherTracWei;
     return nativeOk && tracOk;
+  }
+
+  /**
+   * Fundable for publishing: native gas above floor AND (own TRAC above floor
+   * OR the wallet is a registered, covering PCA agent). The PCA conviction
+   * reads only run when own TRAC is short (so a normal funded wallet pays no
+   * extra RPC) and FAIL OPEN to "not a PCA agent" so a flaky conviction read
+   * never falsely marks an otherwise-empty wallet fundable.
+   */
+  protected async isWalletPublishFundable(
+    address: string,
+    f: { native: bigint | null; trac: bigint | null },
+  ): Promise<boolean> {
+    const nativeOk = f.native === null || f.native > this.minPublisherNativeWei;
+    if (!nativeOk) return false; // even a PCA agent needs gas
+    const tracOk = f.trac === null || f.trac > this.minPublisherTracWei;
+    if (tracOk) return true;
+    return this.isConvictionFundedAgent(address);
+  }
+
+  /**
+   * True iff `address` is a registered Publishing Conviction Account agent
+   * whose account can still cover a publish (live, non-expired, non-zero
+   * allowance) — i.e. it can publish without holding its own TRAC. Cheap-exit
+   * when the PCA NFT is not deployed; best-effort otherwise (any read failure ⇒
+   * false, so the wallet then relies on its own-TRAC gate rather than being
+   * optimistically selected and reverting). NOTE: a tiny consent-free "squat"
+   * PCA (RFC-001 §3.6) whose allowance rounds up to ≥1 wei but cannot cover a
+   * real publish can still pass this liveness probe; that is an
+   * attacker-induced edge that degrades to a single retry, not a fund loss.
+   */
+  protected async isConvictionFundedAgent(address: string): Promise<boolean> {
+    if (!this.contracts.dkgPublishingConvictionNFT) return false;
+    const conv = this as unknown as {
+      getConvictionAgentAccountId(agent: string): Promise<bigint>;
+      convictionAccountCanCover(accountId: bigint, baseCost: bigint): Promise<boolean>;
+    };
+    try {
+      const accountId = await withTimeout(
+        conv.getConvictionAgentAccountId(address),
+        RPC_READ_STALL_TIMEOUT_MS,
+        'pca agent account lookup',
+      );
+      if (accountId <= 0n) return false;
+      // `baseCost = 1n` is a liveness probe (account exists, not expired, >=1 wei
+      // discounted allowance). The exact publish cost is unknown at selection
+      // time, so this confirms the PCA path is usable rather than pricing it.
+      return await withTimeout(
+        conv.convictionAccountCanCover(accountId, 1n),
+        RPC_READ_STALL_TIMEOUT_MS,
+        'pca account coverage probe',
+      );
+    } catch {
+      return false;
+    }
   }
 
   /**

@@ -2769,6 +2769,34 @@ describe('createKnowledgeAssets — funding-aware wallet selection', () => {
     expect(chosen.address).toBe(walletB.address);
   });
 
+  it('treats a covering PCA agent wallet (zero own-TRAC) as fundable, preferring it over the unfundable round-robin head', async () => {
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    // walletA (head): gas, ZERO own-TRAC, NOT a PCA agent → unfundable.
+    // walletB: gas, ZERO own-TRAC, but a registered+covering PCA agent → its
+    // publish is paid from the conviction account, so it IS fundable.
+    nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);
+    tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), 0n);
+    (a as any).contracts.dkgPublishingConvictionNFT = {}; // PCA NFT deployed
+    (a as any).getConvictionAgentAccountId = recorder(async (addr: string) =>
+      addr.toLowerCase() === lc(walletB.address) ? 7n : 0n);
+    (a as any).convictionAccountCanCover = recorder(async () => true);
+    const chosen = await (a as any).nextAuthorizedSigner(CG);
+    expect(chosen.address).toBe(walletB.address); // chosen ONLY via the PCA fallback
+  });
+
+  it('does NOT treat a non-covering (squat) PCA agent wallet as fundable', async () => {
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    // walletA (head): gas, ZERO own-TRAC, registered PCA but CANNOT cover (squat).
+    // walletB: gas + own-TRAC → genuinely fundable.
+    nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);
+    tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), ONE);
+    (a as any).contracts.dkgPublishingConvictionNFT = {};
+    (a as any).getConvictionAgentAccountId = recorder(async () => 9n); // registered
+    (a as any).convictionAccountCanCover = recorder(async () => false); // but can't cover
+    const chosen = await (a as any).nextAuthorizedSigner(CG);
+    expect(chosen.address).toBe(walletB.address); // squat PCA head skipped for the funded wallet
+  });
+
   it('still throws "no authorized publisher" when no wallet is authorized (unchanged)', async () => {
     const { a } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
     (a as any).contracts.contextGraphs = { isAuthorizedPublisher: recorder(async () => false) };

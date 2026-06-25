@@ -151,6 +151,19 @@ describe('async lift publish result mapping', () => {
     expect(failure.retryable).toBe(false);
   });
 
+  it('classifies a code-stripped funds error (message marker only) as terminal insufficient_funds from broadcast', () => {
+    // A re-wrap could drop .code but preserve the message — the marker fallback
+    // must still keep it terminal (mirrors the daemon + node-ui robustness).
+    const failure = mapPublishExceptionToLiftJobFailure({
+      error: new Error('No operational wallet has enough funds to publish to Verifiable Memory — fund a wallet and retry.'),
+      failedFromState: 'broadcast',
+      errorPayloadRef: 'urn:error:no-funded-wallet-msg',
+    });
+
+    expect(failure.code).toBe('insufficient_funds');
+    expect(failure.retryable).toBe(false);
+  });
+
   it('classifies confirmation mismatches on included jobs', () => {
     const failure = mapPublishExceptionToLiftJobFailure({
       error: new Error('confirmation mismatch detected'),

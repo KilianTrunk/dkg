@@ -250,7 +250,7 @@ program
         process.exit(1);
       }
 
-      const { providers, readProvider } = createCliEvmProviders(rpcUrl, chainResolved?.rpcUrls);
+      const { urls, providers, readProvider } = createCliEvmProviders(rpcUrl, chainResolved?.rpcUrls);
       const wallet = new ethers.Wallet(opWallets.wallets[0].privateKey, readProvider);
 
       const hub = new ethers.Contract(hubAddress, [
@@ -302,7 +302,7 @@ program
       const signedTx = await wallet.signTransaction(filled);
       const txHash = ethers.Transaction.from(signedTx).hash ?? '0x';
       console.log(`  TX: ${txHash}`);
-      const receipt = await sendCliRawTransactionWithFailover(providers, signedTx, txHash);
+      const receipt = await sendCliRawTransactionWithFailover(providers, signedTx, txHash, urls);
       console.log(`  Confirmed in block ${receipt.blockNumber}`);
       console.log(`  New ask: ${amount} TRAC`);
     } catch (err) {

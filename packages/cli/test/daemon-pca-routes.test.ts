@@ -50,6 +50,60 @@ describe('daemon /api/pca V10 caller contract', () => {
     expect(calls).toEqual([[ethers.parseEther('100'), 42n]]);
   });
 
+  // Route-level coverage of the shared transport-status mapping (#1329 review):
+  // every PCA write catch routes through the SAME respondPcaTransportError /
+  // classifyChainRpcTransportStatus, placed after the feature-unavailable
+  // (503) branch and BEFORE the deterministic-revert / generic-500 branches.
+  // createPublishingConvictionAccount is the representative write path.
+  it('POST /api/pca → 503 when the on-chain create exhausts every configured RPC endpoint', async () => {
+    const agent = {
+      createPublishingConvictionAccount: async () => {
+        const err: any = new Error(
+          'createPublishingConvictionAccount transaction preparation failed on all configured ' +
+          'RPC endpoints (https://rpc.example/v2/SECRETKEY, https://backup.example): boom',
+        );
+        err.code = 'RPC_ENDPOINTS_EXHAUSTED';
+        err.rpcUrls = ['https://rpc.example/v2/SECRETKEY', 'https://backup.example'];
+        throw err;
+      },
+    };
+    const { res, done } = runCtx('POST', '/api/pca', agent, { tokens: '100', primaryNode: '42' });
+    await done;
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body).code).toBe('RPC_ENDPOINTS_EXHAUSTED');
+    // Sanitized: no RPC URL or embedded key leaks into the response body (R-2).
+    expect(res.body).not.toContain('://');
+    expect(res.body).not.toContain('SECRETKEY');
+  });
+
+  it('POST /api/pca → 504 when the on-chain create reports a bounded chain timeout', async () => {
+    const agent = {
+      createPublishingConvictionAccount: async () => {
+        const err: any = new Error('tx 0xabc timed out waiting for a receipt after 180000ms');
+        err.code = 'TIMEOUT';
+        throw err;
+      },
+    };
+    const { res, done } = runCtx('POST', '/api/pca', agent, { tokens: '100', primaryNode: '42' });
+    await done;
+    expect(res.statusCode).toBe(504);
+  });
+
+  it('POST /api/pca → 500 (NOT down-classified) for a genuine on-chain revert', async () => {
+    // The transport branch is strictly code-keyed, so a CALL_EXCEPTION revert
+    // (no transport code) must fall through to the deterministic/500 mapping.
+    const agent = {
+      createPublishingConvictionAccount: async () => {
+        const err: any = new Error('execution reverted');
+        err.code = 'CALL_EXCEPTION';
+        throw err;
+      },
+    };
+    const { res, done } = runCtx('POST', '/api/pca', agent, { tokens: '100', primaryNode: '42' });
+    await done;
+    expect(res.statusCode).toBe(500);
+  });
+
   it('POST /api/pca WITHOUT primaryNode → 400, facade not called (no silently-inert PCA)', async () => {
     let called = false;
     const agent = { createPublishingConvictionAccount: async () => { called = true; return { accountId: 9n, hash: '0x', blockNumber: 1, success: true }; } };

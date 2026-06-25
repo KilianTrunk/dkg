@@ -907,6 +907,7 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     const job = await queue.getStatus(jobId);
     expect(job?.state).toBe('failed');
     expect(job?.reason).toMatch(/missing storage lane/i);
+    await expect(queue.recover(jobId)).rejects.toThrow(/Cannot recover job .*missing storage lane/i);
   });
 
   it('26f. recoverOnStartup() ABANDONS legacy running jobs even when promoteStarted=false is explicitly present', async () => {

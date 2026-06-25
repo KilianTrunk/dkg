@@ -664,7 +664,9 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
     return reason.includes('partial promote ambiguity')
       || lastError.includes('partial promote ambiguity')
       || reason.includes('legacy promote job')
-      || lastError.includes('legacy promote job');
+      || lastError.includes('legacy promote job')
+      || reason.includes('missing storage lane')
+      || lastError.includes('cannot prove the wm storage lane');
   }
 
   /**

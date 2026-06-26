@@ -6,7 +6,7 @@ import {
   isPcaUnavailableError,
   type V10PublishingConvictionAccountInfo,
 } from '@origintrail-official/dkg-chain';
-import { jsonResponse, readBody, SMALL_BODY_BYTES } from '../http-utils.js';
+import { jsonResponse, readBody, SMALL_BODY_BYTES, respondIfChainRpcTransportError } from '../http-utils.js';
 import type { RequestContext } from './context.js';
 
 const ZERO = '0x0000000000000000000000000000000000000000';
@@ -189,6 +189,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       const msg = err?.message ?? String(err);
       if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (respondIfChainRpcTransportError(res, err)) return;
       const revert = classifyPcaRevert(msg);
       if (revert) return jsonResponse(res, revert.status, { error: revert.error });
       return jsonResponse(res, 500, {
@@ -240,6 +241,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       const msg = err?.message ?? String(err);
       if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (respondIfChainRpcTransportError(res, err)) return;
       if (isOwnerRevert(msg)) {
         return jsonResponse(res, 403, {
           error: 'NotAccountOwner — daemon EOA is not the PCA owner',
@@ -284,6 +286,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       const msg = err?.message ?? String(err);
       if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (respondIfChainRpcTransportError(res, err)) return;
       if (isOwnerRevert(msg)) {
         return jsonResponse(res, 403, {
           error: 'NotAccountOwner — daemon EOA is not the PCA owner',
@@ -322,6 +325,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       const msg = err?.message ?? String(err);
       if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (respondIfChainRpcTransportError(res, err)) return;
       if (isOwnerRevert(msg)) {
         return jsonResponse(res, 403, {
           error: 'NotAccountOwner — daemon EOA is not the PCA owner',
@@ -355,6 +359,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       const msg = err?.message ?? String(err);
       if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (respondIfChainRpcTransportError(res, err)) return;
       const revert = classifyPcaRevert(msg);
       if (revert) return jsonResponse(res, revert.status, { error: revert.error, accountId: idStr });
       return jsonResponse(res, 500, { error: `settlePublishingConvictionAccount failed: ${msg}` });
@@ -398,6 +403,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       const msg = err?.message ?? String(err);
       if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (respondIfChainRpcTransportError(res, err)) return;
       return jsonResponse(res, 500, {
         error: `getPublishingConvictionAccountInfo failed: ${msg}`,
       });

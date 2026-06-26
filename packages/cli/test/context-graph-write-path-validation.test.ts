@@ -33,6 +33,8 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import type { ServerResponse } from 'node:http';
 import { resolveRequiredWriteContextGraphId } from '../src/daemon/http-utils.js';
+import { handleMemoryRoutes } from '../src/daemon/routes/memory.js';
+import type { RequestContext } from '../src/daemon/routes/context.js';
 import {
   startLiveDaemon,
   stopLiveDaemon,
@@ -115,6 +117,113 @@ function rowProvider(rows: Row[]) {
       },
     },
   };
+}
+
+function preSignedAttestationFor(address: string) {
+  return {
+    address,
+    reservedKaId: '1',
+    signature: {
+      r: `0x${'11'.repeat(32)}`,
+      vs: `0x${'22'.repeat(32)}`,
+    },
+  };
+}
+
+function routeRes() {
+  const res: any = { statusCode: 0, body: '', headers: {} as Record<string, string>, writableEnded: false };
+  res.writeHead = (status: number, headers?: Record<string, string>) => {
+    res.statusCode = status;
+    if (headers) Object.assign(res.headers, headers);
+    return res;
+  };
+  res.setHeader = (key: string, value: string) => { res.headers[key] = value; };
+  res.end = (body?: string) => {
+    res.body = body ?? '';
+    res.writableEnded = true;
+  };
+  return res;
+}
+
+async function runSharedMemoryPublishRoute(params: {
+  body: Record<string, unknown>;
+  bearer?: string;
+  tokenAgents?: Record<string, string>;
+}) {
+  const res = routeRes();
+  const seen: Array<Record<string, any>> = [];
+  const url = new URL('http://127.0.0.1/api/shared-memory/publish');
+  const agent = {
+    resolveAgentByToken: (token?: string) => (token ? params.tokenAgents?.[token] : undefined),
+    async listContextGraphs() {
+      return [{ id: 'cg', uri: 'did:dkg:context-graph:cg', subscribed: true, synced: true }];
+    },
+    async contextGraphExists(id: string) {
+      return id === 'cg';
+    },
+    store: {
+      async query() {
+        return {
+          type: 'quads' as const,
+          quads: [{ subject: 'urn:root', predicate: 'urn:p', object: 'urn:o' }],
+        };
+      },
+    },
+    async getContextGraphOnChainId() {
+      return '1';
+    },
+    async publishFromFinalizedAssertion(contextGraphId: string, assertionName: string, opts: Record<string, unknown>) {
+      seen.push({ contextGraphId, assertionName, opts });
+      return {
+        kaId: 1n,
+        status: 'confirmed',
+        assertionUri: `did:dkg:assertion:${assertionName}`,
+        seal: {
+          authorAddress: params.tokenAgents?.[params.bearer ?? ''] ?? CALLER,
+          merkleRoot: new Uint8Array(32).fill(1),
+        },
+        kaManifest: [{ tokenId: 1n, rootEntity: 'urn:root' }],
+      };
+    },
+    async publishFromSharedMemory(contextGraphId: string, selection: unknown, opts: Record<string, unknown>) {
+      seen.push({ contextGraphId, selection, opts });
+      return {
+        kaId: 1n,
+        status: 'confirmed',
+        kaManifest: [{ tokenId: 1n, rootEntity: 'urn:root' }],
+        publicQuads: [{ subject: 'urn:root', predicate: 'urn:p', object: 'urn:o' }],
+      };
+    },
+  };
+  const tracker = {
+    start() {},
+    async trackPhase(_ctx: unknown, _phase: string, fn: () => unknown) { return fn(); },
+    complete() {},
+    fail() {},
+    setCost() {},
+    setTxHash() {},
+  };
+  const req = {
+    method: 'POST',
+    headers: params.bearer ? { authorization: `Bearer ${params.bearer}` } : {},
+    __dkgPrebufferedBody: Buffer.from(JSON.stringify(params.body)),
+  };
+  await handleMemoryRoutes({
+    req,
+    res,
+    agent,
+    tracker,
+    dashDb: { insertNotification: () => 1 },
+    config: {},
+    network: {},
+    path: url.pathname,
+    url,
+    requestToken: params.bearer,
+    requestAgentAddress: params.tokenAgents?.[params.bearer ?? ''] ?? 'did:dkg:agent:test',
+    emitMemoryGraphChanged: () => {},
+    emitNotification: () => {},
+  } as unknown as RequestContext);
+  return { res, seen };
 }
 
 // The routes' real write-preflight opts (knowledge-assets.ts:478-482 /
@@ -274,12 +383,67 @@ describe('resolveRequiredWriteContextGraphId — write-target resolution (real r
   });
 });
 
+describe('shared-memory publish authorship route matrix', () => {
+  it('defaults selection publish authorship to the agent-scoped token', async () => {
+    const agentAddress = `0x${'ab'.repeat(20)}`;
+    const { res, seen } = await runSharedMemoryPublishRoute({
+      bearer: 'agent-a-token',
+      tokenAgents: { 'agent-a-token': agentAddress },
+      body: { contextGraphId: 'cg', selection: ['urn:root'] },
+    });
+
+    expect(res.statusCode, res.body).toBe(200);
+    expect(seen).toHaveLength(1);
+    expect(seen[0].opts.authorAgentAddress).toBe(agentAddress);
+  });
+
+  it('allows selection publish when body author matches the agent-scoped token', async () => {
+    const agentAddress = `0x${'cd'.repeat(20)}`;
+    const { res, seen } = await runSharedMemoryPublishRoute({
+      bearer: 'agent-a-token',
+      tokenAgents: { 'agent-a-token': agentAddress },
+      body: { contextGraphId: 'cg', selection: ['urn:root'], authorAgentAddress: agentAddress },
+    });
+
+    expect(res.statusCode, res.body).toBe(200);
+    expect(seen).toHaveLength(1);
+    expect(seen[0].opts.authorAgentAddress).toBe(agentAddress);
+  });
+
+  it('canonicalizes selection publish when body author matches the agent-scoped token with different casing', async () => {
+    const agentAddress = `0x${'dc'.repeat(20)}`;
+    const mixedCaseAgent = `0x${agentAddress.slice(2).toUpperCase()}`;
+    const { res, seen } = await runSharedMemoryPublishRoute({
+      bearer: 'agent-a-token',
+      tokenAgents: { 'agent-a-token': agentAddress },
+      body: { contextGraphId: 'cg', selection: ['urn:root'], authorAgentAddress: mixedCaseAgent },
+    });
+
+    expect(res.statusCode, res.body).toBe(200);
+    expect(seen).toHaveLength(1);
+    expect(seen[0].opts.authorAgentAddress).toBe(agentAddress);
+  });
+
+  it('keeps node-token selection publish explicit author override behavior', async () => {
+    const authorAgentAddress = `0x${'ef'.repeat(20)}`;
+    const { res, seen } = await runSharedMemoryPublishRoute({
+      bearer: 'node-token',
+      tokenAgents: {},
+      body: { contextGraphId: 'cg', selection: ['urn:root'], authorAgentAddress },
+    });
+
+    expect(res.statusCode, res.body).toBe(200);
+    expect(seen).toHaveLength(1);
+    expect(seen[0].opts.authorAgentAddress).toBe(authorAgentAddress);
+  });
+});
+
 describe('context-graph write-path validation — real daemon route wiring', () => {
   let daemon: LiveDaemon;
   const LOCAL_CG = 'write-path-cg';
 
   beforeAll(async () => {
-    daemon = await startLiveDaemon({ authEnabled: false });
+    daemon = await startLiveDaemon();
     const created = await postJson(daemon, '/api/context-graph/create', { id: LOCAL_CG, name: LOCAL_CG });
     expect(created.status).toBe(200);
   }, 90_000);
@@ -289,6 +453,42 @@ describe('context-graph write-path validation — real daemon route wiring', () 
   });
 
   const QUADS = [{ subject: 'urn:s', predicate: 'urn:p', object: 'urn:o' }];
+
+  async function postJsonAsAgent(authToken: string, path: string, body: unknown) {
+    const res = await fetch(`${daemon.base}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
+      body: JSON.stringify(body),
+    });
+    return { status: res.status, body: (await res.json().catch(() => ({}))) as Record<string, any> };
+  }
+
+  async function registerAgentClient(label: string) {
+    const registered = await postJson(daemon, '/api/agent/register', {
+      name: `${label}-${Date.now().toString(36)}`,
+      framework: 'test',
+    });
+    expect(registered.status, `${label} register: ${JSON.stringify(registered.body)}`).toBeLessThan(300);
+    const agentAddress = String(registered.body.agentAddress);
+    const authToken = String(registered.body.authToken);
+    expect(agentAddress).toMatch(/^0x[0-9a-fA-F]{40}$/);
+    expect(authToken.length).toBeGreaterThan(0);
+    return {
+      agentAddress,
+      authToken,
+      post: (path: string, body: unknown) => postJsonAsAgent(authToken, path, body),
+    };
+  }
+
+  async function createRegisteredAgentContextGraph(
+    agent: Awaited<ReturnType<typeof registerAgentClient>>,
+    id: string,
+  ) {
+    const created = await agent.post('/api/context-graph/create', { id, name: id, accessPolicy: 1 });
+    expect(created.status, `agent CG create: ${JSON.stringify(created.body)}`).toBeLessThan(300);
+    const registered = await agent.post('/api/context-graph/register', { id, accessPolicy: 1 });
+    expect(registered.status, `agent CG register: ${JSON.stringify(registered.body)}`).toBe(200);
+  }
 
   // ── every write route rejects an unknown contextGraphId before mutating ──
   it('rejects unknown wm/write targets with CONTEXT_GRAPH_NOT_FOUND before mutation', async () => {
@@ -345,6 +545,58 @@ describe('context-graph write-path validation — real daemon route wiring', () 
     const res = await postJson(daemon, '/api/shared-memory/publish', { contextGraphId: 'missing-cg', selection: 'all' });
     expect(res.status).toBe(400);
     expect(res.body).toMatchObject({ code: 'CONTEXT_GRAPH_NOT_FOUND' });
+  });
+
+  it('rejects an agent token that selection-publishes as a different authorAgentAddress before reading shared memory', async () => {
+    const agentA = await registerAgentClient('swm-publish-author-a');
+    const agentB = await registerAgentClient('swm-publish-author-b');
+    const cg = `swm-publish-author-${Date.now().toString(36)}`;
+    await createRegisteredAgentContextGraph(agentA, cg);
+
+    const res = await agentA.post('/api/shared-memory/publish', {
+      contextGraphId: cg,
+      selection: 'all',
+      authorAgentAddress: agentB.agentAddress,
+    });
+
+    expect(res.status).toBe(403);
+    expect(String(res.body.error)).toContain(agentA.agentAddress);
+    expect(String(res.body.error)).toContain(agentB.agentAddress);
+    expect(String(res.body.error)).toContain('authorAgentAddress');
+  });
+
+  it('rejects an agent token that selection-publishes with a different pre-signed author before reading shared memory', async () => {
+    const agentA = await registerAgentClient('swm-publish-presign-a');
+    const agentB = await registerAgentClient('swm-publish-presign-b');
+    const cg = `swm-publish-presign-${Date.now().toString(36)}`;
+    await createRegisteredAgentContextGraph(agentA, cg);
+
+    const res = await agentA.post('/api/shared-memory/publish', {
+      contextGraphId: cg,
+      selection: 'all',
+      preSignedAuthorAttestation: preSignedAttestationFor(agentB.agentAddress),
+    });
+
+    expect(res.status).toBe(403);
+    expect(String(res.body.error)).toContain(agentA.agentAddress);
+    expect(String(res.body.error)).toContain(agentB.agentAddress);
+    expect(String(res.body.error)).toContain('preSignedAuthorAttestation.address');
+  });
+
+  it('passes the token-scoped storage lane into shared-memory assertionName publish calls', async () => {
+    const { res, seen } = await runSharedMemoryPublishRoute({
+      bearer: 'agent-token',
+      tokenAgents: { 'agent-token': CALLER },
+      body: {
+        contextGraphId: 'cg',
+        assertionName: 'agent-owned-assertion',
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.assertionName).toBe('agent-owned-assertion');
+    expect(seen[0]?.opts).toMatchObject({ agentAddress: CALLER });
   });
 
   // ── a real locally-created graph (and its full DID) is accepted ──

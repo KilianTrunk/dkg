@@ -39,9 +39,13 @@ import {
   isWritableQuad,
   validateQuadObjectTerms,
   respondIfReconcileUnavailable,
+  respondIfChainRpcTransportError,
+  sanitizeRpcMessage,
   validateWritableQuadLiteralSizes,
   normalizeContextGraphIdOrUri,
   resolveRequiredWriteContextGraphId,
+  isNoFundedPublisherWalletLike,
+  noFundedPublisherWalletBody,
 } from "../http-utils.js";
 import { validatePreSignedAuthorAttestation } from "./memory.js";
 import { recordAssertionActivity } from "../activity-notification.js";
@@ -62,6 +66,10 @@ import {
 import {
   decodePromoteJobId,
   asyncPromoteUnavailable,
+  authorizeAgentScopedAuthorClaim,
+  buildAutoRegisterFailureBody,
+  isSameAgentAddress,
+  scopedTokenPromoteLane,
 } from "./shared-assertion-helpers.js";
 import { PromoteJobConflictError } from "@origintrail-official/dkg-publisher";
 import { deriveStatus } from "@origintrail-official/dkg-publisher";
@@ -167,6 +175,13 @@ function respondAssertionError(res: RequestContext["res"], e: any): void {
   // KA-number-floor reconcile couldn't reach the chain (e.g. a rate-limited RPC
   // 429'd the one-time-per-author read) -> retryable 503, not 500.
   if (respondIfReconcileUnavailable(res, e)) return;
+  // Transient chain-RPC transport failure (all endpoints exhausted / receipt
+  // lookup failed / timeout) -> retryable 503/504, keyed on err.code so a
+  // genuine on-chain revert (no transport code) still falls through to the
+  // 4xx/500 mapping below. Code-keyed check precedes the message-keyed 400
+  // branch so an exhaustion message that happens to contain "not found"
+  // (e.g. "header not found") is not mis-mapped to a 400.
+  if (respondIfChainRpcTransportError(res, e)) return;
   const msg = e?.message ?? String(e);
   if (
     e?.name === "ReservedNamespaceError" ||
@@ -312,6 +327,12 @@ export function resolveFinalizeOptions(
     jsonResponse(res, 400, { error: '"schemeVersion" must be a positive integer when supplied' });
     return null;
   }
+  if (!authorizeAgentScopedAuthorClaim(res, tokenAgentAddress, authorAgentAddress, "authorAgentAddress")) {
+    return null;
+  }
+  if (!authorizeAgentScopedAuthorClaim(res, tokenAgentAddress, resolvedPreSignedAttestation?.address, "preSignedAuthorAttestation.address")) {
+    return null;
+  }
   // Token attribution — parity with /api/shared-memory/publish (memory.ts).
   // An agent-scoped bearer token attributes authorship to that agent when the
   // body specified neither an explicit `authorAgentAddress` nor a pre-signed
@@ -321,12 +342,15 @@ export function resolveFinalizeOptions(
   // Without this, the create + finalize routes ignored the token and a custodial
   // agent's publish was sealed under the node's own signer instead of the agent
   // (the on-chain author came out as the node's operational wallet).
-  const effectiveAuthorAgentAddress =
+  const explicitAuthorAgentAddress =
     typeof authorAgentAddress === "string"
       ? authorAgentAddress
-      : resolvedPreSignedAttestation == null
-        ? tokenAgentAddress
-        : undefined;
+      : undefined;
+  const effectiveAuthorAgentAddress =
+    (explicitAuthorAgentAddress && tokenAgentAddress && isSameAgentAddress(tokenAgentAddress, explicitAuthorAgentAddress)
+      ? tokenAgentAddress
+      : explicitAuthorAgentAddress) ??
+    (resolvedPreSignedAttestation == null ? tokenAgentAddress : undefined);
   return {
     ...(subGraphName ? { subGraphName } : {}),
     ...(typeof effectiveAuthorAgentAddress === "string" ? { authorAgentAddress: effectiveAuthorAgentAddress } : {}),
@@ -338,6 +362,64 @@ export function resolveFinalizeOptions(
 
 function hasFinalizeOnlyCreateFields(raw: Record<string, unknown>): boolean {
   return FINALIZE_ONLY_CREATE_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(raw, field));
+}
+
+function resolveAuthorAgentAddressFromFinalizeOptions(
+  finalizeOptions: Record<string, unknown>,
+  tokenAgentAddress?: string,
+): string | undefined {
+  const finalizedAuthor = finalizeOptions.authorAgentAddress;
+  if (typeof finalizedAuthor === "string") {
+    return tokenAgentAddress && isSameAgentAddress(tokenAgentAddress, finalizedAuthor)
+      ? tokenAgentAddress
+      : finalizedAuthor;
+  }
+  return tokenAgentAddress;
+}
+
+function scopedTokenStorageLane(agentAddress?: string): { agentAddress?: string } {
+  return agentAddress ? { agentAddress } : {};
+}
+
+async function resolveFinalizeStorageLane(
+  agent: RequestContext["agent"],
+  contextGraphId: string,
+  name: string,
+  finalizeOptions: Record<string, unknown>,
+  tokenAgentAddress?: string,
+): Promise<{ agentAddress?: string }> {
+  const tokenLane = scopedTokenStorageLane(tokenAgentAddress);
+  if (tokenLane.agentAddress) return tokenLane;
+
+  const explicitAuthorLane = resolveAuthorAgentAddressFromFinalizeOptions(finalizeOptions, undefined);
+  if (!explicitAuthorLane) return {};
+
+  const history = agent.assertion?.history;
+  if (typeof history !== "function") return {};
+
+  const subGraphName =
+    typeof finalizeOptions.subGraphName === "string"
+      ? finalizeOptions.subGraphName
+      : undefined;
+  const baseOptions = subGraphName ? { subGraphName } : {};
+
+  let defaultHistory: unknown;
+  try {
+    defaultHistory = await history.call(agent.assertion, contextGraphId, name, baseOptions);
+  } catch {
+    return {};
+  }
+  if (defaultHistory != null) return {};
+
+  try {
+    const authorHistory = await history.call(agent.assertion, contextGraphId, name, {
+      ...baseOptions,
+      agentAddress: explicitAuthorLane,
+    });
+    return authorHistory != null ? { agentAddress: explicitAuthorLane } : {};
+  } catch {
+    return {};
+  }
 }
 
 // uint32 epoch ceiling (matches sibling routes memory.ts / publisher.ts). Not an
@@ -361,20 +443,15 @@ function classifyVmPublish(pub: unknown): { httpStatus: 200 | 207 | 502; reason?
   };
 }
 
-// Reject finalized-publish request shapes that don't make sense once the URL
-// name + seal already select the assertion and encode the author (PR #971).
-// The seal commits to the whole assertion content + author, so assertionName /
-// author overrides / partial selection on vm/publish are user errors, not
-// silently-ignored fields.
-function validateFinalizedAssertionPublishRequest(
-  parsed: Record<string, unknown>,
+// Reject finalized-publish fields that don't make sense once the URL name +
+// seal already select the assertion and encode the author (PR #971). The seal
+// commits to the whole assertion content + author, so assertionName / author
+// overrides / partial selection are user errors, not silently-ignored fields.
+function validateFinalizedAssertionPublishShape(
+  source: Record<string, unknown>,
   res: RequestContext["res"],
 ): boolean {
-  const nested = parsed.options && typeof parsed.options === "object" && !Array.isArray(parsed.options)
-    ? parsed.options as Record<string, unknown>
-    : undefined;
-  const assertionName = parsed.assertionName ?? nested?.assertionName;
-  if (assertionName !== undefined) {
+  if (source.assertionName !== undefined) {
     jsonResponse(res, 400, {
       error:
         '"assertionName" is not accepted on /api/knowledge-assets/:name/vm/publish — the URL name selects the assertion.',
@@ -382,10 +459,8 @@ function validateFinalizedAssertionPublishRequest(
     return false;
   }
   const hasAuthorOverride =
-    parsed.authorAgentAddress != null ||
-    parsed.preSignedAuthorAttestation != null ||
-    nested?.authorAgentAddress != null ||
-    nested?.preSignedAuthorAttestation != null;
+    source.authorAgentAddress != null ||
+    source.preSignedAuthorAttestation != null;
   if (hasAuthorOverride) {
     jsonResponse(res, 400, {
       error:
@@ -393,8 +468,7 @@ function validateFinalizedAssertionPublishRequest(
     });
     return false;
   }
-  const selection = parsed.selection ?? nested?.selection;
-  if (selection !== undefined && selection !== "all") {
+  if (source.selection !== undefined && source.selection !== "all") {
     jsonResponse(res, 400, {
       error:
         '"selection" must be omitted or "all" on vm/publish — the seal commits to the entire assertion content.',
@@ -402,6 +476,29 @@ function validateFinalizedAssertionPublishRequest(
     return false;
   }
   return true;
+}
+
+function publishIntegerString(
+  value: unknown,
+  field: string,
+  res: RequestContext["res"],
+  opts: { positive: boolean },
+): string | null {
+  if (typeof value !== "string" && typeof value !== "number") {
+    jsonResponse(res, 400, { error: `"${field}" must be a ${opts.positive ? "positive " : "non-negative "}integer (string or number)` });
+    return null;
+  }
+  if (typeof value === "number" && (!Number.isSafeInteger(value) || (opts.positive ? value <= 0 : value < 0))) {
+    jsonResponse(res, 400, { error: `"${field}" must be a ${opts.positive ? "positive " : "non-negative "}safe integer (string or number)` });
+    return null;
+  }
+  const v = typeof value === "string" ? value.trim() : String(value);
+  const pattern = opts.positive ? /^[1-9]\d*$/ : /^\d+$/;
+  if (!pattern.test(v)) {
+    jsonResponse(res, 400, { error: `"${field}" must be a ${opts.positive ? "positive " : "non-negative "}integer (string or number)` });
+    return null;
+  }
+  return v;
 }
 
 // Validate + normalize the finalized-publish options BEFORE they reach
@@ -422,23 +519,15 @@ function resolveFinalizedPublishOptions(
 
   let resolvedPublisherIdentityOverride: bigint | undefined;
   if (publisherNodeIdentityIdOverride !== undefined && publisherNodeIdentityIdOverride !== null) {
-    const v = String(publisherNodeIdentityIdOverride);
-    if (!/^\d+$/.test(v)) {
-      jsonResponse(res, 400, {
-        error: '"publisherNodeIdentityIdOverride" must be a non-negative integer (string or number)',
-      });
-      return null;
-    }
+    const v = publishIntegerString(publisherNodeIdentityIdOverride, "publisherNodeIdentityIdOverride", res, { positive: false });
+    if (v === null) return null;
     resolvedPublisherIdentityOverride = BigInt(v);
   }
 
   let resolvedPublishEpochs: number | undefined;
   if (rawPublishEpochs !== undefined && rawPublishEpochs !== null) {
-    const v = String(rawPublishEpochs).trim();
-    if (!/^[1-9]\d*$/.test(v)) {
-      jsonResponse(res, 400, { error: `"${publishEpochsField}" must be a positive integer (string or number)` });
-      return null;
-    }
+    const v = publishIntegerString(rawPublishEpochs, publishEpochsField, res, { positive: true });
+    if (v === null) return null;
     const n = Number(v);
     if (!Number.isSafeInteger(n)) {
       jsonResponse(res, 400, { error: `"${publishEpochsField}" is too large to safely represent as a JavaScript integer` });
@@ -467,6 +556,26 @@ function resolveFinalizedPublishOptions(
       ? { publisherNodeIdentityIdOverride: resolvedPublisherIdentityOverride }
       : {}),
   };
+}
+
+function resolveInlineVmPublishOptions(
+  ctx: RequestContext,
+  source: Record<string, unknown>,
+): Record<string, unknown> | null {
+  if (!validateFinalizedAssertionPublishShape(source, ctx.res)) return null;
+  return resolveFinalizedPublishOptions(ctx, source);
+}
+
+function resolveStandaloneVmPublishOptions(
+  ctx: RequestContext,
+  source: Record<string, unknown>,
+): Record<string, unknown> | null {
+  if (!validateFinalizedAssertionPublishShape(source, ctx.res)) return null;
+  const raw = source.options;
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    if (!validateFinalizedAssertionPublishShape(raw as Record<string, unknown>, ctx.res)) return null;
+  }
+  return resolveFinalizedPublishOptions(ctx, raw);
 }
 
 async function verifyDirectPublishOnChainContextGraphId(
@@ -666,6 +775,10 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       }
       // Transient KA-number-floor reconcile failure (rate-limited RPC) -> 503.
       if (respondIfReconcileUnavailable(res, e)) return;
+      // A transient chain-RPC transport exhaustion on the direct explicit-quads
+      // mint is retryable (503/504), not a hard 500 — parity with /vm/publish
+      // and /api/context-graph/register. Code-keyed, so on-chain reverts stay 500.
+      if (respondIfChainRpcTransportError(res, e)) return;
       return jsonResponse(res, 500, { error: e?.message ?? String(e) });
     }
   }
@@ -754,6 +867,13 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
     // request-shape error into orphaned state.
     const alsoPublishVmRequested =
       alsoPublishVm === true || (typeof alsoPublishVm === "object" && alsoPublishVm !== null);
+    const alsoPublishVmOptions = alsoPublishVmRequested
+      ? resolveInlineVmPublishOptions(
+          ctx,
+          typeof alsoPublishVm === "object" && alsoPublishVm !== null ? alsoPublishVm : {},
+        )
+      : {};
+    if (alsoPublishVmOptions === null) return;
     if (!shouldFinalize && (alsoShareSwm === true || alsoPublishVmRequested)) {
       return jsonResponse(res, 400, {
         error: '"alsoShareSwm"/"alsoPublishVm" require a finalized assertion (non-empty "quads" and "finalize" !== false)',
@@ -792,7 +912,13 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       // finalize throws KaIdNamespaceMismatch. So stamp under the same resolved
       // author the finalize uses: the body author, else the token's agent (else
       // undefined → the daemon's default agent for node/admin tokens).
-      const createAuthorAgentAddress = resolvedAuthorAgentAddress ?? writePreflightCallerAgentAddress;
+      const createAuthorAgentAddress = resolveAuthorAgentAddressFromFinalizeOptions(
+        finalizeOptions,
+        writePreflightCallerAgentAddress,
+      );
+      const atomicAuthorLane = createAuthorAgentAddress
+        ? { agentAddress: createAuthorAgentAddress }
+        : {};
       const assertionUri = await agent.assertion.create(resolvedContextGraphId, name, {
         subGraphName,
         ...(createAuthorAgentAddress ? { agentAddress: createAuthorAgentAddress } : {}),
@@ -805,12 +931,15 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       // explicit finalize:false leaves an editable WM draft and never touches
       // the chain (OT-RFC-43 §10.5.5). `also*` are opt-in transitions on top.
       if (hasQuads) {
-        await agent.assertion.write(resolvedContextGraphId, name, quads, { subGraphName });
+        await agent.assertion.write(resolvedContextGraphId, name, quads, { subGraphName, ...atomicAuthorLane });
         result.written = quads.length;
         emitMemoryGraphChanged?.({ contextGraphId: resolvedContextGraphId, layers: ["wm"], subGraphName, operation: "assertion_written", source: "api", counts: { triples: quads.length } });
       }
       if (shouldFinalize) {
-        const seal = await agent.assertion.finalize(resolvedContextGraphId, name, finalizeOptions);
+        const seal = await agent.assertion.finalize(resolvedContextGraphId, name, {
+          ...finalizeOptions,
+          ...atomicAuthorLane,
+        });
         result.merkleRoot = hex(seal.merkleRoot);
         // Surface the sealed author so clients (and tests) can confirm custodial
         // attribution on the atomic create+finalize path, mirroring the dedicated
@@ -829,6 +958,7 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
           // covers the seal-on-share path too.
           const share = await agent.assertion.promote(resolvedContextGraphId, name, {
             subGraphName,
+            ...atomicAuthorLane,
             ...(resolvedAuthorAgentAddress ? { authorAgentAddress: resolvedAuthorAgentAddress } : {}),
           });
           result.swmShared = true;
@@ -844,13 +974,16 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
             recordActivityAndNotify(ctx, { contextGraphId: resolvedContextGraphId, kind: "promoted", actorAgentAddress: resolvedAuthorAgentAddress ?? requestAgentAddress, subGraphName, tripleCount: share.promotedCount });
           }
         } catch (e: any) {
-          errors.push({ phase: "swm-share", error: e?.message ?? String(e) });
+          errors.push({ phase: "swm-share", error: sanitizeRpcMessage(e?.message ?? String(e)) });
         }
       }
       if (alsoPublishVm === true || (typeof alsoPublishVm === "object" && alsoPublishVm !== null)) {
         try {
-          const opts = typeof alsoPublishVm === "object" && alsoPublishVm ? alsoPublishVm : {};
-          const pub: any = await agent.publishFromFinalizedAssertion(resolvedContextGraphId, name, { subGraphName, ...opts });
+          const pub: any = await agent.publishFromFinalizedAssertion(resolvedContextGraphId, name, {
+            subGraphName,
+            ...alsoPublishVmOptions,
+            ...atomicAuthorLane,
+          });
           result.kaId = pub?.kaId;
           result.ual = pub?.ual;
           result.txHash = pub?.onChainResult?.txHash;
@@ -862,10 +995,10 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
             result.status = "vm-confirmed";
           } else {
             result.status = httpStatus === 207 ? "vm-partial" : "vm-failed";
-            errors.push({ phase: "vm-publish", error: reason ?? "VM publish did not confirm" });
+            errors.push({ phase: "vm-publish", error: sanitizeRpcMessage(reason ?? "VM publish did not confirm") });
           }
         } catch (e: any) {
-          errors.push({ phase: "vm-publish", error: e?.message ?? String(e) });
+          errors.push({ phase: "vm-publish", error: sanitizeRpcMessage(e?.message ?? String(e)) });
         }
       }
 
@@ -915,18 +1048,21 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
   }
 
   // Shared GET preflight: decode/validate the :identifier, require + normalize
-  // contextGraphId, validate subGraphName, extract optional agentAddress.
+  // contextGraphId, validate subGraphName, extract optional agentAddress. For
+  // agent-scoped bearer tokens, omitted agentAddress defaults to the token's
+  // storage lane so GETs see the same draft the write routes created.
   function readGetParams(): { cg: string; subGraphName?: string; agentAddress?: string } | null {
     if (decodeAndValidateName(name, res) === null) return null;
     const rawCg = url.searchParams.get("contextGraphId");
     if (!validateRequiredContextGraphId(rawCg, res)) return null;
     const subGraphName = url.searchParams.get("subGraphName") ?? undefined;
     if (!validateOptionalSubGraphName(subGraphName, res)) return null;
-    const agentAddress = url.searchParams.get("agentAddress") ?? undefined;
-    if (agentAddress !== undefined && !/^0x[0-9a-fA-F]{40}$/.test(agentAddress)) {
+    const explicitAgentAddress = url.searchParams.get("agentAddress") ?? undefined;
+    if (explicitAgentAddress !== undefined && !/^0x[0-9a-fA-F]{40}$/.test(explicitAgentAddress)) {
       jsonResponse(res, 400, { error: '"agentAddress" must be a 0x-prefixed 20-byte EVM address' });
       return null;
     }
+    const agentAddress = explicitAgentAddress ?? writePreflightCallerAgentAddress;
     return { cg: normalizeContextGraphIdOrUri(rawCg as string), subGraphName, agentAddress };
   }
 
@@ -957,7 +1093,10 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       if (typeof hist.name === "string") resolvedName = hist.name;
     }
     try {
-      const quads = await agent.assertion.query(p.cg, resolvedName, p.subGraphName ? { subGraphName: p.subGraphName } : undefined);
+      const quads = await agent.assertion.query(p.cg, resolvedName, {
+        ...(p.subGraphName ? { subGraphName: p.subGraphName } : {}),
+        ...(p.agentAddress ? { agentAddress: p.agentAddress } : {}),
+      });
       const sorted = [...quads].sort((l, r) => JSON.stringify(l).localeCompare(JSON.stringify(r)));
       return jsonResponse(res, 200, { quads: sorted, count: sorted.length });
     } catch (e: any) {
@@ -1052,25 +1191,38 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         // corrupt an in-progress draft and — if the following write() throws —
         // leave that wipe behind. So gate it on an active-draft existence check:
         // brand-new or discarded names get created; existing drafts stay append-only.
-        const existing = await agent.assertion.history(contextGraphId, name, { subGraphName });
+        const writeAuthorLane = writePreflightCallerAgentAddress
+          ? { agentAddress: writePreflightCallerAgentAddress }
+          : {};
+        const existing = await agent.assertion.history(contextGraphId, name, { subGraphName, ...writeAuthorLane });
         if (!existing || existing.state === "discarded") {
           // Stamp the kaId under the request token's agent (OT-RFC-43 §F2) so a
           // later finalize as that agent doesn't hit KaIdNamespaceMismatch.
           await agent.assertion.create(contextGraphId, name, {
             subGraphName,
-            ...(writePreflightCallerAgentAddress ? { agentAddress: writePreflightCallerAgentAddress } : {}),
+            ...writeAuthorLane,
           });
         }
-        await agent.assertion.write(contextGraphId, name, parsed.quads, { subGraphName });
+        await agent.assertion.write(contextGraphId, name, parsed.quads, { subGraphName, ...writeAuthorLane });
         emitMemoryGraphChanged?.({ contextGraphId, layers: ["wm"], subGraphName, operation: "assertion_written", source: "api", counts: { triples: parsed.quads.length } });
         return jsonResponse(res, 200, { written: parsed.quads.length });
       }
       if (verb === "finalize") {
         const finalizeOptions = resolveFinalizeOptions(parsed, res, writePreflightCallerAgentAddress);
         if (finalizeOptions === null) return;
+        const finalizeStorageLane = await resolveFinalizeStorageLane(
+          agent,
+          contextGraphId,
+          name,
+          finalizeOptions,
+          writePreflightCallerAgentAddress,
+        );
         let seal;
         try {
-          seal = await agent.assertion.finalize(contextGraphId, name, finalizeOptions);
+          seal = await agent.assertion.finalize(contextGraphId, name, {
+            ...finalizeOptions,
+            ...finalizeStorageLane,
+          });
         } catch (e: any) {
           // #1116 (review A1): a finalize(layer:"swm") on an asset that was only
           // SUBSET-shared is rejected — subset shares are SWM-only, not
@@ -1097,7 +1249,10 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         });
       }
       if (verb === "discard") {
-        await agent.assertion.discard(contextGraphId, name, { subGraphName });
+        await agent.assertion.discard(contextGraphId, name, {
+          subGraphName,
+          ...(writePreflightCallerAgentAddress ? { agentAddress: writePreflightCallerAgentAddress } : {}),
+        });
         // Parity with legacy discard: evict any cached extraction-status record
         // for this assertion so a re-import doesn't see a stale "completed".
         ctx.extractionStatus.delete(contextGraphAssertionUri(contextGraphId, requestAgentAddress, name, subGraphName));
@@ -1113,7 +1268,11 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         }
         const onConflict = parsed.onConflict === "replace" ? "replace" : "reject";
         try {
-          const result = await agent.assertion.pullFrom(contextGraphId, name, sourceLayer, { subGraphName, onConflict });
+          const result = await agent.assertion.pullFrom(contextGraphId, name, sourceLayer, {
+            subGraphName,
+            onConflict,
+            ...(writePreflightCallerAgentAddress ? { agentAddress: writePreflightCallerAgentAddress } : {}),
+          });
           return jsonResponse(res, 200, { wmDraft: "open", seededFrom: { layer: sourceLayer }, ...result });
         } catch (e: any) {
           if (e?.code === "WM_DRAFT_CONFLICT") {
@@ -1150,7 +1309,13 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         skipSeal = parsed.skipSeal;
       }
       try {
-        const share = await agent.assertion.promote(contextGraphId, name, { entities: parsed.entities, subGraphName, awaitCuratorAck, skipSeal });
+        const share = await agent.assertion.promote(contextGraphId, name, {
+          entities: parsed.entities,
+          subGraphName,
+          awaitCuratorAck,
+          skipSeal,
+          ...scopedTokenPromoteLane(writePreflightCallerAgentAddress),
+        });
         if (share.promotedCount !== 0) {
           emitMemoryGraphChanged?.({ contextGraphId, layers: ["wm", "swm"], subGraphName, operation: "assertion_promoted", source: "api", counts: { triples: share.promotedCount } });
           recordActivityAndNotify(ctx, { contextGraphId, kind: "promoted", actorAgentAddress: requestAgentAddress, subGraphName, tripleCount: share.promotedCount });
@@ -1202,6 +1367,7 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         const result = await agent.assertion.promoteAsync(contextGraphId, name, {
           entities: entities ?? "all",
           subGraphName,
+          ...scopedTokenPromoteLane(writePreflightCallerAgentAddress),
         });
         return jsonResponse(res, 200, { jobId: result.jobId, state: "queued" });
       } catch (err: any) {
@@ -1234,8 +1400,7 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       try {
         // Validate the request shape + normalize options BEFORE the publish (PR
         // #971): this is a standalone request, so a 400 here mutates nothing.
-        if (!validateFinalizedAssertionPublishRequest(parsed, res)) return;
-        const opts = resolveFinalizedPublishOptions(ctx, parsed.options);
+        const opts = resolveStandaloneVmPublishOptions(ctx, parsed);
         if (opts === null) return;
         // #1116: registration moved from seal-time to publish-time, but it must
         // run AFTER the local preconditions, not before — otherwise a doomed
@@ -1248,8 +1413,9 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         // transparently register and retry (idempotent). All other errors
         // propagate to the precondition/500 mapping below unchanged.
         let pub: any;
+        const publishStorageLane = scopedTokenStorageLane(writePreflightCallerAgentAddress);
         try {
-          pub = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts });
+          pub = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts, ...publishStorageLane });
         } catch (firstErr: any) {
           // #1116 (review B): code-first, message fallback. The publisher now
           // stamps `code: 'CG_NOT_REGISTERED'` on this throw; match on it and
@@ -1259,13 +1425,13 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
           try {
             await agent.ensureRegisteredForPublish(contextGraphId, { callerAgentAddress: requestAgentAddress });
           } catch (regErr: any) {
-            return jsonResponse(res, 400, {
-              error:
-                `Context graph "${contextGraphId}" could not be auto-registered on-chain before publish: ` +
-                `${regErr?.message ?? String(regErr)}`,
-            });
+            // A transient RPC outage during the pre-publish auto-registration
+            // is retryable (503/504), NOT a permanent client error (400) — a
+            // 400 would tell retry-aware clients to give up on a flaky RPC.
+            if (respondIfChainRpcTransportError(res, regErr)) return;
+            return jsonResponse(res, 400, buildAutoRegisterFailureBody(contextGraphId, regErr));
           }
-          pub = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts });
+          pub = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts, ...publishStorageLane });
         }
         const { httpStatus, reason } = classifyVmPublish(pub);
         if (httpStatus === 200) {
@@ -1307,6 +1473,21 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         if (e?.code === "PUBLISH_NOT_FULL_SHARE" || /is not finalized/.test(msg) || /No quads in shared memory/.test(msg) || /has no private payload/.test(msg)) {
           return jsonResponse(res, 409, { code: e?.code === "PUBLISH_NOT_FULL_SHARE" ? "PUBLISH_NOT_FULL_SHARE" : "VM_PUBLISH_PRECONDITION", error: msg });
         }
+        // Funded-wallet selection found no operational wallet holding the
+        // gas + TRAC a publish needs. This is a user-actionable funding
+        // condition (4xx), not a server/on-chain bug. Classification + body are
+        // shared with the top-level daemon handler (lifecycle.ts) so the two
+        // publish routes cannot drift on the code/marker contract.
+        if (isNoFundedPublisherWalletLike(e)) {
+          return jsonResponse(res, 400, noFundedPublisherWalletBody(msg));
+        }
+        // A transient chain-RPC transport failure (all endpoints exhausted /
+        // receipt lookup failed / timeout) is retryable -> 503/504, matching
+        // /api/context-graph/register. Keyed strictly on err.code, so an
+        // on-chain revert (CALL_EXCEPTION, no transport code) still keeps the
+        // generic 500 below (the #988 "publish never down-classifies on-chain
+        // errors" parity contract).
+        if (respondIfChainRpcTransportError(res, e)) return;
         return jsonResponse(res, 500, { error: msg });
       }
     }

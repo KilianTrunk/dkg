@@ -12,7 +12,10 @@ import {
   validateContextGraphId,
   validateSubGraphName,
   isSafeIri,
+  NO_FUNDED_PUBLISHER_WALLET_CODE,
+  messageIndicatesNoFundedPublisherWallet,
 } from '@origintrail-official/dkg-core';
+import { enrichEvmError, isChainRpcTransportError } from '@origintrail-official/dkg-chain';
 import type { DKGAgent, ContextGraphWritePreflightProbe } from '@origintrail-official/dkg-agent';
 import type { DkgConfig } from '../config.js';
 import { enforceSignedRequestPostBody } from '../auth.js';
@@ -67,6 +70,63 @@ export function payloadTooLargeResponseBody(err: unknown): Record<string, unknow
   const hint = shaped.hint;
   if (typeof hint === 'string' && hint.length > 0) body.hint = hint;
   return body;
+}
+
+/**
+ * True iff `err` is (or looks like) the funded-wallet-selection failure
+ * (`InsufficientPublisherFundsError`, code `NO_FUNDED_PUBLISHER_WALLET`) —
+ * code-first, with a message-marker fallback for a re-wrap that dropped `.code`.
+ * Code + marker are the shared dkg-core contract so the daemon, publisher
+ * classifier, chain, and node-ui cannot drift. Shared by the `/vm/publish` route
+ * catch and the top-level daemon handler.
+ */
+export function isNoFundedPublisherWalletLike(err: unknown): boolean {
+  const e = err as { code?: unknown; message?: unknown } | null | undefined;
+  if (e?.code === NO_FUNDED_PUBLISHER_WALLET_CODE) return true;
+  return messageIndicatesNoFundedPublisherWallet(e?.message);
+}
+
+/** The HTTP-400 response body for a no-funded-wallet publish failure: the
+ *  structured `code` plus the actionable message (which lists per-wallet
+ *  balances). Single source of truth for both publish routes. */
+export function noFundedPublisherWalletBody(message: string): { code: string; error: string } {
+  return { code: NO_FUNDED_PUBLISHER_WALLET_CODE, error: message };
+}
+
+/**
+ * Map a thrown request error to the daemon's top-level HTTP response — the
+ * single neutral place that rethrowing routes (e.g. `/api/shared-memory/publish`)
+ * and the lifecycle catch agree on status codes: 413 payload-too-large; 400 for
+ * SyntaxError / reserved-namespace / NO_FUNDED_PUBLISHER_WALLET; otherwise a 500
+ * with the EVM-decoded message. Unit-testable in isolation.
+ */
+export function respondWithDaemonError(res: ServerResponse, err: any): void {
+  if (res.headersSent || res.writableEnded) return;
+  if (isPayloadTooLargeError(err)) {
+    jsonResponse(res, 413, payloadTooLargeResponseBody(err));
+  } else if (err instanceof SyntaxError) {
+    jsonResponse(res, 400, { error: err.message });
+  } else if (
+    // Round 9 Bug 25: user-authored quads with reserved URN prefixes map to 400
+    // so share/publish routes that rethrow get the correct status.
+    err?.name === 'ReservedNamespaceError' ||
+    (typeof err?.message === 'string' && err.message.includes('reserved namespace'))
+  ) {
+    jsonResponse(res, 400, { error: err.message });
+  } else if (isNoFundedPublisherWalletLike(err)) {
+    // Funded-wallet selection found no operational wallet with gas + TRAC — a
+    // user-actionable funding condition (4xx), not a server bug.
+    jsonResponse(res, 400, noFundedPublisherWalletBody(typeof err?.message === 'string' ? err.message : String(err)));
+  } else if (respondIfChainRpcTransportError(res, err)) {
+    // Transient transport exhaustion (RPC_ENDPOINTS_EXHAUSTED /
+    // RPC_RECEIPT_LOOKUP_FAILED → 503, TIMEOUT → 504) is retryable — a route
+    // that RE-THROWS to this top-level handler (e.g. the SWM→VM publish at
+    // /api/shared-memory/publish) gets the retryable status instead of 500.
+    // Code-keyed, so on-chain reverts (no transport code) fall through to 500.
+  } else {
+    enrichEvmError(err);
+    jsonResponse(res, 500, { error: err?.message ?? String(err) });
+  }
 }
 
 export function oversizedRdfLiteralResponseBody(err: unknown): Record<string, unknown> {
@@ -214,6 +274,98 @@ export function respondIfReconcileUnavailable(res: ServerResponse, e: any): bool
     code: "KA_FLOOR_RECONCILE_UNAVAILABLE",
     retryable: true,
   });
+  return true;
+}
+
+/**
+ * Strip http(s) URLs from a chain error message before it is returned in an
+ * HTTP response body. The adapter's multi-provider `RPC_ENDPOINTS_EXHAUSTED`
+ * message embeds `this.rpcUrls.join(', ')`, and with default-backup inheritance
+ * an operator-set private `chain.rpcUrl` may carry an API key — so a response
+ * body must never echo raw RPC URLs (the failover logger is already host-only).
+ */
+export function sanitizeRpcMessage(msg: string): string {
+  return msg.replace(/https?:\/\/[^\s,)'"]+/gi, "[rpc]");
+}
+
+/**
+ * Maps a TRANSPORT-level chain RPC failure to a RETRYABLE HTTP status,
+ * keyed STRICTLY on `err.code` (never message text):
+ *   - `RPC_ENDPOINTS_EXHAUSTED`   → 503 (all configured endpoints failed over)
+ *   - `RPC_RECEIPT_LOOKUP_FAILED` → 503 (receipt lookup failed on every endpoint)
+ *   - `TIMEOUT`                   → 504 (receipt wait / RPC request timed out)
+ *
+ * Returns `undefined` for anything else. On-chain reverts (`CALL_EXCEPTION`),
+ * `INSUFFICIENT_FUNDS`, and application errors carry NO `RPC_*`/`TIMEOUT`
+ * transport code (the chain adapter only stamps these on the multi-RPC
+ * failover loops), so they fall through to each route's own mapping — which
+ * preserves the #988 contract that a genuine publish/on-chain failure stays
+ * 5xx/4xx and is NEVER down-classified by message text.
+ *
+ * Shared chokepoint for `/api/context-graph/register`, the `/vm/publish`
+ * catch, `respondAssertionError` (WM-verb writes), the SWM→VM publish
+ * auto-register leg, and the top-level daemon catch, so EVERY chain-write
+ * surface answers a transient RPC outage with the SAME retryable status
+ * instead of a generic 500 (or, in the auto-register leg, a misleading 400).
+ * Mirrors the failover engine's own multi-RPC awareness at the HTTP boundary.
+ */
+export function classifyChainRpcTransportStatus(
+  err: unknown,
+): { status: number; body: Record<string, unknown> } | undefined {
+  if (!isChainRpcTransportError(err)) return undefined;
+  const { code } = err;
+  const msg = sanitizeRpcMessage(typeof err.message === "string" ? err.message : "");
+  const txHash = typeof err.txHash === "string" && err.txHash ? err.txHash : "";
+  // Exhaustive over ChainRpcTransportCode: a new code added to the boundary
+  // without a case here is a COMPILE error (the `never` default), so the
+  // classifier can never silently inherit timeout/504 semantics for a new code.
+  switch (code) {
+    case "RPC_ENDPOINTS_EXHAUSTED":
+      return { status: 503, body: { error: msg || "Configured chain RPC endpoints were exhausted.", code } };
+    case "RPC_RECEIPT_LOOKUP_FAILED":
+      return {
+        status: 503,
+        body: {
+          error: msg || "Transaction receipt lookup failed on all configured chain RPC endpoints.",
+          code,
+          ...(txHash ? { txHash } : {}),
+        },
+      };
+    case "RPC_TIMEOUT":
+      // Internal, chain-namespaced timeout code. Expose the public/legacy
+      // `code: "TIMEOUT"` in the 504 body (clients key on that), keeping the
+      // wire contract stable while the boundary stays namespaced internally.
+      return {
+        status: 504,
+        body: { error: msg || "Chain transaction timed out.", code: "TIMEOUT", ...(txHash ? { txHash } : {}) },
+      };
+    default: {
+      const _exhaustive: never = code;
+      return _exhaustive;
+    }
+  }
+}
+
+/**
+ * Single responder for a transient chain-RPC transport failure: maps it to a
+ * retryable 503/504 (via {@link classifyChainRpcTransportStatus}), writes the
+ * response, and returns true. Returns false (writing nothing) for any
+ * non-transport error so the caller falls through to its own mapping.
+ * `extraBody` adds route-specific fields to the response body (e.g. the identity
+ * route's `{ identityId, hasIdentity }`). The canonical transport fields
+ * (`error`, `code`, `txHash`) are merged LAST so a caller can never shadow them
+ * — `extraBody` may only ADD fields, keeping this responder the single source of
+ * truth for the transport response shape. Use this instead of repeating the
+ * classify→jsonResponse branch in every chain-write catch.
+ */
+export function respondIfChainRpcTransportError(
+  res: ServerResponse,
+  err: unknown,
+  extraBody?: Record<string, unknown>,
+): boolean {
+  const transport = classifyChainRpcTransportStatus(err);
+  if (!transport) return false;
+  jsonResponse(res, transport.status, extraBody ? { ...extraBody, ...transport.body } : transport.body);
   return true;
 }
 

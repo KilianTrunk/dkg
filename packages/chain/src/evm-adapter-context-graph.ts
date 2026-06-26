@@ -19,7 +19,11 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
   /**
    * Reserve the next authorized signer and return its address. The publisher
    * uses this to bind off-chain signatures to the tx signer before
-   * `publishDirect` is submitted.
+   * `publishDirect` is submitted. This pre-pin runs BEFORE the publish cost is
+   * known (and the ChainAdapter interface advertises no cost arg), so it selects
+   * on the funding floor only — cost-aware selection lives inside
+   * `createKnowledgeAssets` (the no-`publisherAddress` path), and pin-time
+   * pricing is tracked as a follow-up (#1328).
    */
   async getAuthorizedPublisherAddress(contextGraphId: bigint): Promise<string> {
     await this.init();

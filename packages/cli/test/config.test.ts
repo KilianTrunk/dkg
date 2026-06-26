@@ -184,6 +184,8 @@ describe('loadNetworkConfig', () => {
         chainName: 'base',
         chainId: 'base:8453',
         rpcUrl: 'https://mainnet.base.org',
+        // Default multi-RPC backups shipped with the overlay (failover engine).
+        rpcUrls: ['https://base-rpc.publicnode.com', 'https://base.drpc.org'],
         hubAddress: '0x99Aa571fD5e681c2D27ee08A7b7989DB02541d13',
         // Relays populated + pre-deployment gate lifted (#1292).
         pending: false,
@@ -196,6 +198,8 @@ describe('loadNetworkConfig', () => {
         chainName: 'gnosis',
         chainId: 'gnosis:100',
         rpcUrl: 'https://rpc.gnosischain.com',
+        // Default multi-RPC backups shipped with the overlay (failover engine).
+        rpcUrls: ['https://gnosis-rpc.publicnode.com', 'https://gnosis.drpc.org'],
         hubAddress: '0x882D0BF07F956b1b94BBfe9E77F47c6fc7D4EC8f',
         // Relays populated + pre-deployment gate lifted (#1292).
         pending: false,
@@ -229,11 +233,15 @@ describe('loadNetworkConfig', () => {
       expect(cfg.genesisId).toBe(expected.genesisId);
       expect(cfg.networkId).toBe(expected.networkId);
       expect(await computeNetworkId(expected.genesisId)).toBe(expected.networkId);
+      // Active networks (base/gnosis) ship default rpcUrls backups so the
+      // failover engine is enabled out of the box; the pre-deployment-gated
+      // neuroweb overlay intentionally stays single-RPC (no rpcUrls key).
       expect(cfg.chain).toEqual({
         name: expected.chainName,
         type: 'evm',
         chainId: expected.chainId,
         rpcUrl: expected.rpcUrl,
+        ...(expected.rpcUrls ? { rpcUrls: expected.rpcUrls } : {}),
         hubAddress: expected.hubAddress,
       });
       // Non-relay prep fields are identical across all mainnets regardless of
@@ -625,6 +633,33 @@ describe('resolveChainConfig (field-level merge)', () => {
     });
   });
 
+  it('threads the shipped network rpcUrls defaults through to the failover engine (real overlays)', async () => {
+    const { _resetNetworkConfigCache } = await import('../src/config.js');
+    const overlays = [
+      { name: 'mainnet-base', primary: 'https://mainnet.base.org', backups: ['https://base-rpc.publicnode.com', 'https://base.drpc.org'] },
+      { name: 'mainnet-gnosis', primary: 'https://rpc.gnosischain.com', backups: ['https://gnosis-rpc.publicnode.com', 'https://gnosis.drpc.org'] },
+      { name: 'testnet', primary: 'https://sepolia.base.org', backups: ['https://base-sepolia-rpc.publicnode.com', 'https://base-sepolia.drpc.org'] },
+    ];
+    for (const { name, primary, backups } of overlays) {
+      _resetNetworkConfigCache();
+      const network = await loadNetworkConfig(name);
+      const merged = resolveChainConfig({}, network);
+      // Primary endpoint is unchanged (backwards compatible); backups are
+      // inherited so the adapter builds a multi-RPC FallbackProvider.
+      expect(merged?.rpcUrl).toBe(primary);
+      expect(merged?.rpcUrls).toEqual(backups);
+    }
+  });
+
+  it('a single-RPC overlay (pre-deployment neuroweb) still resolves with NO rpcUrls (back-compat)', async () => {
+    const { _resetNetworkConfigCache } = await import('../src/config.js');
+    _resetNetworkConfigCache();
+    const network = await loadNetworkConfig('mainnet-neuroweb');
+    const merged = resolveChainConfig({}, network);
+    expect(merged?.rpcUrl).toBe('https://astrosat-parachain-rpc.origin-trail.network');
+    expect(merged?.rpcUrls).toBeUndefined();
+  });
+
   it('keeps raw chain merging side-effect-free for pre-deployment network metadata', () => {
     const merged = resolveChainConfig({}, {
       _status: 'pre-deployment: replace PEER_ID_* relay values before enabling Base mainnet',
@@ -656,6 +691,72 @@ describe('resolveChainConfig (field-level merge)', () => {
     expect(merged?.hubAddress).toBe(fullNetworkChain.hubAddress);
     expect(merged?.chainId).toBe(fullNetworkChain.chainId);
     expect(merged?.type).toBe('evm');
+  });
+
+  it('does NOT inherit public backups behind a LOCAL (loopback) primary — avoids a cross-chain FallbackProvider', () => {
+    // A local Hardhat / devnet primary (loopback) on a real-network overlay
+    // must stay single-RPC: ethers rejects a FallbackProvider that spans chains
+    // (local 31337 + public Base Sepolia 84532). This is the kafka-plugin /
+    // devnet e2e regression the default backups would otherwise cause.
+    for (const localUrl of ['http://127.0.0.1:8545', 'http://localhost:9549', 'http://0.0.0.0:8545', 'http://127.0.0.2:8545']) {
+      const merged = resolveChainConfig({ chain: { rpcUrl: localUrl } }, { chain: fullNetworkChain });
+      expect(merged?.rpcUrl).toBe(localUrl);
+      expect(merged?.rpcUrls ?? []).toEqual([]);
+    }
+  });
+
+  it('an explicit operator rpcUrls still wins even with a loopback primary', () => {
+    const merged = resolveChainConfig(
+      { chain: { rpcUrl: 'http://127.0.0.1:8545', rpcUrls: ['http://127.0.0.1:8546'] } },
+      { chain: fullNetworkChain },
+    );
+    expect(merged?.rpcUrl).toBe('http://127.0.0.1:8545');
+    expect(merged?.rpcUrls).toEqual(['http://127.0.0.1:8546']);
+  });
+
+  it('does NOT inherit public backups when the operator pins a DIFFERENT chainId — even on a non-loopback host (#1329 review)', () => {
+    // A Docker/LAN devnet primary that overrides chainId to a different chain
+    // (e.g. local 31337 on the testnet base:84532 overlay) is NOT loopback, but
+    // inheriting the public Base-Sepolia backups would still build a cross-chain
+    // FallbackProvider that ethers rejects at init. Suppress on chain-identity
+    // mismatch, not only on loopback URLs.
+    const merged = resolveChainConfig(
+      { chain: { rpcUrl: 'http://hardhat:8545', chainId: 'evm:31337' } },
+      { chain: fullNetworkChain },
+    );
+    expect(merged?.rpcUrl).toBe('http://hardhat:8545');
+    expect(merged?.chainId).toBe('evm:31337');
+    expect(merged?.rpcUrls ?? []).toEqual([]);
+  });
+
+  it('STILL inherits public backups for a non-loopback private RPC on the SAME chain', () => {
+    // The intended operator case: a private/custom RPC on the overlay's own
+    // chain (chainId omitted, or explicitly equal) keeps the public backups for
+    // failover. Only a DIFFERENT chain (loopback or mismatched chainId) suppresses.
+    const omittedChainId = resolveChainConfig(
+      { chain: { rpcUrl: 'https://my-private-rpc.example/abc' } },
+      { chain: fullNetworkChain },
+    );
+    expect(omittedChainId?.rpcUrls).toEqual(fullNetworkChain.rpcUrls);
+
+    const sameChainId = resolveChainConfig(
+      { chain: { rpcUrl: 'https://my-private-rpc.example/abc', chainId: fullNetworkChain.chainId } },
+      { chain: fullNetworkChain },
+    );
+    expect(sameChainId?.rpcUrls).toEqual(fullNetworkChain.rpcUrls);
+  });
+
+  it('STILL inherits backups when only chainId differs and the operator did NOT pin an rpcUrl (#1332 review)', () => {
+    // A chainId override with NO custom rpcUrl leaves the primary as the network
+    // RPC (same chain as the backups) — there is no cross-chain FallbackProvider
+    // to avoid, so suppressing the backups would needlessly drop failover. The
+    // suppression must trigger only when the operator pins their OWN primary.
+    const merged = resolveChainConfig(
+      { chain: { chainId: 'evm:31337' } },
+      { chain: fullNetworkChain },
+    );
+    expect(merged?.rpcUrl).toBe(fullNetworkChain.rpcUrl);
+    expect(merged?.rpcUrls).toEqual(fullNetworkChain.rpcUrls);
   });
 
   it('overrides hub independently of rpcUrl (multichain forward-compat)', () => {

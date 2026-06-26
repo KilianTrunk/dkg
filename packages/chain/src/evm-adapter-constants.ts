@@ -57,3 +57,12 @@ export const RPC_RECEIPT_TIMEOUT_MS = 180_000;
 export const ADMIN_KEY_PURPOSE = 1;
 
 export const OPERATIONAL_KEY_PURPOSE = 2;
+
+/**
+ * TTL (ms) for the per-operational-wallet funding cache used by funding-aware
+ * publish signer selection (`nextAuthorizedSigner`). Short enough that a
+ * just-funded wallet is picked up quickly and a draining wallet self-corrects,
+ * long enough that a sequential bulk "Publish All" loop reuses one
+ * native+TRAC balance read per wallet instead of re-reading on every iteration.
+ */
+export const PUBLISHER_FUNDING_CACHE_TTL_MS = 15_000;

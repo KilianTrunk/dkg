@@ -37,7 +37,11 @@ describe('#1116 share/seal route error mapping (fake agent)', () => {
     }
   });
 
-  async function startWith(assertion: Record<string, unknown>, agentOverrides: Record<string, unknown> = {}) {
+  async function startWith(
+    assertion: Record<string, unknown>,
+    agentOverrides: Record<string, unknown> = {},
+    routeOverrides: { requestToken?: string; requestAgentAddress?: string } = {},
+  ) {
     const agent = {
       async listContextGraphs() {
         return [{
@@ -88,8 +92,8 @@ describe('#1116 share/seal route error mapping (fake agent)', () => {
           apiPortRef: { value: 0 },
           url,
           path: url.pathname,
-          requestToken: undefined,
-          requestAgentAddress: 'did:dkg:agent:test',
+          requestToken: routeOverrides.requestToken,
+          requestAgentAddress: routeOverrides.requestAgentAddress ?? 'did:dkg:agent:test',
           emitMemoryGraphChanged: () => {},
           emitNotification: () => {},
         } as any);
@@ -111,6 +115,16 @@ describe('#1116 share/seal route error mapping (fake agent)', () => {
 
   async function post(pathSuffix: string, body: Record<string, unknown>) {
     const res = await fetch(`${baseUrl}/api/knowledge-assets/${ASSERTION_NAME}/${pathSuffix}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const json = await res.json().catch(() => null);
+    return { status: res.status, body: json };
+  }
+
+  async function postRoot(body: Record<string, unknown>) {
+    const res = await fetch(`${baseUrl}/api/knowledge-assets`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -164,6 +178,111 @@ describe('#1116 share/seal route error mapping (fake agent)', () => {
     expect(finalizeCalls.length).toBe(1);
     expect(finalizeCalls[0]?.opts?.layer).toBe('swm');
     expect(finalizeCalls[0]?.contextGraphId).toBe(CG_ID);
+  });
+
+  it('wm/finalize: uses the token-canonical storage lane and author when body author differs only by case', async () => {
+    const token = 'agent-token-finalize-case';
+    const tokenAgentAddress = `0x${'cd'.repeat(20)}`;
+    const mixedCaseAuthor = `0x${'CD'.repeat(20)}`;
+    const finalizeCalls: Array<{ contextGraphId: unknown; name: unknown; opts: any }> = [];
+
+    await startWith(
+      {
+        finalize: async (contextGraphId: unknown, name: unknown, opts: any) => {
+          finalizeCalls.push({ contextGraphId, name, opts });
+          return {
+            assertionUri: 'did:dkg:assertion:case-finalize',
+            merkleRoot: new Uint8Array(32),
+            authorAddress: tokenAgentAddress,
+            schemeVersion: 1,
+            chainId: 1n,
+            kav10Address: `0x${'ef'.repeat(20)}`,
+            eip712Digest: `0x${'12'.repeat(32)}`,
+          };
+        },
+      },
+      {
+        resolveAgentByToken: (t?: string) => (t === token ? tokenAgentAddress : undefined),
+      },
+      { requestToken: token, requestAgentAddress: tokenAgentAddress },
+    );
+
+    const res = await post('wm/finalize', {
+      contextGraphId: CG_ID,
+      authorAgentAddress: mixedCaseAuthor,
+    });
+
+    expect(res.status).toBe(200);
+    expect(finalizeCalls).toHaveLength(1);
+    expect(finalizeCalls[0]?.opts?.agentAddress).toBe(tokenAgentAddress);
+    expect(finalizeCalls[0]?.opts?.authorAgentAddress).toBe(tokenAgentAddress);
+  });
+
+  it('wm/finalize: node/admin author signer does not change the storage lane', async () => {
+    const authorAgentAddress = `0x${'ab'.repeat(20)}`;
+    const finalizeCalls: Array<{ contextGraphId: unknown; name: unknown; opts: any }> = [];
+
+    await startWith({
+      finalize: async (contextGraphId: unknown, name: unknown, opts: any) => {
+        finalizeCalls.push({ contextGraphId, name, opts });
+        return {
+          assertionUri: 'did:dkg:assertion:admin-author-finalize',
+          merkleRoot: new Uint8Array(32),
+          authorAddress: authorAgentAddress,
+          schemeVersion: 1,
+          chainId: 1n,
+          kav10Address: `0x${'ef'.repeat(20)}`,
+          eip712Digest: `0x${'12'.repeat(32)}`,
+        };
+      },
+    });
+
+    const res = await post('wm/finalize', {
+      contextGraphId: CG_ID,
+      authorAgentAddress,
+    });
+
+    expect(res.status).toBe(200);
+    expect(finalizeCalls).toHaveLength(1);
+    expect(finalizeCalls[0]?.opts?.agentAddress).toBeUndefined();
+    expect(finalizeCalls[0]?.opts?.authorAgentAddress).toBe(authorAgentAddress);
+  });
+
+  it('wm/finalize: node/admin pre-signed author does not change the storage lane', async () => {
+    const preSignedAuthor = `0x${'ab'.repeat(20)}`;
+    const finalizeCalls: Array<{ contextGraphId: unknown; name: unknown; opts: any }> = [];
+
+    await startWith({
+      finalize: async (contextGraphId: unknown, name: unknown, opts: any) => {
+        finalizeCalls.push({ contextGraphId, name, opts });
+        return {
+          assertionUri: 'did:dkg:assertion:presigned-finalize',
+          merkleRoot: new Uint8Array(32),
+          authorAddress: preSignedAuthor,
+          schemeVersion: 1,
+          chainId: 1n,
+          kav10Address: `0x${'ef'.repeat(20)}`,
+          eip712Digest: `0x${'12'.repeat(32)}`,
+        };
+      },
+    });
+
+    const res = await post('wm/finalize', {
+      contextGraphId: CG_ID,
+      preSignedAuthorAttestation: {
+        address: preSignedAuthor,
+        reservedKaId: '1',
+        signature: {
+          r: `0x${'01'.repeat(32)}`,
+          vs: `0x${'02'.repeat(32)}`,
+        },
+      },
+    });
+
+    expect(res.status).toBe(200);
+    expect(finalizeCalls).toHaveLength(1);
+    expect(finalizeCalls[0]?.opts?.agentAddress).toBeUndefined();
+    expect(finalizeCalls[0]?.opts?.preSignedAuthorAttestation?.address).toBe(preSignedAuthor);
   });
 
   it('swm/share: an unrelated promote error still propagates (not silently 409ed)', async () => {
@@ -261,6 +380,359 @@ describe('#1116 share/seal route error mapping (fake agent)', () => {
   // registers then fails-before-retry would still pass. This pins the exact
   // call order with a fake agent.
   describe('vm/publish auto-register retry sequence', () => {
+    it('atomic create+alsoPublishVm forces the token-scoped storage lane over caller publish options', async () => {
+      const token = 'agent-token-atomic';
+      const tokenAgentAddress = `0x${'cd'.repeat(20)}`;
+      const attackerAgentAddress = `0x${'aa'.repeat(20)}`;
+      const seenOpts: unknown[] = [];
+
+      await startWith(
+        {
+          create: async () => 'did:dkg:assertion:atomic-agent-publish',
+          write: async () => undefined,
+          finalize: async () => ({
+            assertionUri: 'did:dkg:assertion:atomic-agent-publish',
+            merkleRoot: new Uint8Array(32),
+            authorAddress: tokenAgentAddress,
+            schemeVersion: 1,
+            chainId: 1n,
+            kav10Address: `0x${'ef'.repeat(20)}`,
+            eip712Digest: `0x${'12'.repeat(32)}`,
+          }),
+        },
+        {
+          resolveAgentByToken: (t?: string) => (t === token ? tokenAgentAddress : undefined),
+          async publishFromFinalizedAssertion(_cg: string, _name: string, opts: unknown) {
+            seenOpts.push(opts);
+            return {
+              status: 'confirmed',
+              ual: 'did:dkg:test/1/44',
+              kaId: '44',
+              seal: { authorAddress: tokenAgentAddress },
+            };
+          },
+        },
+        { requestToken: token, requestAgentAddress: tokenAgentAddress },
+      );
+
+      const res = await postRoot({
+        contextGraphId: CG_ID,
+        name: 'atomic-agent-publish',
+        quads: [{
+          subject: 'did:dkg:test:AtomicAgentPublish',
+          predicate: 'http://schema.org/name',
+          object: '"Atomic"',
+          graph: '',
+        }],
+        finalize: true,
+        alsoPublishVm: {
+          agentAddress: attackerAgentAddress,
+          clearAfter: false,
+        },
+      });
+
+      expect(res.status).toBe(201);
+      expect(res.body.status).toBe('vm-confirmed');
+      expect(seenOpts).toHaveLength(1);
+      expect(seenOpts[0]).toMatchObject({
+        agentAddress: tokenAgentAddress,
+        clearSharedMemoryAfter: false,
+      });
+    });
+
+    it('atomic create+alsoPublishVm strips caller storage-lane overrides on default-lane requests', async () => {
+      const attackerAgentAddress = `0x${'aa'.repeat(20)}`;
+      const seenOpts: Record<string, unknown>[] = [];
+
+      await startWith(
+        {
+          create: async () => 'did:dkg:assertion:atomic-default-publish',
+          write: async () => undefined,
+          finalize: async () => ({
+            assertionUri: 'did:dkg:assertion:atomic-default-publish',
+            merkleRoot: new Uint8Array(32),
+            authorAddress: `0x${'ef'.repeat(20)}`,
+            schemeVersion: 1,
+            chainId: 1n,
+            kav10Address: `0x${'ef'.repeat(20)}`,
+            eip712Digest: `0x${'34'.repeat(32)}`,
+          }),
+        },
+        {
+          async publishFromFinalizedAssertion(_cg: string, _name: string, opts: Record<string, unknown>) {
+            seenOpts.push(opts);
+            return {
+              status: 'confirmed',
+              ual: 'did:dkg:test/1/45',
+              kaId: '45',
+              seal: { authorAddress: `0x${'ef'.repeat(20)}` },
+            };
+          },
+        },
+      );
+
+      const res = await postRoot({
+        contextGraphId: CG_ID,
+        name: 'atomic-default-publish',
+        subGraphName: 'real-subgraph',
+        quads: [{
+          subject: 'did:dkg:test:AtomicDefaultPublish',
+          predicate: 'http://schema.org/name',
+          object: '"Atomic default"',
+          graph: '',
+        }],
+        finalize: true,
+        alsoPublishVm: {
+          agentAddress: attackerAgentAddress,
+          subGraphName: 'evil-subgraph',
+          epochs: '2',
+          clearAfter: false,
+        },
+      });
+
+      expect(res.status).toBe(201);
+      expect(res.body.status).toBe('vm-confirmed');
+      expect(seenOpts).toHaveLength(1);
+      expect(seenOpts[0]).toMatchObject({
+        subGraphName: 'real-subgraph',
+        publishEpochs: 2,
+        clearSharedMemoryAfter: false,
+      });
+      expect(Object.prototype.hasOwnProperty.call(seenOpts[0], 'agentAddress')).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(seenOpts[0], 'authorAgentAddress')).toBe(false);
+    });
+
+    it('atomic create+alsoPublishVm rejects forbidden finalized-publish shape before mutation', async () => {
+      const createCalls: unknown[] = [];
+
+      await startWith({
+        create: async (...args: unknown[]) => {
+          createCalls.push(args);
+          return 'did:dkg:assertion:should-not-create';
+        },
+        write: async () => undefined,
+        finalize: async () => {
+          throw new Error('finalize should not be called');
+        },
+      });
+
+      const res = await postRoot({
+        contextGraphId: CG_ID,
+        name: 'atomic-invalid-publish-shape',
+        quads: [{
+          subject: 'did:dkg:test:InvalidPublishShape',
+          predicate: 'http://schema.org/name',
+          object: '"Invalid shape"',
+          graph: '',
+        }],
+        finalize: true,
+        alsoPublishVm: {
+          authorAgentAddress: `0x${'aa'.repeat(20)}`,
+          selection: { rootEntities: ['urn:only-this'] },
+        },
+      });
+
+      expect(res.status).toBe(400);
+      expect(String(res.body.error)).toContain('authorAgentAddress');
+      expect(createCalls).toHaveLength(0);
+    });
+
+    it('atomic create+alsoPublishVm rejects partial selection before mutation', async () => {
+      const createCalls: unknown[] = [];
+
+      await startWith({
+        create: async (...args: unknown[]) => {
+          createCalls.push(args);
+          return 'did:dkg:assertion:should-not-create';
+        },
+        write: async () => undefined,
+        finalize: async () => {
+          throw new Error('finalize should not be called');
+        },
+      });
+
+      const res = await postRoot({
+        contextGraphId: CG_ID,
+        name: 'atomic-invalid-publish-selection',
+        quads: [{
+          subject: 'did:dkg:test:InvalidPublishSelection',
+          predicate: 'http://schema.org/name',
+          object: '"Invalid selection"',
+          graph: '',
+        }],
+        finalize: true,
+        alsoPublishVm: {
+          selection: { rootEntities: ['urn:only-this'] },
+        },
+      });
+
+      expect(res.status).toBe(400);
+      expect(String(res.body.error)).toContain('selection');
+      expect(createCalls).toHaveLength(0);
+    });
+
+    it('atomic create+alsoPublishVm rejects assertionName before mutation', async () => {
+      const createCalls: unknown[] = [];
+
+      await startWith({
+        create: async (...args: unknown[]) => {
+          createCalls.push(args);
+          return 'did:dkg:assertion:should-not-create';
+        },
+        write: async () => undefined,
+        finalize: async () => {
+          throw new Error('finalize should not be called');
+        },
+      });
+
+      const res = await postRoot({
+        contextGraphId: CG_ID,
+        name: 'atomic-invalid-publish-assertion-name',
+        quads: [{
+          subject: 'did:dkg:test:InvalidPublishAssertionName',
+          predicate: 'http://schema.org/name',
+          object: '"Invalid assertionName"',
+          graph: '',
+        }],
+        finalize: true,
+        alsoPublishVm: {
+          assertionName: 'other-assertion',
+        },
+      });
+
+      expect(res.status).toBe(400);
+      expect(String(res.body.error)).toContain('assertionName');
+      expect(createCalls).toHaveLength(0);
+    });
+
+    it('atomic create+alsoPublishVm rejects malformed publish controls before mutation', async () => {
+      const createCalls: unknown[] = [];
+
+      await startWith({
+        create: async (...args: unknown[]) => {
+          createCalls.push(args);
+          return 'did:dkg:assertion:should-not-create';
+        },
+        write: async () => undefined,
+        finalize: async () => {
+          throw new Error('finalize should not be called');
+        },
+      });
+
+      const res = await postRoot({
+        contextGraphId: CG_ID,
+        name: 'atomic-invalid-publish-controls',
+        quads: [{
+          subject: 'did:dkg:test:InvalidPublishControls',
+          predicate: 'http://schema.org/name',
+          object: '"Invalid controls"',
+          graph: '',
+        }],
+        finalize: true,
+        alsoPublishVm: {
+          publishEpochs: [2],
+        },
+      });
+
+      expect(res.status).toBe(400);
+      expect(String(res.body.error)).toContain('publishEpochs');
+      expect(createCalls).toHaveLength(0);
+
+      const identityRes = await postRoot({
+        contextGraphId: CG_ID,
+        name: 'atomic-invalid-publish-identity',
+        quads: [{
+          subject: 'did:dkg:test:InvalidPublishIdentity',
+          predicate: 'http://schema.org/name',
+          object: '"Invalid identity"',
+          graph: '',
+        }],
+        finalize: true,
+        alsoPublishVm: {
+          publisherNodeIdentityIdOverride: [0],
+        },
+      });
+
+      expect(identityRes.status).toBe(400);
+      expect(String(identityRes.body.error)).toContain('publisherNodeIdentityIdOverride');
+      expect(createCalls).toHaveLength(0);
+
+      const unsafeIdentityRes = await postRoot({
+        contextGraphId: CG_ID,
+        name: 'atomic-unsafe-publish-identity',
+        quads: [{
+          subject: 'did:dkg:test:UnsafePublishIdentity',
+          predicate: 'http://schema.org/name',
+          object: '"Unsafe identity"',
+          graph: '',
+        }],
+        finalize: true,
+        alsoPublishVm: {
+          publisherNodeIdentityIdOverride: Number.MAX_SAFE_INTEGER + 1,
+        },
+      });
+
+      expect(unsafeIdentityRes.status).toBe(400);
+      expect(String(unsafeIdentityRes.body.error)).toContain('publisherNodeIdentityIdOverride');
+      expect(String(unsafeIdentityRes.body.error)).toContain('safe integer');
+      expect(createCalls).toHaveLength(0);
+    });
+
+    it('passes the token-scoped storage lane into finalized publish calls', async () => {
+      const token = 'agent-token-a';
+      const tokenAgentAddress = `0x${'ab'.repeat(20)}`;
+      const seenOpts: unknown[] = [];
+
+      await startWith(
+        {},
+        {
+          resolveAgentByToken: (t?: string) => (t === token ? tokenAgentAddress : undefined),
+          async publishFromFinalizedAssertion(_cg: string, _name: string, opts: unknown) {
+            seenOpts.push(opts);
+            return {
+              status: 'confirmed',
+              ual: 'did:dkg:test/1/43',
+              kaId: '43',
+              seal: { authorAddress: tokenAgentAddress },
+            };
+          },
+        },
+        { requestToken: token, requestAgentAddress: tokenAgentAddress },
+      );
+
+      const res = await post('vm/publish', { contextGraphId: CG_ID });
+
+      expect(res.status).toBe(200);
+      expect(seenOpts).toHaveLength(1);
+      expect(seenOpts[0]).toMatchObject({ agentAddress: tokenAgentAddress });
+    });
+
+    it('standalone vm/publish rejects partial selection before publish', async () => {
+      const publishCalls: unknown[] = [];
+
+      await startWith(
+        {},
+        {
+          async publishFromFinalizedAssertion(_cg: string, _name: string, opts: unknown) {
+            publishCalls.push(opts);
+            return { status: 'confirmed', ual: 'did:dkg:test/1/45', kaId: '45' };
+          },
+        },
+      );
+
+      const cases = [
+        { contextGraphId: CG_ID, selection: { rootEntities: ['urn:only-this'] } },
+        { contextGraphId: CG_ID, options: { selection: { rootEntities: ['urn:only-this'] } } },
+      ];
+
+      for (const body of cases) {
+        const res = await post('vm/publish', body);
+        expect(res.status).toBe(400);
+        expect(String(res.body.error)).toContain('selection');
+      }
+      expect(publishCalls).toHaveLength(0);
+    });
+
     it('on CG_NOT_REGISTERED: registers ONCE between TWO publish calls and returns the retry result', async () => {
       const calls: string[] = [];
       let publishCount = 0;

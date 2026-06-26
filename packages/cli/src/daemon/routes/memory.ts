@@ -66,6 +66,7 @@ import {
 import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, assertSafeRdfTerm, sparqlIri, contextGraphSharedMemoryUri, sharedMemoryReadBothFilter, contextGraphAssertionUri, contextGraphMetaUri, escapeDkgRdfLiteral, escapeSparqlLiteral, PROTOCOL_SYNC } from '@origintrail-official/dkg-core';
 import { skolemizeByEntity, findReservedSubjectPrefix, isSkolemizedUri, type PublishOptions, type PublishResult } from '@origintrail-official/dkg-publisher';
 import type { Quad } from '@origintrail-official/dkg-storage';
+import { buildAutoRegisterFailureBody } from "./shared-assertion-helpers.js";
 import {
   DashboardDB,
   MetricsCollector,
@@ -229,6 +230,7 @@ import {
   shortId,
   sleep,
   deriveBlockExplorerUrl,
+  respondIfChainRpcTransportError,
 } from '../http-utils.js';
 import {
   normalizeRepo,
@@ -335,6 +337,7 @@ import {
 } from '../local-agents.js';
 
 import type { RequestContext } from './context.js';
+import { authorizeAgentScopedAuthorClaim, isSameAgentAddress } from './shared-assertion-helpers.js';
 
 /**
  * Validate a `preSignedAuthorAttestation` payload from a finalize request.
@@ -1835,6 +1838,7 @@ WHERE {
     const tokenAgentAddress = requestToken
       ? agent.resolveAgentByToken(requestToken)
       : undefined;
+    const hasAssertionName = typeof bodyAssertionName === 'string' && bodyAssertionName.length > 0;
     if (
       bodyAuthorAgentAddress != null &&
       bodyPreSignedAttestation != null
@@ -1849,6 +1853,17 @@ WHERE {
       const validated = validatePreSignedAuthorAttestation(bodyPreSignedAttestation, res);
       if (validated === undefined) return;
       resolvedPreSignedAttestation = validated;
+      if (
+        !hasAssertionName &&
+        !authorizeAgentScopedAuthorClaim(
+          res,
+          tokenAgentAddress,
+          resolvedPreSignedAttestation.address,
+          'preSignedAuthorAttestation.address',
+        )
+      ) {
+        return;
+      }
     }
     let resolvedAuthorAgentAddress: string | undefined;
     if (resolvedPreSignedAttestation == null) {
@@ -1859,7 +1874,16 @@ WHERE {
             error: '"authorAgentAddress" must be a 0x-prefixed 20-byte EVM address',
           });
         }
-        resolvedAuthorAgentAddress = bodyAuthorAgentAddress;
+        if (
+          !hasAssertionName &&
+          !authorizeAgentScopedAuthorClaim(res, tokenAgentAddress, bodyAuthorAgentAddress, 'authorAgentAddress')
+        ) {
+          return;
+        }
+        resolvedAuthorAgentAddress =
+          tokenAgentAddress && isSameAgentAddress(tokenAgentAddress, bodyAuthorAgentAddress)
+            ? tokenAgentAddress
+            : bodyAuthorAgentAddress;
       } else if (tokenAgentAddress != null) {
         resolvedAuthorAgentAddress = tokenAgentAddress;
       }
@@ -1876,7 +1900,7 @@ WHERE {
     // are illegal in this fork because the seal already encodes the
     // author. `selection` is forced to `'all'` because the seal is keyed
     // by the assertion's exact merkleRoot.
-    if (typeof bodyAssertionName === 'string' && bodyAssertionName.length > 0) {
+    if (hasAssertionName) {
       const nameVal = validateAssertionName(bodyAssertionName);
       if (!nameVal.valid) {
         return jsonResponse(res, 400, {
@@ -1914,6 +1938,7 @@ WHERE {
           () =>
             agent.publishFromFinalizedAssertion(resolvedContextGraphId, bodyAssertionName, {
               ...(subGraphName ? { subGraphName } : {}),
+              ...(tokenAgentAddress ? { agentAddress: tokenAgentAddress } : {}),
               operationCtx: ctx2,
               ...(resolvedPublisherIdentityOverride !== undefined
                 ? { publisherNodeIdentityIdOverride: resolvedPublisherIdentityOverride }
@@ -2122,11 +2147,10 @@ WHERE {
         // (insufficient TRAC, missing chain signer, etc.)
         // instead of a generic 500 from the publish leg later.
         tracker.fail(ctx, regErr);
-        return jsonResponse(res, 400, {
-          error:
-            `Context graph "${resolvedContextGraphId}" could not be auto-registered on-chain before publish: ` +
-            `${regErr?.message ?? String(regErr)}`,
-        });
+        // A transient RPC outage during pre-publish auto-registration is
+        // retryable (503/504), NOT a permanent client mistake (400).
+        if (respondIfChainRpcTransportError(res, regErr)) return;
+        return jsonResponse(res, 400, buildAutoRegisterFailureBody(resolvedContextGraphId, regErr));
       }
       const basePublishOptions = {
         operationCtx: ctx,

@@ -62,6 +62,23 @@ export interface EVMAdapterBaseConfig {
    * non-finite or `< 1` value falls back to the default.
    */
   cgRegistryScanPageSize?: number;
+  /**
+   * Funding-aware publish wallet selection: minimum NATIVE gas balance (wei) an
+   * operational wallet must hold to be PREFERRED when selecting the publish
+   * signer. Default `0n` (strictly-positive: a wallet at exactly zero gas is
+   * skipped in favour of a funded one). Selection only *prefers* a fundable
+   * wallet — when none qualifies it still falls back to the best-funded
+   * authorized wallet, so a too-low value is harmless. Raise it to reserve a
+   * larger gas buffer.
+   */
+  minPublisherNativeWei?: bigint;
+  /**
+   * Funding-aware publish wallet selection: minimum TRAC balance (wei) an
+   * operational wallet must hold to be PREFERRED when selecting the publish
+   * signer. Default `0n` (strictly-positive), matching the on-chain
+   * `V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE`. See `minPublisherNativeWei`.
+   */
+  minPublisherTracWei?: bigint;
 }
 
 export interface EVMAdapterConfig extends EVMAdapterBaseConfig {

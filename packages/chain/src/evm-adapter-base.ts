@@ -15,17 +15,19 @@ import { JsonRpcProvider, FallbackProvider, Wallet, Contract, ethers } from 'eth
 import { createFilterErrorSilencer, installFilterNotFoundConsoleSuppressor, formatProviderError } from './filter-error-silencer.js';
 import type { FilterErrorSilencer } from './filter-error-silencer.js';
 import { DEFAULT_APPROVAL_POLICY } from './chain-adapter.js';
-import type { ApprovalPolicy, V10PublishParams, OnChainPublishResult } from './chain-adapter.js';
+import type { ApprovalPolicy, V10PublishParams, OnChainPublishResult, ConvictionReader } from './chain-adapter.js';
 import { HubResolutionCache } from './hub-resolution-cache.js';
 import { KeyedSerializer } from './keyed-mutex.js';
 import { floorPublishTokenAmount, withSpan, getMetrics } from '@origintrail-official/dkg-core';
 import { loadAbi } from './evm-adapter-abi.js';
-import { errorCode, errorMessage, errorStatus, isTooLowAllowanceError, enrichEvmError, HUB_STALE_ERROR_MARKERS } from './evm-adapter-errors.js';
+import { errorCode, errorMessage, errorStatus, isTooLowAllowanceError, enrichEvmError, HUB_STALE_ERROR_MARKERS, isInsufficientFundsError, InsufficientPublisherFundsError, formatNoFundedPublisherWalletMessage, type PublisherWalletBalance } from './evm-adapter-errors.js';
 import { resolveRpcUrls, boundedRetryFetchRequest, withTimeout, isKnownTransactionError, isRetryableRpcError, assertSuccessfulReceipt, sleep } from './evm-adapter-rpc.js';
+import { noteRpcFailover, noteRpcExhaustion, rpcHost } from './rpc-failover-log.js';
+import { ChainRpcTransportError, createRpcTimeoutError } from './chain-rpc-transport-error.js';
 import { computeApprovalAction, effectivePublishAllowance, V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE } from './evm-adapter-allowance.js';
 import { formatProviderContext } from './evm-adapter-types.js';
 import type { ContractCache, EVMAdapterConfig } from './evm-adapter-types.js';
-import { RPC_READ_STALL_TIMEOUT_MS, DEFAULT_RANDOM_SAMPLING_HUB_REFRESH_MS, RPC_BROADCAST_ATTEMPT_TIMEOUT_MS, RPC_RECEIPT_ATTEMPT_TIMEOUT_MS, RPC_RECEIPT_TIMEOUT_MS, RPC_RECEIPT_POLL_INTERVAL_MS, RPC_TRANSACTION_POPULATION_ATTEMPT_TIMEOUT_MS, ADMIN_KEY_PURPOSE, OPERATIONAL_KEY_PURPOSE } from './evm-adapter-constants.js';
+import { RPC_READ_STALL_TIMEOUT_MS, DEFAULT_RANDOM_SAMPLING_HUB_REFRESH_MS, RPC_BROADCAST_ATTEMPT_TIMEOUT_MS, RPC_RECEIPT_ATTEMPT_TIMEOUT_MS, RPC_RECEIPT_TIMEOUT_MS, RPC_RECEIPT_POLL_INTERVAL_MS, RPC_TRANSACTION_POPULATION_ATTEMPT_TIMEOUT_MS, ADMIN_KEY_PURPOSE, OPERATIONAL_KEY_PURPOSE, PUBLISHER_FUNDING_CACHE_TTL_MS } from './evm-adapter-constants.js';
 
 /**
  * Maps a Hub-registered contract name to the function that invalidates
@@ -348,6 +350,31 @@ export class EVMChainAdapterBase {
    */
   protected readonly signerTxSerializer = new KeyedSerializer();
 
+  /**
+   * Funding-aware publish selection floors. A wallet is "fundable" (preferred
+   * by `nextAuthorizedSigner`) when its native balance > `minPublisherNativeWei`
+   * AND its TRAC balance > `minPublisherTracWei`. Default `0n` (strictly
+   * positive). See `EVMAdapterBaseConfig.minPublisher*Wei`.
+   */
+  protected readonly minPublisherNativeWei: bigint;
+
+  protected readonly minPublisherTracWei: bigint;
+
+  /**
+   * Kill-switch (env `DKG_DISABLE_FUNDED_WALLET_SELECTION=1`): when set,
+   * `nextAuthorizedSigner` reverts to the pre-funding-aware behaviour
+   * (first authorized wallet in round-robin order, no balance reads).
+   */
+  protected readonly fundedWalletSelectionDisabled: boolean;
+
+  /**
+   * Short-TTL per-wallet funding cache (lowercased address → native+TRAC wei).
+   * A `null` metric means the read failed / no token contract; callers FAIL
+   * OPEN (treat null as fundable). Reused across a bulk publish loop so it
+   * does not re-read the same wallet on every iteration.
+   */
+  protected readonly fundingCache = new Map<string, { native: bigint | null; trac: bigint | null; ts: number }>();
+
   protected readonly hubAddress: string;
 
   protected readonly tokenAddress?: string;
@@ -655,6 +682,9 @@ export class EVMChainAdapterBase {
     this.tokenAddress = config.tokenAddress ? ethers.getAddress(config.tokenAddress) : undefined;
     this.chainId = config.chainId ?? 'evm:31337';
     this.approvalPolicy = config.approvalPolicy ?? DEFAULT_APPROVAL_POLICY;
+    this.minPublisherNativeWei = config.minPublisherNativeWei ?? 0n;
+    this.minPublisherTracWei = config.minPublisherTracWei ?? 0n;
+    this.fundedWalletSelectionDisabled = process.env.DKG_DISABLE_FUNDED_WALLET_SELECTION === '1';
 
     this.contracts = {
       hub: new Contract(config.hubAddress, loadAbi('Hub'), this.signer),
@@ -755,6 +785,9 @@ export class EVMChainAdapterBase {
               throw err;
             }
             lastRetryable = err;
+            if (i < this.providers.length - 1) {
+              noteRpcFailover(`${label} broadcast`, this.rpcUrls[i], err, this.rpcUrls[i + 1]);
+            }
           }
         }
         // All configured endpoints exhausted.
@@ -768,9 +801,13 @@ export class EVMChainAdapterBase {
         metrics.chainRpcFailoverTotal.add(1, {
           rpc_method: 'eth_sendRawTransaction', chain_id: this.chainId, reason: 'exhausted',
         });
-        throw new Error(
+        if (lastRetryable) noteRpcExhaustion(`${label} broadcast`, this.rpcUrls);
+        // Typed transport error so a broadcast-time all-endpoints-exhausted
+        // failure maps to a retryable 503 at the HTTP boundary, not a 500.
+        throw new ChainRpcTransportError(
+          'RPC_ENDPOINTS_EXHAUSTED',
           `${label} broadcast failed on all configured RPC endpoints for tx ${txHash}: ${errorMessage(lastRetryable)}`,
-          { cause: lastRetryable },
+          { cause: lastRetryable, rpcUrls: this.rpcUrls },
         );
       },
       { attributes: { 'rpc.method': 'eth_sendRawTransaction', 'dkg.chain_id': this.chainId } },
@@ -817,6 +854,9 @@ export class EVMChainAdapterBase {
               throw err;
             }
             lastRetryable = err;
+            if (i < this.providers.length - 1) {
+              noteRpcFailover('receipt lookup', this.rpcUrls[i], err, this.rpcUrls[i + 1]);
+            }
           }
         }
         if (lastRetryable && !sawNonErrorResponse) {
@@ -831,13 +871,12 @@ export class EVMChainAdapterBase {
           metrics.chainRpcFailoverTotal.add(1, {
             rpc_method: 'eth_getTransactionReceipt', chain_id: this.chainId, reason: 'exhausted',
           });
-          const err = new Error(
+          noteRpcExhaustion('receipt lookup', this.rpcUrls);
+          throw new ChainRpcTransportError(
+            'RPC_RECEIPT_LOOKUP_FAILED',
             `Receipt lookup for tx ${txHash} failed on all configured RPC endpoints: ${errorMessage(lastRetryable)}`,
-            { cause: lastRetryable },
+            { cause: lastRetryable, txHash },
           );
-          (err as any).code = 'RPC_RECEIPT_LOOKUP_FAILED';
-          (err as any).txHash = txHash;
-          throw err;
         }
         // At least one backend answered but the tx is not yet mined (null
         // receipt). This is a benign poll tick, not a terminal outcome, so we
@@ -869,14 +908,11 @@ export class EVMChainAdapterBase {
       }
       await sleep(RPC_RECEIPT_POLL_INTERVAL_MS);
     }
-    const err = new Error(
+    throw createRpcTimeoutError(
       `${label} tx ${txHash} timed out waiting for a receipt after ${RPC_RECEIPT_TIMEOUT_MS}ms` +
       (lastError ? ` (last RPC error: ${errorMessage(lastError)})` : ''),
-      { cause: lastError },
+      { cause: lastError, txHash },
     );
-    (err as any).code = 'TIMEOUT';
-    (err as any).txHash = txHash;
-    throw err;
   }
 
   protected async signPopulatedTransaction(
@@ -1094,6 +1130,9 @@ export class EVMChainAdapterBase {
       } catch (err) {
         if (!isRetryableRpcError(err)) throw err;
         lastRetryable = err;
+        if (i < this.providers.length - 1) {
+          noteRpcFailover(`${label} preparation`, this.rpcUrls[i], err, this.rpcUrls[i + 1]);
+        }
         continue;
       }
       if (!prepared) continue;
@@ -1102,6 +1141,7 @@ export class EVMChainAdapterBase {
       // (chain.tx_submit / chain.tx_wait); the tx_send span is the parent.
       return this.sendSignedTransactionAndWait(prepared.signedTx, prepared.txHash, label);
     }
+    if (lastRetryable) noteRpcExhaustion(`${label} preparation`, this.rpcUrls);
     // A retryable error from the only configured RPC is still an "endpoints
     // exhausted" condition: downstream classifiers (e.g.
     // `/api/context-graph/register` → `classifyRegisterContextGraphError`)
@@ -1118,15 +1158,18 @@ export class EVMChainAdapterBase {
     const message = this.providers.length <= 1
       ? errorMessage(lastRetryable)
       : `${label} transaction preparation failed on all configured RPC endpoints ` +
-        `(${this.rpcUrls.join(', ')}): ${errorMessage(lastRetryable)}`;
+        // HOST-ONLY: a configured rpcUrl may carry an API key and this message
+        // is surfaced to HTTP clients via response paths that echo err.message
+        // (e.g. the create+publish 207 tail), so never embed full RPC URLs.
+        `(${this.rpcUrls.map(rpcHost).join(', ')}): ${errorMessage(lastRetryable)}`;
     // Transaction preparation exhausted every configured RPC endpoint.
     metrics.chainRpcFailoverTotal.add(1, {
       rpc_method: 'eth_sendRawTransaction', chain_id: this.chainId, reason: 'exhausted',
     });
-    const err = new Error(message, { cause: lastRetryable });
-    (err as any).code = 'RPC_ENDPOINTS_EXHAUSTED';
-    (err as any).rpcUrls = [...this.rpcUrls];
-    throw err;
+    throw new ChainRpcTransportError('RPC_ENDPOINTS_EXHAUSTED', message, {
+      cause: lastRetryable,
+      rpcUrls: this.rpcUrls,
+    });
   }
 
   /**
@@ -1289,38 +1332,308 @@ export class EVMChainAdapterBase {
   }
 
   /**
-   * Pick the next signer in the pool that the on-chain ContextGraphs contract
-   * authorizes for the target context graph. Falls back to round-robin only
-   * when the auth surface is unavailable.
+   * Pick the operational wallet that signs the next publish tx. Among the
+   * wallets the on-chain ContextGraphs contract authorizes for this context
+   * graph (round-robin order from `signerIndex`), PREFER one that is funded
+   * (native gas AND TRAC above the configured floors, or a covering PCA agent)
+   * so a publish is never routed to an authorized-but-empty wallet — the
+   * unfunded-wallet publish-failure this selector exists to fix. When the
+   * ContextGraphs auth surface is unavailable, every operational wallet is a
+   * candidate — still funding-aware over the full pool, NOT a plain pick. When
+   * no candidate is fundable, falls back to the best-funded one (the publish
+   * then surfaces an actionable InsufficientPublisherFundsError rather than a
+   * raw revert). The DKG_DISABLE_FUNDED_WALLET_SELECTION kill-switch is the only
+   * path that reverts to a plain round-robin pick (the first authorized wallet).
+   * Selection is serialized via `signerSelectionQueue` so concurrent publishes
+   * advance the `signerIndex` cursor coherently.
    */
-  protected async nextAuthorizedSigner(contextGraphId: bigint): Promise<Wallet> {
+  protected async nextAuthorizedSigner(contextGraphId: bigint, requiredTracWei: bigint = 0n): Promise<Wallet> {
     const previousSelection = this.signerSelectionQueue;
     let releaseSelection!: () => void;
     this.signerSelectionQueue = new Promise<void>((resolve) => { releaseSelection = resolve; });
     await previousSelection;
     try {
-      if (!this.contracts.contextGraphs) {
-        return this.nextSigner();
+      // Candidate wallets in round-robin order from the current cursor.
+      const start = this.signerIndex % this.signerPool.length;
+      const ordered: Wallet[] = [];
+      for (let i = 0; i < this.signerPool.length; i += 1) {
+        ordered.push(this.signerPool[(start + i) % this.signerPool.length]);
       }
 
-      const start = this.signerIndex % this.signerPool.length;
-      for (let i = 0; i < this.signerPool.length; i += 1) {
-        const idx = (start + i) % this.signerPool.length;
-        const signer = this.signerPool[idx];
-        const authorized = await this.contracts.contextGraphs.isAuthorizedPublisher(contextGraphId, signer.address);
-        if (authorized) {
-          this.signerIndex = idx + 1;
-          return signer;
+      // Filter to on-chain authorized publishers. With no ContextGraphs
+      // surface, every operational wallet is a candidate (was: a single
+      // round-robin pick; now funding-aware over the whole pool).
+      let authorized: Wallet[];
+      if (!this.contracts.contextGraphs) {
+        authorized = ordered;
+      } else {
+        authorized = [];
+        for (const signer of ordered) {
+          if (await this.contracts.contextGraphs.isAuthorizedPublisher(contextGraphId, signer.address)) {
+            authorized.push(signer);
+          }
         }
       }
 
-      throw new Error(
-        `No authorized publisher wallet found in signer pool for context graph ${contextGraphId.toString()}. ` +
-        'Ensure at least one configured wallet is permitted by on-chain publish authority.',
-      );
+      if (authorized.length === 0) {
+        throw new Error(
+          `No authorized publisher wallet found in signer pool for context graph ${contextGraphId.toString()}. ` +
+          'Ensure at least one configured wallet is permitted by on-chain publish authority.',
+        );
+      }
+
+      const chosen = this.fundedWalletSelectionDisabled
+        ? authorized[0]
+        : await this.selectFundedSigner(authorized, requiredTracWei);
+
+      // Advance the cursor just past the chosen wallet so the next selection
+      // rotates — preserving cross-wallet nonce concurrency (#953) when more
+      // than one wallet is funded.
+      const chosenPoolIdx = this.signerPool.findIndex((s) => s.address === chosen.address);
+      this.signerIndex = (chosenPoolIdx >= 0 ? chosenPoolIdx : 0) + 1;
+      return chosen;
     } finally {
       releaseSelection();
     }
+  }
+
+  /**
+   * Among `authorized` wallets (already in round-robin order), return the first
+   * that is fundable (native > floor AND TRAC > floor). Balance reads are
+   * short-TTL cached, run in parallel, and FAIL OPEN (a read error / timeout
+   * counts the wallet as fundable) so a flaky RPC never blocks a publish. When
+   * none is fundable, return the best-funded wallet (max native, then max TRAC)
+   * so the publish still attempts and the contract gives the real verdict.
+   */
+  protected async selectFundedSigner(authorized: Wallet[], requiredTracWei: bigint): Promise<Wallet> {
+    const fundings = await Promise.all(authorized.map((s) => this.getWalletFunding(s.address)));
+    // Fundability is own-balance first (cheap), with a Publishing Conviction
+    // Account (PCA) fallback: a registered+covering PCA agent wallet pays the
+    // publish from its conviction account, NOT its own TRAC (the contract only
+    // `transferFrom`s the wallet on the direct-spend branch). Such a wallet
+    // legitimately holds gas + zero own-TRAC, so without this fallback the
+    // funding gate would skip it and lose the conviction discount.
+    const fundable = await Promise.all(
+      authorized.map((s, i) => this.isWalletPublishFundable(s.address, fundings[i], requiredTracWei)),
+    );
+    for (let i = 0; i < authorized.length; i += 1) {
+      if (fundable[i]) return authorized[i];
+    }
+    let bestIdx = 0;
+    for (let i = 1; i < authorized.length; i += 1) {
+      const a = fundings[i];
+      const b = fundings[bestIdx];
+      const an = a.native ?? -1n;
+      const bn = b.native ?? -1n;
+      if (an > bn || (an === bn && (a.trac ?? -1n) > (b.trac ?? -1n))) bestIdx = i;
+    }
+    return authorized[bestIdx];
+  }
+
+  /**
+   * The single fundability predicate: native gas above the floor AND own-TRAC
+   * covers the publish (above the operator floor AND `>= requiredTracWei`, the
+   * publish cost — `0n` when the cost is unknown, so only the floor applies), OR
+   * the wallet is a registered, covering PCA agent (publish paid from its
+   * conviction account, not its own TRAC). A `null` metric (read failed / no
+   * token contract) is treated as satisfied so selection FAILS OPEN. The PCA
+   * conviction reads run only when own-TRAC is short, so a normally funded
+   * wallet pays no extra RPC.
+   */
+  protected async isWalletPublishFundable(
+    address: string,
+    f: { native: bigint | null; trac: bigint | null },
+    requiredTracWei: bigint,
+  ): Promise<boolean> {
+    const nativeOk = f.native === null || f.native > this.minPublisherNativeWei;
+    if (!nativeOk) return false; // even a PCA agent needs gas
+    const ownTracOk = f.trac === null
+      || (f.trac > this.minPublisherTracWei && f.trac >= requiredTracWei);
+    if (ownTracOk) return true;
+    return this.isConvictionFundedAgent(address, requiredTracWei);
+  }
+
+  /**
+   * True iff `address` is a registered Publishing Conviction Account agent whose
+   * account can cover a publish costing `requiredCostWei` — i.e. it can publish
+   * without holding its own TRAC. A `0n`/unknown cost falls back to a `1n`
+   * liveness probe (account exists, not expired, has allowance). Cheap-exit when
+   * the PCA NFT is not deployed; best-effort otherwise (any read failure ⇒
+   * false, so the wallet then relies on its own-TRAC gate rather than being
+   * optimistically selected and reverting). NOTE: with the `1n` liveness probe
+   * (cost unknown), a tiny consent-free "squat" PCA (RFC-001 §3.6) whose
+   * allowance rounds up to ≥1 wei but cannot cover a real publish can still pass;
+   * that is an attacker-induced edge that degrades to a single retry, not a fund
+   * loss. When the real cost is threaded (the createKnowledgeAssets paths) the
+   * probe prices the actual publish and rejects such squats.
+   */
+  protected async isConvictionFundedAgent(address: string, requiredCostWei: bigint): Promise<boolean> {
+    if (!this.contracts.dkgPublishingConvictionNFT) return false;
+    // Typed against the shared ConvictionReader interface that ConvictionMethods
+    // `implements`, so a rename/signature change in the mixin is a compile error.
+    const conv = this as unknown as ConvictionReader;
+    try {
+      const accountId = await withTimeout(
+        conv.getConvictionAgentAccountId(address),
+        RPC_READ_STALL_TIMEOUT_MS,
+        'pca agent account lookup',
+      );
+      if (accountId <= 0n) return false;
+      return await withTimeout(
+        conv.convictionAccountCanCover(accountId, requiredCostWei > 0n ? requiredCostWei : 1n),
+        RPC_READ_STALL_TIMEOUT_MS,
+        'pca account coverage probe',
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Best-effort native + TRAC balance read for one operational wallet, cached
+   * for `PUBLISHER_FUNDING_CACHE_TTL_MS`. A read failure / timeout yields
+   * `null` for that metric (callers fail open). `forceRefresh` bypasses and
+   * warms the cache (used on the error-enrichment path).
+   */
+  protected async getWalletFunding(
+    address: string,
+    opts?: { forceRefresh?: boolean },
+  ): Promise<{ native: bigint | null; trac: bigint | null }> {
+    const key = address.toLowerCase();
+    const now = Date.now();
+    if (!opts?.forceRefresh) {
+      const cached = this.fundingCache.get(key);
+      if (cached && now - cached.ts < PUBLISHER_FUNDING_CACHE_TTL_MS) {
+        return { native: cached.native, trac: cached.trac };
+      }
+    }
+    const [native, trac] = await Promise.all([
+      this.readNativeBalance(address),
+      this.readTracBalance(address),
+    ]);
+    this.fundingCache.set(key, { native, trac, ts: now });
+    return { native, trac };
+  }
+
+  private async readNativeBalance(address: string): Promise<bigint | null> {
+    try {
+      return await withTimeout(
+        this.provider.getBalance(address),
+        RPC_READ_STALL_TIMEOUT_MS,
+        'publish wallet native balance',
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  private async readTracBalance(address: string): Promise<bigint | null> {
+    const token = this.contracts.token;
+    if (!token) return null; // no token contract: TRAC does not gate selection
+    try {
+      return (await withTimeout(
+        token.balanceOf(address),
+        RPC_READ_STALL_TIMEOUT_MS,
+        'publish wallet TRAC balance',
+      )) as bigint;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Snapshot native+TRAC balances for every operational wallet (best-effort,
+   *  force-refreshed) for the no-funded-wallet diagnostic. */
+  protected async snapshotPublisherWalletBalances(): Promise<PublisherWalletBalance[]> {
+    return Promise.all(
+      this.signerPool.map(async (s) => {
+        const f = await this.getWalletFunding(s.address, { forceRefresh: true });
+        return { address: s.address, nativeWei: f.native, tracWei: f.trac };
+      }),
+    );
+  }
+
+  /**
+   * If `err` is (or looks like) an insufficient-funds publish failure on
+   * `signer`, replace it with an actionable {@link InsufficientPublisherFundsError}
+   * carrying every operational wallet's balances; otherwise return `err`
+   * unchanged. Best-effort — never lets the enrichment mask the original error.
+   */
+  protected async enrichInsufficientPublisherFundsError(
+    err: unknown,
+    signer: Wallet,
+    contextGraphId: bigint,
+    requiredTracWei: bigint = 0n,
+  ): Promise<unknown> {
+    try {
+      let selectedShort = isInsufficientFundsError(err);
+      if (!selectedShort && this.looksLikeFundsRevert(err)) {
+        // A TRAC shortfall surfaces as a token transferFrom revert (not an
+        // "insufficient funds" string). looksLikeFundsRevert is restricted to
+        // funds-SHAPED reverts (not any CALL_EXCEPTION), so an unrelated contract
+        // revert is never re-read as a funds problem. Reuse the SINGLE
+        // isWalletPublishFundable predicate so selection and enrichment can't
+        // drift on the funding rules.
+        const f = await this.getWalletFunding(signer.address, { forceRefresh: true });
+        selectedShort = !(await this.isWalletPublishFundable(signer.address, f, requiredTracWei));
+      }
+      // Only emit NO_FUNDED_PUBLISHER_WALLET — which asserts the WHOLE pool is
+      // unfunded and maps downstream to a TERMINAL insufficient_funds failure —
+      // when no wallet AUTHORIZED for this context graph can fund the cost. If the
+      // selected wallet was short but another authorized wallet could cover it (a
+      // cost-blind pre-pin, an explicit pinned address, or a stale cached
+      // balance), preserve the original error so a retry can reroute to that
+      // wallet instead of being told no wallet is funded.
+      if (selectedShort && !(await this.poolHasFundableSigner(contextGraphId, requiredTracWei))) {
+        const balances = await this.snapshotPublisherWalletBalances();
+        return new InsufficientPublisherFundsError(
+          formatNoFundedPublisherWalletMessage(balances),
+          balances,
+          { cause: err },
+        );
+      }
+    } catch {
+      /* never let enrichment mask the original failure */
+    }
+    return err;
+  }
+
+  /**
+   * True iff some operational wallet AUTHORIZED for `contextGraphId` is fundable
+   * for a publish costing `requiredTracWei` (own balance above floor+cost, or a
+   * covering PCA agent). Only an authorized+funded wallet is a viable reroute, so
+   * a funded-but-unauthorized wallet does NOT suppress NO_FUNDED. Used to
+   * distinguish a whole-pool funding problem (→ NO_FUNDED, terminal) from the
+   * selected wallet merely being the wrong, recoverable pick. Cached reads;
+   * fail-open per wallet.
+   */
+  protected async poolHasFundableSigner(contextGraphId: bigint, requiredTracWei: bigint): Promise<boolean> {
+    const contextGraphs = this.contracts.contextGraphs;
+    const checks = await Promise.all(
+      this.signerPool.map(async (s) => {
+        // No ContextGraphs surface ⇒ every operational wallet is a candidate
+        // (mirrors nextAuthorizedSigner); otherwise only authorized wallets are
+        // viable reroutes.
+        if (contextGraphs && !(await contextGraphs.isAuthorizedPublisher(contextGraphId, s.address))) return false;
+        return this.isWalletPublishFundable(s.address, await this.getWalletFunding(s.address), requiredTracWei);
+      }),
+    );
+    return checks.some(Boolean);
+  }
+
+  /**
+   * True iff `err` is a FUNDS-SHAPED chain revert (a TRAC transfer / allowance
+   * shortfall) worth a balance re-read in {@link enrichInsufficientPublisherFundsError}.
+   * Deliberately NOT every `CALL_EXCEPTION` / "execution reverted" — a generic
+   * contract revert (e.g. an InvalidAuthorAttestation) must never be re-read and
+   * masked as an insufficient-funds error. Also excludes our own control-flow
+   * sentinels (null/dropped receipt, write-ahead-hook failure).
+   */
+  protected looksLikeFundsRevert(err: unknown): boolean {
+    const msg = errorMessage(err).toLowerCase();
+    if (/receipt is null|receipt was null|replaced or dropped|write-?ahead/.test(msg)) {
+      return false;
+    }
+    return /transfer amount exceeds balance|erc20insufficientbalance|insufficient allowance|toolowallowance|insufficient funds/.test(msg);
   }
 
   /** All operational wallet addresses (for display / funding). */
@@ -1488,13 +1801,11 @@ export class EVMChainAdapterBase {
       // non-RPC error (e.g. a genuine "contract not in Hub" misconfig) keeps
       // its original shape.
       if (isRetryableRpcError(err)) {
-        const wrapped = new Error(
-          `chain initialisation failed on all configured RPC endpoints (${this.rpcUrls.join(', ')}): ${errorMessage(err)}`,
-          { cause: err },
+        throw new ChainRpcTransportError(
+          'RPC_ENDPOINTS_EXHAUSTED',
+          `chain initialisation failed on all configured RPC endpoints (${this.rpcUrls.map(rpcHost).join(', ')}): ${errorMessage(err)}`,
+          { cause: err, rpcUrls: this.rpcUrls },
         );
-        (wrapped as any).code = 'RPC_ENDPOINTS_EXHAUSTED';
-        (wrapped as any).rpcUrls = [...this.rpcUrls];
-        throw wrapped;
       }
       throw err;
     }
@@ -2237,7 +2548,13 @@ export class EVMChainAdapterBase {
       }
       txSigner = selected;
     } else {
-      txSigner = await this.nextAuthorizedSigner(params.contextGraphId);
+      // No pre-pinned publisher address: select cost-aware here, where the
+      // publish `tokenAmount` IS known (unlike the publisher's pre-pin via
+      // getAuthorizedPublisherAddress, which runs before the cost is sized).
+      txSigner = await this.nextAuthorizedSigner(
+        params.contextGraphId,
+        floorPublishTokenAmount(params.tokenAmount),
+      );
     }
     const ka = this.contracts.knowledgeAssetsLifecycle.connect(txSigner) as Contract;
     const kaAddress = await ka.getAddress();
@@ -2403,7 +2720,19 @@ export class EVMChainAdapterBase {
       () => {
         throw new Error('Transaction receipt is null');
       },
-    );
+    ).catch(async (err: unknown) => {
+      // Turn an insufficient-funds failure (native gas OR a zero-TRAC
+      // transferFrom revert) on the selected wallet into an actionable
+      // InsufficientPublisherFundsError listing every operational wallet's
+      // balances, so the user is told which wallet to fund instead of seeing a
+      // raw ethers "insufficient funds" string. Non-funds errors pass through.
+      throw await this.enrichInsufficientPublisherFundsError(
+        err,
+        txSigner,
+        params.contextGraphId,
+        floorPublishTokenAmount(params.tokenAmount),
+      );
+    });
 
     let kaId = 0n;
     let startKAId = 0n;

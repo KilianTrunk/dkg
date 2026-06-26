@@ -216,6 +216,7 @@ import {
   shortId,
   sleep,
   deriveBlockExplorerUrl,
+  classifyChainRpcTransportStatus,
 } from '../http-utils.js';
 import {
   normalizeRepo,
@@ -344,40 +345,16 @@ import type { RequestContext } from './context.js';
  * fallback).
  */
 function classifyRegisterContextGraphError(err: unknown): { status: number; body?: Record<string, unknown> } | undefined {
+  // Transport-level RPC failures (all endpoints exhausted / receipt lookup
+  // failed / receipt-wait timeout) map to a retryable status via the shared,
+  // code-keyed helper — identical mapping across every chain-write route.
+  const transport = classifyChainRpcTransportStatus(err);
+  if (transport) return transport;
   const msg = typeof err === 'string'
     ? err
     : err && typeof err === 'object' && 'message' in err
       ? String((err as { message?: unknown }).message ?? '')
       : '';
-  const code = err && typeof err === 'object' && 'code' in err
-    ? String((err as { code?: unknown }).code ?? '')
-    : '';
-  const txHash = err && typeof err === 'object' && 'txHash' in err
-    ? String((err as { txHash?: unknown }).txHash ?? '')
-    : '';
-  if (code === 'RPC_ENDPOINTS_EXHAUSTED') {
-    return { status: 503, body: { error: msg || 'Configured chain RPC endpoints were exhausted.', code } };
-  }
-  if (code === 'RPC_RECEIPT_LOOKUP_FAILED') {
-    return {
-      status: 503,
-      body: {
-        error: msg || 'Transaction receipt lookup failed on all configured chain RPC endpoints.',
-        code,
-        ...(txHash ? { txHash } : {}),
-      },
-    };
-  }
-  if (code === 'TIMEOUT') {
-    return {
-      status: 504,
-      body: {
-        error: msg || 'Context graph registration timed out.',
-        code,
-        ...(txHash ? { txHash } : {}),
-      },
-    };
-  }
   if (msg.includes('already registered')) return { status: 409, body: { error: msg } };
   if (msg.includes('does not exist')) return { status: 404, body: { error: msg } };
   if (msg.includes('no known creator')) return { status: 503, body: { error: msg, hint: 'Creator not yet synced. Retry after sync completes.' } };

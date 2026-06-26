@@ -89,6 +89,20 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   'nextSigner',
   'nextAuthorizedSigner',
   'findSignerByAddress',
+  // Funding-aware publish wallet selection internals (native+TRAC balance
+  // reads, the fundability gate, the cache, and the insufficient-funds error
+  // enrichment). EVM-only — the mock has no provider/ERC-20 balance surface
+  // and selects from its single signerAddress, so there is nothing to mirror.
+  'selectFundedSigner',
+  'isWalletPublishFundable',
+  'isConvictionFundedAgent',
+  'getWalletFunding',
+  'readNativeBalance',
+  'readTracBalance',
+  'snapshotPublisherWalletBalances',
+  'poolHasFundableSigner',
+  'enrichInsufficientPublisherFundsError',
+  'looksLikeFundsRevert',
   'walletKeyHash',
   'hasAdminPurpose',
   'hasOperationalPurpose',

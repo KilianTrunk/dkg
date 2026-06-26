@@ -2244,6 +2244,7 @@ export async function runDaemonInner(
       version: nodeVersion,
       commit: nodeCommit,
       role: config.nodeRole ?? "edge",
+      chainId: config.chain?.chainId,
       minLevel,
       bufferMaxEntries: config.telemetry?.logs?.bufferMaxEntries,
       onError: (m) => log(`Telemetry(OTLP): ${m}`),

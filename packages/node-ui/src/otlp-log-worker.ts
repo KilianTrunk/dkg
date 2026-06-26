@@ -61,6 +61,8 @@ export interface OtlpLogWorkerOptions {
   commit?: string;
   /** 'core' | 'edge' */
   role?: string;
+  /** Chain id string, e.g. 'base:8453' → resource attr dkg.chain (matches traces/metrics). */
+  chainId?: string;
   /** OTel resource service.name. Default 'dkg-node'. */
   serviceName?: string;
   /**
@@ -146,8 +148,9 @@ export class OtlpLogWorker {
       // Kept as structured metadata for richer filtering / correlation.
       attr('dkg.network', opts.network),
       attr('dkg.peer_id', opts.peerId),
-      attr('dkg.node_name', opts.nodeName),
-      attr('dkg.node_role', opts.role),
+      attr('dkg.node.name', opts.nodeName),
+      attr('dkg.node.role', opts.role),
+      attr('dkg.chain', opts.chainId),
       attr('dkg.commit', opts.commit),
     ].filter((a): a is OtlpAttribute => a !== null);
   }

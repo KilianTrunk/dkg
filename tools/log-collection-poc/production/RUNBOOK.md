@@ -47,7 +47,16 @@ On every OriginTrail-hosted node (running a build with PR #1317), add the block 
 - `name`: **unique per node** (e.g. `testnet-core-01`, `mainnet-core-02`) — this is the Grafana Node selector value.
 - `telemetry.logs.endpoint`: `https://logs-ingest.xtrmstrngth.com/v1/logs`
 - `telemetry.logs.token`: the `<INGEST_TOKEN>` from Step 2.
+
+> **⚠️ You MUST set `telemetry.logs.exporter: "otlp"`.** If `logs.exporter` is
+> left unset, a node defaults to the **legacy syslog/Graylog** exporter, not
+> OTLP — so nothing reaches Alloy/Loki and the dashboards stay empty. The infra
+> templates must emit `"logs": { "exporter": "otlp", … }` explicitly on every
+> hosted node.
+
 Restart the node. Local logging (SQLite + daemon.log) is unaffected; this only adds the redacted OTLP copy.
+
+**Logs vs traces/metrics (different transports, same endpoint host):** logs ship via a hand-rolled **OTLP/HTTP JSON** exporter (the OTel Logs SDK is still "Development"), while **traces and metrics use the stable OTel SDK** OTLP/protobuf exporters. The polaris setup today only has a **logs** backend (Loki via Alloy), so leave `telemetry.traces`/`telemetry.metrics` out (or set `enabled: false`) until a traces backend (Tempo) and metrics backend (Mimir/Prometheus) are provisioned — the `node-config.example.json` shows the full three-signal shape and `config.alloy` has the matching commented routing.
 
 ## Step 4 — view in Grafana
 - **Per-node:** `https://polaris.xtrmstrngth.com/d/dkg-node-logs` → pick a **Node** → set the time range (top-right) → logs appear. `Level` and `Filter (regex)` narrow further; the bottom panel is volume-by-level.

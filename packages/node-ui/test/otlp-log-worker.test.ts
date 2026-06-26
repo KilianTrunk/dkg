@@ -67,6 +67,7 @@ function baseOpts(url: string, over: Partial<OtlpLogWorkerOptions> = {}): OtlpLo
     version: '10.0.0',
     commit: 'abc1234',
     role: 'core',
+    chainId: 'base:8453',
     flushIntervalMs: 20,
     baseBackoffMs: 40,
     maxBackoffMs: 200,
@@ -110,7 +111,10 @@ describe('OtlpLogWorker — OTLP/HTTP log export', () => {
     const attrMap = Object.fromEntries(resourceAttrs.map((a) => [a.key, a.value.stringValue]));
     expect(attrMap['service.name']).toBe('dkg-node');
     expect(attrMap['dkg.network']).toBe('devnet');
-    expect(attrMap['dkg.node_role']).toBe('core');
+    // Dotted OTel-style keys, matching the traces/metrics resource (telemetry.ts).
+    expect(attrMap['dkg.node.role']).toBe('core');
+    expect(attrMap['dkg.node.name']).toBe('test-node');
+    expect(attrMap['dkg.chain']).toBe('base:8453');
     expect(attrMap['dkg.peer_id']).toBe('12D3KooWtest');
     // Label-promoted identity for the Grafana node selector.
     expect(attrMap['service.instance.id']).toBe('test-node'); // defaults to nodeName

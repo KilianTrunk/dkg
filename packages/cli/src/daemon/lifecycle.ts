@@ -2261,29 +2261,16 @@ export async function runDaemonInner(
     log("Telemetry: OTLP log export disabled");
   }
 
-  // Dispatch to the configured log exporter. 'syslog' is the default when
-  // unset (preserves prior behaviour); 'otlp' is the recommended path; 'none'
-  // keeps logs local-only even while telemetry is enabled.
-  function startTelemetry(): { ok: boolean; error?: string } {
-    const mode = resolveLogExporterMode(config.telemetry);
-    if (mode === "none") return { ok: true };
-    if (mode === "otlp") return startOtlpExporter();
-    return startLogPusher();
-  }
-
-  function stopTelemetry(): void {
-    stopLogPusher();
-    stopOtlpExporter();
-  }
-
-  // OTel traces + metrics SDK (independent of the log-exporter path above).
+  // OTel traces + metrics SDK (independent of the log-exporter path below).
   // Endpoints resolve env-first (standard OTEL_EXPORTER_OTLP_* names) then
   // config; a signal registers ONLY when its endpoint resolves — never a
-  // guessed prod default. enabled=false ⇒ initTelemetry is a total no-op.
-  if (config.telemetry?.enabled) {
+  // guessed prod default. Idempotent (initTelemetry no-ops once configured), so
+  // it is safe to call both at boot AND from the runtime enable toggle.
+  function startOtelSdk(): void {
     const { tracesEndpoint, metricsEndpoint, tracesOn, metricsOn } = resolveOtelSignals(
       config.telemetry,
     );
+    if (!tracesOn && !metricsOn) return;
     try {
       initTelemetry({
         enabled: true,
@@ -2301,34 +2288,60 @@ export async function runDaemonInner(
         traces: tracesOn
           ? {
               endpoint: tracesEndpoint,
-              token: config.telemetry.traces?.token,
-              sampleRatio: config.telemetry.traces?.sampleRatio,
+              token: config.telemetry?.traces?.token,
+              sampleRatio: config.telemetry?.traces?.sampleRatio,
             }
           : undefined,
         metrics: metricsOn
           ? {
               endpoint: metricsEndpoint,
-              token: config.telemetry.metrics?.token,
-              exportIntervalMs: config.telemetry.metrics?.exportIntervalMs,
+              token: config.telemetry?.metrics?.token,
+              exportIntervalMs: config.telemetry?.metrics?.exportIntervalMs,
             }
           : undefined,
       });
-      if (tracesOn || metricsOn) {
-        log(
-          `Telemetry: OTel SDK registered (traces=${tracesOn ? tracesEndpoint : "off"}, metrics=${metricsOn ? metricsEndpoint : "off"})`,
-        );
-      }
+      log(
+        `Telemetry: OTel SDK registered (traces=${tracesOn ? tracesEndpoint : "off"}, metrics=${metricsOn ? metricsEndpoint : "off"})`,
+      );
     } catch (err) {
       // Telemetry must never block startup.
       log(`Telemetry: OTel init failed (non-fatal): ${String(err)}`);
     }
   }
 
+  // Start ALL telemetry signals under the master gate: OTel traces/metrics
+  // (SDK) AND the configured log exporter. Used at boot and from the runtime
+  // enable toggle so both behave identically (the bug fixed here: enabling from
+  // a boot-disabled state previously started only logs, never traces/metrics).
+  // The log-exporter result is returned separately — a failed log shipper must
+  // NOT tear down or disable the independent traces/metrics signals.
+  function startTelemetry(): { ok: boolean; error?: string } {
+    startOtelSdk();
+    // Dispatch to the configured log exporter. 'syslog' is the default when
+    // unset (preserves prior behaviour); 'otlp' is the recommended path; 'none'
+    // keeps logs local-only even while telemetry is enabled.
+    const mode = resolveLogExporterMode(config.telemetry);
+    if (mode === "none") return { ok: true };
+    if (mode === "otlp") return startOtlpExporter();
+    return startLogPusher();
+  }
+
+  // Stop ALL telemetry signals: log exporters AND the OTel SDK (flush + shut
+  // down + clear the API globals). Async so a runtime disable actually stops
+  // traces/metrics — not just logs — and callers can await an orderly teardown.
+  async function stopTelemetry(): Promise<void> {
+    stopLogPusher();
+    stopOtlpExporter();
+    await shutdownTelemetry().catch(() => {});
+  }
+
   if (config.telemetry?.enabled) {
     const r = startTelemetry();
     if (!r.ok) {
-      log(`Telemetry: ${r.error}`);
-      config.telemetry.enabled = false;
+      // Log forwarding failed to start (e.g. mainnet syslog port 0). Disable
+      // ONLY the log signal — leave the master gate and any registered
+      // traces/metrics intact; they are independent signals.
+      log(`Telemetry: log exporter not started — ${r.error} (traces/metrics unaffected)`);
     }
   }
 
@@ -2756,7 +2769,7 @@ export async function runDaemonInner(
         const r = startTelemetry();
         if (!r.ok) return r;
       } else {
-        stopTelemetry();
+        await stopTelemetry();
       }
       config.telemetry = { ...config.telemetry, enabled };
       await saveConfig(config);
@@ -3228,9 +3241,8 @@ export async function runDaemonInner(
         clearInterval(pruneTimer);
         rateLimiter.destroy();
         metricsCollector.stop();
-        stopTelemetry();
-        // Flush + shut down the OTel SDK (no-op if never registered).
-        await shutdownTelemetry().catch(() => {});
+        // Stops log exporters AND flushes + shuts down the OTel SDK.
+        await stopTelemetry();
         natStatusWatcherStop?.();
         resetNatStatus();
         await publisherRuntime

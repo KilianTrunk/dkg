@@ -17,7 +17,7 @@
  * imported into the browser UI bundle.
  */
 
-import { metrics as otelMetrics } from '@opentelemetry/api';
+import { metrics as otelMetrics, trace as otelTrace } from '@opentelemetry/api';
 import { resourceFromAttributes } from '@opentelemetry/resources';
 import {
   NodeTracerProvider,
@@ -144,7 +144,14 @@ export function isTelemetryConfigured(): boolean {
   return configured;
 }
 
-/** Flush + shut down providers at daemon teardown. Safe if never initialized. */
+/**
+ * Flush + shut down providers. Used both at daemon teardown AND when telemetry
+ * is turned off via the runtime master gate, so it must FULLY reverse
+ * `initTelemetry`: stop the exporters, then clear the OTel API globals so a
+ * later `initTelemetry` (live re-enable) can register fresh providers — without
+ * the `disable()` calls, the API keeps the first (now shut-down) provider and a
+ * re-enable would silently no-op. Safe if never initialized; idempotent.
+ */
 export async function shutdownTelemetry(): Promise<void> {
   const tasks: Promise<void>[] = [];
   if (tracerProvider) {
@@ -156,6 +163,15 @@ export async function shutdownTelemetry(): Promise<void> {
     tasks.push(meterProvider.shutdown().catch(() => {}));
   }
   await Promise.all(tasks);
+  // Reset the global API so a subsequent initTelemetry() can re-register
+  // (setGlobal*Provider only takes effect once until the slot is disabled).
+  if (tracerProvider) otelTrace.disable();
+  if (meterProvider) {
+    otelMetrics.disable();
+    // Rebind the core facade's instrument cache back to the no-op meter so
+    // getMetrics() after disable is inert rather than holding dead instruments.
+    rebuildMetrics();
+  }
   tracerProvider = null;
   meterProvider = null;
   configured = false;

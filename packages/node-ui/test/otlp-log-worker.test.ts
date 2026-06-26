@@ -13,6 +13,9 @@ import type { LogRecord } from '@origintrail-official/dkg-core';
 interface Captured {
   body: any;
   headers: Record<string, string | string[] | undefined>;
+  /** Status the server RESPONDED with for this request — lets a test tell a
+   *  failed (503) attempt apart from the successful (200) delivery. */
+  status: number;
 }
 
 type Responder = (reqIndex: number) => { status: number; headers?: Record<string, string> };
@@ -27,8 +30,8 @@ function startServer(responder: Responder): Promise<{ url: string; received: Cap
       const raw = Buffer.concat(chunks).toString('utf8');
       let body: unknown = raw;
       try { body = JSON.parse(raw); } catch { /* keep raw */ }
-      received.push({ body, headers: req.headers });
       const { status, headers } = responder(reqIndex++);
+      received.push({ body, headers: req.headers, status });
       if (headers) for (const [k, v] of Object.entries(headers)) res.setHeader(k, v);
       res.statusCode = status;
       res.end('{}');
@@ -194,7 +197,7 @@ describe('OtlpLogWorker — OTLP/HTTP log export', () => {
     expect(delivered).toEqual(['m7', 'm8', 'm9']);
   });
 
-  it('retries on a retryable 503 then succeeds (records not lost)', async () => {
+  it('retries on a retryable 503 then succeeds — the batch is preserved into the 200', async () => {
     let calls = 0;
     const srv = await startServer((i) => {
       calls = i + 1;
@@ -207,10 +210,16 @@ describe('OtlpLogWorker — OTLP/HTTP log export', () => {
     w.push(rec({ message: 'must-arrive' }));
     // First attempt 503, then backoff (~40ms), then a 200.
     await waitFor(() => srv.received.length >= 2, 4000);
-    const delivered = srv.received
-      .flatMap((r) => r.body.resourceLogs[0].scopeLogs[0].logRecords.map((lr: any) => lr.body.stringValue))
-      .filter((m: string) => m === 'must-arrive');
-    expect(delivered.length).toBeGreaterThanOrEqual(1);
+    const msgsOf = (r: Captured): string[] =>
+      r.body.resourceLogs[0].scopeLogs[0].logRecords.map((lr: any) => lr.body.stringValue);
+    // The 503 attempt must NOT be counted as delivery evidence: assert the
+    // record arrived specifically on the SUCCESSFUL (200) request, proving the
+    // requeued batch survived the retry rather than being lost or replaced.
+    const okReq = srv.received.find((r) => r.status === 200);
+    const failReq = srv.received.find((r) => r.status === 503);
+    expect(failReq, 'expected a failed 503 attempt').toBeDefined();
+    expect(okReq, 'expected a successful 200 retry').toBeDefined();
+    expect(msgsOf(okReq!)).toContain('must-arrive');
     expect(calls).toBeGreaterThanOrEqual(2);
   });
 

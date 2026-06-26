@@ -1,4 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest';
+import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { trace, metrics, SpanStatusCode } from '@opentelemetry/api';
 import { NodeTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-node';
 import {
@@ -15,6 +17,15 @@ import { initTelemetry, isTelemetryConfigured, shutdownTelemetry } from '../src/
  * disabled ⇒ no-op, span error status, metric label cardinality, and
  * log↔trace correlation. Uses in-memory OTel exporters (no network).
  */
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+async function waitFor(cond: () => boolean, timeoutMs = 5000): Promise<void> {
+  const start = Date.now();
+  while (!cond()) {
+    if (Date.now() - start > timeoutMs) throw new Error('waitFor timed out');
+    await sleep(20);
+  }
+}
 
 function registerInMemoryTracer(): InMemorySpanExporter {
   const exporter = new InMemorySpanExporter();
@@ -87,7 +98,61 @@ describe('withSpan — status + attributes + error recording', () => {
   });
 });
 
+describe('initTelemetry — real OTLP exporter bootstrap exports traces + metrics', () => {
+  // Proves the actual boot path (OTLP/proto exporters, BatchSpanProcessor,
+  // tracerProvider.register(), setGlobalMeterProvider + rebuildMetrics) really
+  // ships data — the prior suite only covered the disabled / no-endpoint cases
+  // and manually-registered in-memory providers, so a regression that dropped
+  // register()/rebuildMetrics() or the span processor went unnoticed.
+  it('a withSpan + getMetrics emission reaches a local OTLP collector', async () => {
+    const hits: Record<string, number> = { '/v1/traces': 0, '/v1/metrics': 0 };
+    const server: Server = createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        const path = req.url ?? '';
+        if (path in hits && Buffer.concat(chunks).length > 0) hits[path] += 1;
+        res.statusCode = 200;
+        res.end();
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    const port = (server.address() as AddressInfo).port;
+    const base = `http://127.0.0.1:${port}`;
+    try {
+      initTelemetry({
+        enabled: true,
+        resource: { serviceInstanceId: 'n1', network: 'devnet', chainId: 'base:8453' },
+        traces: { endpoint: `${base}/v1/traces` },
+        metrics: { endpoint: `${base}/v1/metrics`, exportIntervalMs: 60_000 },
+      });
+      expect(isTelemetryConfigured()).toBe(true);
+
+      // Emit through the SAME facade the production call sites use.
+      await withSpan('chain.tx_send', () => 'done', {
+        attributes: { 'rpc.method': 'eth_sendRawTransaction', 'dkg.chain_id': 'base:8453' },
+      });
+      getMetrics().chainRpcTotal.add(1, {
+        rpc_method: 'eth_call', outcome: 'ok', retryable: false, chain_id: 'base:8453',
+      });
+
+      // shutdownTelemetry force-flushes the span batch + the metric reader.
+      await shutdownTelemetry();
+
+      await waitFor(() => hits['/v1/traces'] >= 1 && hits['/v1/metrics'] >= 1, 5000);
+      expect(hits['/v1/traces']).toBeGreaterThanOrEqual(1);
+      expect(hits['/v1/metrics']).toBeGreaterThanOrEqual(1);
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+});
+
 describe('metrics — bounded, low-cardinality attributes only', () => {
+  // NOTE: the END-TO-END proof that a REAL instrumented call site emits bounded
+  // labels lives in packages/chain/test/chain-rpc-telemetry.unit.test.ts (it
+  // drives the actual contractReadWithFailover seam). This test pins the
+  // allow-list contract at the facade level.
   it('emits counters/histograms with only allow-listed attribute keys', async () => {
     const exporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
     const mp = new MeterProvider({

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { resolveOtelSignals, resolveLogExporterMode } from '../src/telemetry-config.js';
+import { resolveOtelSignals, resolveLogExporterMode, isUnknownLogExporter } from '../src/telemetry-config.js';
 
 /**
  * Daemon telemetry-routing resolution (the logic lifecycle.ts uses to pick the
@@ -16,6 +16,17 @@ describe('resolveLogExporterMode', () => {
     expect(resolveLogExporterMode({ enabled: true, logs: { exporter: 'otlp' } })).toBe('otlp');
     expect(resolveLogExporterMode({ enabled: true, logs: { exporter: 'none' } })).toBe('none');
     expect(resolveLogExporterMode({ enabled: true, logs: { exporter: 'syslog' } })).toBe('syslog');
+  });
+  it('FAILS CLOSED to none for an unknown/typo exporter (never silently syslog → off-node)', () => {
+    // Config is user JSON/YAML — the TS union does not guard this at runtime.
+    for (const bad of ['none ', 'otpl', 'syslogg', 'disabled', 'OTLP', '']) {
+      expect(resolveLogExporterMode({ enabled: true, logs: { exporter: bad } } as any)).toBe('none');
+      expect(isUnknownLogExporter({ enabled: true, logs: { exporter: bad } } as any)).toBe(true);
+    }
+    // Known values + unset are NOT flagged as unknown.
+    expect(isUnknownLogExporter({ enabled: true, logs: { exporter: 'otlp' } })).toBe(false);
+    expect(isUnknownLogExporter({ enabled: true })).toBe(false);
+    expect(isUnknownLogExporter(undefined)).toBe(false);
   });
 });
 

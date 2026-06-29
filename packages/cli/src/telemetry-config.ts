@@ -10,10 +10,24 @@ export type LogExporterMode = 'none' | 'otlp' | 'syslog';
 
 /**
  * Which log exporter the daemon should start. Only consulted when
- * `telemetry.enabled`. Defaults to 'syslog' (preserves prior behaviour).
+ * `telemetry.enabled`. UNSET defaults to 'syslog' (preserves prior behaviour),
+ * but the config is user-provided JSON/YAML so the TS union does NOT protect
+ * this boundary: an unknown/typo'd value (e.g. "none " / "otpl" / "disabled")
+ * must FAIL CLOSED to 'none' — never silently fall through to syslog and ship
+ * logs off-node against the operator's intent. Returns null `mode` info via the
+ * second tuple element so the caller can warn on an unrecognized value.
  */
 export function resolveLogExporterMode(telemetry: DkgConfig['telemetry']): LogExporterMode {
-  return telemetry?.logs?.exporter ?? 'syslog';
+  const raw = telemetry?.logs?.exporter;
+  if (raw === undefined || raw === null) return 'syslog'; // documented default when UNSET
+  if (raw === 'none' || raw === 'otlp' || raw === 'syslog') return raw;
+  return 'none'; // unknown/typo → fail closed (local-only, never off-node)
+}
+
+/** True when `telemetry.logs.exporter` is set to a value outside the known enum. */
+export function isUnknownLogExporter(telemetry: DkgConfig['telemetry']): boolean {
+  const raw = telemetry?.logs?.exporter;
+  return raw !== undefined && raw !== null && raw !== 'none' && raw !== 'otlp' && raw !== 'syslog';
 }
 
 export interface ResolvedOtelSignals {

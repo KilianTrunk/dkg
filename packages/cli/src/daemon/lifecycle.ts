@@ -130,7 +130,7 @@ import {
   exitOnStoreConfigErrors,
   validateNetworkConfigReadiness,
 } from '../config.js';
-import { resolveOtelSignals, resolveLogExporterMode } from '../telemetry-config.js';
+import { resolveOtelSignals, resolveLogExporterMode, isUnknownLogExporter } from '../telemetry-config.js';
 import { createDaemonLogSink } from './log-sink.js';
 import { createPublicSnapshotStore, createPublisherControlFromStore, startPublisherRuntimeIfEnabled, type PublisherRuntime } from '../publisher-runner.js';
 import { createCatchupRunner, type CatchupJobResult, type CatchupRunner } from '../catchup-runner.js';
@@ -2323,7 +2323,14 @@ export async function runDaemonInner(
     await startOtelSdk();
     // Dispatch to the configured log exporter. 'syslog' is the default when
     // unset (preserves prior behaviour); 'otlp' is the recommended path; 'none'
-    // keeps logs local-only even while telemetry is enabled.
+    // keeps logs local-only even while telemetry is enabled. An UNKNOWN/typo'd
+    // value fails closed to 'none' (never silently syslog → off-node).
+    if (isUnknownLogExporter(config.telemetry)) {
+      log(
+        `Telemetry: unknown logs.exporter "${config.telemetry?.logs?.exporter}" — ` +
+          `keeping logs local-only (no off-node forwarding). Use 'otlp', 'syslog', or 'none'.`,
+      );
+    }
     const mode = resolveLogExporterMode(config.telemetry);
     if (mode === "none") return { ok: true };
     if (mode === "otlp") return startOtlpExporter();

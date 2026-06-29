@@ -140,6 +140,23 @@ export function isTransientStorageACKDeclineCode(code: string | undefined): bool
   return typeof code === 'string' && TRANSIENT_STORAGE_ACK_DECLINE_CODES.has(code);
 }
 
+/** The fixed, known decline-code enum values — the ONLY values permitted as a metric label. */
+const KNOWN_STORAGE_ACK_DECLINE_CODES: ReadonlySet<string> = new Set<string>(
+  Object.values(STORAGE_ACK_DECLINE_CODES),
+);
+
+/**
+ * Bound a decline code to the known enum for use as a low-cardinality METRIC
+ * label. A `declineCode` read off a peer's StorageACK is UNTRUSTED — a malicious
+ * or buggy peer could emit endless unique codes and explode metric cardinality —
+ * so anything outside the fixed enum maps to `'other'`. The full (sanitized)
+ * code still rides logs and the `declines` diagnostic map; only the metric
+ * dimension is bounded.
+ */
+export function boundedDeclineCodeLabel(code: string | undefined | null): string {
+  return typeof code === 'string' && KNOWN_STORAGE_ACK_DECLINE_CODES.has(code) ? code : 'other';
+}
+
 /**
  * RC11 / PR5 — ACK-provenance telemetry: which of the four LU-6
  * Phase B discovery paths caused this core to be hosting the

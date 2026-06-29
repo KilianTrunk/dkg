@@ -127,4 +127,43 @@ describe('chain RPC telemetry — real readContractWith emits bounded labels', (
 
     a.destroy?.();
   });
+
+  // eth_getLogs page-scan branch (queryEventLogsPage) — its own outcome metric.
+  function logScanContract(queryFilter: () => Promise<unknown[]>): any {
+    const c: any = { connect: () => c, queryFilter };
+    return c;
+  }
+  const scanProviders = [{ provider: {} as any, backendHead: 1_000 }];
+
+  it('eth_getLogs SUCCESS: records dkg.chain.rpc.total{eth_getLogs, ok} bounded labels', async () => {
+    installMeter();
+    const a: any = new EVMChainAdapter(minimalConfig());
+    const { logs } = await a.queryEventLogsPage(
+      logScanContract(async () => []), {}, 0, 100, scanProviders, new Map(), 'unit getLogs',
+    );
+    expect(logs).toEqual([]);
+    await mp!.forceFlush();
+    const pts = chainRpcDataPoints().filter((p) => p.attrs.rpc_method === 'eth_getLogs');
+    expect(pts.some((p) => p.attrs.outcome === 'ok' && p.attrs.chain_id === 'evm:31337')).toBe(true);
+    const keys = new Set(pts.flatMap((p) => Object.keys(p.attrs)));
+    expect([...keys].filter((k) => !ALLOWED_RPC_LABELS.has(k))).toEqual([]);
+    for (const bad of FORBIDDEN_LABELS) expect(keys.has(bad)).toBe(false);
+    a.destroy?.();
+  });
+
+  it('eth_getLogs FAILURE (all backends error): records a non-ok outcome', async () => {
+    installMeter();
+    const a: any = new EVMChainAdapter(minimalConfig());
+    await expect(
+      a.queryEventLogsPage(
+        logScanContract(async () => { throw new Error('getLogs boom'); }),
+        {}, 0, 100, scanProviders, new Map(), 'unit getLogs',
+      ),
+    ).rejects.toBeTruthy();
+    await mp!.forceFlush();
+    const pts = chainRpcDataPoints().filter((p) => p.attrs.rpc_method === 'eth_getLogs');
+    expect(pts.length).toBeGreaterThanOrEqual(1);
+    expect(pts.every((p) => p.attrs.outcome !== 'ok')).toBe(true);
+    a.destroy?.();
+  });
 });

@@ -8,6 +8,7 @@ import {
   computeUpdateACKDigest,
   isStorageACKDecline,
   isTransientStorageACKDeclineCode,
+  boundedDeclineCodeLabel,
   isSubscriptionSource,
   withSpan,
   getMetrics,
@@ -748,7 +749,10 @@ export class ACKCollector {
                 span.setAttribute('dkg.decline_code', declineCode);
                 getMetrics().ackPeerTotal.add(1, {
                   result: 'decline',
-                  decline_code: declineCode,
+                  // `declineCode` is peer-supplied and untrusted — bound it to the
+                  // known enum so a peer can't explode metric cardinality with
+                  // unique codes. Full code stays on the span + declines map.
+                  decline_code: boundedDeclineCodeLabel(declineCode),
                 });
               }
               // A non-decline response is NOT counted as a successful ACK here:

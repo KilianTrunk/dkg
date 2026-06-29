@@ -12,6 +12,7 @@ import {
   computeUpdateACKDigest,
   assertSafeIri,
   STORAGE_ACK_DECLINE_CODES,
+  boundedDeclineCodeLabel,
   computeCatalogRoot,
   catalogCommittedLeaves,
   contextGraphCatalogUri,
@@ -336,7 +337,9 @@ export class StorageACKHandler {
           span.setAttribute('dkg.decline_code', declineCode);
           getMetrics().ackHandlerTotal.add(1, {
             outcome: 'decline',
-            decline_code: declineCode,
+            // Bound to the known enum so the metric label can't become
+            // high-cardinality (defensive — only fixed enum values as labels).
+            decline_code: boundedDeclineCodeLabel(declineCode),
             ...(chainIdLabel ? { chain_id: chainIdLabel } : {}),
           });
         } else {

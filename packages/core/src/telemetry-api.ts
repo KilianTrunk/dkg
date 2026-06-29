@@ -120,13 +120,16 @@ const OP_DURATION_BUCKETS = [50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 
 const RPC_DURATION_BUCKETS = [25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 120000];
 
 export interface DkgMetrics {
-  /** outcome={tentative|confirmed|failed}, source={direct|swm}, chain_id */
+  /** outcome={tentative|confirmed|failed|error}, source={direct|swm}, chain_id
+   *  (`error` = the publish flow threw before producing a status). */
   publishTotal: Counter;
   /** ms; outcome, source, chain_id */
   publishDuration: Histogram;
   /** outcome={reached|timeout|impossible}, chain_id */
   ackQuorumTotal: Counter;
-  /** result={ack|decline|transport_error}, decline_code? (fixed enum) */
+  /** result={ack|decline|rejected|transport_error}, decline_code? (fixed enum)
+   *  — `ack` = validated; `rejected` = signature/merkle/identity check failed;
+   *  `decline` = peer declined; `transport_error` = send threw. */
   ackPeerTotal: Counter;
   /** result={valid|key-not-registered|not-in-sharding-table|rpc-error} */
   ackVerifyTotal: Counter;
@@ -140,7 +143,8 @@ export interface DkgMetrics {
   chainRpcFailoverTotal: Counter;
   /** outcome={ok|error}, protocol_id */
   syncRequestTotal: Counter;
-  /** outcome={ok|busy|limit|error} */
+  /** outcome={ok|busy|limit|error|invalid} — `invalid` = malformed request
+   *  (e.g. missing contextGraphId) short-circuited before serving. */
   syncResponseTotal: Counter;
   /** outcome={ok|error}, protocol_id — outbound P2P protocol send */
   protocolSendTotal: Counter;

@@ -62,5 +62,9 @@ export type {
 export { LlmClient, LlmRequestError } from './llm/client.js';
 export { resolveCapabilities } from './llm/capability-resolver.js';
 export type { LlmConfig, LlmChatRequest, LlmChatMessage, LlmStreamEvent, LlmCompletionResult, LlmCapabilities } from './llm/types.js';
-export { initTelemetry, shutdownTelemetry, isTelemetryConfigured } from './telemetry.js';
-export type { TelemetryInitConfig, TelemetryResource, OtlpSignalConfig } from './telemetry.js';
+export {
+  initTelemetry, shutdownTelemetry, isTelemetryConfigured,
+  // Back-compat shims for the pre-#1317 telemetry API (no-ops / legacy config).
+  recordGauge, setOperationSpan,
+} from './telemetry.js';
+export type { TelemetryInitConfig, TelemetryResource, OtlpSignalConfig, TelemetryConfig } from './telemetry.js';

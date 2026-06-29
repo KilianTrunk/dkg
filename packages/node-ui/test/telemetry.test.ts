@@ -48,14 +48,21 @@ describe('telemetry — disabled is a total no-op', () => {
     expect(await withSpan('agent.publish', () => 42)).toBe(42);
   });
 
-  it('initTelemetry({enabled:false}) registers nothing', () => {
-    initTelemetry({ enabled: false });
+  it('initTelemetry({enabled:false}) registers nothing', async () => {
+    await initTelemetry({ enabled: false });
     expect(isTelemetryConfigured()).toBe(false);
   });
 
-  it('initTelemetry with no endpoints registers nothing even when enabled', () => {
-    initTelemetry({ enabled: true, resource: { serviceInstanceId: 'n1' } });
+  it('initTelemetry with no endpoints registers nothing even when enabled', async () => {
+    await initTelemetry({ enabled: true, resource: { serviceInstanceId: 'n1' } });
     expect(isTelemetryConfigured()).toBe(false);
+  });
+
+  it('accepts the legacy { metricsEndpoint } config shape (back-compat)', async () => {
+    // Old callers passed a flat metricsEndpoint; it must map to metrics.endpoint.
+    // No endpoint reachable here, but it must register (configured) without throwing.
+    await initTelemetry({ enabled: true, metricsEndpoint: 'http://127.0.0.1:4318/v1/metrics', serviceName: 'legacy' } as any);
+    expect(isTelemetryConfigured()).toBe(true);
   });
 
   it('metric instruments are usable (no throw) when telemetry is off', () => {
@@ -120,7 +127,7 @@ describe('initTelemetry — real OTLP exporter bootstrap exports traces + metric
     const port = (server.address() as AddressInfo).port;
     const base = `http://127.0.0.1:${port}`;
     try {
-      initTelemetry({
+      await initTelemetry({
         enabled: true,
         resource: { serviceInstanceId: 'n1', network: 'devnet', chainId: 'base:8453' },
         traces: { endpoint: `${base}/v1/traces` },
@@ -141,6 +148,46 @@ describe('initTelemetry — real OTLP exporter bootstrap exports traces + metric
 
       await waitFor(() => hits['/v1/traces'] >= 1 && hits['/v1/metrics'] >= 1, 5000);
       expect(hits['/v1/traces']).toBeGreaterThanOrEqual(1);
+      expect(hits['/v1/metrics']).toBeGreaterThanOrEqual(1);
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  it('enable → disable → RE-enable re-registers the SDK and exports again', async () => {
+    // Proves the master-gate lifecycle: shutdownTelemetry() clears the OTel API
+    // globals (trace.disable()/metrics.disable()), so a later initTelemetry()
+    // registers fresh providers instead of silently no-opping on the stale slot.
+    const hits: Record<string, number> = { '/v1/metrics': 0 };
+    const server: Server = createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        const path = req.url ?? '';
+        if (path in hits && Buffer.concat(chunks).length > 0) hits[path] += 1;
+        res.statusCode = 200;
+        res.end();
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    const port = (server.address() as AddressInfo).port;
+    const metricsCfg = { enabled: true, metrics: { endpoint: `http://127.0.0.1:${port}/v1/metrics`, exportIntervalMs: 60_000 } };
+    try {
+      await initTelemetry(metricsCfg);
+      expect(isTelemetryConfigured()).toBe(true);
+
+      // Disable: must fully tear down + clear globals.
+      await shutdownTelemetry();
+      expect(isTelemetryConfigured()).toBe(false);
+
+      // Re-enable: must register AGAIN (the bug this guards against = a re-enable
+      // that no-ops because the global provider slot was never released).
+      await initTelemetry(metricsCfg);
+      expect(isTelemetryConfigured()).toBe(true);
+
+      getMetrics().publishTotal.add(1, { outcome: 'completed', source: 'direct' });
+      await shutdownTelemetry(); // force-flush the metric reader
+      await waitFor(() => hits['/v1/metrics'] >= 1, 5000);
       expect(hits['/v1/metrics']).toBeGreaterThanOrEqual(1);
     } finally {
       await new Promise<void>((r) => server.close(() => r()));

@@ -1,7 +1,7 @@
 {
   "_comment": "Add these keys to each OriginTrail-hosted node's config.json. `name` MUST be unique per node — it becomes the Grafana Node selector value. `network` is auto-derived by the node (testnet/mainnet) → the Environment label. Requires a node build that includes the OTLP telemetry feature (PR #1317).",
 
-  "_comment_signals": "Three independent signals, all OFF until telemetry.enabled=true AND the signal has an endpoint. LOGS use a hand-rolled OTLP/HTTP JSON exporter (the OTel Logs SDK is still 'Development'); set logs.exporter to 'otlp' — if you leave it unset on a hosted node it defaults to legacy syslog/Graylog, NOT OTLP. TRACES and METRICS use the stable OTel SDK exporters (OTLP/protobuf). For the polaris setup today only logs have a backend (Loki via Alloy); keep traces/metrics here so the config is ready when Tempo/Mimir are provisioned, or set traces.enabled/metrics.enabled to false to leave them off explicitly.",
+  "_comment_signals": "Three independent signals. LOGS use a hand-rolled OTLP/HTTP JSON exporter (the OTel Logs SDK is still 'Development'); set logs.exporter to 'otlp' — if you leave it unset on a hosted node it defaults to legacy syslog/Graylog, NOT OTLP. TRACES and METRICS use the stable OTel SDK exporters (OTLP/protobuf). IMPORTANT: the polaris backend today is LOGS-ONLY (Alloy → Loki; no Tempo for traces, no Prometheus/Mimir for metrics). So traces/metrics are shown here with enabled:false — they will NOT export until you (a) stand up a traces/metrics backend, (b) point config.alloy at it (see its FULL-SIGNAL section), and (c) flip enabled:true. Pointing them at the logs-only ingest host while enabled would just send spans/metrics into a void.",
 
   "name": "testnet-core-01",
 
@@ -14,12 +14,14 @@
       "level": "info"
     },
     "traces": {
-      "endpoint": "https://logs-ingest.xtrmstrngth.com/v1/traces",
+      "enabled": false,
+      "endpoint": "https://traces-ingest.example.com/v1/traces",
       "token": "<INGEST_TOKEN>",
       "sampleRatio": 1
     },
     "metrics": {
-      "endpoint": "https://logs-ingest.xtrmstrngth.com/v1/metrics",
+      "enabled": false,
+      "endpoint": "https://metrics-ingest.example.com/v1/metrics",
       "token": "<INGEST_TOKEN>",
       "exportIntervalMs": 30000
     }

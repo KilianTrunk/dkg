@@ -795,19 +795,21 @@ export interface DkgConfig {
  */
 export const TELEMETRY_ENDPOINTS: Record<
   string,
-  { syslog: { host: string; port: number }; otlp: string; otlpLogs?: string }
+  { syslog: { host: string; port: number }; otlp: string }
 > = {
   testnet: {
     syslog: { host: 'loggly.origin-trail.network', port: 12201 },
     otlp: 'https://telemetry-testnet.origintrail.io/v1/metrics',
-    otlpLogs: 'https://telemetry-testnet.origintrail.io/v1/logs', // OriginTrail-hosted opt-in collector (TBD)
   },
   mainnet: {
     syslog: { host: 'loggly.origin-trail.network', port: 0 }, // legacy syslog — OTLP is the mainnet path
     otlp: 'https://telemetry.origintrail.io/v1/metrics',
-    otlpLogs: 'https://telemetry.origintrail.io/v1/logs', // OriginTrail-hosted opt-in collector (TBD)
   },
 };
+// NOTE: there is intentionally NO per-network OTLP *logs* endpoint here. The
+// OTLP log exporter resolves its endpoint env-first (OTEL_EXPORTER_OTLP_*) then
+// from `config.telemetry.logs.endpoint` (see startOtlpExporter) — never from a
+// hardcoded default — so a node can't ship logs to a placeholder URL.
 
 const DEFAULT_CONFIG: DkgConfig = {
   name: 'dkg-node',

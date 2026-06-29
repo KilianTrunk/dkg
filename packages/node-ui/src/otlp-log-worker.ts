@@ -177,8 +177,24 @@ export class OtlpLogWorker {
       clearInterval(this.timer);
       this.timer = null;
     }
-    // Best-effort final flush; failures are swallowed.
+    // Best-effort final flush; failures are swallowed. Fire-and-forget — use
+    // shutdown() when you need to AWAIT the final flush (orderly teardown).
     void this.flush(true);
+  }
+
+  /**
+   * Async teardown for the daemon shutdown / telemetry-disable path: stop the
+   * timer and AWAIT a final flush, so the caller can guarantee no batch is still
+   * being sent (or stranded in the buffer) once this resolves. stop() is the
+   * fire-and-forget variant for callers that can't await.
+   */
+  async shutdown(): Promise<void> {
+    this.stopped = true;
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+    await this.flush(true).catch(() => {});
   }
 
   /** Test/diagnostic hook. */

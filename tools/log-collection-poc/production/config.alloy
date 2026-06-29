@@ -24,7 +24,9 @@
 // AUTH: the OTLP port is NOT exposed directly. It is reached only through the
 // Cloudflare-proxied ingest hostname, which enforces the bearer token (a
 // Cloudflare WAF rule on the Authorization header, or a Cloudflare service
-// token). Alloy binds to localhost on the host; nodes hit Cloudflare → origin.
+// token). The OTLP receiver below binds 0.0.0.0:4318 (all interfaces) — so a
+// host/VM firewall MUST block public access to TCP 4318; only the local
+// cloudflared/reverse-proxy should reach it. Nodes hit Cloudflare → origin.
 // (Per-version Alloy receiver auth is finicky; gating at the edge is simpler
 // and equally strong.)
 

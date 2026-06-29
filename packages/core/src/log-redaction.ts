@@ -59,6 +59,15 @@ export const DEFAULT_SENSITIVE_KEYS: readonly string[] = [
 
 export const REDACTED = '[REDACTED]';
 
+/**
+ * Keys whose value is a multi-word secret PHRASE (BIP39-style). Their unquoted
+ * value must be consumed across whitespace, otherwise `mnemonic=legal winner
+ * thank year …` would only redact `legal` and ship the rest of the phrase.
+ * Handled by a dedicated matcher and EXCLUDED from the single-token matcher so
+ * a value is never processed twice.
+ */
+const PHRASE_KEYS: readonly string[] = ['mnemonic', 'seedPhrase', 'seed_phrase', 'seedphrase'];
+
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -71,12 +80,21 @@ function escapeRegExp(s: string): string {
  *     mnemonic with spaces is fully removed); bare values up to the next
  *     delimiter otherwise.
  */
-export function redactMessage(message: string, keyRegex: RegExp, jwtRegex: RegExp): string {
+export function redactMessage(
+  message: string,
+  keyRegex: RegExp,
+  jwtRegex: RegExp,
+  phraseRegex: RegExp = DEFAULT_PHRASE_REGEX,
+): string {
   if (!message) return message;
   // Reset lastIndex defensively (these are global regexes reused across calls).
   jwtRegex.lastIndex = 0;
   keyRegex.lastIndex = 0;
+  phraseRegex.lastIndex = 0;
   let out = message.replace(jwtRegex, REDACTED);
+  // Phrase keys first (multi-word values), then single-token keys. The two key
+  // sets are disjoint, so no value is rewritten twice.
+  out = out.replace(phraseRegex, (_full, keyAndSep: string) => `${keyAndSep}${REDACTED}`);
   out = out.replace(keyRegex, (_full, keyAndSep: string) => `${keyAndSep}${REDACTED}`);
   return out;
 }
@@ -103,6 +121,34 @@ function buildKeyRegex(keys: readonly string[]): RegExp {
   );
 }
 
+/**
+ * Like `buildKeyRegex` but the VALUE matcher consumes a multi-word run for
+ * unquoted phrase secrets: a quoted run, OR up to 24 whitespace-separated
+ * alphabetic words (BIP39 mnemonics are 12–24 lowercase words). The 24-word cap
+ * stops it from swallowing an entire trailing sentence while still redacting a
+ * full seed phrase. Only fires on `key: …` / `key=…` (a bare "mnemonic" word in
+ * prose, with no separator, is left untouched).
+ */
+function buildPhraseKeyRegex(keys: readonly string[]): RegExp {
+  const alt = keys.map(escapeRegExp).join('|');
+  return new RegExp(
+    '(' +
+      '["\'`]?\\b(?:' + alt + ')\\b["\'`]?' +
+      '\\s*[:=]\\s*' +
+    ')' +
+    '(' +
+      '"[^"]*"' + '|' +
+      "'[^']*'" + '|' +
+      '`[^`]*`' + '|' +
+      '[A-Za-z]+(?:\\s+[A-Za-z]+){0,23}' + // up to 24 alpha words
+    ')',
+    'gi',
+  );
+}
+
+/** Default phrase matcher for direct `redactMessage` callers. */
+const DEFAULT_PHRASE_REGEX = buildPhraseKeyRegex(PHRASE_KEYS);
+
 // JWT: three base64url segments separated by dots, starting with the
 // canonical `eyJ` ('{"' base64url-encoded). Conservative min lengths.
 const JWT_SOURCE = '\\beyJ[A-Za-z0-9_-]{6,}\\.[A-Za-z0-9_-]{6,}\\.[A-Za-z0-9_-]{6,}\\b';
@@ -113,11 +159,16 @@ const JWT_SOURCE = '\\beyJ[A-Za-z0-9_-]{6,}\\.[A-Za-z0-9_-]{6,}\\.[A-Za-z0-9_-]{
  */
 export function createLogRedactor(extraKeys: readonly string[] = []): (record: LogRecord) => LogRecord {
   const keys = extraKeys.length ? [...DEFAULT_SENSITIVE_KEYS, ...extraKeys] : DEFAULT_SENSITIVE_KEYS;
-  const keyRegex = buildKeyRegex(keys);
+  const phraseSet = new Set(PHRASE_KEYS.map((k) => k.toLowerCase()));
+  // Phrase keys get the multi-word matcher; everything else (incl. extraKeys)
+  // gets the single-token matcher. Disjoint sets → a value is never matched twice.
+  const singleKeys = keys.filter((k) => !phraseSet.has(k.toLowerCase()));
+  const keyRegex = buildKeyRegex(singleKeys);
+  const phraseRegex = buildPhraseKeyRegex(PHRASE_KEYS);
   const jwtRegex = new RegExp(JWT_SOURCE, 'g');
   return (record: LogRecord): LogRecord => {
     if (!record || !record.message) return record;
-    const redacted = redactMessage(record.message, keyRegex, jwtRegex);
+    const redacted = redactMessage(record.message, keyRegex, jwtRegex, phraseRegex);
     if (redacted === record.message) return record; // no change → no alloc
     return { ...record, message: redacted };
   };

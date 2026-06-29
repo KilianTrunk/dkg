@@ -1296,6 +1296,10 @@ export class PublishMethods extends DKGAgentBase {
    return withSpan('agent.publish', async (span) => {
     const chainId = typeof this.chain?.chainId === 'string' && this.chain.chainId !== 'none' ? this.chain.chainId : undefined;
     const publishStartedAt = Date.now();
+    // try/catch so a throw before the success metric (local publish / broadcast
+    // / chain) is still counted — withSpan marks the span ERROR + rethrows; this
+    // adds the matching publishTotal{outcome:'error'} so failures aren't invisible.
+    try {
     span.setAttributes({
       'dkg.context_graph_id': contextGraphId,
       'dkg.triple_count': quads.length,
@@ -1459,6 +1463,12 @@ export class PublishMethods extends DKGAgentBase {
     getMetrics().publishDuration.record(Date.now() - publishStartedAt, publishMetricAttrs);
 
     return result;
+    } catch (err) {
+      const publishFailAttrs = { outcome: 'error', source: 'direct', ...(chainId ? { chain_id: chainId } : {}) };
+      getMetrics().publishTotal.add(1, publishFailAttrs);
+      getMetrics().publishDuration.record(Date.now() - publishStartedAt, publishFailAttrs);
+      throw err;
+    }
    });
   }
 
@@ -4143,6 +4153,9 @@ export class PublishMethods extends DKGAgentBase {
    return withSpan('agent.publish_from_swm', async (span) => {
     const chainId = typeof this.chain?.chainId === 'string' && this.chain.chainId !== 'none' ? this.chain.chainId : undefined;
     const publishStartedAt = Date.now();
+    // try/catch so a throw before the success metric is still counted as an
+    // error outcome (see the direct-publish path for the rationale).
+    try {
     span.setAttributes({
       'dkg.context_graph_id': contextGraphId,
       'dkg.selection': selection === 'all' ? 'all' : 'roots',
@@ -4380,6 +4393,12 @@ export class PublishMethods extends DKGAgentBase {
     getMetrics().publishDuration.record(Date.now() - publishStartedAt, publishMetricAttrs);
 
     return result;
+    } catch (err) {
+      const publishFailAttrs = { outcome: 'error', source: 'swm', ...(chainId ? { chain_id: chainId } : {}) };
+      getMetrics().publishTotal.add(1, publishFailAttrs);
+      getMetrics().publishDuration.record(Date.now() - publishStartedAt, publishFailAttrs);
+      throw err;
+    }
    });
   }
 

@@ -310,6 +310,10 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
     const isWorkspace = request.includeSharedMemory;
     const contextGraphId = request.contextGraphId;
     if (!contextGraphId || typeof contextGraphId !== 'string') {
+      // Count this early return too — it short-circuits before limiter.run, so
+      // without this it would never reach the syncResponseTotal{ok}/{error}
+      // recording on the limiter promise below.
+      getMetrics().syncResponseTotal.add(1, { outcome: 'invalid' });
       return new TextEncoder().encode('');
     }
     throwIfAborted(signal);

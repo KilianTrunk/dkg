@@ -750,9 +750,11 @@ export class ACKCollector {
                   result: 'decline',
                   decline_code: declineCode,
                 });
-              } else {
-                getMetrics().ackPeerTotal.add(1, { result: 'ack' });
               }
+              // A non-decline response is NOT counted as a successful ACK here:
+              // it is still unverified. The terminal ackPeerTotal{result:'ack'}
+              // is recorded only after signature/merkle/identity validation
+              // passes below; failed validation is counted {result:'rejected'}.
               return decoded;
             },
             {
@@ -829,12 +831,14 @@ export class ACKCollector {
           const recoveredAddress = this.recoverACKSigner(ack, ackDigest);
           if (!recoveredAddress) {
             recordACKFailure(peerId, 'INVALID_SIGNATURE');
+            getMetrics().ackPeerTotal.add(1, { result: 'rejected' });
             log(`[ACKCollector] Invalid ACK signature from ${peerId.slice(-8)}`);
             return null;
           }
 
           if (!this.merkleRootsMatch(ack.merkleRoot, merkleRoot)) {
             recordACKFailure(peerId, 'MERKLE_ROOT_MISMATCH');
+            getMetrics().ackPeerTotal.add(1, { result: 'rejected' });
             log(`[ACKCollector] Merkle root mismatch from ${peerId.slice(-8)}`);
             return null;
           }
@@ -868,6 +872,7 @@ export class ACKCollector {
             if (!verdict.valid) {
               const reason = sanitizeDeclineField(verdict.reason ?? 'unknown', MAX_DECLINE_CODE_CHARS) || 'unknown';
               recordACKFailure(peerId, `ACK_VERIFY:${reason}`);
+              getMetrics().ackPeerTotal.add(1, { result: 'rejected' });
               log(
                 `[ACKCollector] ACK from ${peerId.slice(-8)} rejected: ${reason}` +
                 ` (signer=${recoveredAddress.slice(0, 10)}..., identity=${identityId})`,
@@ -891,6 +896,7 @@ export class ACKCollector {
             );
             if (!valid) {
               recordACKFailure(peerId, 'ACK_VERIFY:key-not-registered');
+              getMetrics().ackPeerTotal.add(1, { result: 'rejected' });
               log(`[ACKCollector] Signer ${recoveredAddress.slice(0, 10)}... not registered for identity ${identityId} — rejecting ACK from ${peerId.slice(-8)}`);
               return null;
             }
@@ -913,6 +919,11 @@ export class ACKCollector {
 
           const sourceTag = subscriptionSource ? ` source=${subscriptionSource}` : '';
           log(`[ACKCollector] Valid ACK from ${peerId.slice(-8)} (identity=${identityId}, signer=${recoveredAddress.slice(0, 10)}...${sourceTag})`);
+
+          // Terminal: a fully-validated ACK (signature + merkle + identity all
+          // passed). Counted here, not at decode time, so the 'ack' result
+          // reflects accepted ACKs only.
+          getMetrics().ackPeerTotal.add(1, { result: 'ack' });
 
           return {
             peerId,

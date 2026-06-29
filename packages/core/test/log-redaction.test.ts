@@ -30,6 +30,31 @@ describe('log redaction — secrets are scrubbed before logs leave the node', ()
     expect(out.message).not.toMatch(/legal winner|sausage|yellow/);
   });
 
+  it('redacts an UNQUOTED multi-word mnemonic (whole phrase, not just the first word)', () => {
+    const out = redact(rec('restored mnemonic=legal winner thank year wave sausage worth useful legal winner thank yellow now'));
+    expect(out.message).toContain('mnemonic=');
+    expect(out.message).toContain(REDACTED);
+    // None of the BIP39 words may survive.
+    expect(out.message).not.toMatch(/legal|winner|thank|year|wave|sausage|worth|useful|yellow/);
+  });
+
+  it('redacts an unquoted seedPhrase with colon separator', () => {
+    const out = redact(rec('seedPhrase: abandon ability able about above absent absorb abstract'));
+    expect(out.message).toContain('seedPhrase:');
+    expect(out.message).not.toMatch(/abandon|ability|absent|abstract/);
+  });
+
+  it('does NOT over-redact past a delimiter after a mnemonic value', () => {
+    const out = redact(rec('mnemonic=abc def ghi, requestId=keep-this-123'));
+    expect(out.message).toContain('keep-this-123');
+    expect(out.message).not.toMatch(/\babc\b|\bdef\b|\bghi\b/);
+  });
+
+  it('does NOT touch a bare "mnemonic" word with no key/value separator', () => {
+    const msg = 'starting node; mnemonic loaded from keystore ok';
+    expect(redact(rec(msg)).message).toBe(msg);
+  });
+
   it('redacts bearer tokens and api keys', () => {
     const out = redact(rec('headers authorization=Bearer-abc.def token: sk_live_9f8e7d6c apiKey=AKIAEXAMPLE123'));
     expect(out.message).not.toContain('sk_live_9f8e7d6c');

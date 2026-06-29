@@ -1341,10 +1341,12 @@ export class EVMChainAdapterBase {
       ? errorMessage(lastRetryable)
       : `${label} transaction preparation failed on all configured RPC endpoints ` +
         `(${this.rpcUrls.map(rpcHost).join(', ')}): ${errorMessage(lastRetryable)}`;
-    // Populate+sign exhausted every endpoint (mirrors the broadcast/receipt
-    // exhaustion counters in sendSignedTransactionAndWait).
+    // Populate+sign exhausted every endpoint. This is the PREPARE phase
+    // (populateTransaction / eth_estimateGas), NOT the broadcast — label it
+    // eth_estimateGas so it doesn't collide with the genuine
+    // eth_sendRawTransaction failover counter in sendSignedTransactionAndWait.
     getMetrics().chainRpcFailoverTotal.add(1, {
-      rpc_method: 'eth_sendRawTransaction', chain_id: this.chainId, reason: 'exhausted',
+      rpc_method: 'eth_estimateGas', chain_id: this.chainId, reason: 'exhausted',
     });
     throw new ChainRpcTransportError('RPC_ENDPOINTS_EXHAUSTED', message, {
       cause: lastRetryable,

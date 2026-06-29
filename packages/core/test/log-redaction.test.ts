@@ -50,6 +50,28 @@ describe('log redaction — secrets are scrubbed before logs leave the node', ()
     expect(out.message).not.toMatch(/\babc\b|\bdef\b|\bghi\b/);
   });
 
+  it('redacts an UNQUOTED `seed=` phrase (whole phrase, not just the first word)', () => {
+    const out = redact(rec('restored seed=legal winner thank year wave sausage worth useful'));
+    expect(out.message).toContain('seed=');
+    expect(out.message).not.toMatch(/legal|winner|thank|year|wave|sausage|worth|useful/);
+  });
+
+  it('still redacts a single-token `seed` (numeric / hex) and stops at a delimiter', () => {
+    expect(redact(rec('seed: 1234567890')).message).not.toContain('1234567890');
+    const out = redact(rec('seed=0xabc123, requestId=keep-456'));
+    expect(out.message).not.toContain('0xabc123');
+    expect(out.message).toContain('keep-456'); // does not over-redact past the comma
+  });
+
+  it('redacts an unquoted multi-word `passphrase`', () => {
+    const out = redact(rec('passphrase=correct horse battery staple'));
+    expect(out.message).not.toMatch(/correct|horse|battery|staple/);
+  });
+
+  it('does not false-positive on the word "seeded"', () => {
+    expect(redact(rec('seeded the database with 5 rows')).message).toBe('seeded the database with 5 rows');
+  });
+
   it('does NOT touch a bare "mnemonic" word with no key/value separator', () => {
     const msg = 'starting node; mnemonic loaded from keystore ok';
     expect(redact(rec(msg)).message).toBe(msg);

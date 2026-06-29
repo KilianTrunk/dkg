@@ -66,7 +66,7 @@ export const REDACTED = '[REDACTED]';
  * Handled by a dedicated matcher and EXCLUDED from the single-token matcher so
  * a value is never processed twice.
  */
-const PHRASE_KEYS: readonly string[] = ['mnemonic', 'seedPhrase', 'seed_phrase', 'seedphrase'];
+const PHRASE_KEYS: readonly string[] = ['mnemonic', 'seedPhrase', 'seed_phrase', 'seedphrase', 'seed', 'passphrase'];
 
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -123,11 +123,14 @@ function buildKeyRegex(keys: readonly string[]): RegExp {
 
 /**
  * Like `buildKeyRegex` but the VALUE matcher consumes a multi-word run for
- * unquoted phrase secrets: a quoted run, OR up to 24 whitespace-separated
- * alphabetic words (BIP39 mnemonics are 12–24 lowercase words). The 24-word cap
- * stops it from swallowing an entire trailing sentence while still redacting a
- * full seed phrase. Only fires on `key: …` / `key=…` (a bare "mnemonic" word in
- * prose, with no separator, is left untouched).
+ * unquoted phrase secrets. The value is a quoted run, OR a bare first token
+ * followed by up to 23 more whitespace-separated ALPHA words — so it redacts
+ * BOTH a single-token secret (`seed=12345`, `seed=0xabc`) AND a full BIP39-style
+ * phrase (`seed=legal winner thank …`), while the 24-word cap + alpha-only
+ * continuation stop it from swallowing an entire trailing sentence or crossing a
+ * `,`/`;`/`}` delimiter. Phrase keys are handled ONLY here (excluded from the
+ * single-token matcher), so this MUST also cover the single-token case. Only
+ * fires on `key: …` / `key=…` (a bare key word in prose is left untouched).
  */
 function buildPhraseKeyRegex(keys: readonly string[]): RegExp {
   const alt = keys.map(escapeRegExp).join('|');
@@ -140,7 +143,7 @@ function buildPhraseKeyRegex(keys: readonly string[]): RegExp {
       '"[^"]*"' + '|' +
       "'[^']*'" + '|' +
       '`[^`]*`' + '|' +
-      '[A-Za-z]+(?:\\s+[A-Za-z]+){0,23}' + // up to 24 alpha words
+      '[^\\s,;}\\]\\)]+(?:\\s+[A-Za-z]+){0,23}' + // single token, + up to 23 trailing alpha words
     ')',
     'gi',
   );

@@ -8,10 +8,17 @@ import {
   encodePublishIntent, decodeStorageACK, computePublishACKDigest,
   isStorageACKDecline, STORAGE_ACK_DECLINE_CODES, computeCatalogRoot,
 } from '@origintrail-official/dkg-core';
-import { TypedEventBus } from '@origintrail-official/dkg-core';
+import { TypedEventBus, rebuildMetrics } from '@origintrail-official/dkg-core';
 import { OxigraphStore } from '@origintrail-official/dkg-storage';
 import { ethers } from 'ethers';
 import type { Quad } from '@origintrail-official/dkg-storage';
+import { metrics } from '@opentelemetry/api';
+import {
+  MeterProvider,
+  PeriodicExportingMetricReader,
+  InMemoryMetricExporter,
+  AggregationTemporality,
+} from '@opentelemetry/sdk-metrics';
 
 // Test H5 prefix inputs — must match whatever `StorageACKHandlerConfig`
 // carries so that the ACK digest the test computes equals the one the
@@ -118,6 +125,45 @@ describe('StorageACKHandler', () => {
         ? ack.coreNodeSignatureVS : new Uint8Array(ack.coreNodeSignatureVS)),
     });
     expect(recovered.toLowerCase()).toBe(coreWallet.address.toLowerCase());
+  });
+
+  it('emits ackHandlerTotal{outcome} through the REAL handler (ack + decline paths)', async () => {
+    // Review coverage gap: the inbound storage-ACK outcome metric is a separate
+    // contract from ACKCollector's — drive the real handler and assert it.
+    const exporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
+    const mp = new MeterProvider({ readers: [new PeriodicExportingMetricReader({ exporter, exportIntervalMillis: 60_000 })] });
+    metrics.setGlobalMeterProvider(mp);
+    rebuildMetrics();
+    try {
+      const handler = await createHandler(swmQuads);
+      const base = {
+        merkleRoot, contextGraphId, publisherPeerId: 'publisher-0', isPrivate: false,
+        kaCount: 1, rootEntities: ['urn:entity:1', 'urn:entity:2'], epochs: 1,
+        tokenAmountStr: '1000', merkleLeafCount: swmMerkleLeafCount,
+      };
+      // ACK path (valid byte size) then DECLINE path (byteSize=1 → underclaim).
+      await handler.handler(encodePublishIntent({ ...base, publicByteSize: 300 }), fakePeerId);
+      await handler.handler(encodePublishIntent({ ...base, publicByteSize: 1 }), fakePeerId);
+
+      await mp.forceFlush();
+      const pts: Array<Record<string, unknown>> = [];
+      for (const rm of exporter.getMetrics())
+        for (const sm of rm.scopeMetrics)
+          for (const m of sm.metrics)
+            if (m.descriptor.name === 'dkg.ack.handler.total')
+              for (const dp of m.dataPoints) pts.push(dp.attributes as Record<string, unknown>);
+
+      expect(pts.some((a) => a.outcome === 'ack')).toBe(true);
+      expect(pts.some((a) => a.outcome === 'decline' && a.decline_code === STORAGE_ACK_DECLINE_CODES.BYTESIZE_UNDERCLAIM)).toBe(true);
+      // Bounded labels only — no high-cardinality keys leak in.
+      const keys = new Set(pts.flatMap((a) => Object.keys(a)));
+      for (const bad of ['peer_id', 'operation_id', 'tx_hash', 'context_graph_id']) expect(keys.has(bad)).toBe(false);
+    } finally {
+      await mp.forceFlush().catch(() => {});
+      await mp.shutdown().catch(() => {});
+      metrics.disable();
+      rebuildMetrics();
+    }
   });
 
   it('declines (BYTESIZE_UNDERCLAIM) when publicByteSize is below the real content lower bound', async () => {

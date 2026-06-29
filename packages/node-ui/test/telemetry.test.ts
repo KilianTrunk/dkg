@@ -9,7 +9,7 @@ import {
   InMemoryMetricExporter,
   AggregationTemporality,
 } from '@opentelemetry/sdk-metrics';
-import { withSpan, getMetrics, rebuildMetrics, Logger, type OperationContext } from '@origintrail-official/dkg-core';
+import { withSpan, getMetrics, rebuildMetrics, currentTraceIds, Logger, type OperationContext } from '@origintrail-official/dkg-core';
 import { initTelemetry, isTelemetryConfigured, shutdownTelemetry } from '../src/telemetry.js';
 
 /**
@@ -63,6 +63,18 @@ describe('telemetry — disabled is a total no-op', () => {
     // No endpoint reachable here, but it must register (configured) without throwing.
     await initTelemetry({ enabled: true, metricsEndpoint: 'http://127.0.0.1:4318/v1/metrics', serviceName: 'legacy' } as any);
     expect(isTelemetryConfigured()).toBe(true);
+  });
+
+  it('traces + metrics are INDEPENDENT: a metrics-only init does NOT block a later traces init', async () => {
+    // Regression for the single-`configured`-flag bug: registering metrics first
+    // must not make a subsequent traces init silently no-op.
+    await initTelemetry({ enabled: true, metrics: { endpoint: 'http://127.0.0.1:4318/v1/metrics', exportIntervalMs: 60_000 } });
+    expect(isTelemetryConfigured()).toBe(true);
+    // Second call, traces only — must register (it was the gated signal).
+    await initTelemetry({ enabled: true, traces: { endpoint: 'http://127.0.0.1:4318/v1/traces' } });
+    // A span now flows through a real (registered) tracer rather than the no-op.
+    const tid = await withSpan('agent.publish', () => currentTraceIds().traceId);
+    expect(tid).toMatch(/^[0-9a-f]{32}$/);
   });
 
   it('metric instruments are usable (no throw) when telemetry is off', () => {

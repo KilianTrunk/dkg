@@ -75,9 +75,10 @@ export interface TelemetryConfig {
   serviceName?: string;
 }
 
+// Independent per-signal lifecycle state (NOT one shared flag) so traces and
+// metrics can be registered separately and one signal's setup never gates the other.
 let tracerProvider: NodeTracerProvider | null = null;
 let meterProvider: MeterProvider | null = null;
-let configured = false;
 
 function buildAttrs(r: TelemetryResource = {}): Record<string, string> {
   const attrs: Record<string, string> = {
@@ -124,12 +125,14 @@ function normalizeInitConfig(input: TelemetryInitConfig | TelemetryConfig): Tele
  * imported (see the BROWSER SAFETY note above).
  */
 export async function initTelemetry(input: TelemetryInitConfig | TelemetryConfig): Promise<void> {
-  if (configured) return;
   const cfg = normalizeInitConfig(input);
   if (!cfg.enabled) return;
 
-  const tracesOn = !!cfg.traces?.endpoint && cfg.traces.enabled !== false;
-  const metricsOn = !!cfg.metrics?.endpoint && cfg.metrics.enabled !== false;
+  // Traces and metrics are INDEPENDENT signals: each registers only if it has
+  // an endpoint AND isn't already registered. (No single `configured` gate — a
+  // metrics-only init followed by a traces init must still register traces.)
+  const tracesOn = !!cfg.traces?.endpoint && cfg.traces.enabled !== false && tracerProvider === null;
+  const metricsOn = !!cfg.metrics?.endpoint && cfg.metrics.enabled !== false && meterProvider === null;
   if (!tracesOn && !metricsOn) return;
 
   const { resourceFromAttributes } = await import('@opentelemetry/resources');
@@ -153,7 +156,6 @@ export async function initTelemetry(input: TelemetryInitConfig | TelemetryConfig
     // register() installs the global tracer provider + an AsyncLocalStorage
     // context manager (so spans flow across awaits) + W3C trace-context propagator.
     tracerProvider.register();
-    configured = true;
   }
 
   // ── Metrics ──
@@ -177,12 +179,12 @@ export async function initTelemetry(input: TelemetryInitConfig | TelemetryConfig
     otelMetrics.setGlobalMeterProvider(meterProvider);
     // Re-bind the core facade's instrument cache to the real meter.
     rebuildMetrics();
-    configured = true;
   }
 }
 
+/** True once EITHER signal (traces or metrics) has registered a real provider. */
 export function isTelemetryConfigured(): boolean {
-  return configured;
+  return tracerProvider !== null || meterProvider !== null;
 }
 
 /**
@@ -218,7 +220,6 @@ export async function shutdownTelemetry(): Promise<void> {
   }
   tracerProvider = null;
   meterProvider = null;
-  configured = false;
 }
 
 /**

@@ -126,9 +126,14 @@ const MAX_DECLINE_MESSAGE_CHARS = 240;
  * quorum-fail throw (`no connected core peers`, `quorum impossible`,
  * `storage_ack_insufficient`) ⇒ quorum was/became impossible.
  */
-function quorumOutcomeFromError(err: QuorumUnmetError): 'timeout' | 'impossible' {
+export function quorumOutcomeFromError(err: QuorumUnmetError): 'timeout' | 'impossible' {
   const msg = err.legacyMessage ?? err.message ?? '';
-  return msg.includes('storage_ack_timeout') ? 'timeout' : 'impossible';
+  // Classify on the structured PREFIX only. The message tail can embed
+  // sanitized peer-supplied decline text (`…Declines: ab12→NO_DATA_IN_SWM`),
+  // so a substring match on the whole string would let a peer that writes
+  // "storage_ack_timeout" into its decline message flip an insufficient/
+  // impossible quorum to 'timeout'. Only the timeout throw STARTS with the prefix.
+  return msg.startsWith('storage_ack_timeout') ? 'timeout' : 'impossible';
 }
 
 function sanitizeDeclineField(value: string, maxChars: number): string {

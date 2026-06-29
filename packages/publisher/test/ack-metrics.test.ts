@@ -15,7 +15,8 @@ import {
   InMemoryMetricExporter,
   AggregationTemporality,
 } from '@opentelemetry/sdk-metrics';
-import { ACKCollector, type ACKCollectorDeps } from '../src/ack-collector.js';
+import { ACKCollector, quorumOutcomeFromError, type ACKCollectorDeps } from '../src/ack-collector.js';
+import { QuorumUnmetError } from '../src/ack-errors.js';
 import { encodeStorageACK, computePublishACKDigest, rebuildMetrics } from '@origintrail-official/dkg-core';
 import { computeFlatKCRootV10, computeFlatKCMerkleLeafCountV10 } from '../src/merkle.js';
 import { ethers } from 'ethers';
@@ -67,6 +68,22 @@ const collectParams = {
   kav10Address: TEST_KAV10_ADDR,
   merkleLeafCount,
 };
+
+describe('quorumOutcomeFromError — classify on the structured prefix, not peer text', () => {
+  const mk = (legacyMessage: string) =>
+    new QuorumUnmetError({ collected: 1, required: 3, dialled: 4, peerOutcomes: [], legacyMessage });
+
+  it('a real timeout message → outcome:timeout', () => {
+    expect(quorumOutcomeFromError(mk('storage_ack_timeout: only 1/3 ACKs received within 120000ms.'))).toBe('timeout');
+  });
+
+  it('insufficient quorum whose DECLINE text contains "storage_ack_timeout" → impossible (not timeout)', () => {
+    // A peer that writes "storage_ack_timeout" into its decline message must NOT
+    // flip an insufficient/impossible quorum to the timeout bucket.
+    const msg = 'storage_ack_insufficient: got 1/3 valid ACKs after 4/4 peers settled. Declines: ab12→NO_DATA_IN_SWM (storage_ack_timeout while waiting)';
+    expect(quorumOutcomeFromError(mk(msg))).toBe('impossible');
+  });
+});
 
 describe('ACK metrics — result:ack only after validation', () => {
   let mp: MeterProvider | null = null;

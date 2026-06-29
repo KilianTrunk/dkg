@@ -24,25 +24,17 @@
  */
 
 import { metrics as otelMetrics, trace as otelTrace } from '@opentelemetry/api';
+import { buildTelemetryResourceAttrs, type TelemetryResourceInput } from './telemetry-resource.js';
 // Type-only imports are erased at compile time → no runtime/bundle dependency.
 import type { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import type { MeterProvider } from '@opentelemetry/sdk-metrics';
 
-/** Stable resource identity, shared by logs + traces + metrics. */
-export interface TelemetryResource {
-  serviceName?: string; // default 'dkg-node'
-  serviceVersion?: string;
-  /** Per-node id → service.instance.id (the Grafana node selector). */
-  serviceInstanceId?: string;
-  /** testnet | mainnet | devnet → deployment.environment + dkg.network */
-  network?: string;
-  peerId?: string;
-  nodeName?: string;
-  nodeRole?: string;
-  commit?: string;
-  /** e.g. 'base:8453' → dkg.chain */
-  chainId?: string;
-}
+/**
+ * Stable resource identity, shared by logs + traces + metrics. Single canonical
+ * type — re-exported alias of `TelemetryResourceInput` (the shared resource
+ * model in ./telemetry-resource) so logs and traces/metrics can't drift.
+ */
+export type TelemetryResource = TelemetryResourceInput;
 
 export interface OtlpSignalConfig {
   endpoint?: string; // full signal URL, e.g. http://localhost:4318/v1/traces
@@ -80,23 +72,9 @@ export interface TelemetryConfig {
 let tracerProvider: NodeTracerProvider | null = null;
 let meterProvider: MeterProvider | null = null;
 
-function buildAttrs(r: TelemetryResource = {}): Record<string, string> {
-  const attrs: Record<string, string> = {
-    'service.name': r.serviceName ?? 'dkg-node',
-  };
-  if (r.serviceVersion) attrs['service.version'] = r.serviceVersion;
-  if (r.serviceInstanceId) attrs['service.instance.id'] = r.serviceInstanceId;
-  if (r.network) {
-    attrs['deployment.environment'] = r.network;
-    attrs['dkg.network'] = r.network;
-  }
-  if (r.peerId) attrs['dkg.peer_id'] = r.peerId;
-  if (r.nodeName) attrs['dkg.node.name'] = r.nodeName;
-  if (r.nodeRole) attrs['dkg.node.role'] = r.nodeRole;
-  if (r.commit) attrs['dkg.commit'] = r.commit;
-  if (r.chainId) attrs['dkg.chain'] = r.chainId;
-  return attrs;
-}
+// Traces/metrics resource attributes come from the SAME shared builder the log
+// worker uses — no second mapping to drift.
+const buildAttrs = buildTelemetryResourceAttrs;
 
 function authHeaders(sig: OtlpSignalConfig): Record<string, string> | undefined {
   const headers = { ...(sig.headers ?? {}) };

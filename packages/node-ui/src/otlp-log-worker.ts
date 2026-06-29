@@ -20,6 +20,7 @@
  */
 
 import type { LogRecord } from '@origintrail-official/dkg-core';
+import { buildTelemetryResourceAttrs } from './telemetry-resource.js';
 
 // OpenTelemetry severity numbers (logs data model).
 const OTEL_SEVERITY: Record<string, { num: number; text: string }> = {
@@ -138,21 +139,24 @@ export class OtlpLogWorker {
     this.authHeaders = { 'content-type': 'application/json', ...(opts.headers ?? {}) };
     if (opts.token) this.authHeaders['authorization'] = `Bearer ${opts.token}`;
 
-    this.resourceAttrs = [
-      attr('service.name', opts.serviceName ?? DEFAULTS.serviceName),
-      attr('service.version', opts.version),
-      // Promoted to Loki index labels by default → drive Grafana dashboard
-      // variables (node selector + environment) off these.
-      attr('service.instance.id', opts.serviceInstanceId ?? opts.nodeName ?? opts.peerId),
-      attr('deployment.environment', opts.deploymentEnvironment ?? opts.network),
-      // Kept as structured metadata for richer filtering / correlation.
-      attr('dkg.network', opts.network),
-      attr('dkg.peer_id', opts.peerId),
-      attr('dkg.node.name', opts.nodeName),
-      attr('dkg.node.role', opts.role),
-      attr('dkg.chain', opts.chainId),
-      attr('dkg.commit', opts.commit),
-    ].filter((a): a is OtlpAttribute => a !== null);
+    // Built from the SHARED resource model so the log resource (and the Loki
+    // labels promoted from service.name / service.instance.id /
+    // deployment.environment / dkg.node.role) can never drift from the
+    // traces/metrics resource. See ./telemetry-resource.
+    this.resourceAttrs = Object.entries(
+      buildTelemetryResourceAttrs({
+        serviceName: opts.serviceName ?? DEFAULTS.serviceName,
+        serviceVersion: opts.version,
+        serviceInstanceId: opts.serviceInstanceId,
+        deploymentEnvironment: opts.deploymentEnvironment,
+        network: opts.network,
+        peerId: opts.peerId,
+        nodeName: opts.nodeName,
+        nodeRole: opts.role,
+        commit: opts.commit,
+        chainId: opts.chainId,
+      }),
+    ).map(([key, value]) => ({ key, value: { stringValue: value } }));
   }
 
   /** Append a record. Filters below minLevel; never awaits the network. */

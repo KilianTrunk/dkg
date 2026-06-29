@@ -1287,6 +1287,24 @@ export class PublishMethods extends DKGAgentBase {
     };
   }
 
+  /**
+   * Record the publish outcome metric (total + duration) for BOTH publish entry
+   * points (`_publish` direct + `_publishFromSharedMemory`). Centralized so the
+   * label shape stays identical and the same observability sequence isn't pasted
+   * into two flows (review: "publish telemetry duplicated across both paths").
+   */
+  recordPublishOutcome(
+    this: DKGAgent,
+    outcome: string,
+    source: 'direct' | 'swm',
+    startedAt: number,
+    chainId?: string,
+  ): void {
+    const attrs = { outcome, source, ...(chainId ? { chain_id: chainId } : {}) };
+    getMetrics().publishTotal.add(1, attrs);
+    getMetrics().publishDuration.record(Date.now() - startedAt, attrs);
+  }
+
   async _publish(this: DKGAgent,
     contextGraphId: string,
     quads: Quad[],
@@ -1458,15 +1476,11 @@ export class PublishMethods extends DKGAgentBase {
     // it can never affect the publish just completed.
     await this.emitPublicProjectionAfterPublish(contextGraphId, result, ctx);
 
-    const publishMetricAttrs = { outcome: result.status, source: 'direct', ...(chainId ? { chain_id: chainId } : {}) };
-    getMetrics().publishTotal.add(1, publishMetricAttrs);
-    getMetrics().publishDuration.record(Date.now() - publishStartedAt, publishMetricAttrs);
+    this.recordPublishOutcome(result.status, 'direct', publishStartedAt, chainId);
 
     return result;
     } catch (err) {
-      const publishFailAttrs = { outcome: 'error', source: 'direct', ...(chainId ? { chain_id: chainId } : {}) };
-      getMetrics().publishTotal.add(1, publishFailAttrs);
-      getMetrics().publishDuration.record(Date.now() - publishStartedAt, publishFailAttrs);
+      this.recordPublishOutcome('error', 'direct', publishStartedAt, chainId);
       throw err;
     }
    });
@@ -4388,15 +4402,11 @@ export class PublishMethods extends DKGAgentBase {
       }
     }
 
-    const publishMetricAttrs = { outcome: result.status, source: 'swm', ...(chainId ? { chain_id: chainId } : {}) };
-    getMetrics().publishTotal.add(1, publishMetricAttrs);
-    getMetrics().publishDuration.record(Date.now() - publishStartedAt, publishMetricAttrs);
+    this.recordPublishOutcome(result.status, 'swm', publishStartedAt, chainId);
 
     return result;
     } catch (err) {
-      const publishFailAttrs = { outcome: 'error', source: 'swm', ...(chainId ? { chain_id: chainId } : {}) };
-      getMetrics().publishTotal.add(1, publishFailAttrs);
-      getMetrics().publishDuration.record(Date.now() - publishStartedAt, publishFailAttrs);
+      this.recordPublishOutcome('error', 'swm', publishStartedAt, chainId);
       throw err;
     }
    });

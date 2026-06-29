@@ -131,6 +131,7 @@ import {
   validateNetworkConfigReadiness,
 } from '../config.js';
 import { resolveOtelSignals, resolveLogExporterMode } from '../telemetry-config.js';
+import { createDaemonLogSink } from './log-sink.js';
 import { createPublicSnapshotStore, createPublisherControlFromStore, startPublisherRuntimeIfEnabled, type PublisherRuntime } from '../publisher-runner.js';
 import { createCatchupRunner, type CatchupJobResult, type CatchupRunner } from '../catchup-runner.js';
 import { loadTokens, httpAuthGuard } from '../auth.js';
@@ -1994,26 +1995,17 @@ export async function runDaemonInner(
   // redaction only protects data crossing the trust boundary to a collector.
   const redactForRemote = createLogRedactor(config.telemetry?.logs?.redact);
 
-  Logger.setSink((entry) => {
-    try {
-      dashDb.insertLog({
-        ts: Date.now(),
-        level: entry.level,
-        operation_name: entry.operationName,
-        operation_id: entry.operationId,
-        module: entry.module,
-        message: entry.message,
-      });
-    } catch {
-      /* DB write must never break the node */
-    }
-    // Fan out a single redacted copy to every active remote shipper.
-    if (logPusher || otlpExporter) {
-      const safe = redactForRemote(entry);
-      logPusher?.push(safe);
-      otlpExporter?.push(safe);
-    }
-  });
+  // Local DB gets the FULL record; remote shippers get a single REDACTED copy.
+  // `remoteShippers` is evaluated per record so runtime enable/disable of the
+  // syslog/OTLP workers is reflected without re-wiring. Logic lives in
+  // createDaemonLogSink so this trust boundary is unit-tested (log-sink.test.ts).
+  Logger.setSink(
+    createDaemonLogSink({
+      insertLog: (rec) => dashDb.insertLog(rec),
+      redact: redactForRemote,
+      remoteShippers: () => [logPusher, otlpExporter],
+    }),
+  );
 
   // Extract the plain value from an RDF typed literal like "6"^^<xsd:integer>
   const metricsSource: MetricsSource = {

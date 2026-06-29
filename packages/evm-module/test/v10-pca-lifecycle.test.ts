@@ -2405,5 +2405,33 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
         CGFacade.connect(creator).createContextGraph([], 0, 0, 1, ethers.ZeroAddress, 0, ethers.ZeroHash),
       ).to.be.reverted;
     });
+
+    // Review feedback: an EXPIRED or FULLY-SWEPT PCA has no live locked
+    // commitment, so it provides no anti-spam stake — the waiver must NOT apply
+    // (else the owner could mint unlimited zero-deposit CGs against a dead PCA).
+    it('does NOT waive when the PCA has EXPIRED (no live backing) — deposit charged', async () => {
+      await setDeposit();
+      const owner = accounts[1];
+      const accountId = await createAccountFor(owner);
+      const expiresAtTimestamp = (await NFT.accounts(accountId))[4]; // tuple idx 4
+      await time.increaseTo(Number(expiresAtTimestamp) + 1);
+
+      // Owner is unfunded for a deposit (committed TRAC is spent; no facade
+      // approval) → waiver denied → _pullRegistrationDeposit reverts.
+      await expect(createPcaCg(owner, owner, accountId)).to.be.reverted;
+    });
+
+    it('does NOT waive when the PCA has been FULLY SWEPT — deposit charged', async () => {
+      await setDeposit();
+      const owner = accounts[1];
+      const accountId = await createAccountFor(owner);
+      const expiresAtTimestamp = (await NFT.accounts(accountId))[4];
+      await time.increaseTo(Number(expiresAtTimestamp) + 1);
+      // Post-expiry settle sweeps the unused account's tail and marks it swept.
+      await NFT.connect(owner).settle(accountId);
+      expect((await NFT.accounts(accountId))[8]).to.equal(true); // fullySwept
+
+      await expect(createPcaCg(owner, owner, accountId)).to.be.reverted;
+    });
   });
 });

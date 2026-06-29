@@ -227,13 +227,25 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable, Re
         }
     }
 
-    /// @dev OT-RFC-53 deposit waiver authorization. Returns true when the CG is
-    ///      backed by PCA `accountId` AND the CALLER is its owner or a currently
-    ///      registered conviction agent. The caller check is EXPLICIT here:
-    ///      `_validatePCACoherence` only ties the stored authority to the owner,
-    ///      NOT `msg.sender`, so without this a third party could create a CG
-    ///      pointing at someone else's PCA and dodge the deposit. Fails CLOSED
-    ///      (charges the deposit) on any resolution/lookup failure.
+    /// @dev OT-RFC-53 deposit waiver authorization. Returns true ONLY when the
+    ///      CG is backed by PCA `accountId` that is currently a LIVE, backed
+    ///      account AND the CALLER is its owner or a currently registered
+    ///      conviction agent. Two independent gates, both required:
+    ///
+    ///      1. ACTIVE PCA — the waiver's premise is that the PCA's locked TRAC
+    ///         is a larger anti-spam stake than the per-CG deposit. An EXPIRED
+    ///         or FULLY-SWEPT PCA has no live commitment, so it earns no waiver
+    ///         (else an owner could mint unlimited zero-deposit CGs against a
+    ///         dead account). `accounts()` returns zeros for a never-minted id
+    ///         (committedTRAC == 0 ⇒ rejected); expiry is timestamp-based,
+    ///         matching PublishingConviction.coverPublishingCost.
+    ///
+    ///      2. CALLER — the check is EXPLICIT here: `_validatePCACoherence` only
+    ///         ties the stored authority to the owner, NOT `msg.sender`, so
+    ///         without this a third party could point a CG at someone else's
+    ///         PCA and dodge the deposit.
+    ///
+    ///      Fails CLOSED (charges the deposit) on any resolution/lookup failure.
     function _waivesRegistrationDeposit(uint256 accountId) internal view returns (bool) {
         if (accountId == 0) return false;
         address nftAddr;
@@ -244,14 +256,37 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable, Re
         }
         if (nftAddr == address(0)) return false;
         IDKGPublishingConvictionNFT nft = IDKGPublishingConvictionNFT(nftAddr);
-        // Owner of the PCA NFT.
+
+        // Gate 1: the PCA must be a live, backed account (committed, unexpired,
+        // not fully swept). Tuple indices: 0=committedTRAC, 4=expiresAtTimestamp,
+        // 8=fullySwept.
+        try nft.accounts(accountId) returns (
+            uint96 committedTRAC,
+            uint40,
+            uint40,
+            uint40,
+            uint40 expiresAtTimestamp,
+            uint16,
+            uint16,
+            uint16,
+            bool fullySwept,
+            uint72,
+            uint40
+        ) {
+            if (committedTRAC == 0 || fullySwept) return false;
+            if (expiresAtTimestamp != 0 && block.timestamp >= expiresAtTimestamp) return false;
+        } catch {
+            return false;
+        }
+
+        // Gate 2: caller is the PCA owner, or a currently registered agent.
         try nft.ownerOf(accountId) returns (address owner_) {
             if (owner_ == msg.sender) return true;
         } catch {
             return false; // nonexistent account → not waivable
         }
-        // Registered conviction agent. `agentToAccountId` returns the single PCA
-        // an agent is bound to (0 when unregistered), so equality is the check.
+        // `agentToAccountId` returns the single PCA an agent is bound to (0 when
+        // unregistered), so equality is the membership check.
         try nft.agentToAccountId(msg.sender) returns (uint256 boundAccount) {
             if (boundAccount == accountId) return true;
         } catch {

@@ -21,13 +21,14 @@ import { KeyedSerializer } from './keyed-mutex.js';
 import { floorPublishTokenAmount, withSpan, getMetrics } from '@origintrail-official/dkg-core';
 import { loadAbi } from './evm-adapter-abi.js';
 import { errorCode, errorMessage, errorStatus, isTooLowAllowanceError, enrichEvmError, HUB_STALE_ERROR_MARKERS, isInsufficientFundsError, InsufficientPublisherFundsError, formatNoFundedPublisherWalletMessage, type PublisherWalletBalance } from './evm-adapter-errors.js';
-import { resolveRpcUrls, boundedRetryFetchRequest, withTimeout, isKnownTransactionError, isRetryableRpcError, assertSuccessfulReceipt, sleep } from './evm-adapter-rpc.js';
-import { noteRpcFailover, noteRpcExhaustion, rpcHost } from './rpc-failover-log.js';
+import { resolveRpcUrls, boundedRetryFetchRequest, withTimeout, isRetryableRpcError, assertSuccessfulReceipt, sleep } from './evm-adapter-rpc.js';
+import { rpcHost } from './rpc-failover-log.js';
 import { ChainRpcTransportError, createRpcTimeoutError } from './chain-rpc-transport-error.js';
+import { RpcFailoverClient, type ReadOpts } from './rpc-failover-client.js';
 import { computeApprovalAction, effectivePublishAllowance, V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE } from './evm-adapter-allowance.js';
 import { formatProviderContext } from './evm-adapter-types.js';
 import type { ContractCache, EVMAdapterConfig } from './evm-adapter-types.js';
-import { RPC_READ_STALL_TIMEOUT_MS, DEFAULT_RANDOM_SAMPLING_HUB_REFRESH_MS, RPC_BROADCAST_ATTEMPT_TIMEOUT_MS, RPC_RECEIPT_ATTEMPT_TIMEOUT_MS, RPC_RECEIPT_TIMEOUT_MS, RPC_RECEIPT_POLL_INTERVAL_MS, RPC_TRANSACTION_POPULATION_ATTEMPT_TIMEOUT_MS, RPC_ENDPOINT_SET_RETRIES, RPC_ENDPOINT_SET_RETRY_BACKOFF_MS, ADMIN_KEY_PURPOSE, OPERATIONAL_KEY_PURPOSE, PUBLISHER_FUNDING_CACHE_TTL_MS } from './evm-adapter-constants.js';
+import { RPC_READ_STALL_TIMEOUT_MS, DEFAULT_RANDOM_SAMPLING_HUB_REFRESH_MS, RPC_RECEIPT_TIMEOUT_MS, RPC_RECEIPT_POLL_INTERVAL_MS, RPC_ENDPOINT_SET_RETRIES, RPC_ENDPOINT_SET_RETRY_BACKOFF_MS, ADMIN_KEY_PURPOSE, OPERATIONAL_KEY_PURPOSE, PUBLISHER_FUNDING_CACHE_TTL_MS } from './evm-adapter-constants.js';
 
 /**
  * Maps a Hub-registered contract name to the function that invalidates
@@ -307,21 +308,6 @@ async function contractAddress(contract: Contract): Promise<string> {
   throw new Error('DKGKnowledgeAssets address is unavailable from the resolved contract handle.');
 }
 
-/**
- * Failover classifier for CONTRACT VIEW reads (`contractReadWithFailover`'s
- * default): the generic `isRetryableRpcError` transient set MINUS `BAD_DATA`.
- * A view `BAD_DATA` ("could not decode result data") is a DETERMINISTIC
- * client-side decode of an empty / wrong-shape return for the ABI type — not an
- * RPC outage — so failing over would re-hit the same decode on every endpoint
- * and mask it as `RPC_ENDPOINTS_EXHAUSTED`. The pre-PR FallbackProvider never
- * failed over on a post-decode error; this restores that. (Direct provider reads
- * — getCode/getBalance/getNetwork — never produce BAD_DATA, so they keep the
- * unmodified `isRetryableRpcError`.)
- */
-function isContractViewRetryable(err: unknown): boolean {
-  return isRetryableRpcError(err) && errorCode(err) !== 'BAD_DATA';
-}
-
 export class EVMChainAdapterBase {
   /** See `ChainAdapter.deploymentId`. */
   get deploymentId(): string {
@@ -336,10 +322,10 @@ export class EVMChainAdapterBase {
    * The bare primary RPC provider (== `primaryProvider`). The nominal runner
    * that signers, boot-bound contract handles, and the Hub-rotation event
    * subscription bind to — NOT the read-failover surface. Every read reconnects
-   * to a per-endpoint provider via `readWithFailover`; the `FallbackProvider`
-   * was removed (see the constructor). Kept as a distinct field name for the
-   * binding sites; reads must never call `this.provider.<read>()` directly
-   * (route through `readWithFailover`).
+   * to a per-endpoint provider via the read facades (`readContract`/`readProvider`
+   * → `this.rpcFailover`); the `FallbackProvider` was removed (see the
+   * constructor). Kept as a distinct field name for the binding sites; reads must
+   * never call `this.provider.<read>()` directly (route through the read facades).
    */
   protected readonly provider: JsonRpcProvider;
 
@@ -348,6 +334,15 @@ export class EVMChainAdapterBase {
   protected readonly providers: JsonRpcProvider[];
 
   protected readonly rpcUrls: string[];
+
+  /**
+   * The pure per-endpoint RPC transport mechanism. Owns the read-failover loop +
+   * the named timeout-policy matrix + typed exhaustion; constructed with a LIVE
+   * endpoint thunk over `this.providers` / `this.rpcUrls` and the
+   * `signPopulatedTransaction` callback, so it never holds a back-reference to
+   * the adapter and never owns tx-safety state.
+   */
+  protected readonly rpcFailover: RpcFailoverClient;
 
   protected readonly filterErrorSilencer: FilterErrorSilencer;
 
@@ -623,8 +618,8 @@ export class EVMChainAdapterBase {
     // does not change the number of `eth_getLogs` operations issued.
     // Immediate-failover (R1): per-endpoint retries are 0 when ≥2 endpoints are
     // configured, so the FIRST retryable failure propagates at once and the
-    // explicit per-provider failover loops (reads: `readWithFailover`; writes:
-    // `sendContractTransaction` / broadcast / receipt / the V10 populate loop)
+    // explicit per-provider failover loops (reads: the `RpcFailoverClient` read
+    // facades; writes: `sendContractTransaction` / broadcast / receipt / the V10 populate loop)
     // advance to the next endpoint immediately instead of burning ~7.5s of
     // same-endpoint backoff on an endpoint we already know is failing. A
     // single-RPC node keeps the bounded `RPC_REQUEST_MAX_RETRIES` retry (its
@@ -638,8 +633,8 @@ export class EVMChainAdapterBase {
       }),
     );
     this.primaryProvider = this.providers[0];
-    // No `FallbackProvider`: reads route through `readWithFailover` over the bare
-    // `this.providers[]` for TRUE immediate failover. ethers' quorum:1
+    // No `FallbackProvider`: reads route through the `RpcFailoverClient` read
+    // facades over the bare `this.providers[]` for TRUE immediate failover. ethers' quorum:1
     // FallbackProvider threw a fast error straight to the caller WITHOUT
     // consulting a backup (it advanced only on a ~4s stall) — empirically
     // unreliable read failover even with per-endpoint retries > 0 — and its
@@ -649,9 +644,28 @@ export class EVMChainAdapterBase {
     // one-shot `#initialSync` latch. `this.provider` is now just the bare
     // primary: the nominal runner that signers, boot-bound contract handles, and
     // the Hub-rotation event subscription bind to. Every actual READ reconnects
-    // to the loop provider (`readWithFailover`) and every WRITE reconnects
-    // per-endpoint explicitly, so this binding is never the failover surface.
+    // to the loop provider (via the `RpcFailoverClient` read facades) and every
+    // WRITE reconnects per-endpoint explicitly, so this binding is never the
+    // failover surface.
     this.provider = this.primaryProvider;
+    // Construct the transport client AFTER `this.providers`/`this.rpcUrls` are
+    // set (above). The endpoint thunk reads `providers`/`rpcUrls` live (so a
+    // reassignment of `(a as any).providers` is observed) and signing routes back
+    // to `signPopulatedTransaction` so that helper stays on the adapter. No
+    // failover read can run before this point — the constructor below only builds
+    // Wallets/Contracts and a lazily-resolved HubResolutionCache.
+    this.rpcFailover = new RpcFailoverClient(
+      // Mapped at CALL time inside the thunk (NOT captured), so a reassignment of
+      // `(a as any).providers` / `(a as any).rpcUrls` after construction still
+      // propagates live. `providers`/`rpcUrls` are built in lockstep
+      // (`providers = rpcUrls.map(...)`), so index i pairs provider[i]↔rpcUrl[i].
+      () => this.providers.map((provider, i) => ({ provider, rpcUrl: this.rpcUrls[i] })),
+      (signer, populated) => this.signPopulatedTransaction(signer, populated),
+      // `this.chainId` is assigned later in this constructor (after the client is
+      // built), so pass a LIVE thunk — resolved at metric-record time — rather
+      // than capturing the still-undefined field value here.
+      () => this.chainId,
+    );
     const providerContext = formatProviderContext(config);
     // PR-8: install the filter-not-found silencer. Without this, RPC
     // nodes that GC filters faster than ethers' polling cadence
@@ -761,320 +775,92 @@ export class EVMChainAdapterBase {
 
   /**
    * Classify an RPC error for low-cardinality metric labels: `timeout` for the
-   * synthetic `withTimeout` TIMEOUT code, else `error`. Used at the chain RPC
-   * metric record sites so the `outcome` label stays bounded.
+   * synthetic `withTimeout` TIMEOUT code, else `error`. Used by the adapter's own
+   * instrumented `eth_getLogs` page scan (`queryEventLogsPage`) so the `outcome`
+   * label stays bounded. (The failover transports — broadcast / receipt / eth_call
+   * / populate — now record their outcomes inside `RpcFailoverClient`.)
    */
   private _rpcOutcomeForError(err: unknown): 'error' | 'timeout' {
     return errorCode(err) === 'TIMEOUT' ? 'timeout' : 'error';
   }
 
-  protected async broadcastSignedTransactionWithFailover(
+  /**
+   * Thin delegator to `this.rpcFailover.broadcast` — the per-endpoint broadcast
+   * loop. `sendSignedTransactionAndWait`'s set-retry loop calls this method; it
+   * only forwards an already-signed tx, so no tx-safety state crosses here.
+   */
+  protected broadcastSignedTransactionWithFailover(
     signedTx: string,
     txHash: string,
     label: string,
   ): Promise<void> {
-    return withSpan(
-      'chain.tx_submit',
-      async (span) => {
-        const metrics = getMetrics();
-        const startedAt = Date.now();
-        let lastRetryable: unknown;
-        for (let i = 0; i < this.providers.length; i += 1) {
-          const provider = this.providers[i];
-          span.addEvent('broadcast.attempt', { attempt: i + 1 });
-          try {
-            await withTimeout(
-              provider.broadcastTransaction(signedTx),
-              RPC_BROADCAST_ATTEMPT_TIMEOUT_MS,
-              `${label} broadcast via RPC #${i + 1}`,
-            );
-            span.setAttribute('dkg.tx_hash', txHash);
-            metrics.chainRpcTotal.add(1, {
-              rpc_method: 'eth_sendRawTransaction', outcome: 'ok', retryable: false, chain_id: this.chainId,
-            });
-            metrics.chainRpcDuration.record(Date.now() - startedAt, {
-              rpc_method: 'eth_sendRawTransaction', chain_id: this.chainId,
-            });
-            return;
-          } catch (err) {
-            if (isKnownTransactionError(err)) {
-              // Already-known / already-mined tx is success for our purposes.
-              span.setAttribute('dkg.tx_hash', txHash);
-              span.addEvent('broadcast.already_known', { attempt: i + 1 });
-              metrics.chainRpcTotal.add(1, {
-                rpc_method: 'eth_sendRawTransaction', outcome: 'ok', retryable: false, chain_id: this.chainId,
-              });
-              metrics.chainRpcDuration.record(Date.now() - startedAt, {
-                rpc_method: 'eth_sendRawTransaction', chain_id: this.chainId,
-              });
-              return;
-            }
-            if (!isRetryableRpcError(err)) {
-              metrics.chainRpcTotal.add(1, {
-                rpc_method: 'eth_sendRawTransaction', outcome: this._rpcOutcomeForError(err),
-                retryable: false, chain_id: this.chainId,
-              });
-              metrics.chainRpcDuration.record(Date.now() - startedAt, {
-                rpc_method: 'eth_sendRawTransaction', chain_id: this.chainId,
-              });
-              throw err;
-            }
-            lastRetryable = err;
-            if (i < this.providers.length - 1) {
-              noteRpcFailover(`${label} broadcast`, this.rpcUrls[i], err, this.rpcUrls[i + 1]);
-            }
-          }
-        }
-        // All configured endpoints exhausted.
-        metrics.chainRpcTotal.add(1, {
-          rpc_method: 'eth_sendRawTransaction', outcome: this._rpcOutcomeForError(lastRetryable),
-          retryable: true, chain_id: this.chainId,
-        });
-        metrics.chainRpcDuration.record(Date.now() - startedAt, {
-          rpc_method: 'eth_sendRawTransaction', chain_id: this.chainId,
-        });
-        metrics.chainRpcFailoverTotal.add(1, {
-          rpc_method: 'eth_sendRawTransaction', chain_id: this.chainId, reason: 'exhausted',
-        });
-        if (lastRetryable) noteRpcExhaustion(`${label} broadcast`, this.rpcUrls);
-        // Typed transport error so a broadcast-time all-endpoints-exhausted
-        // failure maps to a retryable 503 at the HTTP boundary, not a 500.
-        throw new ChainRpcTransportError(
-          'RPC_ENDPOINTS_EXHAUSTED',
-          `${label} broadcast failed on all configured RPC endpoints for tx ${txHash}: ${errorMessage(lastRetryable)}`,
-          { cause: lastRetryable, rpcUrls: this.rpcUrls },
-        );
-      },
-      { attributes: { 'rpc.method': 'eth_sendRawTransaction', 'dkg.chain_id': this.chainId } },
-    );
-  }
-
-  protected async getTransactionReceiptWithFailover(txHash: string): Promise<ethers.TransactionReceipt | null> {
-    return withSpan(
-      'chain.tx_wait',
-      async (span) => {
-        const metrics = getMetrics();
-        const startedAt = Date.now();
-        let lastRetryable: unknown;
-        let sawNonErrorResponse = false;
-        for (let i = 0; i < this.providers.length; i += 1) {
-          const provider = this.providers[i];
-          span.addEvent('receipt.attempt', { attempt: i + 1 });
-          try {
-            const receipt = await withTimeout(
-              provider.getTransactionReceipt(txHash),
-              RPC_RECEIPT_ATTEMPT_TIMEOUT_MS,
-              `receipt lookup via RPC #${i + 1}`,
-            );
-            sawNonErrorResponse = true;
-            if (receipt) {
-              span.setAttribute('dkg.tx_hash', txHash);
-              metrics.chainRpcTotal.add(1, {
-                rpc_method: 'eth_getTransactionReceipt', outcome: 'ok', retryable: false, chain_id: this.chainId,
-              });
-              metrics.chainRpcDuration.record(Date.now() - startedAt, {
-                rpc_method: 'eth_getTransactionReceipt', chain_id: this.chainId,
-              });
-              return receipt;
-            }
-          } catch (err) {
-            if (!isRetryableRpcError(err)) {
-              metrics.chainRpcTotal.add(1, {
-                rpc_method: 'eth_getTransactionReceipt', outcome: this._rpcOutcomeForError(err),
-                retryable: false, chain_id: this.chainId,
-              });
-              metrics.chainRpcDuration.record(Date.now() - startedAt, {
-                rpc_method: 'eth_getTransactionReceipt', chain_id: this.chainId,
-              });
-              throw err;
-            }
-            lastRetryable = err;
-            if (i < this.providers.length - 1) {
-              noteRpcFailover('receipt lookup', this.rpcUrls[i], err, this.rpcUrls[i + 1]);
-            }
-          }
-        }
-        if (lastRetryable && !sawNonErrorResponse) {
-          // No backend could even answer the lookup → endpoints exhausted.
-          metrics.chainRpcTotal.add(1, {
-            rpc_method: 'eth_getTransactionReceipt', outcome: this._rpcOutcomeForError(lastRetryable),
-            retryable: true, chain_id: this.chainId,
-          });
-          metrics.chainRpcDuration.record(Date.now() - startedAt, {
-            rpc_method: 'eth_getTransactionReceipt', chain_id: this.chainId,
-          });
-          metrics.chainRpcFailoverTotal.add(1, {
-            rpc_method: 'eth_getTransactionReceipt', chain_id: this.chainId, reason: 'exhausted',
-          });
-          noteRpcExhaustion('receipt lookup', this.rpcUrls);
-          throw new ChainRpcTransportError(
-            'RPC_RECEIPT_LOOKUP_FAILED',
-            `Receipt lookup for tx ${txHash} failed on all configured RPC endpoints: ${errorMessage(lastRetryable)}`,
-            { cause: lastRetryable, txHash },
-          );
-        }
-        // At least one backend answered but the tx is not yet mined (null
-        // receipt). This is a benign poll tick, not a terminal outcome, so we
-        // intentionally do NOT emit an outcome metric here (the surrounding
-        // poll loop calls this repeatedly until mined/timeout).
-        span.setAttribute('dkg.receipt_pending', true);
-        return null;
-      },
-      { attributes: { 'rpc.method': 'eth_getTransactionReceipt', 'dkg.chain_id': this.chainId } },
-    );
+    return this.rpcFailover.broadcast(signedTx, txHash, label);
   }
 
   /**
-   * Per-endpoint read-failover primitive (the bare `this.providers[]`, no
-   * FallbackProvider). Runs `fn` against each provider in turn; on a RETRYABLE
-   * error advances to the next (host-only `noteRpcFailover` per hop) and, once
-   * all are exhausted, throws the typed `RPC_ENDPOINTS_EXHAUSTED` (→ bounded
-   * 503). A NON-retryable error is rethrown AT ONCE (failing over a deterministic
-   * chain error would only mask it). The default "retryable?" classifier is
-   * `isRetryableRpcError`; override it via `opts.isRetryable` for reads whose
-   * error shapes carry domain meaning (a contract view's `BAD_DATA`,
-   * `getMaxKaNumberForAuthor`'s absent-view).
-   *
-   * The per-attempt `withTimeout` is a hard deadline that ABORTS and fails over a
-   * hung backend:
-   *   - MULTI-RPC: every attempt capped at `RPC_READ_STALL_TIMEOUT_MS` (4s, suits
-   *     a POINT read); a WIDE read (a multi-thousand-block `eth_getLogs`) raises
-   *     it via `opts.multiAttemptTimeoutMs` so a slow-but-healthy scan isn't
-   *     aborted + failed over into a spurious exhaustion.
-   *   - SINGLE-RPC: uncapped (nothing to fail over to; #894) UNLESS
-   *     `opts.attemptTimeoutMs` is given (a hard bound on EVERY attempt incl.
-   *     single-RPC — fail-open funding reads that must not stall selection).
-   *
-   * `fn` receives the active provider (`p => p.getCode(addr)`, or for a view
-   * `p => contract.connect(p).someView(args)`) and MUST be a PURE read — no
-   * sign / broadcast / WAL — since it may execute on more than one provider.
+   * Thin delegator to `this.rpcFailover.getReceipt` — the per-endpoint receipt
+   * loop. Used by `waitForReceiptWithFailover` and the `publish.ts` callers.
    */
-  protected async readWithFailover<T>(
+  protected getTransactionReceiptWithFailover(txHash: string): Promise<ethers.TransactionReceipt | null> {
+    return this.rpcFailover.getReceipt(txHash);
+  }
+
+  /**
+   * Common point-view CONTRACT read — the chain-concept surface the domain mixins
+   * call: a `contract`, a `label`, a string `method` name, and its args, run with
+   * the default `pointRead` policy + the `isContractViewRetryable` classifier. The
+   * untyped ethers `Contract` resolves the string method through `any`, so this
+   * loses NO static checking versus a `c.method(...)` lambda.
+   */
+  protected readContract<T = any>(
+    contract: Contract,
+    label: string,
+    method: string,
+    ...args: unknown[]
+  ): Promise<T> {
+    return this.rpcFailover.readContract(label, contract, (c) => c[method](...args));
+  }
+
+  /**
+   * CONTRACT view read needing a non-default policy or classifier — the funding
+   * reads (`failOpenFundingRead`), the events scan (`wideLogScan`), or a bespoke
+   * `isRetryable`. Keeps the `fn` lambda (vs the string-method `readContract`) for
+   * reads whose call shape isn't a plain `c.method(...args)`.
+   */
+  protected readContractWith<T>(
+    contract: Contract,
+    label: string,
+    fn: (c: Contract) => Promise<T>,
+    opts?: ReadOpts,
+  ): Promise<T> {
+    return this.rpcFailover.readContract(label, contract, fn, opts);
+  }
+
+  /**
+   * Raw PROVIDER read (no contract rebind) — `getCode` / `getBlock` /
+   * `getNetwork` / `getBalance` / `getBlockNumber`, the fail-open native-balance
+   * funding read, and the `getMaxKaNumberForAuthor` staticCall with its bespoke
+   * absent-view classifier. Default `pointRead` + `isRetryableRpcError`; override
+   * the policy/classifier via `opts`.
+   */
+  protected readProvider<T>(
     label: string,
     fn: (provider: JsonRpcProvider) => Promise<T>,
-    opts?: {
-      attemptTimeoutMs?: number;
-      multiAttemptTimeoutMs?: number;
-      // Override the "should this error fail over?" classifier (default
-      // `isRetryableRpcError`).
-      isRetryable?: (err: unknown) => boolean;
-    },
+    opts?: ReadOpts,
   ): Promise<T> {
-    const isRetryable = opts?.isRetryable ?? isRetryableRpcError;
-    let lastRetryable: unknown;
-    for (let i = 0; i < this.providers.length; i += 1) {
-      const isLast = i === this.providers.length - 1;
-      // Per-attempt hard deadline (see the method doc — NOT the old FallbackProvider
-      // stallTimeout, which parallelized a backup rather than aborting a read):
-      //   - MULTI-RPC: cap every attempt — `attemptTimeoutMs` if given, else
-      //     `multiAttemptTimeoutMs` (raised for WIDE log scans so a slow-but-healthy
-      //     getLogs isn't aborted), else the 4s point-read default.
-      //   - SINGLE-RPC: uncapped UNLESS `attemptTimeoutMs` is given (fail-open
-      //     funding reads); `multiAttemptTimeoutMs` never caps single-RPC (#894 —
-      //     nothing to fail over to).
-      const capMs = opts?.attemptTimeoutMs
-        ?? (this.providers.length > 1
-          ? (opts?.multiAttemptTimeoutMs ?? RPC_READ_STALL_TIMEOUT_MS)
-          : undefined);
-      try {
-        const attempt = fn(this.providers[i]);
-        return await (capMs == null
-          ? attempt
-          : withTimeout(attempt, capMs, `${label} via RPC #${i + 1}`));
-      } catch (err) {
-        if (!isRetryable(err)) throw err;
-        lastRetryable = err;
-        if (!isLast) {
-          noteRpcFailover(label, this.rpcUrls[i], err, this.rpcUrls[i + 1]);
-        }
-      }
-    }
-    if (lastRetryable) noteRpcExhaustion(label, this.rpcUrls);
-    // Single provider → carry the typed code but keep the original message
-    // byte-identical (there is no second endpoint, so the raw message reads
-    // cleaner and any message-inspecting caller keeps seeing it). Multiple
-    // providers → the host-only "all endpoints" aggregate (never full URLs —
-    // a configured rpcUrl may carry an API key and this message can reach HTTP
-    // clients via response paths that echo err.message). Mirrors the write
-    // preparation loop's single-vs-multi message handling.
-    const message = this.providers.length <= 1
-      ? errorMessage(lastRetryable)
-      : `${label} read failed on all configured RPC endpoints ` +
-        `(${this.rpcUrls.map(rpcHost).join(', ')}): ${errorMessage(lastRetryable)}`;
-    throw new ChainRpcTransportError('RPC_ENDPOINTS_EXHAUSTED', message, {
-      cause: lastRetryable,
-      rpcUrls: this.rpcUrls,
-    });
+    return this.rpcFailover.read(label, fn, opts);
   }
 
   /**
-   * Rebind a CONTRACT to `runner` (a provider for a view read, or a signer for a
-   * write populate) for one per-endpoint attempt, leaving the boot-bound
-   * `this.contracts.*` handle untouched. The `as Contract` recovers the
-   * dynamic-method index signature ethers' `BaseContract.connect` drops.
+   * Rebind a CONTRACT to a `provider` for one per-endpoint VIEW read, leaving the
+   * boot-bound `this.contracts.*` handle untouched. The sole remaining base caller
+   * is the `getMaxKaNumberForAuthor` staticCall (a `readProvider` lambda); the
+   * write-path signer rebind lives in the module's `populateAndSign`. The
+   * `as Contract` recovers the dynamic-method index signature ethers'
+   * `BaseContract.connect` drops.
    */
   protected rebindContract(contract: Contract, runner: JsonRpcProvider | Wallet): Contract {
     return contract.connect(runner) as Contract;
-  }
-
-  /** Rebind a SIGNER to `provider` for one per-endpoint populate+sign attempt. */
-  protected rebindSigner(signer: Wallet, provider: JsonRpcProvider): Wallet {
-    return signer.connect(provider);
-  }
-
-  /**
-   * `readWithFailover` for a CONTRACT VIEW read: runs `fn` against `contract`
-   * rebound to each provider in turn (failover), leaving `this.contracts.*`
-   * untouched. `fn` MUST be a pure view read. The default failover classifier is
-   * `isContractViewRetryable` (the transient set MINUS `BAD_DATA`, which on a
-   * view is a deterministic decode, not an outage, so it is rethrown rather than
-   * failed over and masked as exhaustion); a caller may pass its own `isRetryable`.
-   */
-  protected contractReadWithFailover<T>(
-    label: string,
-    contract: Contract,
-    fn: (c: Contract) => Promise<T>,
-    opts?: {
-      attemptTimeoutMs?: number;
-      multiAttemptTimeoutMs?: number;
-      isRetryable?: (err: unknown) => boolean;
-    },
-  ): Promise<T> {
-    // Single telemetry choke-point for every CONTRACT VIEW read (eth_call):
-    // one `chain.eth_call` span + RPC metric spanning the whole failover
-    // sequence. Replaces the former per-call-site spans (token.allowance,
-    // Hub.getContractAddress, identityStorage.getIdentityId, …) so all view
-    // reads are instrumented uniformly now that they route through here.
-    return withSpan(
-      'chain.eth_call',
-      async (span) => {
-        const metrics = getMetrics();
-        const startedAt = Date.now();
-        try {
-          const out = await this.readWithFailover(label, (p) => fn(this.rebindContract(contract, p)), {
-            ...opts,
-            isRetryable: opts?.isRetryable ?? isContractViewRetryable,
-          });
-          metrics.chainRpcTotal.add(1, {
-            rpc_method: 'eth_call', outcome: 'ok', retryable: false, chain_id: this.chainId,
-          });
-          return out;
-        } catch (err) {
-          const outcome = this._rpcOutcomeForError(err);
-          metrics.chainRpcTotal.add(1, {
-            rpc_method: 'eth_call', outcome, retryable: isRetryableRpcError(err), chain_id: this.chainId,
-          });
-          throw err;
-        } finally {
-          metrics.chainRpcDuration.record(Date.now() - startedAt, {
-            rpc_method: 'eth_call', chain_id: this.chainId,
-          });
-        }
-      },
-      // `dkg.read` carries the per-call identity (e.g. 'token.allowance') on
-      // the span only — kept OFF the metric to hold its label set low-cardinality.
-      { attributes: { 'rpc.method': 'eth_call', 'dkg.chain_id': this.chainId, 'dkg.read': label } },
-    );
   }
 
   protected async waitForReceiptWithFailover(
@@ -1258,21 +1044,14 @@ export class EVMChainAdapterBase {
   }
 
   /**
-   * Per-endpoint populate+sign loop SHARED by `sendContractTransaction` and the
-   * V10 publish/update path. Iterates `this.providers[i]` (signer + contract
-   * rebound to each), populates (gas/nonce/chainId reads, optional OOG-buffer gas
-   * estimate) + signs, and returns the FIRST successful `{signedTx,txHash}`.
-   * Advances ONLY on `isRetryableRpcError`; a non-retryable error (a decoded
-   * revert — e.g. `TooLowAllowance`) propagates AT ONCE so the caller can react.
-   * Exhaustion → typed `RPC_ENDPOINTS_EXHAUSTED`.
-   *
-   * STRICTLY pre-broadcast: signs once on the winning provider, does NOT broadcast
-   * or fire the WAL — the caller broadcasts the single returned tx. This keeps the
-   * WAL split intact (onBroadcast between sign and broadcast), so the V10 path
-   * reuses THIS helper rather than `sendContractTransaction` (which broadcasts
-   * internally).
+   * Thin delegator to `this.rpcFailover.populateAndSign` — the per-endpoint
+   * populate+sign loop (which reaches `signPopulatedTransaction` via the injected
+   * callback). Called by `populateAndSignV10WithAllowanceRecovery` (the
+   * `forcedReapprove` latch owner) and `sendContractTransaction`. STRICTLY
+   * pre-broadcast — the caller owns the WAL split and broadcasts the single
+   * returned tx.
    */
-  protected async populateAndSignAcrossProviders(
+  protected populateAndSignAcrossProviders(
     contract: Contract,
     method: string,
     args: readonly unknown[],
@@ -1280,78 +1059,7 @@ export class EVMChainAdapterBase {
     label: string,
     opts?: { gasLimitBufferBps?: number },
   ): Promise<{ signedTx: string; txHash: string }> {
-    let lastRetryable: unknown;
-    for (let i = 0; i < this.providers.length; i += 1) {
-      const rpcSigner = this.rebindSigner(signer, this.providers[i]);
-      try {
-        const connected = this.rebindContract(contract, rpcSigner) as any;
-        const populated = await withTimeout<ethers.TransactionRequest>(
-          connected[method].populateTransaction(...args) as Promise<ethers.TransactionRequest>,
-          RPC_TRANSACTION_POPULATION_ATTEMPT_TIMEOUT_MS,
-          `${label} transaction population via RPC #${i + 1}`,
-        );
-        if (opts?.gasLimitBufferBps && populated.gasLimit == null) {
-          try {
-            const est = (await withTimeout<bigint>(
-              connected[method].estimateGas(...args) as Promise<bigint>,
-              RPC_TRANSACTION_POPULATION_ATTEMPT_TIMEOUT_MS,
-              `${label} gas estimation via RPC #${i + 1}`,
-            ));
-            populated.gasLimit = (est * BigInt(10_000 + opts.gasLimitBufferBps)) / 10_000n;
-          } catch (estErr) {
-            // A RETRYABLE estimate failure must not silently drop the OOG
-            // headroom: if another RPC is left, re-throw so the loop fails over
-            // to it (it may estimate fine and apply the buffer). Only on the LAST
-            // provider — or for a non-retryable estimate error, where failover
-            // can't help — fall back to ethers' own unbuffered estimate during
-            // signing, leaving a breadcrumb so a recurring OOG isn't a mystery.
-            const hasMoreProviders = i < this.providers.length - 1;
-            if (isRetryableRpcError(estErr) && hasMoreProviders) {
-              throw estErr;
-            }
-            console.warn(
-              `[chain] ${label}: buffered gas estimation failed; falling back to ` +
-              `ethers' unbuffered estimate (no OOG headroom applied): ` +
-              `${estErr instanceof Error ? estErr.message : String(estErr)}`,
-            );
-          }
-        }
-        return await withTimeout(
-          this.signPopulatedTransaction(rpcSigner, populated),
-          RPC_TRANSACTION_POPULATION_ATTEMPT_TIMEOUT_MS,
-          `${label} transaction signing via RPC #${i + 1}`,
-        );
-      } catch (err) {
-        if (!isRetryableRpcError(err)) throw err;
-        lastRetryable = err;
-        if (i < this.providers.length - 1) {
-          noteRpcFailover(`${label} preparation`, this.rpcUrls[i], err, this.rpcUrls[i + 1]);
-        }
-      }
-    }
-    if (lastRetryable) noteRpcExhaustion(`${label} preparation`, this.rpcUrls);
-    // Single provider → carry the code on a new error but keep the message
-    // byte-identical (no second endpoint, so the raw message reads cleaner and
-    // any message-inspecting caller keeps seeing it). Multiple providers → the
-    // HOST-ONLY aggregate (never full URLs — a configured rpcUrl may carry an API
-    // key and this message reaches HTTP clients via response paths that echo
-    // err.message, e.g. the create+publish 207 tail). Asserted by
-    // evm-adapter.unit.test.ts.
-    const message = this.providers.length <= 1
-      ? errorMessage(lastRetryable)
-      : `${label} transaction preparation failed on all configured RPC endpoints ` +
-        `(${this.rpcUrls.map(rpcHost).join(', ')}): ${errorMessage(lastRetryable)}`;
-    // Populate+sign exhausted every endpoint. This is the PREPARE phase
-    // (populateTransaction / eth_estimateGas), NOT the broadcast — label it
-    // eth_estimateGas so it doesn't collide with the genuine
-    // eth_sendRawTransaction failover counter in sendSignedTransactionAndWait.
-    getMetrics().chainRpcFailoverTotal.add(1, {
-      rpc_method: 'eth_estimateGas', chain_id: this.chainId, reason: 'exhausted',
-    });
-    throw new ChainRpcTransportError('RPC_ENDPOINTS_EXHAUSTED', message, {
-      cause: lastRetryable,
-      rpcUrls: this.rpcUrls,
-    });
+    return this.rpcFailover.populateAndSign(contract, method, args, signer, label, opts);
   }
 
   protected async sendContractTransaction(
@@ -1424,10 +1132,12 @@ export class EVMChainAdapterBase {
   ): Promise<void> {
     if (!this.contracts.token) return;
     const tokenWithSigner = this.contracts.token.connect(signer) as Contract;
-    const currentAllowance: bigint = await this.contractReadWithFailover(
-      'token.allowance',
+    const currentAllowance: bigint = await this.readContract(
       tokenWithSigner,
-      (c) => c.allowance(signer.address, kav10Address),
+      'token.allowance',
+      'allowance',
+      signer.address,
+      kav10Address,
     );
     const { needsApprove, targetAllowance } = computeApprovalAction(
       this.approvalPolicy,
@@ -1512,11 +1222,11 @@ export class EVMChainAdapterBase {
         // recovery poll indefinitely. `withTimeout` rejects after
         // `RPC_READ_STALL_TIMEOUT_MS`, which the catch below treats as a
         // not-yet-visible read and backs off (same as a thrown read error).
-        current = (await this.contractReadWithFailover(
-          'allowance visibility poll',
+        current = (await this.readContractWith(
           token,
+          'allowance visibility poll',
           (c) => c.allowance(owner, spender),
-          { attemptTimeoutMs: RPC_READ_STALL_TIMEOUT_MS },
+          { policy: 'failOpenFundingRead' },
         )) as bigint;
       } catch {
         // Transient read failure / stall timeout — treat as not-yet-visible
@@ -1568,9 +1278,9 @@ export class EVMChainAdapterBase {
       } else {
         authorized = [];
         for (const signer of ordered) {
-          if (await this.contractReadWithFailover(
-            'contextGraphs.isAuthorizedPublisher', this.contracts.contextGraphs,
-            (c) => c.isAuthorizedPublisher(contextGraphId, signer.address),
+          if (await this.readContract(
+            this.contracts.contextGraphs, 'contextGraphs.isAuthorizedPublisher',
+            'isAuthorizedPublisher', contextGraphId, signer.address,
           )) {
             authorized.push(signer);
           }
@@ -1719,12 +1429,12 @@ export class EVMChainAdapterBase {
 
   private async readNativeBalance(address: string): Promise<bigint | null> {
     try {
-      return await this.readWithFailover(
+      return await this.readProvider(
         'publish wallet native balance',
         (p) => p.getBalance(address),
         // Fail-open funding read: keep a HARD per-attempt cap even on the
         // last / single provider so a hung RPC can't stall wallet selection.
-        { attemptTimeoutMs: RPC_READ_STALL_TIMEOUT_MS },
+        { policy: 'failOpenFundingRead' },
       );
     } catch {
       return null;
@@ -1735,9 +1445,9 @@ export class EVMChainAdapterBase {
     const token = this.contracts.token;
     if (!token) return null; // no token contract: TRAC does not gate selection
     try {
-      return (await this.contractReadWithFailover(
-        'token.balanceOf', token, (c) => c.balanceOf(address),
-        { attemptTimeoutMs: RPC_READ_STALL_TIMEOUT_MS },
+      return (await this.readContractWith(
+        token, 'token.balanceOf', (c) => c.balanceOf(address),
+        { policy: 'failOpenFundingRead' },
       )) as bigint;
     } catch {
       return null;
@@ -1816,9 +1526,9 @@ export class EVMChainAdapterBase {
         // No ContextGraphs surface ⇒ every operational wallet is a candidate
         // (mirrors nextAuthorizedSigner); otherwise only authorized wallets are
         // viable reroutes.
-        if (contextGraphs && !(await this.contractReadWithFailover(
-          'contextGraphs.isAuthorizedPublisher', contextGraphs,
-          (c) => c.isAuthorizedPublisher(contextGraphId, s.address),
+        if (contextGraphs && !(await this.readContract(
+          contextGraphs, 'contextGraphs.isAuthorizedPublisher',
+          'isAuthorizedPublisher', contextGraphId, s.address,
         ))) return false;
         return this.isWalletPublishFundable(s.address, await this.getWalletFunding(s.address), requiredTracWei);
       }),
@@ -1886,9 +1596,9 @@ export class EVMChainAdapterBase {
     identityId: bigint,
     address: string,
   ): Promise<boolean> {
-    return this.contractReadWithFailover(
-      'identityStorage.keyHasPurpose', identityStorage,
-      (c) => c.keyHasPurpose(identityId, this.walletKeyHash(address), ADMIN_KEY_PURPOSE),
+    return this.readContract(
+      identityStorage, 'identityStorage.keyHasPurpose',
+      'keyHasPurpose', identityId, this.walletKeyHash(address), ADMIN_KEY_PURPOSE,
     );
   }
 
@@ -1897,9 +1607,9 @@ export class EVMChainAdapterBase {
     identityId: bigint,
     address: string,
   ): Promise<boolean> {
-    return this.contractReadWithFailover(
-      'identityStorage.keyHasPurpose', identityStorage,
-      (c) => c.keyHasPurpose(identityId, this.walletKeyHash(address), OPERATIONAL_KEY_PURPOSE),
+    return this.readContract(
+      identityStorage, 'identityStorage.keyHasPurpose',
+      'keyHasPurpose', identityId, this.walletKeyHash(address), OPERATIONAL_KEY_PURPOSE,
     );
   }
 
@@ -1912,10 +1622,11 @@ export class EVMChainAdapterBase {
   protected async resolveContract(name: string, abiName?: string): Promise<Contract> {
     let address: string;
     try {
-      address = await this.contractReadWithFailover(
-        `Hub.getContractAddress(${name})`,
+      address = await this.readContract(
         this.contracts.hub,
-        (c) => c.getContractAddress(name),
+        `Hub.getContractAddress(${name})`,
+        'getContractAddress',
+        name,
       );
     } catch (err) {
       if (this.isContractMissingRevert(err)) {
@@ -1932,10 +1643,11 @@ export class EVMChainAdapterBase {
   protected async resolveAssetStorage(name: string, abiName?: string): Promise<Contract> {
     let address: string;
     try {
-      address = await this.contractReadWithFailover(
-        `Hub.getAssetStorageAddress(${name})`,
+      address = await this.readContract(
         this.contracts.hub,
-        (c) => c.getAssetStorageAddress(name),
+        `Hub.getAssetStorageAddress(${name})`,
+        'getAssetStorageAddress',
+        name,
       );
     } catch (err) {
       if (this.isContractMissingRevert(err)) {
@@ -2079,10 +1791,11 @@ export class EVMChainAdapterBase {
 
     await this.startHubRotationListener();
 
-    const tokenAddress: string = this.tokenAddress ?? await this.contractReadWithFailover(
-      'Hub.getContractAddress(Token)',
+    const tokenAddress: string = this.tokenAddress ?? await this.readContract(
       this.contracts.hub,
-      (c) => c.getContractAddress('Token'),
+      'Hub.getContractAddress(Token)',
+      'getContractAddress',
+      'Token',
     );
     if (tokenAddress !== ethers.ZeroAddress) {
       this.contracts.token = new Contract(
@@ -2109,7 +1822,7 @@ export class EVMChainAdapterBase {
   }
 
   protected async getBlockTimestamp(blockNumber: number): Promise<number> {
-    const block = await this.readWithFailover('getBlock', (p) => p.getBlock(blockNumber));
+    const block = await this.readProvider('getBlock', (p) => p.getBlock(blockNumber));
     return block?.timestamp ?? 0;
   }
 
@@ -2120,8 +1833,8 @@ export class EVMChainAdapterBase {
   async getIdentityId(): Promise<bigint> {
     await this.init();
     const identityStorage = await this.getIdentityStorage();
-    const id: bigint = await this.contractReadWithFailover(
-      'identityStorage.getIdentityId', identityStorage, (c) => c.getIdentityId(this.signer.address),
+    const id: bigint = await this.readContract(
+      identityStorage, 'identityStorage.getIdentityId', 'getIdentityId', this.signer.address,
     );
     return id;
   }
@@ -2186,17 +1899,17 @@ export class EVMChainAdapterBase {
     const getMax = (storage as any).getMaxKaNumberForAuthor;
     if (typeof getMax?.staticCall === 'function') {
       try {
-        // Route through `readWithFailover` (which gives the per-attempt stall
+        // Route through `readProvider` (which gives the per-attempt stall
         // timeout + endpoint failover for free) with a CUSTOM classifier: the
         // absent-view shapes (`BAD_DATA` empty-`0x`, bare `CALL_EXCEPTION`) are
         // DETERMINISTIC across endpoints and mean "pre-10.0.4 contract lacks the
-        // selector", so they are NON-retryable here — `readWithFailover` rethrows
+        // selector", so they are NON-retryable here — `readProvider` rethrows
         // them straight to the catch below (→ scan / bytecode-confirm) instead of
         // failing over and masking them as `RPC_ENDPOINTS_EXHAUSTED`. ONLY a
         // genuine transient advances to the next endpoint. `isKaHighWaterViewUnavailable`
         // runs FIRST (it enriches the error) so the ordering invariant the catch
         // below also relies on is preserved.
-        const max = await this.readWithFailover(
+        const max = await this.readProvider(
           'DKGKnowledgeAssets.getMaxKaNumberForAuthor',
           (p) => this.rebindContract(storage, p).getMaxKaNumberForAuthor.staticCall(normalized),
           {
@@ -2219,7 +1932,7 @@ export class EVMChainAdapterBase {
     }
 
     const storageAddress = await contractAddress(storage);
-    const code = await this.readWithFailover(
+    const code = await this.readProvider(
       'DKGKnowledgeAssets getCode',
       (p) => p.getCode(storageAddress),
     );
@@ -2653,7 +2366,7 @@ export class EVMChainAdapterBase {
     if (EVMChainAdapterBase.preflightCacheFresh(this.cachedChainId, now)) {
       return this.cachedChainId!.value;
     }
-    const network = await this.readWithFailover('getNetwork (chainId)', (p) => p.getNetwork());
+    const network = await this.readProvider('getNetwork (chainId)', (p) => p.getNetwork());
     this.cachedChainId = { value: network.chainId, cachedAt: now };
     return network.chainId;
   }
@@ -2670,7 +2383,7 @@ export class EVMChainAdapterBase {
    */
   async hasContractCode(address: string): Promise<boolean> {
     try {
-      const code = await this.readWithFailover('hasContractCode getCode', (p) => p.getCode(address));
+      const code = await this.readProvider('hasContractCode getCode', (p) => p.getCode(address));
       return code !== undefined && code !== null && code !== '0x' && code.length > 2;
     } catch {
       return false;
@@ -2712,9 +2425,9 @@ export class EVMChainAdapterBase {
         );
       }
       if (this.contracts.contextGraphs) {
-        const authorized = await this.contractReadWithFailover(
-          'contextGraphs.isAuthorizedPublisher', this.contracts.contextGraphs,
-          (c) => c.isAuthorizedPublisher(params.contextGraphId, selected.address),
+        const authorized = await this.readContract(
+          this.contracts.contextGraphs, 'contextGraphs.isAuthorizedPublisher',
+          'isAuthorizedPublisher', params.contextGraphId, selected.address,
         );
         if (!authorized) {
           throw new Error(
@@ -2997,7 +2710,7 @@ export class EVMChainAdapterBase {
   }
 
   async getBlockNumber(): Promise<number> {
-    return this.readWithFailover('getBlockNumber', (p) => p.getBlockNumber());
+    return this.readProvider('getBlockNumber', (p) => p.getBlockNumber());
   }
 
   getProvider(): JsonRpcProvider {
@@ -3007,9 +2720,10 @@ export class EVMChainAdapterBase {
   /**
    * @deprecated Returns the bare PRIMARY provider, which does NOT fail over: the
    * ethers `FallbackProvider` was removed and reads now route through the
-   * adapter's own read methods (`readWithFailover` over `this.providers[]`). Call
-   * those read methods instead, or `getProvider()` if you explicitly want the
-   * bare primary. Retained only for backward compatibility — this adapter is a
+   * adapter's own read facades (`readContract`/`readProvider` over
+   * `this.providers[]`). Call those read methods instead, or `getProvider()` if
+   * you explicitly want the bare primary. Retained only for backward
+   * compatibility — this adapter is a
    * published export, so removing a public method would be a breaking change.
    */
   getReadProvider(): JsonRpcProvider {

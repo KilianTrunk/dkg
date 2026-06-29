@@ -2,9 +2,11 @@
 /**
  * R3 (PR #1317 review): the metric instrumentation must be proven through the
  * REAL instrumented code path, not by hand-emitting `getMetrics().xxx.add(...)`
- * with canned attributes. This drives the actual `contractReadWithFailover`
- * choke-point (the single seam every contract VIEW read funnels through after
- * the #1335 failover refactor) under an in-memory OTel meter and asserts the
+ * with canned attributes. This drives the actual `readContractWith` adapter
+ * delegator → `RpcFailoverClient.readContract` choke-point (the single seam
+ * every contract VIEW read funnels through after the #1335 failover refactor
+ * re-homed the telemetry into `RpcFailoverClient`) under an in-memory OTel meter
+ * and asserts the
  * emitted `dkg.chain.rpc.total` carries ONLY the bounded low-cardinality label
  * set. It is the direct regression gate for the reviewer's example: "if
  * `chainRpcTotal.add(...)` were changed to include `{ rpc_url: this.rpcUrls[i] }`
@@ -45,7 +47,7 @@ function fakeContract(): any {
 const ALLOWED_RPC_LABELS = new Set(['rpc_method', 'outcome', 'retryable', 'chain_id']);
 const FORBIDDEN_LABELS = ['rpc_url', 'peer_id', 'tx_hash', 'operation_id', 'assertion_id', 'kaId'];
 
-describe('chain RPC telemetry — real contractReadWithFailover emits bounded labels', () => {
+describe('chain RPC telemetry — real readContractWith emits bounded labels', () => {
   let mp: MeterProvider | null = null;
   let exporter: InMemoryMetricExporter;
 
@@ -84,7 +86,7 @@ describe('chain RPC telemetry — real contractReadWithFailover emits bounded la
     a.providers = [{}]; // one dummy provider — `fn` ignores it
     a.rpcUrls = ['http://loopback'];
 
-    const out = await a.contractReadWithFailover('token.allowance', fakeContract(), () => 42n);
+    const out = await a.readContractWith(fakeContract(), 'token.allowance', () => 42n);
     expect(out).toBe(42n);
 
     await mp!.forceFlush();
@@ -110,7 +112,7 @@ describe('chain RPC telemetry — real contractReadWithFailover emits bounded la
     a.rpcUrls = ['http://loopback'];
 
     await expect(
-      a.contractReadWithFailover('token.allowance', fakeContract(), () => {
+      a.readContractWith(fakeContract(), 'token.allowance', () => {
         throw new Error('boom');
       }),
     ).rejects.toBeTruthy();

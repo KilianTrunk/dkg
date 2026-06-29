@@ -283,40 +283,55 @@ export class OtlpLogWorker {
   }
 
   private buildPayload(batch: Array<{ r: LogRecord; tsMs: number }>): string {
-    const logRecords = batch.map(({ r, tsMs }) => {
-      const sev = OTEL_SEVERITY[r.level] ?? OTEL_SEVERITY.info;
-      const nano = String(tsMs * 1_000_000);
-      return {
-        timeUnixNano: nano,
-        observedTimeUnixNano: nano,
-        severityNumber: sev.num,
-        severityText: sev.text,
-        body: { stringValue: r.message },
-        // W3C trace correlation — OTLP top-level fields (hex), not attributes.
-        // Present only when the log was emitted inside a recording span.
-        ...(r.traceId ? { traceId: r.traceId } : {}),
-        ...(r.spanId ? { spanId: r.spanId } : {}),
-        attributes: [
-          attr('dkg.operation_id', r.operationId),
-          attr('dkg.operation_name', r.operationName),
-          attr('dkg.source_operation_id', r.sourceOperationId),
-          attr('dkg.module', r.module),
-        ].filter((a): a is OtlpAttribute => a !== null),
-      };
-    });
-
-    return JSON.stringify({
-      resourceLogs: [
-        {
-          resource: { attributes: this.resourceAttrs },
-          scopeLogs: [
-            {
-              scope: { name: 'dkg-node', version: this.scopeVersion },
-              logRecords,
-            },
-          ],
-        },
-      ],
-    });
+    return encodeOtlpLogPayload(batch, this.resourceAttrs, this.scopeVersion);
   }
+}
+
+/**
+ * PURE OTLP/HTTP logs wire-format encoder (ExportLogsServiceRequest JSON).
+ * Extracted from `OtlpLogWorker` so the protocol/payload shape is independent
+ * from the worker's scheduling + retry/backoff mechanics (review: "OtlpLogWorker
+ * mixes too many concerns") — change the wire shape here without touching the
+ * buffer/timer logic, and vice-versa. No side effects, no `this`.
+ */
+export function encodeOtlpLogPayload(
+  batch: ReadonlyArray<{ r: LogRecord; tsMs: number }>,
+  resourceAttrs: ReadonlyArray<OtlpAttribute>,
+  scopeVersion?: string,
+): string {
+  const logRecords = batch.map(({ r, tsMs }) => {
+    const sev = OTEL_SEVERITY[r.level] ?? OTEL_SEVERITY.info;
+    const nano = String(tsMs * 1_000_000);
+    return {
+      timeUnixNano: nano,
+      observedTimeUnixNano: nano,
+      severityNumber: sev.num,
+      severityText: sev.text,
+      body: { stringValue: r.message },
+      // W3C trace correlation — OTLP top-level fields (hex), not attributes.
+      // Present only when the log was emitted inside a recording span.
+      ...(r.traceId ? { traceId: r.traceId } : {}),
+      ...(r.spanId ? { spanId: r.spanId } : {}),
+      attributes: [
+        attr('dkg.operation_id', r.operationId),
+        attr('dkg.operation_name', r.operationName),
+        attr('dkg.source_operation_id', r.sourceOperationId),
+        attr('dkg.module', r.module),
+      ].filter((a): a is OtlpAttribute => a !== null),
+    };
+  });
+
+  return JSON.stringify({
+    resourceLogs: [
+      {
+        resource: { attributes: resourceAttrs },
+        scopeLogs: [
+          {
+            scope: { name: 'dkg-node', version: scopeVersion },
+            logRecords,
+          },
+        ],
+      },
+    ],
+  });
 }

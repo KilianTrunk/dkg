@@ -197,6 +197,37 @@ describe('OtlpLogWorker — OTLP/HTTP log export', () => {
     expect(delivered).toEqual(['m7', 'm8', 'm9']);
   });
 
+  it('preserves W3C trace_id/span_id as top-level OTLP fields on the wire', async () => {
+    const srv = await startServer(() => ({ status: 200 }));
+    servers.push(srv.close);
+    const w = new OtlpLogWorker(baseOpts(srv.url));
+    workers.push(w);
+    w.start();
+    const traceId = '0af7651916cd43dd8448eb211c80319c';
+    const spanId = 'b7ad6b7169203331';
+    w.push(rec({ message: 'inside a span', traceId, spanId }));
+    await waitFor(() => srv.received.length >= 1);
+
+    const lr = srv.received[0].body.resourceLogs[0].scopeLogs[0].logRecords[0];
+    // Correlation must ride the OTLP record as TOP-LEVEL fields (not attributes),
+    // else the log stream loses trace↔log correlation even though the Logger attached them.
+    expect(lr.traceId).toBe(traceId);
+    expect(lr.spanId).toBe(spanId);
+  });
+
+  it('omits trace_id/span_id when the record was not emitted inside a span', async () => {
+    const srv = await startServer(() => ({ status: 200 }));
+    servers.push(srv.close);
+    const w = new OtlpLogWorker(baseOpts(srv.url));
+    workers.push(w);
+    w.start();
+    w.push(rec({ message: 'no span' })); // rec() sets no traceId/spanId
+    await waitFor(() => srv.received.length >= 1);
+    const lr = srv.received[0].body.resourceLogs[0].scopeLogs[0].logRecords[0];
+    expect(lr.traceId).toBeUndefined();
+    expect(lr.spanId).toBeUndefined();
+  });
+
   it('retries on a retryable 503 then succeeds — the batch is preserved into the 200', async () => {
     let calls = 0;
     const srv = await startServer((i) => {

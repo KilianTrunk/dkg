@@ -303,6 +303,13 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
     span.setAttribute('dkg.protocol_id', protocolSync);
     const signal = options?.signal;
     const handlerStartedAt = Date.now();
+    // Outer guard over ALL pre-limiter work (parse + validation + abort). A
+    // synchronous throw here — e.g. parseSyncRequest on malformed peer bytes —
+    // escapes BEFORE the limiter promise's ok/error recording, so without this
+    // it would be invisible in dkg.sync.response.total. The returned limiter
+    // promise is NOT awaited inside this try, so its async outcomes are still
+    // recorded by its own .then/.catch (no double counting).
+    try {
     const request = parseSyncRequest(data);
     const offset = Math.max(0, Math.min(Number.isSafeInteger(Number(request.offset)) ? Number(request.offset) : 0, 1_000_000));
     const limit = Math.max(1, Math.min(Number.isSafeInteger(Number(request.limit)) ? Number(request.limit) : syncPageSize, syncPageSize));
@@ -526,5 +533,12 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
       getMetrics().syncResponseTotal.add(1, { outcome: 'error' });
       throw err;
     });
+    } catch (preLimiterErr) {
+      // Malformed/unparseable request or a pre-limiter validation/abort throw —
+      // count it as an invalid outcome before preserving the throw (withSpan
+      // still records the span ERROR + the stream reset behaviour is unchanged).
+      getMetrics().syncResponseTotal.add(1, { outcome: 'invalid' });
+      throw preLimiterErr;
+    }
   }));
 }

@@ -70,4 +70,27 @@ describe('sync responder metrics — every path records an outcome', () => {
 
     expect(counts['invalid'] ?? 0).toBeGreaterThanOrEqual(1);
   });
+
+  it('records outcome=invalid for MALFORMED request bytes (parseSyncRequest throws)', async () => {
+    exporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
+    mp = new MeterProvider({ readers: [new PeriodicExportingMetricReader({ exporter, exportIntervalMillis: 60_000 })] });
+    metrics.setGlobalMeterProvider(mp);
+    rebuildMetrics();
+
+    const invoke = captureHandler();
+    // Non-JSON bytes → parseSyncRequest (JSON.parse) throws BEFORE the
+    // missing-contextGraphId guard and before limiter.run. The handler must
+    // still count it and re-throw (stream reset preserved).
+    await expect(invoke(new TextEncoder().encode('{not-json'), 'remote-peer')).rejects.toBeTruthy();
+
+    await mp.forceFlush();
+    const counts: Record<string, number> = {};
+    for (const rm of exporter.getMetrics())
+      for (const sm of rm.scopeMetrics)
+        for (const m of sm.metrics)
+          if (m.descriptor.name === 'dkg.sync.response.total')
+            for (const dp of m.dataPoints as Array<{ attributes: Record<string, unknown>; value: number }>)
+              counts[String(dp.attributes.outcome)] = (counts[String(dp.attributes.outcome)] ?? 0) + dp.value;
+    expect(counts['invalid'] ?? 0).toBeGreaterThanOrEqual(1);
+  });
 });

@@ -429,6 +429,25 @@ function rejectOversizedRdfLiterals(quads: Quad[] | undefined, label: string): v
   assertQuadLiteralsMutf8Safe(quads, { label });
 }
 
+/**
+ * Record the publish outcome metric (total + duration) for BOTH publish entry
+ * points (`_publish` direct + `_publishFromSharedMemory`). A module-level
+ * function (NOT a `this` method) so the metric sequence isn't pasted into two
+ * flows AND so `PublishMethods.prototype._publish.call(stub, …)` unit tests —
+ * which invoke `_publish` with a hand-built `this` — don't break on a missing
+ * sibling method.
+ */
+function recordPublishOutcome(
+  outcome: string,
+  source: 'direct' | 'swm',
+  startedAt: number,
+  chainId?: string,
+): void {
+  const attrs = { outcome, source, ...(chainId ? { chain_id: chainId } : {}) };
+  getMetrics().publishTotal.add(1, attrs);
+  getMetrics().publishDuration.record(Date.now() - startedAt, attrs);
+}
+
 export class PublishMethods extends DKGAgentBase {
   async publishWorkspaceGossip(this: DKGAgent,
     contextGraphId: string,
@@ -1287,24 +1306,6 @@ export class PublishMethods extends DKGAgentBase {
     };
   }
 
-  /**
-   * Record the publish outcome metric (total + duration) for BOTH publish entry
-   * points (`_publish` direct + `_publishFromSharedMemory`). Centralized so the
-   * label shape stays identical and the same observability sequence isn't pasted
-   * into two flows (review: "publish telemetry duplicated across both paths").
-   */
-  recordPublishOutcome(
-    this: DKGAgent,
-    outcome: string,
-    source: 'direct' | 'swm',
-    startedAt: number,
-    chainId?: string,
-  ): void {
-    const attrs = { outcome, source, ...(chainId ? { chain_id: chainId } : {}) };
-    getMetrics().publishTotal.add(1, attrs);
-    getMetrics().publishDuration.record(Date.now() - startedAt, attrs);
-  }
-
   async _publish(this: DKGAgent,
     contextGraphId: string,
     quads: Quad[],
@@ -1476,11 +1477,11 @@ export class PublishMethods extends DKGAgentBase {
     // it can never affect the publish just completed.
     await this.emitPublicProjectionAfterPublish(contextGraphId, result, ctx);
 
-    this.recordPublishOutcome(result.status, 'direct', publishStartedAt, chainId);
+    recordPublishOutcome(result.status, 'direct', publishStartedAt, chainId);
 
     return result;
     } catch (err) {
-      this.recordPublishOutcome('error', 'direct', publishStartedAt, chainId);
+      recordPublishOutcome('error', 'direct', publishStartedAt, chainId);
       throw err;
     }
    });
@@ -4402,11 +4403,11 @@ export class PublishMethods extends DKGAgentBase {
       }
     }
 
-    this.recordPublishOutcome(result.status, 'swm', publishStartedAt, chainId);
+    recordPublishOutcome(result.status, 'swm', publishStartedAt, chainId);
 
     return result;
     } catch (err) {
-      this.recordPublishOutcome('error', 'swm', publishStartedAt, chainId);
+      recordPublishOutcome('error', 'swm', publishStartedAt, chainId);
       throw err;
     }
    });

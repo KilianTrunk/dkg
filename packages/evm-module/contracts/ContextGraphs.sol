@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 
 import {ContractStatus} from "./abstract/ContractStatus.sol";
 import {IDKGPublishingConvictionNFT} from "./interfaces/IDKGPublishingConvictionNFT.sol";
+import {IContextGraphWaiverStorage} from "./interfaces/IContextGraphWaiverStorage.sol";
 import {IInitializable} from "./interfaces/IInitializable.sol";
 import {INamed} from "./interfaces/INamed.sol";
 import {IVersioned} from "./interfaces/IVersioned.sol";
@@ -207,16 +208,19 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable, Re
         // publishing escrow. Skipped when ParametersStorage is unresolved
         // (deposit feature off) or the param is 0 (dormant default).
         //
-        // WAIVER: a CG backed by a PCA the creator owns or is a registered agent
-        // of pays NO separate deposit — the PCA already locks real TRAC (a far
-        // larger anti-spam stake than the per-CG deposit) and funds the CG's
-        // publishing. The result is a zero-escrow CG, which is the same state a
-        // dormant deposit param already produces, so the consume path is
-        // unchanged (it falls through to the PCA). See _waivesRegistrationDeposit.
+        // WAIVER (quota-bounded): a CG backed by a PCA the creator owns or is a
+        // registered agent of can skip the deposit — but only up to the PCA's
+        // per-PCA quota (committedTRAC / deposit), enforced in
+        // ContextGraphWaiverStorage. So N deposit-free CGs still cost N×deposit
+        // of LOCKED PCA commitment (paid by the PCA instead of separate liquid
+        // TRAC), a sub-floor or dust PCA gets none, and a single PCA can no
+        // longer mint unlimited free CGs. A waived CG carries no escrow — the
+        // same state a dormant deposit produces — so the consume path is
+        // unchanged (it falls through to the PCA).
         if (address(parametersStorage) != address(0)) {
             uint96 deposit = parametersStorage.contextGraphRegistrationDeposit();
             if (deposit > 0) {
-                if (_waivesRegistrationDeposit(publishAuthorityAccountId)) {
+                if (_tryWaiveRegistrationDeposit(publishAuthorityAccountId, deposit)) {
                     emit ContextGraphRegistrationDepositWaived(
                         contextGraphId, publishAuthorityAccountId, msg.sender
                     );
@@ -227,72 +231,28 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable, Re
         }
     }
 
-    /// @dev OT-RFC-53 deposit waiver authorization. Returns true ONLY when the
-    ///      CG is backed by PCA `accountId` that is currently a LIVE, backed
-    ///      account AND the CALLER is its owner or a currently registered
-    ///      conviction agent. Two independent gates, both required:
-    ///
-    ///      1. ACTIVE PCA — the waiver's premise is that the PCA's locked TRAC
-    ///         is a larger anti-spam stake than the per-CG deposit. An EXPIRED
-    ///         or FULLY-SWEPT PCA has no live commitment, so it earns no waiver
-    ///         (else an owner could mint unlimited zero-deposit CGs against a
-    ///         dead account). `accounts()` returns zeros for a never-minted id
-    ///         (committedTRAC == 0 ⇒ rejected); expiry is timestamp-based,
-    ///         matching PublishingConviction.coverPublishingCost.
-    ///
-    ///      2. CALLER — the check is EXPLICIT here: `_validatePCACoherence` only
-    ///         ties the stored authority to the owner, NOT `msg.sender`, so
-    ///         without this a third party could point a CG at someone else's
-    ///         PCA and dodge the deposit.
-    ///
-    ///      Fails CLOSED (charges the deposit) on any resolution/lookup failure.
-    function _waivesRegistrationDeposit(uint256 accountId) internal view returns (bool) {
+    /// @dev OT-RFC-53 deposit waiver. Delegates eligibility + the per-PCA quota
+    ///      to ContextGraphWaiverStorage (co-located with its counter, off this
+    ///      contract's bytecode budget). The storage contract verifies the PCA
+    ///      is active/backed, meets the governance stake floor, that `msg.sender`
+    ///      (the CG creator) owns or is a registered agent of the PCA, and that
+    ///      the PCA's quota isn't exhausted — consuming one quota slot when it
+    ///      returns true. Resolved fresh via the Hub; fails CLOSED (charge the
+    ///      deposit) on any resolution/call failure.
+    function _tryWaiveRegistrationDeposit(uint256 accountId, uint96 deposit) internal returns (bool) {
         if (accountId == 0) return false;
-        address nftAddr;
-        try hub.getContractAddress("DKGPublishingConvictionNFT") returns (address addr) {
-            nftAddr = addr;
+        address waiverAddr;
+        try hub.getContractAddress("ContextGraphWaiverStorage") returns (address addr) {
+            waiverAddr = addr;
         } catch {
             return false;
         }
-        if (nftAddr == address(0)) return false;
-        IDKGPublishingConvictionNFT nft = IDKGPublishingConvictionNFT(nftAddr);
-
-        // Gate 1: the PCA must be a live, backed account (committed, unexpired,
-        // not fully swept). Tuple indices: 0=committedTRAC, 4=expiresAtTimestamp,
-        // 8=fullySwept.
-        try nft.accounts(accountId) returns (
-            uint96 committedTRAC,
-            uint40,
-            uint40,
-            uint40,
-            uint40 expiresAtTimestamp,
-            uint16,
-            uint16,
-            uint16,
-            bool fullySwept,
-            uint72,
-            uint40
-        ) {
-            if (committedTRAC == 0 || fullySwept) return false;
-            if (expiresAtTimestamp != 0 && block.timestamp >= expiresAtTimestamp) return false;
+        if (waiverAddr == address(0)) return false;
+        try IContextGraphWaiverStorage(waiverAddr).tryConsumeWaiver(accountId, msg.sender, deposit) returns (bool waived) {
+            return waived;
         } catch {
             return false;
         }
-
-        // Gate 2: caller is the PCA owner, or a currently registered agent.
-        try nft.ownerOf(accountId) returns (address owner_) {
-            if (owner_ == msg.sender) return true;
-        } catch {
-            return false; // nonexistent account → not waivable
-        }
-        // `agentToAccountId` returns the single PCA an agent is bound to (0 when
-        // unregistered), so equality is the membership check.
-        try nft.agentToAccountId(msg.sender) returns (uint256 boundAccount) {
-            if (boundAccount == accountId) return true;
-        } catch {
-            /* fall through → not waived */
-        }
-        return false;
     }
 
     // -----------------------------------------------------------------------

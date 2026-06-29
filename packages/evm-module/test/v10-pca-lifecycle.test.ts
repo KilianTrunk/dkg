@@ -75,6 +75,7 @@ async function deployFixture(): Promise<Fixture> {
     'ContextGraphStorage',
     'ContextGraphs',
     'ContextGraphValueStorage',
+    'ContextGraphWaiverStorage',
     'DKGPublishingConvictionNFT',
     'DKGStakingConvictionNFT',
     'StakingV10',
@@ -2345,6 +2346,14 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     const createPcaCg = (caller: SignerWithAddress, owner: SignerWithAddress, accountId: bigint) =>
       CGFacade.connect(caller).createContextGraph([], 0, 1, 0, owner.address, accountId, ethers.ZeroHash);
 
+    // Create a PCA with a SPECIFIC committed amount (createAccountFor is fixed at 50k).
+    const createAccountWith = async (owner: SignerWithAddress, amount: bigint): Promise<bigint> => {
+      await Token.mint(owner.address, amount);
+      await Token.connect(owner).approve(await NFT.getAddress(), amount);
+      await NFT.connect(owner).createAccount(amount, 0);
+      return NFT.totalSupply();
+    };
+
     it('WAIVES the deposit when the PCA OWNER creates the CG (no TRAC pulled)', async () => {
       await setDeposit();
       const owner = accounts[1];
@@ -2432,6 +2441,52 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
       expect((await NFT.accounts(accountId))[8]).to.equal(true); // fullySwept
 
       await expect(createPcaCg(owner, owner, accountId)).to.be.reverted;
+    });
+
+    // Review feedback (anti-spam): the waiver must NOT let one PCA mint unlimited
+    // free CGs. Two guards — a minimum-commitment floor and a per-PCA quota.
+    it('does NOT waive a PCA below the minimum-commitment floor — deposit charged', async () => {
+      await setDeposit(); // 100 TRAC; default floor = 25k
+      const owner = accounts[1];
+      const accountId = await createAccountWith(owner, ethers.parseEther('10000')); // < 25k floor
+      // Below floor → not waived → unfunded create reverts.
+      await expect(createPcaCg(owner, owner, accountId)).to.be.reverted;
+    });
+
+    it('waives only up to the per-PCA quota (committedTRAC / deposit), then charges', async () => {
+      const Params = await hre.ethers.getContract<ParametersStorage>('ParametersStorage');
+      // deposit 25k, PCA 50k → quota = 2 (floor 25k still satisfied by 50k).
+      await Params.connect(accounts[0]).setContextGraphRegistrationDeposit(ethers.parseEther('25000'));
+      const owner = accounts[1];
+      const accountId = await createAccountFor(owner); // 50k committed
+
+      // First two are waived.
+      await expect(createPcaCg(owner, owner, accountId)).to.emit(CGFacade, 'ContextGraphRegistrationDepositWaived');
+      await expect(createPcaCg(owner, owner, accountId)).to.emit(CGFacade, 'ContextGraphRegistrationDepositWaived');
+      // Third exceeds the quota → charged → unfunded → revert.
+      await expect(createPcaCg(owner, owner, accountId)).to.be.reverted;
+
+      const Waiver = await hre.ethers.getContract('ContextGraphWaiverStorage');
+      expect(await (Waiver as any).waivedCgCount(accountId)).to.equal(2n);
+    });
+
+    it('waives a PCA exactly AT the floor (committed == minPcaCommitment) — pins < not <=', async () => {
+      await setDeposit(); // 100; default floor 25k
+      const owner = accounts[1];
+      const accountId = await createAccountWith(owner, ethers.parseEther('25000')); // == floor
+      await expect(createPcaCg(owner, owner, accountId)).to.emit(
+        CGFacade,
+        'ContextGraphRegistrationDepositWaived',
+      );
+    });
+
+    it('tryConsumeWaiver reverts for any caller other than ContextGraphs (counter anti-grief)', async () => {
+      const Waiver = await hre.ethers.getContract('ContextGraphWaiverStorage');
+      const owner = accounts[1];
+      const accountId = await createAccountFor(owner);
+      await expect(
+        (Waiver as any).connect(accounts[2]).tryConsumeWaiver(accountId, owner.address, ethers.parseEther('100')),
+      ).to.be.revertedWithCustomError(Waiver, 'OnlyContextGraphs');
     });
   });
 });

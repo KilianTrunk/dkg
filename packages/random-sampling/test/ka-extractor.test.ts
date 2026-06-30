@@ -1300,6 +1300,32 @@ describe('extractV10KCFromStore — #1367 sub-graph KA extraction', () => {
     expect(hex(result.leaves)).toEqual(hex(anchor));
   });
 
+  it('MULTI-ROOT mixed-source: one root from (a) per-cgId, another only from the sub-graph — both accumulate (per-root cascade)', async () => {
+    // Distinguishes a PER-ROOT cascade from a per-KC one: a per-KC cascade would
+    // see (a) non-empty (ROOT_A present), use (a) alone, and DROP ROOT_B.
+    const ROOT_A = 'urn:entity:rule-A';
+    const ROOT_B = 'urn:entity:rule-B';
+    const triplesA = [{ subject: ROOT_A, predicate: 'urn:p:name', object: '"A"' }];
+    const triplesB = [
+      { subject: ROOT_B, predicate: 'urn:p:name', object: '"B"' },
+      { subject: ROOT_B, predicate: 'urn:p:note', object: ESCAPE_OBJ },
+    ];
+    await seedOntology(store, CG_NAME, CG_ID);
+    await seedScopedMinimalMeta(store, { cgName: CG_NAME, cgId: CG_ID, ual: UAL, kaId: KA_ID, roots: [ROOT_A, ROOT_B] });
+    await seedSubGraphPointer(store, { cgName: CG_NAME, cgId: CG_ID, ual: UAL, subGraphName: SUB, target: 'percgid' });
+    // ROOT_A lives in the (a) per-cgId data graph; ROOT_B only in the (b2) sub-graph source.
+    await seedGraphData(store, contextGraphDataUri(CG_NAME, CG_ID.toString()), triplesA);
+    await seedGraphData(store, contextGraphSubGraphUri(CG_NAME, SUB), triplesB);
+
+    const result = await extractV10KCFromStore(store, CG_ID, KA_ID);
+
+    expect(result.subGraphName).toBe(SUB); // discovered because ROOT_B was empty in (a)
+    expect(result.triples).toHaveLength(triplesA.length + triplesB.length);
+    const hex = (ls: Uint8Array[]) => ls.map((l) => Buffer.from(l).toString('hex')).sort();
+    const anchor = [...triplesA, ...triplesB].map((t) => hashTripleV10(t.subject, t.predicate, t.object));
+    expect(hex(result.leaves)).toEqual(hex(anchor));
+  });
+
   it('FALLBACK non-union: (a) empty and BOTH (b1)+(b2) hold the root — only (b1) is read, never unioned with (b2)', async () => {
     await seedOntology(store, CG_NAME, CG_ID);
     await seedScopedMinimalMeta(store, { cgName: CG_NAME, cgId: CG_ID, ual: UAL, kaId: KA_ID, roots: [ROOT] });

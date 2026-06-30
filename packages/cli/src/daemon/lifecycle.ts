@@ -69,7 +69,7 @@ import {
 } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets, KaNumberAllocator } from '@origintrail-official/dkg-agent';
 import { isExternalBackend } from '@origintrail-official/dkg-storage';
-import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, DEFAULT_PROTOCOL_OUTBOX_BACKOFFS_MS, DEFAULT_PROTOCOL_OUTBOX_MAX_AGE_MS, pickNetworkTunables } from '@origintrail-official/dkg-core';
+import { computeNetworkId, createOperationContext, createLogRedactor, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, DEFAULT_PROTOCOL_OUTBOX_BACKOFFS_MS, DEFAULT_PROTOCOL_OUTBOX_MAX_AGE_MS, pickNetworkTunables } from '@origintrail-official/dkg-core';
 import { findReservedSubjectPrefix, isSkolemizedUri } from '@origintrail-official/dkg-publisher';
 import {
   DashboardDB,
@@ -78,6 +78,9 @@ import {
   handleNodeUIRequest,
   ChatMemoryManager,
   LogPushWorker,
+  OtlpLogWorker,
+  initTelemetry,
+  shutdownTelemetry,
   LlmClient,
   SqliteMessageIdempotencyStore,
   SqliteProtocolOutboxStore,
@@ -127,6 +130,8 @@ import {
   exitOnStoreConfigErrors,
   validateNetworkConfigReadiness,
 } from '../config.js';
+import { resolveOtelSignals, resolveLogExporterMode, isUnknownLogExporter } from '../telemetry-config.js';
+import { createDaemonLogSink } from './log-sink.js';
 import { createPublicSnapshotStore, createPublisherControlFromStore, startPublisherRuntimeIfEnabled, type PublisherRuntime } from '../publisher-runner.js';
 import { createCatchupRunner, type CatchupJobResult, type CatchupRunner } from '../catchup-runner.js';
 import { loadTokens, httpAuthGuard } from '../auth.js';
@@ -1985,21 +1990,22 @@ export async function runDaemonInner(
   chatDb = dashDb;
   log("Dashboard DB initialized at " + join(dkgDir(), "node-ui.db"));
 
-  Logger.setSink((entry) => {
-    try {
-      dashDb.insertLog({
-        ts: Date.now(),
-        level: entry.level,
-        operation_name: entry.operationName,
-        operation_id: entry.operationId,
-        module: entry.module,
-        message: entry.message,
-      });
-    } catch {
-      /* DB write must never break the node */
-    }
-    logPusher?.push(entry);
-  });
+  // Redactor for the copy of each record that LEAVES the node. The local
+  // dashboard DB keeps full-fidelity records (it's the operator's own machine);
+  // redaction only protects data crossing the trust boundary to a collector.
+  const redactForRemote = createLogRedactor(config.telemetry?.logs?.redact);
+
+  // Local DB gets the FULL record; remote shippers get a single REDACTED copy.
+  // `remoteShippers` is evaluated per record so runtime enable/disable of the
+  // syslog/OTLP workers is reflected without re-wiring. Logic lives in
+  // createDaemonLogSink so this trust boundary is unit-tested (log-sink.test.ts).
+  Logger.setSink(
+    createDaemonLogSink({
+      insertLog: (rec) => dashDb.insertLog(rec),
+      redact: redactForRemote,
+      remoteShippers: () => [logPusher, otlpExporter],
+    }),
+  );
 
   // Extract the plain value from an RDF typed literal like "6"^^<xsd:integer>
   const metricsSource: MetricsSource = {
@@ -2168,6 +2174,7 @@ export async function runDaemonInner(
     : "mainnet";
   const syslogEndpoint = TELEMETRY_ENDPOINTS[networkKey]?.syslog;
   let logPusher: LogPushWorker | null = null;
+  let otlpExporter: OtlpLogWorker | null = null;
 
   function startLogPusher(): { ok: boolean; error?: string } {
     if (logPusher) return { ok: true };
@@ -2209,11 +2216,144 @@ export async function runDaemonInner(
     log("Telemetry: log streaming disabled");
   }
 
+  function startOtlpExporter(): { ok: boolean; error?: string } {
+    if (otlpExporter) return { ok: true };
+    // Resolve env-first, matching the traces/metrics precedence (resolveOtelSignals):
+    // the standard OTEL_EXPORTER_OTLP_LOGS_ENDPOINT, then OTEL_EXPORTER_OTLP_ENDPOINT
+    // + /v1/logs, then config. NO hardcoded per-network fallback — logs must never
+    // ship to a placeholder/TBD URL the operator never set.
+    const envBase = process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.replace(/\/$/, "");
+    const endpoint =
+      process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT ||
+      (envBase ? `${envBase}/v1/logs` : undefined) ||
+      config.telemetry?.logs?.endpoint;
+    if (!endpoint) {
+      return {
+        ok: false,
+        error: `OTLP log export is not configured for ${networkKey} (set config.telemetry.logs.endpoint or OTEL_EXPORTER_OTLP_ENDPOINT)`,
+      };
+    }
+    const minLevel = config.telemetry?.logs?.level ?? "info";
+    otlpExporter = new OtlpLogWorker({
+      endpoint,
+      token: config.telemetry?.logs?.token,
+      network: networkKey,
+      peerId: agent.peerId,
+      nodeName: config.name,
+      version: nodeVersion,
+      commit: nodeCommit,
+      role: config.nodeRole ?? "edge",
+      chainId: config.chain?.chainId,
+      minLevel,
+      bufferMaxEntries: config.telemetry?.logs?.bufferMaxEntries,
+      onError: (m) => log(`Telemetry(OTLP): ${m}`),
+    });
+    otlpExporter.start();
+    log(`Telemetry: OTLP log export enabled → ${endpoint} (level ≥ ${minLevel})`);
+    return { ok: true };
+  }
+
+  async function stopOtlpExporter(): Promise<void> {
+    if (!otlpExporter) return;
+    // Await the final flush so disable/shutdown can't return while logs are
+    // still in flight or stranded in the buffer.
+    await otlpExporter.shutdown();
+    otlpExporter = null;
+    log("Telemetry: OTLP log export disabled");
+  }
+
+  // OTel traces + metrics SDK (independent of the log-exporter path below).
+  // Endpoints resolve env-first (standard OTEL_EXPORTER_OTLP_* names) then
+  // config; a signal registers ONLY when its endpoint resolves — never a
+  // guessed prod default. Idempotent (initTelemetry no-ops once configured), so
+  // it is safe to call both at boot AND from the runtime enable toggle.
+  async function startOtelSdk(): Promise<void> {
+    const { tracesEndpoint, metricsEndpoint, tracesOn, metricsOn } = resolveOtelSignals(
+      config.telemetry,
+    );
+    if (!tracesOn && !metricsOn) return;
+    try {
+      await initTelemetry({
+        enabled: true,
+        resource: {
+          serviceName: "dkg-node",
+          serviceVersion: nodeVersion,
+          serviceInstanceId: config.name,
+          network: networkKey,
+          peerId: agent.peerId,
+          nodeName: config.name,
+          nodeRole: config.nodeRole ?? "edge",
+          commit: nodeCommit,
+          chainId: config.chain?.chainId,
+        },
+        traces: tracesOn
+          ? {
+              endpoint: tracesEndpoint,
+              token: config.telemetry?.traces?.token,
+              sampleRatio: config.telemetry?.traces?.sampleRatio,
+            }
+          : undefined,
+        metrics: metricsOn
+          ? {
+              endpoint: metricsEndpoint,
+              token: config.telemetry?.metrics?.token,
+              exportIntervalMs: config.telemetry?.metrics?.exportIntervalMs,
+            }
+          : undefined,
+      });
+      log(
+        `Telemetry: OTel SDK registered (traces=${tracesOn ? tracesEndpoint : "off"}, metrics=${metricsOn ? metricsEndpoint : "off"})`,
+      );
+    } catch (err) {
+      // Telemetry must never block startup.
+      log(`Telemetry: OTel init failed (non-fatal): ${String(err)}`);
+    }
+  }
+
+  // Start ALL telemetry signals under the master gate: OTel traces/metrics
+  // (SDK) AND the configured log exporter. Used at boot and from the runtime
+  // enable toggle so both behave identically (the bug fixed here: enabling from
+  // a boot-disabled state previously started only logs, never traces/metrics).
+  // The log-exporter result is returned separately — a failed log shipper must
+  // NOT tear down or disable the independent traces/metrics signals.
+  // Await the SDK init first (it is dynamically imported) so traces/metrics are
+  // fully registered before the log exporter result is returned — that ordering
+  // lets the runtime-enable path roll the SDK back if the log exporter fails.
+  async function startTelemetry(): Promise<{ ok: boolean; error?: string }> {
+    await startOtelSdk();
+    // Dispatch to the configured log exporter. 'syslog' is the default when
+    // unset (preserves prior behaviour); 'otlp' is the recommended path; 'none'
+    // keeps logs local-only even while telemetry is enabled. An UNKNOWN/typo'd
+    // value fails closed to 'none' (never silently syslog → off-node).
+    if (isUnknownLogExporter(config.telemetry)) {
+      log(
+        `Telemetry: unknown logs.exporter "${config.telemetry?.logs?.exporter}" — ` +
+          `keeping logs local-only (no off-node forwarding). Use 'otlp', 'syslog', or 'none'.`,
+      );
+    }
+    const mode = resolveLogExporterMode(config.telemetry);
+    if (mode === "none") return { ok: true };
+    if (mode === "otlp") return startOtlpExporter();
+    return startLogPusher();
+  }
+
+  // Stop ALL telemetry signals: log exporters AND the OTel SDK (flush + shut
+  // down + clear the API globals). Async so a runtime disable actually stops
+  // traces/metrics — not just logs — and callers can await an orderly teardown.
+  async function stopTelemetry(): Promise<void> {
+    stopLogPusher();
+    await stopOtlpExporter();
+    await shutdownTelemetry().catch(() => {});
+  }
+
   if (config.telemetry?.enabled) {
-    const r = startLogPusher();
+    const r = await startTelemetry();
     if (!r.ok) {
-      log(`Telemetry: ${r.error}`);
-      config.telemetry.enabled = false;
+      // Log forwarding failed to start (e.g. mainnet syslog port 0). Disable
+      // ONLY the log signal — leave the master gate and any registered
+      // traces/metrics intact; they are independent signals. (Boot path:
+      // best-effort per signal; the runtime toggle below rolls back instead.)
+      log(`Telemetry: log exporter not started — ${r.error} (traces/metrics unaffected)`);
     }
   }
 
@@ -2638,10 +2778,17 @@ export async function runDaemonInner(
       enabled: boolean,
     ): Promise<{ ok: boolean; error?: string }> => {
       if (enabled) {
-        const r = startLogPusher();
-        if (!r.ok) return r;
+        const r = await startTelemetry();
+        if (!r.ok) {
+          // The OTel SDK may have started before the log exporter failed. Roll
+          // it back so we never leave traces/metrics exporting while we report
+          // failure and persist nothing — the API/UI state stays consistent
+          // (telemetry remains off) with what is actually running.
+          await stopTelemetry();
+          return r;
+        }
       } else {
-        stopLogPusher();
+        await stopTelemetry();
       }
       config.telemetry = { ...config.telemetry, enabled };
       await saveConfig(config);
@@ -3113,6 +3260,8 @@ export async function runDaemonInner(
         clearInterval(pruneTimer);
         rateLimiter.destroy();
         metricsCollector.stop();
+        // Stops log exporters AND flushes + shuts down the OTel SDK.
+        await stopTelemetry();
         natStatusWatcherStop?.();
         resetNatStatus();
         await publisherRuntime

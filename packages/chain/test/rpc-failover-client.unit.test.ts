@@ -76,7 +76,11 @@ function makeClient(
   rpcUrls: string[],
   signPopulated: SignPopulatedFn = NEVER_SIGN,
 ): RpcFailoverClient {
-  return new RpcFailoverClient(() => providers.map((p, i) => ({ provider: p as any, rpcUrl: rpcUrls[i] })), signPopulated);
+  return new RpcFailoverClient(
+    () => providers.map((p, i) => ({ provider: p as any, rpcUrl: rpcUrls[i] })),
+    signPopulated,
+    () => 'evm:31337',
+  );
 }
 
 const URLS = ['https://primary.example', 'https://backup.example'];

@@ -538,8 +538,65 @@ export interface DkgConfig {
    * on first start and stored in `<DKG_HOME>/auth.token`.
    */
   auth?: { enabled?: boolean; tokens?: string[] };
-  /** Opt-in telemetry streaming to central network dashboard. */
-  telemetry?: { enabled?: boolean };
+  /**
+   * Opt-in telemetry streaming to a central network dashboard.
+   * `enabled` is the master gate: when false, NOTHING is forwarded off the
+   * node (local logging — SQLite + daemon.log — is always on regardless).
+   */
+  telemetry?: {
+    enabled?: boolean;
+    /**
+     * Remote log forwarding (opt-in). Active only when `enabled` is true.
+     */
+    logs?: {
+      /**
+       * Outbound transport for logs. 'none' = local only; 'otlp' = OTLP/HTTP
+       * to an OpenTelemetry collector; 'syslog' = legacy RFC 5424 → Graylog.
+       * Defaults to 'syslog' when unset (preserves prior behaviour).
+       */
+      exporter?: 'none' | 'otlp' | 'syslog';
+      /**
+       * OTLP/HTTP logs endpoint, e.g. http://localhost:4318/v1/logs. Falls
+       * back to the per-network default (TELEMETRY_ENDPOINTS[network].otlpLogs).
+       */
+      endpoint?: string;
+      /** Bearer credential for the operator's collector. Treated as a secret. */
+      token?: string;
+      /** Minimum level forwarded remotely. Local sink keeps everything. Default 'info'. */
+      level?: 'debug' | 'info' | 'warn' | 'error';
+      /** Extra sensitive key names to redact from messages before they leave the node. */
+      redact?: string[];
+      /** Bounded in-memory buffer; drop-oldest on overflow. Default 500. */
+      bufferMaxEntries?: number;
+    };
+    /**
+     * OTel trace export (opt-in, independent of logs). Registers the tracer
+     * ONLY when an endpoint resolves (config or OTEL_EXPORTER_OTLP_* env);
+     * never falls back to a guessed prod URL.
+     */
+    traces?: {
+      enabled?: boolean;
+      /** OTLP traces endpoint, e.g. http://localhost:4318/v1/traces. */
+      endpoint?: string;
+      /** Bearer credential. Treated as a secret. */
+      token?: string;
+      /** Parent-based ratio sampler 0..1. Default 1.0. */
+      sampleRatio?: number;
+    };
+    /**
+     * OTel metric export (opt-in, independent of logs). Registers the meter
+     * ONLY when an endpoint resolves (config or OTEL_EXPORTER_OTLP_* env).
+     */
+    metrics?: {
+      enabled?: boolean;
+      /** OTLP metrics endpoint, e.g. http://localhost:4318/v1/metrics. */
+      endpoint?: string;
+      /** Bearer credential. Treated as a secret. */
+      token?: string;
+      /** PeriodicExportingMetricReader interval. Default 30000ms. */
+      exportIntervalMs?: number;
+    };
+  };
   /** Shared memory (workspace) data TTL in milliseconds. Default: 30 days (2592000000). Set to 0 to disable cleanup. */
   sharedMemoryTtlMs?: number;
   /** @deprecated Legacy alias for sharedMemoryTtlMs */
@@ -736,16 +793,23 @@ export interface DkgConfig {
  * Nodes resolve the correct endpoints from the network they're on.
  * Operators only see a single toggle — no endpoint configuration.
  */
-export const TELEMETRY_ENDPOINTS: Record<string, { syslog: { host: string; port: number }; otlp: string }> = {
+export const TELEMETRY_ENDPOINTS: Record<
+  string,
+  { syslog: { host: string; port: number }; otlp: string }
+> = {
   testnet: {
     syslog: { host: 'loggly.origin-trail.network', port: 12201 },
     otlp: 'https://telemetry-testnet.origintrail.io/v1/metrics',
   },
   mainnet: {
-    syslog: { host: 'loggly.origin-trail.network', port: 0 }, // TODO: assign mainnet syslog port
+    syslog: { host: 'loggly.origin-trail.network', port: 0 }, // legacy syslog — OTLP is the mainnet path
     otlp: 'https://telemetry.origintrail.io/v1/metrics',
   },
 };
+// NOTE: there is intentionally NO per-network OTLP *logs* endpoint here. The
+// OTLP log exporter resolves its endpoint env-first (OTEL_EXPORTER_OTLP_*) then
+// from `config.telemetry.logs.endpoint` (see startOtlpExporter) — never from a
+// hardcoded default — so a node can't ship logs to a placeholder URL.
 
 const DEFAULT_CONFIG: DkgConfig = {
   name: 'dkg-node',

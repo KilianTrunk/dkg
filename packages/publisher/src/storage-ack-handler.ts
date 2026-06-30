@@ -4,10 +4,15 @@ import {
   decodePublishIntent,
   decodeUpdateIntent,
   encodeStorageACK,
+  decodeStorageACK,
+  isStorageACKDecline,
+  withSpan,
+  getMetrics,
   computePublishACKDigest,
   computeUpdateACKDigest,
   assertSafeIri,
   STORAGE_ACK_DECLINE_CODES,
+  boundedDeclineCodeLabel,
   computeCatalogRoot,
   catalogCommittedLeaves,
   contextGraphCatalogUri,
@@ -300,8 +305,70 @@ export class StorageACKHandler {
   /**
    * Protocol stream handler for `/dkg/10.0.1/storage-ack`.
    * Receives PublishIntent, returns StorageACK.
+   *
+   * Wrapped in a fresh ROOT span (`publisher.storage_ack_handler`) — this
+   * is an inbound libp2p callback with no cross-node trace context. Kept
+   * MINIMAL (no per-step child spans) because it runs under libp2p stream
+   * backpressure. Classifies the terminal outcome (ack / decline / reset)
+   * for the `ackHandlerTotal` metric; a thrown error resets the stream and
+   * is auto-recorded as a span ERROR by withSpan.
    */
-  handler = async (data: Uint8Array, _peerId: PeerId): Promise<Uint8Array> => {
+  handler = async (data: Uint8Array, peerId: PeerId): Promise<Uint8Array> => {
+    const chainIdLabel = this.config.chainId != null
+      ? this.config.chainId.toString()
+      : undefined;
+    return withSpan('publisher.storage_ack_handler', async (span) => {
+      let cgIdAttr: string | undefined;
+      try {
+        // contextGraphId is cheap to read off the decoded intent for the span
+        // attribute; the full classification rides the encoded response below.
+        const intentPreview = decodePublishIntent(data);
+        cgIdAttr = intentPreview.contextGraphId;
+        if (cgIdAttr) span.setAttribute('dkg.context_graph_id', cgIdAttr);
+      } catch {
+        // Malformed request — handlePublishIntent will throw + reset below.
+      }
+      try {
+        const result = await this.handlePublishIntent(data, peerId);
+        const decoded = decodeStorageACK(result);
+        if (isStorageACKDecline(decoded)) {
+          const declineCode = decoded.declineCode || 'UNKNOWN';
+          span.setAttribute('dkg.ack_outcome', 'decline');
+          span.setAttribute('dkg.decline_code', declineCode);
+          getMetrics().ackHandlerTotal.add(1, {
+            outcome: 'decline',
+            // Bound to the known enum so the metric label can't become
+            // high-cardinality (defensive — only fixed enum values as labels).
+            decline_code: boundedDeclineCodeLabel(declineCode),
+            ...(chainIdLabel ? { chain_id: chainIdLabel } : {}),
+          });
+        } else {
+          span.setAttribute('dkg.ack_outcome', 'ack');
+          getMetrics().ackHandlerTotal.add(1, {
+            outcome: 'ack',
+            ...(chainIdLabel ? { chain_id: chainIdLabel } : {}),
+          });
+        }
+        return result;
+      } catch (err) {
+        // Throw resets the libp2p stream — withSpan records ERROR. Tag the
+        // terminal outcome + metric, then re-throw to preserve control flow.
+        span.setAttribute('dkg.ack_outcome', 'reset');
+        getMetrics().ackHandlerTotal.add(1, {
+          outcome: 'reset',
+          ...(chainIdLabel ? { chain_id: chainIdLabel } : {}),
+        });
+        throw err;
+      }
+    });
+  };
+
+  /**
+   * Original publish-intent handling body. Split out from {@link handler}
+   * so the public entry point is a thin `withSpan` wrapper; the logic here
+   * is byte-for-byte the pre-instrumentation behaviour.
+   */
+  private handlePublishIntent = async (data: Uint8Array, _peerId: PeerId): Promise<Uint8Array> => {
     if (this.config.nodeRole !== 'core') {
       throw new Error('Only core nodes can issue StorageACKs');
     }

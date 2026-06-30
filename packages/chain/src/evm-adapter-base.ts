@@ -18,7 +18,7 @@ import { DEFAULT_APPROVAL_POLICY } from './chain-adapter.js';
 import type { ApprovalPolicy, V10PublishParams, OnChainPublishResult, ConvictionReader } from './chain-adapter.js';
 import { HubResolutionCache } from './hub-resolution-cache.js';
 import { KeyedSerializer } from './keyed-mutex.js';
-import { floorPublishTokenAmount } from '@origintrail-official/dkg-core';
+import { floorPublishTokenAmount, withSpan, getMetrics } from '@origintrail-official/dkg-core';
 import { loadAbi } from './evm-adapter-abi.js';
 import { errorCode, errorMessage, errorStatus, isTooLowAllowanceError, enrichEvmError, HUB_STALE_ERROR_MARKERS, isInsufficientFundsError, InsufficientPublisherFundsError, formatNoFundedPublisherWalletMessage, type PublisherWalletBalance } from './evm-adapter-errors.js';
 import { resolveRpcUrls, boundedRetryFetchRequest, withTimeout, isRetryableRpcError, assertSuccessfulReceipt, sleep } from './evm-adapter-rpc.js';
@@ -661,6 +661,10 @@ export class EVMChainAdapterBase {
       // (`providers = rpcUrls.map(...)`), so index i pairs provider[i]↔rpcUrl[i].
       () => this.providers.map((provider, i) => ({ provider, rpcUrl: this.rpcUrls[i] })),
       (signer, populated) => this.signPopulatedTransaction(signer, populated),
+      // `this.chainId` is assigned later in this constructor (after the client is
+      // built), so pass a LIVE thunk — resolved at metric-record time — rather
+      // than capturing the still-undefined field value here.
+      () => this.chainId,
     );
     const providerContext = formatProviderContext(config);
     // PR-8: install the filter-not-found silencer. Without this, RPC
@@ -767,6 +771,17 @@ export class EVMChainAdapterBase {
   protected findSignerByAddress(address: string): Wallet | undefined {
     const normalized = ethers.getAddress(address).toLowerCase();
     return this.signerPool.find((signer) => signer.address.toLowerCase() === normalized);
+  }
+
+  /**
+   * Classify an RPC error for low-cardinality metric labels: `timeout` for the
+   * synthetic `withTimeout` TIMEOUT code, else `error`. Used by the adapter's own
+   * instrumented `eth_getLogs` page scan (`queryEventLogsPage`) so the `outcome`
+   * label stays bounded. (The failover transports — broadcast / receipt / eth_call
+   * / populate — now record their outcomes inside `RpcFailoverClient`.)
+   */
+  private _rpcOutcomeForError(err: unknown): 'error' | 'timeout' {
+    return errorCode(err) === 'TIMEOUT' ? 'timeout' : 'error';
   }
 
   /**
@@ -1066,13 +1081,24 @@ export class EVMChainAdapterBase {
     // the limit by `gasLimitBufferBps` basis points so the drift can't OOG.
     opts?: { gasLimitBufferBps?: number },
   ): Promise<ethers.TransactionReceipt> {
-    // Populate+sign with per-endpoint failover (shared with the V10 path), then
-    // broadcast+confirm the single signed tx. Split so `onBroadcast` (the WAL
-    // checkpoint) can sit between sign and broadcast for the V10 callers.
-    const { signedTx, txHash } = await this.populateAndSignAcrossProviders(
-      contract, method, args, signer, label, opts,
+    // Parent span for the whole send. Broadcast + receipt-wait open their own
+    // nested spans/metrics (chain.tx_submit / chain.tx_wait) inside
+    // sendSignedTransactionAndWait; populate+sign failover is counted inside
+    // populateAndSignAcrossProviders.
+    return withSpan(
+      'chain.tx_send',
+      async (span) => {
+        // Populate+sign with per-endpoint failover (shared with the V10 path),
+        // then broadcast+confirm the single signed tx. Split so `onBroadcast`
+        // (the WAL checkpoint) can sit between sign and broadcast for V10 callers.
+        const { signedTx, txHash } = await this.populateAndSignAcrossProviders(
+          contract, method, args, signer, label, opts,
+        );
+        span.setAttribute('dkg.tx_hash', txHash);
+        return this.sendSignedTransactionAndWait(signedTx, txHash, label);
+      },
+      { attributes: { 'rpc.method': 'eth_sendRawTransaction', 'dkg.chain_id': this.chainId } },
     );
-    return this.sendSignedTransactionAndWait(signedTx, txHash, label);
   }
 
   /**
@@ -2017,39 +2043,66 @@ export class EVMChainAdapterBase {
     label: string,
     preferred?: JsonRpcProvider,
   ): Promise<{ logs: ReadonlyArray<ethers.EventLog | ethers.Log>; provider: JsonRpcProvider }> {
-    // Eligible backends (tip covers the page), with the sticky preferred one moved
-    // to the front when it still qualifies; the remainder keep their freshest-first
-    // order from `scanProviders`.
-    const eligible = scanProviders.filter(({ backendHead }) => backendHead >= hi);
-    const ordered =
-      preferred && eligible.some(({ provider }) => provider === preferred)
-        ? [
-            ...eligible.filter(({ provider }) => provider === preferred),
-            ...eligible.filter(({ provider }) => provider !== preferred),
-          ]
-        : eligible;
-    let pageError: unknown;
-    for (const { provider } of ordered) {
-      let contract = connected.get(provider);
-      if (!contract) {
-        contract = baseContract.connect(provider) as Contract;
-        connected.set(provider, contract);
-      }
-      try {
-        const logs = await withTimeout(
-          contract.queryFilter(filter as any, lo, hi),
-          KA_HIGH_WATER_PAGE_TIMEOUT_MS,
-          `${label} getLogs [${lo}, ${hi}]`,
+    return withSpan(
+      'chain.eth_getLogs',
+      async (span) => {
+        const metrics = getMetrics();
+        const startedAt = Date.now();
+        // Eligible backends (tip covers the page), with the sticky preferred one moved
+        // to the front when it still qualifies; the remainder keep their freshest-first
+        // order from `scanProviders`.
+        const eligible = scanProviders.filter(({ backendHead }) => backendHead >= hi);
+        const ordered =
+          preferred && eligible.some(({ provider }) => provider === preferred)
+            ? [
+                ...eligible.filter(({ provider }) => provider === preferred),
+                ...eligible.filter(({ provider }) => provider !== preferred),
+              ]
+            : eligible;
+        let pageError: unknown;
+        for (const { provider } of ordered) {
+          let contract = connected.get(provider);
+          if (!contract) {
+            contract = baseContract.connect(provider) as Contract;
+            connected.set(provider, contract);
+          }
+          try {
+            const logs = await withTimeout(
+              contract.queryFilter(filter as any, lo, hi),
+              KA_HIGH_WATER_PAGE_TIMEOUT_MS,
+              `${label} getLogs [${lo}, ${hi}]`,
+            );
+            metrics.chainRpcTotal.add(1, {
+              rpc_method: 'eth_getLogs', outcome: 'ok', retryable: false, chain_id: this.chainId,
+            });
+            metrics.chainRpcDuration.record(Date.now() - startedAt, {
+              rpc_method: 'eth_getLogs', chain_id: this.chainId,
+            });
+            return { logs, provider };
+          } catch (err) {
+            pageError = err; // hung or errored — fail over to the next eligible backend
+          }
+        }
+        // Every eligible backend failed for this page → one error/timeout outcome.
+        const outcome = pageError ? this._rpcOutcomeForError(pageError) : 'error';
+        metrics.chainRpcTotal.add(1, {
+          rpc_method: 'eth_getLogs', outcome, retryable: isRetryableRpcError(pageError), chain_id: this.chainId,
+        });
+        metrics.chainRpcDuration.record(Date.now() - startedAt, {
+          rpc_method: 'eth_getLogs', chain_id: this.chainId,
+        });
+        throw new Error(
+          `${label}: no configured RPC could serve the log range [${lo}, ${hi}]` +
+            `${pageError ? `: ${errorMessage(pageError)}` : ''}.`,
+          pageError ? { cause: pageError } : undefined,
         );
-        return { logs, provider };
-      } catch (err) {
-        pageError = err; // hung or errored — fail over to the next eligible backend
-      }
-    }
-    throw new Error(
-      `${label}: no configured RPC could serve the log range [${lo}, ${hi}]` +
-        `${pageError ? `: ${errorMessage(pageError)}` : ''}.`,
-      pageError ? { cause: pageError } : undefined,
+      },
+      {
+        attributes: {
+          'rpc.method': 'eth_getLogs', 'dkg.chain_id': this.chainId,
+          'dkg.block_lo': lo, 'dkg.block_hi': hi,
+        },
+      },
     );
   }
 

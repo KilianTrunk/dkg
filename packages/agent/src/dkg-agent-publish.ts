@@ -97,8 +97,11 @@ import {
   pickNetworkTunables,
   sharedMemoryReadBothFilter,
   partitionCatalogQuads,
+  withSpan,
+  getMetrics,
   assertQuadLiteralsMutf8Safe,
 } from '@origintrail-official/dkg-core';
+import { SpanStatusCode } from '@opentelemetry/api';
 import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad, type LargeLiteralStorageConfig } from '@origintrail-official/dkg-storage';
 import { EVMChainAdapter, NoChainAdapter, enrichEvmError, buildKnowledgeAssetUal, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
 import {
@@ -424,6 +427,25 @@ function normalizeOptionalContextGraphId(value: string | null | undefined): stri
 function rejectOversizedRdfLiterals(quads: Quad[] | undefined, label: string): void {
   if (!quads || quads.length === 0) return;
   assertQuadLiteralsMutf8Safe(quads, { label });
+}
+
+/**
+ * Record the publish outcome metric (total + duration) for BOTH publish entry
+ * points (`_publish` direct + `_publishFromSharedMemory`). A module-level
+ * function (NOT a `this` method) so the metric sequence isn't pasted into two
+ * flows AND so `PublishMethods.prototype._publish.call(stub, …)` unit tests —
+ * which invoke `_publish` with a hand-built `this` — don't break on a missing
+ * sibling method.
+ */
+function recordPublishOutcome(
+  outcome: string,
+  source: 'direct' | 'swm',
+  startedAt: number,
+  chainId?: string,
+): void {
+  const attrs = { outcome, source, ...(chainId ? { chain_id: chainId } : {}) };
+  getMetrics().publishTotal.add(1, attrs);
+  getMetrics().publishDuration.record(Date.now() - startedAt, attrs);
 }
 
 export class PublishMethods extends DKGAgentBase {
@@ -1290,6 +1312,19 @@ export class PublishMethods extends DKGAgentBase {
     privateQuads?: Quad[],
     opts?: PublishOpts,
   ): Promise<PublishResult> {
+   return withSpan('agent.publish', async (span) => {
+    const chainId = typeof this.chain?.chainId === 'string' && this.chain.chainId !== 'none' ? this.chain.chainId : undefined;
+    const publishStartedAt = Date.now();
+    // try/catch so a throw before the success metric (local publish / broadcast
+    // / chain) is still counted — withSpan marks the span ERROR + rethrows; this
+    // adds the matching publishTotal{outcome:'error'} so failures aren't invisible.
+    try {
+    span.setAttributes({
+      'dkg.context_graph_id': contextGraphId,
+      'dkg.triple_count': quads.length,
+      'dkg.has_private': !!privateQuads && privateQuads.length > 0,
+      ...(chainId ? { 'dkg.chain_id': chainId } : {}),
+    });
     const ctx = opts?.operationCtx ?? createOperationContext('publish');
     const onPhase = opts?.onPhase;
     this.log.info(ctx, `Starting publish to context graph "${contextGraphId}" with ${quads.length} triples`);
@@ -1425,6 +1460,12 @@ export class PublishMethods extends DKGAgentBase {
       encryptInlineChunked,
     });
 
+    span.setAttribute('dkg.publish_status', result.status);
+    if (result.status === 'failed') {
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      span.addEvent('publish_failed', { error: String(result.contextGraphError ?? '') });
+    }
+
     onPhase?.('broadcast', 'start');
     this.log.info(ctx, `Local publish complete, broadcasting to peers`);
     await this.broadcastPublish(contextGraphId, result, ctx);
@@ -1436,7 +1477,14 @@ export class PublishMethods extends DKGAgentBase {
     // it can never affect the publish just completed.
     await this.emitPublicProjectionAfterPublish(contextGraphId, result, ctx);
 
+    recordPublishOutcome(result.status, 'direct', publishStartedAt, chainId);
+
     return result;
+    } catch (err) {
+      recordPublishOutcome('error', 'direct', publishStartedAt, chainId);
+      throw err;
+    }
+   });
   }
 
   /**
@@ -4117,6 +4165,17 @@ export class PublishMethods extends DKGAgentBase {
       schemeVersion?: number;
     },
   ): Promise<PublishResult> {
+   return withSpan('agent.publish_from_swm', async (span) => {
+    const chainId = typeof this.chain?.chainId === 'string' && this.chain.chainId !== 'none' ? this.chain.chainId : undefined;
+    const publishStartedAt = Date.now();
+    // try/catch so a throw before the success metric is still counted as an
+    // error outcome (see the direct-publish path for the rationale).
+    try {
+    span.setAttributes({
+      'dkg.context_graph_id': contextGraphId,
+      'dkg.selection': selection === 'all' ? 'all' : 'roots',
+      ...(chainId ? { 'dkg.chain_id': chainId } : {}),
+    });
     const ctx = options?.operationCtx ?? createOperationContext('publishFromSWM');
     const effectiveSubCG = options?.subContextGraphId ?? options?.contextGraphId;
     // `ctxGraphIdStr` doubles as `publishContextGraphId` for REMAP-flow
@@ -4248,6 +4307,12 @@ export class PublishMethods extends DKGAgentBase {
       encryptInlineChunked,
     });
 
+    span.setAttribute('dkg.publish_status', result.status);
+    if (result.status === 'failed') {
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      span.addEvent('publish_failed', { error: String(result.contextGraphError ?? '') });
+    }
+
     if (result.status === 'confirmed' && result.onChainResult) {
       const rootEntities = result.kaManifest.map(ka => ka.rootEntity);
 
@@ -4338,7 +4403,14 @@ export class PublishMethods extends DKGAgentBase {
       }
     }
 
+    recordPublishOutcome(result.status, 'swm', publishStartedAt, chainId);
+
     return result;
+    } catch (err) {
+      recordPublishOutcome('error', 'swm', publishStartedAt, chainId);
+      throw err;
+    }
+   });
   }
 
   /** @deprecated Use publishFromSharedMemory. Will be removed in V10.1. */

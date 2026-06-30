@@ -159,6 +159,7 @@ describe('multi-RPC read failover (real loopback providers)', () => {
           (provider, i) => ({ provider, rpcUrl: a.getRpcUrls()[i] }),
         ),
         async () => { throw new Error('read path must not sign'); },
+        () => a.chainId,
       );
 
       const code = await client.read('getCode', (p) => p.getCode(HUB));

@@ -79,7 +79,11 @@ const NEVER_SIGN: SignPopulatedFn = async () => {
  * read failover regression is caught without a god-object back-reference.
  */
 function makeClient(providers: unknown[], rpcUrls: string[], signPopulated: SignPopulatedFn = NEVER_SIGN): RpcFailoverClient {
-  return new RpcFailoverClient(() => providers.map((p, i) => ({ provider: p as any, rpcUrl: rpcUrls[i] })), signPopulated);
+  return new RpcFailoverClient(
+    () => providers.map((p, i) => ({ provider: p as any, rpcUrl: rpcUrls[i] })),
+    signPopulated,
+    () => 'evm:31337',
+  );
 }
 
 describe('RpcFailoverClient.read — read-failover loop logic (bare-mock, #1336)', () => {

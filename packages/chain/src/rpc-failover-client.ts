@@ -30,6 +30,7 @@
  */
 
 import { JsonRpcProvider, Wallet, Contract, ethers } from 'ethers';
+import { withSpan, getMetrics } from '@origintrail-official/dkg-core';
 import { withTimeout, isRetryableRpcError, isKnownTransactionError } from './evm-adapter-rpc.js';
 import { errorCode, errorMessage } from './evm-adapter-errors.js';
 import { noteRpcFailover, noteRpcExhaustion, rpcHost } from './rpc-failover-log.js';
@@ -119,7 +120,43 @@ export class RpcFailoverClient {
   constructor(
     private readonly getEndpoints: () => RpcEndpoint[],
     private readonly signPopulated: SignPopulatedFn,
+    // The chain id (e.g. `evm:31337`) carried on every chain-RPC metric label so
+    // a multi-chain node's series stay separable. A LIVE thunk so the adapter can
+    // construct this client BEFORE its own `chainId` field is assigned and still
+    // have the label resolve correctly at metric-record time.
+    private readonly chainId: () => string,
   ) {}
+
+  /**
+   * Classify an RPC error for low-cardinality metric labels: `timeout` for the
+   * synthetic `withTimeout` TIMEOUT code, else `error`. Keeps the `outcome` label
+   * bounded at the metric record sites.
+   */
+  private rpcOutcome(err: unknown): 'error' | 'timeout' {
+    return errorCode(err) === 'TIMEOUT' ? 'timeout' : 'error';
+  }
+
+  /**
+   * Single chain-RPC outcome boundary: records `dkg.chain.rpc.total` (and the
+   * `dkg.chain.rpc.failover.total` exhaustion counter) with ONE identical,
+   * bounded label shape `{rpc_method, outcome, retryable, chain_id}` for every
+   * method, so broadcast/getReceipt/readContract don't each hand-roll the label
+   * object. Duration stays in each method's `finally` (already uniform). The
+   * caller decides the per-path outcome (a success vs the receipt null-pending
+   * skip vs a typed exhaustion) — this owns only the recording.
+   */
+  private recordRpcOutcome(
+    method: string,
+    outcome: 'ok' | 'error' | 'timeout',
+    opts?: { retryable?: boolean; exhausted?: boolean },
+  ): void {
+    const chain_id = this.chainId();
+    const m = getMetrics();
+    m.chainRpcTotal.add(1, { rpc_method: method, outcome, retryable: opts?.retryable ?? false, chain_id });
+    if (opts?.exhausted) {
+      m.chainRpcFailoverTotal.add(1, { rpc_method: method, chain_id, reason: 'exhausted' });
+    }
+  }
 
   /**
    * Per-endpoint read-failover primitive over the bare endpoints (no
@@ -162,11 +199,35 @@ export class RpcFailoverClient {
     fn: (c: Contract) => Promise<T>,
     opts?: ReadOpts,
   ): Promise<T> {
-    return this.runAcrossProviders(
-      label,
-      (p) => fn(this.rebindContract(contract, p)),
-      opts?.isRetryable ?? isContractViewRetryable,
-      opts?.policy ?? 'pointRead',
+    const chainId = this.chainId();
+    // Single telemetry choke-point for every CONTRACT VIEW read (eth_call): one
+    // `chain.eth_call` span + RPC metric spanning the whole failover sequence.
+    // `dkg.read=label` (e.g. 'token.allowance') rides the SPAN only — kept OFF
+    // the metric so its label set stays low-cardinality.
+    return withSpan(
+      'chain.eth_call',
+      async () => {
+        const metrics = getMetrics();
+        const startedAt = Date.now();
+        try {
+          const out = await this.runAcrossProviders(
+            label,
+            (p) => fn(this.rebindContract(contract, p)),
+            opts?.isRetryable ?? isContractViewRetryable,
+            opts?.policy ?? 'pointRead',
+          );
+          this.recordRpcOutcome('eth_call', 'ok');
+          return out;
+        } catch (err) {
+          this.recordRpcOutcome('eth_call', this.rpcOutcome(err), { retryable: isRetryableRpcError(err) });
+          throw err;
+        } finally {
+          metrics.chainRpcDuration.record(Date.now() - startedAt, {
+            rpc_method: 'eth_call', chain_id: chainId,
+          });
+        }
+      },
+      { attributes: { 'rpc.method': 'eth_call', 'dkg.chain_id': chainId, 'dkg.read': label } },
     );
   }
 
@@ -256,6 +317,13 @@ export class RpcFailoverClient {
       ? errorMessage(lastRetryable)
       : `${label} transaction preparation failed on all configured RPC endpoints ` +
         `(${endpoints.map((e) => rpcHost(e.rpcUrl)).join(', ')}): ${errorMessage(lastRetryable)}`;
+    // Populate+sign exhausted every endpoint. This is the PREPARE phase
+    // (populateTransaction / eth_estimateGas), NOT the broadcast — label it
+    // eth_estimateGas so it doesn't collide with the genuine
+    // eth_sendRawTransaction failover counter in the broadcast loop.
+    getMetrics().chainRpcFailoverTotal.add(1, {
+      rpc_method: 'eth_estimateGas', chain_id: this.chainId(), reason: 'exhausted',
+    });
     throw new ChainRpcTransportError('RPC_ENDPOINTS_EXHAUSTED', message, {
       cause: lastRetryable,
       rpcUrls: endpoints.map((e) => e.rpcUrl),
@@ -271,35 +339,64 @@ export class RpcFailoverClient {
    * (→ retryable 503), mirroring the preparation loop + CLI path.
    */
   async broadcast(signedTx: string, txHash: string, label: string): Promise<void> {
-    const endpoints = this.getEndpoints();
-    let lastRetryable: unknown;
-    for (let i = 0; i < endpoints.length; i += 1) {
-      const provider = endpoints[i].provider;
-      try {
-        await withTimeout(
-          provider.broadcastTransaction(signedTx),
-          RPC_BROADCAST_ATTEMPT_TIMEOUT_MS,
-          `${label} broadcast via RPC #${i + 1}`,
-        );
-        return;
-      } catch (err) {
-        if (isKnownTransactionError(err)) return;
-        if (!isRetryableRpcError(err)) throw err;
-        lastRetryable = err;
-        if (i < endpoints.length - 1) {
-          noteRpcFailover(`${label} broadcast`, endpoints[i].rpcUrl, err, endpoints[i + 1].rpcUrl);
+    const chainId = this.chainId();
+    return withSpan(
+      'chain.tx_submit',
+      async (span) => {
+        const metrics = getMetrics();
+        const startedAt = Date.now();
+        try {
+          const endpoints = this.getEndpoints();
+          let lastRetryable: unknown;
+          for (let i = 0; i < endpoints.length; i += 1) {
+            const provider = endpoints[i].provider;
+            span.addEvent('broadcast.attempt', { attempt: i + 1 });
+            try {
+              await withTimeout(
+                provider.broadcastTransaction(signedTx),
+                RPC_BROADCAST_ATTEMPT_TIMEOUT_MS,
+                `${label} broadcast via RPC #${i + 1}`,
+              );
+              span.setAttribute('dkg.tx_hash', txHash);
+              this.recordRpcOutcome('eth_sendRawTransaction', 'ok');
+              return;
+            } catch (err) {
+              if (isKnownTransactionError(err)) {
+                // Already-known / already-mined tx is success for our purposes.
+                span.setAttribute('dkg.tx_hash', txHash);
+                span.addEvent('broadcast.already_known', { attempt: i + 1 });
+                this.recordRpcOutcome('eth_sendRawTransaction', 'ok');
+                return;
+              }
+              if (!isRetryableRpcError(err)) {
+                this.recordRpcOutcome('eth_sendRawTransaction', this.rpcOutcome(err), { retryable: false });
+                throw err;
+              }
+              lastRetryable = err;
+              if (i < endpoints.length - 1) {
+                noteRpcFailover(`${label} broadcast`, endpoints[i].rpcUrl, err, endpoints[i + 1].rpcUrl);
+              }
+            }
+          }
+          // All configured endpoints exhausted.
+          this.recordRpcOutcome('eth_sendRawTransaction', this.rpcOutcome(lastRetryable), { retryable: true, exhausted: true });
+          if (lastRetryable) noteRpcExhaustion(`${label} broadcast`, endpoints.map((e) => e.rpcUrl));
+          // Typed transport error (mirroring the preparation loop + CLI path) so a
+          // broadcast-time all-endpoints-exhausted failure maps to a retryable 503 at
+          // the HTTP boundary, not a generic 500 — an exhaustion after a provider
+          // populated/signed would otherwise surface code-less.
+          throw new ChainRpcTransportError(
+            'RPC_ENDPOINTS_EXHAUSTED',
+            `${label} broadcast failed on all configured RPC endpoints for tx ${txHash}: ${errorMessage(lastRetryable)}`,
+            { cause: lastRetryable, rpcUrls: endpoints.map((e) => e.rpcUrl) },
+          );
+        } finally {
+          metrics.chainRpcDuration.record(Date.now() - startedAt, {
+            rpc_method: 'eth_sendRawTransaction', chain_id: chainId,
+          });
         }
-      }
-    }
-    if (lastRetryable) noteRpcExhaustion(`${label} broadcast`, endpoints.map((e) => e.rpcUrl));
-    // Typed transport error (mirroring the preparation loop + CLI path) so a
-    // broadcast-time all-endpoints-exhausted failure maps to a retryable 503 at
-    // the HTTP boundary, not a generic 500 — an exhaustion after a provider
-    // populated/signed would otherwise surface code-less.
-    throw new ChainRpcTransportError(
-      'RPC_ENDPOINTS_EXHAUSTED',
-      `${label} broadcast failed on all configured RPC endpoints for tx ${txHash}: ${errorMessage(lastRetryable)}`,
-      { cause: lastRetryable, rpcUrls: endpoints.map((e) => e.rpcUrl) },
+      },
+      { attributes: { 'rpc.method': 'eth_sendRawTransaction', 'dkg.chain_id': chainId } },
     );
   }
 
@@ -313,36 +410,66 @@ export class RpcFailoverClient {
    * deadline.
    */
   async getReceipt(txHash: string): Promise<ethers.TransactionReceipt | null> {
-    const endpoints = this.getEndpoints();
-    let lastRetryable: unknown;
-    let sawNonErrorResponse = false;
-    for (let i = 0; i < endpoints.length; i += 1) {
-      const provider = endpoints[i].provider;
-      try {
-        const receipt = await withTimeout(
-          provider.getTransactionReceipt(txHash),
-          RPC_RECEIPT_ATTEMPT_TIMEOUT_MS,
-          `receipt lookup via RPC #${i + 1}`,
-        );
-        sawNonErrorResponse = true;
-        if (receipt) return receipt;
-      } catch (err) {
-        if (!isRetryableRpcError(err)) throw err;
-        lastRetryable = err;
-        if (i < endpoints.length - 1) {
-          noteRpcFailover('receipt lookup', endpoints[i].rpcUrl, err, endpoints[i + 1].rpcUrl);
+    const chainId = this.chainId();
+    return withSpan(
+      'chain.tx_wait',
+      async (span) => {
+        const metrics = getMetrics();
+        const startedAt = Date.now();
+        try {
+          const endpoints = this.getEndpoints();
+          let lastRetryable: unknown;
+          let sawNonErrorResponse = false;
+          for (let i = 0; i < endpoints.length; i += 1) {
+            const provider = endpoints[i].provider;
+            span.addEvent('receipt.attempt', { attempt: i + 1 });
+            try {
+              const receipt = await withTimeout(
+                provider.getTransactionReceipt(txHash),
+                RPC_RECEIPT_ATTEMPT_TIMEOUT_MS,
+                `receipt lookup via RPC #${i + 1}`,
+              );
+              sawNonErrorResponse = true;
+              if (receipt) {
+                span.setAttribute('dkg.tx_hash', txHash);
+                this.recordRpcOutcome('eth_getTransactionReceipt', 'ok');
+                return receipt;
+              }
+            } catch (err) {
+              if (!isRetryableRpcError(err)) {
+                this.recordRpcOutcome('eth_getTransactionReceipt', this.rpcOutcome(err), { retryable: false });
+                throw err;
+              }
+              lastRetryable = err;
+              if (i < endpoints.length - 1) {
+                noteRpcFailover('receipt lookup', endpoints[i].rpcUrl, err, endpoints[i + 1].rpcUrl);
+              }
+            }
+          }
+          if (lastRetryable && !sawNonErrorResponse) {
+            // No backend could even answer the lookup → endpoints exhausted.
+            this.recordRpcOutcome('eth_getTransactionReceipt', this.rpcOutcome(lastRetryable), { retryable: true, exhausted: true });
+            noteRpcExhaustion('receipt lookup', endpoints.map((e) => e.rpcUrl));
+            throw new ChainRpcTransportError(
+              'RPC_RECEIPT_LOOKUP_FAILED',
+              `Receipt lookup for tx ${txHash} failed on all configured RPC endpoints: ${errorMessage(lastRetryable)}`,
+              { cause: lastRetryable, txHash },
+            );
+          }
+          // At least one backend answered but the tx is not yet mined (null
+          // receipt). This is a benign poll tick, not a terminal outcome, so we
+          // intentionally do NOT emit an outcome metric here (the surrounding
+          // poll loop calls this repeatedly until mined/timeout).
+          span.setAttribute('dkg.receipt_pending', true);
+          return null;
+        } finally {
+          metrics.chainRpcDuration.record(Date.now() - startedAt, {
+            rpc_method: 'eth_getTransactionReceipt', chain_id: chainId,
+          });
         }
-      }
-    }
-    if (lastRetryable && !sawNonErrorResponse) {
-      noteRpcExhaustion('receipt lookup', endpoints.map((e) => e.rpcUrl));
-      throw new ChainRpcTransportError(
-        'RPC_RECEIPT_LOOKUP_FAILED',
-        `Receipt lookup for tx ${txHash} failed on all configured RPC endpoints: ${errorMessage(lastRetryable)}`,
-        { cause: lastRetryable, txHash },
-      );
-    }
-    return null;
+      },
+      { attributes: { 'rpc.method': 'eth_getTransactionReceipt', 'dkg.chain_id': chainId } },
+    );
   }
 
   /**

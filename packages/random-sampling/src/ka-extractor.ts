@@ -2,6 +2,10 @@ import {
   assertSafeIri,
   contextGraphDataUri,
   contextGraphMetaUri,
+  contextGraphLayerUri,
+  contextGraphSubGraphUri,
+  validateSubGraphName,
+  MemoryLayer,
   hashTripleV10,
   TRUST_LEVEL_PREDICATE,
   LEGACY_TRUST_LEVEL_PREDICATE,
@@ -48,6 +52,13 @@ export interface KCExtractionResult {
   contextGraphName: string;
   /** Data graph URI that contained the public triples. */
   dataGraph: string;
+  /**
+   * Sub-graph the KA's content was found in, or `undefined` for a CG-root KA
+   * (#1367). Discovered from `dkg:subGraphName` in `_meta`; lets the dRAG
+   * citation path see which sub-graph was resolved. Additive — pre-existing
+   * readers ignore it.
+   */
+  subGraphName?: string;
   /** UAL of the KC discovered via `dkg:batchId == kaId`. */
   ual: string;
   /** Root entities for each KA, in stable (sorted) order. */
@@ -155,11 +166,31 @@ export class KCDataMissingError extends Error {
  * Throws {@link KCNotFoundError}, {@link KCRootEntitiesNotFoundError},
  * or {@link KCDataMissingError} on the named failure modes — each is a
  * skip-this-period signal for the prover, not a retry.
+ *
+ * #1367 — sub-graph awareness. A KA published into a named sub-graph is
+ * sampled under the PARENT cgId (the chain has no sub-graph dimension) but
+ * its public data does NOT live in the per-cgId data graph above: the
+ * author keeps it in the per-KA verifiable-memory layer
+ * (`<cg>/<sub>/_verifiable_memory/<author>/<number>`) and a replica keeps
+ * it in the bare sub-graph graph (`<cg>/<sub>`). When the per-cgId graph
+ * yields nothing for a root we DISCOVER the sub-graph name from `_meta`
+ * (read-both: the per-cgId partition — populated on replicas — UNION the
+ * default label `_meta` — where the originator keeps it, because its
+ * per-cgId partition is the minimal `buildScopedMinimalMeta` shape that
+ * omits `dkg:subGraphName`) and fall back to those two graphs. This is a
+ * read-path change only: leaves are still `hashTripleV10` of the same
+ * triple content, so anchored roots are unchanged.
+ *
+ * `subGraphNameHint` short-circuits discovery for callers that already know
+ * the sub-graph (the dRAG citation path, which scans the graph URI first).
+ * It is ADDITIVE: the (a)→(b1)→(b2) cascade still runs, so a stale/empty
+ * hint can never cause under-inclusion or regress a root/remap KA.
  */
 export async function extractV10KCFromStore(
   store: TripleStore,
   cgId: bigint,
   kaId: bigint,
+  subGraphNameHint?: string,
 ): Promise<KCExtractionResult> {
   const cgIdStr = cgId.toString();
   // Map cgId (numeric) → local CG name via the ontology graph. The
@@ -254,23 +285,71 @@ export async function extractV10KCFromStore(
     throw new KCRootEntitiesNotFoundError(cgId, kaId, ual);
   }
 
-  // 3. Pull public triples per root entity. Same filter the publisher
-  //    used to gather SWM quads; keeps the leaf set bit-for-bit.
-  const triples: KCTriple[] = [];
-  for (const root of rootEntities) {
+  // 3. Pull public triples per root entity, with the #1367 sub-graph
+  //    cascade. For each root: read the per-cgId data graph (a) FIRST — the
+  //    sole home for CG-root and remapped KAs. Only when (a) yields nothing
+  //    for some root do we discover the sub-graph and fall back to the
+  //    per-KA verifiable-memory layer (b1, author publish) then the bare
+  //    sub-graph graph (b2, replica finalization). FIRST non-empty source
+  //    per root wins — never a UNION: two co-resident copies with divergent
+  //    literal escaping would not collapse under set semantics and would
+  //    inflate the leaf set → V10ProofLeafCountMismatch. The root+genid
+  //    subject filter and POST_PUBLISH_PREDICATES_TO_SKIP exclusion (the VM
+  //    layer carries self-attested trust stamps) apply to every source.
+  const readRoot = async (graph: string, root: string): Promise<KCTriple[]> => {
     const genidPrefix = `${root}/.well-known/genid/`;
     const result = await store.query(
       `CONSTRUCT { ?s ?p ?o } WHERE {
-         GRAPH <${dataGraph}> {
+         GRAPH <${graph}> {
            ?s ?p ?o .
            FILTER(?s = <${root}> || STRSTARTS(STR(?s), "${escapeSparqlString(genidPrefix)}"))
          }
        }`,
     );
-    if (result.type === 'quads') {
-      for (const q of result.quads) {
-        if (POST_PUBLISH_PREDICATES_TO_SKIP.has(q.predicate)) continue;
-        triples.push({ subject: q.subject, predicate: q.predicate, object: q.object });
+    if (result.type !== 'quads') return [];
+    const out: KCTriple[] = [];
+    for (const q of result.quads) {
+      if (POST_PUBLISH_PREDICATES_TO_SKIP.has(q.predicate)) continue;
+      out.push({ subject: q.subject, predicate: q.predicate, object: q.object });
+    }
+    return out;
+  };
+
+  const triples: KCTriple[] = [];
+  const emptyRoots: string[] = [];
+  for (const root of rootEntities) {
+    const fromRoot = await readRoot(dataGraph, root);
+    if (fromRoot.length > 0) triples.push(...fromRoot);
+    else emptyRoots.push(root);
+  }
+
+  // Hot path: CG-root / remapped KAs satisfy every root from (a), so we never
+  // discover or touch any sub-graph graph — identical work to pre-#1367.
+  let subGraphName: string | undefined;
+  if (emptyRoots.length > 0) {
+    subGraphName = await resolveSubGraphName(store, metaGraph, cgName, ual, subGraphNameHint);
+    if (subGraphName) {
+      // (author, number) is globally unique per chain (ka_numbers is keyed on
+      // author only; the contract reverts KaIdNamespaceMismatch otherwise), so
+      // these constructed URIs can only ever name THIS KA's graphs. All parts
+      // are safe-by-construction: cgName was assertSafeIri-probed in
+      // resolveContextGraphNameFromOnChainId, subGraphName is validateSubGraphName'd
+      // in resolveSubGraphName, author is hex and number is numeric — no
+      // store-returned IRI is interpolated into SPARQL.
+      const vmAuthor = '0x' + (kaId >> 96n).toString(16).padStart(40, '0');
+      const vmNumber = kaId & ((1n << 96n) - 1n);
+      const subSources = [
+        contextGraphLayerUri(cgName, MemoryLayer.VerifiableMemory, vmAuthor, vmNumber, subGraphName), // (b1)
+        contextGraphSubGraphUri(cgName, subGraphName), // (b2)
+      ];
+      for (const root of emptyRoots) {
+        for (const g of subSources) {
+          const fromSub = await readRoot(g, root);
+          if (fromSub.length > 0) {
+            triples.push(...fromSub);
+            break; // first non-empty source for THIS root — do not union the rest
+          }
+        }
       }
     }
   }
@@ -284,10 +363,46 @@ export async function extractV10KCFromStore(
   const leaves: Uint8Array[] = triples.map((t) => hashTripleV10(t.subject, t.predicate, t.object));
   for (const root of privateRoots) leaves.push(root);
 
-  return { contextGraphName: cgName, dataGraph, ual, rootEntities, triples, privateRoots, leaves };
+  return { contextGraphName: cgName, dataGraph, subGraphName, ual, rootEntities, triples, privateRoots, leaves };
 }
 
 // ── Internal helpers ───────────────────────────────────────────────────
+
+/**
+ * Resolve the sub-graph a KA's content lives in (#1367), or `undefined` for a
+ * CG-root KA. An explicit `hint` (dRAG citation path, which scanned the graph
+ * URI) short-circuits the query. Otherwise read `dkg:subGraphName` keyed on
+ * the UAL with a READ-BOTH union: the per-cgId `_meta` carries it on REPLICAS
+ * (the full confirmed meta is remapped there), while the ORIGINATOR keeps it
+ * only in the default label `_meta` — its per-cgId partition is the minimal
+ * `buildScopedMinimalMeta` shape, which omits `dkg:subGraphName`. Either source
+ * is validated before use; an absent/invalid value returns `undefined` so the
+ * caller safely degrades to root-only (a legacy sub-graph KA with no pointer
+ * simply stays `kc-not-synced`, never a wrong root).
+ */
+async function resolveSubGraphName(
+  store: TripleStore,
+  perCgIdMetaGraph: string,
+  cgName: string,
+  ual: string,
+  hint?: string,
+): Promise<string | undefined> {
+  if (hint) {
+    return validateSubGraphName(hint).valid ? hint : undefined;
+  }
+  const defaultMetaGraph = contextGraphMetaUri(cgName); // did:dkg:context-graph:<NAME>/_meta
+  const result = await store.query(
+    `SELECT ?sg WHERE {
+       { GRAPH <${perCgIdMetaGraph}> { <${ual}> <${DKG}subGraphName> ?sg } }
+       UNION
+       { GRAPH <${defaultMetaGraph}> { <${ual}> <${DKG}subGraphName> ?sg } }
+     } LIMIT 1`,
+  );
+  if (result.type !== 'bindings' || result.bindings.length === 0) return undefined;
+  const sg = stripQuotes(result.bindings[0]['sg'] ?? '');
+  if (!sg || !validateSubGraphName(sg).valid) return undefined;
+  return sg;
+}
 
 /**
  * Look up the local CG name for a given on-chain id.
@@ -397,7 +512,8 @@ export async function extractV10KCQuads(
   store: TripleStore,
   cgId: bigint,
   kaId: bigint,
+  subGraphNameHint?: string,
 ): Promise<Quad[]> {
-  const result = await extractV10KCFromStore(store, cgId, kaId);
+  const result = await extractV10KCFromStore(store, cgId, kaId, subGraphNameHint);
   return result.triples.map((t) => ({ ...t, graph: result.dataGraph }));
 }

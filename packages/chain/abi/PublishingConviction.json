@@ -114,6 +114,22 @@
   {
     "inputs": [
       {
+        "internalType": "uint256",
+        "name": "accountId",
+        "type": "uint256"
+      },
+      {
+        "internalType": "address",
+        "name": "caller",
+        "type": "address"
+      }
+    ],
+    "name": "NotAccountOwner",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
         "internalType": "address",
         "name": "caller",
         "type": "address"
@@ -330,6 +346,31 @@
       },
       {
         "indexed": true,
+        "internalType": "address",
+        "name": "owner",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "cleared",
+        "type": "uint256"
+      }
+    ],
+    "name": "AgentsCleared",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "accountId",
+        "type": "uint256"
+      },
+      {
+        "indexed": true,
         "internalType": "uint40",
         "name": "epoch",
         "type": "uint40"
@@ -492,6 +533,19 @@
       }
     ],
     "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "accountId",
+        "type": "uint256"
+      }
+    ],
+    "name": "clearAgents",
+    "outputs": [],
+    "stateMutability": "nonpayable",
     "type": "function"
   },
   {

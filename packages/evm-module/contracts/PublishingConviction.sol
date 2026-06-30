@@ -326,6 +326,23 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
         _;
     }
 
+    /// @dev Owner-gate for the ONE direct-to-logic owner action (`clearAgents`).
+    ///      DELIBERATE, isolated exception to the usual pattern where owner
+    ///      validation lives on the NFT wrapper and logic is gated by
+    ///      `onlyConvictionNFT`: the wrapper is non-upgradeable and exposes no
+    ///      `clearAgents` entry point, so the bulk reset validates ownership
+    ///      here against the live `ownerOf`. Do NOT copy this for new agent
+    ///      operations — add those to the wrapper. `ownerOf` reverts for a
+    ///      nonexistent account (and for an unresolvable address(0) NFT), so a
+    ///      bad id cannot slip past this gate.
+    modifier onlyCurrentPcaOwner(uint256 accountId) {
+        address nftAddr = hub.getContractAddress("DKGPublishingConvictionNFT");
+        if (IERC721(nftAddr).ownerOf(accountId) != msg.sender) {
+            revert NotAccountOwner(accountId, msg.sender);
+        }
+        _;
+    }
+
     // ============================================================
     //                  Account lifecycle
     // ============================================================
@@ -1173,19 +1190,12 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
     /// @dev    PCA NFT transfers PRESERVE the allow-list (it travels with the
     ///         token; see `onTransfer`). This is the explicit reset: a new owner
     ///         can drop an inherited allow-list, or an owner can wipe it before
-    ///         transferring the PCA to another party. Owner-validation is done
-    ///         HERE via `ownerOf` (not on the NFT wrapper, which is
-    ///         non-upgradeable and exposes no entry point for this) — so unlike
-    ///         `registerAgent`/`deregisterAgent` (gated by the wrapper), this is a
-    ///         direct owner-gated call. `ownerOf` reverts for a nonexistent
-    ///         account, so a bad id cannot reach the storage write; an
-    ///         unresolvable NFT (address 0) reverts the `ownerOf` call too.
-    function clearAgents(uint256 accountId) external {
-        address nftAddr = hub.getContractAddress("DKGPublishingConvictionNFT");
-        if (IERC721(nftAddr).ownerOf(accountId) != msg.sender) {
-            revert NotAccountOwner(accountId, msg.sender);
-        }
+    ///         transferring the PCA to another party.
+    function clearAgents(uint256 accountId) external onlyCurrentPcaOwner(accountId) {
         uint256 cleared = publishingConvictionStorage.agentCount(accountId);
+        // slither-disable-next-line reentrancy-events -- the callee is the trusted
+        // Hub-registered PublishingConvictionStorage (onlyContracts), state is
+        // written there before this event, and no value is transferred.
         publishingConvictionStorage.clearAgents(accountId);
         emit AgentsCleared(accountId, msg.sender, cleared);
     }

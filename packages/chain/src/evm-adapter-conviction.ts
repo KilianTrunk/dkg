@@ -367,6 +367,29 @@ export class ConvictionMethods extends EVMChainAdapterBase implements Conviction
     });
   }
 
+  /**
+   * Bulk-clear EVERY registered agent of a PCA. Owner-gated on-chain (ownerOf
+   * == caller). Unlike register/deregister (NFT-wrapper methods), `clearAgents`
+   * lives on the PublishingConviction LOGIC contract — the non-upgradeable
+   * wrapper has no entry point for it — so resolve the logic directly. Note PCA
+   * transfers PRESERVE the allow-list; this is the explicit reset a new owner
+   * uses to drop inherited agents.
+   */
+  async clearPublishingConvictionAgents(accountId: bigint): Promise<TxResult> {
+    await this.init();
+    return this.pcaWrite(async () => {
+      const logic = await this.resolveContract('PublishingConviction');
+      const receipt = await this.sendContractTransaction(
+        logic,
+        'clearAgents',
+        [accountId],
+        this.signer,
+        'clear publishing conviction agents',
+      );
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, txIndex: receipt.index, success: receipt.status === 1 };
+    });
+  }
+
   async isPublishingConvictionAgent(accountId: bigint, agent: string): Promise<boolean> {
     await this.init();
     if (!this.contracts.dkgPublishingConvictionNFT) return false;

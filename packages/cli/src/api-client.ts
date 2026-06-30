@@ -502,14 +502,18 @@ export class ApiClient {
    */
   async sharedMemoryWrite(contextGraphId: string, quads: Array<{
     subject: string; predicate: string; object: string; graph: string;
-  }>): Promise<{
+  }>, subGraphName?: string): Promise<{
     shareOperationId: string;
     contextGraphId: string;
     graph: string;
     triplesWritten: number;
     skolemizedBlankNodes?: number;
   }> {
-    return this.post('/api/shared-memory/write', { contextGraphId, quads });
+    return this.post('/api/shared-memory/write', {
+      contextGraphId,
+      quads,
+      ...(subGraphName ? { subGraphName } : {}),
+    });
   }
 
   /**

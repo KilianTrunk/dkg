@@ -110,7 +110,9 @@ describe('crypto_bitcoin golden import (§4.1)', () => {
       ds.quads.some(
         (q) =>
           q.predicate === 'http://schema.org/citation' &&
-          q.object.startsWith('https://bigquery.googleapis.com'),
+          // exact URL (not a host-prefix startsWith — that trips CodeQL's incomplete
+          // URL-sanitization rule and is a weaker check anyway).
+          q.object === 'https://bigquery.googleapis.com/v2/projects/bigquery-public-data/datasets/crypto_bitcoin',
       ),
     ).toBe(true);
   });

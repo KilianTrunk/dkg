@@ -744,7 +744,7 @@ export class MockChainAdapter implements ChainAdapter {
     return this.convictionAccounts.get(accountId)?.primaryNode ?? 0n;
   }
 
-  async getPcaContractContext(): Promise<{ chainId: number; hubAddress: string; nftAddress: string; tokenAddress: string; publishingConvictionAddress: string }> {
+  async getPcaContractContext(): Promise<{ chainId: number; hubAddress: string; nftAddress: string; tokenAddress: string; publishingConvictionAddress: string; clearAgentsSupported: boolean }> {
     // Mock has no real contracts; return deterministic placeholders so the
     // wallet-connect endpoint stays shaped-correctly on a no-chain node.
     return {
@@ -753,6 +753,7 @@ export class MockChainAdapter implements ChainAdapter {
       nftAddress: '0x' + '0'.repeat(40),
       tokenAddress: '0x' + '0'.repeat(40),
       publishingConvictionAddress: '0x' + '0'.repeat(40),
+      clearAgentsSupported: true,
     };
   }
 

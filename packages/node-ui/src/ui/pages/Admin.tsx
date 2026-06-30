@@ -696,13 +696,15 @@ function PcaCard({
         <button
           className="dkg-btn-secondary"
           style={{ fontSize: 11 }}
-          disabled={!canManage || action.saving || pca.agentCount === 0 || !useWalletPath}
+          disabled={!canManage || action.saving || pca.agentCount === 0 || !useWalletPath || !contracts?.clearAgentsSupported}
           title={
             pca.agentCount === 0
               ? 'No agents to clear'
-              : !useWalletPath
-                ? 'Bulk clear is available for a wallet-owned PCA; for a node-owned PCA remove agents individually (full node support ships with the PublishingConviction upgrade)'
-                : ownerGatedTitle
+              : !contracts?.clearAgentsSupported
+                ? 'Available once the PublishingConviction 10.0.6 upgrade is deployed on this chain'
+                : !useWalletPath
+                  ? 'Bulk clear is available for a wallet-owned PCA; for a node-owned PCA remove agents individually (full node support ships with the PublishingConviction upgrade)'
+                  : ownerGatedTitle
           }
           onClick={() => { action.setError(null); setModal('clearAgents'); }}
         >Clear agents</button>

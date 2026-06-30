@@ -948,6 +948,7 @@ export interface ChainAdapter {
     nftAddress: string;
     tokenAddress: string;
     publishingConvictionAddress: string;
+    clearAgentsSupported: boolean;
   }>;
 
   /**

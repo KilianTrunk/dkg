@@ -656,6 +656,7 @@ describe('GET /api/pca/contracts — wallet-connect address context', () => {
         nftAddress: '0x' + '2'.repeat(40),
         tokenAddress: '0x' + '3'.repeat(40),
         publishingConvictionAddress: '0x' + '4'.repeat(40),
+        clearAgentsSupported: true,
       }),
     };
     const { res, done } = runCtx('GET', '/api/pca/contracts', agent);
@@ -667,6 +668,7 @@ describe('GET /api/pca/contracts — wallet-connect address context', () => {
       nftAddress: '0x' + '2'.repeat(40),
       tokenAddress: '0x' + '3'.repeat(40),
       publishingConvictionAddress: '0x' + '4'.repeat(40),
+      clearAgentsSupported: true,
     });
   });
 

@@ -2857,6 +2857,10 @@ export interface PcaContractContext {
   // PublishingConviction LOGIC contract — owns the owner-gated clearAgents
   // (the NFT wrapper has no entry point), so the wallet-connect path needs it.
   publishingConvictionAddress: string;
+  // True once the DEPLOYED PublishingConviction is >= 10.0.6 (clearAgents lands
+  // there). The UI gates the "Clear agents" button on it so it only enables
+  // after the upgrade is live — self-healing, no node redeploy needed.
+  clearAgentsSupported: boolean;
 }
 /** Addresses + chainId the browser wallet-connect path needs to build owner-signed PCA txs. */
 export const fetchPcaContracts = () => get<PcaContractContext>('/api/pca/contracts');

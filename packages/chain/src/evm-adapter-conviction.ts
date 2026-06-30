@@ -452,6 +452,7 @@ export class ConvictionMethods extends EVMChainAdapterBase implements Conviction
     nftAddress: string;
     tokenAddress: string;
     publishingConvictionAddress: string;
+    clearAgentsSupported: boolean;
   }> {
     await this.init();
     const nft = this.requireConvictionNFT();
@@ -465,6 +466,18 @@ export class ConvictionMethods extends EVMChainAdapterBase implements Conviction
     // needs its address to wallet-sign the bulk agent reset.
     const logic = await this.resolveContract('PublishingConviction');
     const publishingConvictionAddress = ethers.getAddress(await logic.getAddress());
+    // `clearAgents` lands in PublishingConviction 10.0.6. Gate the UI on the
+    // DEPLOYED version so the button only enables once the upgrade is live —
+    // self-healing (no node software redeploy needed when the contract is
+    // upgraded). Fail closed (unsupported) if the version can't be read.
+    let clearAgentsSupported = false;
+    try {
+      const v = String(await logic.version()).split('.').map((n) => parseInt(n, 10) || 0);
+      const [maj, min, pat] = [v[0] ?? 0, v[1] ?? 0, v[2] ?? 0];
+      clearAgentsSupported = maj > 10 || (maj === 10 && (min > 0 || (min === 0 && pat >= 6)));
+    } catch {
+      /* unknown / pre-versioned contract → treat as unsupported */
+    }
     const chainId = Number(await this.getEvmChainId());
     return {
       chainId,
@@ -472,6 +485,7 @@ export class ConvictionMethods extends EVMChainAdapterBase implements Conviction
       nftAddress,
       tokenAddress,
       publishingConvictionAddress,
+      clearAgentsSupported,
     };
   }
 

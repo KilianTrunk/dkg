@@ -1256,11 +1256,11 @@ describe('@unit DKGPublishingConvictionNFT', function () {
   });
 
   // ======================================================================
-  // H. ERC-721 behavior (agent clearing on transfer)
+  // H. ERC-721 behavior — agent allow-list PRESERVED across transfer
   // ======================================================================
 
-  describe('ERC-721 transferability', () => {
-    it('clears agent registrations on transfer', async () => {
+  describe('ERC-721 transferability — agents preserved across transfer', () => {
+    it('PRESERVES agent registrations on transferFrom (the allow-list travels with the PCA)', async () => {
       const amount = hre.ethers.parseEther('60000');
       await TokenContract.approve(await NFT.getAddress(), amount);
       await NFT.createAccount(amount, 0);
@@ -1269,18 +1269,90 @@ describe('@unit DKGPublishingConvictionNFT', function () {
 
       await NFT.transferFrom(accounts[0].address, accounts[7].address, 1);
 
-      expect(await NFT.getRegisteredAgents(1)).to.deep.equal([]);
-      expect(await NFT.agentToAccountId(agent)).to.equal(0n);
+      expect(await NFT.ownerOf(1)).to.equal(accounts[7].address);
+      expect(await NFT.getRegisteredAgents(1)).to.deep.equal([agent]); // preserved, not cleared
+      expect(await NFT.agentToAccountId(agent)).to.equal(1n); // still bound to the account
     });
 
-    it('new owner can register fresh agents after transfer', async () => {
+    it('PRESERVES agents on safeTransferFrom to an EOA (the standard-wallet path)', async () => {
+      const amount = hre.ethers.parseEther('60000');
+      await TokenContract.approve(await NFT.getAddress(), amount);
+      await NFT.createAccount(amount, 0);
+      const agent = accounts[3].address;
+      await NFT.registerAgent(1, agent);
+
+      await NFT['safeTransferFrom(address,address,uint256)'](
+        accounts[0].address,
+        accounts[7].address,
+        1,
+      );
+
+      expect(await NFT.getRegisteredAgents(1)).to.deep.equal([agent]);
+    });
+
+    it('a new owner can ADD agents on top of the preserved list', async () => {
       const amount = hre.ethers.parseEther('60000');
       await TokenContract.approve(await NFT.getAddress(), amount);
       await NFT.createAccount(amount, 0);
       await NFT.registerAgent(1, accounts[3].address);
       await NFT.transferFrom(accounts[0].address, accounts[7].address, 1);
       await NFT.connect(accounts[7]).registerAgent(1, accounts[8].address);
-      expect(await NFT.getRegisteredAgents(1)).to.deep.equal([accounts[8].address]);
+      expect(await NFT.getRegisteredAgents(1)).to.deep.equal([
+        accounts[3].address,
+        accounts[8].address,
+      ]);
+    });
+  });
+
+  // ======================================================================
+  // H2. clearAgents — explicit owner-gated bulk reset (on the logic contract)
+  // ======================================================================
+
+  describe('clearAgents (explicit owner-gated reset)', () => {
+    // Create a PCA (id = totalSupply after mint) and register the given agents.
+    const createAccountWithAgents = async (...agents: string[]): Promise<bigint> => {
+      const amount = hre.ethers.parseEther('60000');
+      await TokenContract.approve(await NFT.getAddress(), amount);
+      await NFT.createAccount(amount, 0);
+      const id = await NFT.totalSupply();
+      for (const a of agents) await NFT.registerAgent(id, a);
+      return id;
+    };
+
+    it('owner clears the whole allow-list and emits AgentsCleared(count)', async () => {
+      const id = await createAccountWithAgents(accounts[3].address, accounts[4].address);
+
+      await expect(LogicContract.clearAgents(id))
+        .to.emit(LogicContract, 'AgentsCleared')
+        .withArgs(id, accounts[0].address, 2);
+
+      expect(await NFT.getRegisteredAgents(id)).to.deep.equal([]);
+      expect(await NFT.agentToAccountId(accounts[3].address)).to.equal(0n);
+      expect(await NFT.agentToAccountId(accounts[4].address)).to.equal(0n);
+    });
+
+    it('a NEW owner can clear the inherited allow-list after transfer', async () => {
+      const id = await createAccountWithAgents(accounts[3].address);
+      await NFT.transferFrom(accounts[0].address, accounts[7].address, id);
+      expect(await NFT.getRegisteredAgents(id)).to.deep.equal([accounts[3].address]); // preserved
+
+      await LogicContract.connect(accounts[7]).clearAgents(id); // new owner drops it
+      expect(await NFT.getRegisteredAgents(id)).to.deep.equal([]);
+      expect(await NFT.agentToAccountId(accounts[3].address)).to.equal(0n);
+    });
+
+    it('reverts NotAccountOwner for a non-owner caller', async () => {
+      const id = await createAccountWithAgents(accounts[3].address);
+
+      await expect(
+        LogicContract.connect(accounts[5]).clearAgents(id),
+      ).to.be.revertedWithCustomError(LogicContract, 'NotAccountOwner');
+      // unchanged
+      expect(await NFT.getRegisteredAgents(id)).to.deep.equal([accounts[3].address]);
+    });
+
+    it('reverts for a nonexistent account (ownerOf reverts)', async () => {
+      await expect(LogicContract.clearAgents(999)).to.be.reverted;
     });
   });
 
@@ -1482,7 +1554,7 @@ describe('@unit DKGPublishingConvictionNFT', function () {
       expect(sums2.total).to.equal(0n);
     });
 
-    it('NFT transfer auto-settles elapsed windows before clearing agents (pre-expiry)', async () => {
+    it('NFT transfer auto-settles elapsed windows (pre-expiry; agents preserved)', async () => {
       const committed = hre.ethers.parseEther('120000');
       const baseAllowance = committed / 12n;
       await TokenContract.approve(await NFT.getAddress(), committed);

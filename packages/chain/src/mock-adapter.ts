@@ -646,6 +646,17 @@ export class MockChainAdapter implements ChainAdapter {
     return this.txResult(true);
   }
 
+  // Owner-gated bulk reset. Mirrors PublishingConviction.clearAgents: clears the
+  // whole allow-list (preserved across transfer; this is the explicit reset).
+  async clearPublishingConvictionAgents(accountId: bigint): Promise<TxResult> {
+    const acct = this.requireConvictionOwner(accountId);
+    for (const key of acct.agents) {
+      this.agentToConvictionAccount.delete(key);
+    }
+    acct.agents.clear();
+    return this.txResult(true);
+  }
+
   async isPublishingConvictionAgent(accountId: bigint, agent: string): Promise<boolean> {
     if (!ethers.isAddress(agent)) return false;
     const acct = this.convictionAccounts.get(accountId);

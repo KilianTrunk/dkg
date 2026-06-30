@@ -6,6 +6,7 @@ import {INamed} from "./interfaces/INamed.sol";
 import {IVersioned} from "./interfaces/IVersioned.sol";
 import {IInitializable} from "./interfaces/IInitializable.sol";
 import {IPublishingConvictionErrors} from "./interfaces/IPublishingConvictionErrors.sol";
+import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {ContractStatus} from "./abstract/ContractStatus.sol";
 import {Chronos} from "./storage/Chronos.sol";
 import {EpochStorage} from "./storage/EpochStorage.sol";
@@ -127,7 +128,7 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
     //           are byte-identical, so seed and move stay net-zero on K_total.
     // 10.0.5 — KC→KA terminology: error InvalidConvictionKcEpochs → InvalidConvictionKaEpochs
     //          (error selector change; no behavior change).
-    string private constant _VERSION = "10.0.5";
+    string private constant _VERSION = "10.0.6";
 
     uint256 public constant BPS_DENOMINATOR = 10_000;
     /// @notice EpochStorage shard ID for the staker reward pool. Mirrors
@@ -204,6 +205,12 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
     );
     event AgentRegistered(uint256 indexed accountId, address indexed agent);
     event AgentDeregistered(uint256 indexed accountId, address indexed agent);
+    /// @notice Emitted when an owner bulk-clears a PCA's agent allow-list via
+    ///         `clearAgents`. `cleared` is the number of agents removed.
+    event AgentsCleared(uint256 indexed accountId, address indexed owner, uint256 cleared);
+
+    /// @notice The caller is not the current owner of `accountId`'s PCA NFT.
+    error NotAccountOwner(uint256 accountId, address caller);
     /// @notice OT-RFC-51: emitted when an account's designated primary node
     ///         changes (including the initial designation at creation, where
     ///         `oldNode == 0`).
@@ -315,6 +322,23 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
     modifier onlyConvictionNFT() {
         if (msg.sender != hub.getContractAddress("DKGPublishingConvictionNFT")) {
             revert OnlyConvictionNFT(msg.sender);
+        }
+        _;
+    }
+
+    /// @dev Owner-gate for the ONE direct-to-logic owner action (`clearAgents`).
+    ///      DELIBERATE, isolated exception to the usual pattern where owner
+    ///      validation lives on the NFT wrapper and logic is gated by
+    ///      `onlyConvictionNFT`: the wrapper is non-upgradeable and exposes no
+    ///      `clearAgents` entry point, so the bulk reset validates ownership
+    ///      here against the live `ownerOf`. Do NOT copy this for new agent
+    ///      operations — add those to the wrapper. `ownerOf` reverts for a
+    ///      nonexistent account (and for an unresolvable address(0) NFT), so a
+    ///      bad id cannot slip past this gate.
+    modifier onlyCurrentPcaOwner(uint256 accountId) {
+        address nftAddr = hub.getContractAddress("DKGPublishingConvictionNFT");
+        if (IERC721(nftAddr).ownerOf(accountId) != msg.sender) {
+            revert NotAccountOwner(accountId, msg.sender);
         }
         _;
     }
@@ -850,13 +874,15 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
         }
     }
 
-    /// @notice Trigger lazy-settlement from the NFT wrapper's transfer
-    ///         hook AND clear every agent registration so the new owner
-    ///         starts with a clean slate. Restricted to the NFT.
-    /// @dev    `from`/`to` arguments are not used internally — the
-    ///         wrapper passes them so a future audit-friendly extension
-    ///         (e.g. emitting a wrapper-layer transfer-settle event with
-    ///         both endpoints) does not require an interface change.
+    /// @notice Trigger lazy-settlement from the NFT wrapper's transfer hook so
+    ///         billing is brought current at the ownership change. Restricted to
+    ///         the NFT.
+    /// @dev    The agent allow-list is intentionally PRESERVED across transfer —
+    ///         it travels with the PCA like the rest of the account's state. Use
+    ///         the owner-gated `clearAgents` to reset it explicitly (a new owner
+    ///         can drop inherited agents; an owner can wipe them before handing
+    ///         the PCA over). `from`/`to` are unused internally — the wrapper
+    ///         passes them so a future event extension needs no interface change.
     function onTransfer(
         uint256 accountId,
         address /* from */,
@@ -870,7 +896,6 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
                 _finalSweep(acct, accountId);
             }
         }
-        publishingConvictionStorage.clearAgents(accountId);
     }
 
     /// @notice Internal helper: sweep all CLOSED windows up to the
@@ -1157,6 +1182,22 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
     ) external onlyConvictionNFT {
         publishingConvictionStorage.removeAgent(accountId, agent);
         emit AgentDeregistered(accountId, agent);
+    }
+
+    /// @notice Clear ALL registered publishing agents for `accountId` in a single
+    ///         call — the owner-gated bulk counterpart to the per-agent
+    ///         `deregisterAgent`.
+    /// @dev    PCA NFT transfers PRESERVE the allow-list (it travels with the
+    ///         token; see `onTransfer`). This is the explicit reset: a new owner
+    ///         can drop an inherited allow-list, or an owner can wipe it before
+    ///         transferring the PCA to another party.
+    function clearAgents(uint256 accountId) external onlyCurrentPcaOwner(accountId) {
+        uint256 cleared = publishingConvictionStorage.agentCount(accountId);
+        // slither-disable-next-line reentrancy-events -- the callee is the trusted
+        // Hub-registered PublishingConvictionStorage (onlyContracts), state is
+        // written there before this event, and no value is transferred.
+        publishingConvictionStorage.clearAgents(accountId);
+        emit AgentsCleared(accountId, msg.sender, cleared);
     }
 
     // ============================================================

@@ -911,6 +911,7 @@ export interface ChainAdapter {
   topUpPublishingConvictionAccount?(accountId: bigint, amount: bigint): Promise<TxResult>;
   registerPublishingConvictionAgent?(accountId: bigint, agent: string): Promise<TxResult>;
   deregisterPublishingConvictionAgent?(accountId: bigint, agent: string): Promise<TxResult>;
+  clearPublishingConvictionAgents?(accountId: bigint): Promise<TxResult>;
   isPublishingConvictionAgent?(accountId: bigint, agent: string): Promise<boolean>;
   settlePublishingConvictionAccount?(accountId: bigint): Promise<TxResult>;
   getPublishingConvictionAccountInfo?(accountId: bigint): Promise<V10PublishingConvictionAccountInfo | null>;

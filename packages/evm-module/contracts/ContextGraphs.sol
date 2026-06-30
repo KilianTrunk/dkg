@@ -451,9 +451,11 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable, Re
      *        authorization. Instead we LIVE-RESOLVE the current PCA NFT
      *        owner via `IDKGPublishingConvictionNFT.ownerOf(accountId)` and
      *        accept either (a) that live owner directly or (b) a registered
-     *        agent whose `agentToAccountId(publisher) == accountId`. Both
-     *        mappings on the NFT contract are cleared by the transfer hook,
-     *        so stale agent entries automatically stop authorizing.
+     *        agent whose `agentToAccountId(publisher) == accountId`. The live
+     *        owner check revokes the FORMER owner immediately on transfer. The
+     *        agent allow-list, however, is PRESERVED across transfer (it travels
+     *        with the PCA), so a former owner's registered agents retain publish
+     *        authority until the new owner calls `PublishingConviction.clearAgents`.
      *
      *      Branch order is IMPORTANT. Because the EOA/Safe branch matches on
      *      the stored authority snapshot, it MUST NOT run in PCA mode — an
@@ -534,9 +536,11 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable, Re
             return false;
         }
 
-        // Registered agent of the authorized account. `agentToAccountId`
-        // is cleared by the NFT's `_update` transfer hook, so stale agent
-        // entries automatically stop authorizing post-transfer.
+        // Registered agent of the authorized account. The agent allow-list is
+        // PRESERVED across PCA transfer (it travels with the token), so a former
+        // owner's agents keep authorizing here until the new owner explicitly
+        // resets it via `PublishingConviction.clearAgents`. The former OWNER is
+        // still revoked immediately by the live `ownerOf` check above.
         uint256 publisherAccountId = IDKGPublishingConvictionNFT(nftAddr).agentToAccountId(publisher);
         return publisherAccountId != 0 && publisherAccountId == authorityAccountId;
     }

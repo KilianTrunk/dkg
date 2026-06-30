@@ -274,7 +274,11 @@ const PINNED_DIGESTS: Record<string, string> = {
   // widened Account tuple, realized-publish credit removed / publishingAllocation rename.
   // Repinned: KC→KA rename of error InvalidConvictionKcEpochs → InvalidConvictionKaEpochs
   // (error selector change; contract bumped to 10.0.5).
-  PublishingConviction:         'a4d44a594509e508091b1f91adfb1d68bec65e38e497f054116493af327ff096',
+  // Repinned (preserve-agents-on-transfer, 10.0.6): added the owner-gated bulk
+  // `clearAgents(uint256)` + event `AgentsCleared(uint256,address,uint256)` +
+  // error `NotAccountOwner(uint256,address)` for the explicit allow-list reset
+  // (transfers now PRESERVE agents). Event/error surface change → new digest.
+  PublishingConviction:         '13281d751828dbb05603dc6a657e917f63680b4e0e052aa95a9d24392743d18a',
   // Updated OT-RFC-51: storage surface for the above — primaryNode field on the
   // widened Account tuple + the seeded per-epoch publishing allocation getters.
   PublishingConvictionStorage:  '7eeae71f0efd9183fce232ccc669227dfd70fe4f93b4663392a0a52c1ccba859',

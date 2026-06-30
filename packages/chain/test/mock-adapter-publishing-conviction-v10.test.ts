@@ -104,6 +104,23 @@ describe('MockChainAdapter — V10 conviction agent register/deregister', () => 
     expect((await mock.getPublishingConvictionAccountInfo(accountId))!.agentCount).toBe(0);
   });
 
+  it('clearPublishingConvictionAgents bulk-removes every agent and frees the reverse map', async () => {
+    const mock = new MockChainAdapter('mock:31337', SIGNER);
+    const { accountId } = await mock.createPublishingConvictionAccount(COMMITTED);
+    const agent1 = ethers.Wallet.createRandom().address;
+    const agent2 = ethers.Wallet.createRandom().address;
+    await mock.registerPublishingConvictionAgent(accountId, agent1);
+    await mock.registerPublishingConvictionAgent(accountId, agent2);
+    expect((await mock.getPublishingConvictionAccountInfo(accountId))!.agentCount).toBe(2);
+
+    const cleared = await mock.clearPublishingConvictionAgents(accountId);
+    expect(cleared.success).toBe(true);
+    expect(await mock.isPublishingConvictionAgent(accountId, agent1)).toBe(false);
+    expect(await mock.isPublishingConvictionAgent(accountId, agent2)).toBe(false);
+    expect(await mock.getConvictionAgentAccountId(agent1)).toBe(0n);
+    expect((await mock.getPublishingConvictionAccountInfo(accountId))!.agentCount).toBe(0);
+  });
+
   it('rejects re-registering an already-registered agent (N28 parity)', async () => {
     const mock = new MockChainAdapter('mock:31337', SIGNER);
     const { accountId } = await mock.createPublishingConvictionAccount(COMMITTED);

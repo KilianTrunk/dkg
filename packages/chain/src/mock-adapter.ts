@@ -657,6 +657,32 @@ export class MockChainAdapter implements ChainAdapter {
     return this.txResult(true);
   }
 
+  // Owner-gated bulk add. Mirrors PublishingConviction.registerAgents: validates
+  // the WHOLE batch (zero / duplicate / cap) before any mutation — all-or-nothing.
+  async registerPublishingConvictionAgents(accountId: bigint, agents: string[]): Promise<TxResult> {
+    const acct = this.requireConvictionOwner(accountId);
+    const cap = MockChainAdapter.MOCK_MAX_AGENTS_PER_ACCOUNT;
+    const toAdd: string[] = [];
+    for (const agent of agents) {
+      if (agent === ethers.ZeroAddress) {
+        throw new Error('Mock: ZeroAgentAddress()');
+      }
+      const key = ethers.getAddress(agent).toLowerCase();
+      if (this.agentToConvictionAccount.has(key) || toAdd.includes(key)) {
+        throw new Error(`Mock: AgentAlreadyRegistered(${agent})`);
+      }
+      if (acct.agents.size + toAdd.length >= cap) {
+        throw new Error(`Mock: AgentCapReached(${accountId}, ${cap})`);
+      }
+      toAdd.push(key);
+    }
+    for (const key of toAdd) {
+      acct.agents.add(key);
+      this.agentToConvictionAccount.set(key, accountId);
+    }
+    return this.txResult(true);
+  }
+
   async isPublishingConvictionAgent(accountId: bigint, agent: string): Promise<boolean> {
     if (!ethers.isAddress(agent)) return false;
     const acct = this.convictionAccounts.get(accountId);

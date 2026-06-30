@@ -121,6 +121,28 @@ describe('MockChainAdapter — V10 conviction agent register/deregister', () => 
     expect((await mock.getPublishingConvictionAccountInfo(accountId))!.agentCount).toBe(0);
   });
 
+  it('registerPublishingConvictionAgents bulk-adds all agents (all-or-nothing on a duplicate)', async () => {
+    const mock = new MockChainAdapter('mock:31337', SIGNER);
+    const { accountId } = await mock.createPublishingConvictionAccount(COMMITTED);
+    const a1 = ethers.Wallet.createRandom().address;
+    const a2 = ethers.Wallet.createRandom().address;
+
+    const res = await mock.registerPublishingConvictionAgents(accountId, [a1, a2]);
+    expect(res.success).toBe(true);
+    expect(await mock.isPublishingConvictionAgent(accountId, a1)).toBe(true);
+    expect(await mock.isPublishingConvictionAgent(accountId, a2)).toBe(true);
+    expect((await mock.getPublishingConvictionAccountInfo(accountId))!.agentCount).toBe(2);
+
+    // All-or-nothing: a batch containing an already-registered agent reverts and
+    // adds none of its entries.
+    const a3 = ethers.Wallet.createRandom().address;
+    await expect(
+      mock.registerPublishingConvictionAgents(accountId, [a3, a1]),
+    ).rejects.toThrow(/AgentAlreadyRegistered/);
+    expect(await mock.isPublishingConvictionAgent(accountId, a3)).toBe(false);
+    expect((await mock.getPublishingConvictionAccountInfo(accountId))!.agentCount).toBe(2);
+  });
+
   it('rejects re-registering an already-registered agent (N28 parity)', async () => {
     const mock = new MockChainAdapter('mock:31337', SIGNER);
     const { accountId } = await mock.createPublishingConvictionAccount(COMMITTED);

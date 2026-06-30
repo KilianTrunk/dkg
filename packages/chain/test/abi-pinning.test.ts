@@ -277,8 +277,11 @@ const PINNED_DIGESTS: Record<string, string> = {
   // Repinned (preserve-agents-on-transfer, 10.0.6): added the owner-gated bulk
   // `clearAgents(uint256)` + event `AgentsCleared(uint256,address,uint256)` +
   // error `NotAccountOwner(uint256,address)` for the explicit allow-list reset
-  // (transfers now PRESERVE agents). Event/error surface change → new digest.
-  PublishingConviction:         '13281d751828dbb05603dc6a657e917f63680b4e0e052aa95a9d24392743d18a',
+  // (transfers now PRESERVE agents).
+  // Repinned (bulk-register-agents, 10.0.7): added owner-gated
+  // `registerAgents(uint256,address[])` (no new event/error — reuses
+  // AgentRegistered). Function surface change → new digest.
+  PublishingConviction:         '2f35f06c94b14f4137b5602d5fc58793bfe812bb5263c6545d9da50f479bdb29',
   // Updated OT-RFC-51: storage surface for the above — primaryNode field on the
   // widened Account tuple + the seeded per-epoch publishing allocation getters.
   PublishingConvictionStorage:  '7eeae71f0efd9183fce232ccc669227dfd70fe4f93b4663392a0a52c1ccba859',

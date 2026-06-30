@@ -390,6 +390,27 @@ export class ConvictionMethods extends EVMChainAdapterBase implements Conviction
     });
   }
 
+  /**
+   * Bulk-register MULTIPLE agents on a PCA in one tx. Owner-gated on-chain
+   * (ownerOf == caller). Like clearAgents, `registerAgents` lives on the
+   * PublishingConviction LOGIC contract (the frozen NFT wrapper has no batch
+   * entry point). All-or-nothing: any invalid entry reverts the whole batch.
+   */
+  async registerPublishingConvictionAgents(accountId: bigint, agents: string[]): Promise<TxResult> {
+    await this.init();
+    return this.pcaWrite(async () => {
+      const logic = await this.resolveContract('PublishingConviction');
+      const receipt = await this.sendContractTransaction(
+        logic,
+        'registerAgents',
+        [accountId, agents],
+        this.signer,
+        'bulk-register publishing conviction agents',
+      );
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, txIndex: receipt.index, success: receipt.status === 1 };
+    });
+  }
+
   async isPublishingConvictionAgent(accountId: bigint, agent: string): Promise<boolean> {
     await this.init();
     if (!this.contracts.dkgPublishingConvictionNFT) return false;

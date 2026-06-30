@@ -1356,6 +1356,70 @@ describe('@unit DKGPublishingConvictionNFT', function () {
     });
   });
 
+  describe('registerAgents (owner-gated bulk add)', () => {
+    const createAccount = async (): Promise<bigint> => {
+      const amount = hre.ethers.parseEther('60000');
+      await TokenContract.approve(await NFT.getAddress(), amount);
+      await NFT.createAccount(amount, 0);
+      return NFT.totalSupply();
+    };
+
+    it('owner bulk-registers multiple agents and emits AgentRegistered per agent', async () => {
+      const id = await createAccount();
+      const agents = [accounts[3].address, accounts[4].address, accounts[5].address];
+
+      const tx = await LogicContract.registerAgents(id, agents);
+      for (const a of agents) {
+        await expect(tx).to.emit(LogicContract, 'AgentRegistered').withArgs(id, a);
+      }
+      expect(await NFT.getRegisteredAgents(id)).to.deep.equal(agents);
+      for (const a of agents) expect(await NFT.agentToAccountId(a)).to.equal(id);
+    });
+
+    it('reverts NotAccountOwner for a non-owner caller (nothing registered)', async () => {
+      const id = await createAccount();
+      await expect(
+        LogicContract.connect(accounts[5]).registerAgents(id, [accounts[3].address]),
+      ).to.be.revertedWithCustomError(LogicContract, 'NotAccountOwner');
+      expect(await NFT.getRegisteredAgents(id)).to.deep.equal([]);
+    });
+
+    it('reverts ZeroAgentAddress on any zero-address entry — all-or-nothing', async () => {
+      const id = await createAccount();
+      await expect(
+        LogicContract.registerAgents(id, [accounts[3].address, hre.ethers.ZeroAddress]),
+      ).to.be.revertedWithCustomError(LogicContract, 'ZeroAgentAddress');
+      expect(await NFT.getRegisteredAgents(id)).to.deep.equal([]); // first entry rolled back too
+    });
+
+    it('reverts AgentCapReached when the batch exceeds the per-account cap — all-or-nothing', async () => {
+      await NFT.setMaxAgentsPerAccount(2);
+      const id = await createAccount();
+      await expect(
+        LogicContract.registerAgents(id, [
+          accounts[3].address,
+          accounts[4].address,
+          accounts[5].address,
+        ]),
+      ).to.be.revertedWithCustomError(LogicContract, 'AgentCapReached');
+      expect(await NFT.getRegisteredAgents(id)).to.deep.equal([]);
+    });
+
+    it('reverts AgentAlreadyRegistered on an in-array duplicate — all-or-nothing', async () => {
+      const id = await createAccount();
+      await expect(
+        LogicContract.registerAgents(id, [accounts[3].address, accounts[3].address]),
+      ).to.be.revertedWithCustomError(StorageContract, 'AgentAlreadyRegistered');
+      expect(await NFT.getRegisteredAgents(id)).to.deep.equal([]);
+    });
+
+    it('reverts for a nonexistent account (ownerOf reverts)', async () => {
+      await expect(
+        LogicContract.registerAgents(999, [accounts[3].address]),
+      ).to.be.reverted;
+    });
+  });
+
   // ======================================================================
   // I. Governance
   // ======================================================================

@@ -128,7 +128,7 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
     //           are byte-identical, so seed and move stay net-zero on K_total.
     // 10.0.5 — KC→KA terminology: error InvalidConvictionKcEpochs → InvalidConvictionKaEpochs
     //          (error selector change; no behavior change).
-    string private constant _VERSION = "10.0.6";
+    string private constant _VERSION = "10.0.7";
 
     uint256 public constant BPS_DENOMINATOR = 10_000;
     /// @notice EpochStorage shard ID for the staker reward pool. Mirrors
@@ -326,15 +326,15 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
         _;
     }
 
-    /// @dev Owner-gate for the ONE direct-to-logic owner action (`clearAgents`).
-    ///      DELIBERATE, isolated exception to the usual pattern where owner
-    ///      validation lives on the NFT wrapper and logic is gated by
+    /// @dev Owner-gate for the direct-to-logic BULK agent actions (`clearAgents`,
+    ///      `registerAgents`). DELIBERATE, isolated exception to the usual pattern
+    ///      where owner validation lives on the NFT wrapper and logic is gated by
     ///      `onlyConvictionNFT`: the wrapper is non-upgradeable and exposes no
-    ///      `clearAgents` entry point, so the bulk reset validates ownership
-    ///      here against the live `ownerOf`. Do NOT copy this for new agent
-    ///      operations — add those to the wrapper. `ownerOf` reverts for a
-    ///      nonexistent account (and for an unresolvable address(0) NFT), so a
-    ///      bad id cannot slip past this gate.
+    ///      batch entry point, so these validate ownership here against the live
+    ///      `ownerOf`. New SINGLE agent ops still belong on the wrapper; only the
+    ///      batch operations the frozen wrapper cannot host live here. `ownerOf`
+    ///      reverts for a nonexistent account (and for an unresolvable address(0)
+    ///      NFT), so a bad id cannot slip past this gate.
     modifier onlyCurrentPcaOwner(uint256 accountId) {
         address nftAddr = hub.getContractAddress("DKGPublishingConvictionNFT");
         if (IERC721(nftAddr).ownerOf(accountId) != msg.sender) {
@@ -1199,6 +1199,36 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
         publishingConvictionStorage.clearAgents(accountId);
         emit AgentsCleared(accountId, msg.sender, cleared);
     }
+
+    /// @notice Register MULTIPLE publishing agents for `accountId` in a single
+    ///         transaction — the owner-gated bulk counterpart to the per-agent
+    ///         `registerAgent`.
+    /// @dev    Direct-to-logic owner action (like `clearAgents`): the NFT wrapper
+    ///         is non-upgradeable and exposes no batch entry point. Each agent is
+    ///         validated EXACTLY as the single `registerAgent` path — non-zero,
+    ///         under the per-account cap (re-checked each iteration so the batch
+    ///         stops at the cap), and not already registered (PCS reverts
+    ///         AgentAlreadyRegistered, which also rejects in-array duplicates).
+    ///         ALL-OR-NOTHING: any invalid entry reverts the whole batch. Emits
+    ///         AgentRegistered per agent. Callee is the trusted Hub-registered
+    ///         PublishingConvictionStorage (onlyContracts).
+    // slither-disable-start reentrancy-events,calls-loop
+    function registerAgents(uint256 accountId, address[] calldata agents)
+        external
+        onlyCurrentPcaOwner(accountId)
+    {
+        uint256 cap = publishingConvictionStorage.maxAgentsPerAccount();
+        for (uint256 i = 0; i < agents.length; i++) {
+            address agent = agents[i];
+            if (agent == address(0)) revert ZeroAgentAddress();
+            if (publishingConvictionStorage.agentCount(accountId) >= cap) {
+                revert AgentCapReached(accountId, cap);
+            }
+            publishingConvictionStorage.addAgent(accountId, agent);
+            emit AgentRegistered(accountId, agent);
+        }
+    }
+    // slither-disable-end reentrancy-events,calls-loop
 
     // ============================================================
     //                  Discount tier ladder

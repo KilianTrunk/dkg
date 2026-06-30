@@ -1272,7 +1272,9 @@ describe('extractV10KCFromStore — #1367 sub-graph KA extraction', () => {
 
     const result = await extractV10KCFromStore(store, fixture.cgId, fixture.kaId, 'stray-hint');
     expect(result.subGraphName).toBeUndefined();
-    expect(result.triples).toEqual([{ subject: 'urn:e:root-ka', predicate: 'urn:p:name', object: '"root"' }]);
+    expect(result.triples.map(({ graph, ...t }) => t)).toEqual([{ subject: 'urn:e:root-ka', predicate: 'urn:p:name', object: '"root"' }]);
+    // #1367: source graph is tracked — a root KA reads only from the per-cgId data graph.
+    expect(result.triples.every((t) => t.graph === result.dataGraph)).toBe(true);
   });
 
   // ── Coverage (audit gaps) ──────────────────────────────────────────────
@@ -1370,8 +1372,59 @@ describe('extractV10KCFromStore — #1367 sub-graph KA extraction', () => {
     await seedScopedMinimalMeta(store, { cgName: CG_NAME, cgId: CG_ID, ual: UAL, kaId: KA_ID, roots: [ROOT] });
     // Pointer present but INVALID (whitespace → validateSubGraphName rejects it).
     await seedSubGraphPointer(store, { cgName: CG_NAME, cgId: CG_ID, ual: UAL, subGraphName: 'bad name', target: 'default' });
-    // (a) empty + invalid pointer → resolveSubGraphName returns undefined → no
+    // (a) empty + invalid pointer → resolveSubGraphNameFromMeta returns undefined → no
     // sub-graph URI is ever constructed/read → safe degrade, never a wrong root.
     await expect(extractV10KCFromStore(store, CG_ID, KA_ID)).rejects.toBeInstanceOf(KCDataMissingError);
+  });
+
+  // ── #1367 review fixes ──────────────────────────────────────────────────
+
+  it('STALE HINT is additive, not authoritative: a stale-but-valid hint falls back to the canonical _meta subGraphName', async () => {
+    // The KA's real sub-graph is SUB; the dRAG citation path passes a stale hint
+    // ("stale") whose graphs hold nothing. The hint must NOT suppress the _meta
+    // pointer — else a synced KA gets reported missing (KCDataMissingError).
+    await seedOntology(store, CG_NAME, CG_ID);
+    await seedScopedMinimalMeta(store, { cgName: CG_NAME, cgId: CG_ID, ual: UAL, kaId: KA_ID, roots: [ROOT] });
+    await seedSubGraphPointer(store, { cgName: CG_NAME, cgId: CG_ID, ual: UAL, subGraphName: SUB, target: 'percgid' });
+    await seedGraphData(store, contextGraphSubGraphUri(CG_NAME, SUB), TRIPLES);
+
+    const result = await extractV10KCFromStore(store, CG_ID, KA_ID, 'stale');
+
+    expect(result.subGraphName).toBe(SUB); // resolved via _meta, not the stale hint
+    expect(result.triples).toHaveLength(TRIPLES.length);
+    expectMatchesAnchor(result);
+  });
+
+  it('PARTIAL roots throw KCDataMissingError (benign skip) — never an incomplete leaf set', async () => {
+    // ROOT_A resolves from the sub-graph; ROOT_B has no data in ANY source. A
+    // partial set would build a V10 root over a SUBSET of leaves → mismatch with
+    // the on-chain root → data-corrupted on submit. The extractor must skip, not
+    // return the partial set.
+    const ROOT_A = 'urn:entity:rule-A';
+    const ROOT_B = 'urn:entity:rule-B';
+    await seedOntology(store, CG_NAME, CG_ID);
+    await seedScopedMinimalMeta(store, { cgName: CG_NAME, cgId: CG_ID, ual: UAL, kaId: KA_ID, roots: [ROOT_A, ROOT_B] });
+    await seedSubGraphPointer(store, { cgName: CG_NAME, cgId: CG_ID, ual: UAL, subGraphName: SUB, target: 'percgid' });
+    await seedGraphData(store, contextGraphSubGraphUri(CG_NAME, SUB), [
+      { subject: ROOT_A, predicate: 'urn:p:name', object: '"A"' },
+    ]); // ROOT_B intentionally absent everywhere
+
+    await expect(extractV10KCFromStore(store, CG_ID, KA_ID)).rejects.toBeInstanceOf(KCDataMissingError);
+  });
+
+  it('extractV10KCQuads reports each triple ACTUAL source graph (not a rewrite to the per-cgId data graph)', async () => {
+    await seedOntology(store, CG_NAME, CG_ID);
+    await seedScopedMinimalMeta(store, { cgName: CG_NAME, cgId: CG_ID, ual: UAL, kaId: KA_ID, roots: [ROOT] });
+    await seedSubGraphPointer(store, { cgName: CG_NAME, cgId: CG_ID, ual: UAL, subGraphName: SUB, target: 'percgid' });
+    const subGraph = contextGraphSubGraphUri(CG_NAME, SUB);
+    await seedGraphData(store, subGraph, TRIPLES);
+
+    const quads = await extractV10KCQuads(store, CG_ID, KA_ID);
+
+    expect(quads).toHaveLength(TRIPLES.length);
+    // Data lives in the bare sub-graph graph (b2) → quads must name THAT graph,
+    // not the per-cgId data graph.
+    expect(quads.every((q) => q.graph === subGraph)).toBe(true);
+    expect(quads.every((q) => q.graph === contextGraphDataUri(CG_NAME, CG_ID.toString()))).toBe(false);
   });
 });

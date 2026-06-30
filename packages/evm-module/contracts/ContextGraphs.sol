@@ -241,7 +241,7 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable, Re
     ///      deposit) on any resolution/call failure.
     function _tryWaiveRegistrationDeposit(uint256 accountId, uint96 deposit) internal returns (bool) {
         if (accountId == 0) return false;
-        address waiverAddr;
+        address waiverAddr = address(0);
         try hub.getContractAddress("ContextGraphWaiverStorage") returns (address addr) {
             waiverAddr = addr;
         } catch {

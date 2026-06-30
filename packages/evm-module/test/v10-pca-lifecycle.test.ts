@@ -2488,5 +2488,24 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
         (Waiver as any).connect(accounts[2]).tryConsumeWaiver(accountId, owner.address, ethers.parseEther('100')),
       ).to.be.revertedWithCustomError(Waiver, 'OnlyContextGraphs');
     });
+
+    // Review (otReviewAgent): the waiver depends on agent membership of the
+    // SPECIFIC backing PCA — `agentToAccountId(creator) == accountId`, not just
+    // "is a registered agent somewhere". An agent of a DIFFERENT PCA must not
+    // waive against this one.
+    it('does NOT waive when the caller is an agent of a DIFFERENT PCA (pins the equality check)', async () => {
+      await setDeposit(); // 100; floor 25k
+      const ownerA = accounts[1];
+      const ownerB = accounts[3];
+      const agentOfB = accounts[4];
+      const accountA = await createAccountFor(ownerA); // PCA #1 (50k)
+      const accountB = await createAccountFor(ownerB); // PCA #2 (50k)
+      await NFT.connect(ownerB).registerAgent(accountB, agentOfB.address); // agent of #2 only
+      expect(await NFT.agentToAccountId(agentOfB.address)).to.equal(accountB);
+
+      // agentOfB targets PCA #1 (ownerA's) → not its agent, not its owner →
+      // not waived → unfunded create reverts (deposit charged).
+      await expect(createPcaCg(agentOfB, ownerA, accountA)).to.be.reverted;
+    });
   });
 });

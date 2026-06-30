@@ -83,7 +83,9 @@ contract ContextGraphWaiverStorage is INamed, IVersioned, IContextGraphWaiverSto
         // for a never-minted id (committedTRAC == 0 ⇒ rejected). Expiry is
         // timestamp-based, matching coverPublishingCost. Tuple idx: 0=committed,
         // 4=expiresAtTimestamp, 8=fullySwept.
-        uint96 committedTRAC;
+        uint96 committedTRAC = 0;
+        // We read 3 of the 11 account-tuple fields on purpose.
+        // slither-disable-next-line unused-return
         try nft.accounts(accountId) returns (
             uint96 committed,
             uint40,
@@ -98,6 +100,8 @@ contract ContextGraphWaiverStorage is INamed, IVersioned, IContextGraphWaiverSto
             uint40
         ) {
             if (committed == 0 || fullySwept) return false;
+            // Timestamp expiry is intentional — mirrors coverPublishingCost.
+            // slither-disable-next-line timestamp
             if (expiresAtTimestamp != 0 && block.timestamp >= expiresAtTimestamp) return false;
             committedTRAC = committed;
         } catch {
@@ -116,7 +120,7 @@ contract ContextGraphWaiverStorage is INamed, IVersioned, IContextGraphWaiverSto
         // Gate 3: the CG creator is the PCA owner or a currently registered
         // agent. EXPLICIT caller check — ContextGraphs' coherence gate only ties
         // the stored authority to the owner, not the creator.
-        bool authorized;
+        bool authorized = false;
         try nft.ownerOf(accountId) returns (address owner_) {
             if (owner_ == creator) authorized = true;
         } catch {

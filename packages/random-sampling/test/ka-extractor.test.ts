@@ -1274,4 +1274,78 @@ describe('extractV10KCFromStore — #1367 sub-graph KA extraction', () => {
     expect(result.subGraphName).toBeUndefined();
     expect(result.triples).toEqual([{ subject: 'urn:e:root-ka', predicate: 'urn:p:name', object: '"root"' }]);
   });
+
+  // ── Coverage (audit gaps) ──────────────────────────────────────────────
+
+  it('MULTI-ROOT (replica/b2): a 2-root sub-graph KC accumulates ALL roots — combined leaf set matches the anchor', async () => {
+    const ROOT_A = 'urn:entity:rule-A';
+    const ROOT_B = 'urn:entity:rule-B';
+    const triplesA = [{ subject: ROOT_A, predicate: 'urn:p:name', object: '"A"' }];
+    const triplesB = [
+      { subject: ROOT_B, predicate: 'urn:p:name', object: '"B"' },
+      { subject: ROOT_B, predicate: 'urn:p:note', object: ESCAPE_OBJ },
+    ];
+    await seedOntology(store, CG_NAME, CG_ID);
+    await seedScopedMinimalMeta(store, { cgName: CG_NAME, cgId: CG_ID, ual: UAL, kaId: KA_ID, roots: [ROOT_A, ROOT_B] });
+    await seedSubGraphPointer(store, { cgName: CG_NAME, cgId: CG_ID, ual: UAL, subGraphName: SUB, target: 'percgid' });
+    await seedGraphData(store, contextGraphSubGraphUri(CG_NAME, SUB), [...triplesA, ...triplesB]);
+
+    const result = await extractV10KCFromStore(store, CG_ID, KA_ID);
+
+    expect(result.subGraphName).toBe(SUB);
+    expect(result.triples).toHaveLength(triplesA.length + triplesB.length);
+    // Both roots' triples present — compare the leaf SET (order-independent).
+    const hex = (ls: Uint8Array[]) => ls.map((l) => Buffer.from(l).toString('hex')).sort();
+    const anchor = [...triplesA, ...triplesB].map((t) => hashTripleV10(t.subject, t.predicate, t.object));
+    expect(hex(result.leaves)).toEqual(hex(anchor));
+  });
+
+  it('FALLBACK non-union: (a) empty and BOTH (b1)+(b2) hold the root — only (b1) is read, never unioned with (b2)', async () => {
+    await seedOntology(store, CG_NAME, CG_ID);
+    await seedScopedMinimalMeta(store, { cgName: CG_NAME, cgId: CG_ID, ual: UAL, kaId: KA_ID, roots: [ROOT] });
+    await seedSubGraphPointer(store, { cgName: CG_NAME, cgId: CG_ID, ual: UAL, subGraphName: SUB, target: 'default' });
+    // (a) per-cgId data graph stays EMPTY.
+    // (b1) VM layer = the canonical copy.
+    const vmGraph = contextGraphLayerUri(CG_NAME, MemoryLayer.VerifiableMemory, vmAuthorOf(KA_ID), vmNumberOf(KA_ID), SUB);
+    await seedGraphData(store, vmGraph, TRIPLES);
+    // (b2) bare sub-graph = byte-divergent + an extra row that must NEVER be read.
+    await seedGraphData(store, contextGraphSubGraphUri(CG_NAME, SUB), [
+      { subject: ROOT, predicate: 'urn:p:name', object: '"rule one"' },
+      { subject: ROOT, predicate: 'urn:p:note', object: `"${escapeNQuads('a\\b"c\nx')}EXTRA"` },
+      { subject: ROOT, predicate: 'urn:p:extra', object: '"should never be read"' },
+    ]);
+
+    const result = await extractV10KCFromStore(store, CG_ID, KA_ID);
+
+    expect(result.subGraphName).toBe(SUB);
+    expect(result.triples).toHaveLength(TRIPLES.length); // (b1) only — not unioned with (b2)
+    expectMatchesAnchor(result);
+  });
+
+  it('skips a post-publish dkg:trustLevel stamp on the (b2) sub-graph source so leaf count stays bit-identical', async () => {
+    const TRUST_LEVEL_PREDICATE = 'http://dkg.io/ontology/trustLevel';
+    await seedOntology(store, CG_NAME, CG_ID);
+    await seedScopedMinimalMeta(store, { cgName: CG_NAME, cgId: CG_ID, ual: UAL, kaId: KA_ID, roots: [ROOT] });
+    await seedSubGraphPointer(store, { cgName: CG_NAME, cgId: CG_ID, ual: UAL, subGraphName: SUB, target: 'percgid' });
+    await seedGraphData(store, contextGraphSubGraphUri(CG_NAME, SUB), [
+      ...TRIPLES,
+      { subject: ROOT, predicate: TRUST_LEVEL_PREDICATE, object: '"5"' }, // post-publish stamp
+    ]);
+
+    const result = await extractV10KCFromStore(store, CG_ID, KA_ID);
+
+    expect(result.triples.map((t) => t.predicate)).not.toContain(TRUST_LEVEL_PREDICATE);
+    expect(result.triples).toHaveLength(TRIPLES.length); // stamp excluded on the sub-graph source too
+    expectMatchesAnchor(result);
+  });
+
+  it('an INVALID subGraphName pointer degrades to root-only (no wrong-URI read) → KCDataMissingError', async () => {
+    await seedOntology(store, CG_NAME, CG_ID);
+    await seedScopedMinimalMeta(store, { cgName: CG_NAME, cgId: CG_ID, ual: UAL, kaId: KA_ID, roots: [ROOT] });
+    // Pointer present but INVALID (whitespace → validateSubGraphName rejects it).
+    await seedSubGraphPointer(store, { cgName: CG_NAME, cgId: CG_ID, ual: UAL, subGraphName: 'bad name', target: 'default' });
+    // (a) empty + invalid pointer → resolveSubGraphName returns undefined → no
+    // sub-graph URI is ever constructed/read → safe degrade, never a wrong root.
+    await expect(extractV10KCFromStore(store, CG_ID, KA_ID)).rejects.toBeInstanceOf(KCDataMissingError);
+  });
 });

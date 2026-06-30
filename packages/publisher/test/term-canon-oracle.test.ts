@@ -190,3 +190,131 @@ describe('term-canon oracle: core == oxigraph 0.5.5', () => {
     }
   });
 });
+
+// Edge classes surfaced by a ~110k-case differential fuzz of
+// canonicalizeObjectTermForHash against real oxigraph 0.5.5 (#1386 review). Each is
+// asserted byte-equal to oxigraph's round-trip form (the deployed canonical form).
+describe('term-canon oracle: fuzz-hardened edge classes (#1386)', () => {
+  it('bare datatype IRIs ("v"^^IRI without <>) fold to the canonical bracketed form', async () => {
+    await expectMatchesOxigraph([
+      `"007"^^${xsd('integer')}`, `"1.50"^^${xsd('decimal')}`, `"1"^^${xsd('boolean')}`,
+      `"1.0E2"^^${xsd('double')}`, `"2026-06-29T24:00:00"^^${xsd('dateTime')}`,
+    ]);
+  });
+
+  it('integers canonicalize ONLY within i64; beyond it (or malformed) stay verbatim', async () => {
+    await expectMatchesOxigraph([
+      lit('9223372036854775807', 'integer'), lit('-9223372036854775808', 'integer'), // i64 bounds → canon
+      lit('+9223372036854775808', 'integer'), lit('00009223372036854775808', 'integer'), // > i64 → verbatim (+/zeros kept)
+      lit('-9223372036854775809', 'long'), lit('+-1', 'integer'), lit('99999999999999999999999', 'integer'),
+      lit('+5', 'int'), lit('007', 'long'), lit('-0', 'integer'),
+    ]);
+  });
+
+  it('decimals canonicalize ONLY within the i128/1e18 Decimal range; beyond → verbatim', async () => {
+    await expectMatchesOxigraph([
+      lit('170141183460469231731.687303715884105727', 'decimal'), // == max → canon
+      lit('0170141183460469231731.6873037158841057270', 'decimal'), // max ± zeros → strip
+      lit('0170141183460469231732', 'decimal'), // > max int → verbatim
+      lit('999999999999999999999999999999.5', 'decimal'), // magnitude overflow → verbatim
+      lit('0.1234567890123456789', 'decimal'), // 19 frac digits → verbatim
+      lit('1.50', 'decimal'), lit('.5', 'decimal'), lit('+0.0', 'decimal'), lit('007.000', 'decimal'),
+    ]);
+  });
+
+  it('double/float special values: case-insensitive nan / inf / infinity with optional sign', async () => {
+    const forms = ['NaN', 'nan', 'NAN', '+nan', '-nan', 'INF', 'inf', 'Infinity', 'infinity', '+Infinity', '-INF', '-inf', '-Infinity'];
+    await expectMatchesOxigraph(forms.map((v) => lit(v, 'double')));
+    await expectMatchesOxigraph(forms.map((v) => lit(v, 'float')));
+  });
+
+  it('double shortest-representation TIES round half away from zero (oxigraph/Rust, not V8 to-even)', async () => {
+    await expectMatchesOxigraph([lit('738507753103385.25', 'double'), lit('-738507753103385.25', 'double'), lit('738507753103385.2', 'double')]);
+  });
+
+  it('years: 4-digit or 5+-no-leading-zero canonicalize; leading-zero 5+ → verbatim; -0000 → 0000', async () => {
+    await expectMatchesOxigraph([
+      lit('12026-01-01T00:00:00+00:00', 'dateTime'), lit('100000-01-01T00:00:00+00:00', 'dateTime'),
+      lit('0000-01-01T00:00:00+00:00', 'dateTime'), lit('09508-01-01T00:00:00+00:00', 'dateTime'),
+      lit('-0000-06-15T12:30:45Z', 'dateTime'), lit('-0000', 'gYear'), lit('012026-06+00:00', 'gYearMonth'),
+    ]);
+  });
+
+  it('years whose seconds-since-epoch overflow oxigraph i128/1e18 Decimal → verbatim', async () => {
+    await expectMatchesOxigraph([
+      lit('5391559471918-01-01T00:00:00+00:00', 'dateTime'), // within range → fold tz to Z
+      lit('5391559471919-01-01T00:00:00+00:00', 'dateTime'), // overflow → verbatim (+00:00 kept)
+      lit('9223372036854775808+00:00', 'gYear'), lit('99999999999999999999-06+00:00', 'gYearMonth'),
+      lit('123456789012345678901234567890+00:00', 'date'),
+    ]);
+  });
+
+  it('dateTime/time fractional seconds beyond 18 digits → verbatim (no tz fold)', async () => {
+    await expectMatchesOxigraph([
+      lit('2026-06-29T12:00:00.123456789012345678+00:00', 'dateTime'), // 18 → fold tz to Z
+      lit('2026-06-29T12:00:00.1234567890123456789+00:00', 'dateTime'), // 19 → verbatim
+      lit('12:00:00.1234567890123456789+00:00', 'time'),
+    ]);
+  });
+
+  it('T24:00 rolls iff minute==0 OR seconds==0; otherwise verbatim', async () => {
+    await expectMatchesOxigraph([
+      lit('2026-06-29T24:00:00', 'dateTime'), lit('2026-06-29T24:00:01', 'dateTime'),
+      lit('2026-06-29T24:10:00', 'dateTime'), lit('2026-06-29T24:30:45', 'dateTime'),
+      lit('2026-06-29T24:12:00.5', 'dateTime'), lit('24:01:00', 'time'), lit('24:01:01', 'time'),
+    ]);
+  });
+
+  it('durations: value-space carry/overflow, subtype constraints, verbatim beyond i64/i128', async () => {
+    await expectMatchesOxigraph([
+      lit('P1Y13M', 'duration'), lit('PT3600S', 'duration'), lit('PT25H', 'dayTimeDuration'),
+      lit('P1DT24H', 'duration'), lit('-P1Y13M', 'duration'), lit('PT90.5S', 'duration'), lit('PT.5S', 'duration'),
+      lit('P1D', 'yearMonthDuration'), lit('P1Y', 'dayTimeDuration'),
+      lit('P768614336404564651Y', 'duration'), lit('P9999999999999999999DT0H', 'duration'),
+      lit('PT0.1234567890123456789S', 'duration'),
+    ]);
+  });
+
+  it('datatype IRI \\u escapes are decoded (oxigraph), affecting datatype matching', async () => {
+    await expectMatchesOxigraph([`"x"^^<http://example.org/\\u0041>`]);
+  });
+
+  it('a \\U escape beyond U+10FFFF never throws (the leaf computation must not crash)', () => {
+    expect(() => canonicalizeObjectTermForHash(`"\\U00110000"^^<${xsd('string')}>`)).not.toThrow();
+    expect(() => canonicalizeObjectTermForHash(`"x\\Uffffffffy"^^<${xsd('string')}>`)).not.toThrow();
+  });
+
+  it('NO-MIGRATION + idempotence over a broad battery: canon is the identity on oxigraph output', async () => {
+    const p2 = (n: number) => String(n).padStart(2, '0');
+    const battery: string[] = [];
+    for (const v of ['0', '7', '-42', '007', '+5', '999999999999999999999999', '9223372036854775808'])
+      battery.push(lit(v, 'integer'), lit(v, 'long'));
+    for (const v of ['1.0', '1.50', '.5', '-0.0', '123.456000', '999999999999999999999999999999.5'])
+      battery.push(lit(v, 'decimal'));
+    for (const v of ['1.0E2', '1e10', 'NaN', 'INF', '-INF', '3.14', '738507753103385.25', 'infinity'])
+      battery.push(lit(v, 'double'));
+    for (let h = 0; h <= 24; h++) for (const ss of ['00', '30', '59'])
+      battery.push(lit(`2026-06-29T${p2(h)}:00:${ss}`, 'dateTime'), lit(`${p2(h)}:00:${ss}`, 'time'));
+    for (const v of ['2026-06-29T12:00:00.500+00:00', '2026-06-29T24:00:00', '-0044-03-15T12:00:00', '09508-01-01T00:00:00'])
+      battery.push(lit(v, 'dateTime'));
+    for (const v of ['P1Y13M', 'PT3600S', 'PT25H', '-P1Y', 'P0Y0M0DT0H0M0S']) battery.push(lit(v, 'duration'));
+    battery.push(lit('café', 'string'), '"x"@EN', lit('4A6f', 'hexBinary'), `"007"^^${xsd('integer')}`);
+
+    const oxi = await oxigraphForms(battery);
+    for (let i = 0; i < battery.length; i++) {
+      const once = canonicalizeObjectTermForHash(battery[i]);
+      expect(canonicalizeObjectTermForHash(once)).toBe(once); // idempotent
+      if (oxi[i] !== '(DROPPED)') expect(canonicalizeObjectTermForHash(oxi[i])).toBe(oxi[i]); // identity on store output
+    }
+  });
+
+  // DOCUMENTED oxigraph 0.5.5 STORAGE defect, deliberately NOT mirrored (see term-canon.ts):
+  // a negative-year dateTime with seconds==59 + a non-zero fraction drifts the minute on
+  // every store round-trip (no stable form), so canon stays deterministic + idempotent.
+  it('negative-year dateTime with :59 + fraction — core is deterministic + idempotent (oxigraph is not)', () => {
+    const x = lit('-1711-04-09T15:19:59.6', 'dateTime');
+    const once = canonicalizeObjectTermForHash(x);
+    expect(once).toBe(x); // left as the valid XSD form
+    expect(canonicalizeObjectTermForHash(once)).toBe(once); // idempotent
+  });
+});

@@ -228,7 +228,9 @@ function canonDouble(lex: string, isFloat: boolean): string {
   if (n === 0) return Object.is(n, -0) ? '-0' : '0';
   const neg = n < 0;
   const a = Math.abs(n);
-  const shortest = roundTiesAwayFromZero(a, isFloat ? shortestFloat32String(a) : a.toString(), isFloat);
+  // double: V8's a.toString() IS the shortest round-trip; only ties need the
+  // away-from-zero correction. float: V8 has no f32-shortest, so search it.
+  const shortest = isFloat ? shortestFloat32String(a) : roundTiesAwayFromZero(a, a.toString(), false);
   const plain = expandToPlainDecimal(shortest);
   return neg ? `-${plain}` : plain;
 }
@@ -280,10 +282,30 @@ function parseXsdDouble(lex: string): number {
   return Number(lex);
 }
 
+// Shortest decimal that round-trips to the f32 `a`, matching Rust's f32 formatting.
+// V8 has no native f32-shortest, and a.toPrecision(p)/toExponential round `a` to
+// NEAREST — which can miss the round-tripping p-digit decimal sitting on the other
+// side of `a` (a's f32 rounding interval is wider than its f64 one). So at each
+// precision we test the nearest p-digit mantissa AND its ±1 neighbours (exact
+// integers, no float-grid error), keep those whose f32 round-trip equals a, and
+// pick the closest to a — ties to the away-from-zero (larger) value, as Rust does.
 function shortestFloat32String(a: number): string {
   for (let p = 1; p <= 9; p++) {
-    const s = a.toPrecision(p);
-    if (Math.fround(Number(s)) === a) return Number(s).toString();
+    const m = /^(\d)(?:\.(\d+))?e([+-]\d+)$/.exec(a.toExponential(p - 1));
+    if (!m) break;
+    const mant = m[1] + (m[2] ?? ''); // p significant digits
+    const e10 = parseInt(m[3], 10) - (p - 1); // value = mant × 10^e10
+    const base = BigInt(mant);
+    const valid: number[] = [];
+    for (const v of [base, base - 1n, base + 1n]) {
+      if (v <= 0n) continue;
+      const c = Number(`${v}e${e10}`);
+      if (Math.fround(c) === a) valid.push(c);
+    }
+    if (valid.length) {
+      valid.sort((x, y) => Math.abs(x - a) - Math.abs(y - a) || y - x); // closest; tie → away from zero
+      return valid[0].toString();
+    }
   }
   return a.toString();
 }
@@ -396,16 +418,17 @@ function canonDateTime(lex: string): string {
   if (rolls) {
     return `${rollNextDay(yy, moN, ddN)}T00:${mi}:${ss}${fracNorm}${tz}`;
   }
-  // KNOWN oxigraph 0.5.5 DEFECT (documented, NOT mirrored): a NEGATIVE-year
-  // dateTime with seconds == 59 AND a non-zero fraction is NON-IDEMPOTENT in the
-  // store — every load→serialize round-trip adds a minute and never stabilises
-  // (-1711-…T15:19:59.6 → :20:59.6 → :21:59.6 → …). No canonicalization can make
-  // such a value consensus-safe (its "stored form" drifts), so we deliberately do
-  // NOT replicate the bump: canon stays DETERMINISTIC + IDEMPOTENT (the best
-  // achievable), normalising tz/fraction like any other dateTime and leaving the
-  // wall-clock untouched. The residual exposure is a pre-existing oxigraph storage
-  // defect for an essentially-nonexistent input class (BCE timestamps at :59 with
-  // sub-second precision) — escalated to the store layer, tracked off this canon.
+  // KNOWN oxigraph 0.5.5 DEFECT (documented, NOT mirrored): a BEFORE-EPOCH dateTime
+  // (before 0001-01-01T00:00:00, i.e. year ≤ 0000) with seconds == 59 AND a non-zero
+  // fraction has its minute bumped by +1 on every load→serialize round-trip. Far
+  // before the epoch it never stabilises (-1711-…T15:19:59.6 → :20:59.6 → :21:59.6 →
+  // …); near it the bump just crosses into year 0001 once. Either way the store has
+  // no stable form for these, so no canonicalization can make them consensus-safe.
+  // We deliberately do NOT replicate the bump: canon stays DETERMINISTIC + IDEMPOTENT
+  // (the best achievable), normalising tz/fraction like any other dateTime and
+  // leaving the wall-clock untouched. Residual exposure = a pre-existing oxigraph
+  // storage defect for an essentially-nonexistent input class (BCE / year-0 timestamps
+  // at :59 with sub-second precision) — escalated to the store layer, off this canon.
   return `${normYear(yy)}-${mo}-${dd}T${hh}:${mi}:${ss}${fracNorm}${tz}`;
 }
 
@@ -448,8 +471,10 @@ function canonGYearMonth(lex: string): string {
   return `${normYear(m[1])}-${m[2]}${tz}`;
 }
 
-// gMonthDay/gMonth/gDay have no year, so February's max day is 29.
-const MONTH_MAX_DAY = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+// gMonthDay day bounds. oxigraph 0.5.5 validates --MM-DD against a NON-leap
+// reference year, so --02-29 is rejected (kept verbatim) — February's max is 28
+// here, unlike a real leap date which needs the year context of xsd:date.
+const MONTH_MAX_DAY = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 function canonGMonthDay(lex: string): string {
   const { body, tz } = splitTz(lex);
   const m = /^--(\d{2})-(\d{2})$/.exec(body);
@@ -479,8 +504,10 @@ function canonGDay(lex: string): string {
 // seconds: Decimal(i128 / 10^18) }. Parse to (months, scaledSeconds), reject if
 // either overflows its integer type (→ verbatim), then re-emit the canonical
 // component breakdown (Y=months/12, M=months%12; D/H/M/S from seconds).
+// Seconds accept a trailing dot with no fraction (oxigraph: "PT1.S" → "PT1S") and a
+// leading dot ("PT.5S" → "PT0.5S"), matching Rust's lenient parse.
 const RE_DURATION =
-  /^(-?)P(?:(\d+)Y)?(?:(\d+)M)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?|\.\d+)S)?)?$/;
+  /^(-?)P(?:(\d+)Y)?(?:(\d+)M)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d*)?|\.\d+)S)?)?$/;
 function canonDuration(lex: string, dt: string): string {
   const m = RE_DURATION.exec(lex);
   if (!m) throw new Error(`invalid duration: ${lex}`);

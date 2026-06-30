@@ -232,6 +232,25 @@ describe('term-canon oracle: fuzz-hardened edge classes (#1386)', () => {
     await expectMatchesOxigraph([lit('738507753103385.25', 'double'), lit('-738507753103385.25', 'double'), lit('738507753103385.2', 'double')]);
   });
 
+  it('xsd:float shortest representation matches Rust f32 formatting (not V8 toPrecision)', async () => {
+    await expectMatchesOxigraph([
+      lit('1.262177448353619e-29', 'float'), lit('1.5474250491067253e+26', 'float'),
+      lit('1.2379400392853803e+27', 'float'), lit('0.1', 'float'), lit('3.14', 'float'), lit('1.0E20', 'float'),
+    ]);
+  });
+
+  it('gMonthDay --02-29 is rejected by oxigraph (no leap-year context) → verbatim', async () => {
+    await expectMatchesOxigraph([
+      lit('--02-29+00:00', 'gMonthDay'), lit('--02-28+00:00', 'gMonthDay'), lit('--02-29', 'gMonthDay'),
+    ]);
+  });
+
+  it('duration seconds accept trailing/leading dot (PT1.S → PT1S, PT.5S → PT0.5S)', async () => {
+    await expectMatchesOxigraph([
+      lit('PT1.S', 'duration'), lit('PT.5S', 'duration'), lit('P1DT2.S', 'duration'), lit('PT60.S', 'duration'),
+    ]);
+  });
+
   it('years: 4-digit or 5+-no-leading-zero canonicalize; leading-zero 5+ → verbatim; -0000 → 0000', async () => {
     await expectMatchesOxigraph([
       lit('12026-01-01T00:00:00+00:00', 'dateTime'), lit('100000-01-01T00:00:00+00:00', 'dateTime'),
@@ -309,12 +328,13 @@ describe('term-canon oracle: fuzz-hardened edge classes (#1386)', () => {
   });
 
   // DOCUMENTED oxigraph 0.5.5 STORAGE defect, deliberately NOT mirrored (see term-canon.ts):
-  // a negative-year dateTime with seconds==59 + a non-zero fraction drifts the minute on
-  // every store round-trip (no stable form), so canon stays deterministic + idempotent.
-  it('negative-year dateTime with :59 + fraction — core is deterministic + idempotent (oxigraph is not)', () => {
-    const x = lit('-1711-04-09T15:19:59.6', 'dateTime');
-    const once = canonicalizeObjectTermForHash(x);
-    expect(once).toBe(x); // left as the valid XSD form
-    expect(canonicalizeObjectTermForHash(once)).toBe(once); // idempotent
+  // a BEFORE-EPOCH dateTime (year ≤ 0000) with seconds==59 + a non-zero fraction has its
+  // minute bumped on every store round-trip (no stable form), so canon stays deterministic +
+  // idempotent rather than chasing the drift.
+  it('before-epoch dateTime with :59 + fraction — core is deterministic + idempotent (oxigraph is not)', () => {
+    for (const x of ['-1711-04-09T15:19:59.6', '0000-06-15T10:10:59.9Z', '0000-12-31T23:59:59.999Z']) {
+      const once = canonicalizeObjectTermForHash(lit(x, 'dateTime'));
+      expect(canonicalizeObjectTermForHash(once)).toBe(once); // idempotent (the consensus-relevant property)
+    }
   });
 });

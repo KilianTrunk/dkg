@@ -2854,6 +2854,9 @@ export interface PcaContractContext {
   hubAddress: string;
   nftAddress: string;
   tokenAddress: string;
+  // PublishingConviction LOGIC contract — owns the owner-gated clearAgents
+  // (the NFT wrapper has no entry point), so the wallet-connect path needs it.
+  publishingConvictionAddress: string;
 }
 /** Addresses + chainId the browser wallet-connect path needs to build owner-signed PCA txs. */
 export const fetchPcaContracts = () => get<PcaContractContext>('/api/pca/contracts');

@@ -25,6 +25,13 @@ export const PCA_NFT_ABI = [
   { type: 'event', name: 'AccountCreated', inputs: [{ name: 'accountId', type: 'uint256', indexed: true }, { name: 'owner', type: 'address', indexed: true }, { name: 'committedTRAC', type: 'uint96', indexed: false }, { name: 'discountBps', type: 'uint16', indexed: false }, { name: 'createdAtEpoch', type: 'uint40', indexed: false }, { name: 'expiresAtEpoch', type: 'uint40', indexed: false }] },
 ] as const;
 
+// `clearAgents` lives on the PublishingConviction LOGIC contract (owner-gated via
+// `ownerOf`), NOT the NFT wrapper — so it is signed against
+// `publishingConvictionAddress`, not `nftAddress`.
+export const PCA_LOGIC_ABI = [
+  { type: 'function', name: 'clearAgents', stateMutability: 'nonpayable', inputs: [{ name: 'accountId', type: 'uint256' }], outputs: [] },
+] as const;
+
 export interface WalletCtx {
   walletClient: WalletClient;
   publicClient: PublicClient;
@@ -32,6 +39,7 @@ export interface WalletCtx {
   chain: Chain;
   nftAddress: Address;
   tokenAddress: Address;
+  publishingConvictionAddress: Address;
 }
 
 /** Phases surfaced to the UI for fine-grained progress. */
@@ -115,6 +123,30 @@ export async function walletRegisterAgent(ctx: WalletCtx, accountId: bigint, age
 
 export async function walletDeregisterAgent(ctx: WalletCtx, accountId: bigint, agent: Address, onPhase?: OnPhase): Promise<TxResult> {
   const { hash, receipt } = await send(ctx, 'deregisterAgent', [accountId, agent], onPhase);
+  return { hash, blockNumber: receipt.blockNumber };
+}
+
+/**
+ * Bulk-clear EVERY registered agent of a PCA (owner-gated). Targets the
+ * PublishingConviction LOGIC contract (not the NFT wrapper). PCA transfers
+ * PRESERVE the allow-list, so this is the explicit reset a new owner uses to
+ * drop inherited agents.
+ */
+export async function walletClearAgents(ctx: WalletCtx, accountId: bigint, onPhase?: OnPhase): Promise<TxResult> {
+  onPhase?.('signing');
+  const hash = await ctx.walletClient.writeContract({
+    account: ctx.account,
+    chain: ctx.chain,
+    address: ctx.publishingConvictionAddress,
+    abi: PCA_LOGIC_ABI,
+    functionName: 'clearAgents',
+    args: [accountId],
+  });
+  onPhase?.('mining');
+  const receipt = await ctx.publicClient.waitForTransactionReceipt({ hash });
+  if (receipt.status === 'reverted') {
+    throw new Error(`Transaction reverted on-chain (${hash.slice(0, 10)}…). Nothing changed.`);
+  }
   return { hash, blockNumber: receipt.blockNumber };
 }
 

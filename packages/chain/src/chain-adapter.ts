@@ -947,6 +947,7 @@ export interface ChainAdapter {
     hubAddress: string;
     nftAddress: string;
     tokenAddress: string;
+    publishingConvictionAddress: string;
   }>;
 
   /**

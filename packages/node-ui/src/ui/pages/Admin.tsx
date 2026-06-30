@@ -9,6 +9,7 @@ import { publicClientFromProvider, walletClientFromProvider } from '../wallet/cl
 import {
   walletRegisterAgent,
   walletDeregisterAgent,
+  walletClearAgents,
   walletSetPrimaryNode,
   walletTopUp,
   walletCreatePca,
@@ -108,6 +109,7 @@ function buildWalletCtx(
     chain,
     nftAddress: contracts.nftAddress as `0x${string}`,
     tokenAddress: contracts.tokenAddress as `0x${string}`,
+    publishingConvictionAddress: contracts.publishingConvictionAddress as `0x${string}`,
   };
 }
 
@@ -617,7 +619,7 @@ function PcaCard({
 }) {
   const action = useAction();
   const w = useWallet();
-  const [modal, setModal] = useState<null | 'funds' | 'addAgent' | 'removeAgent' | 'primaryNode' | 'settle'>(null);
+  const [modal, setModal] = useState<null | 'funds' | 'addAgent' | 'removeAgent' | 'clearAgents' | 'primaryNode' | 'settle'>(null);
   const [tokens, setTokens] = useState('');
   const [agentAddr, setAgentAddr] = useState('');
   const [node, setNode] = useState('');
@@ -691,6 +693,19 @@ function PcaCard({
         <button className="dkg-btn-secondary" style={{ fontSize: 11 }} disabled={!canManage || action.saving} title={ownerGatedTitle} onClick={() => { action.setError(null); setModal('funds'); }}>Top up</button>
         <button className="dkg-btn-secondary" style={{ fontSize: 11 }} disabled={!canManage || action.saving} title={ownerGatedTitle} onClick={() => { action.setError(null); setModal('addAgent'); }}>Add agent</button>
         <button className="dkg-btn-secondary" style={{ fontSize: 11 }} disabled={!canManage || action.saving} title={ownerGatedTitle} onClick={() => { action.setError(null); setModal('removeAgent'); }}>Remove agent</button>
+        <button
+          className="dkg-btn-secondary"
+          style={{ fontSize: 11 }}
+          disabled={!canManage || action.saving || pca.agentCount === 0 || !useWalletPath}
+          title={
+            pca.agentCount === 0
+              ? 'No agents to clear'
+              : !useWalletPath
+                ? 'Bulk clear is available for a wallet-owned PCA; for a node-owned PCA remove agents individually (full node support ships with the PublishingConviction upgrade)'
+                : ownerGatedTitle
+          }
+          onClick={() => { action.setError(null); setModal('clearAgents'); }}
+        >Clear agents</button>
         <button className="dkg-btn-secondary" style={{ fontSize: 11 }} disabled={!canManage || action.saving} title={ownerGatedTitle} onClick={() => { action.setError(null); setModal('primaryNode'); }}>Set primary node</button>
         <button className="dkg-btn-secondary" style={{ fontSize: 11 }} onClick={() => { action.setError(null); setModal('settle'); }}>Settle</button>
       </div>
@@ -768,6 +783,30 @@ function PcaCard({
           <label className="v10-form-label" htmlFor={`rmagent-${pca.accountId}`}>Agent wallet address</label>
           <input id={`rmagent-${pca.accountId}`} className="v10-form-input" style={inputStyle} value={agentAddr} onChange={(e) => setAgentAddr(e.target.value)} placeholder="0x…" autoFocus autoComplete="off" />
         </div>
+      </Modal>
+
+      <Modal
+        open={modal === 'clearAgents'}
+        onClose={close}
+        title={`Clear all agents — PCA #${pca.accountId}`}
+        subtitle="Removes EVERY registered publishing agent in one transaction (owner-gated). Agents are PRESERVED across NFT transfer, so use this to drop an allow-list inherited from a previous owner."
+        footer={
+          <>
+            <button className="v10-modal-btn" onClick={close}>Cancel</button>
+            <button className="v10-modal-btn primary" disabled={action.saving} onClick={async () => {
+              if (await exec(
+                () => { throw new Error('Bulk-clear for a node-owned PCA ships with the PublishingConviction upgrade — remove agents individually meanwhile.'); },
+                (ctx, onPhase) => walletClearAgents(ctx, BigInt(pca.accountId), onPhase),
+                'Agents cleared',
+              )) close();
+            }}>{action.saving ? (action.phase ?? 'Clearing…') : `Clear ${pca.agentCount} agent${pca.agentCount === 1 ? '' : 's'}`}</button>
+          </>
+        }
+      >
+        {action.error && <div className="v10-modal-error">{action.error}</div>}
+        <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: 0 }}>
+          This removes all {pca.agentCount} registered agent{pca.agentCount === 1 ? '' : 's'} from PCA #{pca.accountId}. You can re-add agents afterwards.
+        </p>
       </Modal>
 
       <Modal

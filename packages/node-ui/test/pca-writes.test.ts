@@ -8,6 +8,7 @@ import { hardhat } from 'viem/chains';
 import {
   walletRegisterAgent,
   walletDeregisterAgent,
+  walletClearAgents,
   walletSetPrimaryNode,
   walletTopUp,
   walletCreatePca,
@@ -16,6 +17,7 @@ import {
 
 const NFT = '0x00000000000000000000000000000000000000Ad' as const;
 const TOKEN = '0x00000000000000000000000000000000000000C0' as const;
+const PC = '0x00000000000000000000000000000000000000B0' as const; // PublishingConviction logic
 const ACCOUNT = '0x1111111111111111111111111111111111111111' as const;
 const AGENT = '0x2222222222222222222222222222222222222222' as const;
 
@@ -38,6 +40,7 @@ function makeCtx(over: { allowance?: bigint; reverted?: boolean; logs?: unknown[
     chain: hardhat,
     nftAddress: NFT,
     tokenAddress: TOKEN,
+    publishingConvictionAddress: PC,
   };
   return { ctx, writeContract, readContract };
 }
@@ -63,6 +66,16 @@ describe('pcaWrites — owner-gated actions (no TRAC)', () => {
     const { ctx, writeContract } = makeCtx();
     await walletSetPrimaryNode(ctx, 5n, 42n);
     expect(writeContract).toHaveBeenCalledWith(expect.objectContaining({ functionName: 'setPrimaryNode', args: [5n, 42n] }));
+  });
+
+  it('walletClearAgents calls clearAgents on the PublishingConviction LOGIC address (not the NFT)', async () => {
+    const { ctx, writeContract } = makeCtx();
+    const r = await walletClearAgents(ctx, 5n);
+    expect(writeContract).toHaveBeenCalledTimes(1);
+    expect(writeContract).toHaveBeenCalledWith(
+      expect.objectContaining({ address: PC, functionName: 'clearAgents', args: [5n], account: ACCOUNT, chain: hardhat }),
+    );
+    expect(r).toEqual({ hash: '0xhash', blockNumber: 7n });
   });
 
   it('throws when the action tx reverts on-chain', async () => {

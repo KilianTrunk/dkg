@@ -648,13 +648,14 @@ describe('PCA write routes — node-admin caller gating', () => {
 });
 
 describe('GET /api/pca/contracts — wallet-connect address context', () => {
-  it('returns chainId + nft/token/hub addresses', async () => {
+  it('returns chainId + nft/token/hub + publishingConviction addresses', async () => {
     const agent = {
       getPcaContractContext: async () => ({
         chainId: 31337,
         hubAddress: '0x' + '1'.repeat(40),
         nftAddress: '0x' + '2'.repeat(40),
         tokenAddress: '0x' + '3'.repeat(40),
+        publishingConvictionAddress: '0x' + '4'.repeat(40),
       }),
     };
     const { res, done } = runCtx('GET', '/api/pca/contracts', agent);
@@ -665,6 +666,7 @@ describe('GET /api/pca/contracts — wallet-connect address context', () => {
       hubAddress: '0x' + '1'.repeat(40),
       nftAddress: '0x' + '2'.repeat(40),
       tokenAddress: '0x' + '3'.repeat(40),
+      publishingConvictionAddress: '0x' + '4'.repeat(40),
     });
   });
 

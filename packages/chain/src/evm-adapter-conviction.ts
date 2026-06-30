@@ -451,6 +451,7 @@ export class ConvictionMethods extends EVMChainAdapterBase implements Conviction
     hubAddress: string;
     nftAddress: string;
     tokenAddress: string;
+    publishingConvictionAddress: string;
   }> {
     await this.init();
     const nft = this.requireConvictionNFT();
@@ -459,12 +460,18 @@ export class ConvictionMethods extends EVMChainAdapterBase implements Conviction
       throw new Error('Token contract not available on this chain');
     }
     const tokenAddress = ethers.getAddress(await this.contracts.token.getAddress());
+    // PublishingConviction is the LOGIC contract that owns clearAgents (the NFT
+    // wrapper has no entry point for it), so the browser wallet-connect path
+    // needs its address to wallet-sign the bulk agent reset.
+    const logic = await this.resolveContract('PublishingConviction');
+    const publishingConvictionAddress = ethers.getAddress(await logic.getAddress());
     const chainId = Number(await this.getEvmChainId());
     return {
       chainId,
       hubAddress: ethers.getAddress(this.hubAddress),
       nftAddress,
       tokenAddress,
+      publishingConvictionAddress,
     };
   }
 

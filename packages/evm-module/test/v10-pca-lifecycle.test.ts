@@ -2547,5 +2547,59 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
       const cgId = await CGS.getLatestContextGraphId();
       expect(await CGS.getRegistrationEscrow(cgId)).to.equal(DEPOSIT); // charged, not free
     });
+
+    // Coverage (audit gap): the floor is GOVERNANCE-tunable and read LIVE by
+    // tryConsumeWaiver — a changed floor must flip the waiver decision end-to-end.
+    // The default-floor cases above can't catch a regression that hard-coded 25k.
+    it('floor is read live — lowering minPcaCommitmentForCgWaiver newly waives a sub-default PCA; raising it charges again', async () => {
+      const Params = await hre.ethers.getContract<ParametersStorage>('ParametersStorage');
+      await setDeposit(); // 100; default floor 25k
+      const owner = accounts[1];
+      const accountId = await createAccountWith(owner, ethers.parseEther('10000')); // 10k — BELOW the 25k default
+
+      // At the default 25k floor a 10k PCA is NOT waived → charged → unfunded → revert.
+      await expect(createPcaCg(owner, owner, accountId)).to.be.reverted;
+
+      // Governance LOWERS the floor to 5k → 10k now clears it → the next CG is WAIVED.
+      await Params.connect(accounts[0]).setMinPcaCommitmentForCgWaiver(ethers.parseEther('5000'));
+      await expect(createPcaCg(owner, owner, accountId))
+        .to.emit(CGFacade, 'ContextGraphRegistrationDepositWaived');
+
+      // Governance RAISES the floor above the 10k commitment (to 50k) → the PCA
+      // fails the floor again → the next CG is charged (owner unfunded → revert).
+      await Params.connect(accounts[0]).setMinPcaCommitmentForCgWaiver(ethers.parseEther('50000'));
+      await expect(createPcaCg(owner, owner, accountId)).to.be.reverted;
+    });
+
+    // Coverage (audit gap): the fail-closed guard must also cover a waiver storage
+    // that is REGISTERED (resolves non-zero, passes the address(0) check at
+    // ContextGraphs.sol:250) but whose tryConsumeWaiver REVERTS internally — the
+    // inner catch at :253, a different branch than the unregistered case above.
+    // Trick: ContextGraphs reads the deposit through its CACHED parametersStorage
+    // pointer (still valid), but ContextGraphWaiverStorage reads ParametersStorage
+    // LIVE via the Hub. Removing ParametersStorage from the Hub therefore leaves
+    // the deposit read intact while making tryConsumeWaiver revert inside.
+    it('fail-closed: a REGISTERED waiver storage whose tryConsumeWaiver REVERTS → owner-eligible PCA CG is CHARGED', async () => {
+      await setDeposit(); // 100; floor 25k — stored on the ParametersStorage contract
+      const owner = accounts[1];
+      const accountId = await createAccountFor(owner); // 50k — would normally be waived for the owner
+
+      // ContextGraphWaiverStorage STAYS registered. Remove ParametersStorage from
+      // the Hub → the storage's live `minPcaCommitmentForCgWaiver()` read hits
+      // address(0) and reverts inside tryConsumeWaiver. ContextGraphs's cached
+      // parametersStorage pointer still serves the deposit read, so we reach the
+      // waiver branch and fall into the inner catch → charge.
+      await HubContract.connect(accounts[0]).removeContractByName('ParametersStorage');
+
+      // Fund the deposit so we can assert it is actually CHARGED (not merely an unfunded revert).
+      await Token.mint(owner.address, DEPOSIT);
+      await Token.connect(owner).approve(await CGFacade.getAddress(), DEPOSIT);
+
+      await expect(createPcaCg(owner, owner, accountId))
+        .to.emit(CGFacade, 'ContextGraphRegistrationDeposited')
+        .and.not.to.emit(CGFacade, 'ContextGraphRegistrationDepositWaived');
+      const cgId = await CGS.getLatestContextGraphId();
+      expect(await CGS.getRegistrationEscrow(cgId)).to.equal(DEPOSIT); // charged, not free
+    });
   });
 });

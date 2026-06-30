@@ -2507,5 +2507,45 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
       // not waived → unfunded create reverts (deposit charged).
       await expect(createPcaCg(agentOfB, ownerA, accountA)).to.be.reverted;
     });
+
+    // Coverage (audit gap): quota = committedTRAC / deposit is read on the LIVE
+    // deposit each call, so raising the deposit shrinks the remaining quota of a
+    // partially-used PCA.
+    it('quota recomputes on the LIVE deposit — raising the deposit shrinks remaining quota', async () => {
+      const Params = await hre.ethers.getContract<ParametersStorage>('ParametersStorage');
+      await Params.connect(accounts[0]).setContextGraphRegistrationDeposit(ethers.parseEther('25000')); // deposit 25k
+      const owner = accounts[1];
+      const accountId = await createAccountFor(owner); // 50k committed → quota 50k/25k = 2
+
+      // First is waived (used 1 of 2).
+      await expect(createPcaCg(owner, owner, accountId)).to.emit(CGFacade, 'ContextGraphRegistrationDepositWaived');
+      // Governance raises the deposit to 50k → quota recomputes to 50k/50k = 1;
+      // used 1 >= 1 → the next CG is CHARGED (owner unfunded → reverts).
+      await Params.connect(accounts[0]).setContextGraphRegistrationDeposit(ethers.parseEther('50000'));
+      await expect(createPcaCg(owner, owner, accountId)).to.be.reverted;
+    });
+
+    // Coverage (audit HIGH gap): if ContextGraphWaiverStorage is unresolvable in
+    // the Hub (not yet registered / deregistered) while the deposit is ON, the
+    // waiver must FAIL CLOSED — an owner-eligible CG is CHARGED, never free.
+    it('fail-closed: ContextGraphWaiverStorage unregistered in the Hub → owner-eligible PCA CG is CHARGED, not waived', async () => {
+      await setDeposit(); // 100 TRAC; floor 25k
+      const owner = accounts[1];
+      const accountId = await createAccountFor(owner); // 50k — would normally be waived for the owner
+
+      // Unregister the waiver storage from the Hub → ContextGraphs resolves
+      // address(0) → the fail-closed branch charges the deposit.
+      await HubContract.connect(accounts[0]).removeContractByName('ContextGraphWaiverStorage');
+
+      // Fund the deposit so we can assert it is actually CHARGED (not merely reverting unfunded).
+      await Token.mint(owner.address, DEPOSIT);
+      await Token.connect(owner).approve(await CGFacade.getAddress(), DEPOSIT);
+
+      await expect(createPcaCg(owner, owner, accountId))
+        .to.emit(CGFacade, 'ContextGraphRegistrationDeposited')
+        .and.not.to.emit(CGFacade, 'ContextGraphRegistrationDepositWaived');
+      const cgId = await CGS.getLatestContextGraphId();
+      expect(await CGS.getRegistrationEscrow(cgId)).to.equal(DEPOSIT); // charged, not free
+    });
   });
 });

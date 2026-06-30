@@ -176,6 +176,19 @@ export class IdentityMethods extends EVMChainAdapterBase {
         `${this.adminSigner.address} is not registered on-chain as an admin key for this identity.`,
       );
     }
+    // Refuse to remove a wallet that is itself registered as an ADMIN key for this
+    // identity. `removeKey` deletes a key by hash regardless of its purpose, so
+    // without this guard the "remove operational wallet" path would strip an
+    // ADMIN_KEY (ERC-734 purpose 1) and could lock the operator out of admin
+    // control. Operational-key removal must touch operational keys only; admin-key
+    // rotation is a deliberate, separate action.
+    if (await this.hasAdminPurpose(identityStorage, identityId, wallet)) {
+      throw new Error(
+        `removeOperationalWallet: refusing to remove ${wallet} — it is registered on-chain as ` +
+        `an ADMIN key for identity ${identityId}, not an operational key. Removing it here would ` +
+        `strip admin control; rotate admin keys through admin-key management instead.`,
+      );
+    }
     const receipt = await this.sendContractTransaction(
       this.contracts.identity!,
       'removeKey',

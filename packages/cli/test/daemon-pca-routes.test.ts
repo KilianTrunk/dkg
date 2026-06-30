@@ -25,6 +25,7 @@ function runCtx(
   agent: any,
   body?: unknown,
   auth?: { authEnabled?: boolean; requestToken?: string; validTokens?: Set<string> },
+  opWallets?: { wallets: Array<{ address: string }>; adminWallet?: { address: string } },
 ) {
   const res = fakeRes();
   // Mirror handle-request.ts: route on url.pathname, query lives on url.
@@ -36,8 +37,9 @@ function runCtx(
     path: url.pathname,
     url,
     // opWallets is read at handler entry to compute PCA ownership; an empty
-    // pool is fine for these tests (no looked-up PCA is "owned by this node").
-    opWallets: { wallets: [] },
+    // pool is fine for most tests (no looked-up PCA is "owned by this node").
+    // The owned-flag describe block passes a populated pool to exercise it.
+    opWallets: opWallets ?? { wallets: [] },
     // Default: auth disabled → isNodeAdminCaller short-circuits true, so the
     // existing route-logic tests below exercise the handler without an admin
     // token. The node-admin gating itself is covered by its own describe block.
@@ -684,5 +686,58 @@ describe('GET /api/pca/contracts — wallet-connect address context', () => {
     const { res, done } = runCtx('GET', '/api/pca/contracts', agent);
     await done;
     expect(res.statusCode).not.toBe(400);
+  });
+});
+
+// #1370 HIGH: `owned` on the lookup-by-id GET means SERVER-MANAGEABLE, i.e. the
+// PCA's ERC-721 owner is the daemon's PRIMARY operational wallet — the single
+// signer every server-side PCA write is signed with. Admin keys and secondary
+// operational wallets are local to the node but cannot drive those writes, so a
+// PCA they own must report owned:false (else the UI lights up owner-gated actions
+// whose writes revert on-chain instead of returning a clean 403/disabled state).
+describe('daemon /api/pca/:id — owned flag is primary-signer-scoped (#1370 HIGH)', () => {
+  const PRIMARY = ethers.getAddress('0x' + '1'.repeat(40));
+  const SECONDARY = ethers.getAddress('0x' + '2'.repeat(40));
+  const ADMIN = ethers.getAddress('0x' + '3'.repeat(40));
+  const opWallets = {
+    wallets: [{ address: PRIMARY }, { address: SECONDARY }],
+    adminWallet: { address: ADMIN },
+  };
+  const agentFor = (owner: string) => ({
+    supportsPublishingConvictionNft: true,
+    getPublishingConvictionAccountInfo: async () => ({
+      owner,
+      committedTRAC: 0n,
+      baseEpochAllowance: 0n,
+      topUpBuffer: 0n,
+      createdAtEpoch: 0,
+      expiresAtEpoch: 0,
+      createdAtTimestamp: 0,
+      expiresAtTimestamp: 0,
+      discountBps: 0,
+      agentCount: 0,
+      lastSettledWindow: 0,
+      fullySwept: false,
+    }),
+    getConvictionPrimaryNode: async () => null,
+    getNodeIdentityId: async () => 0n,
+  });
+  const ownedFor = async (owner: string) => {
+    const { res, done } = runCtx('GET', '/api/pca/7', agentFor(owner), undefined, undefined, opWallets);
+    await done;
+    expect(res.statusCode).toBe(200);
+    return JSON.parse(res.body).owned;
+  };
+
+  it('owned:true when the PCA owner is the PRIMARY operational wallet (server can sign)', async () => {
+    expect(await ownedFor(PRIMARY)).toBe(true);
+  });
+
+  it('owned:false when owned by a SECONDARY operational wallet (not the server signer)', async () => {
+    expect(await ownedFor(SECONDARY)).toBe(false);
+  });
+
+  it('owned:false when owned by the ADMIN wallet (admin key never server-signs PCA writes)', async () => {
+    expect(await ownedFor(ADMIN)).toBe(false);
   });
 });

@@ -28,12 +28,21 @@ function minimalConfig(overrides: Partial<EVMAdapterConfig> = {}): EVMAdapterCon
   };
 }
 
-function makeAdapter(opts: { admin?: boolean; identityId?: bigint } = {}) {
+function makeAdapter(opts: { admin?: boolean; identityId?: bigint; adminPurposeWallets?: string[] } = {}) {
   const cfg = minimalConfig(opts.admin === false ? {} : { adminPrivateKey: ADMIN_PK });
   const a = new EVMChainAdapter(cfg);
   (a as any).init = async () => undefined;
   (a as any).getIdentityStorage = async () => ({ __isIdentityStorage: true });
-  (a as any).hasAdminPurpose = async () => true;
+  // Purpose-aware: the configured admin key (plus any extras the test marks)
+  // reads back as an on-chain ADMIN_KEY; everything else does not. The default
+  // lets removing an ordinary external op wallet proceed while still exercising
+  // the admin-key check on the admin signer — and lets a test mark the REMOVE
+  // TARGET as an admin key to assert the de-admin guard fires.
+  const adminPurposeSet = new Set(
+    [new ethers.Wallet(ADMIN_PK).address, ...(opts.adminPurposeWallets ?? [])].map((w) => w.toLowerCase()),
+  );
+  (a as any).hasAdminPurpose = async (_s: any, _id: bigint, addr: string) =>
+    adminPurposeSet.has(String(addr).toLowerCase());
   (a as any).getIdentityId = async () => opts.identityId ?? 5n;
   const calls: Array<{ contract: string; method: string; args: any[]; signer: string }> = [];
   (a as any).sendContractTransaction = async (contract: any, method: string, args: any[], signer: any) => {
@@ -94,6 +103,14 @@ describe('EVMChainAdapter.removeOperationalWallet', () => {
     const { a, calls } = makeAdapter();
     const primary = (a as any).signer.address as string;
     await expect(a.removeOperationalWallet(primary)).rejects.toThrow(/refusing to remove the node's primary/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('REFUSES to remove a wallet that is itself an on-chain ADMIN key (de-admin guard), before any tx', async () => {
+    // `removeKey` deletes by hash regardless of purpose, so removing a target
+    // that holds ADMIN_KEY purpose would strip admin control. Guard must fire.
+    const { a, calls } = makeAdapter({ adminPurposeWallets: [EXTERNAL] });
+    await expect(a.removeOperationalWallet(EXTERNAL)).rejects.toThrow(/ADMIN key/);
     expect(calls).toHaveLength(0);
   });
 

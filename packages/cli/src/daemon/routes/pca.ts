@@ -174,14 +174,17 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
 
   if (!path.startsWith('/api/pca')) return;
 
-  // The node "owns" (can manage) a PCA when its ERC-721 owner is one of the
-  // node's local wallets. Used to flag looked-up-by-id accounts owned elsewhere
-  // so the UI can disable owner-gated actions instead of firing doomed 403s.
-  const nodeWalletSet = new Set(
-    [...opWallets.wallets, ...(opWallets.adminWallet ? [opWallets.adminWallet] : [])]
-      .map((w) => w.address.toLowerCase()),
-  );
-  const isOwnedByNode = (owner: string): boolean => nodeWalletSet.has(owner.toLowerCase());
+  // The node can SERVER-MANAGE a PCA only when its ERC-721 owner is the daemon's
+  // PRIMARY operational wallet (opWallets.wallets[0]) — that is the single signer
+  // every server-side, bearer-token-driven PCA write is signed with. Admin keys
+  // and secondary operational wallets cannot drive these writes (the chain
+  // adapter holds only the primary signer for the PCA path), so flagging a PCA
+  // they own as owned:true would light up a manage UI whose owner-gated writes
+  // revert on-chain (ownerOf mismatch), not a clean 403. Ownership for the
+  // wallet-connect (client-signed) path is resolved separately in the browser.
+  const serverSignerAddr = opWallets.wallets[0]?.address.toLowerCase() ?? null;
+  const isOwnedByNode = (owner: string): boolean =>
+    serverSignerAddr != null && owner.toLowerCase() === serverSignerAddr;
 
   // PCA writes are signed with the daemon's OWNER EOA, so the on-chain
   // owner gate is satisfied by the daemon for every node-owned PCA — the

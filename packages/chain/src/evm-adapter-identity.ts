@@ -189,6 +189,18 @@ export class IdentityMethods extends EVMChainAdapterBase {
         `strip admin control; rotate admin keys through admin-key management instead.`,
       );
     }
+    // Positive guard: only remove a wallet that IS registered as an OPERATIONAL
+    // key for this identity. `removeKey` deletes a key by its hash regardless of
+    // purpose, so without this an address attached with any other (non-admin,
+    // non-operational) purpose could be silently deleted through the
+    // operational-wallet endpoint. Operational-key removal must touch operational
+    // keys only — reject anything that is not one.
+    if (!(await this.hasOperationalPurpose(identityStorage, identityId, wallet))) {
+      throw new Error(
+        `removeOperationalWallet: refusing to remove ${wallet} — it is not registered on-chain as ` +
+        `an operational key for identity ${identityId}.`,
+      );
+    }
     const receipt = await this.sendContractTransaction(
       this.contracts.identity!,
       'removeKey',

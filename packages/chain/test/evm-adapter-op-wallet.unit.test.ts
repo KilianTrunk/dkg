@@ -28,7 +28,7 @@ function minimalConfig(overrides: Partial<EVMAdapterConfig> = {}): EVMAdapterCon
   };
 }
 
-function makeAdapter(opts: { admin?: boolean; identityId?: bigint; adminPurposeWallets?: string[] } = {}) {
+function makeAdapter(opts: { admin?: boolean; identityId?: bigint; adminPurposeWallets?: string[]; operationalPurposeWallets?: string[] } = {}) {
   const cfg = minimalConfig(opts.admin === false ? {} : { adminPrivateKey: ADMIN_PK });
   const a = new EVMChainAdapter(cfg);
   (a as any).init = async () => undefined;
@@ -43,6 +43,15 @@ function makeAdapter(opts: { admin?: boolean; identityId?: bigint; adminPurposeW
   );
   (a as any).hasAdminPurpose = async (_s: any, _id: bigint, addr: string) =>
     adminPurposeSet.has(String(addr).toLowerCase());
+  // Purpose-aware operational check (mirrors hasAdminPurpose): by default the
+  // ordinary external op wallet reads back as an OPERATIONAL_KEY so removal
+  // proceeds; a test can pass an empty/explicit set to exercise the positive
+  // operational-key guard.
+  const operationalPurposeSet = new Set(
+    (opts.operationalPurposeWallets ?? [EXTERNAL]).map((w) => w.toLowerCase()),
+  );
+  (a as any).hasOperationalPurpose = async (_s: any, _id: bigint, addr: string) =>
+    operationalPurposeSet.has(String(addr).toLowerCase());
   (a as any).getIdentityId = async () => opts.identityId ?? 5n;
   const calls: Array<{ contract: string; method: string; args: any[]; signer: string }> = [];
   (a as any).sendContractTransaction = async (contract: any, method: string, args: any[], signer: any) => {
@@ -111,6 +120,16 @@ describe('EVMChainAdapter.removeOperationalWallet', () => {
     // that holds ADMIN_KEY purpose would strip admin control. Guard must fire.
     const { a, calls } = makeAdapter({ adminPurposeWallets: [EXTERNAL] });
     await expect(a.removeOperationalWallet(EXTERNAL)).rejects.toThrow(/ADMIN key/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('REFUSES to remove an address not registered as an OPERATIONAL key (positive guard), before any tx', async () => {
+    // `removeKey` deletes by hash regardless of purpose; without a positive
+    // operational-key check a key attached with some other (non-admin,
+    // non-operational) purpose could be silently deleted via this endpoint.
+    const NON_OP = '0x' + 'a'.repeat(40);
+    const { a, calls } = makeAdapter({ operationalPurposeWallets: [] }); // nothing is an operational key
+    await expect(a.removeOperationalWallet(NON_OP)).rejects.toThrow(/not registered on-chain as an operational key/);
     expect(calls).toHaveLength(0);
   });
 

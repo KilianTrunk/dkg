@@ -82,4 +82,27 @@ describe('§9 conformance validation', () => {
     ]);
     expect(report.conformant).toBe(true);
   });
+
+  it('rejects concept paths with invalid segments (would mint a malformed subject IRI)', () => {
+    const files = [
+      { path: 'index.md', content: '# Root\n' },
+      { path: 'bad name.md', content: '---\ntype: T\ntitle: Spacey\n---\nbody' }, // space in segment
+      { path: '-bad.md', content: '---\ntype: T\ntitle: Dashy\n---\nbody' }, // leading dash
+      { path: 'ok/good.md', content: '---\ntype: T\ntitle: Good\n---\nbody' }, // valid
+    ];
+    // validateBundle hard-errors the invalid paths…
+    const report = validateBundle(files);
+    expect(report.conformant).toBe(false);
+    expect(report.errors.join('\n')).toMatch(/bad name: invalid concept path/);
+    expect(report.errors.join('\n')).toMatch(/-bad: invalid concept path/);
+
+    // …and importBundle skips them with an `invalid-path` warning, never minting a
+    // malformed IRI; the valid concept still imports.
+    const r = importBundle(files);
+    expect(r.warnings.filter((w) => w.code === 'invalid-path').map((w) => w.conceptId).sort()).toEqual(['-bad', 'bad name']);
+    expect(r.concepts.map((c) => c.conceptId)).toContain('ok/good');
+    expect(r.concepts.some((c) => c.conceptId === 'bad name' || c.conceptId === '-bad')).toBe(false);
+    // no emitted subject IRI contains a space (the malformed-IRI symptom)
+    expect(r.quads.every((q) => !q.subject.includes(' '))).toBe(true);
+  });
 });

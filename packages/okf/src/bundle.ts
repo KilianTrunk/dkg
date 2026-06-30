@@ -17,6 +17,7 @@ import { mapConcept } from './mapping.js';
 import {
   isConceptFile,
   isReservedFile,
+  isValidSegment,
   pathToConceptId,
   conceptIdToIri,
 } from './paths.js';
@@ -60,6 +61,17 @@ export function importBundle(files: BundleFile[], opts: OkfMappingOptions = {}):
         conceptId: pathToConceptId(f.path),
         code: 'parse',
         message: err instanceof OkfDocumentError ? err.message : String(err),
+      });
+      continue;
+    }
+    // A concept whose path has a non-OKF segment would mint a malformed subject IRI
+    // (e.g. `bad name.md` → `urn:okf:bad name`, a space-bearing IRI that breaks
+    // N-Quads / node writes). Skip it with a warning rather than emit bad RDF.
+    if (!doc.conceptId.split('/').every(isValidSegment)) {
+      warnings.push({
+        conceptId: doc.conceptId,
+        code: 'invalid-path',
+        message: `invalid concept path segment(s) — must match [A-Za-z0-9_][A-Za-z0-9_.-]* (§2); skipped`,
       });
       continue;
     }

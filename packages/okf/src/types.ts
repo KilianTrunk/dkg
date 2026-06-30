@@ -106,7 +106,7 @@ export interface ConceptMapping {
 /** A non-fatal diagnostic surfaced during a bundle import. */
 export interface OkfWarning {
   conceptId?: string;
-  code: 'broken-link' | 'code-span-link' | 'missing-type' | 'reserved-skip' | 'parse';
+  code: 'broken-link' | 'code-span-link' | 'missing-type' | 'reserved-skip' | 'parse' | 'invalid-path';
   message: string;
 }
 

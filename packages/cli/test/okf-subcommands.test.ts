@@ -288,6 +288,57 @@ describe.sequential('dkg okf subcommands', { timeout: 120_000 }, () => {
     expect(manifest.chunksDone).toBe(manifest.totalChunks);
   });
 
+  it('--private forwards --sub-graph-name into the shared-memory write body + manifest', async () => {
+    clear();
+    const bundle = await makeBundle();
+    const r = await runCli(
+      ['okf', 'import', bundle, '--context-graph-id', 'cg-sg', '--sub-graph-name', 'team', '--private', '--create-context-graph'],
+      env(),
+    );
+    expect(r.exitCode).toBe(0);
+    // Every bulk write must carry the sub-graph so data lands in cg/team SWM, not root.
+    const writes = stub.calls.filter((c) => c.method === 'POST' && c.url.split('?')[0] === '/api/shared-memory/write');
+    expect(writes.length).toBeGreaterThan(0);
+    for (const w of writes) expect(JSON.parse(w.body || '{}').subGraphName).toBe('team');
+    // The resumability manifest records the sub-graph (so a resume can't mix root/sub-graph).
+    const manifest = JSON.parse(await readFile(join(bundle, '.okf-import-manifest.json'), 'utf-8'));
+    expect(manifest.subGraphName).toBe('team');
+  });
+
+  it('refuses --private into an existing PUBLIC Context Graph; --allow-public-context-graph overrides', async () => {
+    clear();
+    const bundle = await makeBundle();
+    const publicCgHandler: StubHandler = (req, raw) => {
+      const url = new URL(`http://127.0.0.1${req.url}`);
+      const path = url.pathname;
+      if (req.method === 'GET' && path === '/api/context-graph/exists') {
+        return { status: 200, body: { id: url.searchParams.get('id'), exists: true } };
+      }
+      if (req.method === 'GET' && path === '/api/context-graph/list') {
+        return { status: 200, body: { contextGraphs: [{ id: 'cg-pub', accessPolicy: 'public' }] } };
+      }
+      return okfDaemonHandler(createdCGs)(req, raw); // everything else succeeds
+    };
+    stub.setHandler(publicCgHandler);
+
+    // Refusal: non-zero exit, and NO bulk write happened.
+    const refused = await runCli(['okf', 'import', bundle, '--context-graph-id', 'cg-pub', '--private'], env());
+    expect(refused.exitCode).not.toBe(0);
+    expect(stub.calls.some((c) => c.url.split('?')[0] === '/api/shared-memory/write')).toBe(false);
+    expect(refused.stderr).toMatch(/Refusing --private/);
+
+    // Override: --allow-public-context-graph proceeds and writes.
+    const before = stub.calls.length;
+    const allowed = await runCli(
+      ['okf', 'import', bundle, '--context-graph-id', 'cg-pub', '--private', '--allow-public-context-graph'],
+      env(),
+    );
+    expect(allowed.exitCode).toBe(0);
+    expect(stub.calls.slice(before).some((c) => c.url.split('?')[0] === '/api/shared-memory/write')).toBe(true);
+
+    stub.setHandler(okfDaemonHandler(createdCGs));
+  });
+
   it('export filters skolemized section nodes (no .well-known/genid files)', async () => {
     clear();
     const outDir = await mkdtemp(join(tmpdir(), 'okf-export-'));

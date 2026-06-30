@@ -14,7 +14,7 @@
  */
 
 import { parseDocument, OkfDocumentError } from './document.js';
-import { isConceptFile, isReservedFile, basename, pathToConceptId } from './paths.js';
+import { isConceptFile, isReservedFile, isValidSegment, basename, pathToConceptId } from './paths.js';
 import type { BundleFile, ConformanceReport } from './types.js';
 
 export function validateBundle(files: BundleFile[]): ConformanceReport {
@@ -60,6 +60,12 @@ export function validateBundle(files: BundleFile[]): ConformanceReport {
     conceptCount += 1;
 
     const conceptId = pathToConceptId(f.path);
+    // Every concept path segment must be a valid OKF segment, or the derived subject
+    // IRI (`${iriBase}${conceptId}`) is malformed (e.g. `urn:okf:bad name`). The
+    // mapper already enforces this for link targets; enforce it for concept files too.
+    if (!conceptId.split('/').every(isValidSegment)) {
+      errors.push(`${conceptId}: invalid concept path segment(s) — must match [A-Za-z0-9_][A-Za-z0-9_.-]* (§2)`);
+    }
     let frontmatter: Record<string, unknown>;
     try {
       frontmatter = parseDocument(f.path, f.content).frontmatter;

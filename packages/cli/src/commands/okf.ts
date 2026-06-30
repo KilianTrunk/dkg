@@ -345,12 +345,16 @@ export function registerOkfCommand(program: Command): void {
             try {
               const prev = JSON.parse(await readFile(manifestPath, 'utf-8')) as {
                 contextGraphId?: string;
+                subGraphName?: string;
                 mode?: string;
                 chunkSize?: number;
                 chunksDone?: number;
               };
               if (
                 prev.contextGraphId === contextGraphId &&
+                // resume only within the SAME target sub-graph (undefined == root) —
+                // never carry a root manifest into a --sub-graph-name run or vice versa.
+                prev.subGraphName === subGraphName &&
                 prev.mode === 'bulk-private-swm' &&
                 prev.chunkSize === CHUNK &&
                 typeof prev.chunksDone === 'number'
@@ -371,7 +375,7 @@ export function registerOkfCommand(program: Command): void {
           // down to a floor, so a too-big batch degrades instead of failing.
           const writeSlice = async (slice: typeof allQuads): Promise<void> => {
             try {
-              const res = await client.sharedMemoryWrite(contextGraphId, slice);
+              const res = await client.sharedMemoryWrite(contextGraphId, slice, subGraphName);
               triplesWritten += res.triplesWritten ?? slice.length;
               skolemized += res.skolemizedBlankNodes ?? 0;
             } catch (e) {
@@ -396,7 +400,7 @@ export function registerOkfCommand(program: Command): void {
             await writeFile(
               manifestPath,
               JSON.stringify(
-                { contextGraphId, mode: 'bulk-private-swm', chunkSize: CHUNK, chunksDone, totalChunks },
+                { contextGraphId, ...(subGraphName ? { subGraphName } : {}), mode: 'bulk-private-swm', chunkSize: CHUNK, chunksDone, totalChunks },
                 null,
                 2,
               ),
@@ -692,10 +696,10 @@ export function registerOkfCommand(program: Command): void {
   // non-zero on any shortfall so it can gate a pipeline. The fix for a
   // shortfall is to re-run the same idempotent `import --private` (a second
   // loose-write pass; the store dedupes, so only the dropped triples land).
-  const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
   // Predicates we treat as integrity signals (order = report order).
   const INTEGRITY_PREDICATES = [
-    RDF_TYPE,
+    RDF_TYPE, // imported from @origintrail-official/dkg-okf — single source of truth
+
     'http://schema.org/source',
     'http://schema.org/license',
     'http://schema.org/citation',

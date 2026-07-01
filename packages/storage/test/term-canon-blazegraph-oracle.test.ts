@@ -187,7 +187,7 @@ describe.skipIf(!BLAZEGRAPH_URL)('term-canon cross-backend oracle: oxigraph ⇄ 
     await expectCrossBackendLeafAgreement(vals.map((v) => lit(v, 'time')));
   });
 
-  it.fails('date / gYear / gYearMonth / gMonthDay / gMonth / gDay [KNOWN #1386 cross-backend divergence]', async () => {
+  it('date / gYear / gYearMonth / gMonthDay / gMonth / gDay (OT-RFC-57)', async () => {
     await expectCrossBackendLeafAgreement([
       lit('2026-06-29', 'date'), lit('2026-06-29Z', 'date'), lit('2026-06-29+00:00', 'date'),
       lit('2026-06-29-00:00', 'date'), lit('2026-06-29+02:00', 'date'),

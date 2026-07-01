@@ -159,10 +159,6 @@ function decodeIriEscapes(iri: string): string {
   });
 }
 
-// oxigraph normalizes the "negative zero" year -0000 to 0000. (Only -0000 reaches
-// here: a leading-zero 5+-digit negative year fails the YEAR pattern → verbatim.)
-const normYear = (yy: string) => (yy === '-0000' ? '0000' : yy);
-
 // oxigraph stores temporal values as seconds-since-0001-01-01 in the same i128/1e18
 // Decimal as xsd:decimal/duration. A date/time whose scaled seconds overflow i128
 // fails to parse and is kept VERBATIM, so a foldable timezone / T24 roll / fraction
@@ -192,6 +188,20 @@ function civilFromDays(zIn: bigint): { y: bigint; m: bigint; d: bigint } {
   const d = doy - (153n * mp + 2n) / 5n + 1n; // [1, 31]
   const m = mp < 10n ? mp + 3n : mp - 9n; // [1, 12]
   return { y: m <= 2n ? y + 1n : y, m, d };
+}
+
+// OT-RFC-57: the UTC date of "midnight in the given tz" — the backend-independent
+// form for xsd:date / gYear / gYearMonth. Blazegraph interprets the value at 00:00
+// in its tz, converts to UTC, and takes the UTC date; a positive offset rolls the
+// date back a day. offsetMin=0 (Z / no-tz) ⇒ the date is unchanged.
+function utcDateFromMidnight(
+  y: bigint,
+  mo: bigint,
+  d: bigint,
+  offsetMin: number,
+): { y: bigint; m: bigint; d: bigint } {
+  const days = daysFromCivil(y, mo, d) + BigInt(Math.floor((0 - offsetMin) / 1440));
+  return civilFromDays(days);
 }
 
 function temporalInRange(yearStr: string, mo: number, dd: number, hh = 0, mi = 0, ss = 0): boolean {
@@ -346,23 +356,7 @@ function stripTrailingZeros(s: string): string {
 }
 
 // ── date/time family ───────────────────────────────────────────────────────────
-// Split + validate the trailing timezone, folding +00:00/-00:00 to Z. oxigraph
-// accepts Z or ±HH:MM with |offset| ≤ 14:00 (HH≤14, MM≤59, total ≤ 840 min);
-// anything else (incl. a malformed +0:00) leaves the timezone in `body`, where the
-// per-type grammar then rejects it → the whole literal is kept verbatim.
-function splitTz(s: string): { body: string; tz: string } {
-  const m = /(Z|[+-]\d{2}:\d{2})$/.exec(s);
-  if (!m) return { body: s, tz: '' };
-  const tz = m[1];
-  const body = s.slice(0, s.length - tz.length);
-  if (tz === 'Z') return { body, tz: 'Z' };
-  const h = parseInt(tz.slice(1, 3), 10);
-  const mi = parseInt(tz.slice(4, 6), 10);
-  if (mi > 59 || h * 60 + mi > 840) throw new Error(`invalid tz: ${tz}`);
-  return { body, tz: tz === '+00:00' || tz === '-00:00' ? 'Z' : tz };
-}
-
-// Like splitTz, but returns the offset MAGNITUDE in minutes (signed) for the
+// Returns the offset MAGNITUDE in minutes (signed) for the
 // backend-independent UTC normalization of xsd:dateTime/xsd:time (OT-RFC-57).
 // hadTz=false ⇒ no timezone present (a bare dateTime is normalized to UTC and
 // gains a Z, matching Blazegraph/Neptune). Malformed/out-of-range tz → throw
@@ -482,8 +476,10 @@ function canonTime(lex: string): string {
   return `${pad2(Math.floor(minInDay / 60))}:${pad2(minInDay % 60)}:${ss}${fracNorm}Z`;
 }
 
+// OT-RFC-57: xsd:date / gYear / gYearMonth normalize to the UTC date of
+// midnight-in-tz, with NO timezone emitted (Blazegraph's value form).
 function canonDate(lex: string): string {
-  const { body, tz } = splitTz(lex);
+  const { body, offsetMin } = splitTzToOffset(lex);
   const m = new RegExp(`^(${YEAR})-(\\d{2})-(\\d{2})$`).exec(body);
   if (!m) throw new Error('invalid xsd:date');
   const moN = +m[2];
@@ -491,50 +487,57 @@ function canonDate(lex: string): string {
   if (moN < 1 || moN > 12) throw new Error('month');
   if (ddN < 1 || ddN > daysInMonth(m[1], moN)) throw new Error('day');
   if (!temporalInRange(m[1], moN, ddN)) throw new Error('year overflows i128 seconds');
-  return `${normYear(m[1])}-${m[2]}-${m[3]}${tz}`;
+  const { y, m: mm, d } = utcDateFromMidnight(BigInt(m[1]), BigInt(moN), BigInt(ddN), offsetMin);
+  return `${fmtYear(y)}-${pad2(Number(mm))}-${pad2(Number(d))}`;
 }
 
 function canonGYear(lex: string): string {
-  const { body, tz } = splitTz(lex);
+  const { body, offsetMin } = splitTzToOffset(lex);
   if (!new RegExp(`^${YEAR}$`).test(body)) throw new Error('invalid xsd:gYear');
   if (!temporalInRange(body, 1, 1)) throw new Error('year overflows i128 seconds');
-  return `${normYear(body)}${tz}`;
+  const { y } = utcDateFromMidnight(BigInt(body), 1n, 1n, offsetMin);
+  return fmtYear(y);
 }
 
 function canonGYearMonth(lex: string): string {
-  const { body, tz } = splitTz(lex);
+  const { body, offsetMin } = splitTzToOffset(lex);
   const m = new RegExp(`^(${YEAR})-(\\d{2})$`).exec(body);
   if (!m || +m[2] < 1 || +m[2] > 12) throw new Error('invalid xsd:gYearMonth');
   if (!temporalInRange(m[1], +m[2], 1)) throw new Error('year overflows i128 seconds');
-  return `${normYear(m[1])}-${m[2]}${tz}`;
+  const { y, m: mm } = utcDateFromMidnight(BigInt(m[1]), BigInt(+m[2]), 1n, offsetMin);
+  return `${fmtYear(y)}-${pad2(Number(mm))}`;
 }
 
 // gMonthDay day bounds. oxigraph 0.5.5 validates --MM-DD against a NON-leap
 // reference year, so --02-29 is rejected (kept verbatim) — February's max is 28
 // here, unlike a real leap date which needs the year context of xsd:date.
 const MONTH_MAX_DAY = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+// OT-RFC-57: gMonthDay / gMonth / gDay have no year to convert, so a timezone is
+// just STRIPPED (Blazegraph's value form). NB the oracle battery only exercises
+// Z/+00:00 here; a non-UTC offset on these bare types is undefined across backends
+// and not consensus-verified — see OT-RFC-57 §7.8.
 function canonGMonthDay(lex: string): string {
-  const { body, tz } = splitTz(lex);
+  const { body } = splitTzToOffset(lex);
   const m = /^--(\d{2})-(\d{2})$/.exec(body);
   if (!m) throw new Error('invalid xsd:gMonthDay');
   const moN = +m[1];
   const ddN = +m[2];
   if (moN < 1 || moN > 12 || ddN < 1 || ddN > MONTH_MAX_DAY[moN - 1]) throw new Error('range');
-  return `${body}${tz}`;
+  return body;
 }
 
 function canonGMonth(lex: string): string {
-  const { body, tz } = splitTz(lex);
+  const { body } = splitTzToOffset(lex);
   const m = /^--(\d{2})$/.exec(body);
   if (!m || +m[1] < 1 || +m[1] > 12) throw new Error('invalid xsd:gMonth');
-  return `${body}${tz}`;
+  return body;
 }
 
 function canonGDay(lex: string): string {
-  const { body, tz } = splitTz(lex);
+  const { body } = splitTzToOffset(lex);
   const m = /^---(\d{2})$/.exec(body);
   if (!m || +m[1] < 1 || +m[1] > 31) throw new Error('invalid xsd:gDay');
-  return `${body}${tz}`;
+  return body;
 }
 
 // ── xsd:duration / dayTimeDuration / yearMonthDuration ─────────────────────────

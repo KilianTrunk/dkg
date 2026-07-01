@@ -427,11 +427,13 @@ function validateClock(hh: number, mi: number, ss: number, fracNorm: string): { 
   return { rolls: false };
 }
 
-// A valid XSD year is EXACTLY 4 digits (leading zeros allowed) OR 5+ digits with
-// NO leading zero. oxigraph rejects a leading-zero 5+-digit year (e.g. 09508) and
-// keeps the whole literal verbatim — so we must too, or we'd normalize tz/fraction
-// on a literal oxigraph leaves untouched.
-const YEAR = '-?(?:\\d{4}|[1-9]\\d{4,})';
+// OT-RFC-57: the backend-independent value canon accepts any 4+-digit year (any
+// number of leading zeros) and normalizes it via BigInt+fmtYear (min-4-digit, no
+// leading zero). This matches Blazegraph, which on write STRIPS a leading-zero
+// year to its value ("02026"^^gYear → "2026") — oxigraph instead keeps the invalid
+// literal verbatim, but the CONVERGENCE oracle holds either way since canon(input)
+// and canon(store-readback) both fold to the same value form (OT-RFC-57 §7.5).
+const YEAR = '-?\\d{4,}';
 
 // OT-RFC-57 backend-independent form: normalize to UTC (subtract the tz offset,
 // rolling the DATE across midnight), truncate fraction to ms, always emit Z. A

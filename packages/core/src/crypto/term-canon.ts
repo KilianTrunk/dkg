@@ -252,7 +252,11 @@ function canonDouble(lex: string, isFloat: boolean): string {
   if (Number.isNaN(n)) return 'NaN';
   if (n === Infinity) return 'INF';
   if (n === -Infinity) return '-INF';
-  if (n === 0) return Object.is(n, -0) ? '-0' : '0';
+  // OT-RFC-57: negative zero folds to "0". Blazegraph drops the sign on write
+  // ("-0.0"^^double → stored "0.0" → value 0), while oxigraph keeps "-0"; emitting
+  // "0" for both signed zeros makes canon(input) == canon(store-readback) on either
+  // backend. (The IEEE-754 -0/+0 distinction is not consensus-observable here.)
+  if (n === 0) return '0';
   const neg = n < 0;
   const a = Math.abs(n);
   // double: V8's a.toString() IS the shortest round-trip; only ties need the

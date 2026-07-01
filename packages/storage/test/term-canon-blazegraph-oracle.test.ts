@@ -142,33 +142,26 @@ describe.skipIf(!BLAZEGRAPH_URL)('term-canon cross-backend oracle: oxigraph ⇄ 
   });
 
   // ───────────────────────────────────────────────────────────────────────────
-  // KNOWN CROSS-BACKEND DIVERGENCE — #1386 canon is NOT cross-backend safe.
+  // CROSS-BACKEND AGREEMENT (OT-RFC-57) — RESOLVED, and now asserted as `it`.
   //
-  // This oracle DETECTED a real divergence (that is its job). Blazegraph
-  // normalizes these datatypes into a different lexical form than oxigraph —
-  // e.g. a timezone-less `"2026-06-29T12:00:00"` is STORED by Blazegraph as
-  // `"2026-06-29T12:00:00.000Z"` (adds `Z` + `.000`) — and #1386's oxigraph-tuned
-  // `canonicalizeObjectTermForHash` does NOT reconcile the difference. Because the
-  // RS extractor hashes STORE-EMITTED terms (packages/random-sampling/src/
-  // ka-extractor.ts:397 `triples.map(t => hashTripleV10(t.subject,t.predicate,
-  // t.object))`), a Blazegraph-backed node computes a DIFFERENT V10 merkle leaf
-  // for the same triple than an oxigraph node → RandomSampling FORK the moment a
-  // non-oxigraph node joins. This is a latent consensus bug in #1386 (the canon
-  // was validated against oxigraph 0.5.5 only); fixing it is a coordinated
-  // dkg-core consensus change with migration implications — OUT OF SCOPE for this
-  // test-coverage PR.
-  //
-  // These cases are marked `it.fails` so the divergence stays TRACKED and CI
-  // stays green: each currently throws (divergence exists) ⇒ `it.fails` passes.
-  // If the canon is ever made cross-backend safe, they flip to FAILING — forcing
-  // whoever fixed it to remove the marker. Affected: xsd:dateTime, xsd:time,
-  // date/gregorian, some xsd:double/float, some escaped string content. The
-  // AGREEING datatypes above assert real cross-backend agreement.
+  // This oracle originally DETECTED a real divergence: Blazegraph normalizes these
+  // datatypes into a different lexical form than oxigraph — e.g. a timezone-less
+  // `"2026-06-29T12:00:00"` is STORED by Blazegraph as `"2026-06-29T12:00:00.000Z"`
+  // (adds `Z` + `.000`), and a positive offset is shifted to UTC. The #1386 canon
+  // (oxigraph-tuned) did not reconcile that; the RS extractor hashes STORE-EMITTED
+  // terms (packages/random-sampling/src/ka-extractor.ts), so a Blazegraph node
+  // would compute a DIFFERENT V10 leaf → RandomSampling fork. OT-RFC-57's backend-
+  // independent value-canon FIXES this: every case below now asserts real cross-
+  // backend agreement (`canon(store_readback)` converges to `canon(input)` on both
+  // backends). The ONLY remaining `it.fails` is astral (> U+FFFF) via a `\U…`
+  // ESCAPE insert — a Blazegraph stored-value corruption no leaf canon can
+  // reconcile (OT-RFC-57 §7.7; note the DKG daemon's raw-UTF-8 path is not affected).
   // ───────────────────────────────────────────────────────────────────────────
   it('xsd:dateTime fractional-seconds + timezone (OT-RFC-57)', async () => {
     const vals = [
       '2026-06-29T12:00:00', '2026-06-29T12:00:00.0', '2026-06-29T12:00:00.500', '2026-06-29T12:00:00.000',
       '2026-06-29T12:00:00Z', '2026-06-29T12:00:00+00:00', '2026-06-29T12:00:00-00:00', '2026-06-29T12:00:00+02:00',
+      '2026-06-29T12:00:00-05:00', '2026-06-29T23:00:00-05:00', // negative offset (incl. one that rolls the date forward)
       '2026-06-29T12:00:00.120Z', '2026-06-29T12:00:00.123456',
     ];
     await expectCrossBackendLeafAgreement(vals.map((v) => lit(v, 'dateTime')));
@@ -183,14 +176,14 @@ describe.skipIf(!BLAZEGRAPH_URL)('term-canon cross-backend oracle: oxigraph ⇄ 
   });
 
   it('xsd:time (OT-RFC-57)', async () => {
-    const vals = ['12:00:00', '12:00:00.0', '12:00:00.500', '12:00:00Z', '12:00:00+00:00', '12:00:00-00:00', '12:00:00+02:00', '24:00:00', '24:00:00Z'];
+    const vals = ['12:00:00', '12:00:00.0', '12:00:00.500', '12:00:00Z', '12:00:00+00:00', '12:00:00-00:00', '12:00:00+02:00', '12:00:00-05:00', '24:00:00', '24:00:00Z'];
     await expectCrossBackendLeafAgreement(vals.map((v) => lit(v, 'time')));
   });
 
   it('date / gYear / gYearMonth / gMonthDay / gMonth / gDay (OT-RFC-57)', async () => {
     await expectCrossBackendLeafAgreement([
       lit('2026-06-29', 'date'), lit('2026-06-29Z', 'date'), lit('2026-06-29+00:00', 'date'),
-      lit('2026-06-29-00:00', 'date'), lit('2026-06-29+02:00', 'date'),
+      lit('2026-06-29-00:00', 'date'), lit('2026-06-29+02:00', 'date'), lit('2026-06-29-05:00', 'date'),
       lit('2026', 'gYear'), lit('2026+00:00', 'gYear'), lit('2026+02:00', 'gYear'), lit('02026', 'gYear'),
       lit('2026-06', 'gYearMonth'), lit('2026-06+00:00', 'gYearMonth'),
       lit('--06-29', 'gMonthDay'), lit('--06-29+00:00', 'gMonthDay'),

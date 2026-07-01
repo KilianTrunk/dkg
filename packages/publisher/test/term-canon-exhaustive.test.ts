@@ -134,3 +134,37 @@ describe('term-canon EXHAUSTIVE', () => {
     await proveParity('numeric boundaries', objs);
   });
 });
+
+// Pure-canon consensus assertions for the two otReviewAgent #1399 findings — no
+// oxigraph round-trip (these exercise exotic inputs the store may reject; the point
+// is the canonicalizer's own deterministic behavior).
+describe('term-canon OT-RFC-57 edge cases (otReviewAgent #1399)', () => {
+  const canon = canonicalizeObjectTermForHash;
+
+  it('dateTime overflowing i128 seconds AFTER the tz shift is kept verbatim (not a UTC leaf)', () => {
+    // Local components pass the range check, but subtracting -14:00 pushes the UTC
+    // instant past the max representable second — must fall back to verbatim.
+    const over = lit('5391559471919-03-30T14:00:00-14:00', 'dateTime');
+    expect(canon(over)).toBe(over);
+    // A near-boundary value that stays in range after folding still normalizes.
+    expect(canon(lit('2026-06-29T12:00:00-14:00', 'dateTime'))).toBe(lit('2026-06-30T02:00:00Z', 'dateTime'));
+  });
+
+  it('bare gregorian: UTC-equivalent zone folds; a non-UTC offset stays verbatim + distinct', () => {
+    // Z / +00:00 / -00:00 fold to the no-timezone value form.
+    for (const z of ['Z', '+00:00', '-00:00']) {
+      expect(canon(lit(`--06-29${z}`, 'gMonthDay'))).toBe(lit('--06-29', 'gMonthDay'));
+    }
+    // Non-UTC offsets must NOT collapse onto one leaf (the bug): kept verbatim + distinct.
+    const plus = lit('--06-29+14:00', 'gMonthDay');
+    const minus = lit('--06-29-14:00', 'gMonthDay');
+    expect(canon(plus)).toBe(plus);
+    expect(canon(minus)).toBe(minus);
+    expect(canon(plus)).not.toBe(canon(minus));
+    // gMonth / gDay likewise.
+    expect(canon(lit('--06+05:00', 'gMonth'))).toBe(lit('--06+05:00', 'gMonth'));
+    expect(canon(lit('--06Z', 'gMonth'))).toBe(lit('--06', 'gMonth'));
+    expect(canon(lit('---29-05:00', 'gDay'))).toBe(lit('---29-05:00', 'gDay'));
+    expect(canon(lit('---29Z', 'gDay'))).toBe(lit('---29', 'gDay'));
+  });
+});

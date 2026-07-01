@@ -453,7 +453,6 @@ function canonDateTime(lex: string): string {
   const ddN = +dd;
   if (moN < 1 || moN > 12) throw new Error('month');
   if (ddN < 1 || ddN > daysInMonth(yy, moN)) throw new Error('day');
-  if (!temporalInRange(yy, moN, ddN, +hh, +mi, +ss)) throw new Error('year overflows i128 seconds');
   const fracNorm = normFrac(frac);
   const { rolls } = validateClock(+hh, +mi, +ss, fracNorm);
   // Base date as a day count; a T24:00 clock rolls one day and resets the hour to 0.
@@ -465,6 +464,12 @@ function canonDateTime(lex: string): string {
   days += BigInt(Math.floor(totalMin / 1440));
   const minInDay = ((totalMin % 1440) + 1440) % 1440;
   const { y, m: mm, d } = civilFromDays(days);
+  // Range-check the NORMALIZED UTC instant, not the lexical components: a tz offset
+  // or T24 roll can push a boundary value outside the i128 seconds range it would
+  // otherwise pass, emitting a leaf for a value the store can't represent stably
+  // (otReviewAgent). Out of range → verbatim (throw, caught upstream).
+  if (!temporalInRange(y.toString(), Number(mm), Number(d), Math.floor(minInDay / 60), minInDay % 60, +ss))
+    throw new Error('normalized dateTime overflows i128 seconds');
   return `${fmtYear(y)}-${pad2(Number(mm))}-${pad2(Number(d))}T${pad2(Math.floor(minInDay / 60))}:${pad2(minInDay % 60)}:${ss}${fracNorm}Z`;
 }
 
@@ -492,16 +497,18 @@ function canonDate(lex: string): string {
   const ddN = +m[3];
   if (moN < 1 || moN > 12) throw new Error('month');
   if (ddN < 1 || ddN > daysInMonth(m[1], moN)) throw new Error('day');
-  if (!temporalInRange(m[1], moN, ddN)) throw new Error('year overflows i128 seconds');
   const { y, m: mm, d } = utcDateFromMidnight(BigInt(m[1]), BigInt(moN), BigInt(ddN), offsetMin);
+  // Validate the NORMALIZED date (the tz roll can cross the year boundary) — see canonDateTime.
+  if (!temporalInRange(y.toString(), Number(mm), Number(d))) throw new Error('normalized date overflows i128 seconds');
   return `${fmtYear(y)}-${pad2(Number(mm))}-${pad2(Number(d))}`;
 }
 
 function canonGYear(lex: string): string {
   const { body, offsetMin } = splitTzToOffset(lex);
   if (!new RegExp(`^${YEAR}$`).test(body)) throw new Error('invalid xsd:gYear');
-  if (!temporalInRange(body, 1, 1)) throw new Error('year overflows i128 seconds');
-  const { y } = utcDateFromMidnight(BigInt(body), 1n, 1n, offsetMin);
+  const { y, m: mm, d } = utcDateFromMidnight(BigInt(body), 1n, 1n, offsetMin);
+  // Validate the NORMALIZED date (a negative offset can roll 01-01 into the prior year).
+  if (!temporalInRange(y.toString(), Number(mm), Number(d))) throw new Error('normalized gYear overflows i128 seconds');
   return fmtYear(y);
 }
 
@@ -509,8 +516,9 @@ function canonGYearMonth(lex: string): string {
   const { body, offsetMin } = splitTzToOffset(lex);
   const m = new RegExp(`^(${YEAR})-(\\d{2})$`).exec(body);
   if (!m || +m[2] < 1 || +m[2] > 12) throw new Error('invalid xsd:gYearMonth');
-  if (!temporalInRange(m[1], +m[2], 1)) throw new Error('year overflows i128 seconds');
-  const { y, m: mm } = utcDateFromMidnight(BigInt(m[1]), BigInt(+m[2]), 1n, offsetMin);
+  const { y, m: mm, d } = utcDateFromMidnight(BigInt(m[1]), BigInt(+m[2]), 1n, offsetMin);
+  // Validate the NORMALIZED date (the tz roll can cross the year boundary).
+  if (!temporalInRange(y.toString(), Number(mm), Number(d))) throw new Error('normalized gYearMonth overflows i128 seconds');
   return `${fmtYear(y)}-${pad2(Number(mm))}`;
 }
 
@@ -518,32 +526,34 @@ function canonGYearMonth(lex: string): string {
 // reference year, so --02-29 is rejected (kept verbatim) — February's max is 28
 // here, unlike a real leap date which needs the year context of xsd:date.
 const MONTH_MAX_DAY = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-// OT-RFC-57: gMonthDay / gMonth / gDay have no year to convert, so a timezone is
-// just STRIPPED (Blazegraph's value form). NB the oracle battery only exercises
-// Z/+00:00 here; a non-UTC offset on these bare types is undefined across backends
-// and not consensus-verified — see OT-RFC-57 §7.8.
+// OT-RFC-57: gMonthDay / gMonth / gDay have no year/date context to convert a
+// timezone into UTC. We therefore fold ONLY a UTC-equivalent zone (Z / +00:00 /
+// -00:00 → offsetMin 0) to the no-timezone value form. A NON-UTC offset is kept
+// VERBATIM (the whole literal, offset included): stripping it would silently
+// COLLAPSE distinct values — "--06-29+14:00" and "--06-29-14:00" are different
+// literals — onto one leaf (otReviewAgent). Verbatim keeps them distinct and defers
+// to the store's own preservation; such exotic offsets on bare gregorian types are
+// vanishingly rare and out of the consensus-verified set (see OT-RFC-57 §7.8).
+function bareGregorian(lex: string, re: RegExp, validate: (m: RegExpExecArray) => boolean): string {
+  const { body, offsetMin } = splitTzToOffset(lex);
+  const m = re.exec(body);
+  if (!m || !validate(m)) throw new Error('invalid bare gregorian');
+  return offsetMin === 0 ? body : lex; // fold UTC-equivalent zone only; else verbatim
+}
 function canonGMonthDay(lex: string): string {
-  const { body } = splitTzToOffset(lex);
-  const m = /^--(\d{2})-(\d{2})$/.exec(body);
-  if (!m) throw new Error('invalid xsd:gMonthDay');
-  const moN = +m[1];
-  const ddN = +m[2];
-  if (moN < 1 || moN > 12 || ddN < 1 || ddN > MONTH_MAX_DAY[moN - 1]) throw new Error('range');
-  return body;
+  return bareGregorian(lex, /^--(\d{2})-(\d{2})$/, (m) => {
+    const moN = +m[1];
+    const ddN = +m[2];
+    return moN >= 1 && moN <= 12 && ddN >= 1 && ddN <= MONTH_MAX_DAY[moN - 1];
+  });
 }
 
 function canonGMonth(lex: string): string {
-  const { body } = splitTzToOffset(lex);
-  const m = /^--(\d{2})$/.exec(body);
-  if (!m || +m[1] < 1 || +m[1] > 12) throw new Error('invalid xsd:gMonth');
-  return body;
+  return bareGregorian(lex, /^--(\d{2})$/, (m) => +m[1] >= 1 && +m[1] <= 12);
 }
 
 function canonGDay(lex: string): string {
-  const { body } = splitTzToOffset(lex);
-  const m = /^---(\d{2})$/.exec(body);
-  if (!m || +m[1] < 1 || +m[1] > 31) throw new Error('invalid xsd:gDay');
-  return body;
+  return bareGregorian(lex, /^---(\d{2})$/, (m) => +m[1] >= 1 && +m[1] <= 31);
 }
 
 // ── xsd:duration / dayTimeDuration / yearMonthDuration ─────────────────────────

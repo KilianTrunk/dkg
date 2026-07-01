@@ -62,6 +62,10 @@ NUM_OP_WALLETS=3
 HARDHAT_BLOCK_INTERVAL_MS="${HARDHAT_BLOCK_INTERVAL_MS:-1000}"
 BLAZEGRAPH_PORT=9999
 BLAZEGRAPH_CONTAINER="devnet-blazegraph"
+# Webapp context path: the 2.1.5 Docker image serves under /bigdata; a native
+# 2.1.6 JAR (the Apple-silicon workaround) serves under /blazegraph. Override with
+# DEVNET_BLAZEGRAPH_CTX to match whichever Blazegraph is actually running.
+BLAZEGRAPH_CTX="${DEVNET_BLAZEGRAPH_CTX:-bigdata}"
 OXIGRAPH_SERVER_PORT_5=7878
 OXIGRAPH_SERVER_PORT_6=7879
 OXIGRAPH_CONTAINER_5="devnet-oxigraph-5"
@@ -262,6 +266,14 @@ deploy_contracts() {
 BLAZEGRAPH_AVAILABLE=false
 
 start_blazegraph() {
+  # Use an EXTERNAL Blazegraph already serving on the port (e.g. a native arm64 JAR
+  # started out-of-band because the amd64 Docker image only runs under glacial qemu
+  # on Apple silicon). Skips Docker entirely; namespaces are the operator's job here.
+  if curl -sf --max-time 4 "http://127.0.0.1:${BLAZEGRAPH_PORT}/${BLAZEGRAPH_CTX}/status" >/dev/null 2>&1; then
+    log "Blazegraph already serving on :${BLAZEGRAPH_PORT}/${BLAZEGRAPH_CTX} (external) — using it (skip Docker)"
+    BLAZEGRAPH_AVAILABLE=true
+    return 0
+  fi
   if ! docker_responsive 3; then
     log "Docker not responsive within 3s — nodes 3-4 will use Oxigraph instead of Blazegraph"
     return 0
@@ -450,8 +462,13 @@ create_node_config() {
     # external Oxigraph on 7878/7879 (nodes 5-6) and a real node's 7878.
     store_block="\"store\": { \"backend\": \"oxigraph-server\", \"options\": { \"port\": $(( ${DEVNET_OXIGRAPH_BASE:-7900} + node_num )) } },"
   elif [ "$node_num" -ge 3 ] && [ "$node_num" -le 4 ]; then
-    if [ "$BLAZEGRAPH_AVAILABLE" = true ]; then
-      store_block="\"store\": { \"backend\": \"blazegraph\", \"options\": { \"url\": \"http://127.0.0.1:${BLAZEGRAPH_PORT}/bigdata/namespace/node${node_num}/sparql\" } },"
+    # DEVNET_BLAZEGRAPH_NS overrides the per-node namespace with a single shared one
+    # (e.g. the built-in "kb") — used when Blazegraph runs as a native arm64 JAR and
+    # offline namespace-creation is unavailable. To avoid two nodes colliding on one
+    # namespace, only node 3 goes to Blazegraph in that mode; node 4 stays oxigraph.
+    if [ "$BLAZEGRAPH_AVAILABLE" = true ] && { [ -z "${DEVNET_BLAZEGRAPH_NS:-}" ] || [ "$node_num" -eq 3 ]; }; then
+      local bz_ns="${DEVNET_BLAZEGRAPH_NS:-node${node_num}}"
+      store_block="\"store\": { \"backend\": \"blazegraph\", \"options\": { \"url\": \"http://127.0.0.1:${BLAZEGRAPH_PORT}/${BLAZEGRAPH_CTX}/namespace/${bz_ns}/sparql\" } },"
     else
       store_block="\"store\": { \"backend\": \"oxigraph\" },"
     fi

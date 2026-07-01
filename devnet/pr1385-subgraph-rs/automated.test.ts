@@ -122,6 +122,8 @@ import {
   getJson,
   waitFor,
   contractAt,
+  valueOf,
+  lexical,
   CONTEXT_GRAPH,
   type DevnetState,
   type DevnetNode,
@@ -143,17 +145,8 @@ import type { TripleStore } from '@origintrail-official/dkg-storage';
 const PRED = 'https://schema.org/identifier';
 const OBJECT_VALUE = 'pr1385-subgraph-rs-marker';
 
-/** Raw value/IRI of a binding (string N-Triples term OR `{value}`-object). */
-const valueOf = (x: unknown): string =>
-  typeof x === 'string' ? x : ((x as { value?: string })?.value ?? '');
-
-/** Bare lexical of an object binding (strip surrounding quotes + any datatype/
- *  lang suffix) so a plain-literal compare is robust to the daemon's term form. */
-function lexical(x: unknown): string {
-  const t = valueOf(x);
-  const m = /^"((?:[^"\\]|\\.)*)"/.exec(t);
-  return m ? m[1] : t;
-}
+// SPARQL binding normalizers (valueOf / lexical) now live in the shared harness —
+// single typed SparqlBindingCell boundary (otReviewAgent #1397).
 
 /** bytes32 hex compare, case-insensitive. */
 const hexEq = (a: Uint8Array, b: string): boolean =>

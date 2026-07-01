@@ -49,6 +49,7 @@ import {
   ensureAllIdentities,
   runDkgCli,
   queryNode,
+  unwrapIri,
   type DevnetState,
   type DevnetNode,
 } from '../_bootstrap/harness.js';
@@ -97,20 +98,9 @@ function lastJsonBlock(stdout: string): Record<string, unknown> {
   }
 }
 
-/** Normalise a SPARQL binding cell to its string term (bare string OR {value,…}). */
-function cellStr(v: unknown): string {
-  if (v === null || v === undefined) return '';
-  if (typeof v === 'string') return v;
-  if (typeof v === 'object' && 'value' in (v as Record<string, unknown>)) {
-    const raw = (v as { value?: unknown }).value;
-    return raw === null || raw === undefined ? '' : String(raw);
-  }
-  return String(v);
-}
-
-/** Strip surrounding < > from an IRI term so it matches the raw `urn:okf:…` form. */
-const unwrapIri = (t: string): string =>
-  t.startsWith('<') && t.endsWith('>') ? t.slice(1, -1) : t;
+// SPARQL binding normalizers (unwrapIri, valueOf) now live in the shared harness —
+// single typed SparqlBindingCell boundary (otReviewAgent #1397). harness.unwrapIri
+// does valueOf() internally, so `unwrapIri(cellStr(x))` collapses to `unwrapIri(x)`.
 
 beforeAll(async () => {
   const detected = await detectDevnet(6);
@@ -211,9 +201,9 @@ describe('PR #1388 — OKF bundle → DKG memory integration', () => {
     expect(bindings.length, `no urn:okf: triples in SWM for ${cgId}`).toBeGreaterThan(0);
 
     const triples = bindings.map((b) => ({
-      s: unwrapIri(cellStr(b.s)),
-      p: unwrapIri(cellStr(b.p)),
-      o: unwrapIri(cellStr(b.o)),
+      s: unwrapIri(b.s),
+      p: unwrapIri(b.p),
+      o: unwrapIri(b.o),
     }));
     const subjects = new Set(triples.map((t) => t.s));
     // Every concept subject is visible team-wide in SWM.

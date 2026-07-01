@@ -52,6 +52,7 @@ import {
   contractAt,
   getJson,
   postJson,
+  httpDelete,
   waitFor,
   type DevnetState,
   type DevnetNode,
@@ -282,21 +283,7 @@ describe('PR #1370 — node-admin operational wallet add / remove + guard', () =
  * helper, so issue it directly with the node's bearer token (the route gates
  * writes on a node-admin token; the harness reads exactly that from auth.token).
  */
-async function postDelete(
-  n: DevnetNode,
-  address: string,
-): Promise<{ status: number; json: any }> {
-  const headers: Record<string, string> = {};
-  if (n.authToken) headers.Authorization = `Bearer ${n.authToken}`;
-  const res = await fetch(
-    `http://127.0.0.1:${n.apiPort}/api/operational-wallets/${encodeURIComponent(ethers.getAddress(address))}`,
-    { method: 'DELETE', headers },
-  );
-  let json: any = null;
-  try {
-    json = await res.json();
-  } catch {
-    /* non-JSON */
-  }
-  return { status: res.status, json };
-}
+// Domain wrapper over the harness httpDelete primitive: builds the op-wallet path
+// (checksummed + URL-encoded) so the five call sites stay unchanged.
+const postDelete = (n: DevnetNode, address: string) =>
+  httpDelete(n, `/api/operational-wallets/${encodeURIComponent(ethers.getAddress(address))}`);

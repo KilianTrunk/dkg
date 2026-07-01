@@ -33,7 +33,11 @@ RUN_ORCHESTRATOR="${RUN_ORCHESTRATOR:-0}"
 SOAK_RS_SECONDS="${SOAK_RS_SECONDS:-1800}"
 if [ "$RUN_ORCHESTRATOR" = "1" ]; then ORCH_RESERVE_SECONDS="${ORCH_RESERVE_SECONDS:-5400}"; else ORCH_RESERVE_SECONDS=0; fi
 
-NEW_SUITES=(pr1386-term-canon pr1385-subgraph-rs pr1388-okf-integration pr1366-pca-deposit-waiver pr1387-bulk-register-agents pr1384-preserve-agents-on-transfer pr1370-admin-op-wallet)
+# Suite list is single-sourced in devnet/suites.json (guarded against drift by
+# devnet/_bootstrap/suite-manifest.test.ts). Read the PR-coverage set from there.
+SUITES_JSON="$REPO_ROOT/devnet/suites.json"
+NEW_SUITES=($(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).prCoverage.join(' '))" "$SUITES_JSON" 2>/dev/null))
+[ "${#NEW_SUITES[@]}" -gt 0 ] || { echo "FATAL: could not read prCoverage from $SUITES_JSON (need node in PATH)"; exit 2; }
 STABILITY_SUITES="${STABILITY_SUITES:-${NEW_SUITES[*]} v10-end-to-end}"
 
 log() { echo "[1002-sweep $(date -u +'%H:%M:%S')] $*" | tee -a "$SUMMARY"; }

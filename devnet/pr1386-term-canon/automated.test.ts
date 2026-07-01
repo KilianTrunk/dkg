@@ -58,6 +58,8 @@ import {
   queryNode,
   getJson,
   waitFor,
+  normTerm,
+  valueOf,
   CONTEXT_GRAPH,
   type DevnetState,
   type DevnetNode,
@@ -109,37 +111,8 @@ function buildBattery(): LiteralCase[] {
   ];
 }
 
-const XSD_STRING = `${XSD}string`;
-
-/** Raw value/IRI of a binding (string term OR `{value}`-object) — used for the
- *  predicate IRI (a NamedNode, no datatype/lang to preserve). */
-const valueOf = (x: unknown): string =>
-  typeof x === 'string' ? x : ((x as { value?: string })?.value ?? '');
-
-/**
- * Normalize a binding to a FULL N-Triples object term, preserving the
- * datatype/lang SUFFIX (which is exactly where canon acts for the lang-tag and
- * xsd:string cases — so we must NOT drop it). The daemon returns term strings on
- * the validated path; the object branch only fires if a future shape returns
- * SPARQL-JSON `{ value, datatype?, 'xml:lang'? }`, in which case we rebuild the
- * same term form the canonicalizer / oxigraph adapter emit:
- *   - lang literal   → `"v"@lang`
- *   - typed literal  → `"v"^^<dt>` (xsd:string elided to bare `"v"`)
- *   - plain literal  → `"v"`
- *   - IRI/blank      → as-is
- */
-function normTerm(x: unknown): string {
-  if (typeof x === 'string') return x; // already an N-Triples term string
-  const o = (x ?? {}) as { value?: string; datatype?: string; type?: string; 'xml:lang'?: string; lang?: string };
-  if (o.value === undefined) return '';
-  const lang = o['xml:lang'] ?? o.lang;
-  if (lang) return `"${o.value}"@${lang}`;
-  if (o.datatype && o.datatype !== XSD_STRING) return `"${o.value}"^^<${o.datatype}>`;
-  // No datatype, or xsd:string, or a non-literal term type → if it looks like an
-  // IRI/blank return verbatim, else a bare quoted literal.
-  if (o.type === 'uri' || o.type === 'bnode') return o.value;
-  return /^["_<]/.test(o.value) ? o.value : `"${o.value}"`;
-}
+// SPARQL binding normalizers (normTerm / valueOf) now live in the shared harness —
+// single typed SparqlBindingCell boundary (otReviewAgent #1397).
 
 const state: { v: DevnetState | null } = { v: null };
 

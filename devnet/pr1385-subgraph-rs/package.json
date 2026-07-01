@@ -4,6 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": { "test:devnet": "vitest run --config vitest.config.ts" },
-  "dependencies": { "ethers": "^6.16.0" },
+  "dependencies": {
+    "ethers": "^6.16.0",
+    "@origintrail-official/dkg-core": "workspace:*",
+    "@origintrail-official/dkg-storage": "workspace:*",
+    "@origintrail-official/dkg-random-sampling": "workspace:*"
+  },
   "devDependencies": { "vitest": "^4.0.18" }
 }

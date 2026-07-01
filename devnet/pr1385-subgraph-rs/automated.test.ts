@@ -24,10 +24,10 @@
  *   `hashTripleV10` of the same triple content, so anchored roots are unchanged
  *   — a read-path change only.
  *
- * NETWORK-OBSERVABLE PROXIES this suite asserts (the extractor is internal to
- * the prover; we observe the data homes + the prover outcome it reads):
+ * WHAT THIS SUITE ASSERTS (it 3 is the deterministic, OUR-KA-specific proof;
+ * the others are supporting evidence + a no-stall regression guard):
  *
- *   it 1 (DETERMINISTIC — the core of #1385): the sub-graph KA's triple is
+ *   it 1 (DETERMINISTIC — materialization): the sub-graph KA's triple is
  *     materialized in exactly the graphs the post-#1385 extractor reads. We probe
  *     via the daemon query route, which (no-view path) scopes a
  *     `{contextGraphId, subGraphName}` query to
@@ -36,9 +36,8 @@
  *     contextGraphSubGraphUri, packages/core/src/constants.ts:327). On the
  *     publisher/author node the VM layer is in scope, so the triple is reachable
  *     by sub-graph name — the same bare sub-graph / VM homes (b1)/(b2) the
- *     extractor falls back to. This is the regression that #1385 makes
- *     observable: pre-#1385 a sub-graph KA's content was unreachable from the CG
- *     scope; post-#1385 it lives in (and is read from) the named sub-graph graph.
+ *     extractor falls back to. Pre-#1385 a sub-graph KA's content was unreachable
+ *     from the CG scope; post-#1385 it lives in the named sub-graph graph.
  *
  *   it 2 (DETERMINISTIC — read-path semantics, NOT a guess): the SAME triple is
  *     NOT reachable from a plain PARENT-CG-scope query (contextGraphId only, no
@@ -53,16 +52,33 @@
  *     cascade is needed. (Asserting reachability-from-parent here would
  *     contradict the real semantics and the PR's own motivation.)
  *
- *   it 3 (BEST-EFFORT — RS liveness / regression): with a sub-graph KA resident
- *     in the shared `devnet-test` CG, RS must still LAND a proof on-chain (no
- *     KCDataMissingError stalls the prover). Gate on the ON-CHAIN solved flag
- *     (getNodeChallenge tuple index [6]) on some core — robust to a warm devnet
- *     where the per-process `submittedCount` is already non-zero. Additionally
- *     snapshot each core's submittedCount BEFORE and accept an INCREASE as a
- *     second liveness signal. Log whether the solved challenge's
- *     knowledgeAssetId (tuple index [0]) matches our sub-graph kaId (strong case)
- *     but DON'T gate on it — the network draw samples across every weighted CG so
- *     which KA is sampled is non-deterministic.
+ *   it 3 (DETERMINISTIC — THE #1385 REGRESSION, OUR KA specifically): we run the
+ *     REAL production `extractV10KCFromStore` (the #1385 code path itself) against
+ *     node1's live oxigraph over the standard SPARQL-HTTP adapter, with the
+ *     per-cgId data-graph read BLANKED so the #1385 sub-graph cascade is forced to
+ *     fire (the publisher's per-cgId promotion — dkg-publisher.ts:1745 — otherwise
+ *     copies the sub-graph KA into `…/context/<cgId>` and path (a) satisfies it
+ *     without ever exercising #1385, which would make a plain root check green
+ *     even if #1385 were reverted). We then assert BOTH: (a) the extractor
+ *     resolved OUR `subGraphName` and read every triple from OUR sub-graph home
+ *     (proves the cascade fired), and (b) the leaves recompute — exactly the way
+ *     the prover does, `structuredKARootV10(triples.map(hashTripleV10),
+ *     privateRoots)` (proof-material.ts:118-131) — to the ON-CHAIN-anchored
+ *     merkleRoot for OUR kaId (DKGKnowledgeAssets.getLatestMerkleRoot). That is
+ *     fully deterministic and independent of which KA the network draw samples —
+ *     it directly proves OUR sub-graph KA is extractable AND provable.
+ *
+ *   it 4 (BEST-EFFORT — no-stall liveness guard, NOT an OUR-KA proof): with a
+ *     sub-graph KA resident in the shared `devnet-test` CG, the RS prover must
+ *     still LAND a proof on-chain (a broken sub-graph extractor would stall every
+ *     period with KCDataMissingError → no proof ever lands). Gate on the ON-CHAIN
+ *     solved flag (getNodeChallenge tuple index [6], in a NEWER period than the
+ *     baseline) OR a submittedCount increase on some core. This is a regression
+ *     guard that the prover doesn't STALL with a sub-graph KA present — it does
+ *     NOT and CANNOT prove OUR specific KA was sampled: the network draw samples
+ *     across every weighted CG so which KA is sampled is non-deterministic. The
+ *     deterministic OUR-KA evidence is it 3; this only logs (never gates on) the
+ *     kaId match.
  *
  * SUB-GRAPH PUBLISH FLOW (each command/flag verified in source):
  *   1. Register the sub-graph (idempotent on this devnet) — POST
@@ -93,6 +109,8 @@
  *   - Never touches node identities / op-wallets; NEVER time-warps (that breaks
  *     in-flight RS challenges this very suite needs to land).
  */
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, it, expect, beforeAll } from 'vitest';
 import {
   detectDevnet,
@@ -103,10 +121,22 @@ import {
   postJson,
   getJson,
   waitFor,
+  contractAt,
   CONTEXT_GRAPH,
   type DevnetState,
   type DevnetNode,
 } from '../_bootstrap/harness.js';
+// The REAL #1385 code path + the on-chain-oracle machinery it feeds. We run the
+// production `extractV10KCFromStore` against node1's live oxigraph over the
+// standard SPARQL 1.1 HTTP adapter (`SparqlHttpStore`), then recompute the KA's
+// V10 root the exact way the prover does (prover.ts:392-395 → proof-material.ts:
+// 118-131: `structuredKARootV10(triples.map(hashTripleV10), privateRoots)`) and
+// compare it to the on-chain-anchored root. That deterministically proves OUR
+// sub-graph KA is extractable AND provable — independent of the network draw.
+import { SparqlHttpStore } from '@origintrail-official/dkg-storage';
+import { extractV10KCFromStore } from '@origintrail-official/dkg-random-sampling';
+import { structuredKARootV10, hashTripleV10 } from '@origintrail-official/dkg-core';
+import type { TripleStore } from '@origintrail-official/dkg-storage';
 
 // Predicate + object literal for the unique sub-graph triple. The object value
 // is asserted to round-trip out of the sub-graph graph in it 1.
@@ -123,6 +153,73 @@ function lexical(x: unknown): string {
   const t = valueOf(x);
   const m = /^"((?:[^"\\]|\\.)*)"/.exec(t);
   return m ? m[1] : t;
+}
+
+/** bytes32 hex compare, case-insensitive. */
+const hexEq = (a: Uint8Array, b: string): boolean =>
+  '0x' + Buffer.from(a).toString('hex') === b.toLowerCase();
+
+/**
+ * Resolve a node's LOCAL oxigraph SPARQL 1.1 endpoint from its `config.json`.
+ * The devnet cores run the `oxigraph-server` backend (`store.options.port`), so
+ * `http://127.0.0.1:<port>/query` is the RAW store — no daemon `/api/query`
+ * scoping/rewrite — which is exactly what the RS prover's extractor reads
+ * (`extractV10KCFromStore` issues explicit `GRAPH <uri>` SPARQL that must hit
+ * the store un-rewritten). Returns null if the node isn't oxigraph-server.
+ */
+function oxigraphQueryEndpoint(node: DevnetNode): string | null {
+  try {
+    const cfg = JSON.parse(readFileSync(join(node.home, 'config.json'), 'utf8'));
+    if (cfg?.store?.backend !== 'oxigraph-server') return null;
+    const port = cfg?.store?.options?.port;
+    if (!port) return null;
+    return `http://127.0.0.1:${port}/query`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A read-only TripleStore decorator that BLANKS the per-cgId data-graph
+ * CONSTRUCT so the #1385 sub-graph cascade (discover-from-`_meta` → b1 per-KA
+ * VM layer → b2 bare sub-graph graph) is forced to fire.
+ *
+ * WHY this is faithful, not synthetic: the publisher's publish→per-cgId
+ * promotion COPIES every KA's public quads (sub-graph KAs included) into the
+ * per-cgId data graph `<NAME>/context/<cgId>` (dkg-publisher.ts:1745 — "RS
+ * prover's extractV10KCFromStore reads triples from there"). So on any core that
+ * ran the promotion, the extractor's path (a) satisfies a sub-graph KA and the
+ * #1385 cascade never fires — which means a plain root check on node1 is
+ * satisfied by the PRE-#1385 path and would stay green even if #1385 were
+ * reverted (the very false-confidence this test must not have). Blanking ONLY
+ * the per-cgId data-graph read reproduces a replica / un-promoted node's store
+ * view — the real scenario #1385 was written for — using the real data, the real
+ * extractor, and the real on-chain oracle. Nothing else is touched: `_meta`
+ * reads (`…/context/<cgId>/_meta`, `…/_meta`), the VM layer and the bare
+ * sub-graph graph all pass straight through, so the leaves the extractor returns
+ * are the genuine sub-graph-home triples.
+ *
+ * The match is anchored on the exact `GRAPH <…/context/<cgId>>` token WITH its
+ * closing `>` so the sibling `…/context/<cgId>/_meta` graph (which the extractor
+ * MUST still read for the UAL/rootEntity/subGraphName resolution) is untouched.
+ */
+function makeReplicaView(inner: TripleStore, perCgIdDataGraph: string): TripleStore {
+  const blankMarker = `GRAPH <${perCgIdDataGraph}>`;
+  return new Proxy(inner, {
+    get(target, prop, receiver) {
+      if (prop === 'query') {
+        return async (sparql: string, options?: unknown) => {
+          const isConstruct = sparql.trim().toUpperCase().startsWith('CONSTRUCT');
+          if (isConstruct && sparql.includes(blankMarker)) {
+            return { type: 'quads' as const, quads: [] };
+          }
+          return (target as TripleStore).query(sparql, options as never);
+        };
+      }
+      const v = Reflect.get(target, prop, receiver);
+      return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+    },
+  }) as unknown as TripleStore;
 }
 
 interface Suite {
@@ -348,6 +445,117 @@ describe('PR #1385 — RS extraction reads named sub-graph KAs (live 6-node devn
   );
 
   it(
+    'DETERMINISTIC (#1385 regression): the REAL extractor recomputes OUR sub-graph ' +
+      "KA's V10 root — via the sub-graph cascade — equal to the on-chain-anchored root",
+    async () => {
+      const s = suite as Suite;
+      expect(s.kaId, 'it 1 must have published the sub-graph KA first').toBeGreaterThan(0n);
+
+      // This is the deterministic evidence the otReviewAgent asked for: it does
+      // NOT depend on which KA the network draw samples. We run the ACTUAL
+      // production `extractV10KCFromStore` (the #1385 code path) against node1's
+      // live oxigraph, FORCE the #1385 sub-graph cascade, recompute the KA's V10
+      // root exactly as the prover does, and assert it equals the root anchored
+      // on-chain for OUR kaId. That proves OUR sub-graph KA is extractable AND
+      // provable — precisely the #1385 regression.
+
+      // node1 (author/publisher) runs oxigraph-server, so we get the RAW store
+      // over the standard SPARQL-HTTP adapter — no daemon scoping — which is what
+      // the prover's extractor reads.
+      const endpoint = oxigraphQueryEndpoint(s.node);
+      expect(
+        endpoint,
+        `node${s.node.num} is not oxigraph-server (no raw SPARQL endpoint to run the real extractor against)`,
+      ).toBeTruthy();
+
+      // On-chain oracle: the KA's anchored V10 merkleRoot. The shared harness's
+      // `state.kas` ABI only carries getLatestMerkleRootAuthor, so build a handle
+      // with the accessor we need (DKGKnowledgeAssets.json:1435-1453).
+      const kas = contractAt(s.state, 'DKGKnowledgeAssets', [
+        'function getLatestMerkleRoot(uint256) view returns (bytes32)',
+      ]);
+      const onChainRoot: string = await kas.getLatestMerkleRoot(s.kaId);
+      expect(
+        /^0x[0-9a-fA-F]{64}$/.test(onChainRoot) && !/^0x0{64}$/.test(onChainRoot),
+        `on-chain root for kaId=${s.kaId} is unset/zero (${onChainRoot}) — KA not anchored?`,
+      ).toBe(true);
+
+      const cgId = 1n; // devnet-test → on-chain id 1 (ontology graph mapping)
+      const raw: TripleStore = new SparqlHttpStore({ queryEndpoint: endpoint!, timeout: 30_000 });
+      // Blank the per-cgId data graph so the #1385 cascade (VM layer / bare
+      // sub-graph graph) is exercised rather than the promotion-populated
+      // per-cgId path — see makeReplicaView for why this is faithful.
+      const store = makeReplicaView(raw, `did:dkg:context-graph:${CONTEXT_GRAPH}/context/${cgId}`);
+
+      // Post-publish, the per-cgId + default `_meta` (batchId/rootEntity/
+      // subGraphName) and the VM sub-graph layer materialize with lag; until then
+      // the extractor throws KCDataMissingError/KCNotFoundError. Poll.
+      const extracted = await waitFor(
+        `the real extractor to resolve OUR sub-graph KA (kaId=${s.kaId}) via the #1385 cascade`,
+        180_000,
+        5_000,
+        async () => {
+          try {
+            const r = await extractV10KCFromStore(store, cgId, s.kaId);
+            // Require the cascade to have fired into the sub-graph home — i.e.
+            // triples came from a graph carrying our sub-graph name. If the
+            // per-cgId blanking somehow didn't force it (data still syncing),
+            // keep polling rather than asserting on a half-synced view.
+            const cascadeFired =
+              r.subGraphName === s.subGraphName &&
+              r.triples.length > 0 &&
+              r.triples.every((t) => (t.graph ?? '').includes(`/${s.subGraphName}`));
+            return cascadeFired ? r : null;
+          } catch {
+            return null; // KCDataMissingError / KCNotFoundError — still syncing
+          }
+        },
+      );
+
+      // (1) The #1385 discover-and-fall-back cascade actually fired for OUR KA:
+      // `subGraphName` is set ONLY when a root is satisfied from a sub-graph home
+      // (ka-extractor.ts:363), never from the per-cgId data graph. This is the
+      // self-guard — if a future change let path (a) satisfy despite the blanking,
+      // this would come back `undefined` and fail loudly instead of silently not
+      // testing the fix.
+      expect(
+        extracted.subGraphName,
+        `extractor did not resolve OUR sub-graph name — cascade did not fire ` +
+          `(got subGraphName=${extracted.subGraphName})`,
+      ).toBe(s.subGraphName);
+      const sourceGraphs = [...new Set(extracted.triples.map((t) => t.graph))];
+      expect(
+        sourceGraphs.every((g) => (g ?? '').includes(`/${s.subGraphName}`)),
+        `expected all triples read from OUR sub-graph home, got ${JSON.stringify(sourceGraphs)}`,
+      ).toBe(true);
+
+      // (2) The leaves read FROM THE SUB-GRAPH HOME recompute to the on-chain root.
+      // Mirror the prover byte-for-byte: leaf = hashTripleV10(s,p,o); the KA root
+      // is the STRUCTURED root hashPair(publicRoot, privateDataHash) — NOT the flat
+      // `extracted.leaves` tree (proof-material.ts:118-131).
+      const leaves = extracted.triples.map((t) => hashTripleV10(t.subject, t.predicate, t.object));
+      const { root: recomputedRoot, leafCount } = structuredKARootV10(leaves, extracted.privateRoots);
+      expect(
+        hexEq(recomputedRoot, onChainRoot),
+        `recomputed V10 root (0x${Buffer.from(recomputedRoot).toString('hex')}) ` +
+          `!= on-chain-anchored root (${onChainRoot}) for OUR sub-graph kaId=${s.kaId} — ` +
+          `the sub-graph home's leaves do NOT reproduce the anchored root`,
+      ).toBe(true);
+
+      await raw.close?.();
+      // eslint-disable-next-line no-console
+      console.log(
+        `#1385 (DETERMINISTIC): OUR sub-graph KA kaId=${s.kaId} extracted via the cascade ` +
+          `(subGraphName="${extracted.subGraphName}", ${leaves.length} leaf(s) from ` +
+          `${JSON.stringify(sourceGraphs)}); recomputed structured V10 root == on-chain root ` +
+          `${onChainRoot} (leafCount=${leafCount}). Sub-graph KA is provably extractable — ` +
+          `no reliance on the network sampling draw.`,
+      );
+    },
+    300_000,
+  );
+
+  it(
     'best-effort: RS still lands a proof on-chain with a sub-graph KA resident (no KCDataMissingError stall)',
     async () => {
       const s = suite as Suite;
@@ -437,10 +645,14 @@ describe('PR #1385 — RS extraction reads named sub-graph KAs (live 6-node devn
 
       expect(live.identityId, 'a core must show RS liveness').toBeGreaterThan(0n);
 
-      // Re-read the on-chain challenge for the live core for the strong-case log.
+      // Re-read the on-chain challenge for the live core, purely for the log.
       // We DO NOT gate on knowledgeAssetId == our sub-graph kaId: the network draw
       // samples across every weighted CG on the devnet, so which KA is sampled is
-      // non-deterministic. We only LOG the match (strong evidence when it happens).
+      // non-deterministic — this test can only witness that the prover DID NOT
+      // STALL, not that OUR KA was the one sampled. The deterministic proof that
+      // OUR sub-graph KA is extractable+provable is it 3 (real extractor vs
+      // on-chain root); the kaId match below is logged as an incidental bonus,
+      // never relied upon.
       try {
         const ch = await rss.getNodeChallenge(live.identityId);
         const sampledKaId = ch[0] as bigint;
@@ -452,7 +664,7 @@ describe('PR #1385 — RS extraction reads named sub-graph KAs (live 6-node devn
             `sampledKaId=${sampledKaId} ourSubGraphKaId=${s.kaId} ` +
             `matchesSubGraphKa=${matchesSubGraphKa}` +
             (matchesSubGraphKa
-              ? ' [STRONG: the SOLVED challenge is our sub-graph KA — the extractor read it]'
+              ? ' [incidental: the sampled KA happened to be ours this run — see it 3 for the deterministic proof]'
               : ''),
         );
       } catch {

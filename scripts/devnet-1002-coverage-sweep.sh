@@ -96,6 +96,12 @@ run_suite() { # $1=suiteDir $2=logTag
 
 # ── Pre-flight ────────────────────────────────────────────────────
 log "10.0.2 sweep. target=${TARGET_SECONDS}s orch=${RUN_ORCHESTRATOR} loop_deadline=$(loop_deadline)s results=$RESULTS"
+# Fail fast if the suite manifest drifted from disk/pnpm-workspace/package.json —
+# else NEW_SUITES (read from suites.json) could silently under-test.
+if ! pnpm vitest run --config devnet/_bootstrap/vitest.manifest.config.ts > "$RESULTS/manifest-guard.log" 2>&1; then
+  log "FATAL: suite manifest drift — see $RESULTS/manifest-guard.log (run 'pnpm test:devnet:manifest')"; exit 2
+fi
+log "suite manifest consistent ($( echo "${NEW_SUITES[*]}" | wc -w | tr -d ' ') PR-coverage suites)."
 if ! healthy; then log "FATAL: devnet not healthy at start — restart it first"; exit 2; fi
 log "devnet healthy (6 nodes + hardhat)."
 

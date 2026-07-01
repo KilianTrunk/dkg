@@ -50,6 +50,8 @@
  *     case; usually it won't on a populated CG).
  */
 import { describe, it, expect, beforeAll } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   detectDevnet,
   ensureAllIdentities,
@@ -60,6 +62,7 @@ import {
   waitFor,
   normTerm,
   valueOf,
+  DEVNET_DIR,
   CONTEXT_GRAPH,
   type DevnetState,
   type DevnetNode,
@@ -209,18 +212,16 @@ describe('PR #1386 — V10 leaf term canonicalization (pipeline consistency)', (
           failures.push(`${c.pred} (${c.note}): no binding returned`);
           continue;
         }
-        // (b) one of the returned FULL terms equals the protocol canon EXACTLY.
-        // This is the load-bearing assertion: the daemon returns an N-Triples
-        // term string (`"v"^^<dt>` / `"v"@lang` / bare `"v"`; harness types
-        // bindings as term strings, oxigraph adapter `termToString` emits this
-        // form), and `canonicalizeObjectTermForHash` is DEFINED to equal the
-        // store's round-trip form. We compare FULL terms — never bare lexicals —
-        // because for the lang-tag (`@EN`→`@en`) and xsd:string (datatype
-        // elision) cases the canonicalization lives in the SUFFIX, so a
-        // lexical-only compare would falsely pass an un-canonicalized result.
-        // `normTerm` only reconstructs a full term if the daemon ever returns an
-        // object-shaped binding; it does not strip the datatype/lang.
-        const exactMatch = got.some((o) => o === expectedCanon);
+        // (b) the CANON of one returned FULL term equals canon(input) —
+        // CONVERGENCE, the exact property an RS prover needs. Under the OT-RFC-57
+        // value-canon the store's lexical form is NOT itself the canonical form
+        // (oxigraph keeps `+02:00`, Blazegraph forces `Z`, sub-ms fractions get
+        // truncated, etc.), so we must canonicalize the store read-back before
+        // comparing — the prover computes keccak(canon(store_readback)) and checks
+        // it against keccak(canon(input)) anchored on-chain. We compare FULL terms
+        // (never bare lexicals) so the lang-tag (`@EN`→`@en`) and xsd:string
+        // (datatype-elision) suffix canonicalization is exercised too.
+        const exactMatch = got.some((o) => canonicalizeObjectTermForHash(o) === expectedCanon);
         if (!exactMatch) {
           failures.push(
             `${c.pred} (${c.note}):\n    published: ${c.object}\n    canon(input)=${expectedCanon}\n    store returned=${JSON.stringify(got)}`,
@@ -236,6 +237,118 @@ describe('PR #1386 — V10 leaf term canonicalization (pipeline consistency)', (
       console.log(
         `#1386: all ${battery.length} diverse literals round-tripped to canon(input) ` +
           `via the live oxigraph store + /api/query (rewrites exercised: ${rewrites.length})`,
+      );
+    },
+    300_000,
+  );
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // (2b) CROSS-BACKEND: the SAME diverse literals, published on an oxigraph node
+  // AND a Blazegraph node, must produce IDENTICAL V10 leaves — RS cannot fork
+  // across the backend boundary. This is the LIVE end-to-end proof of OT-RFC-57
+  // (the CI oracle proves it in a storage unit; this proves it through the real
+  // daemon + real stores on a mixed devnet). Skips cleanly if the devnet
+  // provisioned no Blazegraph node (Docker/emulation absent → nodes 3-4 fell back
+  // to oxigraph).
+  // ──────────────────────────────────────────────────────────────────────────
+  it(
+    'cross-backend: an oxigraph node and a Blazegraph node produce IDENTICAL V10 leaves (OT-RFC-57)',
+    async () => {
+      const s = state.v!;
+      const backendOf = (num: number): string => {
+        try {
+          return (
+            JSON.parse(readFileSync(join(DEVNET_DIR, `node${num}`, 'config.json'), 'utf8'))?.store?.backend ?? ''
+          );
+        } catch {
+          return '';
+        }
+      };
+      const isOxi = (b: string) => /oxigraph|sparql-http/.test(b);
+      const oxiNum = [1, 2, 5, 6].find((n) => s.nodes[n] && isOxi(backendOf(n)));
+      const bgNum = [3, 4].find((n) => s.nodes[n] && backendOf(n) === 'blazegraph');
+      if (!oxiNum || !bgNum) {
+        // eslint-disable-next-line no-console
+        console.log(
+          `#1386 cross-backend SKIP: need 1 oxigraph + 1 blazegraph node (got oxi=${oxiNum}, bg=${bgNum}). ` +
+            `Backends: ${[1, 2, 3, 4, 5, 6].map((n) => `n${n}=${backendOf(n) || '?'}`).join(' ')}`,
+        );
+        return;
+      }
+      const oxiNode = s.nodes[oxiNum]!;
+      const bgNode = s.nodes[bgNum]!;
+      // eslint-disable-next-line no-console
+      console.log(
+        `#1386 cross-backend: oxigraph=node${oxiNum} (${backendOf(oxiNum)}), blazegraph=node${bgNum} (${backendOf(bgNum)})`,
+      );
+
+      // Battery: every AFFECTED class where oxigraph & Blazegraph store-forms diverge
+      // (the value-canon must fold them to ONE leaf) + controls both already agree on.
+      const lit = (v: string, dt: string) => `"${v}"^^<${XSD}${dt}>`;
+      const battery = [
+        lit('2026-06-29T12:00:00+02:00', 'dateTime'), // tz → UTC
+        lit('2026-06-29T12:00:00.123456', 'dateTime'), // sub-ms → ms truncate
+        lit('2026-06-29T12:00:00.500', 'dateTime'), // trailing-zero fraction strip
+        lit('2026-06-29+02:00', 'date'), // date tz → strip
+        lit('02026', 'gYear'), // leading-zero year → strip
+        lit('-0.0', 'double'), // signed zero → "0"
+        lit('42', 'integer'), // control: already agree
+        '"plain literal"', // control: plain string
+      ];
+
+      const publishAndReadLeaves = async (node: DevnetNode, tag: string) => {
+        const { path, subject } = makeNquadsFile(
+          import.meta.dirname,
+          `xbackend-${tag}`,
+          CONTEXT_GRAPH,
+          battery.map((object, i) => ({ predicate: `${P}xb${i}`, object })),
+        );
+        const pub = await publishViaCli(node, CONTEXT_GRAPH, path);
+        expect(pub.kaId, `${tag} publish kaId`).toBeGreaterThan(0n);
+        const rows = await waitFor(
+          `${tag} store to materialize <${subject}> (all ${battery.length} preds)`,
+          120_000,
+          3_000,
+          async () => {
+            const r = await queryNode(node, `SELECT ?p ?o WHERE { <${subject}> ?p ?o }`, {
+              contextGraphId: CONTEXT_GRAPH,
+            });
+            const preds = new Set(r.map((x) => valueOf(x.p).replace(/^<|>$/g, '')));
+            return battery.every((_, i) => preds.has(`${P}xb${i}`)) ? r : null;
+          },
+        );
+        const leafByPred = new Map<string, string>();
+        for (const row of rows) {
+          const pred = valueOf(row.p).replace(/^<|>$/g, '');
+          // canon(store read-back) = exactly the leaf term the RS prover hashes.
+          leafByPred.set(pred, canonicalizeObjectTermForHash(normTerm(row.o)));
+        }
+        return leafByPred;
+      };
+
+      const oxiLeaves = await publishAndReadLeaves(oxiNode, 'oxi');
+      const bgLeaves = await publishAndReadLeaves(bgNode, 'bg');
+
+      const failures: string[] = [];
+      battery.forEach((object, i) => {
+        const pred = `${P}xb${i}`;
+        const anchored = canonicalizeObjectTermForHash(object); // canon(input) = anchored leaf
+        const oxi = oxiLeaves.get(pred);
+        const bg = bgLeaves.get(pred);
+        if (oxi !== anchored || bg !== anchored || oxi !== bg) {
+          failures.push(
+            `${object}\n    canon(input)   = ${anchored}\n    oxigraph leaf  = ${oxi}\n    blazegraph leaf= ${bg}`,
+          );
+        }
+      });
+      expect(
+        failures.length,
+        `CROSS-BACKEND V10 LEAF DIVERGENCE — a Blazegraph node would fork RS from oxigraph:\n${failures.join('\n')}`,
+      ).toBe(0);
+      // eslint-disable-next-line no-console
+      console.log(
+        `#1386 cross-backend: all ${battery.length} literals produce IDENTICAL leaves on ` +
+          `oxigraph(node${oxiNum}) + Blazegraph(node${bgNum}) — RS cannot fork (OT-RFC-57 validated live).`,
       );
     },
     300_000,

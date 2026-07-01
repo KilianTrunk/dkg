@@ -30,16 +30,21 @@ async function oxiForms(objects: string[]): Promise<string[]> {
 async function proveParity(label: string, objects: string[]): Promise<void> {
   const oxi = await oxiForms(objects);
   const mismatches: string[] = [];
-  // forward parity
+  // OT-RFC-57: the canon is now a backend-INDEPENDENT value canon — for temporal
+  // types it emits the UTC value form, NOT oxigraph's preserved lexical form. So
+  // the old "core == oxigraph" identity no longer holds. Assert CONVERGENCE
+  // (canon(oxigraph_readback) == canon(input)) — the property consensus needs —
+  // and true idempotence (canon(canon(x)) == canon(x)).
   objects.forEach((obj, i) => {
-    const got = canonicalizeObjectTermForHash(obj);
-    if (got !== oxi[i]) mismatches.push(`FWD in=${obj}\n   core=${got}\n   oxi =${oxi[i]}`);
-  });
-  // no-migration: core is the identity on oxigraph's own canonical output
-  oxi.forEach((o) => {
-    if (o === '(DROPPED)') return;
-    const re = canonicalizeObjectTermForHash(o);
-    if (re !== o) mismatches.push(`IDEMPOTENCE BROKEN oxi=${o}\n   core(oxi)=${re}`);
+    if (oxi[i] === '(DROPPED)') return;
+    const canonIn = canonicalizeObjectTermForHash(obj);
+    const canonOxi = canonicalizeObjectTermForHash(oxi[i]);
+    if (canonIn !== canonOxi) {
+      mismatches.push(`CONVERGENCE in=${obj}\n   canon(in) =${canonIn}\n   canon(oxi ${oxi[i]})=${canonOxi}`);
+    }
+    if (canonicalizeObjectTermForHash(canonIn) !== canonIn) {
+      mismatches.push(`IDEMPOTENCE BROKEN in=${obj}\n   canon=${canonIn}\n   canon(canon)=${canonicalizeObjectTermForHash(canonIn)}`);
+    }
   });
   if (mismatches.length) {
     throw new Error(`${label}: ${mismatches.length} mismatch(es):\n${mismatches.slice(0, 30).join('\n')}`);

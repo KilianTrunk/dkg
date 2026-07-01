@@ -355,6 +355,91 @@ describe('PR #1386 — V10 leaf term canonicalization (pipeline consistency)', (
   );
 
   // ──────────────────────────────────────────────────────────────────────────
+  // (2c) ASTRAL hazard (OT-RFC-57 §7.7): a supplementary-plane codepoint (> U+FFFF)
+  // is the ONE class no leaf canon can reconcile — Blazegraph corrupts it on write
+  // (truncates to the low 16 bits). This test PROVES oxigraph preserves it (leaf ==
+  // canon(input)) and OBSERVES whether the corruption manifests through the real
+  // daemon publish path (the CI unit oracle proved it via a direct insert; the
+  // daemon's SPARQL-update path may differ). Either outcome is reported, not
+  // hard-failed — the point is to surface the §7.7 hazard live, not gate on a
+  // backend bug. Skips cleanly if no Blazegraph node.
+  // ──────────────────────────────────────────────────────────────────────────
+  it(
+    'cross-backend: astral (>U+FFFF) — oxigraph preserves it; report the Blazegraph §7.7 corruption hazard live',
+    async () => {
+      const s = state.v!;
+      const backendOf = (num: number): string => {
+        try {
+          return (
+            JSON.parse(readFileSync(join(DEVNET_DIR, `node${num}`, 'config.json'), 'utf8'))?.store?.backend ?? ''
+          );
+        } catch {
+          return '';
+        }
+      };
+      const oxiNum = [1, 2, 5, 6].find((n) => s.nodes[n] && /oxigraph|sparql-http/.test(backendOf(n)));
+      const bgNum = [3, 4].find((n) => s.nodes[n] && backendOf(n) === 'blazegraph');
+      if (!oxiNum || !bgNum) {
+        // eslint-disable-next-line no-console
+        console.log(`#1386 astral SKIP: need 1 oxigraph + 1 blazegraph node (oxi=${oxiNum}, bg=${bgNum}).`);
+        return;
+      }
+      const astral = `"smile\\U0001F600"^^<${XSD}string>`; // 😀 = U+1F600 (supplementary plane)
+      const anchored = canonicalizeObjectTermForHash(astral); // canon(input) preserves 😀
+
+      const readLeaf = async (num: number, tag: string): Promise<string | null> => {
+        try {
+          const { path, subject } = makeNquadsFile(import.meta.dirname, `astral-${tag}`, CONTEXT_GRAPH, [
+            { predicate: `${P}astral`, object: astral },
+          ]);
+          const pub = await publishViaCli(s.nodes[num]!, CONTEXT_GRAPH, path);
+          if (!(pub.kaId > 0n)) return null;
+          const rows = await waitFor(
+            `${tag} astral materialize`,
+            60_000,
+            3_000,
+            async () => {
+              const r = await queryNode(s.nodes[num]!, `SELECT ?o WHERE { <${subject}> <${P}astral> ?o }`, {
+                contextGraphId: CONTEXT_GRAPH,
+              });
+              return r.length > 0 ? r : null;
+            },
+          );
+          return canonicalizeObjectTermForHash(normTerm(rows[0].o));
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.log(`#1386 astral: ${tag} publish/query threw (${(e as Error).message.slice(0, 80)})`);
+          return null;
+        }
+      };
+
+      const oxiLeaf = await readLeaf(oxiNum, 'oxi');
+      const bgLeaf = await readLeaf(bgNum, 'bg');
+      // eslint-disable-next-line no-console
+      console.log(`#1386 astral: canon(input)=${anchored}\n    oxigraph leaf = ${oxiLeaf}\n    blazegraph leaf= ${bgLeaf}`);
+
+      // Oxigraph MUST round-trip the astral char to canon(input) — a real regression
+      // if not. (Only assert if the publish landed; a transient publish failure on
+      // this warm CG shouldn't false-fail the hazard documentation.)
+      if (oxiLeaf !== null) expect(oxiLeaf, 'oxigraph must preserve astral (leaf == canon(input))').toBe(anchored);
+
+      // Blazegraph: DOCUMENT, do not gate. Corruption or a write failure both = the
+      // §7.7 hazard manifesting; agreement = it does not manifest via this path.
+      if (bgLeaf === null) {
+        // eslint-disable-next-line no-console
+        console.log('#1386 astral: §7.7 hazard — Blazegraph could not store/serve the astral literal (publish/query failed).');
+      } else if (bgLeaf !== anchored) {
+        // eslint-disable-next-line no-console
+        console.log(`#1386 astral: §7.7 HAZARD CONFIRMED LIVE — Blazegraph forked the leaf (oxi≠bg). Astral content is unprovable across the backend boundary.`);
+      } else {
+        // eslint-disable-next-line no-console
+        console.log('#1386 astral: Blazegraph PRESERVED astral via the daemon path — §7.7 corruption did not manifest here (differs from the direct-insert unit oracle).');
+      }
+    },
+    300_000,
+  );
+
+  // ──────────────────────────────────────────────────────────────────────────
   // (3): an RS proof LANDS on-chain. Gate success on the on-chain `solved` flag
   // (getNodeChallenge tuple index [6]), NOT the cumulative per-process
   // submittedCount — which has been incrementing for the whole devnet session

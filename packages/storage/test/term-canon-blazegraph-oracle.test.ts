@@ -207,7 +207,7 @@ describe.skipIf(!BLAZEGRAPH_URL)('term-canon cross-backend oracle: oxigraph ⇄ 
 
   it('xsd:double / xsd:float (OT-RFC-57)', async () => {
     // Signed zero folds to "0" on both backends (Blazegraph drops the sign on
-    // write; the canon now emits "0" for -0.0 to match — OT-RFC-57 §7.6).
+    // write; the canon now emits "0" for -0.0 to match — OT-RFC-57 §7.5).
     const dbl = ['1.0E2', '1e10', '-0.0', '3.14', '1E-7', '1.5E300', 'NaN', 'INF', '-INF', '0.1', '0.5', '100', '0', '0.0', '-2.5E-3', '6.022E23'];
     await expectCrossBackendLeafAgreement(dbl.map((v) => lit(v, 'double')));
     await expectCrossBackendLeafAgreement(['1.0', '0.1', '3.14', '1E2', '1.5', '100', '0'].map((v) => lit(v, 'float')));

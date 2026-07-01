@@ -136,11 +136,20 @@ elif [ "$RUN_ORCHESTRATOR" = "1" ]; then
   log "PHASE 3 skipped — devnet not healthy after stability loop."
 fi
 
-# ── Aggregate ─────────────────────────────────────────────────────
+# ── Aggregate + exit code ─────────────────────────────────────────
+# Exit non-zero so callers/CI can gate on this sweep (otReviewAgent #1397):
+#   0 = all pass (skips allowed) · 1 = one or more suites FAILED ·
+#   2 = health-guarded loop aborted (infra), no suite failures.
+TOTAL_FAILS=0
 log "═══ PASS-RATES ($ROUND stability rounds + 1 baseline) ═══"
 for i in "${!TALLY_NAMES[@]}"; do
   p=${TALLY_PASS[$i]}; f=${TALLY_FAIL[$i]}; k=${TALLY_SKIP[$i]}; tot=$(( p + f + k ))
+  TOTAL_FAILS=$(( TOTAL_FAILS + f ))
   log "  $(printf '%-38s' "${TALLY_NAMES[$i]}") ${p}/${tot} pass$( [ "$f" -gt 0 ] && echo "  ⚠ ${f} FAIL" )$( [ "$k" -gt 0 ] && echo "  (${k} skip)" )"
 done
-log "TOTAL elapsed $(elapsed)s. aborted=$ABORTED. Results: $RESULTS"
+log "TOTAL elapsed $(elapsed)s. aborted=$ABORTED. suite-failures=$TOTAL_FAILS. Results: $RESULTS"
 log "10.0.2 coverage sweep complete."
+if [ "$TOTAL_FAILS" -gt 0 ]; then log "EXIT 1 — $TOTAL_FAILS suite failure(s)."; exit 1; fi
+if [ "$ABORTED" != "0" ]; then log "EXIT 2 — health-guarded loop aborted (infra), no suite failures."; exit 2; fi
+log "EXIT 0 — all pass."
+exit 0

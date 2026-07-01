@@ -63,11 +63,10 @@ import {
   type DevnetNode,
 } from '../_bootstrap/harness.js';
 // PR #1386's protocol leaf canonicalizer — the SAME function the publisher and the
-// RS prover run at `tripleContentV10`. Imported from the built dist (this module is
-// self-contained, zero imports) so the assertion is grounded in the exact code the
-// network uses, not a re-implementation. Relative-path import because this suite is
-// not a pnpm workspace member and so has no `@origintrail-official/*` resolution.
-import { canonicalizeObjectTermForHash } from '../../packages/core/dist/crypto/term-canon.js';
+// RS prover run at `tripleContentV10` — imported from the package's public module
+// boundary (not its build layout), so the assertion is grounded in the exact code
+// the network uses. See OT-RFC-57 for the backend-independent canon this validates.
+import { canonicalizeObjectTermForHash } from '@origintrail-official/dkg-core';
 
 const XSD = 'http://www.w3.org/2001/XMLSchema#';
 const P = 'http://example.org/p'; // distinct predicate per object: pN

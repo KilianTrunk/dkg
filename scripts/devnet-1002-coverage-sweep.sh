@@ -119,6 +119,9 @@ done
 [ "$ABORTED" = "0" ] && log "PHASE 2 done: $ROUND rounds."
 
 # ── Phase 3: destructive orchestrator LAST (opt-in) ───────────────
+# ORCH_RC: "" = didn't run; 0 = ok; 124/137 = hit the time-box cap (EXPECTED,
+# non-fatal); any other non-zero = a real orchestrator failure (gates the sweep).
+ORCH_RC=""
 if [ "$RUN_ORCHESTRATOR" = "1" ] && healthy; then
   TO_BIN=""; command -v gtimeout >/dev/null 2>&1 && TO_BIN=gtimeout || { command -v timeout >/dev/null 2>&1 && TO_BIN=timeout; }
   CAP=$(( TARGET_SECONDS - $(elapsed) - 60 )); [ "$CAP" -lt 300 ] && CAP=300
@@ -126,20 +129,22 @@ if [ "$RUN_ORCHESTRATOR" = "1" ] && healthy; then
   if [ -n "$TO_BIN" ]; then
     SOAK_RS_SECONDS="$SOAK_RS_SECONDS" RESULTS_DIR="$RESULTS/orchestrator" "$TO_BIN" -k 60 "$CAP" \
       bash "$REPO_ROOT/scripts/devnet-comprehensive.sh" > "$RESULTS/orchestrator.log" 2>&1
-    log "PHASE 3 (orchestrator) exit=$? — see orchestrator.log + orchestrator/"
+    ORCH_RC=$?
   else
     SOAK_RS_SECONDS="$SOAK_RS_SECONDS" RESULTS_DIR="$RESULTS/orchestrator" \
       bash "$REPO_ROOT/scripts/devnet-comprehensive.sh" > "$RESULTS/orchestrator.log" 2>&1
-    log "PHASE 3 (orchestrator) exit=$? — see orchestrator.log"
+    ORCH_RC=$?
   fi
+  log "PHASE 3 (orchestrator) exit=$ORCH_RC — see orchestrator.log + orchestrator/"
 elif [ "$RUN_ORCHESTRATOR" = "1" ]; then
   log "PHASE 3 skipped — devnet not healthy after stability loop."
+  ORCH_RC="skipped"
 fi
 
 # ── Aggregate + exit code ─────────────────────────────────────────
 # Exit non-zero so callers/CI can gate on this sweep (otReviewAgent #1397):
 #   0 = all pass (skips allowed) · 1 = one or more suites FAILED ·
-#   2 = health-guarded loop aborted (infra), no suite failures.
+#   2 = health-guarded loop aborted (infra) · 3 = orchestrator failed.
 TOTAL_FAILS=0
 log "═══ PASS-RATES ($ROUND stability rounds + 1 baseline) ═══"
 for i in "${!TALLY_NAMES[@]}"; do
@@ -147,9 +152,14 @@ for i in "${!TALLY_NAMES[@]}"; do
   TOTAL_FAILS=$(( TOTAL_FAILS + f ))
   log "  $(printf '%-38s' "${TALLY_NAMES[$i]}") ${p}/${tot} pass$( [ "$f" -gt 0 ] && echo "  ⚠ ${f} FAIL" )$( [ "$k" -gt 0 ] && echo "  (${k} skip)" )"
 done
-log "TOTAL elapsed $(elapsed)s. aborted=$ABORTED. suite-failures=$TOTAL_FAILS. Results: $RESULTS"
+# Orchestrator counts as failed on any non-zero EXCEPT the expected time-box
+# cap (124 = timeout, 137 = SIGKILL after -k grace) and "skipped"/"" (didn't run).
+ORCH_FAILED=0
+case "$ORCH_RC" in ""|skipped|0|124|137) ;; *) ORCH_FAILED=1 ;; esac
+log "TOTAL elapsed $(elapsed)s. aborted=$ABORTED. suite-failures=$TOTAL_FAILS. orchestrator=${ORCH_RC:-n/a}. Results: $RESULTS"
 log "10.0.2 coverage sweep complete."
 if [ "$TOTAL_FAILS" -gt 0 ]; then log "EXIT 1 — $TOTAL_FAILS suite failure(s)."; exit 1; fi
 if [ "$ABORTED" != "0" ]; then log "EXIT 2 — health-guarded loop aborted (infra), no suite failures."; exit 2; fi
+if [ "$ORCH_FAILED" = "1" ]; then log "EXIT 3 — orchestrator failed (exit=$ORCH_RC), no suite failures."; exit 3; fi
 log "EXIT 0 — all pass."
 exit 0

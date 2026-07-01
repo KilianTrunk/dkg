@@ -359,6 +359,7 @@ describe('PR #1385 — RS extraction reads named sub-graph KAs (live 6-node devn
       // warm devnet, so an absolute check would be trivially true).
       const coreIds: Record<number, bigint> = {};
       const before: Record<number, number> = {};
+      const beforePeriod: Record<number, bigint> = {};
       for (let n = 1; n <= 4; n++) {
         const node = s.state.nodes[n]!;
         const { status, json } = await getJson(node, '/api/random-sampling/status');
@@ -370,6 +371,16 @@ describe('PR #1385 — RS extraction reads named sub-graph KAs (live 6-node devn
         coreIds[n] = BigInt(json?.identityId ?? '0');
         expect(coreIds[n], `node${n} identityId from RS status`).toBeGreaterThan(0n);
         before[n] = Number(json?.loop?.submittedCount ?? 0);
+        // Baseline the current challenge period so path (A) only counts a
+        // challenge SOLVED in a NEWER period than now — a PRE-EXISTING solved
+        // challenge must not satisfy liveness (otReviewAgent #1397). Tuple idx
+        // [4] = activeProofPeriodStartBlock (monotonic across periods).
+        try {
+          const ch0 = await rss.getNodeChallenge(coreIds[n]);
+          beforePeriod[n] = BigInt(ch0[4] ?? 0n);
+        } catch {
+          beforePeriod[n] = 0n;
+        }
       }
 
       // Poll for liveness via TWO independent signals (first to fire wins):
@@ -402,10 +413,12 @@ describe('PR #1385 — RS extraction reads named sub-graph KAs (live 6-node devn
             } catch {
               /* transient — keep polling */
             }
-            // (A) on-chain solved
+            // (A) on-chain: a challenge solved in a NEWER period than the
+            // baseline — i.e. a proof landed AFTER this suite published its KA.
+            // (A pre-existing solved challenge, same period, does NOT count.)
             try {
               const ch = await rss.getNodeChallenge(id);
-              if (ch[6] === true) {
+              if (ch[6] === true && BigInt(ch[4] ?? 0n) > (beforePeriod[n] ?? 0n)) {
                 return {
                   node: n,
                   identityId: id,

@@ -332,7 +332,12 @@ jobs:
           # Stock image ships the default `kb` namespace; that's all the
           # adapter needs (it isolates per-test via unique GRAPH IRIs).
           BLAZEGRAPH_TEST_URL: http://127.0.0.1:9999/bigdata/namespace/kb/sparql
-        run: pnpm --filter @origintrail-official/dkg-storage exec vitest run test/blazegraph.integration.test.ts
+        # term-canon-blazegraph-oracle: cross-backend V10 leaf agreement (OT-RFC-57)
+        # — proves an oxigraph node and a Blazegraph node compute the SAME merkle
+        # leaf for the same typed literal (else RandomSampling forks). dateTime/time
+        # are fixed here; date/gregorian/double/escaping remain it.fails pending
+        # the rest of the backend-independent canon.
+        run: pnpm --filter @origintrail-official/dkg-storage exec vitest run test/blazegraph.integration.test.ts test/term-canon-blazegraph-oracle.test.ts
 
   # ------------------------------------------------------------------
   # Tornado publisher lane — sharded across 4 parallel runners.

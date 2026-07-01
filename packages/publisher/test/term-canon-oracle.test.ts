@@ -32,16 +32,27 @@ async function oxigraphForms(objects: string[]): Promise<string[]> {
   return objects.map((_, i) => byPred.get(`urn:p#${i}`) ?? '(DROPPED)');
 }
 
-/** Assert the pure core canonicalizer reproduces oxigraph's form for every input. */
+/**
+ * OT-RFC-57: the canon is now a backend-INDEPENDENT value canon — it no longer
+ * reproduces oxigraph's stored lexical form (for temporal types it emits the UTC,
+ * ms-truncated form so oxigraph and Blazegraph nodes agree). So we assert
+ * CONVERGENCE, not identity: `canon(oxigraph_readback) === canon(input)`. This is
+ * exactly what consensus needs — the publisher (input) and a prover reading from
+ * an oxigraph store compute the same leaf — and it holds for BOTH the types the
+ * canon rewrites (dateTime/time) and the types it leaves as oxigraph's form.
+ */
 async function expectMatchesOxigraph(objects: string[]): Promise<void> {
   const oxi = await oxigraphForms(objects);
   const mismatches: string[] = [];
   objects.forEach((obj, i) => {
-    const got = canonicalizeObjectTermForHash(obj);
-    if (got !== oxi[i]) mismatches.push(`  in:  ${obj}\n  core:${got}\n  oxi: ${oxi[i]}`);
+    const canonInput = canonicalizeObjectTermForHash(obj);
+    const canonOxi = canonicalizeObjectTermForHash(oxi[i]);
+    if (canonInput !== canonOxi) {
+      mismatches.push(`  in:            ${obj}\n  canon(input):  ${canonInput}\n  canon(oxi-store ${oxi[i]}): ${canonOxi}`);
+    }
   });
   if (mismatches.length) {
-    throw new Error(`core canon diverged from oxigraph (${mismatches.length}/${objects.length}):\n${mismatches.join('\n')}`);
+    throw new Error(`canon(input) != canon(oxigraph-readback) — publisher/prover would fork (${mismatches.length}/${objects.length}):\n${mismatches.join('\n')}`);
   }
   expect(mismatches.length).toBe(0);
 }
@@ -322,8 +333,15 @@ describe('term-canon oracle: fuzz-hardened edge classes (#1386)', () => {
     const oxi = await oxigraphForms(battery);
     for (let i = 0; i < battery.length; i++) {
       const once = canonicalizeObjectTermForHash(battery[i]);
-      expect(canonicalizeObjectTermForHash(once)).toBe(once); // idempotent
-      if (oxi[i] !== '(DROPPED)') expect(canonicalizeObjectTermForHash(oxi[i])).toBe(oxi[i]); // identity on store output
+      expect(canonicalizeObjectTermForHash(once)).toBe(once); // idempotent (fixed point)
+      // OT-RFC-57: the canon is no longer the IDENTITY on oxigraph's output — for
+      // temporal types it normalizes oxigraph's preserved form to the UTC value
+      // form (so oxigraph nodes agree with Blazegraph). That is the intended
+      // oxigraph/devnet migration (mainnet = Blazegraph is unchanged; asserted by
+      // the Blazegraph oracle). What MUST hold for consensus is CONVERGENCE:
+      // canon(oxigraph_readback) == canon(input) ⇒ publisher and an oxigraph
+      // prover compute the same leaf.
+      if (oxi[i] !== '(DROPPED)') expect(canonicalizeObjectTermForHash(oxi[i])).toBe(once);
     }
   });
 

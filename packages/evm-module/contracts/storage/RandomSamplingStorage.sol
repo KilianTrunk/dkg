@@ -33,7 +33,16 @@ contract RandomSamplingStorage is INamed, IVersioned, IInitializable, ContractSt
     //           and silently corrupt claim math. Tests now drive state
     //           through `appendCheckpoint`.
     //         * `getEpochFirstScorePerStake` retired (always 0 under D26).
-    string private constant _VERSION = "10.0.2";
+    // 10.0.2 → 10.1.0: OT-RFC-49 — `RandomSamplingLib.Challenge` grew two
+    // pinned fields (`challengeLeafCount`, `challengeRoot`) so the persisted
+    // tuple via `getNodeChallenge`/`setNodeChallenge` is wider; the migration
+    // `clearOutstandingChallenges` admin path is added in WS-E.
+    // 10.2.0 — Audit G-3: new `nodeChallengeStakeSnapshot` mapping (+ a
+    // `nodeChallengeStakeSnapshotSet` present-flag and setter) records the node's
+    // effective stake at challenge creation so submitProof can score against
+    // min(snapshot, live), defeating within-period flash-stake spikes. The flag
+    // (not snapshot != 0) gates the cap so a zero-stake node is still capped at 0.
+    string private constant _VERSION = "10.2.0";
     uint8 public constant CHUNK_BYTE_SIZE = 32;
     Chronos public chronos;
 
@@ -90,6 +99,19 @@ contract RandomSamplingStorage is INamed, IVersioned, IInitializable, ContractSt
     mapping(uint256 => mapping(uint72 => mapping(bytes32 => uint256)))
         public delegatorLastSettledNodeEpochScorePerStake;
 
+    // ── Audit G-3 (10.2.0) — APPENDED after all pre-existing state so no slot of
+    //    the score/reward mappings above shifts (upgrade-safe layout).
+    // identityId => node effective stake snapshotted at challenge creation.
+    // submitProof scores against min(snapshot, live) so a within-period flash-stake
+    // cannot inflate the (sticky, whole-epoch) score. A value of 0 here is a VALID
+    // snapshot (a node with zero challenge-time stake is still capped at 0, not left
+    // uncapped) — presence is tracked by the explicit flag below, never by the value.
+    mapping(uint72 => uint256) public nodeChallengeStakeSnapshot;
+    // identityId => whether the CURRENT challenge has a stake snapshot recorded.
+    // Set by `setNodeChallengeStakeSnapshot` (only `createChallenge` calls it); an
+    // injected challenge via the privileged `setNodeChallenge` path has no snapshot.
+    mapping(uint72 => bool) public nodeChallengeStakeSnapshotSet;
+
     event W1Set(uint256 oldW1, uint256 newW1);
     event W2Set(uint256 oldW2, uint256 newW2);
     event ProofingPeriodDurationAdded(uint16 durationInBlocks, uint256 indexed effectiveEpoch);
@@ -141,6 +163,9 @@ contract RandomSamplingStorage is INamed, IVersioned, IInitializable, ContractSt
         uint256 newDelegatorLastSettledNodeEpochScorePerStake
     );
     event NodeChallengeSet(uint72 indexed identityId, RandomSamplingLib.Challenge challenge);
+    /// @notice OT-RFC-49 / WS-E — a node's outstanding challenge was cleared by the
+    ///         `clearOutstandingChallenges` migration sweep at the catalog-cutover redeploy.
+    event NodeChallengeCleared(uint72 indexed identityId);
     event ActiveProofPeriodStartBlockSet(uint256 indexed activeProofPeriodStartBlock);
     event EpochNodeValidProofsCountIncremented(uint256 indexed epoch, uint72 indexed identityId, uint256 newCount);
     event EpochNodeValidProofsCountSet(uint256 indexed epoch, uint72 indexed identityId, uint256 newCount);
@@ -385,6 +410,40 @@ contract RandomSamplingStorage is INamed, IVersioned, IInitializable, ContractSt
     ) external onlyContracts {
         nodesChallenges[identityId] = challenge;
         emit NodeChallengeSet(identityId, challenge);
+    }
+
+    /// @notice G-3 — snapshot the node's effective stake at challenge creation so
+    ///         submitProof can score against min(snapshot, live), defeating a
+    ///         within-period flash-stake spike. `createChallenge` always sets this;
+    ///         a 0 value (only reachable via the privileged setNodeChallenge path)
+    ///         means "no snapshot" and submitProof applies no cap.
+    function setNodeChallengeStakeSnapshot(uint72 identityId, uint256 stake18) external onlyContracts {
+        nodeChallengeStakeSnapshot[identityId] = stake18;
+        nodeChallengeStakeSnapshotSet[identityId] = true;
+    }
+
+    /// @notice OT-RFC-49 / WS-E migration — clear outstanding (unsolved) random-
+    ///         sampling challenges across the redeploy that swaps the curated
+    ///         proof surface from the private ciphertext to the public `_catalog`.
+    ///
+    /// A challenge issued in period N against the OLD (ciphertext) surface must
+    /// not survive the cutover: post-upgrade the pinned `challengeRoot`/
+    /// `challengeLeafCount` fields read as their zero default for any pre-upgrade
+    /// challenge (they were appended to the struct in this version), so `submitProof`
+    /// already reverts them via its `leafCount == 0` bounds check — but a node then
+    /// sits with an unsolved challenge it can neither solve nor (mid-period) replace.
+    /// This admin sweep deletes them so every node re-draws cleanly against the
+    /// catalog surface on the next `createChallenge`. The operator supplies the set
+    /// of node `identityId`s with outstanding challenges (enumerable off-chain from
+    /// `ChallengeGenerated`/`NodeChallengeSet` logs) and runs this ONCE as part of
+    /// the epoch-boundary cut. Idempotent: deleting an already-empty entry is a no-op.
+    ///
+    /// @param identityIds the node identity ids whose challenge slot to clear.
+    function clearOutstandingChallenges(uint72[] calldata identityIds) external onlyOwnerOrMultiSigOwner {
+        for (uint256 i = 0; i < identityIds.length; i++) {
+            delete nodesChallenges[identityIds[i]];
+            emit NodeChallengeCleared(identityIds[i]);
+        }
     }
 
     /**

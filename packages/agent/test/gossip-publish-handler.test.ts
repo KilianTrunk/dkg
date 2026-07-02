@@ -6,6 +6,7 @@ import {
 } from '@origintrail-official/dkg-core';
 import { OxigraphStore, type Quad } from '@origintrail-official/dkg-storage';
 import { GossipPublishHandler } from '../src/gossip-publish-handler.js';
+import type { ContextGraphSub } from '../src/index.js';
 
 const CONTEXT_GRAPH = 'test-gossip-handler';
 
@@ -30,18 +31,25 @@ function makePublishMessage(opts: {
   });
 }
 
-function createHandler(store?: OxigraphStore, callbacks?: Partial<{ contextGraphExists: (id: string) => Promise<boolean>; getContextGraphOwner: (id: string) => Promise<string | null>; subscribeToContextGraph: (id: string) => void }>) {
+function createHandler(store?: OxigraphStore, callbacks?: Partial<{
+  contextGraphExists: (id: string) => Promise<boolean>;
+  getContextGraphOwner: (id: string) => Promise<string | null>;
+  subscribeToContextGraph: (id: string) => void;
+  setContextGraphSubscription: (id: string, next: ContextGraphSub) => void;
+}>) {
   const s = store ?? new OxigraphStore();
+  const subscriptions = new Map<string, ContextGraphSub>();
   return {
     store: s,
     handler: new GossipPublishHandler(
       s,
       undefined,
-      new Map<string, any>(),
+      subscriptions,
       {
         contextGraphExists: callbacks?.contextGraphExists ?? (async () => false),
         getContextGraphOwner: callbacks?.getContextGraphOwner ?? (async () => null),
         subscribeToContextGraph: callbacks?.subscribeToContextGraph ?? (() => {}),
+        setContextGraphSubscription: callbacks?.setContextGraphSubscription ?? ((id, next) => { subscriptions.set(id, next); }),
       },
     ),
   };
@@ -149,6 +157,48 @@ describe('GossipPublishHandler', () => {
     ).toBe(countBefore);
   });
 
+  it('does NOT persist tentative _meta for the agents registry CG (#1233 — agents/_meta bloat)', async () => {
+    const { store, handler } = createHandler();
+    const agentsCg = SYSTEM_CONTEXT_GRAPHS.AGENTS;
+    const entity = 'did:dkg:agent:0x1111111111111111111111111111111111111111';
+
+    const data = makePublishMessage({
+      ual: 'did:dkg:mock:31337/0x1/t-session-1',
+      contextGraphId: agentsCg,
+      nquads: `<${entity}> <http://schema.org/name> "Agent" .`,
+      kas: [{ tokenId: 1, rootEntity: entity, privateMerkleRoot: new Uint8Array(0), privateTripleCount: 0 }],
+    });
+
+    await handler.handlePublishMessage(data, agentsCg);
+
+    // The profile data is still stored in the agents DATA graph...
+    const dataCount = await store.countQuads(`did:dkg:context-graph:${agentsCg}`);
+    expect(dataCount, 'agent profile data must still land in the data graph').toBeGreaterThan(0);
+
+    // ...but NO per-publish tentative tracking record lands in agents/_meta.
+    // That record has no consumer (the registry is served from the data graph)
+    // and a fresh one per peer heartbeat is what grows agents/_meta unbounded.
+    const metaCount = await store.countQuads(`did:dkg:context-graph:${agentsCg}/_meta`);
+    expect(metaCount, 'agents/_meta must not accumulate per-publish tentative records').toBe(0);
+  });
+
+  it('DOES persist tentative _meta for a non-registry data CG (control)', async () => {
+    const { store, handler } = createHandler();
+    const entity = 'did:dkg:test:meta-control-entity';
+
+    const data = makePublishMessage({
+      ual: 'did:dkg:mock:31337/0x1/1',
+      contextGraphId: CONTEXT_GRAPH,
+      nquads: `<${entity}> <http://schema.org/name> "Thing" .`,
+      kas: [{ tokenId: 1, rootEntity: entity, privateMerkleRoot: new Uint8Array(0), privateTripleCount: 0 }],
+    });
+
+    await handler.handlePublishMessage(data, CONTEXT_GRAPH);
+
+    const metaCount = await store.countQuads(`did:dkg:context-graph:${CONTEXT_GRAPH}/_meta`);
+    expect(metaCount, 'non-registry CGs keep the tentative publish-tracking record').toBeGreaterThan(0);
+  });
+
   it('inserts quads for UAL with empty kas (no structural validation)', async () => {
     const { store, handler } = createHandler();
 
@@ -166,6 +216,56 @@ describe('GossipPublishHandler', () => {
     );
     const bindings = result.type === 'bindings' ? result.bindings : [];
     expect(bindings.length).toBeGreaterThan(0);
+  });
+
+  it('keeps legacy subscription-map fallback when setContextGraphSubscription is omitted', async () => {
+    const store = new OxigraphStore();
+    const subscriptions = new Map<string, ContextGraphSub>();
+    const handler = new GossipPublishHandler(
+      store,
+      undefined,
+      subscriptions,
+      {
+        contextGraphExists: async () => false,
+        getContextGraphOwner: async () => null,
+        subscribeToContextGraph: () => {},
+      },
+    );
+
+    const id = 'legacy-callback-discovery';
+    const data = makePublishMessage({
+      contextGraphId: SYSTEM_CONTEXT_GRAPHS.ONTOLOGY,
+      nquads: [
+        `<did:dkg:context-graph:${id}> <${DKG_ONTOLOGY.RDF_TYPE}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}> <did:dkg:context-graph:${SYSTEM_CONTEXT_GRAPHS.ONTOLOGY}> .`,
+        `<did:dkg:context-graph:${id}> <${DKG_ONTOLOGY.SCHEMA_NAME}> "Legacy Callback Discovery" <did:dkg:context-graph:${SYSTEM_CONTEXT_GRAPHS.ONTOLOGY}> .`,
+      ].join('\n'),
+    });
+
+    await handler.handlePublishMessage(data, SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+
+    expect(subscriptions.get(id)).toMatchObject({
+      name: 'Legacy Callback Discovery',
+      subscribed: true,
+      synced: false,
+      metaSynced: false,
+    });
+  });
+
+  it('requires the invalidating subscription setter for agent-backed handlers', () => {
+    const store = new OxigraphStore();
+    const subscriptions = new Map<string, ContextGraphSub>();
+
+    expect(() => new GossipPublishHandler(
+      store,
+      undefined,
+      subscriptions,
+      {
+        contextGraphExists: async () => false,
+        getContextGraphOwner: async () => null,
+        subscribeToContextGraph: () => {},
+      },
+      { requireContextGraphSubscriptionSetter: true },
+    )).toThrow('requires setContextGraphSubscription');
   });
 
   it('rejects forged ontology policy approvals from non-owners', async () => {

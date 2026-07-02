@@ -1,3 +1,6 @@
+import { MemoryLayer, memoryLayerSlug } from './memory-model.js';
+import { assertSafeIri } from './sparql-safe.js';
+
 // ── V10 Protocol Stream IDs ─────────────────────────────────────────────
 
 export const PROTOCOL_PUBLISH = '/dkg/10.0.0/publish';
@@ -20,6 +23,7 @@ export const PROTOCOL_DISCOVER = '/dkg/10.0.0/discover';
 // (sync is a self-healing catch-up net, so the brief mixed-version
 // window during auto-update is no-data-loss).
 export const PROTOCOL_SYNC = '/dkg/10.0.2/sync';
+export const PROTOCOL_GET_ASSERTION_ARTIFACT = '/dkg/10.0.2/get-assertion-artifact';
 // Universal Messenger pilot protocol (rc.9 PR-3). Bumped from
 // /dkg/10.0.0/message to /dkg/10.0.1/message to opt into the
 // reliability substrate (ReliableEnvelope wrapper, sender +
@@ -219,22 +223,69 @@ export function contextGraphSharedMemoryUri(contextGraphId: string, subGraphName
   return `did:dkg:context-graph:${contextGraphId}/_shared_memory`;
 }
 
+/**
+ * SPARQL `FILTER` scoping a `GRAPH ?g` pattern to a shared-working-memory
+ * bucket's OT-RFC-46 read-both layout: the bare bucket `<swmGraph>` AND its
+ * per-KA layer graphs (`<swmGraph>/<addr>/<number>`), excluding the
+ * `<swmGraph>/staging/` sub-tree.
+ *
+ * Single source of truth for this predicate. It was previously copy-pasted
+ * across the publisher, agent, storage-ACK and daemon SWM read paths, and the
+ * publish-from-SWM selection bug came from those copies drifting apart. Reuse
+ * this anywhere a SWM read must see promoted (per-KA) data so the paths stay in
+ * lockstep.
+ *
+ * @param swmGraph bucket URI from `contextGraphSharedMemoryUri(...)`
+ * @param graphVar SPARQL variable bound to the named graph (default `?g`)
+ */
+export function sharedMemoryReadBothFilter(swmGraph: string, graphVar: string = "?g"): string {
+  const safeSwmGraph = assertSafeIri(swmGraph);
+  if (!/^\?[A-Za-z_][A-Za-z0-9_]*$/.test(graphVar)) {
+    throw new Error(`Unsafe SPARQL graph variable: ${graphVar}`);
+  }
+  return `FILTER(((STRSTARTS(STR(${graphVar}), "${safeSwmGraph}/") && !STRSTARTS(STR(${graphVar}), "${safeSwmGraph}/staging/")) || STR(${graphVar}) = "${safeSwmGraph}"))`;
+}
+
 export function contextGraphSharedMemoryMetaUri(contextGraphId: string, subGraphName?: string): string {
   if (subGraphName) return `did:dkg:context-graph:${contextGraphId}/${subGraphName}/_shared_memory_meta`;
   return `did:dkg:context-graph:${contextGraphId}/_shared_memory_meta`;
 }
 
-export function contextGraphVerifiedMemoryUri(contextGraphId: string, verifiedMemoryId: string): string {
-  return `did:dkg:context-graph:${contextGraphId}/_verified_memory/${verifiedMemoryId}`;
+export function contextGraphVerifiableMemoryUri(contextGraphId: string, verifiableMemoryId: string): string {
+  return `did:dkg:context-graph:${contextGraphId}/_verifiable_memory/${verifiableMemoryId}`;
 }
 
-export function contextGraphVerifiedMemoryMetaUri(contextGraphId: string, verifiedMemoryId: string): string {
-  return `did:dkg:context-graph:${contextGraphId}/_verified_memory/${verifiedMemoryId}/_meta`;
+export function contextGraphVerifiableMemoryMetaUri(contextGraphId: string, verifiableMemoryId: string): string {
+  return `did:dkg:context-graph:${contextGraphId}/_verifiable_memory/${verifiableMemoryId}/_meta`;
 }
 
 export function contextGraphAssertionUri(contextGraphId: string, agentAddress: string, name: string, subGraphName?: string): string {
   if (subGraphName) return `did:dkg:context-graph:${contextGraphId}/${subGraphName}/assertion/${agentAddress}/${name}`;
   return `did:dkg:context-graph:${contextGraphId}/assertion/${agentAddress}/${name}`;
+}
+
+/**
+ * Uniform per-KA graph URI for ANY memory layer (OT-RFC-46 Chorus).
+ *
+ *   did:dkg:context-graph:{cg}[/{sub}]/{_layer}/{addr}/{number}
+ *
+ * The layer is just a parameter — WM, SWM, and VM share ONE structure, ONE
+ * builder, and (downstream) ONE read path. `kaNumber` is the per-author KA
+ * number (the identifying half of the UAL `did:dkg:{chain}/{addr}/{number}`),
+ * minted at create. A KA moves between layers by swapping only the `{_layer}`
+ * segment; the `{addr}/{number}` suffix is stable for its whole lifecycle.
+ */
+export function contextGraphLayerUri(
+  contextGraphId: string,
+  layer: MemoryLayer,
+  agentAddress: string,
+  kaNumber: string | number | bigint,
+  subGraphName?: string,
+): string {
+  const base = subGraphName
+    ? `did:dkg:context-graph:${contextGraphId}/${subGraphName}`
+    : `did:dkg:context-graph:${contextGraphId}`;
+  return `${base}/${memoryLayerSlug(layer)}/${agentAddress}/${kaNumber}`;
 }
 
 export function contextGraphRulesUri(contextGraphId: string): string {
@@ -245,6 +296,28 @@ export function contextGraphRulesUri(contextGraphId: string): string {
  * Stable URI for an assertion's lifecycle record in `_meta`.
  * Persists across WM → SWM → VM transitions so assertions remain
  * queryable by identity after promotion.
+ *
+ * TODO(rfc-ka-trim) P3.2 (deferred): merge the lifecycle URN into the seal
+ * subject — return `contextGraphAssertionUri(...)` here (keep this URN shape
+ * as `assertionLifecycleUriLegacy` for read-both) so state/memoryLayer/
+ * assertionGraph/assertionName/kaId/reservedUal/per-layer pointers/
+ * wasAttributedTo land on the one `{cg}/assertion/{addr}/{name}` node
+ * (−5 quads/KA). Deferred from the Phase-3 stage because the audit during
+ * implementation surfaced two hazards that need their own pass:
+ *   1. Subject collision with AUTHOR-SIGNED material: the seal +
+ *      publish-receipt rows live on the seal subject; subject-scoped wipes
+ *      (`assertionCreate` clean-slate, `deleteByPattern({subject})` sites)
+ *      would delete them unless the preserve set is extended to
+ *      ASSERTION_SEAL_PREDICATES + ASSERTION_PUBLISH_RECEIPT_PREDICATES.
+ *   2. Identity double-allocation: the finalize `hasExistingKaId` guard,
+ *      the re-finalize reservedUal reuse and the A2 preserve step read
+ *      kaId/reservedUal by EXACT subject — each needs read-both
+ *      (new-subject ‖ this legacy URN) with new-first precedence, or
+ *      upgraded nodes re-allocate KA numbers and fork UALs.
+ * Read-both is also required in: history + resolveByKaId (dkg-agent.ts —
+ * the URN-prefix author parse), sync replication scope, promote guards,
+ * PROV event targets, node-ui receipt/lifecycle-feed hooks (the receipt
+ * hook already reads both shapes — see useEntityOnChainReceipt P3.4).
  */
 export function assertionLifecycleUri(contextGraphId: string, agentAddress: string, name: string, subGraphName?: string): string {
   if (subGraphName) return `urn:dkg:assertion:${contextGraphId}:${subGraphName}:${agentAddress}:${name}`;
@@ -261,6 +334,18 @@ export function contextGraphSubGraphMetaUri(contextGraphId: string, subGraphName
 
 export function contextGraphSubGraphPrivateUri(contextGraphId: string, subGraphName: string): string {
   return `did:dkg:context-graph:${contextGraphId}/${subGraphName}/_private`;
+}
+
+/**
+ * the public `_catalog` subgraph of a (private) CG: the
+ * bounded, plaintext, core-servable named graph holding the CG's DCAT catalog
+ * entry. `_`-prefixed, so it cannot collide with a user sub-graph name
+ * (`validateSubGraphName` reserves the prefix). This is the serving / open-serve
+ * boundary; the catalog quads are committed inside the CG's own VM merkle root
+ * (combined model), and the partition routing them here happens at publish time.
+ */
+export function contextGraphCatalogUri(contextGraphId: string): string {
+  return `did:dkg:context-graph:${contextGraphId}/_catalog`;
 }
 
 export function validateContextGraphId(id: string): { valid: boolean; reason?: string } {

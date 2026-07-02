@@ -47,6 +47,7 @@ import {
   buildAuthorAttestationTypedData,
   buildUpdateAuthorAttestationTypedData,
   AUTHOR_SCHEME_VERSION_V1,
+  computePublishACKDigest,
 } from '@origintrail-official/dkg-core';
 
 let fileSnapshotId: string;
@@ -103,7 +104,11 @@ async function publishOneKCV10(opts: {
     ethers.parseEther('500000'),
   );
 
-  const contextGraphId = await createTestContextGraph(adapter);
+  // Public CG (accessPolicy 0): publishOneKCV10 exercises §F2 mint / replay /
+  // byte-size lifecycle mechanics with PLAINTEXT, not curated ciphertext. A
+  // curated CG would (correctly) require a ciphertext commitment the plaintext
+  // path never carries, reverting with CuratedCGRequiresCiphertextCommitment.
+  const contextGraphId = await createTestContextGraph(adapter, undefined, 0);
 
   const kaCount = opts.kaCount ?? 1;
   const byteSize = opts.byteSize ?? 256n;
@@ -116,37 +121,51 @@ async function publishOneKCV10(opts: {
 
   const coreOp = new Wallet(HARDHAT_KEYS.CORE_OP, provider);
 
+  // OT-RFC-43 Option-1 (variant 1a): the real adapter + contract require a
+  // packed reservedKaId in the author's namespace. Use the caller-provided id
+  // when given (deterministic-mint / replay tests), otherwise allocate a fresh
+  // per-author number for CORE_OP. Computed BEFORE the author attestation
+  // because the §F2 author digest now binds reservedKaId as its 5th field.
+  const reservedKaId = opts.reservedKaId ?? packReservedKaId(coreOp.address, nextKaNumber(coreOp.address));
+
   // RFC-001 §3 author attestation. EIP-712 typed data over
-  // (cgId, merkleRoot, authorAddress, schemeVersion=1) bound to KAV10.
+  // (cgId, merkleRoot, authorAddress, schemeVersion=1, reservedKaId) bound to
+  // KAV10. §F2: reservedKaId is the 5th bound field and must equal the value
+  // placed in PublishParams or on-chain recovery reverts InvalidAuthorSignature.
   const authorTyped = buildAuthorAttestationTypedData({
     chainId: evmChainId,
     kav10Address,
-    contextGraphId,
     merkleRoot,
     authorAddress: coreOp.address,
+    reservedKaId,
   });
   const authorRaw = ethers.Signature.from(
     await coreOp.signTypedData(authorTyped.domain, authorTyped.types, authorTyped.message),
   );
 
-  // PR #357: V10 ACK now binds merkleLeafCount (uint256). Mirrors
-  // helpers/v10-kc-helpers.ts:buildPublishAckDigest.
-  // #820 / RFC-39: the publish ACK digest additionally binds the trailing
-  // (ciphertextChunksRoot, ciphertextChunkCount, isImmutable) triple — see
-  // KnowledgeAssetsLifecycle._executePublishCore and computePublishACKDigest.
-  // This publish is plaintext + mutable, so all three are zero.
+  // OT-RFC-49 / WS-B Trap 3: the publish ACK digest is prefixed with
+  // `ACK_DIGEST_VERSION` and binds the trailing (catalogRoot, catalogLeafCount,
+  // isImmutable) triple — see KnowledgeAssetsLifecycle._executePublishCore. Use
+  // the canonical off-chain helper so the test digest is byte-identical to the
+  // contract's (hand-rolling it dropped the version prefix and reverted
+  // SignerIsNotNodeOperator). This publish is plaintext + mutable, so the
+  // catalog pair + isImmutable are zero.
   const merkleLeafCount = 1;
-  const ackDigest = ethers.getBytes(ethers.solidityPackedKeccak256(
-    ['uint256', 'address', 'uint256', 'bytes32', 'uint256', 'uint256', 'uint256', 'uint256', 'uint256', 'bytes32', 'uint256', 'uint256'],
-    [evmChainId, kav10Address, contextGraphId, ethers.hexlify(merkleRoot), kaCount, byteSize, epochs, tokenAmount, merkleLeafCount, ethers.ZeroHash, 0, 0],
-  ));
+  const ackDigest = computePublishACKDigest(
+    evmChainId,
+    kav10Address,
+    contextGraphId,
+    merkleRoot,
+    BigInt(kaCount),
+    BigInt(byteSize),
+    BigInt(epochs),
+    BigInt(tokenAmount),
+    BigInt(merkleLeafCount),
+    new Uint8Array(32),
+    0n,
+    false,
+  );
   const ackRaw = ethers.Signature.from(await coreOp.signMessage(ackDigest));
-
-  // OT-RFC-43 Option-1 (variant 1a): the real adapter + contract require a
-  // packed reservedKaId in the author's namespace. Use the caller-provided id
-  // when given (deterministic-mint / replay tests), otherwise allocate a fresh
-  // per-author number for CORE_OP.
-  const reservedKaId = opts.reservedKaId ?? packReservedKaId(coreOp.address, nextKaNumber(coreOp.address));
 
   const result = await adapter.createKnowledgeAssets!({
     publishOperationId: ethers.hexlify(ethers.randomBytes(32)),

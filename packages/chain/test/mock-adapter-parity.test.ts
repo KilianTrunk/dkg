@@ -76,7 +76,7 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   'getContract',            // resolves a Contract from the Hub — not applicable off-chain
   'getBlockNumber',         // the mock exposes its own block counter differently (advanceBlock)
   'getProvider',            // returns a JsonRpcProvider; mock has none
-  'getReadProvider',        // returns the EVM fallback read provider; mock has no RPC provider
+  'getReadProvider',        // @deprecated bare-primary accessor; mock has no RPC provider
   'getSignerAddress',       // mock exposes `signerAddress` as a field
   'getSignerAddresses',     // pool not applicable to mock
   'getAuthorizedPublisherAddress', // pool-specific signer selection; mock has one signerAddress
@@ -89,6 +89,20 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   'nextSigner',
   'nextAuthorizedSigner',
   'findSignerByAddress',
+  // Funding-aware publish wallet selection internals (native+TRAC balance
+  // reads, the fundability gate, the cache, and the insufficient-funds error
+  // enrichment). EVM-only — the mock has no provider/ERC-20 balance surface
+  // and selects from its single signerAddress, so there is nothing to mirror.
+  'selectFundedSigner',
+  'isWalletPublishFundable',
+  'isConvictionFundedAgent',
+  'getWalletFunding',
+  'readNativeBalance',
+  'readTracBalance',
+  'snapshotPublisherWalletBalances',
+  'poolHasFundableSigner',
+  'enrichInsufficientPublisherFundsError',
+  'looksLikeFundsRevert',
   'walletKeyHash',
   'hasAdminPurpose',
   'hasOperationalPurpose',
@@ -102,6 +116,19 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   'getTransactionReceiptWithFailover',
   'waitForReceiptWithFailover',
   'signPopulatedTransaction',
+  // #1336 read-facade + populate plumbing: the chain-concept read facades over
+  // the `RpcFailoverClient` transport — `readContract` (string-method point read),
+  // `readContractWith` (policy/classifier-bearing contract read), and the raw
+  // `readProvider` — plus the event-log scan wrapper, the contract rebind helper,
+  // and the populate+sign-across-providers delegator. Protected EVM-only helpers
+  // over `this.providers[]` (the mock has no RPC provider pool), not ChainAdapter
+  // contract methods — same category as the write-failover helpers above.
+  'readContract',
+  'readContractWith',
+  'readProvider',
+  'queryFilterWithFailover',
+  'rebindContract',
+  'populateAndSignAcrossProviders',
   'sendSignedTransactionAndWait',
   'sendPopulatedTransaction',
   'sendContractTransaction',
@@ -196,6 +223,21 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   // `updateKnowledgeCollectionV10` accepts any ack without recovery, so
   // there is no on-chain digest to reproduce here.
   'getUpdateAckDigestFields',
+  // #1080 follow-up: `resolveKaStorageDeployBlock` binary-searches the deployed
+  // DKGKnowledgeAssets contract's birth block to anchor the pre-10.0.4
+  // KnowledgeAssetCreated fallback scan (avoids a from-genesis crawl under a
+  // 2,000-block eth_getLogs cap). EVM-only — the mock's getMaxKaNumberForAuthor
+  // is an in-memory scan with no chain, deploy block, or eth_getCode to resolve.
+  'resolveKaStorageDeployBlock',
+  'resolveContractDeployBlock',
+  'resolveLogScanHead',
+  // companion retry-wrapper for the deploy-block binary search's historical
+  // eth_getCode probes — EVM-only, same rationale as resolveKaStorageDeployBlock.
+  'getContractCodeAtBlock',
+  // per-page KnowledgeAssetCreated log-scan with cross-backend failover — EVM-only
+  // (the mock's getMaxKaNumberForAuthor is an in-memory scan, no providers).
+  'queryKaCreatedPage',
+  'queryEventLogsPage',
 ]);
 
 const NO_CHAIN_EXEMPT_FROM_EVM = new Set<string>([

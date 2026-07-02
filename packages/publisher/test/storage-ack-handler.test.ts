@@ -6,12 +6,19 @@ import {
 } from '../src/merkle.js';
 import {
   encodePublishIntent, decodeStorageACK, computePublishACKDigest,
-  isStorageACKDecline, STORAGE_ACK_DECLINE_CODES,
+  isStorageACKDecline, STORAGE_ACK_DECLINE_CODES, computeCatalogRoot,
 } from '@origintrail-official/dkg-core';
-import { TypedEventBus } from '@origintrail-official/dkg-core';
+import { TypedEventBus, rebuildMetrics } from '@origintrail-official/dkg-core';
 import { OxigraphStore } from '@origintrail-official/dkg-storage';
 import { ethers } from 'ethers';
 import type { Quad } from '@origintrail-official/dkg-storage';
+import { metrics } from '@opentelemetry/api';
+import {
+  MeterProvider,
+  PeriodicExportingMetricReader,
+  InMemoryMetricExporter,
+  AggregationTemporality,
+} from '@opentelemetry/sdk-metrics';
 
 // Test H5 prefix inputs — must match whatever `StorageACKHandlerConfig`
 // carries so that the ACK digest the test computes equals the one the
@@ -120,6 +127,176 @@ describe('StorageACKHandler', () => {
     expect(recovered.toLowerCase()).toBe(coreWallet.address.toLowerCase());
   });
 
+  it('emits ackHandlerTotal{outcome} through the REAL handler (ack + decline paths)', async () => {
+    // Review coverage gap: the inbound storage-ACK outcome metric is a separate
+    // contract from ACKCollector's — drive the real handler and assert it.
+    const exporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
+    const mp = new MeterProvider({ readers: [new PeriodicExportingMetricReader({ exporter, exportIntervalMillis: 60_000 })] });
+    metrics.setGlobalMeterProvider(mp);
+    rebuildMetrics();
+    try {
+      const handler = await createHandler(swmQuads);
+      const base = {
+        merkleRoot, contextGraphId, publisherPeerId: 'publisher-0', isPrivate: false,
+        kaCount: 1, rootEntities: ['urn:entity:1', 'urn:entity:2'], epochs: 1,
+        tokenAmountStr: '1000', merkleLeafCount: swmMerkleLeafCount,
+      };
+      // ACK path (valid byte size) then DECLINE path (byteSize=1 → underclaim).
+      await handler.handler(encodePublishIntent({ ...base, publicByteSize: 300 }), fakePeerId);
+      await handler.handler(encodePublishIntent({ ...base, publicByteSize: 1 }), fakePeerId);
+
+      await mp.forceFlush();
+      const pts: Array<Record<string, unknown>> = [];
+      for (const rm of exporter.getMetrics())
+        for (const sm of rm.scopeMetrics)
+          for (const m of sm.metrics)
+            if (m.descriptor.name === 'dkg.ack.handler.total')
+              for (const dp of m.dataPoints) pts.push(dp.attributes as Record<string, unknown>);
+
+      expect(pts.some((a) => a.outcome === 'ack')).toBe(true);
+      expect(pts.some((a) => a.outcome === 'decline' && a.decline_code === STORAGE_ACK_DECLINE_CODES.BYTESIZE_UNDERCLAIM)).toBe(true);
+      // Bounded labels only — no high-cardinality keys leak in.
+      const keys = new Set(pts.flatMap((a) => Object.keys(a)));
+      for (const bad of ['peer_id', 'operation_id', 'tx_hash', 'context_graph_id']) expect(keys.has(bad)).toBe(false);
+    } finally {
+      await mp.forceFlush().catch(() => {});
+      await mp.shutdown().catch(() => {});
+      metrics.disable();
+      rebuildMetrics();
+    }
+  });
+
+  it('declines (BYTESIZE_UNDERCLAIM) when publicByteSize is below the real content lower bound', async () => {
+    // The 3 fixture triples have Σ(|s|+|p|+|o|) = 69, a strict lower bound on
+    // any valid N-Quads serialization. A claim of 1 (the byteSize=1 cost dodge)
+    // must be refused so the on-chain ask actually prices the real footprint.
+    const handler = await createHandler(swmQuads);
+    const intent = encodePublishIntent({
+      merkleRoot,
+      contextGraphId,
+      publisherPeerId: 'publisher-0',
+      publicByteSize: 1,
+      isPrivate: false,
+      kaCount: 1,
+      rootEntities: ['urn:entity:1', 'urn:entity:2'],
+      epochs: 1,
+      tokenAmountStr: '1000',
+      merkleLeafCount: swmMerkleLeafCount,
+    });
+
+    const response = await handler.handler(intent, fakePeerId);
+    const decoded = decodeStorageACK(response);
+
+    expect(isStorageACKDecline(decoded)).toBe(true);
+    expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.BYTESIZE_UNDERCLAIM);
+    expect(decoded.declineMessage).toContain('under-claim');
+  });
+
+  it('signs a public ACK when publicByteSize meets the real content lower bound (boundary)', async () => {
+    // Exactly the Σ term-length floor (69) is accepted — an honest publisher's
+    // `publicByteSize == nquads.length` is always strictly above it.
+    const handler = await createHandler(swmQuads);
+    const intent = encodePublishIntent({
+      merkleRoot,
+      contextGraphId,
+      publisherPeerId: 'publisher-0',
+      publicByteSize: 69,
+      isPrivate: false,
+      kaCount: 1,
+      rootEntities: ['urn:entity:1', 'urn:entity:2'],
+      epochs: 1,
+      tokenAmountStr: '1000',
+      merkleLeafCount: swmMerkleLeafCount,
+    });
+
+    const response = await handler.handler(intent, fakePeerId);
+    const decoded = decodeStorageACK(response);
+    expect(isStorageACKDecline(decoded)).toBe(false);
+  });
+
+  it('byteSize floor is UTF-8 bytes — a UTF-16 code-unit count is rejected for non-ASCII content', async () => {
+    // `publicByteSize` is a UTF-8 byte count; the floor must be too. With a
+    // non-ASCII IRI, UTF-8 byte length > UTF-16 code-unit length, so a claim at
+    // the (smaller) code-unit sum — which a JS `.length` floor would have wrongly
+    // ACCEPTED — must be declined.
+    const naQuads: Quad[] = [makeQuad('urn:s:日本', 'urn:p', 'urn:o:語')];
+    const naRoot = computeFlatKCRoot(naQuads, []);
+    const naLeafCount = computeFlatKCMerkleLeafCountV10(naQuads, []);
+    const utf8Floor =
+      Buffer.byteLength('urn:s:日本', 'utf8') +
+      Buffer.byteLength('urn:p', 'utf8') +
+      Buffer.byteLength('urn:o:語', 'utf8');
+    const utf16Sum = 'urn:s:日本'.length + 'urn:p'.length + 'urn:o:語'.length;
+    expect(utf8Floor).to.be.greaterThan(utf16Sum); // sanity: non-ASCII makes UTF-8 > UTF-16
+
+    const handler = await createHandler(naQuads);
+    const mk = (publicByteSize: number) =>
+      encodePublishIntent({
+        merkleRoot: naRoot,
+        contextGraphId,
+        publisherPeerId: 'publisher-0',
+        publicByteSize,
+        isPrivate: false,
+        kaCount: 1,
+        rootEntities: ['urn:s:日本'],
+        epochs: 1,
+        tokenAmountStr: '1000',
+        merkleLeafCount: naLeafCount,
+      });
+
+    // Claim at the UTF-16 code-unit sum (< UTF-8 floor) → declined under-claim.
+    const declined = decodeStorageACK(await handler.handler(mk(utf16Sum), fakePeerId));
+    expect(isStorageACKDecline(declined)).toBe(true);
+    expect(declined.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.BYTESIZE_UNDERCLAIM);
+    // Claim at the UTF-8 floor → accepted.
+    const accepted = decodeStorageACK(await handler.handler(mk(utf8Floor), fakePeerId));
+    expect(isStorageACKDecline(accepted)).toBe(false);
+  });
+
+  it('inline path: byteSize floor is the EXACT serialized payload, not just term bytes', async () => {
+    // When the publisher sends the payload inline (stagingQuads), the core has
+    // the exact serialized bytes, so the floor is the full payload length — a
+    // claim at the bare term-byte sum (which the loose lower bound accepted)
+    // under-prices the real serialization (<>, separators, graph term, ` .`).
+    const g = 'did:dkg:context-graph:42';
+    const inlineQuads: Quad[] = [makeQuad('urn:s', 'urn:p', 'urn:o', g)];
+    const nquadsStr = inlineQuads
+      .map((q) => `<${q.subject}> <${q.predicate}> <${q.object}> <${q.graph}> .`)
+      .join('\n');
+    const stagingBytes = new TextEncoder().encode(nquadsStr);
+    const inlineRoot = computeFlatKCRoot(inlineQuads, []);
+    const inlineLeaf = computeFlatKCMerkleLeafCountV10(inlineQuads, []);
+    const termSum =
+      Buffer.byteLength('urn:s', 'utf8') +
+      Buffer.byteLength('urn:p', 'utf8') +
+      Buffer.byteLength('urn:o', 'utf8');
+    expect(stagingBytes.length).to.be.greaterThan(termSum); // serialization overhead exists
+
+    const handler = await createHandler([]); // no SWM data; the payload is inline
+    const mk = (publicByteSize: number) =>
+      encodePublishIntent({
+        merkleRoot: inlineRoot,
+        contextGraphId,
+        publisherPeerId: 'publisher-0',
+        publicByteSize,
+        isPrivate: false,
+        kaCount: 1,
+        rootEntities: ['urn:s'],
+        epochs: 1,
+        tokenAmountStr: '1000',
+        merkleLeafCount: inlineLeaf,
+        stagingQuads: stagingBytes,
+      });
+
+    // Claim at the term-byte sum (omits serialization overhead) → declined.
+    const declined = decodeStorageACK(await handler.handler(mk(termSum), fakePeerId));
+    expect(isStorageACKDecline(declined)).toBe(true);
+    expect(declined.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.BYTESIZE_UNDERCLAIM);
+    // Claim at the exact serialized byte length → accepted.
+    const ok = decodeStorageACK(await handler.handler(mk(stagingBytes.length), fakePeerId));
+    expect(isStorageACKDecline(ok)).toBe(false);
+  });
+
   it('declines (SIGNER_NOT_REGISTERED) when the signer is no longer confirmed registered', async () => {
     // PR #557: this used to throw, which the publisher saw as a libp2p
     // stream reset; now the handler returns a typed decline so the
@@ -134,7 +311,7 @@ describe('StorageACKHandler', () => {
       publisherPeerId: 'publisher-0',
       publicByteSize: 300,
       isPrivate: false,
-      kaCount: 2,
+      kaCount: 1,
       rootEntities: ['urn:entity:1', 'urn:entity:2'],
       epochs: 1,
       tokenAmountStr: '1000',
@@ -162,7 +339,7 @@ describe('StorageACKHandler', () => {
       publisherPeerId: 'publisher-0',
       publicByteSize: 300,
       isPrivate: false,
-      kaCount: 2,
+      kaCount: 1,
       rootEntities: ['urn:entity:1', 'urn:entity:2'],
       epochs: 1,
       tokenAmountStr: '1000',
@@ -200,6 +377,56 @@ describe('StorageACKHandler', () => {
     expect(decoded.declineMessage).toContain('urn:entity:1');
   });
 
+  it('calls the decline hook with typed, bounded details when returning a decline', async () => {
+    const onDecline = vi.fn();
+    const handler = await createHandler([], { onDecline });
+    const intent = encodePublishIntent({
+      merkleRoot,
+      contextGraphId,
+      publisherPeerId: 'publisher-0',
+      publicByteSize: 300,
+      isPrivate: false,
+      kaCount: 1,
+      rootEntities: ['urn:entity:1'],
+    });
+
+    const response = await handler.handler(intent, fakePeerId);
+    const decoded = decodeStorageACK(response);
+
+    expect(isStorageACKDecline(decoded)).toBe(true);
+    expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM);
+    expect(onDecline).toHaveBeenCalledOnce();
+    expect(onDecline).toHaveBeenCalledWith({
+      code: STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM,
+      contextGraphId,
+      message: expect.stringContaining('No data found in SWM'),
+    });
+    const details = onDecline.mock.calls[0]?.[0];
+    expect(details.message.length).toBeLessThanOrEqual(240);
+  });
+
+  it('ignores decline hook failures and preserves the encoded decline', async () => {
+    const handler = await createHandler([], {
+      onDecline: async () => { throw new Error('logger unavailable'); },
+    });
+    const intent = encodePublishIntent({
+      merkleRoot,
+      contextGraphId,
+      publisherPeerId: 'publisher-0',
+      publicByteSize: 300,
+      isPrivate: false,
+      kaCount: 1,
+      rootEntities: ['urn:entity:1'],
+    });
+
+    const response = await handler.handler(intent, fakePeerId);
+    const decoded = decodeStorageACK(response);
+
+    expect(isStorageACKDecline(decoded)).toBe(true);
+    expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM);
+    expect(decoded.declineMessage).toContain('No data found in SWM');
+  });
+
   it('declines (MERKLE_MISMATCH_IN_SWM) when SWM data does not match the publisher merkle root', async () => {
     const differentQuads = [makeQuad('urn:other', 'urn:p', 'urn:val')];
     const handler = await createHandler(differentQuads);
@@ -222,54 +449,82 @@ describe('StorageACKHandler', () => {
   });
 
   // OT-RFC-38 / LU-5 — encrypted-payload branch for curated CGs.
-  describe('isEncryptedPayload (curated CG path)', () => {
-    // Opaque AEAD ciphertext as far as the handler is concerned. The
-    // handler MUST NOT try to parse this as N-Quads. We use distinctive
-    // bytes so a mistakenly-applied parse path would obviously fail.
-    const ciphertextBytes = new Uint8Array([0x01, 0xff, 0x00, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78]);
-    // The publisher's claimed plaintext merkle root. The handler MUST NOT
-    // recompute against the ciphertext — it just signs what was claimed.
-    const claimedRoot = ethers.getBytes(ethers.keccak256(new TextEncoder().encode('test-plaintext-root')));
-    const claimedKaCount = 3;
+  describe('isEncryptedPayload (curated catalog ACK path — OT-RFC-49)', () => {
+    // OT-RFC-49 / WS-D — a curated ACK ships the PUBLIC `_catalog` N-quads
+    // inline (plaintext — the catalog is public; the PRIVATE data is encrypted
+    // for members only, off the ACK wire). The core REBUILDS the catalog root
+    // over the inline catalog via `computeCatalogRoot(catalogCommittedLeaves(...))`
+    // and DECLINEs `CATALOG_ROOT_MISMATCH` on disagreement — it does NOT blindly
+    // sign over opaque bytes (the behaviour OT-RFC-49 deliberately reversed).
+    //
+    // `merkleRoot` is the PRIVATE flat-KC root the core cannot recompute (it
+    // holds no plaintext) — it is trusted and signed verbatim, gated by the
+    // independent `isCgCurated` oracle.
+    const cgDid = `did:dkg:context-graph:${contextGraphId}`;
+    const catalogTriples = [
+      { subject: cgDid, predicate: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', object: 'http://www.w3.org/ns/dcat#Dataset' },
+      { subject: cgDid, predicate: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', object: 'https://dkg.network/ontology#PrivateContextGraph' },
+      { subject: cgDid, predicate: 'http://purl.org/dc/terms/identifier', object: `"${cgDid}"` },
+    ];
+    const catalogNquads = catalogTriples
+      .map((t) => `<${t.subject}> <${t.predicate}> ${t.object.startsWith('"') ? t.object : `<${t.object}>`} .`)
+      .join('\n');
+    const catalogBytes = new TextEncoder().encode(catalogNquads);
+    const expectedCatalog = computeCatalogRoot(catalogTriples);
+    const catalogRoot = expectedCatalog.root;
+    const catalogLeafCount = expectedCatalog.leafCount;
+    // The publisher's claimed PRIVATE flat-KC root (the core trusts it).
+    const claimedRoot = ethers.getBytes(ethers.keccak256(new TextEncoder().encode('test-private-root')));
+    const claimedKaCount = 1;
     const claimedLeafCount = 9;
     const claimedEpochs = 2;
     const claimedTokenAmountStr = '5000';
 
-    it('signs the V10 digest from publisher-claimed fields without parsing ciphertext', async () => {
-      const handler = await createHandler([]);
-      const intent = encodePublishIntent({
+    function curatedIntent(overrides: Record<string, unknown> = {}): Uint8Array {
+      return encodePublishIntent({
         merkleRoot: claimedRoot,
         contextGraphId,
         publisherPeerId: 'curator-edge',
-        publicByteSize: ciphertextBytes.length,
+        publicByteSize: catalogBytes.length,
         isPrivate: true,
         kaCount: claimedKaCount,
         rootEntities: [],
-        stagingQuads: ciphertextBytes,
+        stagingQuads: catalogBytes,
         epochs: claimedEpochs,
         tokenAmountStr: claimedTokenAmountStr,
         merkleLeafCount: claimedLeafCount,
         isEncryptedPayload: true,
+        catalogRoot,
+        catalogLeafCount,
+        ...overrides,
       });
+    }
 
-      const response = await handler.handler(intent, fakePeerId);
+    it('rebuilds + verifies the catalog root, persists the catalog, and signs the catalog ACK digest', async () => {
+      const handler = await createHandler([]);
+      const response = await handler.handler(curatedIntent(), fakePeerId);
       const ack = decodeStorageACK(response);
 
       expect(isStorageACKDecline(ack)).toBe(false);
       const decodedRoot = ack.merkleRoot instanceof Uint8Array
         ? ack.merkleRoot : new Uint8Array(ack.merkleRoot);
+      // The ACK carries the PRIVATE merkleRoot the publisher claimed.
       expect(Buffer.from(decodedRoot).equals(Buffer.from(claimedRoot))).toBe(true);
 
+      // The digest is now signed over the CATALOG commitment (not ciphertext).
       const expectedDigest = computePublishACKDigest(
         TEST_CHAIN_ID,
         TEST_KAV10_ADDR,
         cgIdBigInt,
         claimedRoot,
         BigInt(claimedKaCount),
-        BigInt(ciphertextBytes.length),
+        BigInt(catalogBytes.length),
         BigInt(claimedEpochs),
         BigInt(claimedTokenAmountStr),
         BigInt(claimedLeafCount),
+        catalogRoot,
+        BigInt(catalogLeafCount),
+        false,
       );
       const prefixedHash = ethers.hashMessage(expectedDigest);
       const recovered = ethers.recoverAddress(prefixedHash, {
@@ -281,171 +536,67 @@ describe('StorageACKHandler', () => {
       expect(recovered.toLowerCase()).toBe(coreWallet.address.toLowerCase());
     });
 
-    it('throws when ciphertext byteSize does not match publicByteSize (prevents pricing fraud)', async () => {
+    it('DECLINEs CATALOG_ROOT_MISMATCH when the rebuilt root != the claimed catalogRoot', async () => {
       const handler = await createHandler([]);
-      const intent = encodePublishIntent({
-        merkleRoot: claimedRoot,
-        contextGraphId,
-        publisherPeerId: 'curator-edge',
-        publicByteSize: ciphertextBytes.length + 100,
-        isPrivate: true,
-        kaCount: claimedKaCount,
-        rootEntities: [],
-        stagingQuads: ciphertextBytes,
-        merkleLeafCount: claimedLeafCount,
-        isEncryptedPayload: true,
-      });
-      await expect(handler.handler(intent, fakePeerId)).rejects.toThrow(
-        /encrypted payload byteSize mismatch/,
-      );
+      const wrongRoot = ethers.getBytes(ethers.keccak256(new TextEncoder().encode('wrong-catalog-root')));
+      const response = await handler.handler(curatedIntent({ catalogRoot: wrongRoot }), fakePeerId);
+      const decoded = decodeStorageACK(response);
+      expect(isStorageACKDecline(decoded)).toBe(true);
+      expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.CATALOG_ROOT_MISMATCH);
     });
 
-    it('throws when stagingQuads is missing (no SWM fallback for opaque blobs)', async () => {
+    it('DECLINEs CATALOG_ROOT_MISMATCH when the inline catalog byteSize != publicByteSize (pricing fraud)', async () => {
       const handler = await createHandler([]);
-      const intent = encodePublishIntent({
-        merkleRoot: claimedRoot,
-        contextGraphId,
-        publisherPeerId: 'curator-edge',
-        publicByteSize: 0,
-        isPrivate: true,
-        kaCount: claimedKaCount,
-        rootEntities: [],
-        merkleLeafCount: claimedLeafCount,
-        isEncryptedPayload: true,
-      });
-      await expect(handler.handler(intent, fakePeerId)).rejects.toThrow(
-        /isEncryptedPayload=true but stagingQuads is empty/,
+      const response = await handler.handler(
+        curatedIntent({ publicByteSize: catalogBytes.length + 100 }),
+        fakePeerId,
       );
+      const decoded = decodeStorageACK(response);
+      expect(isStorageACKDecline(decoded)).toBe(true);
+      expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.CATALOG_ROOT_MISMATCH);
     });
 
-    it('throws when kaCount or merkleLeafCount is missing/zero (publisher must supply both)', async () => {
+    it('DECLINEs when the inline catalog stagingQuads is missing', async () => {
       const handler = await createHandler([]);
-      const noKaCountIntent = encodePublishIntent({
-        merkleRoot: claimedRoot,
-        contextGraphId,
-        publisherPeerId: 'curator-edge',
-        publicByteSize: ciphertextBytes.length,
-        isPrivate: true,
-        kaCount: 0,
-        rootEntities: [],
-        stagingQuads: ciphertextBytes,
-        merkleLeafCount: claimedLeafCount,
-        isEncryptedPayload: true,
-      });
-      await expect(handler.handler(noKaCountIntent, fakePeerId)).rejects.toThrow(
-        /encrypted PublishIntent.kaCount must be positive/,
+      const response = await handler.handler(
+        curatedIntent({ stagingQuads: undefined, publicByteSize: 0 }),
+        fakePeerId,
       );
-
-      const noLeafCountIntent = encodePublishIntent({
-        merkleRoot: claimedRoot,
-        contextGraphId,
-        publisherPeerId: 'curator-edge',
-        publicByteSize: ciphertextBytes.length,
-        isPrivate: true,
-        kaCount: claimedKaCount,
-        rootEntities: [],
-        stagingQuads: ciphertextBytes,
-        merkleLeafCount: 0,
-        isEncryptedPayload: true,
-      });
-      await expect(handler.handler(noLeafCountIntent, fakePeerId)).rejects.toThrow(
-        /encrypted PublishIntent.merkleLeafCount must be a positive integer/,
-      );
+      const decoded = decodeStorageACK(response);
+      expect(isStorageACKDecline(decoded)).toBe(true);
+      expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.CATALOG_ROOT_MISMATCH);
     });
 
     it('Codex PR #608: rejects isEncryptedPayload=true when the local curation oracle says the CG is PUBLIC', async () => {
       // The bypass we're plugging: a malicious publisher sets
-      // `isEncryptedPayload=true` on a CG that is actually public so
-      // the core skips merkle / KA / leaf verification and signs over
-      // arbitrary publisher-supplied bytes. The oracle reports
-      // "not curated" → handler MUST refuse before signing.
-      const handler = await createHandler([], {
-        isCgCurated: async () => false,
-      });
-      const intent = encodePublishIntent({
-        merkleRoot: claimedRoot,
-        contextGraphId,
-        publisherPeerId: 'malicious-publisher',
-        publicByteSize: ciphertextBytes.length,
-        isPrivate: true,
-        kaCount: claimedKaCount,
-        rootEntities: [],
-        stagingQuads: ciphertextBytes,
-        merkleLeafCount: claimedLeafCount,
-        isEncryptedPayload: true,
-      });
-      await expect(handler.handler(intent, fakePeerId)).rejects.toThrow(
+      // `isEncryptedPayload=true` on a CG that is actually public so the core
+      // would sign over a private `merkleRoot` it cannot verify. The oracle
+      // reports "not curated" → handler MUST refuse before signing.
+      const handler = await createHandler([], { isCgCurated: async () => false });
+      await expect(handler.handler(curatedIntent(), fakePeerId)).rejects.toThrow(
         /isEncryptedPayload=true rejected.*PUBLIC \(not curated\)/,
       );
     });
 
     it('Codex PR #608: rejects isEncryptedPayload=true when the oracle returns null (curation unknown)', async () => {
-      // Fail-closed: if the core can't determine whether the CG is
-      // curated (e.g. CG metadata not yet synced from chain), it MUST
-      // NOT honour the encrypted-payload claim. The publisher should
-      // retry via the plaintext-inline path (which IS verifiable).
-      const handler = await createHandler([], {
-        isCgCurated: async () => null,
-      });
-      const intent = encodePublishIntent({
-        merkleRoot: claimedRoot,
-        contextGraphId,
-        publisherPeerId: 'curator-edge',
-        publicByteSize: ciphertextBytes.length,
-        isPrivate: true,
-        kaCount: claimedKaCount,
-        rootEntities: [],
-        stagingQuads: ciphertextBytes,
-        merkleLeafCount: claimedLeafCount,
-        isEncryptedPayload: true,
-      });
-      await expect(handler.handler(intent, fakePeerId)).rejects.toThrow(
+      const handler = await createHandler([], { isCgCurated: async () => null });
+      await expect(handler.handler(curatedIntent(), fakePeerId)).rejects.toThrow(
         /isEncryptedPayload=true rejected.*UNKNOWN/,
       );
     });
 
     it('Codex PR #608: rejects isEncryptedPayload=true when no curation oracle is wired (defensive default)', async () => {
-      // Operators wiring a core without curated-CG support (e.g. only
-      // care about public CGs) shouldn't be silently tricked into
-      // signing for opaque blobs. With no oracle, every encrypted-
-      // payload claim is refused.
-      const handler = await createHandler([], {
-        isCgCurated: undefined,
-      });
-      const intent = encodePublishIntent({
-        merkleRoot: claimedRoot,
-        contextGraphId,
-        publisherPeerId: 'curator-edge',
-        publicByteSize: ciphertextBytes.length,
-        isPrivate: true,
-        kaCount: claimedKaCount,
-        rootEntities: [],
-        stagingQuads: ciphertextBytes,
-        merkleLeafCount: claimedLeafCount,
-        isEncryptedPayload: true,
-      });
-      await expect(handler.handler(intent, fakePeerId)).rejects.toThrow(
+      const handler = await createHandler([], { isCgCurated: undefined });
+      await expect(handler.handler(curatedIntent(), fakePeerId)).rejects.toThrow(
         /no curation oracle wired/,
       );
     });
 
     it('honours the signer-registration gate (declines instead of signing when key is unregistered)', async () => {
-      const handler = await createHandler([], {
-        isSignerRegistered: async () => false,
-      });
-      const intent = encodePublishIntent({
-        merkleRoot: claimedRoot,
-        contextGraphId,
-        publisherPeerId: 'curator-edge',
-        publicByteSize: ciphertextBytes.length,
-        isPrivate: true,
-        kaCount: claimedKaCount,
-        rootEntities: [],
-        stagingQuads: ciphertextBytes,
-        merkleLeafCount: claimedLeafCount,
-        isEncryptedPayload: true,
-      });
-      const response = await handler.handler(intent, fakePeerId);
+      // Catalog is VALID, so the handler reaches the signing gate and declines
+      // there (not earlier on a catalog mismatch).
+      const handler = await createHandler([], { isSignerRegistered: async () => false });
+      const response = await handler.handler(curatedIntent(), fakePeerId);
       const decoded = decodeStorageACK(response);
       expect(isStorageACKDecline(decoded)).toBe(true);
       expect(decoded.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.SIGNER_NOT_REGISTERED);

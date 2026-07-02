@@ -21,6 +21,11 @@
     "type": "error"
   },
   {
+    "inputs": [],
+    "name": "ZeroShardingTableSizeLimit",
+    "type": "error"
+  },
+  {
     "anonymous": false,
     "inputs": [
       {
@@ -106,6 +111,19 @@
   },
   {
     "inputs": [],
+    "name": "contextGraphRegistrationDeposit",
+    "outputs": [
+      {
+        "internalType": "uint96",
+        "name": "",
+        "type": "uint96"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
     "name": "hub",
     "outputs": [
       {
@@ -133,6 +151,19 @@
   {
     "inputs": [],
     "name": "maximumStake",
+    "outputs": [
+      {
+        "internalType": "uint96",
+        "name": "",
+        "type": "uint96"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "minPcaCommitmentForCgWaiver",
     "outputs": [
       {
         "internalType": "uint96",
@@ -289,6 +320,19 @@
   {
     "inputs": [
       {
+        "internalType": "uint96",
+        "name": "amount",
+        "type": "uint96"
+      }
+    ],
+    "name": "setContextGraphRegistrationDeposit",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
         "internalType": "uint16",
         "name": "maxOperatorFee_",
         "type": "uint16"
@@ -308,6 +352,19 @@
       }
     ],
     "name": "setMaximumStake",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint96",
+        "name": "amount",
+        "type": "uint96"
+      }
+    ],
+    "name": "setMinPcaCommitmentForCgWaiver",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"

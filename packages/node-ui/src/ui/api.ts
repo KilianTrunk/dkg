@@ -1,5 +1,6 @@
 const BASE = '';
 const CONTEXT_GRAPH_URI_PREFIX = 'did:dkg:context-graph:';
+const CONTEXT_GRAPH_LOAD_TIMEOUT_MS = 60000;
 declare global {
   interface Window { __DKG_TOKEN__?: string; }
 }
@@ -52,6 +53,25 @@ export class HttpError extends Error {
   }
 }
 
+export class LocalAgentApiError extends Error {
+  status?: number;
+  code?: string;
+  source?: string;
+  details?: string;
+  correlationId?: string;
+  timeoutMs?: number;
+  target?: string;
+  route?: string;
+  integrationId?: string;
+  retryable?: boolean;
+
+  constructor(message: string, metadata: Partial<LocalAgentApiError> = {}) {
+    super(message);
+    this.name = 'LocalAgentApiError';
+    Object.assign(this, metadata);
+  }
+}
+
 async function fetchWithTimeout(input: string, init: RequestInit = {}, timeoutMs = 10000): Promise<Response> {
   try {
     return await fetch(input, { ...init, signal: AbortSignal.timeout(timeoutMs) });
@@ -65,7 +85,21 @@ async function fetchWithTimeout(input: string, init: RequestInit = {}, timeoutMs
 
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`, { headers: authHeaders() });
-  if (!res.ok) throw new HttpError(res.status);
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({}));
+    const msg = (errBody as { error?: string })?.error ?? `HTTP ${res.status}`;
+    throw new HttpError(res.status, msg, errBody);
+  }
+  return res.json() as Promise<T>;
+}
+
+async function getWithTimeout<T>(path: string, timeoutMs: number): Promise<T> {
+  const res = await fetchWithTimeout(`${BASE}${path}`, { headers: authHeaders() }, timeoutMs);
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({}));
+    const msg = (errBody as { error?: string })?.error ?? `HTTP ${res.status}`;
+    throw new HttpError(res.status, msg, errBody);
+  }
   return res.json() as Promise<T>;
 }
 
@@ -99,7 +133,11 @@ async function put<T>(path: string, body: unknown): Promise<T> {
 
 async function del<T>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`, { method: 'DELETE', headers: authHeaders() });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({}));
+    const msg = (errBody as { error?: string })?.error ?? `HTTP ${res.status}`;
+    throw new HttpError(res.status, msg, errBody);
+  }
   return res.json() as Promise<T>;
 }
 
@@ -442,7 +480,10 @@ export const fetchNodeLog = (params: { lines?: number; q?: string } = {}) => {
 
 // --- Context graphs (V10) — legacy daemon paths keep working server-side redirects.
 export async function fetchContextGraphs(): Promise<{ contextGraphs: any[] }> {
-  const data = await get<{ contextGraphs?: any[] }>('/api/context-graph/list');
+  const data = await getWithTimeout<{ contextGraphs?: any[] }>(
+    '/api/context-graph/list',
+    CONTEXT_GRAPH_LOAD_TIMEOUT_MS,
+  );
   const list = data.contextGraphs ?? [];
   return { contextGraphs: list.filter((p: any) => !p.isSystem) };
 }
@@ -734,7 +775,7 @@ export async function importFile(
   if (opts?.ontologyRef) form.append('ontologyRef', opts.ontologyRef);
   if (opts?.subGraphName) form.append('subGraphName', opts.subGraphName);
 
-  const res = await fetch(`${BASE}/api/assertion/${encodeURIComponent(assertionName)}/import-file`, {
+  const res = await fetch(`${BASE}/api/knowledge-assets/${encodeURIComponent(assertionName)}/wm/import-file`, {
     method: 'POST',
     headers: authHeaders(),
     body: form,
@@ -827,43 +868,12 @@ export async function fetchAssertionUals(contextGraphId: string): Promise<Record
   return map;
 }
 
-// --- Publish (assertion-lifecycle: RFC-001 §9.x sign-at-creation) ---
-//
-// Creates a fresh auto-named assertion, writes the supplied quads,
-// finalizes (computes the merkle root and signs the EIP-712
-// AuthorAttestation stamped into `_meta`), promotes into SWM, and
-// publishes — the publisher forwards the seal verbatim and never
-// re-signs.
-export const publishTriples = async (contextGraphId: string, quads: any[]) => {
-  const assertionName = `ui-publish-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const created = await post<{ assertionUri: string; seal?: Record<string, unknown> }>(
-    '/api/assertion/create',
-    {
-      contextGraphId,
-      name: assertionName,
-      quads,
-      finalize: true,
-      promote: true,
-    },
-  );
-  const published = await post<any>('/api/shared-memory/publish', {
-    contextGraphId,
-    assertionName,
-  });
-  return { ...published, assertionUri: created.assertionUri, ...(created.seal ? { seal: created.seal } : {}) };
-};
-
-export const writeSharedMemory = (
-  contextGraphId: string,
-  quads: Array<{ subject: string; predicate: string; object: string; graph?: string }>,
-  opts: { subGraphName?: string; localOnly?: boolean } = {},
-) =>
-  post<any>('/api/shared-memory/write', {
-    contextGraphId,
-    quads,
-    ...(opts.subGraphName ? { subGraphName: opts.subGraphName } : {}),
-    ...(opts.localOnly !== undefined ? { localOnly: opts.localOnly } : {}),
-  });
+// NOTE: the legacy `publishTriples` (create + `/api/shared-memory/publish`
+// {assertionName}) and `writeSharedMemory` (`/api/shared-memory/write`) helpers
+// were removed in the API-cleanup pass (#1087). Publishing now goes through the
+// canonical per-KA `knowledgeAssetPublish` (`…/vm/publish`); the
+// `/api/shared-memory/write` ROUTE still exists daemon-side but has no node-UI
+// caller.
 
 export const writeProfileQueryCatalog = (
   contextGraphId: string,
@@ -1033,6 +1043,11 @@ export const knowledgeAssetFinalize = (
     authorAgentAddress?: string;
     preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
     schemeVersion?: number;
+    // #1116 — `layer:"swm"` seals content already shared to SWM (the daemon
+    // reconstructs a transient WM draft from SWM, finalizes, drops the draft);
+    // default ("wm") seals the open Working-Memory draft. Lets a publish path
+    // seal an unsealed-in-SWM asset in place before retrying /vm/publish.
+    layer?: 'wm' | 'swm';
   } = {},
 ) => {
   assertExclusiveAuthorFields(opts);
@@ -1092,6 +1107,137 @@ export const knowledgeAssetPublish = (
     },
   );
 };
+
+/**
+ * Thrown by `knowledgeAssetPublishWithSeal` when a SWM asset can't be sealed in
+ * place because only a subset of it was shared (daemon `SWM_SUBSET_NOT_SEALABLE`).
+ * The UI surfaces this as "share the full asset first" — it is NOT retried.
+ */
+export class SwmSubsetNotSealableError extends Error {
+  constructor(message?: string) {
+    super(message ?? 'Share the full asset to Shared Memory before publishing.');
+    this.name = 'SwmSubsetNotSealableError';
+  }
+}
+
+/**
+ * Publish a named SWM assertion to VM, sealing it in place first if the daemon
+ * reports it isn't finalized (the #1116 / §4.4 catch→seal→retry contract).
+ *
+ * Normal path: by the time content reaches SWM it is sealed (seal-on-share is
+ * the default), so the first `/vm/publish` succeeds. This is the robustness
+ * safety net for the rare unsealed-in-SWM case:
+ *   - `PUBLISH_NOT_FULL_SHARE` / `VM_PUBLISH_PRECONDITION` (409) → seal in place
+ *     via `wm/finalize {layer:"swm"}`, then retry publish ONCE.
+ *   - `SWM_SUBSET_NOT_SEALABLE` (409, on the seal) → throw
+ *     `SwmSubsetNotSealableError` (caller tells the user to share the full
+ *     asset); never loops.
+ * `sealed` in the result tells the caller a seal step ran so it can surface
+ * "sealing then publishing" instead of a silent skip.
+ *
+ * A daemon HTTP-207 partial publish (KA minted on-chain but the context-graph
+ * binding failed) comes back as `res.ok`, so it is NOT thrown — the body
+ * carries `contextGraphError`. Callers MUST check that field and surface a
+ * partial/warning state rather than treating it as a clean success.
+ */
+export async function knowledgeAssetPublishWithSeal(
+  contextGraphId: string,
+  name: string,
+  opts: { subGraphName?: string } & KnowledgeAssetFinalizedPublishOptions = {},
+): Promise<Record<string, unknown> & { sealed?: boolean; contextGraphError?: string }> {
+  try {
+    return await knowledgeAssetPublish(contextGraphId, name, opts);
+  } catch (err: unknown) {
+    const code =
+      err instanceof HttpError && err.status === 409
+        ? (err.body as { code?: string } | undefined)?.code
+        : undefined;
+    if (code !== 'PUBLISH_NOT_FULL_SHARE' && code !== 'VM_PUBLISH_PRECONDITION') throw err;
+    // Unsealed in SWM — seal in place, then retry the publish once.
+    try {
+      await knowledgeAssetFinalize(contextGraphId, name, {
+        layer: 'swm',
+        ...(opts.subGraphName ? { subGraphName: opts.subGraphName } : {}),
+      });
+    } catch (sealErr: unknown) {
+      if (
+        sealErr instanceof HttpError &&
+        sealErr.status === 409 &&
+        (sealErr.body as { code?: string } | undefined)?.code === 'SWM_SUBSET_NOT_SEALABLE'
+      ) {
+        throw new SwmSubsetNotSealableError(
+          (sealErr.body as { error?: string } | undefined)?.error,
+        );
+      }
+      throw sealErr;
+    }
+    const result = await knowledgeAssetPublish(contextGraphId, name, opts);
+    return { ...result, sealed: true };
+  }
+}
+
+/**
+ * Aggregate result of a batch SWM→VM publish. Shared so every batch-publish CTA reports
+ * the partial/sample/error accounting identically (no per-component drift).
+ */
+export interface BatchPublishResult {
+  published: number;
+  total: number;
+  sealed: number;        // how many needed an in-place seal before publishing
+  partial: number;       // how many minted on-chain but failed the CG binding (207)
+  partialError?: string; // a sample contextGraphError detail (the first 207's reason)
+  // Every per-KA failure (not just the last), so callers can report the count + the
+  // name/reason of each — `failures.length` is the failed count.
+  failures: Array<{ name: string; subGraph?: string; error: string }>;
+  sample: PublishResult | null; // a representative confirmed result for the headline
+}
+
+/**
+ * Publish each named SWM assertion to Verifiable Memory through
+ * `knowledgeAssetPublishWithSeal` (seal-in-SWM retry + 207 partial handling), aggregating
+ * into ONE `BatchPublishResult`. The canonical batch-publish loop reused by every CTA
+ * (MemoryLayerView / entities / layer-widgets) so the partial-detail, sample, and per-KA
+ * error accounting cannot drift between them. Per-KA failures are collected into
+ * the `failures[]` array (never thrown); the caller renders the aggregate.
+ */
+export async function publishAssertionsToVm(
+  contextGraphId: string,
+  items: Array<{ name: string; subGraph?: string }>,
+): Promise<BatchPublishResult> {
+  let published = 0;
+  let sealed = 0;
+  let partial = 0;
+  let firstPartialError: string | undefined;
+  const failures: BatchPublishResult['failures'] = [];
+  let sample: PublishResult | null = null;
+  for (const a of items) {
+    try {
+      const res = await knowledgeAssetPublishWithSeal(
+        contextGraphId,
+        a.name,
+        a.subGraph ? { subGraphName: a.subGraph } : {},
+      );
+      published += 1;
+      if (res.sealed) sealed += 1;
+      // PR #972 — a 207 partial: minted on-chain but the CG binding failed.
+      if (res.contextGraphError) {
+        partial += 1;
+        if (firstPartialError === undefined) firstPartialError = res.contextGraphError;
+      }
+      const pr = res as unknown as PublishResult;
+      // Prefer a fully-clean sample (confirmed + txHash + no binding error) for the
+      // headline; fall back to the first result otherwise.
+      if (!sample || (pr.status === 'confirmed' && !!pr.txHash && !pr.contextGraphError)) sample = pr;
+    } catch (err: unknown) {
+      const message =
+        err instanceof SwmSubsetNotSealableError
+          ? err.message
+          : (err as { message?: string })?.message ?? 'publish failed';
+      failures.push({ name: a.name, ...(a.subGraph ? { subGraph: a.subGraph } : {}), error: message });
+    }
+  }
+  return { published, total: items.length, sealed, partial, partialError: firstPartialError, failures, sample };
+}
 
 // --- Assertions (WM objects) ---
 
@@ -1305,9 +1451,26 @@ export async function listAssertions(
     GRAPH <${metaGraph}> { ?g <http://dkg.io/ontology/memoryLayer> "WM" }
     ${metaFilter}
   }`;
+  // rc.17 per-KA WM: the data graph is …/_working_memory/{addr}/{number} (number-keyed),
+  // but the surviving list row is the lifecycle URN (name-keyed). Count the URN's data
+  // graph via its dkg:assertionGraph pointer and key by the URN too — else
+  // countByGraph.get(urn) is undefined and the triple-count badge is lost for every WM KA.
+  //
+  // The pointer (`dkg:assertionGraph`) is stamped ONLY on the lifecycle-URN
+  // subject form (`urn:dkg:assertion:…`), never on the data-graph-URI form, so
+  // a straight INNER join `?g assertionGraph ?dg . GRAPH ?dg { … }` yields exactly
+  // one count row per WM KA, already keyed by the URN that the parser keeps below.
+  // (The earlier `OPTIONAL { GRAPH <_meta> { … } } BIND(COALESCE(…)) GRAPH ?countGraph`
+  // shape was rejected 400 "expected OPTIONAL" by the node's SPARQL engine — the
+  // whole count query failed and every WM KA lost its triple badge.) A freshly
+  // created WM KA with no data graph yet simply produces no count row and renders
+  // without a badge — the badge is `!= null`-guarded, matching prior semantics.
   const countSparql = `SELECT ?g (COUNT(*) AS ?cnt) WHERE {
-    GRAPH <${metaGraph}> { ?g <http://dkg.io/ontology/memoryLayer> "WM" }
-    GRAPH ?g { ?s ?p ?o }
+    GRAPH <${metaGraph}> {
+      ?g <http://dkg.io/ontology/memoryLayer> "WM" ;
+         <http://dkg.io/ontology/assertionGraph> ?dg
+    }
+    GRAPH ?dg { ?s ?p ?o }
     ${metaFilter}
   } GROUP BY ?g`;
   const [listData, countData] = await Promise.all([
@@ -1320,7 +1483,14 @@ export async function listAssertions(
   for (const b of (countData?.result?.bindings ?? [])) {
     const g = typeof b.g === 'string' ? b.g : b.g?.value;
     const cntRaw = typeof b.cnt === 'string' ? b.cnt : b.cnt?.value;
-    const cnt = cntRaw != null ? parseInt(cntRaw, 10) : NaN;
+    // The aggregate comes back as a typed RDF literal whose lexical form can be
+    // wrapped: `"21"^^<http://www.w3.org/2001/XMLSchema#integer>`. A bare
+    // `parseInt('"21"^^…')` reads the leading quote and yields NaN, which the
+    // `isFinite` guard then drops — losing the badge even when the query
+    // succeeds. Pull the leading digits past an optional quote, mirroring
+    // `listSwmEntities`' `^"?(\d+)` handling of the same value shape.
+    const cntMatch = typeof cntRaw === 'string' ? cntRaw.match(/^"?(\d+)/) : null;
+    const cnt = cntMatch ? parseInt(cntMatch[1], 10) : NaN;
     if (g && Number.isFinite(cnt)) countByGraph.set(g, cnt);
   }
   // #706 fix — the prior `startsWith('did:dkg:context-graph:<cg>/assertion/')`
@@ -1421,7 +1591,7 @@ export const promoteAssertion = (
   subGraphName?: string,
 ) =>
   post<{ promotedCount: number }>(
-    `/api/assertion/${encodeURIComponent(assertionName)}/promote`,
+    `/api/knowledge-assets/${encodeURIComponent(assertionName)}/swm/share`,
     { contextGraphId, entities, ...(subGraphName ? { subGraphName } : {}) },
   );
 
@@ -1444,7 +1614,8 @@ export const promoteAssertion = (
 export type PromoteOutcome =
   | { kind: 'success'; promotedCount: number; message: string }
   | { kind: 'noop'; message: string }
-  | { kind: 'not-persisted'; message: string; expectedTripleCount?: number };
+  | { kind: 'not-persisted'; message: string; expectedTripleCount?: number }
+  | { kind: 'payload-too-large'; message: string; actualBytes?: number; limitBytes?: number };
 
 export function describePromoteResult(
   assertionName: string,
@@ -1467,6 +1638,25 @@ export function describePromoteError(
   assertionName: string,
   err: unknown,
 ): PromoteOutcome | null {
+  if (err instanceof HttpError && err.status === 413) {
+    const body = err.body as {
+      code?: string;
+      actualBytes?: number;
+      limitBytes?: number;
+      hint?: string;
+    } | undefined;
+    if (body?.code === 'SWM_GOSSIP_PAYLOAD_TOO_LARGE') {
+      const hint = typeof body.hint === 'string' && body.hint.length > 0
+        ? body.hint
+        : 'Promote fewer entities per call or split the assertion into smaller root-entity batches.';
+      return {
+        kind: 'payload-too-large',
+        actualBytes: typeof body.actualBytes === 'number' ? body.actualBytes : undefined,
+        limitBytes: typeof body.limitBytes === 'number' ? body.limitBytes : undefined,
+        message: `${assertionName} is too large to promote to Shared Working Memory. ${hint}`,
+      };
+    }
+  }
   if (err instanceof HttpError && err.status === 409) {
     const body = err.body as { code?: string; expectedTripleCount?: number } | undefined;
     if (body?.code === 'ASSERTION_NOT_PERSISTED') {
@@ -1514,7 +1704,7 @@ export const fetchExtractionStatus = (
   const params = new URLSearchParams({ contextGraphId });
   if (subGraphName) params.set('subGraphName', subGraphName);
   return get<ExtractionStatus>(
-    `/api/assertion/${encodeURIComponent(assertionName)}/extraction-status?${params}`,
+    `/api/knowledge-assets/${encodeURIComponent(assertionName)}/wm/extraction-status?${params}`,
   );
 };
 
@@ -1527,79 +1717,41 @@ export function fileUrl(hash: string, contentType?: string): string {
   return `${BASE}/api/file/${encodeURIComponent(normalizedHash)}${params}`;
 }
 
-export interface SwmRootEntity {
-  uri: string;
-  label: string;
-  tripleCount: number;
-}
-
-const SKOLEM_GENID_SEGMENT = '/.well-known/genid/';
-
-function canonicalSwmRootUri(uri: string): string {
-  const trimmed = uri.trim();
-  const unwrapped = trimmed.startsWith('<') && trimmed.endsWith('>') ? trimmed.slice(1, -1) : trimmed;
-  const idx = unwrapped.indexOf(SKOLEM_GENID_SEGMENT);
-  return idx === -1 ? unwrapped : unwrapped.slice(0, idx);
-}
-
-function labelFromUri(uri: string): string {
-  const hash = uri.lastIndexOf('#');
-  const slash = uri.lastIndexOf('/');
-  const cut = Math.max(hash, slash);
-  return cut >= 0 ? uri.slice(cut + 1) : uri;
-}
-
-/** List root entities in SWM with their triple counts. */
-export async function listSwmEntities(contextGraphId: string): Promise<SwmRootEntity[]> {
-  const swmGraph = `did:dkg:context-graph:${contextGraphId}/_shared_memory`;
-  const sparql = `SELECT ?s (COUNT(?p) AS ?cnt) WHERE {
-    GRAPH ?g {
-      ?s ?p ?o .
-      FILTER(STR(?g) = "${swmGraph}")
-      FILTER(?p != <http://dkg.io/ontology/workspaceOwner>)
-    }
-  } GROUP BY ?s ORDER BY DESC(?cnt)`;
-  const data = await post<{ result: any }>('/api/query', { sparql, contextGraphId, view: 'shared-working-memory' });
-  const bindings: any[] = data?.result?.bindings ?? [];
-  const countsByRoot = new Map<string, number>();
-  for (const b of bindings) {
-    const uri = typeof b.s === 'string' ? b.s : b.s?.value ?? '';
-    const cntRaw = typeof b.cnt === 'string' ? b.cnt : b.cnt?.value ?? '0';
-    const m = cntRaw.match(/^"?(\d+)/);
-    const tripleCount = m ? parseInt(m[1], 10) : 0;
-    const rootUri = canonicalSwmRootUri(uri);
-    if (!rootUri) continue;
-    countsByRoot.set(rootUri, (countsByRoot.get(rootUri) ?? 0) + tripleCount);
-  }
-  return [...countsByRoot.entries()]
-    .map(([uri, tripleCount]) => ({ uri, label: labelFromUri(uri), tripleCount }))
-    .sort((a, b) => b.tripleCount - a.tripleCount || a.label.localeCompare(b.label));
-}
-
 export interface PublishResult {
   kaId: string;
   status: string;
   kas: { tokenId: string; rootEntity: string }[];
   txHash?: string;
   blockNumber?: number;
+  // Set when the daemon returned HTTP 207 (PR #972): the KA minted on-chain
+  // (status "confirmed", txHash present) BUT the context-graph binding failed.
+  // A PARTIAL publish — the asset is permanently on-chain, but it isn't linked
+  // into the context graph, so CG-scoped views may be incomplete. Re-publishing
+  // does NOT repair the binding (the KA is already minted); this is a node-side
+  // condition for the operator. Callers must surface it, not treat the
+  // confirmed/txHash result as a clean success.
+  contextGraphError?: string;
 }
 
 /**
- * Publish one SWM root on-chain (SWM -> VM).
- * Selection-based shared-memory publish is not atomic across independent roots
- * yet, so the UI keeps the single-root guard until the daemon can identify one
- * lifecycle/assertion for a multi-root request.
+ * Short status suffix for a 207 partial publish — appended to a "confirmed"
+ * status so the row reads as a warning, not a clean success.
  */
-export const publishSharedMemory = (contextGraphId: string, rootEntities: string[]) => {
-  if (rootEntities.length !== 1) {
-    throw new Error('Shared-memory publish currently requires exactly one root entity.');
-  }
-  return post<PublishResult>('/api/shared-memory/publish', {
-    contextGraphId,
-    selection: rootEntities,
-    clearAfter: false,
-  });
-};
+export const PARTIAL_PUBLISH_STATUS_SUFFIX = 'binding incomplete';
+
+/**
+ * The single, canonical explanation for a 207 partial publish, shared by every
+ * publish CTA so the copy can't drift. Accurate to the contract: the asset is
+ * already on-chain and re-publishing will NOT repair the context-graph binding
+ * — so this surfaces the condition to the node operator WITHOUT suggesting a
+ * republish. The daemon's `contextGraphError` detail is appended when present.
+ */
+export function partialPublishWarning(contextGraphError?: string): string {
+  const base =
+    'Published on-chain, but linking it into the context graph did not complete, ' +
+    'so context-graph views may be incomplete.';
+  return contextGraphError ? `${base} (${contextGraphError})` : base;
+}
 
 // --- Query history ---
 export const fetchQueryHistory = (limit = 50, offset = 0) =>
@@ -1770,6 +1922,22 @@ export interface LocalAgentChatResponse {
   turnId?: string;
 }
 
+export interface LocalAgentChatFailurePersistenceOptions {
+  sessionId?: string;
+  correlationId?: string;
+  userMessage: string;
+  assistantReply?: string;
+  failureReason?: string;
+  profile?: string;
+  attachments?: LocalAgentChatAttachmentRef[];
+  contextGraphId?: string;
+}
+
+export interface LocalAgentChatFailurePersistenceResponse {
+  ok?: boolean;
+  turnId?: string;
+}
+
 export async function sendOpenClawLocalChat(
   text: string,
   opts?: LocalAgentChatRequestOptions,
@@ -1782,7 +1950,7 @@ export async function sendOpenClawLocalChat(
   });
   if (!res.ok) {
     const errBody = await res.json().catch(() => ({}));
-    throw new Error((errBody as { error?: string })?.error ?? `Request failed (${res.status})`);
+    throw buildLocalAgentApiError(errBody, `Request failed (${res.status})`, res.status);
   }
   return res.json();
 }
@@ -1790,7 +1958,19 @@ export async function sendOpenClawLocalChat(
 export type OpenClawStreamEvent =
   | { type: 'text_delta'; delta: string }
   | ({ type: 'final' } & LocalAgentChatResponse)
-  | { type: 'error'; error: string };
+  | ({
+      type: 'error';
+      error: string;
+      code?: string;
+      source?: string;
+      details?: string;
+      correlationId?: string;
+      timeoutMs?: number;
+      target?: string;
+      route?: string;
+      integrationId?: string;
+      retryable?: boolean;
+    });
 
 type HermesRawStreamEvent =
   | OpenClawStreamEvent
@@ -1856,7 +2036,7 @@ export async function streamOpenClawLocalChat(
 
   if (!res.ok) {
     const errBody = await res.json().catch(() => ({}));
-    throw new Error((errBody as { error?: string })?.error ?? `Request failed (${res.status})`);
+    throw buildLocalAgentApiError(errBody, `Request failed (${res.status})`, res.status);
   }
 
   const contentType = (res.headers.get('content-type') ?? '').toLowerCase();
@@ -1878,7 +2058,7 @@ export async function streamOpenClawLocalChat(
   const handleEvent = (event: OpenClawStreamEvent): void => {
     opts.onEvent?.(event);
     if (event.type === 'error') {
-      streamError = new Error(event.error || 'Stream failed');
+      streamError = buildLocalAgentApiError(event, event.error || 'Stream failed');
     } else if (event.type === 'final') {
       finalPayload = {
         text: event.text,
@@ -1948,7 +2128,7 @@ export async function sendHermesLocalChat(
   });
   if (!res.ok) {
     const errBody = await res.json().catch(() => ({}));
-    throw new Error(formatLocalAgentError(errBody, `Request failed (${res.status})`));
+    throw buildLocalAgentApiError(errBody, `Request failed (${res.status})`, res.status);
   }
   return res.json();
 }
@@ -1972,7 +2152,7 @@ export async function streamHermesLocalChat(
 
   if (!res.ok) {
     const errBody = await res.json().catch(() => ({}));
-    throw new Error(formatLocalAgentError(errBody, `Request failed (${res.status})`));
+    throw buildLocalAgentApiError(errBody, `Request failed (${res.status})`, res.status);
   }
 
   const contentType = (res.headers.get('content-type') ?? '').toLowerCase();
@@ -1999,7 +2179,7 @@ export async function streamHermesLocalChat(
   const handleEvent = (event: OpenClawStreamEvent): void => {
     opts.onEvent?.(event);
     if (event.type === 'error') {
-      streamError = new Error(event.error || 'Stream failed');
+      streamError = buildLocalAgentApiError(event, event.error || 'Stream failed');
     } else if (event.type === 'final') {
       finalPayload = {
         text: event.text,
@@ -2064,6 +2244,38 @@ function formatLocalAgentError(body: unknown, fallback: string): string {
     : JSON.stringify(record.details);
   if (!details || details === error) return error;
   return `${error}: ${details}`;
+}
+
+function buildLocalAgentApiError(body: unknown, fallback: string, status?: number): LocalAgentApiError {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return new LocalAgentApiError(fallback, { status });
+  }
+  const record = body as Record<string, unknown>;
+  const message = formatLocalAgentError(record, fallback);
+  const stringField = (key: string): string | undefined => {
+    const value = record[key];
+    return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+  };
+  const numberField = (key: string): number | undefined => {
+    const value = record[key];
+    return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+  };
+  const booleanField = (key: string): boolean | undefined => {
+    const value = record[key];
+    return typeof value === 'boolean' ? value : undefined;
+  };
+  return new LocalAgentApiError(message, {
+    status,
+    code: stringField('code'),
+    source: stringField('source'),
+    details: stringField('details'),
+    correlationId: stringField('correlationId'),
+    timeoutMs: numberField('timeoutMs'),
+    target: stringField('target'),
+    route: stringField('route'),
+    integrationId: stringField('integrationId'),
+    retryable: booleanField('retryable'),
+  });
 }
 
 interface LocalAgentIntegrationRecord {
@@ -2144,6 +2356,7 @@ export interface LocalAgentHistoryMessage {
   author: string;
   ts: string;
   turnId?: string;
+  persistStatus?: 'pending' | 'in_progress' | 'stored' | 'failed' | 'skipped';
   failureReason?: string | null;
   attachmentRefs?: LocalAgentChatAttachmentRef[];
   toolCalls?: Array<{ name: string; args: Record<string, unknown>; result: unknown }>;
@@ -2241,6 +2454,7 @@ async function fetchLocalAgentHistoryBySessionId(
         author: message.author,
         ts: message.ts,
         turnId: message.turnId,
+        persistStatus: message.persistStatus,
         failureReason: message.failureReason,
         attachmentRefs: message.attachmentRefs,
         toolCalls: message.toolCalls,
@@ -2640,6 +2854,34 @@ export async function fetchLocalAgentHistory(
   return fetchLocalAgentHistoryBySessionId(sessionId, limit);
 }
 
+async function persistHermesLocalChatFailure(
+  opts: LocalAgentChatFailurePersistenceOptions,
+): Promise<LocalAgentChatFailurePersistenceResponse> {
+  const sessionId = opts.sessionId?.trim();
+  if (!sessionId) throw new Error('Missing Hermes session id');
+  return post<LocalAgentChatFailurePersistenceResponse>('/api/hermes-channel/persist-turn', {
+    sessionId,
+    userMessage: opts.userMessage,
+    assistantReply: opts.assistantReply ?? '',
+    correlationId: opts.correlationId,
+    attachmentRefs: opts.attachments,
+    persistenceState: 'failed',
+    failureReason: opts.failureReason,
+    contextGraphId: opts.contextGraphId,
+    profile: opts.profile,
+    metadata: { source: 'node-ui-failed-turn' },
+  });
+}
+
+export async function persistLocalAgentChatFailure(
+  id: string,
+  opts: LocalAgentChatFailurePersistenceOptions,
+): Promise<LocalAgentChatFailurePersistenceResponse> {
+  const normalizedId = id.trim().toLowerCase();
+  if (normalizedId === 'hermes') return persistHermesLocalChatFailure(opts);
+  throw new Error(`${id} local chat persistence is not available yet.`);
+}
+
 export async function streamLocalAgentChat(
   id: string,
   text: string,
@@ -2727,6 +2969,140 @@ export const fetchRpcHealth = () =>
       error?: string;
     }>;
   }>('/api/chain/rpc-health');
+
+// --- Admin: Publishing Conviction Accounts (PCA) ---
+
+export interface PcaSnapshot {
+  accountId: string;
+  owner: string;
+  committedTRAC: string;
+  committedTRACTrac: string;
+  baseEpochAllowance: string;
+  topUpBuffer: string;
+  topUpBufferTrac: string;
+  createdAtEpoch: number;
+  expiresAtEpoch: number;
+  createdAtTimestamp: number;
+  expiresAtTimestamp: number;
+  discountBps: number;
+  agentCount: number;
+  lastSettledWindow: number;
+  fullySwept: boolean;
+  /** OT-RFC-51 node identityId this PCA funds ('0' = unset). */
+  primaryNode?: string;
+  /** True when `primaryNode` equals this node's own identity. */
+  fundsThisNode?: boolean;
+  /** True when this PCA is owned (and thus manageable) by one of this node's wallets. */
+  owned?: boolean;
+  probedKey?: { key: string; registered: boolean; adapterSupported?: boolean; error?: string };
+}
+
+export interface PcaContractContext {
+  chainId: number;
+  hubAddress: string;
+  nftAddress: string;
+  tokenAddress: string;
+  // PublishingConviction LOGIC contract — owns the owner-gated clearAgents
+  // (the NFT wrapper has no entry point), so the wallet-connect path needs it.
+  publishingConvictionAddress: string;
+  // True once the DEPLOYED PublishingConviction is >= 10.0.6 (clearAgents lands
+  // there). The UI gates the "Clear agents" button on it so it only enables
+  // after the upgrade is live — self-healing, no node redeploy needed.
+  clearAgentsSupported: boolean;
+}
+/** Addresses + chainId the browser wallet-connect path needs to build owner-signed PCA txs. */
+export const fetchPcaContracts = () => get<PcaContractContext>('/api/pca/contracts');
+
+export const fetchPcas = () => get<{ accounts: PcaSnapshot[] }>('/api/pca');
+export const fetchPcaInfo = (accountId: string, key?: string) =>
+  get<PcaSnapshot>(
+    `/api/pca/${encodeURIComponent(accountId)}${key ? `?key=${encodeURIComponent(key)}` : ''}`,
+  );
+export const createPca = (tokens: string, primaryNode: string) =>
+  post<{ accountId: string; txHash: string; blockNumber: number; committedTokens: string }>(
+    '/api/pca',
+    { tokens, primaryNode },
+  );
+export const addPcaFunds = (accountId: string, tokens: string) =>
+  post<{ accountId: string; addedTokens: string; txHash: string; blockNumber: number }>(
+    `/api/pca/${encodeURIComponent(accountId)}/funds`,
+    { tokens },
+  );
+export const settlePca = (accountId: string) =>
+  post<{ accountId: string; settled: boolean; txHash: string; blockNumber: number }>(
+    `/api/pca/${encodeURIComponent(accountId)}/settle`,
+    {},
+  );
+export const registerPcaAgent = (accountId: string, agent: string) =>
+  post<{ accountId: string; agent: string; registered: boolean; txHash: string; blockNumber: number }>(
+    `/api/pca/${encodeURIComponent(accountId)}/agent`,
+    { agent },
+  );
+export const deregisterPcaAgent = (accountId: string, agent: string) =>
+  del<{ accountId: string; agent: string; deregistered: boolean; txHash: string; blockNumber: number }>(
+    `/api/pca/${encodeURIComponent(accountId)}/agent/${encodeURIComponent(agent)}`,
+  );
+export const setPcaPrimaryNode = (accountId: string, node: string) =>
+  post<{ accountId: string; primaryNode: string; txHash: string; blockNumber: number }>(
+    `/api/pca/${encodeURIComponent(accountId)}/primary-node`,
+    { node },
+  );
+
+// --- Admin: Node operational wallets (Identity operational keys) ---
+
+export interface OperationalWallet {
+  address: string;
+  isAdmin: boolean;
+  isPrimary: boolean;
+  /** On-chain authorization status: true/false, or null when unknown (no profile). */
+  registered: boolean | null;
+}
+export interface OperationalWalletsResponse {
+  identityId: string;
+  hasProfile: boolean;
+  adminKeyConfigured: boolean;
+  canManage: boolean;
+  wallets: OperationalWallet[];
+}
+export const fetchOperationalWallets = () =>
+  get<OperationalWalletsResponse>('/api/operational-wallets');
+export const addOperationalWallet = (address: string) =>
+  post<{ address: string; added: boolean; txHash: string; blockNumber: number }>(
+    '/api/operational-wallets',
+    { address },
+  );
+export const removeOperationalWallet = (address: string) =>
+  del<{ address: string; removed: boolean; txHash: string; blockNumber: number }>(
+    `/api/operational-wallets/${encodeURIComponent(address)}`,
+  );
+
+// --- Admin: Agent workspace encryption keys ---
+
+export interface AgentEncryptionKey {
+  encryptionKeyId: string;
+  encryptionKeyAlgorithm: string;
+  publicEncryptionKey: string;
+  encryptionKeyProof: string;
+  createdAt: string;
+  revokedAt: string | null;
+  status: 'active' | 'revoked';
+}
+export const fetchAgentEncryptionKeys = (address: string) =>
+  get<{ agentAddress: string; agentDid: string; keys: AgentEncryptionKey[] }>(
+    `/api/agent/${encodeURIComponent(address)}/encryption-keys`,
+  );
+export const rotateAgentEncryptionKey = (address: string, retireOld: boolean) =>
+  post<{ ok: true; newKeyId: string; retiredKeyId?: string; profilePublished: boolean; profilePublishError?: string }>(
+    `/api/agent/${encodeURIComponent(address)}/rotate-encryption-key`,
+    { retireOld },
+  );
+export const revokeAgentEncryptionKey = (address: string, keyId: string) =>
+  post<{ ok: true; revokedKeyId: string; revokedAt: string; profilePublished: boolean; profilePublishError?: string }>(
+    `/api/agent/${encodeURIComponent(address)}/revoke-encryption-key`,
+    { keyId },
+  );
+export const publishAgentProfile = () =>
+  post<{ ok: true; ual: string | null }>('/api/agent/publish-profile', {});
 
 // --- Node control ---
 export const shutdownNode = () =>
@@ -2842,6 +3218,7 @@ export interface SubGraphInfo {
   tripleCount: number;
 }
 export const fetchSubGraphs = (contextGraphId: string) =>
-  get<{ contextGraphId: string; subGraphs: SubGraphInfo[] }>(
+  getWithTimeout<{ contextGraphId: string; subGraphs: SubGraphInfo[] }>(
     `/api/sub-graph/list?contextGraphId=${encodeURIComponent(contextGraphId)}`,
+    CONTEXT_GRAPH_LOAD_TIMEOUT_MS,
   );

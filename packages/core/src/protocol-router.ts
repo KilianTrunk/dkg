@@ -7,6 +7,7 @@ import {
   POOLED_MESSAGE_PROTOCOL,
   type MessageStreamPoolOptions,
 } from './message-stream-pool.js';
+import { withSpan, getMetrics } from './telemetry-api.js';
 
 type AbortableByteStream = Stream | (AsyncIterable<Uint8Array> & { abort(reason?: unknown): void });
 
@@ -32,6 +33,9 @@ export function isRecoverableSendError(err: unknown): boolean {
     msg.includes('epipe') ||
     msg.includes('aborted') ||
     msg.includes('no valid addresses') ||
+    (msg.includes('sync responder') &&
+      (msg.includes('queue full') ||
+        msg.includes('queue wait exceeded'))) ||
     // libp2p dial exhaustion — every known multiaddr for the peer
     // failed in one attempt. Surfaced by `transportManager.dial` and
     // by `dialProtocol` after iterating every relay/transport
@@ -88,6 +92,8 @@ export interface SendOptions {
    * there's just one path available, single-path runs.
    */
   parallelPaths?: number;
+  /** Optional caller cancellation signal composed with timeout and node stop. */
+  signal?: AbortSignal;
 }
 
 export interface ProtocolRouterOptions {
@@ -116,6 +122,13 @@ export interface ProtocolRouterOptions {
    * call-time surface.
    */
   peerResolver?: PeerResolver;
+}
+
+export class QuietRetryableHandlerError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'QuietRetryableHandlerError';
+  }
 }
 
 export class ProtocolRouter {
@@ -273,7 +286,7 @@ export class ProtocolRouter {
     logicalProtocolId: string,
     pool: MessageStreamPool,
   ): void {
-    pool.registerHandler(async (requestData, peerId) => {
+    pool.registerHandler(async (requestData, peerId, options) => {
       const handler = this.handlers.get(logicalProtocolId);
       if (!handler) {
         throw new Error(`no application handler for ${logicalProtocolId}`);
@@ -304,7 +317,16 @@ export class ProtocolRouter {
           throw new Error('peerId.toBytes not available on pooled handler');
         },
       };
-      return handler(requestData, wrappedPeerId);
+      const handlerSignalScope = composeAbortSignalsScoped(options?.signal, this.node.stopSignal);
+      const handlerSignal = handlerSignalScope.signal;
+      try {
+        if (handlerSignal?.aborted) throw asAbortError(handlerSignal.reason);
+        const responseData = await handler(requestData, wrappedPeerId, { signal: handlerSignal });
+        if (handlerSignal?.aborted) throw asAbortError(handlerSignal.reason);
+        return responseData;
+      } finally {
+        handlerSignalScope.dispose();
+      }
     });
   }
 
@@ -362,30 +384,61 @@ export class ProtocolRouter {
       // error. By caching once we make the whole handler consistently
       // abortable, and `stream.close({ signal })` participates in shutdown.
       const stopSignal = this.node.stopSignal;
+      const streamController = new AbortController();
+      const onStreamClose = () => {
+        if (!streamController.signal.aborted) {
+          streamController.abort(new Error('stream closed by peer'));
+        }
+      };
+      stream.addEventListener('close', onStreamClose as EventListener, { once: true });
+      const handlerSignalScope = composeAbortSignalsScoped(streamController.signal, stopSignal);
+      const handlerSignal = handlerSignalScope.signal;
       try {
-        const requestData = await readAllWithSignal(stream, limit, stopSignal);
+        const requestData = await readAllWithSignal(stream, limit, handlerSignal);
         const peerId = {
           toString: () => connection.remotePeer.toString(),
           toBytes: () => connection.remotePeer.toMultihash().bytes,
         };
-        const responseData = await handler(requestData, peerId);
+        if (handlerSignal?.aborted) throw asAbortError(handlerSignal.reason);
+        const responseData = await handler(requestData, peerId, { signal: handlerSignal });
+        if (handlerSignal?.aborted) throw asAbortError(handlerSignal.reason);
+        stream.removeEventListener('close', onStreamClose as EventListener);
         stream.send(responseData);
         await stream.close(stopSignal ? { signal: stopSignal } : undefined);
       } catch (err) {
-        if (stopSignal?.aborted) {
+        if ((stopSignal?.aborted || handlerSignal?.aborted) && isAbortRelatedError(err, handlerSignal, stopSignal)) {
           try {
-            stream.abort(asAbortError(stopSignal.reason));
+            const abortReason = stopSignal?.aborted ? stopSignal.reason : handlerSignal?.reason;
+            stream.abort(asAbortError(abortReason));
           } catch {
             // stream already closed
           }
           return;
         }
-        console.error(`[ProtocolRouter] handler error on ${protocolId} from ${connection.remotePeer.toString().slice(-8)}:`, err instanceof Error ? err.message : err);
+        // F3: peer closed/reset the stream before the response was written —
+        // routine churn, not a fault. Downgrade to a quiet warn (no "error"
+        // token) so it doesn't spam the node log as a red error line.
+        if (err instanceof QuietRetryableHandlerError) {
+          try {
+            stream.abort(err);
+          } catch {
+            // stream already closed
+          }
+          return;
+        }
+        if (isBenignStreamClosure(err)) {
+          console.warn(`[ProtocolRouter] stream closed by peer before response on ${protocolId} from ${connection.remotePeer.toString().slice(-8)}`);
+        } else {
+          console.error(`[ProtocolRouter] handler error on ${protocolId} from ${connection.remotePeer.toString().slice(-8)}:`, err instanceof Error ? err.message : err);
+        }
         try {
           stream.abort(new Error('handler error'));
         } catch {
           // stream already closed
         }
+      } finally {
+        handlerSignalScope.dispose();
+        stream.removeEventListener('close', onStreamClose as EventListener);
       }
     }, { runOnLimitedConnection: true });
 
@@ -435,7 +488,34 @@ export class ProtocolRouter {
     }
   }
 
+  // Outbound P2P send — wrapped with a `protocol_router.send` span + the P2P
+  // send-duration metric. No-op when telemetry is disabled. The heavy
+  // pooled/one-shot logic lives in sendInner; this wrapper only measures.
   async send(
+    peerIdStr: string,
+    protocolId: string,
+    data: Uint8Array,
+    timeoutMsOrOpts: number | SendOptions = DEFAULT_SEND_TIMEOUT_MS,
+  ): Promise<Uint8Array> {
+    const startedAt = Date.now();
+    const m = getMetrics();
+    try {
+      const res = await withSpan(
+        'protocol_router.send',
+        () => this.sendInner(peerIdStr, protocolId, data, timeoutMsOrOpts),
+        { attributes: { 'dkg.protocol_id': protocolId, 'dkg.peer': peerIdStr.slice(0, 8) } },
+      );
+      m.protocolSendTotal.add(1, { protocol_id: protocolId, outcome: 'ok' });
+      return res;
+    } catch (err) {
+      m.protocolSendTotal.add(1, { protocol_id: protocolId, outcome: 'error' });
+      throw err;
+    } finally {
+      m.protocolSendDuration.record(Date.now() - startedAt, { protocol_id: protocolId });
+    }
+  }
+
+  private async sendInner(
     peerIdStr: string,
     protocolId: string,
     data: Uint8Array,
@@ -472,7 +552,9 @@ export class ProtocolRouter {
     const overallStartedAt = Date.now();
     const overallDeadline = AbortSignal.timeout(timeoutMs);
     const stopSignal = this.node.stopSignal;
-    const overallSignal = composeAbortSignals(overallDeadline, stopSignal) ?? overallDeadline;
+    const budgetSignal = composeAbortSignals(overallDeadline, opts.signal) ?? overallDeadline;
+    const overallSignal = composeAbortSignals(budgetSignal, stopSignal) ?? budgetSignal;
+    if (overallSignal.aborted) throw asAbortError(overallSignal.reason);
 
     const overlay = this.pooledByLogical.get(protocolId);
     const memoizedVariant = this.peerWireVariantFor(peerIdStr, protocolId);
@@ -549,8 +631,7 @@ export class ProtocolRouter {
     if (parallelPaths > 1) {
       // Reuse the overall budget rather than starting a fresh one
       // — see comment above. Codex PR #560 round 4.
-      const multipathSignal = overallDeadline;
-      const multipathSignalWithStop = composeAbortSignals(multipathSignal, stopSignal) ?? multipathSignal;
+      const multipathSignalWithStop = overallSignal;
       // Multi-path pre-attempt — race up to N live connections.
       // Returns the response on a winning path, or null if there
       // weren't enough live candidates (or all candidates failed).
@@ -624,7 +705,8 @@ export class ProtocolRouter {
         throw lastErr;
       }
       const attemptDeadline = AbortSignal.timeout(remaining);
-      const attemptSignal = composeAbortSignals(attemptDeadline, stopSignal) ?? attemptDeadline;
+      const attemptSignal = composeAbortSignals(attemptDeadline, overallSignal) ?? attemptDeadline;
+      if (attemptSignal.aborted) throw asAbortError(attemptSignal.reason);
       // Track which connection (if any) the fast path picked this
       // attempt so the catch block can blacklist it on failure
       // without needing to inspect stream/connection internals from
@@ -802,7 +884,7 @@ export class ProtocolRouter {
         if (pickedConnection) {
           triedConnections.add(pickedConnection);
         }
-        if (stopSignal?.aborted || attemptDeadline.aborted || overallDeadline.aborted) throw err;
+        if (attemptSignal.aborted || overallSignal.aborted) throw err;
         if (!isRecoverableSendError(err) || attempt >= 2) throw err;
         const backoff = (attempt + 1) * 500;
         // Make the backoff abortable so the overall deadline is
@@ -818,6 +900,10 @@ export class ProtocolRouter {
             clearTimeout(t);
             if (stopSignal?.aborted) {
               reject(asAbortError(stopSignal.reason));
+              return;
+            }
+            if (!overallDeadline.aborted) {
+              reject(asAbortError(overallSignal.reason));
               return;
             }
             reject(new Error(`send timeout: backoff aborted by overall deadline (${timeoutMs}ms)`));
@@ -1301,6 +1387,40 @@ export function composeAbortSignals(
   return combined.signal;
 }
 
+function composeAbortSignalsScoped(
+  primary: AbortSignal | undefined,
+  secondary: AbortSignal | undefined,
+): { signal: AbortSignal | undefined; dispose: () => void } {
+  if (!primary || !secondary || primary === secondary) {
+    return { signal: primary ?? secondary, dispose: () => undefined };
+  }
+  const combined = new AbortController();
+  let disposed = false;
+  const cleanup = () => {
+    if (disposed) return;
+    disposed = true;
+    primary.removeEventListener('abort', forwardPrimary);
+    secondary.removeEventListener('abort', forwardSecondary);
+  };
+  const forwardPrimary = () => {
+    if (!combined.signal.aborted) combined.abort(primary.reason);
+    cleanup();
+  };
+  const forwardSecondary = () => {
+    if (!combined.signal.aborted) combined.abort(secondary.reason);
+    cleanup();
+  };
+  if (primary.aborted) {
+    combined.abort(primary.reason);
+  } else if (secondary.aborted) {
+    combined.abort(secondary.reason);
+  } else {
+    primary.addEventListener('abort', forwardPrimary, { once: true });
+    secondary.addEventListener('abort', forwardSecondary, { once: true });
+  }
+  return { signal: combined.signal, dispose: cleanup };
+}
+
 function abortStream(stream: AbortableByteStream, reason: unknown): void {
   if ('abort' in stream && typeof stream.abort === 'function') {
     try {
@@ -1312,10 +1432,56 @@ function abortStream(stream: AbortableByteStream, reason: unknown): void {
 }
 
 function asAbortError(reason: unknown): Error {
-  if (reason instanceof Error) return reason;
+  if (reason instanceof Error) {
+    if (reason.name === 'AbortError') return reason;
+    const err = new Error(reason.message || 'aborted');
+    (err as Error & { name: string }).name = 'AbortError';
+    (err as Error & { cause?: unknown }).cause = reason;
+    return err;
+  }
   const err = new Error(typeof reason === 'string' ? reason : 'aborted');
   (err as Error & { name: string }).name = 'AbortError';
   return err;
+}
+
+function isAbortRelatedError(
+  err: unknown,
+  handlerSignal: AbortSignal | undefined,
+  stopSignal: AbortSignal | undefined,
+): boolean {
+  if (err === handlerSignal?.reason || err === stopSignal?.reason) return true;
+  const error = err instanceof Error ? err : undefined;
+  if (error?.name === 'AbortError') return true;
+  const msg = (error?.message ?? String(err)).toLowerCase();
+  return msg.includes('aborted') || msg.includes('aborterror');
+}
+
+// F3: a peer that closes/resets its side of a stream before we finish
+// writing the response surfaces in the inbound handler as a stream-write
+// lifecycle error (e.g. "Cannot write to a stream that is closed"), not a
+// real handler fault. These are routine during peer churn and shouldn't be
+// logged as red errors. Recognise the benign cases so the handler can
+// downgrade them.
+//
+// Match ONLY stream-write / stream-lifecycle signals. We deliberately do
+// NOT match broad connection- or muxer-level text ("connection closed",
+// "muxer is closed"): a genuine handler bug can throw an error that merely
+// mentions a closed connection, and swallowing those would hide real faults
+// (Codex). Keep the matcher to the narrow set of phrases that specifically
+// denote writing to / reacting on an already-closed or reset stream.
+function isBenignStreamClosure(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  if (!msg) return false;
+  return (
+    msg.includes('stream that is closed') ||
+    msg.includes('stream is closed') ||
+    msg.includes('stream closed') ||
+    msg.includes('stream reset') ||
+    msg.includes('stream ended') ||
+    msg.includes('stream aborted') ||
+    msg.includes('writable end') ||
+    msg.includes('write after end')
+  );
 }
 
 async function readAll(

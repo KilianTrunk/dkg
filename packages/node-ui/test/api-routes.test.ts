@@ -263,8 +263,8 @@ describe('handleNodeUIRequest Stage 5 memory/publication routes', () => {
   // contract break with no migration signal), the route serves a 410
   // Gone stub that names the two replacements — the adapter's
   // `dkg_memory_import` tool and the daemon's
-  // `POST /api/assertion/:name/write` direct route. Mirrors the B38
-  // pattern for the session-publication routes above.
+  // `POST /api/knowledge-assets/:name/wm/write` direct route. Mirrors the
+  // B38 pattern for the session-publication routes above.
   it('returns 410 Gone for POST /api/memory/import with migration pointers (Codex B52)', async () => {
     harness.setArgs([
       {} as any, '.', undefined, undefined, undefined,
@@ -293,8 +293,8 @@ describe('handleNodeUIRequest Stage 5 memory/publication routes', () => {
     // daemon HTTP routes below.
     expect(body.replacements.length).toBeGreaterThanOrEqual(2);
     const replacementPaths = body.replacements.map((r: any) => r.path ?? r.name ?? '');
-    expect(replacementPaths.join(' ')).toMatch(/\/api\/assertion\/create/);
-    expect(replacementPaths.join(' ')).toMatch(/\/api\/assertion\/:name\/write/);
+    expect(replacementPaths.join(' ')).toMatch(/\/api\/knowledge-assets(?:\s|$)/);
+    expect(replacementPaths.join(' ')).toMatch(/\/api\/knowledge-assets\/:name\/wm\/write/);
     const allNames = body.replacements.map((r: any) => r.name ?? '').join(' ');
     expect(allNames).not.toMatch(/dkg_memory_import/);
   });

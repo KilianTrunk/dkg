@@ -22,7 +22,7 @@ import {
   loadConfig, saveConfig, configExists, configPath,
   readPid, readApiPort, isProcessRunning, dkgDir, logPath, ensureDkgDir, removeApiPort,
   apiPortPath,
-  loadNetworkConfig, loadProjectConfig, resolveAutoUpdateConfig, resolveAutoUpdateSource, resolveChainConfig,
+  loadNetworkConfig, loadProjectConfig, resolveAutoUpdateConfig, resolveAutoUpdateSource, resolveChainConfig, resolveReadyChainConfig,
   releasesDir, activeSlot, swapSlot,
   slotEntryPoint, isStandaloneInstall, repoDir, isDkgMonorepo,
   resolveContextGraphs, resolveNetworkDefaultContextGraphs,
@@ -132,7 +132,7 @@ program
   .action(async () => {
     try {
       const config = await loadConfig();
-      const network = await loadNetworkConfig();
+      const network = await loadNetworkConfig(config.networkConfig);
       const { loadOpWallets } = await import('@origintrail-official/dkg-agent');
       const opWallets = await loadOpWallets(dkgDir());
 
@@ -227,7 +227,7 @@ program
   .action(async (amount: string, opts: ActionOpts) => {
     try {
       const config = await loadConfig();
-      const network = await loadNetworkConfig();
+      const network = await loadNetworkConfig(config.networkConfig);
       const { loadOpWallets } = await import('@origintrail-official/dkg-agent');
       const opWallets = await loadOpWallets(dkgDir());
 
@@ -236,7 +236,7 @@ program
         process.exit(1);
       }
 
-      const chainResolved = resolveChainConfig(config, network);
+      const chainResolved = resolveReadyChainConfig(config, network);
       const rpcUrl = chainResolved?.rpcUrl;
       const hubAddress = chainResolved?.hubAddress;
       if (!rpcUrl || !hubAddress) {
@@ -250,7 +250,7 @@ program
         process.exit(1);
       }
 
-      const { providers, readProvider } = createCliEvmProviders(rpcUrl, chainResolved?.rpcUrls);
+      const { urls, providers, readProvider } = createCliEvmProviders(rpcUrl, chainResolved?.rpcUrls);
       const wallet = new ethers.Wallet(opWallets.wallets[0].privateKey, readProvider);
 
       const hub = new ethers.Contract(hubAddress, [
@@ -302,7 +302,7 @@ program
       const signedTx = await wallet.signTransaction(filled);
       const txHash = ethers.Transaction.from(signedTx).hash ?? '0x';
       console.log(`  TX: ${txHash}`);
-      const receipt = await sendCliRawTransactionWithFailover(providers, signedTx, txHash);
+      const receipt = await sendCliRawTransactionWithFailover(providers, signedTx, txHash, urls);
       console.log(`  Confirmed in block ${receipt.blockNumber}`);
       console.log(`  New ask: ${amount} TRAC`);
     } catch (err) {

@@ -1,6 +1,6 @@
-import React, { useMemo, useState, useCallback } from 'react';
+import React, { useMemo, useState, useCallback, useEffect } from 'react';
 import type { ReactNode } from 'react';
-import { listAssertions, promoteAssertion, describePromoteError, ensureContextGraphOnChain, knowledgeAssetFinalize, knowledgeAssetPublish } from '../../../api.js';
+import { listAssertions, promoteAssertion, describePromoteError, knowledgeAssetFinalize, publishAssertionsToVm, partialPublishWarning } from '../../../api.js';
 import type { MemoryEntity } from '../../../hooks/useMemoryEntities.js';
 import { useProjectProfileContext } from '../../../hooks/useProjectProfile.js';
 import { LAYER_CONFIG, entityMeta, layerNoun } from '../helpers.js';
@@ -100,17 +100,26 @@ export function LayerStatsWidget({ entities, entityCount, triples, layer }: {
 }
 
 
-export function LayerActionsWidget({ layer, count, contextGraphId, onComplete }: {
+export function LayerActionsWidget({ layer, count, contextGraphId, onComplete, onResult }: {
   layer: 'wm' | 'swm';
   count: number;
   contextGraphId: string;
   entities: MemoryEntity[];
   onComplete: () => void;
+  /** Lift the latest outcome to the parent strip so it survives this widget
+   * unmounting when the promoted/published layer empties (entityCount → 0). */
+  onResult?: (r: { ok: boolean; text: string } | null) => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const isWm = layer === 'wm';
+  // Mirror the outcome up to the strip; it persists past this widget's unmount.
+  useEffect(() => {
+    if (result) onResult?.({ ok: true, text: result });
+    else if (error) onResult?.({ ok: false, text: error });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [result, error]);
 
   const handleAction = useCallback(async () => {
     setBusy(true);
@@ -122,12 +131,12 @@ export function LayerActionsWidget({ layer, count, contextGraphId, onComplete }:
     let currentAssertion: string | null = null;
     try {
       if (isWm) {
-        // Verifiable Memory is the on-chain layer and `finalize` (the seal that
-        // a later VM publish requires) needs the CG registered on-chain. Promote
-        // moves content OUT of Working Memory, after which it can no longer be
-        // finalized — so we auto-register + finalize HERE, before sharing, so the
-        // shared assertions are publishable to VM later. (See OT-RFC-44 Design B.)
-        await ensureContextGraphOnChain(contextGraphId);
+        // Seal each draft before sharing — promote moves content OUT of Working
+        // Memory, after which it can no longer be finalized, and a later vm/publish
+        // requires a finalized assertion. The seal is CG-independent (#1116: finalize
+        // works on an unregistered CG with no chain write) and promote is off-chain, so
+        // no client-side CG pre-registration is needed — /vm/publish registers the CG
+        // later, only after publish preconditions pass. (See OT-RFC-44 Design B.)
         const assertions = await listAssertions(contextGraphId, 'wm');
         let promoted = 0;
         let noopCount = 0;
@@ -159,28 +168,24 @@ export function LayerActionsWidget({ layer, count, contextGraphId, onComplete }:
       } else {
         // SWM -> VM: publish each shared assertion as ONE Knowledge Asset
         // (Design B, any entity count) via the per-assertion vm/publish path —
-        // NOT the legacy single-root shared-memory publish. Auto-register first
-        // since VM is the on-chain layer.
-        await ensureContextGraphOnChain(contextGraphId);
+        // NOT the legacy single-root shared-memory publish. We go through the
+        // shared knowledgeAssetPublishWithSeal wrapper so this CTA gets the same
+        // seal-in-SWM retry + 207 partial-publish handling as the other publish
+        // surfaces. No pre-register: the daemon's /vm/publish runs preconditions
+        // first and only auto-registers (with the stored policy) on its
+        // CG_NOT_REGISTERED retry, so a doomed publish never burns gas.
         const assertions = await listAssertions(contextGraphId, 'swm');
-        let published = 0;
-        let lastErr: string | null = null;
-        for (const a of assertions) {
-          currentAssertion = a.name;
-          try {
-            await knowledgeAssetPublish(contextGraphId, a.name, a.subGraph ? { subGraphName: a.subGraph } : {});
-            published += 1;
-          } catch (e: any) {
-            lastErr = e?.message ?? 'publish failed';
-          }
-        }
-        if (published > 0) {
-          const tail = lastErr ? ' (some assertions could not be published)' : '';
-          setResult(`Published ${published} knowledge asset${published !== 1 ? 's' : ''} to Verifiable Memory${tail}`);
+        // Shared batch loop (api.ts publishAssertionsToVm) — uniform partial/error
+        // accounting with the other batch-publish CTAs (carries the partial detail).
+        const r = await publishAssertionsToVm(contextGraphId, assertions);
+        if (r.published > 0) {
+          const tail = r.failures.length ? ` (${r.failures.length} assertion${r.failures.length === 1 ? '' : 's'} could not be published)` : '';
+          const partialTail = r.partial > 0 ? ` — ⚠ ${r.partial}: ${partialPublishWarning(r.partialError)}` : '';
+          setResult(`Published ${r.published} knowledge asset${r.published !== 1 ? 's' : ''} to Verifiable Memory${tail}${partialTail}`);
         } else if (assertions.length === 0) {
           setResult('Nothing to publish — promote assertions to Shared Memory first.');
         } else {
-          throw new Error(lastErr ?? 'Publish failed');
+          throw new Error(r.failures[0] ? `${r.failures[0].name}: ${r.failures[0].error}` : 'Publish failed');
         }
       }
       onComplete?.();
@@ -202,10 +207,11 @@ export function LayerActionsWidget({ layer, count, contextGraphId, onComplete }:
       <div className="v10-decision-context" style={{ marginBottom: 10 }}>
         {count} {noun} in this layer can be {isWm ? 'promoted to Shared Working Memory for collaborative review' : 'published to Verifiable Memory on-chain'}.
       </div>
-      {result && <div style={{ fontSize: 11, color: 'var(--text-success)', marginBottom: 8 }}>✓ {result}</div>}
-      {error && <div style={{ fontSize: 11, color: 'var(--text-danger)', marginBottom: 8 }}>✕ {error}</div>}
+      {result && <div data-testid="layer-action-result" style={{ fontSize: 11, color: 'var(--text-success)', marginBottom: 8 }}>✓ {result}</div>}
+      {error && <div data-testid="layer-action-result" style={{ fontSize: 11, color: 'var(--text-danger)', marginBottom: 8 }}>✕ {error}</div>}
       <div className="v10-decision-actions">
         <button
+          data-testid={isWm ? 'widget-promote-all-btn' : 'widget-publish-vm-btn'}
           className={isWm ? 'v10-decision-btn approve' : 'v10-decision-btn primary-cta publish-vm'}
           style={isWm
             ? { borderColor: `${color}50`, color: 'var(--text-warning)', background: `${color}15`, opacity: busy ? 0.5 : 1 }
@@ -230,9 +236,22 @@ export function LayerWidgetStrip({ layer, entities, entityCount, tripleCount, co
   contextGraphId?: string;
   onComplete?: () => void;
 }) {
+  // Latest promote/publish outcome, lifted from LayerActionsWidget so the "✓ Promoted
+  // N triples" feedback survives that widget unmounting the instant the acted-on layer
+  // empties (entityCount → 0) and the strip swaps to the empty state.
+  const [lastAction, setLastAction] = useState<{ ok: boolean; text: string } | null>(null);
+  const actionResult = lastAction && (
+    <div
+      data-testid="layer-action-result"
+      style={{ fontSize: 11, color: lastAction.ok ? 'var(--text-success)' : 'var(--text-danger)', marginBottom: 8 }}
+    >
+      {lastAction.ok ? '✓' : '✕'} {lastAction.text}
+    </div>
+  );
   if (entityCount === 0) {
     return (
       <div className="v10-layer-widgets-strip empty">
+        {actionResult}
         <EmptyState
           compact
           tone={toneForLayer(layer)}
@@ -257,7 +276,7 @@ export function LayerWidgetStrip({ layer, entities, entityCount, tripleCount, co
       </div>
       {(layer === 'wm' || layer === 'swm') && (
         <div className="v10-layer-widgets-strip-action">
-          <LayerActionsWidget layer={layer} count={entityCount} entities={entities} contextGraphId={contextGraphId} onComplete={onComplete} />
+          <LayerActionsWidget layer={layer} count={entityCount} entities={entities} contextGraphId={contextGraphId} onComplete={onComplete} onResult={setLastAction} />
         </div>
       )}
     </div>

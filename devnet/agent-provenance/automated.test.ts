@@ -179,6 +179,7 @@ async function ensurePcaAccountForOpWallets(
   const nftAsAdmin = (s.nft.connect(nftAdmin) as ethers.Contract & {
     createAccount: (
       amount: bigint,
+      primaryNode: bigint,
       overrides?: { nonce?: number },
     ) => Promise<ethers.ContractTransactionResponse>;
     registerAgent: (
@@ -203,7 +204,10 @@ async function ensurePcaAccountForOpWallets(
   await (await tokenAsAdmin.approve(nftAddress, committed, {
     nonce: await nextNonce(),
   })).wait();
-  const createTx = await nftAsAdmin.createAccount(committed, {
+  // primaryNode = 0n: this PCA designates no node, so no committed publishing
+  // allocation (K_n) is seeded. These tests exercise PCA *discount* publishing
+  // (windowSpent), not committed allocation, so the 0 sentinel is correct.
+  const createTx = await nftAsAdmin.createAccount(committed, 0n, {
     nonce: await nextNonce(),
   });
   const createReceipt = await createTx.wait();
@@ -470,7 +474,7 @@ async function detectDevnet(): Promise<DevnetState | null> {
   const nft = new ethers.Contract(
     addrs.nftAddress,
     [
-      'function createAccount(uint96) external returns (uint256)',
+      'function createAccount(uint96, uint72) external returns (uint256)',
       'function registerAgent(uint256, address) external',
       'function agentToAccountId(address) view returns (uint256)',
       'function windowSpent(uint256, uint40) view returns (uint96)',
@@ -489,7 +493,7 @@ async function detectDevnet(): Promise<DevnetState | null> {
   );
   const eps = new ethers.Contract(
     addrs.epsAddress,
-    ['function getNodeEpochProducedKnowledgeValue(uint72, uint256) view returns (uint96)'],
+    ['function getNodeEpochPublishingAllocation(uint72, uint256) view returns (uint96)'],
     provider,
   );
   const chronos = new ethers.Contract(
@@ -570,7 +574,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
   //      - publish status == confirmed
   //      - kas.getLatestMerkleRootAuthor(kaId) == node5.submitter.address
   //      - nft.windowSpent(accountId, currentBillingWindow) increased
-  //      - eps.getNodeEpochProducedKnowledgeValue(core1.id, epoch) increased
+  //      - eps.getNodeEpochPublishingAllocation(core1.id, epoch) increased
   // =========================================================================
   it('mode (a) — edge op-wallet on core1 PCA, attribution to core1, NFT windowSpent grows', async () => {
     const s = state.v!;
@@ -589,7 +593,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
     const beforeSpent: bigint =
       (await s.nft.windowSpent(accountId, beforeWindow)) +
       (await s.nft.windowSpent(accountId, beforeWindow + 1n));
-    const beforeEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core1.identityId, epoch);
+    const beforeEps: bigint = await s.eps.getNodeEpochPublishingAllocation(core1.identityId, epoch);
     const beforeBalance = await sumOpBalances(s.token, edge);
 
     // 4. Publish from edge attributing to core1.
@@ -617,8 +621,13 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
         : 0n);
     expect(afterSpent - beforeSpent).toBeGreaterThan(0n);
 
-    const afterEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core1.identityId, epoch);
-    expect(afterEps).toBeGreaterThan(beforeEps);
+    // RFC-51: a realized publish no longer credits the node's publishing
+    // allocation (K_n). That getter now tracks COMMITTED PCA allocation only
+    // (seeded in PublishingConviction when a PCA designates a primaryNode),
+    // never per-publish. The real coverage here is windowSpent growing + author
+    // matching an op-wallet + balance unchanged (PCA-covered).
+    const afterEps: bigint = await s.eps.getNodeEpochPublishingAllocation(core1.identityId, epoch);
+    expect(afterEps).toBe(beforeEps);
 
     // Op-wallet pool TRAC must NOT decrement — PCA covered the cost.
     const afterBalance = await sumOpBalances(s.token, edge);
@@ -682,7 +691,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
     const beforeSpent: bigint =
       (await s.nft.windowSpent(accountId, beforeWindow)) +
       (await s.nft.windowSpent(accountId, beforeWindow + 1n));
-    const beforeEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core1.identityId, epoch);
+    const beforeEps: bigint = await s.eps.getNodeEpochPublishingAllocation(core1.identityId, epoch);
 
     const file = makeNquadsFile('mode-a-strict');
     const result = await publishViaCli(edge, CONTEXT_GRAPH, file, {
@@ -707,8 +716,11 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
         : 0n);
     expect(afterSpent - beforeSpent).toBeGreaterThan(0n);
 
-    const afterEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core1.identityId, epoch);
-    expect(afterEps).toBeGreaterThan(beforeEps);
+    // RFC-51: a realized publish no longer credits K_n (committed-allocation
+    // getter only). The strict-mode coverage is the zero-TRAC invariant below
+    // plus windowSpent growth — Eps must simply not move.
+    const afterEps: bigint = await s.eps.getNodeEpochPublishingAllocation(core1.identityId, epoch);
+    expect(afterEps).toBe(beforeEps);
 
     // The strict invariant: every edge op-wallet's TRAC balance is STILL
     // ZERO. The conviction branch never called `transferFrom` on the
@@ -737,7 +749,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
 
     const epoch: bigint = await s.chronos.getCurrentEpoch();
     const beforeBalance = await sumOpBalances(s.token, edge);
-    const beforeEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core3.identityId, epoch);
+    const beforeEps: bigint = await s.eps.getNodeEpochPublishingAllocation(core3.identityId, epoch);
 
     const file = makeNquadsFile('mode-c');
     const result = await publishViaCli(edge, CONTEXT_GRAPH, file, {
@@ -753,9 +765,11 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
       expect(beforeBalance - afterBalance).toBeGreaterThan(0n);
     }
 
-    // core3 Eps incremented.
-    const afterEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core3.identityId, epoch);
-    expect(afterEps).toBeGreaterThan(beforeEps);
+    // RFC-51: a realized direct-spend publish no longer credits K_n. The
+    // real coverage here is the full-fee TRAC decrement (above) + author
+    // matching an op-wallet; Eps must not move.
+    const afterEps: bigint = await s.eps.getNodeEpochPublishingAllocation(core3.identityId, epoch);
+    expect(afterEps).toBe(beforeEps);
 
     // Author is one of the op wallets.
     const onChainAuthor: string = await s.kas.getLatestMerkleRootAuthor(result.kaId!);
@@ -777,7 +791,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
       .filter((id) => id > 0n);
     const beforeEps: Record<string, bigint> = {};
     for (const id of allCoreIds) {
-      beforeEps[id.toString()] = await s.eps.getNodeEpochProducedKnowledgeValue(id, epoch);
+      beforeEps[id.toString()] = await s.eps.getNodeEpochPublishingAllocation(id, epoch);
     }
 
     const file = makeNquadsFile('mode-d');
@@ -786,7 +800,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
     expect(result.status.toLowerCase()).toBe('confirmed');
 
     for (const id of allCoreIds) {
-      const after: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(id, epoch);
+      const after: bigint = await s.eps.getNodeEpochPublishingAllocation(id, epoch);
       expect(after).toBe(beforeEps[id.toString()]);
     }
   }, 120_000);
@@ -814,7 +828,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
     if (core1.identityId === 0n) throw new Error('core1 has no identity');
 
     const epoch: bigint = await s.chronos.getCurrentEpoch();
-    const beforeEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core1.identityId, epoch);
+    const beforeEps: bigint = await s.eps.getNodeEpochPublishingAllocation(core1.identityId, epoch);
 
     const file = makeNquadsFile('mode-fallthrough');
     const result = await publishViaCli(edge, CONTEXT_GRAPH, file, {
@@ -824,9 +838,13 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
     expect(result.status.toLowerCase()).toBe('confirmed');
     expect(result.kaId).toBeDefined();
 
-    // Attribution preserved regardless of cost-coverage branch.
-    const afterEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core1.identityId, epoch);
-    expect(afterEps).toBeGreaterThan(beforeEps);
+    // RFC-51: this test's original primary invariant (a publish credits the
+    // named core's K_n) no longer has a new-model analog — a realized publish
+    // never credits K_n regardless of the cost-coverage branch. The surviving
+    // proof of correct fall-through is: publish CONFIRMED (above) + author
+    // recorded as one of the op-wallets (below). Eps must simply not move.
+    const afterEps: bigint = await s.eps.getNodeEpochPublishingAllocation(core1.identityId, epoch);
+    expect(afterEps).toBe(beforeEps);
 
     // Author = one of the op wallets (msg.sender).
     const onChainAuthor: string = await s.kas.getLatestMerkleRootAuthor(result.kaId!);
@@ -844,8 +862,9 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
   //   1. Register a fresh custodial agent on core2's daemon. The daemon
   //      generates a secp256k1 keypair, persists it in agent-keystore.json,
   //      and returns { agentAddress, authToken, publicKey, privateKey }.
-  //   2. Use the agent's bearer token to call core2's publish endpoint
-  //      directly (POST /api/shared-memory/write + /api/shared-memory/publish).
+  //   2. Use the agent's bearer token to stage a named KA on core2
+  //      (POST /api/knowledge-assets {finalize, alsoShareSwm}) + publish it
+  //      (POST /api/knowledge-assets/:name/vm/publish).
   //   3. The daemon's publish route resolves the bearer → agent address →
   //      AgentKeyRecord → custodial private key, and threads it down to
   //      DKGPublisher as `authorPrivateKey`. The publisher signs the
@@ -893,18 +912,23 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
 
     // 2. Snapshot pre-publish state.
     const epoch: bigint = await s.chronos.getCurrentEpoch();
-    const beforeEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core2.identityId, epoch);
+    const beforeEps: bigint = await s.eps.getNodeEpochPublishingAllocation(core2.identityId, epoch);
 
-    // 3. Write a single triple to SWM via the agent's token, then publish.
+    // 3. Stage a single triple as a named KA (create → write → seal → share)
+    //    via the agent's token, then publish it to VM with the canonical
+    //    per-KA route. (The legacy loose write + selection-publish bridge was
+    //    removed; the named-KA lifecycle is the only publish path now.)
     const ts = Date.now();
     const subjectIri = `urn:test:mode-b:${ts}`;
-    const writeRes = await fetch(
-      `http://127.0.0.1:${core2.apiPort}/api/shared-memory/write`,
+    const assertionName = `mode-b-${ts}`;
+    const createRes = await fetch(
+      `http://127.0.0.1:${core2.apiPort}/api/knowledge-assets`,
       {
         method: 'POST',
         headers: agentHeaders,
         body: JSON.stringify({
           contextGraphId: CONTEXT_GRAPH,
+          name: assertionName,
           quads: [
             {
               subject: subjectIri,
@@ -919,30 +943,31 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
               graph: `did:dkg:context-graph:${CONTEXT_GRAPH}`,
             },
           ],
+          finalize: true,
+          alsoShareSwm: true,
         }),
       },
     );
-    if (!writeRes.ok) {
+    if (!createRes.ok) {
       throw new Error(
-        `core2 /api/shared-memory/write failed: ${writeRes.status} ${await writeRes.text()}`,
+        `core2 /api/knowledge-assets create failed: ${createRes.status} ${await createRes.text()}`,
       );
     }
 
     const publishRes = await fetch(
-      `http://127.0.0.1:${core2.apiPort}/api/shared-memory/publish`,
+      `http://127.0.0.1:${core2.apiPort}/api/knowledge-assets/${encodeURIComponent(assertionName)}/vm/publish`,
       {
         method: 'POST',
         headers: agentHeaders,
         body: JSON.stringify({
           contextGraphId: CONTEXT_GRAPH,
-          selection: { rootEntities: [subjectIri] },
-          clearAfter: true,
+          // Per-KA /vm/publish clears only this KA's own roots; no CG-wide clear.
         }),
       },
     );
     if (!publishRes.ok) {
       throw new Error(
-        `core2 /api/shared-memory/publish failed: ${publishRes.status} ${await publishRes.text()}`,
+        `core2 vm/publish failed: ${publishRes.status} ${await publishRes.text()}`,
       );
     }
     const publishJson = (await publishRes.json()) as {
@@ -965,8 +990,12 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
     );
     expect(isCoreWallet).toBe(false);
 
-    // Attribution still flows to core2 (the routing node).
-    const afterEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core2.identityId, epoch);
-    expect(afterEps).toBeGreaterThan(beforeEps);
+    // RFC-51: the original "attribution flows to core2" proof (core2's K_n
+    // grows) has no new-model analog — a realized publish never credits K_n.
+    // The surviving proof that this is core2-routed custodial publishing is:
+    // KC.author == the custodial agent (not a core2 op-wallet) + confirmed
+    // (asserted above). Eps must simply not move.
+    const afterEps: bigint = await s.eps.getNodeEpochPublishingAllocation(core2.identityId, epoch);
+    expect(afterEps).toBe(beforeEps);
   }, 180_000);
 });

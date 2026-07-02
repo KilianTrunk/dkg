@@ -10,6 +10,13 @@ export type QueryResult =
 
 export interface PreSignedAuthorAttestationPayload {
   address: string;
+  /**
+   * OT-RFC-43 Section F2 -- the packed reservedKaId the author signed the
+   * AuthorAttestation over, as a decimal string (uint256-safe over JSON).
+   * Required: the digest binds it, so the daemon honours the author's
+   * reserved slot rather than re-allocating.
+   */
+  reservedKaId: string;
   signature: { r: string; vs: string };
 }
 
@@ -74,6 +81,7 @@ function assertExclusiveAuthorFields(args: {
 
 function assertCreateFinalizeFieldsHaveQuads(args: {
   quads?: unknown[];
+  finalize?: boolean;
   authorAgentAddress?: string;
   preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
   schemeVersion?: number;
@@ -82,8 +90,11 @@ function assertCreateFinalizeFieldsHaveQuads(args: {
     args.authorAgentAddress != null ||
     args.preSignedAuthorAttestation != null ||
     args.schemeVersion !== undefined;
-  if (hasFinalizeOnlyField && !(Array.isArray(args.quads) && args.quads.length > 0)) {
-    throw new Error('authorAgentAddress, preSignedAuthorAttestation, and schemeVersion require non-empty quads');
+  // These fields only take effect at finalize, so they require both non-empty
+  // quads AND finalize !== false -- mirrors the daemon create-route guard.
+  const willFinalize = Array.isArray(args.quads) && args.quads.length > 0 && args.finalize !== false;
+  if (hasFinalizeOnlyField && !willFinalize) {
+    throw new Error('authorAgentAddress, preSignedAuthorAttestation, and schemeVersion require non-empty quads and finalize !== false');
   }
 }
 
@@ -92,7 +103,7 @@ function assertCreateFinalizeFieldsHaveQuads(args: {
  * `RandomSamplingStatus` from `@origintrail-official/dkg-agent` but
  * lives here so the CLI doesn't take a runtime dep on the agent
  * package (only types). The `loop.lastOutcome` is intentionally
- * `unknown` — the CLI prints it as JSON; the structured discrimination
+ * `unknown` -- the CLI prints it as JSON; the structured discrimination
  * is the prover's concern, not the CLI's.
  */
 export interface RandomSamplingStatusResponse {
@@ -126,7 +137,9 @@ export interface DaemonStatusResponse {
   name: string;
   peerId: string;
   nodeRole?: string;
+  networkConfig?: string;
   networkId?: string;
+  networkName?: string | null;
   uptimeMs: number;
   connectedPeers: number;
   relayConnected: boolean;
@@ -145,6 +158,23 @@ export interface DaemonStatusResponse {
   storeBackend?: string;
   storeUrl?: string | null;
   storeQuads?: number | null;
+  // Concurrency admission control (PR #1209 limiter, surfaced by #1230):
+  // inFlight = requests currently holding a slot, max = effective cap
+  // (0 = disabled), rejectedTotal = cumulative 503-shed count since boot.
+  // Optional: daemons predating #1230 omit it.
+  admission?: {
+    inFlight: number;
+    max: number;
+    rejectedTotal: number;
+  };
+  // Auto-update status (surfaced by /api/status). Optional — daemons may omit.
+  // `updateAvailable` is null until the first check completes;
+  // `updateChannelTargetMissing` is true when a pinned auto-update channel has
+  // no acceptable target (tag unpublished / prerelease rejected / non-semver).
+  updateAvailable?: boolean | null;
+  updateChannelTargetMissing?: boolean;
+  latestVersion?: string | null;
+  latestCommit?: string | null;
 }
 
 export interface ApiClientConnectOptions {
@@ -418,138 +448,35 @@ export class ApiClient {
   }
 
   /**
-   * One-shot legacy publish: routed through the new assertion lifecycle
-   * with an auto-generated assertion name. The seal carries the same
-   * EIP-712 AuthorAttestation that the publisher used to derive at
-   * chain-tx time; from a caller's perspective this is the same method
-   * — only the on-the-wire route changed.
-   *
-   * Use `publishAssertion(contextGraphId, name, quads, opts)` directly
-   * when you want to control the assertion name (for resumability,
-   * audit, dedupe, etc.).
-   */
-  async publish(contextGraphId: string, quads: Array<{
-    subject: string; predicate: string; object: string; graph: string;
-  }>, privateQuads?: Array<{
-    subject: string; predicate: string; object: string; graph: string;
-  }>, options?: {
-    accessPolicy?: 'public' | 'ownerOnly' | 'allowList';
-    allowedPeers?: string[];
-    publishEpochs?: number;
-    publisherNodeIdentityIdOverride?: bigint;
-  }): Promise<{
-    kaId: string;
-    status: 'tentative' | 'confirmed';
-    kas: Array<{ tokenId: string; rootEntity: string }>;
-    txHash?: string;
-    blockNumber?: number;
-    batchId?: string;
-    publisherAddress?: string;
-  }> {
-    if (privateQuads?.length || options?.accessPolicy || options?.allowedPeers?.length) {
-      throw new Error(
-        'privateQuads, accessPolicy, and allowedPeers are not supported in the V10 assertion-lifecycle publish flow. ' +
-        'Re-think the publish: there is no longer a free-form SWM write that can carry private quads — ' +
-        'every published assertion goes through finalize, which signs an EIP-712 attestation over the public quads.',
-      );
-    }
-    const autoName = `cli-publish-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    return this.publishAssertion(contextGraphId, autoName, quads, {
-      ...(options?.publishEpochs !== undefined
-        ? { publishEpochs: options.publishEpochs }
-        : {}),
-      ...(options?.publisherNodeIdentityIdOverride !== undefined
-        ? { publisherNodeIdentityIdOverride: options.publisherNodeIdentityIdOverride }
-        : {}),
-    });
-  }
-
-  /**
-   * Direct SWM write — appends loose triples to shared memory without
-   * creating a named WM assertion. Triples land ungrouped; downstream
-   * selection-based publishes (see `publishFromSharedMemory`) seal
-   * them at the publish boundary via the agent's selection bridge.
-   *
-   * Use this for "write loose content, decide what to publish later"
-   * workflows (e.g. node-ui MemoryLayer, mcp `dkg_share`). For
-   * sealed-from-creation provenance, use `createAssertion` /
-   * `appendToAssertion` / `publishAssertion` instead — the seal then
-   * binds to the named assertion at finalize time.
-   */
-  async sharedMemoryWrite(contextGraphId: string, quads: Array<{
-    subject: string; predicate: string; object: string; graph: string;
-  }>): Promise<{
-    shareOperationId: string;
-    contextGraphId: string;
-    graph: string;
-    triplesWritten: number;
-    skolemizedBlankNodes?: number;
-  }> {
-    return this.post('/api/shared-memory/write', { contextGraphId, quads });
-  }
-
-  /**
-   * Selection-based publish — publishes one selected SWM rootEntity to
-   * verified memory. Passing `"all"` is accepted only when the source
-   * SWM currently resolves to a single publishable root. The agent mints the
-   * AuthorAttestation seal inline at the selection boundary using
-   * the calling agent's bearer-token identity / explicit
-   * `authorAgentAddress` / `preSignedAuthorAttestation`, or falls
-   * back to the publisher's wallet. The publisher refuses any
-   * on-chain publish without a seal — sign-at-creation is preserved
-   * at the daemon boundary regardless of which fork the caller used
-   * to put content into SWM.
-   *
-   * For finalized-assertion publishes (seal from creation), use
-   * `publishFromFinalizedAssertion` instead — that path threads the
-   * already-signed seal through verbatim with no re-signing.
-   */
-  async publishFromSharedMemory(
-    contextGraphId: string,
-    selection: 'all' | { rootEntities: string[] } = 'all',
-    clearAfter = true,
-    options?: { subGraphName?: string; publishEpochs?: number; publisherNodeIdentityIdOverride?: bigint },
-  ): Promise<{
-    kaId: string;
-    status: 'tentative' | 'confirmed';
-    kas: Array<{ tokenId: string; rootEntity: string }>;
-    txHash?: string;
-    blockNumber?: number;
-  }> {
-    return this.post('/api/shared-memory/publish', {
-      contextGraphId,
-      selection,
-      clearAfter,
-      ...(options?.subGraphName ? { subGraphName: options.subGraphName } : {}),
-      ...(options?.publishEpochs !== undefined ? { publishEpochs: options.publishEpochs } : {}),
-      ...(options?.publisherNodeIdentityIdOverride !== undefined
-        ? { publisherNodeIdentityIdOverride: options.publisherNodeIdentityIdOverride.toString() }
-        : {}),
-    });
-  }
-
-  /**
    * Create an assertion in WM, optionally writing quads + finalizing +
    * promoting in the same call. Maps directly to the extended
-   * `POST /api/assertion/create` body.
+   * `POST /api/knowledge-assets` body.
    *
-   * RFC-001 §9.x — the assertion lifecycle is the canonical entry
-   * point for staging content for VM publish. Callers that previously
-   * went through the legacy `/api/shared-memory/write` (now removed)
-   * use this method instead.
+   * RFC-001 Section 9.x -- the assertion lifecycle is the canonical entry
+   * point for staging content for VM publish.
    */
-  // ── OT-RFC-43 §10.5 — GitHub-shaped Knowledge Asset SDK ──────────────────
-  // Layer-explicit wrappers over /api/knowledge-assets/... (the new clean
-  // surface). The legacy assertion/* + shared-memory/* methods below remain
-  // for back-compat during the migration window.
+  // -- OT-RFC-43 Section 10.5 -- GitHub-shaped Knowledge Asset SDK ------------------
+  // Layer-explicit wrappers over /api/knowledge-assets/... (the clean product surface).
 
-  /** Create a KA + open a WM draft (atomic: pass `quads` to auto write+finalize). */
+  /**
+   * Create a KA + open a WM draft. Pass `quads` to write them atomically; by
+   * default the draft is also sealed (finalized). Pass `finalize: false` to
+   * write a draft WITHOUT sealing -- an editable WM-only assertion that never
+   * touches the chain (the only lifecycle available to local-only /
+   * on-chain-unregistered CGs).
+   */
   async createKnowledgeAsset(
     contextGraphId: string,
     name: string,
     options?: {
       subGraphName?: string;
       quads?: Array<{ subject: string; predicate: string; object: string; graph: string }>;
+      /**
+       * Seal the draft after writing `quads` (default true). `false` keeps an
+       * editable WM draft and never touches the chain. Cannot be combined with
+       * `alsoShareSwm`/`alsoPublishVm` (those require a sealed assertion).
+       */
+      finalize?: boolean;
       authorAgentAddress?: string;
       preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
       schemeVersion?: number;
@@ -615,12 +542,12 @@ export class ApiClient {
     return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/pull-from`, { contextGraphId, layer, ...(options ?? {}) });
   }
 
-  /** Advance the SWM pointer (WM → SWM; git push origin <branch>). */
+  /** Advance the SWM pointer (WM -> SWM; git push origin <branch>). */
   async knowledgeAssetShare(
     contextGraphId: string,
     name: string,
     options?: { subGraphName?: string; entities?: string[] | 'all' },
-  ): Promise<{ swmShared: boolean; promotedCount: number }> {
+  ): Promise<{ swmShared: boolean; promotedCount: number; shareOperationId?: string }> {
     return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/swm/share`, { contextGraphId, ...(options ?? {}) });
   }
 
@@ -638,6 +565,29 @@ export class ApiClient {
     });
   }
 
+  async knowledgeAssetPublishAsync(
+    contextGraphId: string,
+    name: string,
+    options?: { subGraphName?: string } & KnowledgeAssetFinalizedPublishOptions,
+  ): Promise<{
+    jobId: string;
+    status: string;
+    contextGraphId: string;
+    name: string;
+    subGraphName?: string;
+    shareOperationId?: string;
+    rootsCount?: number;
+    sealMerkleRoot?: string;
+    intentKey?: string;
+  }> {
+    const publishOptions = finalizedPublishOptionsPayload(options, ['subGraphName']);
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/vm/publish-async`, {
+      contextGraphId,
+      ...(options?.subGraphName ? { subGraphName: options.subGraphName } : {}),
+      ...(publishOptions ? { options: publishOptions } : {}),
+    });
+  }
+
   async createAssertion(
     contextGraphId: string,
     name: string,
@@ -645,7 +595,7 @@ export class ApiClient {
       subGraphName?: string;
       quads?: Array<{ subject: string; predicate: string; object: string; graph: string }>;
       finalize?: boolean;
-      promote?: boolean;
+      alsoShareSwm?: boolean;
       authorAgentAddress?: string;
       preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
       schemeVersion?: number;
@@ -662,14 +612,15 @@ export class ApiClient {
       eip712Digest: string;
     };
     promotedCount?: number;
+    shareOperationId?: string;
   }> {
-    return this.post('/api/assertion/create', {
+    return this.post('/api/knowledge-assets', {
       contextGraphId,
       name,
       ...(options?.subGraphName ? { subGraphName: options.subGraphName } : {}),
       ...(options?.quads ? { quads: options.quads } : {}),
       ...(options?.finalize !== undefined ? { finalize: options.finalize } : {}),
-      ...(options?.promote !== undefined ? { promote: options.promote } : {}),
+      ...(options?.alsoShareSwm !== undefined ? { alsoShareSwm: options.alsoShareSwm } : {}),
       ...(options?.authorAgentAddress
         ? { authorAgentAddress: options.authorAgentAddress }
         : {}),
@@ -684,7 +635,7 @@ export class ApiClient {
 
   /**
    * Append quads to an existing WM assertion. Wraps
-   * `POST /api/assertion/:name/write`. Used by batched ingest paths
+   * `POST /api/knowledge-assets/:name/wm/write`. Used by batched ingest paths
    * (e.g. `dkg index`) that materialize a single named assertion
    * across many round-trips before finalize.
    */
@@ -694,7 +645,7 @@ export class ApiClient {
     quads: Array<{ subject: string; predicate: string; object: string; graph: string }>,
     options?: { subGraphName?: string },
   ): Promise<{ written: number }> {
-    return this.post(`/api/assertion/${encodeURIComponent(name)}/write`, {
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/write`, {
       contextGraphId,
       quads,
       ...(options?.subGraphName ? { subGraphName: options.subGraphName } : {}),
@@ -702,7 +653,7 @@ export class ApiClient {
   }
 
   /**
-   * Finalize a previously-created assertion. RFC-001 §9.x — computes
+   * Finalize a previously-created assertion. RFC-001 Section 9.x -- computes
    * the canonical merkleRoot, builds the EIP-712 AuthorAttestation,
    * signs (custodial / pre-signed / publisher fallback), and stamps
    * the seal triples to `_meta`.
@@ -726,7 +677,7 @@ export class ApiClient {
     eip712Digest: string;
   }> {
     return this.post(
-      `/api/assertion/${encodeURIComponent(name)}/finalize`,
+      `/api/knowledge-assets/${encodeURIComponent(name)}/wm/finalize`,
       {
         contextGraphId,
         ...(options?.subGraphName ? { subGraphName: options.subGraphName } : {}),
@@ -744,7 +695,7 @@ export class ApiClient {
   }
 
   /**
-   * Publish a previously-finalized assertion to the verified-memory
+   * Publish a previously-finalized assertion to the verifiable-memory
    * chain. The seal in `_meta` (written by `finalizeAssertion`)
    * supplies the AuthorAttestation; the publisher forwards it
    * verbatim and never re-signs.
@@ -752,6 +703,12 @@ export class ApiClient {
    * Pre-condition: the assertion must be both finalized AND promoted
    * to SWM. The high-level `publishAssertion` helper handles the
    * whole sequence in one call.
+   *
+   * Routes to the canonical per-KA publish `POST
+   * /api/knowledge-assets/:name/vm/publish` (the URL name selects the
+   * assertion). Kept as a thin wrapper over `knowledgeAssetPublish` so
+   * lifecycle callers (`dkg publisher publish-async`, `dkg index`,
+   * `publishAssertion`) keep a narrow typed return.
    */
   async publishFromFinalizedAssertion(
     contextGraphId: string,
@@ -773,22 +730,23 @@ export class ApiClient {
     blockNumber?: number;
     contextGraphError?: string;
   }> {
-    return this.post('/api/shared-memory/publish', {
-      contextGraphId,
-      assertionName,
-      ...(options?.subGraphName ? { subGraphName: options.subGraphName } : {}),
-      ...(options?.clearAfter !== undefined ? { clearAfter: options.clearAfter } : {}),
-      ...(options?.publishEpochs !== undefined ? { publishEpochs: options.publishEpochs } : {}),
-      ...(options?.publisherNodeIdentityIdOverride !== undefined
-        ? { publisherNodeIdentityIdOverride: options.publisherNodeIdentityIdOverride.toString() }
-        : {}),
-    });
+    return this.knowledgeAssetPublish(contextGraphId, assertionName, options) as Promise<{
+      kaId: string;
+      status: 'tentative' | 'confirmed';
+      assertionUri: string;
+      authorAddress: string;
+      merkleRoot: string;
+      kas: Array<{ tokenId: string; rootEntity: string }>;
+      txHash?: string;
+      blockNumber?: number;
+      contextGraphError?: string;
+    }>;
   }
 
   /**
-   * High-level convenience: create → write → finalize → promote →
+   * High-level convenience: create -> write -> finalize -> promote ->
    * publish, all in two HTTP round-trips. The composite mirrors what
-   * a typical OpenClaw/Hermes client does — stage content, commit it,
+   * a typical OpenClaw/Hermes client does -- stage content, commit it,
    * push it on-chain. Use this unless you need fine-grained control
    * over the individual steps.
    */
@@ -819,7 +777,7 @@ export class ApiClient {
       ...(options?.subGraphName ? { subGraphName: options.subGraphName } : {}),
       quads,
       finalize: true,
-      promote: true,
+      alsoShareSwm: true,
       ...(options?.authorAgentAddress
         ? { authorAgentAddress: options.authorAgentAddress }
         : {}),
@@ -860,10 +818,13 @@ export class ApiClient {
     };
   }
 
-  // ─── Publishing Conviction Account (PCA) ────────────────────────────
+  // --- Publishing Conviction Account (PCA) ----------------------------
 
   async createPca(request: {
     tokens: string;
+    // OT-RFC-51: the node identityId this PCA's committed TRAC funds. Required
+    // -- a PCA created with no node seeds publishing allocation to nobody.
+    primaryNode: string;
   }): Promise<{
     accountId: string;
     txHash: string;
@@ -929,39 +890,105 @@ export class ApiClient {
     agentCount: number;
     lastSettledWindow: number;
     fullySwept: boolean;
+    // OT-RFC-51 node association (string uint72; '0' = unset).
+    primaryNode?: string;
     probedKey?: { key: string; registered: boolean; adapterSupported?: boolean; error?: string };
   }> {
     const qs = probeKey ? `?key=${encodeURIComponent(probeKey)}` : '';
     return this.get(`/api/pca/${encodeURIComponent(accountId)}${qs}`);
   }
 
-  async publisherEnqueue(request: {
-    contextGraphId: string;
-    shareOperationId: string;
-    roots: string[];
-    namespace: string;
-    scope: string;
-    authorityProofRef: string;
-    swmId?: string;
-    transitionType?: 'CREATE' | 'MUTATE' | 'REVOKE';
-    authorityType?: 'owner' | 'multisig' | 'quorum' | 'capability';
-    priorVersion?: string;
-    subGraphName?: string;
-    accessPolicy?: 'public' | 'ownerOnly' | 'allowList';
-    allowedPeers?: string[];
-    // V10 sign-at-enqueue. Absent `seal` → tentative; supply for on-chain attestation.
-    entityProofs?: boolean;
-    publishEpochs?: number;
-    /** Stringified bigint; `'0'` = mode d (no attribution) per RFC-001 §4. */
-    publisherNodeIdentityIdOverride?: string;
-    seal?: {
-      merkleRoot: `0x${string}`;
-      authorAddress: `0x${string}`;
-      signature: { r: `0x${string}`; vs: `0x${string}` };
-      schemeVersion: number;
-    };
-  }): Promise<{ jobId: string; contextGraphId: string; shareOperationId: string; rootsCount: number }> {
-    return this.post('/api/publisher/enqueue', request);
+  /**
+   * List the PCAs owned by this node's operational wallet, each annotated with
+   * its OT-RFC-51 `primaryNode` association and whether it funds this node.
+   */
+  async listPcas(): Promise<{
+    accounts: Array<{
+      accountId: string;
+      owner: string;
+      committedTRAC: string;
+      committedTRACTrac: string;
+      baseEpochAllowance: string;
+      topUpBuffer: string;
+      topUpBufferTrac: string;
+      createdAtEpoch: number;
+      expiresAtEpoch: number;
+      createdAtTimestamp: number;
+      expiresAtTimestamp: number;
+      discountBps: number;
+      agentCount: number;
+      lastSettledWindow: number;
+      fullySwept: boolean;
+      primaryNode?: string;
+      fundsThisNode?: boolean;
+    }>;
+  }> {
+    return this.get('/api/pca');
+  }
+
+  /** OT-RFC-51 owner-gated re-designation of the node a PCA funds. */
+  async setPcaPrimaryNode(accountId: string, node: string): Promise<{
+    accountId: string;
+    primaryNode: string;
+    txHash: string;
+    blockNumber: number;
+  }> {
+    return this.post(`/api/pca/${encodeURIComponent(accountId)}/primary-node`, { node });
+  }
+
+  // ─── Node operational wallets (Identity operational keys) ────────────
+
+  /** List the node's local operational wallets (addresses only) + on-chain status. */
+  async listOperationalWallets(): Promise<{
+    identityId: string;
+    hasProfile: boolean;
+    adminKeyConfigured: boolean;
+    canManage: boolean;
+    wallets: Array<{
+      address: string;
+      isAdmin: boolean;
+      isPrimary: boolean;
+      registered: boolean | null;
+    }>;
+  }> {
+    return this.get('/api/operational-wallets');
+  }
+
+  /** Authorize an address as an operational key on the node identity (admin-signed). */
+  async addOperationalWallet(address: string): Promise<{
+    address: string;
+    added: boolean;
+    txHash: string;
+    blockNumber: number;
+  }> {
+    return this.post('/api/operational-wallets', { address });
+  }
+
+  /** De-authorize an operational key (admin-signed); refuses the primary wallet. */
+  async removeOperationalWallet(address: string): Promise<{
+    address: string;
+    removed: boolean;
+    txHash: string;
+    blockNumber: number;
+  }> {
+    return this.del(`/api/operational-wallets/${encodeURIComponent(address)}`);
+  }
+
+  /** List a local agent's workspace encryption keys (public fields only). */
+  async getAgentEncryptionKeys(address: string): Promise<{
+    agentAddress: string;
+    agentDid: string;
+    keys: Array<{
+      encryptionKeyId: string;
+      encryptionKeyAlgorithm: string;
+      publicEncryptionKey: string;
+      encryptionKeyProof: string;
+      createdAt: string;
+      revokedAt: string | null;
+      status: 'active' | 'revoked';
+    }>;
+  }> {
+    return this.get(`/api/agent/${encodeURIComponent(address)}/encryption-keys`);
   }
 
   async publisherJobs(status?: string): Promise<{ jobs: any[] }> {
@@ -993,7 +1020,7 @@ export class ApiClient {
     return this.post('/api/publisher/clear', { status });
   }
 
-  // ───────────────────────── EPCIS ─────────────────────────────────────
+  // ------------------------- EPCIS -------------------------------------
 
   async captureEpcis(request: {
     epcisDocument: unknown;
@@ -1076,11 +1103,11 @@ export class ApiClient {
   }
 
   /**
-   * Run SPARQL via the daemon. `opts` covers the full /api/query surface —
+   * Run SPARQL via the daemon. `opts` covers the full /api/query surface --
    * memory-layer routing (`view`, `graphSuffix`, `verifiedGraph`,
    * `subGraphName`, `includeSharedMemory`, `includeContextGraphPartitions`,
    * `agentAddress`, `assertionName`), and P-13's `minTrust` (only meaningful
-   * on `view: "verified-memory"`; ignored elsewhere). `contextGraphId` stays
+   * on `view: "verifiable-memory"`; ignored elsewhere). `contextGraphId` stays
    * in the 2nd positional slot for backwards compatibility.
    */
   async query(
@@ -1090,7 +1117,7 @@ export class ApiClient {
       graphSuffix?: string;
       includeSharedMemory?: boolean;
       includeContextGraphPartitions?: boolean;
-      view?: 'working-memory' | 'shared-working-memory' | 'verified-memory';
+      view?: 'working-memory' | 'shared-working-memory' | 'verifiable-memory';
       agentAddress?: string;
       assertionName?: string;
       subGraphName?: string;
@@ -1153,8 +1180,12 @@ export class ApiClient {
     catchup?:
       | {
         connectedPeers: number;
+        totalPeers?: number;
+        selectedPeers?: number;
         syncCapablePeers: number;
         peersTried: number;
+        peersResponded: number;
+        peersSucceeded: number;
         dataSynced: number;
         sharedMemorySynced: number;
         denied: boolean;
@@ -1168,11 +1199,15 @@ export class ApiClient {
             insertedDataTriples: number;
             bytesReceived: number;
             resumedPhases: number;
+            timedOutPhases: number;
+            completedPhases: number;
+            checkpointAdvances: number;
             emptyResponses: number;
             metaOnlyResponses: number;
             dataRejectedMissingMeta: number;
             rejectedKcs: number;
             failedPeers: number;
+            failedPhases: number;
           };
           sharedMemory: {
             fetchedMetaTriples: number;
@@ -1181,9 +1216,13 @@ export class ApiClient {
             insertedDataTriples: number;
             bytesReceived: number;
             resumedPhases: number;
+            timedOutPhases: number;
+            completedPhases: number;
+            checkpointAdvances: number;
             emptyResponses: number;
             droppedDataTriples: number;
             failedPeers: number;
+            failedPhases: number;
           };
         };
       }
@@ -1202,8 +1241,12 @@ export class ApiClient {
     catchup?:
       | {
         connectedPeers: number;
+        totalPeers?: number;
+        selectedPeers?: number;
         syncCapablePeers: number;
         peersTried: number;
+        peersResponded: number;
+        peersSucceeded: number;
         dataSynced: number;
         sharedMemorySynced: number;
         denied: boolean;
@@ -1217,11 +1260,15 @@ export class ApiClient {
             insertedDataTriples: number;
             bytesReceived: number;
             resumedPhases: number;
+            timedOutPhases: number;
+            completedPhases: number;
+            checkpointAdvances: number;
             emptyResponses: number;
             metaOnlyResponses: number;
             dataRejectedMissingMeta: number;
             rejectedKcs: number;
             failedPeers: number;
+            failedPhases: number;
           };
           sharedMemory: {
             fetchedMetaTriples: number;
@@ -1230,9 +1277,13 @@ export class ApiClient {
             insertedDataTriples: number;
             bytesReceived: number;
             resumedPhases: number;
+            timedOutPhases: number;
+            completedPhases: number;
+            checkpointAdvances: number;
             emptyResponses: number;
             droppedDataTriples: number;
             failedPeers: number;
+            failedPhases: number;
           };
         };
       }
@@ -1255,8 +1306,11 @@ export class ApiClient {
     finishedAt?: number;
     result?: {
       connectedPeers: number;
+      totalPeers?: number;
+      selectedPeers?: number;
       syncCapablePeers: number;
       peersTried: number;
+      peersResponded: number;
       peersSucceeded: number;
       dataSynced: number;
       sharedMemorySynced: number;
@@ -1271,11 +1325,15 @@ export class ApiClient {
           insertedDataTriples: number;
           bytesReceived: number;
           resumedPhases: number;
+          timedOutPhases: number;
+          completedPhases: number;
+          checkpointAdvances: number;
           emptyResponses: number;
           metaOnlyResponses: number;
           dataRejectedMissingMeta: number;
           rejectedKcs: number;
           failedPeers: number;
+          failedPhases: number;
         };
         sharedMemory: {
           fetchedMetaTriples: number;
@@ -1284,9 +1342,13 @@ export class ApiClient {
           insertedDataTriples: number;
           bytesReceived: number;
           resumedPhases: number;
+          timedOutPhases: number;
+          completedPhases: number;
+          checkpointAdvances: number;
           emptyResponses: number;
           droppedDataTriples: number;
           failedPeers: number;
+          failedPhases: number;
         };
       };
     };
@@ -1318,7 +1380,7 @@ export class ApiClient {
      * Atomic combined-flow flag. When `true`, the daemon registers the
      * CG on-chain in the same call after the local create step
      * succeeds. Required when `pcaAccountId` is supplied (a standalone
-     * `createContextGraph` does NOT persist PCA ids — Codex PR #502
+     * `createContextGraph` does NOT persist PCA ids -- Codex PR #502
      * round-3).
      */
     register?: boolean;
@@ -1327,7 +1389,7 @@ export class ApiClient {
      * the combined-flow path. Only meaningful together with
      * `register: true`. The agent otherwise defaults
      * `publishPolicy = curated (0)` for curated/private CGs and
-     * `publishPolicy = open (1)` for public CGs — which makes the
+     * `publishPolicy = open (1)` for public CGs -- which makes the
      * valid `{ accessPolicy: 0 (public), publishPolicy: 0 (curated),
      * pcaAccountId }` combo unreachable unless the caller can pin
      * `publishPolicy` explicitly. Codex PR #502 round-10 (raised by
@@ -1429,7 +1491,7 @@ export class ApiClient {
    * the local agent produced; does NOT forward over P2P. To deliver it
    * to the curator, follow up with `requestJoin(...)` and the
    * `curatorPeerId` from the V10 invite. PR #448 split sign vs forward
-   * to fix a duplicate-forward bug — see daemon route comment.
+   * to fix a duplicate-forward bug -- see daemon route comment.
    *
    * The `delegation` shape mirrors `SignedAgentDelegation` from
    * `@dkg/agent`: `version` is part of the digest grammar (see
@@ -1535,14 +1597,14 @@ export class ApiClient {
 
   async verify(request: {
     contextGraphId: string;
-    verifiedMemoryId: string;
+    verifiableMemoryId: string;
     batchId: string;
     timeoutMs?: number;
     requiredSignatures?: number;
   }): Promise<{
     txHash?: string;
     blockNumber?: number;
-    verifiedMemoryId: string;
+    verifiableMemoryId: string;
     signers: string[];
     status?: 'verified' | 'partial' | 'no_quorum';
     trustLevel?: number;
@@ -1556,7 +1618,7 @@ export class ApiClient {
     /**
      * Optional. If supplied it MUST match the address resolved from
      * the bearer token; the daemon rejects any mismatch with 403.
-     * Prefer omitting and relying on the token — see A-12 review on
+     * Prefer omitting and relying on the token -- see A-12 review on
      * /api/endorse for the provenance-forgery rationale.
      */
     agentAddress?: string;
@@ -1595,7 +1657,7 @@ export class ApiClient {
     if (request.ontologyRef) form.append('ontologyRef', request.ontologyRef);
     if (request.subGraphName) form.append('subGraphName', request.subGraphName);
 
-    return this.postForm(`/api/assertion/${encodeURIComponent(name)}/import-file`, form);
+    return this.postForm(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/import-file`, form);
   }
 
   async assertionExtractionStatus(name: string, contextGraphId: string, subGraphName?: string): Promise<{
@@ -1610,7 +1672,7 @@ export class ApiClient {
     const params = new URLSearchParams({ contextGraphId });
     if (subGraphName) params.set('subGraphName', subGraphName);
     return this.get(
-      `/api/assertion/${encodeURIComponent(name)}/extraction-status?${params.toString()}`,
+      `/api/knowledge-assets/${encodeURIComponent(name)}/wm/extraction-status?${params.toString()}`,
     );
   }
 
@@ -1620,13 +1682,14 @@ export class ApiClient {
     subGraphName?: string;
   }): Promise<{
     promoted?: boolean;
+    swmShared?: boolean;
     promotedCount?: number;
     contextGraphId?: string;
     count?: number;
     sharedMemoryGraph?: string;
     rootEntities?: string[];
   }> {
-    return this.post(`/api/assertion/${encodeURIComponent(name)}/promote`, request);
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/swm/share`, request);
   }
 
   async queryAssertion(name: string, request: {
@@ -1636,7 +1699,9 @@ export class ApiClient {
     quads: Array<{ subject: string; predicate: string; object: string; graph: string }>;
     count: number;
   }> {
-    return this.post(`/api/assertion/${encodeURIComponent(name)}/query`, request);
+    const params = new URLSearchParams({ contextGraphId: request.contextGraphId });
+    if (request.subGraphName) params.set('subGraphName', request.subGraphName);
+    return this.get(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/quads?${params.toString()}`);
   }
 
   async publishCclPolicy(request: {

@@ -24,7 +24,7 @@
 const ONT = 'http://dkg.io/ontology/';
 
 /**
- * Predicates written by `/api/assertion/:name/finalize` (sealed at
+ * Predicates written by `/api/knowledge-assets/:name/wm/finalize` (sealed at
  * the moment the agent commits the assertion's content to a chain).
  */
 export const ASSERTION_SEAL_PREDICATES = {
@@ -42,6 +42,14 @@ export const ASSERTION_SEAL_PREDICATES = {
   ASSERTED_AT_CHAIN_ID: `${ONT}assertedAtChainId`,
   /** `KnowledgeAssetsV10` deployment address the sig commits to (string literal, checksummed). */
   ASSERTED_AT_KAV10_ADDRESS: `${ONT}assertedAtKav10Address`,
+  /**
+   * OT-RFC-43 §F2 — the packed reservedKaId `(uint160(author)<<96)|uint96(number)`
+   * bound into the EIP-712 AuthorAttestation digest. Persisted so the idempotent
+   * re-finalize rebuild and the publish/mint reuse the SAME id the signature
+   * committed to (xsd:integer; the 256-bit value rides as an arbitrary-precision
+   * integer literal).
+   */
+  RESERVED_KA_ID: `${ONT}reservedKaId`,
   /** Daemon-clock dateTime when the seal was written (xsd:dateTime). */
   ASSERTION_FINALIZED_AT: `${ONT}assertionFinalizedAt`,
   /**
@@ -70,16 +78,21 @@ export const ASSERTION_SEAL_PREDICATES = {
 } as const;
 
 /**
- * Predicates written by `/api/shared-memory/publish` after a
- * successful on-chain publish. These are receipts; they don't
- * affect the seal's validity.
+ * Predicates written by named VM publish lifecycle routes after a successful
+ * on-chain publish. These are receipts; they don't affect the seal's validity.
  */
 export const ASSERTION_PUBLISH_RECEIPT_PREDICATES = {
   /** Transaction hash of the KAv10 publish (string literal). */
   PUBLISHED_AT_TX: `${ONT}publishedAtTx`,
   /** Block number (xsd:integer). */
   PUBLISHED_AT_BLOCK: `${ONT}publishedAtBlock`,
-  /** Knowledge collection id assigned by `KnowledgeCollectionStorage` (xsd:integer). */
+  /**
+   * Knowledge collection id assigned by `KnowledgeCollectionStorage`
+   * (xsd:integer). RFC ka-metadata-trim Phase 2: NO LONGER WRITTEN — it was
+   * the third resident copy of the on-chain id, which is queryable as
+   * `dkg:batchId` on the UAL subject. The constant stays for read-both
+   * consumers resolving rows written by older nodes (node-ui receipt hook).
+   */
   PUBLISHED_AT_KA_ID: `${ONT}publishedAtKaId`,
 } as const;
 
@@ -111,6 +124,8 @@ export function buildAssertionSealQuads(args: {
   authorSchemeVersion: number;
   chainId: bigint;
   kav10Address: string;
+  /** OT-RFC-43 §F2 — the packed id bound into the AuthorAttestation digest. */
+  reservedKaId: bigint;
   finalizedAtIso: string;
   /**
    * Root entities the seal commits to (one per emitted quad). Required
@@ -187,6 +202,10 @@ export function buildAssertionSealQuads(args: {
       JSON.stringify(args.kav10Address),
     ),
     quad(
+      ASSERTION_SEAL_PREDICATES.RESERVED_KA_ID,
+      `"${args.reservedKaId.toString()}"^^${xsdInteger}`,
+    ),
+    quad(
       ASSERTION_SEAL_PREDICATES.ASSERTION_FINALIZED_AT,
       `"${args.finalizedAtIso}"^^${xsdDateTime}`,
     ),
@@ -210,7 +229,13 @@ export function buildAssertionPublishReceiptQuads(args: {
   metaGraph: string;
   txHash: string;
   blockNumber: bigint;
-  kaId: bigint;
+  /**
+   * @deprecated RFC ka-metadata-trim Phase 2 — accepted for caller
+   * compatibility but no longer persisted: the on-chain id is queryable as
+   * `dkg:batchId` on the UAL subject; readers of the legacy
+   * `dkg:publishedAtKaId` row are read-both.
+   */
+  kaId?: bigint;
 }): Array<{ subject: string; predicate: string; object: string; graph: string }> {
   const xsdInteger = '<http://www.w3.org/2001/XMLSchema#integer>';
   return [
@@ -224,12 +249,6 @@ export function buildAssertionPublishReceiptQuads(args: {
       subject: args.assertionUri,
       predicate: ASSERTION_PUBLISH_RECEIPT_PREDICATES.PUBLISHED_AT_BLOCK,
       object: `"${args.blockNumber.toString()}"^^${xsdInteger}`,
-      graph: args.metaGraph,
-    },
-    {
-      subject: args.assertionUri,
-      predicate: ASSERTION_PUBLISH_RECEIPT_PREDICATES.PUBLISHED_AT_KA_ID,
-      object: `"${args.kaId.toString()}"^^${xsdInteger}`,
       graph: args.metaGraph,
     },
   ];
@@ -247,6 +266,12 @@ export interface AssertionSeal {
   authorSchemeVersion: number;
   chainId: bigint;
   kav10Address: string;
+  /**
+   * OT-RFC-43 §F2 — the packed id the AuthorAttestation digest bound. Optional:
+   * absent on seals that predate the binding; consumers fall back to the
+   * lifecycle-URN kaId when undefined.
+   */
+  reservedKaId?: bigint;
   finalizedAtIso: string;
   /**
    * Root entities the seal commits to. Set at finalize time, used at
@@ -340,6 +365,11 @@ export function parseAssertionSealQuads(
     kav10Address: stringLiteralToValue(
       seen.get(ASSERTION_SEAL_PREDICATES.ASSERTED_AT_KAV10_ADDRESS)!,
     ),
+    // OT-RFC-43 §F2 — optional on read: present on seals finalized after the
+    // binding landed; consumers fall back to the lifecycle-URN kaId when absent.
+    reservedKaId: seen.has(ASSERTION_SEAL_PREDICATES.RESERVED_KA_ID)
+      ? integerLiteralToValue(seen.get(ASSERTION_SEAL_PREDICATES.RESERVED_KA_ID)!)
+      : undefined,
     finalizedAtIso: dateTimeLiteralToValue(
       seen.get(ASSERTION_SEAL_PREDICATES.ASSERTION_FINALIZED_AT)!,
     ),

@@ -31,20 +31,25 @@ import {
 
 const CHAIN_ID = 31337n;
 const KAV10_ADDRESS = '0x0000000000000000000000000000000000000042';
-const CG_ID = 1337n;
 const MERKLE_ROOT = new Uint8Array(32).fill(0xaa);
 const AUTHOR_ADDRESS = '0x70997970C51812dc3A010C7d01b50e0d17dc79C8';
+// §F2 — the packed reservedKaId now bound into the AuthorAttestation digest:
+// (uint160(author) << 96) | uint96(number). Number = 1 for this fixture.
+const RESERVED_KA_ID = (BigInt(AUTHOR_ADDRESS) << 96n) | 1n;
 
 // Golden hex reference — precomputed offline with `ethers.TypedDataEncoder`
 // against the exact KnowledgeAssetsLifecycle EIP-712 layout. If this drifts,
 // the off-chain typed-data builder no longer matches the on-chain
 // `_hashAuthorAttestation` and every publish will fail signature recovery.
+// #1116: recomputed for the CG-INDEPENDENT AuthorAttestation
+// (`AuthorAttestation(bytes32 merkleRoot,address authorAddress,uint8 schemeVersion,uint256 reservedKaId)`)
+// at domain version 3.0.0. Must match the contract PR's new typehash + _EIP712_VERSION.
 const AUTHOR_ATTESTATION_DIGEST_GOLDEN =
-  '0x8b43a996c02f5bf79077213758e1504b1b62a4d8802d32a6710b5049d16fb54c';
+  '0xae3febe85ae679da21fb1ccc088cfbf222ef867fd7310c8f19fff2a809db6bac';
 const AUTHOR_ATTESTATION_DOMAIN_SEPARATOR_GOLDEN =
-  '0x8d1039bf11fed6d60879b8382f853f0a36eccb90a660d676560daa3165e5fa84';
+  '0x8c7428a771584a490b1962839233f067bf006e9beedcf54e93faa441f8f66829';
 const AUTHOR_ATTESTATION_STRUCT_HASH_GOLDEN =
-  '0xb72293311c0783593beea12f1d87bbb8ed1899ee1d55d439271a650c01446896';
+  '0x10d3abd5db80ec0df22e006712bda8542705bfc73b5877416021f42ed6ebc5ef';
 
 // ── Tiny abi-encode helpers (32-byte left-padded big-endian) ─────────────
 //
@@ -124,17 +129,17 @@ const EIP712_DOMAIN_TYPEHASH = keccak256(
 );
 const AUTHOR_ATTESTATION_TYPEHASH = keccak256(
   utf8(
-    'AuthorAttestation(uint256 contextGraphId,bytes32 merkleRoot,address authorAddress,uint8 schemeVersion)',
+    'AuthorAttestation(bytes32 merkleRoot,address authorAddress,uint8 schemeVersion,uint256 reservedKaId)',
   ),
 );
 
 function manualHashAuthorAttestation(args: {
   chainId: bigint;
   kav10Address: string;
-  contextGraphId: bigint;
   merkleRootHex: string;
   authorAddress: string;
   schemeVersion: number;
+  reservedKaId: bigint;
 }): { digest: Uint8Array; domainSeparator: Uint8Array; structHash: Uint8Array } {
   const nameHash = keccak256(utf8(AUTHOR_ATTESTATION_DOMAIN_NAME));
   const versionHash = keccak256(utf8(AUTHOR_ATTESTATION_DOMAIN_VERSION));
@@ -152,10 +157,10 @@ function manualHashAuthorAttestation(args: {
   const structHash = keccak256(
     concat(
       AUTHOR_ATTESTATION_TYPEHASH,
-      uint256ToWord(args.contextGraphId),
       bytes32ToWord(args.merkleRootHex),
       addressToWord(args.authorAddress),
       uint8ToWord(args.schemeVersion),
+      uint256ToWord(args.reservedKaId),
     ),
   );
 
@@ -182,9 +187,9 @@ function toHex(bytes: Uint8Array): string {
 function digestForFixture(args: {
   chainId: bigint;
   kav10Address: string;
-  contextGraphId: bigint;
   merkleRoot: Uint8Array;
   authorAddress: string;
+  reservedKaId: bigint;
   schemeVersion?: number;
 }): { digest: string; domainSeparator: string; structHash: string } {
   const payload = buildAuthorAttestationTypedData(args);
@@ -193,10 +198,10 @@ function digestForFixture(args: {
   const out = manualHashAuthorAttestation({
     chainId: payload.domain.chainId,
     kav10Address: payload.domain.verifyingContract,
-    contextGraphId: payload.message.contextGraphId,
     merkleRootHex: payload.message.merkleRoot,
     authorAddress: payload.message.authorAddress,
     schemeVersion: payload.message.schemeVersion,
+    reservedKaId: payload.message.reservedKaId,
   });
   return {
     digest: toHex(out.digest),
@@ -210,9 +215,9 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
     const out = digestForFixture({
       chainId: CHAIN_ID,
       kav10Address: KAV10_ADDRESS,
-      contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
     });
     expect(out.digest).toBe(AUTHOR_ATTESTATION_DIGEST_GOLDEN);
     expect(out.domainSeparator).toBe(AUTHOR_ATTESTATION_DOMAIN_SEPARATOR_GOLDEN);
@@ -230,36 +235,37 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
     const payload = buildAuthorAttestationTypedData({
       chainId: CHAIN_ID,
       kav10Address: KAV10_ADDRESS,
-      contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
     });
     expect(payload.domain.name).toBe(AUTHOR_ATTESTATION_DOMAIN_NAME);
     expect(payload.domain.version).toBe(AUTHOR_ATTESTATION_DOMAIN_VERSION);
     expect(payload.primaryType).toBe(AUTHOR_ATTESTATION_PRIMARY_TYPE);
     expect(payload.types.AuthorAttestation).toEqual([
-      { name: 'contextGraphId', type: 'uint256' },
       { name: 'merkleRoot', type: 'bytes32' },
       { name: 'authorAddress', type: 'address' },
       { name: 'schemeVersion', type: 'uint8' },
+      { name: 'reservedKaId', type: 'uint256' },
     ]);
     expect(payload.message.schemeVersion).toBe(AUTHOR_SCHEME_VERSION_V1);
+    expect(payload.message.reservedKaId).toBe(RESERVED_KA_ID);
   });
 
   it('is deterministic for identical inputs', () => {
     const a = digestForFixture({
       chainId: CHAIN_ID,
       kav10Address: KAV10_ADDRESS,
-      contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
     }).digest;
     const b = digestForFixture({
       chainId: CHAIN_ID,
       kav10Address: KAV10_ADDRESS,
-      contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
     }).digest;
     expect(a).toBe(b);
   });
@@ -268,16 +274,16 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
     const a = digestForFixture({
       chainId: CHAIN_ID,
       kav10Address: KAV10_ADDRESS,
-      contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
     }).digest;
     const b = digestForFixture({
       chainId: CHAIN_ID + 1n,
       kav10Address: KAV10_ADDRESS,
-      contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
     }).digest;
     expect(a).not.toBe(b);
   });
@@ -286,53 +292,40 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
     const a = digestForFixture({
       chainId: CHAIN_ID,
       kav10Address: KAV10_ADDRESS,
-      contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
     }).digest;
     const b = digestForFixture({
       chainId: CHAIN_ID,
       kav10Address: '0x0000000000000000000000000000000000000043',
-      contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
     }).digest;
     expect(a).not.toBe(b);
   });
 
-  it('different contextGraphId produces a different digest (per-CG binding)', () => {
-    const a = digestForFixture({
-      chainId: CHAIN_ID,
-      kav10Address: KAV10_ADDRESS,
-      contextGraphId: CG_ID,
-      merkleRoot: MERKLE_ROOT,
-      authorAddress: AUTHOR_ADDRESS,
-    }).digest;
-    const b = digestForFixture({
-      chainId: CHAIN_ID,
-      kav10Address: KAV10_ADDRESS,
-      contextGraphId: CG_ID + 1n,
-      merkleRoot: MERKLE_ROOT,
-      authorAddress: AUTHOR_ADDRESS,
-    }).digest;
-    expect(a).not.toBe(b);
-  });
+  // (#1116) The seal is now context-graph-independent — the AuthorAttestation
+  // no longer binds contextGraphId, so there is no per-CG digest binding to
+  // assert here. CG binding now happens at publish (PublishParams.contextGraphId
+  // + the separate ACK digest), not in the author signature.
 
   it('different merkleRoot produces a different digest (per-publish binding)', () => {
     const a = digestForFixture({
       chainId: CHAIN_ID,
       kav10Address: KAV10_ADDRESS,
-      contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
     }).digest;
     const altRoot = new Uint8Array(32).fill(0xbb);
     const b = digestForFixture({
       chainId: CHAIN_ID,
       kav10Address: KAV10_ADDRESS,
-      contextGraphId: CG_ID,
       merkleRoot: altRoot,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
     }).digest;
     expect(a).not.toBe(b);
   });
@@ -341,16 +334,16 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
     const a = digestForFixture({
       chainId: CHAIN_ID,
       kav10Address: KAV10_ADDRESS,
-      contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
     }).digest;
     const b = digestForFixture({
       chainId: CHAIN_ID,
       kav10Address: KAV10_ADDRESS,
-      contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC',
+      reservedKaId: RESERVED_KA_ID,
     }).digest;
     expect(a).not.toBe(b);
   });
@@ -359,17 +352,17 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
     const a = digestForFixture({
       chainId: CHAIN_ID,
       kav10Address: KAV10_ADDRESS,
-      contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
       schemeVersion: 1,
     }).digest;
     const b = digestForFixture({
       chainId: CHAIN_ID,
       kav10Address: KAV10_ADDRESS,
-      contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
       schemeVersion: 2,
     }).digest;
     expect(a).not.toBe(b);
@@ -380,9 +373,9 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
       buildAuthorAttestationTypedData({
         chainId: CHAIN_ID,
         kav10Address: KAV10_ADDRESS,
-        contextGraphId: CG_ID,
         merkleRoot: new Uint8Array(16),
         authorAddress: AUTHOR_ADDRESS,
+        reservedKaId: RESERVED_KA_ID,
       }),
     ).toThrow(/merkleRoot/);
   });
@@ -393,7 +386,7 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
     // values are baked into the on-chain `_EIP712_NAME_HASH` and
     // `_EIP712_VERSION_HASH`.
     expect(AUTHOR_ATTESTATION_DOMAIN_NAME).toBe('KnowledgeAssetsLifecycle');
-    expect(AUTHOR_ATTESTATION_DOMAIN_VERSION).toBe('2.0.0');
+    expect(AUTHOR_ATTESTATION_DOMAIN_VERSION).toBe('3.0.0');
     expect(AUTHOR_ATTESTATION_PRIMARY_TYPE).toBe('AuthorAttestation');
     expect(AUTHOR_SCHEME_VERSION_V1).toBe(1);
     // Sanity on the keccak256 helpers we depend on for this test.

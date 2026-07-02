@@ -4,7 +4,7 @@
  */
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Interface, ethers } from 'ethers';
 import {
   computeApprovalAction,
@@ -12,6 +12,8 @@ import {
   effectivePublishAllowance,
   enrichEvmError,
   EVMChainAdapter,
+  InsufficientPublisherFundsError,
+  isNoFundedPublisherWalletError,
   isTooLowAllowanceError,
   resolveRpcUrls,
   V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE,
@@ -23,10 +25,31 @@ import {
   DEFAULT_REFILL_BELOW_FRACTION,
   type ApprovalPolicy,
 } from '../src/chain-adapter.js';
+import { _resetRpcFailoverStatsForTest } from '../src/rpc-failover-log.js';
+import { isChainRpcTransportError } from '../src/chain-rpc-transport-error.js';
+import { connectable } from './connectable.js';
+
+// Isolate the process-wide RPC failover stats + dedup window before EVERY test
+// so a failover/exhaustion warning emitted by one test can't suppress (via the
+// shared dedup window) a `console.warn` assertion in another — and so the new
+// failover-log lines are observed against a clean slate (otReviewAgent #1329).
+beforeEach(() => {
+  _resetRpcFailoverStatsForTest();
+});
+
 
 const DEPLOYER_PK = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
 const OTHER_PK = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b63b91100';
 const ADMIN_PK = '0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a';
+
+// Plain hand-rolled call recorder: records every call's args, runs the real
+// impl, returns its result. Replaces vitest's fake-fn API one-for-one without
+// pulling in the mock framework.
+function recorder<A extends unknown[], R>(impl: (...args: A) => R) {
+  const calls: A[] = [];
+  const fn = (...args: A): R => { calls.push(args); return impl(...args); };
+  return Object.assign(fn, { calls });
+}
 
 function minimalConfig(overrides: Partial<EVMAdapterConfig> = {}): EVMAdapterConfig {
   return {
@@ -118,6 +141,23 @@ describe('decodeEvmError / enrichEvmError (07 EVM_MODULE — custom errors)', ()
   });
 });
 
+describe('isNoFundedPublisherWalletError (code-first + shared message marker)', () => {
+  it('matches the structured code', () => {
+    expect(isNoFundedPublisherWalletError({ code: 'NO_FUNDED_PUBLISHER_WALLET' })).toBe(true);
+  });
+  it('matches the shared message marker when .code is dropped by a wrapper', () => {
+    // Same semantics as the daemon-side predicate — keyed on the dkg-core
+    // "No operational wallet has enough funds" prefix, not the literal code.
+    expect(isNoFundedPublisherWalletError(new Error('No operational wallet has enough funds to publish.'))).toBe(true);
+  });
+  it('does NOT match unrelated errors', () => {
+    expect(isNoFundedPublisherWalletError({ code: 'CALL_EXCEPTION' })).toBe(false);
+    expect(isNoFundedPublisherWalletError(new Error('insufficient funds for gas'))).toBe(false);
+    expect(isNoFundedPublisherWalletError(undefined)).toBe(false);
+    expect(isNoFundedPublisherWalletError(null)).toBe(false);
+  });
+});
+
 describe('EVMChainAdapter constructor / getters (no init)', () => {
   it('sets chainType, chainId default, and signer pool', () => {
     const a = new EVMChainAdapter(minimalConfig({ chainId: 'evm:84532' }));
@@ -166,7 +206,6 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     const a = new EVMChainAdapter(minimalConfig());
     expect(a.getProvider()).toBeDefined();
     expect(typeof a.getProvider().getBlockNumber).toBe('function');
-    expect(a.getReadProvider()).toBeDefined();
   });
 
   it('issues un-batched JSON-RPC requests (batchMaxCount=1) so a rate-limited read rejects on its own awaited promise — issue #939', async () => {
@@ -211,12 +250,12 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
 
   it('falls back to getContextGraph when ContextGraphStorage lacks getAccessPolicy', async () => {
     const a = new EVMChainAdapter(minimalConfig());
-    const getAccessPolicy = vi.fn(async () => {
+    const getAccessPolicy = recorder(async (_id: bigint) => {
       const err = new Error('missing revert data');
       (err as any).code = 'CALL_EXCEPTION';
       throw err;
     });
-    const getContextGraph = vi.fn(async () => ({
+    const getContextGraph = recorder(async (_id: bigint) => ({
       owner_: ethers.ZeroAddress,
       participantAgents: [],
       metadataBatchId: 0n,
@@ -228,24 +267,24 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
       publishAuthorityAccountId: 0n,
     }));
     (a as any).init = async () => undefined;
-    (a as any).contracts.contextGraphStorage = {
+    (a as any).contracts.contextGraphStorage = connectable({
       getAccessPolicy,
       getContextGraph,
-    };
+    });
 
     await expect(a.getContextGraphAccessPolicy(6n)).resolves.toBe(1);
-    expect(getAccessPolicy).toHaveBeenCalledWith(6n);
-    expect(getContextGraph).toHaveBeenCalledWith(6n);
+    expect(getAccessPolicy.calls.at(-1)).toEqual([6n]);
+    expect(getContextGraph.calls.at(-1)).toEqual([6n]);
   });
 
   it('parses accessPolicy from tuple fallback results', async () => {
     const a = new EVMChainAdapter(minimalConfig());
     (a as any).init = async () => undefined;
-    (a as any).contracts.contextGraphStorage = {
-      getAccessPolicy: vi.fn(async () => {
+    (a as any).contracts.contextGraphStorage = connectable({
+      getAccessPolicy: recorder(async () => {
         throw new Error('selector unavailable');
       }),
-      getContextGraph: vi.fn(async () => [
+      getContextGraph: recorder(async () => [
         ethers.ZeroAddress,
         [],
         0n,
@@ -256,9 +295,40 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
         ethers.ZeroAddress,
         0n,
       ]),
-    };
+    });
 
     await expect(a.getContextGraphAccessPolicy(7n)).resolves.toBe(0);
+  });
+
+  it('surfaces context graph liveness RPC failures instead of reporting inactive', async () => {
+    const a = new EVMChainAdapter(minimalConfig());
+    const rpcError = new Error('rpc unavailable');
+    (a as any).init = async () => undefined;
+    (a as any).contracts.contextGraphStorage = connectable({
+      isContextGraphActive: recorder(async () => {
+        throw rpcError;
+      }),
+    });
+
+    await expect(a.isContextGraphActiveOnChain(8n)).rejects.toThrow('rpc unavailable');
+  });
+
+  it('returns false for a successful inactive context graph liveness read', async () => {
+    const a = new EVMChainAdapter(minimalConfig());
+    const isContextGraphActive = recorder(async (_id: bigint) => false);
+    (a as any).init = async () => undefined;
+    (a as any).contracts.contextGraphStorage = connectable({ isContextGraphActive });
+
+    await expect(a.isContextGraphActiveOnChain(9n)).resolves.toBe(false);
+    expect(isContextGraphActive.calls.at(-1)).toEqual([9n]);
+  });
+
+  it('surfaces missing ContextGraphStorage as unknown instead of reporting inactive', async () => {
+    const a = new EVMChainAdapter(minimalConfig());
+    (a as any).init = async () => undefined;
+    (a as any).contracts.contextGraphStorage = undefined;
+
+    await expect(a.isContextGraphActiveOnChain(10n)).rejects.toThrow('ContextGraphStorage not deployed');
   });
 
   it('uses configured tokenAddress without resolving Hub.Token during init', async () => {
@@ -266,19 +336,19 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     const contractAddress = ethers.getAddress(`0x${'11'.repeat(20)}`);
     const assetStorageAddress = ethers.getAddress(`0x${'33'.repeat(20)}`);
     const a = new EVMChainAdapter(minimalConfig({ tokenAddress }));
-    const getContractAddress = vi.fn(async (name: string) => {
+    const getContractAddress = recorder(async (name: string) => {
       if (name === 'Token') throw new Error('Hub.Token should not be resolved when tokenAddress is configured');
       return contractAddress;
     });
-    (a as any).contracts.hub = {
+    (a as any).contracts.hub = connectable({
       getContractAddress,
-      getAssetStorageAddress: vi.fn(async () => assetStorageAddress),
-      on: vi.fn(async () => undefined),
-    };
+      getAssetStorageAddress: recorder(async () => assetStorageAddress),
+      on: recorder(async () => undefined),
+    });
 
     await (a as any).init();
 
-    expect(getContractAddress).not.toHaveBeenCalledWith('Token');
+    expect(getContractAddress.calls).not.toContainEqual(['Token']);
     await expect((a as any).contracts.token.getAddress()).resolves.toBe(tokenAddress);
   });
 
@@ -308,18 +378,18 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     }));
     const receipt = { hash: '0xabc', blockNumber: 12, status: 1, logs: [] };
     const primary = {
-      getTransactionReceipt: vi.fn(async () => {
+      getTransactionReceipt: recorder(async () => {
         const err = new Error('socket hang up');
         (err as any).code = 'ECONNRESET';
         throw err;
       }),
     };
-    const backup = { getTransactionReceipt: vi.fn(async () => receipt) };
+    const backup = { getTransactionReceipt: recorder(async () => receipt) };
     (a as any).providers = [primary, backup];
 
     await expect((a as any).getTransactionReceiptWithFailover('0xabc')).resolves.toBe(receipt);
-    expect(primary.getTransactionReceipt).toHaveBeenCalledTimes(1);
-    expect(backup.getTransactionReceipt).toHaveBeenCalledTimes(1);
+    expect(primary.getTransactionReceipt.calls).toHaveLength(1);
+    expect(backup.getTransactionReceipt.calls).toHaveLength(1);
   });
 
   it('fails receipt lookup immediately when every RPC endpoint errors', async () => {
@@ -328,14 +398,14 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
       rpcUrls: ['https://backup.example'],
     }));
     const primary = {
-      getTransactionReceipt: vi.fn(async () => {
+      getTransactionReceipt: recorder(async () => {
         const err = new Error('socket hang up');
         (err as any).code = 'ECONNRESET';
         throw err;
       }),
     };
     const backup = {
-      getTransactionReceipt: vi.fn(async () => {
+      getTransactionReceipt: recorder(async () => {
         const err = new Error('502 bad gateway');
         (err as any).status = 502;
         throw err;
@@ -346,8 +416,8 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     await expect((a as any).getTransactionReceiptWithFailover('0xabc')).rejects.toMatchObject({
       code: 'RPC_RECEIPT_LOOKUP_FAILED',
     });
-    expect(primary.getTransactionReceipt).toHaveBeenCalledTimes(1);
-    expect(backup.getTransactionReceipt).toHaveBeenCalledTimes(1);
+    expect(primary.getTransactionReceipt.calls).toHaveLength(1);
+    expect(backup.getTransactionReceipt.calls).toHaveLength(1);
   });
 
   it('does not fail over deterministic CALL_EXCEPTION errors', async () => {
@@ -357,12 +427,12 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     }));
     const err = new Error('execution reverted');
     (err as any).code = 'CALL_EXCEPTION';
-    const primary = { getTransactionReceipt: vi.fn(async () => { throw err; }) };
-    const backup = { getTransactionReceipt: vi.fn(async () => null) };
+    const primary = { getTransactionReceipt: recorder(async () => { throw err; }) };
+    const backup = { getTransactionReceipt: recorder(async () => null) };
     (a as any).providers = [primary, backup];
 
     await expect((a as any).getTransactionReceiptWithFailover('0xabc')).rejects.toBe(err);
-    expect(backup.getTransactionReceipt).not.toHaveBeenCalled();
+    expect(backup.getTransactionReceipt.calls).toEqual([]);
   });
 
   it('tries backup RPC when contract transaction population is rate-limited', async () => {
@@ -375,26 +445,31 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     const signer = new ethers.Wallet(DEPLOYER_PK, primaryProvider);
     const receipt = { hash: '0xabc', blockNumber: 12, status: 1, logs: [] };
     const populated = { to: '0x0000000000000000000000000000000000000001', data: '0x1234' };
-    const populateTransaction = vi.fn()
-      .mockImplementationOnce(async () => {
+    // mockImplementationOnce → mockResolvedValueOnce chain modelled as a queue
+    // the recorder shifts through (rejection modelled by throwing).
+    const populateQueue: Array<() => Promise<any>> = [
+      async () => {
         const err = new Error('429 too many requests');
         (err as any).status = 429;
         throw err;
-      })
-      .mockResolvedValueOnce(populated);
+      },
+      async () => populated,
+    ];
+    const populateTransaction = recorder(async () => (populateQueue.shift() ?? (async () => populated))());
     const runners: any[] = [];
     const contract = {
-      connect: vi.fn((runner: any) => {
+      connect: recorder((runner: any) => {
         runners.push(runner);
         return { createContextGraph: { populateTransaction } };
       }),
     };
     (a as any).providers = [primaryProvider, backupProvider];
-    (a as any).signPopulatedTransaction = vi.fn(async () => ({
+    const signPopulatedTransaction = recorder(async (..._a: unknown[]) => ({
       signedTx: '0xdeadbeef',
       txHash: receipt.hash,
     }));
-    (a as any).sendSignedTransactionAndWait = vi.fn(async () => receipt);
+    (a as any).signPopulatedTransaction = signPopulatedTransaction;
+    (a as any).sendSignedTransactionAndWait = recorder(async () => receipt);
 
     await expect((a as any).sendContractTransaction(
       contract,
@@ -404,12 +479,191 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
       'create on-chain context graph',
     )).resolves.toBe(receipt);
 
-    expect(populateTransaction).toHaveBeenCalledTimes(2);
+    expect(populateTransaction.calls).toHaveLength(2);
     expect(runners.map((runner) => runner.provider)).toEqual([primaryProvider, backupProvider]);
-    expect((a as any).signPopulatedTransaction).toHaveBeenCalledWith(
+    expect(signPopulatedTransaction.calls).toContainEqual([
       runners[1],
       populated,
-    );
+    ]);
+  });
+
+  it('inflates gasLimit by gasLimitBufferBps when populate leaves it unset (OOG headroom)', async () => {
+    // createChallenge's gas depends on per-block randomness, so the adapter
+    // estimates once and inflates the limit. Verify the buffered branch
+    // actually mutates the populated tx that gets signed (Codex review:
+    // previously only covered indirectly through flaky Hardhat e2e).
+    const a = new EVMChainAdapter(minimalConfig({ rpcUrl: 'https://only.example' }));
+    const provider = { name: 'only' } as any;
+    const signer = new ethers.Wallet(DEPLOYER_PK, provider);
+    const receipt = { hash: '0xabc', blockNumber: 7, status: 1, logs: [] };
+    // No gasLimit from populate → buffered-estimate path runs.
+    const populated: any = { to: '0x0000000000000000000000000000000000000001', data: '0x1234' };
+    const populateTransaction = recorder(async () => populated);
+    const estimateGas = recorder(async () => 1_000_000n);
+    const contract = {
+      connect: recorder(() => ({ createChallenge: { populateTransaction, estimateGas } })),
+    };
+    (a as any).providers = [provider];
+    const signSpy = recorder(async (..._a: any[]) => ({ signedTx: '0xdead', txHash: receipt.hash }));
+    (a as any).signPopulatedTransaction = signSpy;
+    (a as any).sendSignedTransactionAndWait = recorder(async () => receipt);
+
+    await expect((a as any).sendContractTransaction(
+      contract,
+      'createChallenge',
+      [],
+      signer,
+      'create random-sampling challenge',
+      { gasLimitBufferBps: 5_000 },
+    )).resolves.toBe(receipt);
+
+    expect(estimateGas.calls).toHaveLength(1);
+    // 1_000_000 * (10_000 + 5_000) / 10_000 = 1_500_000
+    expect(signSpy.calls[0][1].gasLimit).toBe(1_500_000n);
+  });
+
+  it('falls back to the unbuffered signing flow and warns when buffered estimateGas throws', async () => {
+    const a = new EVMChainAdapter(minimalConfig({ rpcUrl: 'https://only.example' }));
+    const provider = { name: 'only' } as any;
+    const signer = new ethers.Wallet(DEPLOYER_PK, provider);
+    const receipt = { hash: '0xabc', blockNumber: 9, status: 1, logs: [] };
+    const populated: any = { to: '0x0000000000000000000000000000000000000001', data: '0x1234' };
+    const populateTransaction = recorder(async () => populated);
+    const estimateGas = recorder(async () => { throw new Error('estimate boom'); });
+    const contract = {
+      connect: recorder(() => ({ createChallenge: { populateTransaction, estimateGas } })),
+    };
+    (a as any).providers = [provider];
+    const signSpy = recorder(async (..._a: any[]) => ({ signedTx: '0xdead', txHash: receipt.hash }));
+    (a as any).signPopulatedTransaction = signSpy;
+    (a as any).sendSignedTransactionAndWait = recorder(async () => receipt);
+    const origWarn = console.warn;
+    const warnSpy = recorder((..._a: unknown[]) => undefined);
+    console.warn = warnSpy as unknown as typeof console.warn;
+    try {
+      await expect((a as any).sendContractTransaction(
+        contract,
+        'createChallenge',
+        [],
+        signer,
+        'create random-sampling challenge',
+        { gasLimitBufferBps: 5_000 },
+      )).resolves.toBe(receipt);
+
+      // No headroom applied — gasLimit stays unset so ethers estimates during
+      // signing (unbuffered, but no worse than before the buffer existed).
+      expect(signSpy.calls[0][1].gasLimit).toBeUndefined();
+      expect(warnSpy.calls).toHaveLength(1);
+      expect(String(warnSpy.calls[0][0])).toContain('buffered gas estimation failed');
+    } finally {
+      console.warn = origWarn;
+    }
+  });
+
+  it('skips gas estimation when populate already set gasLimit (buffer is a no-op)', async () => {
+    const a = new EVMChainAdapter(minimalConfig({ rpcUrl: 'https://only.example' }));
+    const provider = { name: 'only' } as any;
+    const signer = new ethers.Wallet(DEPLOYER_PK, provider);
+    const receipt = { hash: '0xabc', blockNumber: 11, status: 1, logs: [] };
+    const populated: any = { to: '0x0000000000000000000000000000000000000001', data: '0x1234', gasLimit: 800_000n };
+    const populateTransaction = recorder(async () => populated);
+    const estimateGas = recorder(async () => 1_000_000n);
+    const contract = {
+      connect: recorder(() => ({ createChallenge: { populateTransaction, estimateGas } })),
+    };
+    (a as any).providers = [provider];
+    const signSpy = recorder(async (..._a: any[]) => ({ signedTx: '0xdead', txHash: receipt.hash }));
+    (a as any).signPopulatedTransaction = signSpy;
+    (a as any).sendSignedTransactionAndWait = recorder(async () => receipt);
+
+    await expect((a as any).sendContractTransaction(
+      contract,
+      'createChallenge',
+      [],
+      signer,
+      'create random-sampling challenge',
+      { gasLimitBufferBps: 5_000 },
+    )).resolves.toBe(receipt);
+
+    expect(estimateGas.calls).toEqual([]);
+    expect(signSpy.calls[0][1].gasLimit).toBe(800_000n);
+  });
+
+  it('fails over to the next RPC when buffered estimateGas is rate-limited (keeps the OOG headroom)', async () => {
+    // A retryable estimate failure must NOT silently drop the gas headroom
+    // by signing unbuffered against the failing provider — that reintroduces
+    // the OOG this guards against. Instead the outer loop should fail over to
+    // a healthy RPC that can estimate, and the buffer is still applied
+    // (Codex review).
+    const a = new EVMChainAdapter(minimalConfig({
+      rpcUrl: 'https://primary.example',
+      rpcUrls: ['https://backup.example'],
+    }));
+    const primaryProvider = { name: 'primary' } as any;
+    const backupProvider = { name: 'backup' } as any;
+    const signer = new ethers.Wallet(DEPLOYER_PK, primaryProvider);
+    const receipt = { hash: '0xabc', blockNumber: 13, status: 1, logs: [] };
+    // Fresh populated per provider so provider #1's discarded attempt can't
+    // leak a gasLimit onto provider #2.
+    const populateTransaction = recorder(async () => (
+      { to: '0x0000000000000000000000000000000000000001', data: '0x1234' } as any
+    ));
+    // mockImplementationOnce → mockResolvedValueOnce chain as a shift()ed queue.
+    const estimateQueue: Array<() => Promise<bigint>> = [
+      async () => {
+        const err = new Error('429 too many requests');
+        (err as any).status = 429;
+        throw err;
+      },
+      async () => 1_000_000n,
+    ];
+    const estimateGas = recorder(async () => (estimateQueue.shift() ?? (async () => 1_000_000n))());
+    const runners: any[] = [];
+    const contract = {
+      connect: recorder((runner: any) => {
+        runners.push(runner);
+        return { createChallenge: { populateTransaction, estimateGas } };
+      }),
+    };
+    (a as any).providers = [primaryProvider, backupProvider];
+    const signSpy = recorder(async (..._a: any[]) => ({ signedTx: '0xdead', txHash: receipt.hash }));
+    (a as any).signPopulatedTransaction = signSpy;
+    (a as any).sendSignedTransactionAndWait = recorder(async () => receipt);
+    const origWarn = console.warn;
+    const warnSpy = recorder((..._a: unknown[]) => undefined);
+    console.warn = warnSpy as unknown as typeof console.warn;
+    try {
+      await expect((a as any).sendContractTransaction(
+        contract,
+        'createChallenge',
+        [],
+        signer,
+        'create random-sampling challenge',
+        { gasLimitBufferBps: 5_000 },
+      )).resolves.toBe(receipt);
+
+      expect(estimateGas.calls).toHaveLength(2);
+      expect(populateTransaction.calls).toHaveLength(2);
+      // Buffer still applied on the healthy provider.
+      expect(signSpy.calls[0][1].gasLimit).toBe(1_500_000n);
+      // Signed against the BACKUP runner, not the rate-limited primary.
+      expect(signSpy.calls[0][0].provider).toBe(backupProvider);
+      // Failover, not silent fallback: the "headroom not applied" fallback
+      // warning must NOT fire (the buffer was applied on the healthy backup).
+      const headroomWarnings = warnSpy.calls.filter(
+        (c: unknown[]) => String(c[0]).includes('buffered gas estimation failed'),
+      );
+      expect(headroomWarnings).toEqual([]);
+      // The failover itself is now observable as exactly one dedup'd line (the
+      // W3 failover logger) — asserted separately from the gas-headroom concern
+      // so neither masks the other.
+      const failoverWarnings = warnSpy.calls.filter(
+        (c: unknown[]) => String(c[0]).includes('RPC failover'),
+      );
+      expect(failoverWarnings).toHaveLength(1);
+    } finally {
+      console.warn = origWarn;
+    }
   });
 
   it('names exhausted RPC endpoints when transaction population fails everywhere', async () => {
@@ -420,20 +674,22 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     const primaryProvider = { name: 'primary' } as any;
     const backupProvider = { name: 'backup' } as any;
     const signer = new ethers.Wallet(DEPLOYER_PK, primaryProvider);
-    const populateTransaction = vi.fn(async () => {
+    const populateTransaction = recorder(async () => {
       const err = new Error('429 too many requests');
       (err as any).status = 429;
       throw err;
     });
     const contract = {
-      connect: vi.fn(() => ({ createContextGraph: { populateTransaction } })),
+      connect: recorder(() => ({ createContextGraph: { populateTransaction } })),
     };
     (a as any).providers = [primaryProvider, backupProvider];
-    (a as any).signPopulatedTransaction = vi.fn(async () => ({
+    const signPopulatedTransaction = recorder(async () => ({
       signedTx: '0xdeadbeef',
       txHash: '0xabc',
     }));
-    (a as any).sendSignedTransactionAndWait = vi.fn(async () => ({}));
+    (a as any).signPopulatedTransaction = signPopulatedTransaction;
+    const sendSignedTransactionAndWait = recorder(async () => ({}));
+    (a as any).sendSignedTransactionAndWait = sendSignedTransactionAndWait;
 
     let thrown: any;
     try {
@@ -450,13 +706,20 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
 
     expect(thrown).toMatchObject({
       code: 'RPC_ENDPOINTS_EXHAUSTED',
+      // The structured rpcUrls property is the canonical config list (diagnostic;
+      // never serialized into an HTTP response body — only code/txHash/message
+      // reach clients).
       rpcUrls: ['https://primary.example', 'https://backup.example'],
     });
-    expect(thrown.message).toContain('https://primary.example');
-    expect(thrown.message).toContain('https://backup.example');
-    expect(populateTransaction).toHaveBeenCalledTimes(2);
-    expect((a as any).signPopulatedTransaction).not.toHaveBeenCalled();
-    expect((a as any).sendSignedTransactionAndWait).not.toHaveBeenCalled();
+    // The MESSAGE names the endpoints HOST-ONLY: a configured rpcUrl may carry
+    // an API key and err.message IS surfaced to HTTP clients via echoing paths
+    // (e.g. the create+publish 207 tail), so it must never embed full URLs.
+    expect(thrown.message).toContain('primary.example');
+    expect(thrown.message).toContain('backup.example');
+    expect(thrown.message).not.toContain('https://');
+    expect(populateTransaction.calls).toHaveLength(2);
+    expect(signPopulatedTransaction.calls).toEqual([]);
+    expect(sendSignedTransactionAndWait.calls).toEqual([]);
   });
 
   it('single-provider exhaustion keeps the RPC_ENDPOINTS_EXHAUSTED code but preserves the original message verbatim (#895 / Codex PR #901)', async () => {
@@ -470,15 +733,17 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     const a = new EVMChainAdapter(minimalConfig({ rpcUrl: 'https://only.example' }));
     const onlyProvider = { name: 'only' } as any;
     const signer = new ethers.Wallet(DEPLOYER_PK, onlyProvider);
-    const populateTransaction = vi.fn(async () => {
+    const populateTransaction = recorder(async () => {
       throw new Error('connect ECONNREFUSED 127.0.0.1:8545');
     });
     const contract = {
-      connect: vi.fn(() => ({ createContextGraph: { populateTransaction } })),
+      connect: recorder(() => ({ createContextGraph: { populateTransaction } })),
     };
     (a as any).providers = [onlyProvider];
-    (a as any).signPopulatedTransaction = vi.fn();
-    (a as any).sendSignedTransactionAndWait = vi.fn();
+    const signPopulatedTransaction = recorder(() => undefined);
+    (a as any).signPopulatedTransaction = signPopulatedTransaction;
+    const sendSignedTransactionAndWait = recorder(() => undefined);
+    (a as any).sendSignedTransactionAndWait = sendSignedTransactionAndWait;
 
     let thrown: any;
     try {
@@ -504,9 +769,9 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     // The original error is preserved as the cause.
     expect((thrown as Error).cause).toBeInstanceOf(Error);
     expect((thrown as { cause: Error }).cause.message).toBe('connect ECONNREFUSED 127.0.0.1:8545');
-    expect(populateTransaction).toHaveBeenCalledTimes(1);
-    expect((a as any).signPopulatedTransaction).not.toHaveBeenCalled();
-    expect((a as any).sendSignedTransactionAndWait).not.toHaveBeenCalled();
+    expect(populateTransaction.calls).toHaveLength(1);
+    expect(signPopulatedTransaction.calls).toEqual([]);
+    expect(sendSignedTransactionAndWait.calls).toEqual([]);
   });
 
   it('broadcasts the exact same signed raw transaction to backup after primary send failure', async () => {
@@ -519,22 +784,53 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     const txHash = '0x' + '11'.repeat(32);
     const receipt = { hash: txHash, blockNumber: 45, status: 1, logs: [] };
     const primary = {
-      broadcastTransaction: vi.fn(async (_raw: string) => {
+      broadcastTransaction: recorder(async (_raw: string) => {
         const err = new Error('429 too many requests');
         (err as any).status = 429;
         throw err;
       }),
-      getTransactionReceipt: vi.fn(async () => null),
+      getTransactionReceipt: recorder(async () => null),
     };
     const backup = {
-      broadcastTransaction: vi.fn(async () => ({ hash: txHash })),
-      getTransactionReceipt: vi.fn(async () => receipt),
+      broadcastTransaction: recorder(async (_raw: string) => ({ hash: txHash })),
+      getTransactionReceipt: recorder(async () => receipt),
     };
     (a as any).providers = [primary, backup];
 
     await expect((a as any).sendSignedTransactionAndWait(signedTx, txHash, 'unit write')).resolves.toBe(receipt);
-    expect(primary.broadcastTransaction).toHaveBeenCalledWith(signedTx);
-    expect(backup.broadcastTransaction).toHaveBeenCalledWith(signedTx);
+    expect(primary.broadcastTransaction.calls).toContainEqual([signedTx]);
+    expect(backup.broadcastTransaction.calls).toContainEqual([signedTx]);
+  });
+
+  it('stamps RPC_ENDPOINTS_EXHAUSTED when broadcast fails over EVERY endpoint (#1329 review R-1)', async () => {
+    // Without the code stamp, a broadcast-time exhaustion (after a provider
+    // populated/signed) surfaces code-less and the daemon maps it to a generic
+    // 500 instead of the intended retryable 503.
+    const a = new EVMChainAdapter(minimalConfig({
+      rpcUrl: 'https://primary.example',
+      rpcUrls: ['https://backup.example'],
+    }));
+    const signedTx = '0xdeadbeef';
+    const txHash = '0x' + '22'.repeat(32);
+    const throttled = (name: string) => ({
+      broadcastTransaction: recorder(async (_raw: string) => {
+        const err = new Error(`429 too many requests (${name})`);
+        (err as any).status = 429;
+        throw err;
+      }),
+    });
+    (a as any).providers = [throttled('primary'), throttled('backup')];
+    const origWarn = console.warn;
+    console.warn = (() => undefined) as typeof console.warn;
+    try {
+      await expect((a as any).broadcastSignedTransactionWithFailover(signedTx, txHash, 'unit write'))
+        .rejects.toMatchObject({
+          code: 'RPC_ENDPOINTS_EXHAUSTED',
+          rpcUrls: ['https://primary.example', 'https://backup.example'],
+        });
+    } finally {
+      console.warn = origWarn;
+    }
   });
 
   it('preserves the transaction hash when post-broadcast receipt lookup exhausts RPC endpoints', async () => {
@@ -546,8 +842,8 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     const txHash = '0x' + '55'.repeat(32);
     const primaryProvider = {
       name: 'primary',
-      broadcastTransaction: vi.fn(async () => ({ hash: txHash })),
-      getTransactionReceipt: vi.fn(async () => {
+      broadcastTransaction: recorder(async () => ({ hash: txHash })),
+      getTransactionReceipt: recorder(async () => {
         const err = new Error('429 too many requests');
         (err as any).status = 429;
         throw err;
@@ -555,8 +851,8 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     };
     const backupProvider = {
       name: 'backup',
-      broadcastTransaction: vi.fn(async () => ({ hash: txHash })),
-      getTransactionReceipt: vi.fn(async () => {
+      broadcastTransaction: recorder(async () => ({ hash: txHash })),
+      getTransactionReceipt: recorder(async () => {
         const err = new Error('502 bad gateway');
         (err as any).status = 502;
         throw err;
@@ -564,12 +860,13 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     };
     const signer = new ethers.Wallet(DEPLOYER_PK, primaryProvider as any);
     const populated = { to: '0x0000000000000000000000000000000000000001', data: '0x1234' };
-    const populateTransaction = vi.fn(async () => populated);
+    const populateTransaction = recorder(async () => populated);
     const contract = {
-      connect: vi.fn(() => ({ createContextGraph: { populateTransaction } })),
+      connect: recorder(() => ({ createContextGraph: { populateTransaction } })),
     };
     (a as any).providers = [primaryProvider, backupProvider];
-    (a as any).signPopulatedTransaction = vi.fn(async () => ({ signedTx, txHash }));
+    const signPopulatedTransaction = recorder(async () => ({ signedTx, txHash }));
+    (a as any).signPopulatedTransaction = signPopulatedTransaction;
 
     await expect((a as any).sendContractTransaction(
       contract,
@@ -581,12 +878,12 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
       code: 'RPC_RECEIPT_LOOKUP_FAILED',
       txHash,
     });
-    expect(populateTransaction).toHaveBeenCalledTimes(1);
-    expect((a as any).signPopulatedTransaction).toHaveBeenCalledTimes(1);
-    expect(primaryProvider.broadcastTransaction).toHaveBeenCalledWith(signedTx);
-    expect(backupProvider.broadcastTransaction).not.toHaveBeenCalled();
-    expect(primaryProvider.getTransactionReceipt).toHaveBeenCalledWith(txHash);
-    expect(backupProvider.getTransactionReceipt).toHaveBeenCalledWith(txHash);
+    expect(populateTransaction.calls).toHaveLength(1);
+    expect(signPopulatedTransaction.calls).toHaveLength(1);
+    expect(primaryProvider.broadcastTransaction.calls).toContainEqual([signedTx]);
+    expect(backupProvider.broadcastTransaction.calls).toEqual([]);
+    expect(primaryProvider.getTransactionReceipt.calls).toContainEqual([txHash]);
+    expect(backupProvider.getTransactionReceipt.calls).toContainEqual([txHash]);
   });
 
   it('classifies receipt wait expiry as a timeout and preserves the transaction hash', async () => {
@@ -597,17 +894,18 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
       const txHash = '0x' + '66'.repeat(32);
       const provider = {
         name: 'primary',
-        broadcastTransaction: vi.fn(async () => ({ hash: txHash })),
-        getTransactionReceipt: vi.fn(async () => null),
+        broadcastTransaction: recorder(async () => ({ hash: txHash })),
+        getTransactionReceipt: recorder(async () => null),
       };
       const signer = new ethers.Wallet(DEPLOYER_PK, provider as any);
       const populated = { to: '0x0000000000000000000000000000000000000001', data: '0x1234' };
-      const populateTransaction = vi.fn(async () => populated);
+      const populateTransaction = recorder(async () => populated);
       const contract = {
-        connect: vi.fn(() => ({ createContextGraph: { populateTransaction } })),
+        connect: recorder(() => ({ createContextGraph: { populateTransaction } })),
       };
       (a as any).providers = [provider];
-      (a as any).signPopulatedTransaction = vi.fn(async () => ({ signedTx, txHash }));
+      const signPopulatedTransaction = recorder(async () => ({ signedTx, txHash }));
+      (a as any).signPopulatedTransaction = signPopulatedTransaction;
 
       const thrown = (async () => {
         try {
@@ -625,14 +923,15 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
       })();
       await vi.advanceTimersByTimeAsync(180_001);
 
-      await expect(thrown).resolves.toMatchObject({
-        code: 'TIMEOUT',
-        txHash,
-      });
-      expect(populateTransaction).toHaveBeenCalledTimes(1);
-      expect((a as any).signPopulatedTransaction).toHaveBeenCalledTimes(1);
-      expect(provider.broadcastTransaction).toHaveBeenCalledWith(signedTx);
-      expect(provider.getTransactionReceipt).toHaveBeenCalled();
+      const timeoutErr = await thrown;
+      expect(timeoutErr).toMatchObject({ code: 'RPC_TIMEOUT', txHash });
+      // The production receipt-wait timeout emitter must throw a recognised
+      // chain-transport error (so the daemon maps it to 504), not a bare shape.
+      expect(isChainRpcTransportError(timeoutErr)).toBe(true);
+      expect(populateTransaction.calls).toHaveLength(1);
+      expect(signPopulatedTransaction.calls).toHaveLength(1);
+      expect(provider.broadcastTransaction.calls).toContainEqual([signedTx]);
+      expect(provider.getTransactionReceipt.calls.length).toBeGreaterThan(0);
     } finally {
       vi.useRealTimers();
     }
@@ -647,21 +946,21 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     const txHash = '0x' + '22'.repeat(32);
     const receipt = { hash: txHash, blockNumber: 46, status: 1, logs: [] };
     const primary = {
-      broadcastTransaction: vi.fn(async () => {
+      broadcastTransaction: recorder(async () => {
         throw new Error('already known');
       }),
-      getTransactionReceipt: vi.fn(async () => receipt),
+      getTransactionReceipt: recorder(async () => receipt),
     };
     const backup = {
-      broadcastTransaction: vi.fn(async () => ({ hash: txHash })),
-      getTransactionReceipt: vi.fn(async () => receipt),
+      broadcastTransaction: recorder(async () => ({ hash: txHash })),
+      getTransactionReceipt: recorder(async () => receipt),
     };
     (a as any).providers = [primary, backup];
 
     await expect((a as any).sendSignedTransactionAndWait(signedTx, txHash, 'unit write')).resolves.toBe(receipt);
-    expect(primary.broadcastTransaction).toHaveBeenCalledTimes(1);
-    expect(backup.broadcastTransaction).not.toHaveBeenCalled();
-    expect(primary.getTransactionReceipt).toHaveBeenCalledWith(txHash);
+    expect(primary.broadcastTransaction.calls).toHaveLength(1);
+    expect(backup.broadcastTransaction.calls).toEqual([]);
+    expect(primary.getTransactionReceipt.calls).toContainEqual([txHash]);
   });
 
   it('treats nonce-too-low transaction responses as accepted and polls receipts', async () => {
@@ -673,23 +972,23 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     const txHash = '0x' + '44'.repeat(32);
     const receipt = { hash: txHash, blockNumber: 48, status: 1, logs: [] };
     const primary = {
-      broadcastTransaction: vi.fn(async () => {
+      broadcastTransaction: recorder(async () => {
         const err = new Error('nonce too low');
         (err as any).code = 'NONCE_EXPIRED';
         throw err;
       }),
-      getTransactionReceipt: vi.fn(async () => receipt),
+      getTransactionReceipt: recorder(async () => receipt),
     };
     const backup = {
-      broadcastTransaction: vi.fn(async () => ({ hash: txHash })),
-      getTransactionReceipt: vi.fn(async () => receipt),
+      broadcastTransaction: recorder(async () => ({ hash: txHash })),
+      getTransactionReceipt: recorder(async () => receipt),
     };
     (a as any).providers = [primary, backup];
 
     await expect((a as any).sendSignedTransactionAndWait(signedTx, txHash, 'unit write')).resolves.toBe(receipt);
-    expect(primary.broadcastTransaction).toHaveBeenCalledTimes(1);
-    expect(backup.broadcastTransaction).not.toHaveBeenCalled();
-    expect(primary.getTransactionReceipt).toHaveBeenCalledWith(txHash);
+    expect(primary.broadcastTransaction.calls).toHaveLength(1);
+    expect(backup.broadcastTransaction.calls).toEqual([]);
+    expect(primary.getTransactionReceipt.calls).toContainEqual([txHash]);
   });
 
   it('throws CALL_EXCEPTION when a mined write receipt reverted', async () => {
@@ -701,12 +1000,12 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     const txHash = '0x' + '33'.repeat(32);
     const receipt = { hash: txHash, blockNumber: 47, status: 0, logs: [] };
     const primary = {
-      broadcastTransaction: vi.fn(async () => ({ hash: txHash })),
-      getTransactionReceipt: vi.fn(async () => receipt),
+      broadcastTransaction: recorder(async () => ({ hash: txHash })),
+      getTransactionReceipt: recorder(async () => receipt),
     };
     const backup = {
-      broadcastTransaction: vi.fn(async () => ({ hash: txHash })),
-      getTransactionReceipt: vi.fn(async () => receipt),
+      broadcastTransaction: recorder(async () => ({ hash: txHash })),
+      getTransactionReceipt: recorder(async () => receipt),
     };
     (a as any).providers = [primary, backup];
 
@@ -714,7 +1013,7 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
       code: 'CALL_EXCEPTION',
       receipt,
     });
-    expect(backup.getTransactionReceipt).not.toHaveBeenCalled();
+    expect(backup.getTransactionReceipt.calls).toEqual([]);
   });
 
   it('signMessage returns 32-byte r and vs (no contract init)', async () => {
@@ -729,12 +1028,12 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     const a = new EVMChainAdapter(minimalConfig({ additionalKeys: [OTHER_PK] }));
     const [firstAddress, secondAddress] = a.getSignerAddresses();
     (a as any).init = async () => undefined;
-    (a as any).contracts.contextGraphs = {
-      isAuthorizedPublisher: vi.fn(async () => {
+    (a as any).contracts.contextGraphs = connectable({
+      isAuthorizedPublisher: recorder(async () => {
         await Promise.resolve();
         return true;
       }),
-    };
+    });
 
     const [firstReserved, secondReserved] = await Promise.all([
       a.getAuthorizedPublisherAddress(1n),
@@ -991,7 +1290,7 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     vi.useFakeTimers();
     try {
       const a = new EVMChainAdapter(minimalConfig());
-      const probeCalls = vi.fn();
+      const probeCalls = recorder(() => undefined);
       const fakeRs = {
         getActiveProofPeriodStatus: async () => ({
           activeProofPeriodStartBlock: 7n,
@@ -1020,7 +1319,7 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
         expect(r.isValid).toBe(false);
         expect(r.proofingPeriodDurationInBlocks).toBeUndefined();
       }
-      expect(probeCalls).toHaveBeenCalledTimes(1);
+      expect(probeCalls.calls).toHaveLength(1);
     } finally {
       vi.useRealTimers();
     }
@@ -1039,7 +1338,7 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     vi.useFakeTimers();
     try {
       const a = new EVMChainAdapter(minimalConfig());
-      const probeCalls = vi.fn();
+      const probeCalls = recorder(() => undefined);
       const oldRs = {
         getActiveProofPeriodStatus: async () => ({
           activeProofPeriodStartBlock: 1n,
@@ -1059,14 +1358,14 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
       const first = a.getActiveProofPeriodStatus();
       await vi.advanceTimersByTimeAsync(2001);
       await first;
-      expect(probeCalls).toHaveBeenCalledTimes(1);
+      expect(probeCalls.calls).toHaveLength(1);
       // TTL refresh: re-resolve hands back a fresh Contract instance.
       (a as any).getRandomSampling = async () => ({ rs: refreshedRs, rss: {} });
       const second = a.getActiveProofPeriodStatus();
       await vi.advanceTimersByTimeAsync(2001);
       await second;
       // Contract identity changed → slot was dropped → fresh probe issued.
-      expect(probeCalls).toHaveBeenCalledTimes(2);
+      expect(probeCalls.calls).toHaveLength(2);
     } finally {
       vi.useRealTimers();
     }
@@ -1081,7 +1380,7 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     vi.useFakeTimers();
     try {
       const a = new EVMChainAdapter(minimalConfig());
-      const probeCalls = vi.fn();
+      const probeCalls = recorder(() => undefined);
       const fakeRs = {
         getActiveProofPeriodStatus: async () => ({
           activeProofPeriodStartBlock: 1n,
@@ -1097,14 +1396,14 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
       const first = a.getActiveProofPeriodStatus();
       await vi.advanceTimersByTimeAsync(2001);
       await first;
-      expect(probeCalls).toHaveBeenCalledTimes(1);
+      expect(probeCalls.calls).toHaveLength(1);
       // Fast-forward past MAX_PROBE_AGE_MS (30s).
       await vi.advanceTimersByTimeAsync(30_001);
       const second = a.getActiveProofPeriodStatus();
       await vi.advanceTimersByTimeAsync(2001);
       await second;
       // Slot was abandoned by the age guard, fresh probe was started.
-      expect(probeCalls).toHaveBeenCalledTimes(2);
+      expect(probeCalls.calls).toHaveLength(2);
     } finally {
       vi.useRealTimers();
     }
@@ -1122,7 +1421,7 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     vi.useFakeTimers();
     try {
       const a = new EVMChainAdapter(minimalConfig());
-      const probeCalls = vi.fn();
+      const probeCalls = recorder(() => undefined);
       const oldRs = {
         getActiveProofPeriodStatus: async () => ({
           activeProofPeriodStartBlock: 1n,
@@ -1148,7 +1447,7 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
       const stale = a.getActiveProofPeriodStatus();
       await vi.advanceTimersByTimeAsync(2001);
       await stale;
-      expect(probeCalls).toHaveBeenCalledTimes(1);
+      expect(probeCalls.calls).toHaveLength(1);
       // Simulate Hub rotation: invalidate the RS pair cache.
       (a as any).invalidateRandomSamplingPair();
       // Swap in the NEW contract for the next call.
@@ -1159,7 +1458,7 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
       expect(fresh.proofingPeriodDurationInBlocks).toBe(555n);
       // Probe must have run against the NEW contract — total
       // probeCalls is now 2 (old hung + new succeeded).
-      expect(probeCalls).toHaveBeenCalledTimes(2);
+      expect(probeCalls.calls).toHaveLength(2);
     } finally {
       vi.useRealTimers();
     }
@@ -1170,7 +1469,7 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     // be allowed to issue a new one — otherwise a single transient
     // failure would permanently disable the live duration read.
     const a = new EVMChainAdapter(minimalConfig());
-    const probeCalls = vi.fn();
+    const probeCalls = recorder(() => undefined);
     let attempt = 0;
     const fakeRs = {
       getActiveProofPeriodStatus: async () => ({
@@ -1192,7 +1491,7 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     await Promise.resolve();
     const second = await a.getActiveProofPeriodStatus();
     expect(second.proofingPeriodDurationInBlocks).toBe(77n);
-    expect(probeCalls).toHaveBeenCalledTimes(2);
+    expect(probeCalls.calls).toHaveLength(2);
   });
 
   it('coerces randomSamplingHubRefreshMs<=0 to the default TTL (no "disable refresh" mode)', () => {
@@ -1226,6 +1525,16 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
 describe('init() RPC-exhaustion bounding (perpetual 429)', () => {
   let server: Server | null = null;
   let url = '';
+  // Track every adapter the tests build so teardown can `destroy()` them. Under
+  // a perpetual 429 the provider keeps retrying with backoff on a keep-alive
+  // socket AFTER the call rejects; if we don't tear it down, that live
+  // connection keeps `server.close()` from ever invoking its callback, and the
+  // afterEach hook blows past vitest's 10s hook-timeout (the flaky CI failure).
+  const adapters: EVMChainAdapter[] = [];
+  function track(a: EVMChainAdapter): EVMChainAdapter {
+    adapters.push(a);
+    return a;
+  }
 
   async function startRateLimited429(): Promise<string> {
     server = createServer((_req, res) => {
@@ -1239,7 +1548,14 @@ describe('init() RPC-exhaustion bounding (perpetual 429)', () => {
   }
 
   afterEach(async () => {
+    // Stop ethers' background retry loop / idle sockets FIRST, then force-close
+    // any still-open connections, so `server.close()` resolves promptly instead
+    // of hanging on the provider's in-flight 429 retry.
+    for (const a of adapters.splice(0)) {
+      try { a.destroy(); } catch { /* destroy() is idempotent */ }
+    }
     if (server) {
+      server.closeAllConnections?.();
       await new Promise<void>((resolve) => server!.close(() => resolve()));
       server = null;
     }
@@ -1247,7 +1563,7 @@ describe('init() RPC-exhaustion bounding (perpetual 429)', () => {
 
   it('surfaces RPC_ENDPOINTS_EXHAUSTED from createOnChainContextGraph within a bounded time under a perpetually rate-limited RPC', async () => {
     url = await startRateLimited429();
-    const a = new EVMChainAdapter(minimalConfig({ rpcUrl: url, rpcUrls: [] }));
+    const a = track(new EVMChainAdapter(minimalConfig({ rpcUrl: url, rpcUrls: [] })));
 
     const start = Date.now();
     let thrown: any;
@@ -1285,7 +1601,7 @@ describe('init() RPC-exhaustion bounding (perpetual 429)', () => {
     const addr = server.address();
     if (!addr || typeof addr === 'string') throw new Error('mock RPC failed to bind');
     url = `http://127.0.0.1:${addr.port}`;
-    const a = new EVMChainAdapter(minimalConfig({ rpcUrl: url, rpcUrls: [] }));
+    const a = track(new EVMChainAdapter(minimalConfig({ rpcUrl: url, rpcUrls: [] })));
 
     // First read: exhaust + count its retries. >1 hit ⇒ it retried.
     hits = 0;
@@ -1309,20 +1625,24 @@ describe('PR3 / RC11 — publish-preflight TTL cache', () => {
 
   it('getEvmChainId issues exactly one provider.getNetwork call across repeat reads', async () => {
     const a = new EVMChainAdapter(minimalConfig());
-    const getNetwork = vi.fn(async () => ({ chainId: 31337n }));
-    (a as unknown as { provider: { getNetwork: () => Promise<{ chainId: bigint }> } }).provider = {
+    const getNetwork = recorder(async () => ({ chainId: 31337n }));
+    // R1/#1336: getEvmChainId now reads via readProvider (this.rpcFailover.read)
+    // over this.providers[] (was this.provider.getNetwork). Mock this.providers[0];
+    // the TTL-cache / dedup / no-cache-on-failure behaviour is unchanged (the
+    // cache wraps the read facade), so the assertions below are preserved verbatim.
+    (a as unknown as { providers: Array<{ getNetwork: () => Promise<{ chainId: bigint }> }> }).providers = [{
       getNetwork: getNetwork as unknown as () => Promise<{ chainId: bigint }>,
-    };
+    }];
 
     expect(await a.getEvmChainId()).toBe(31337n);
     expect(await a.getEvmChainId()).toBe(31337n);
     expect(await a.getEvmChainId()).toBe(31337n);
-    expect(getNetwork).toHaveBeenCalledTimes(1);
+    expect(getNetwork.calls).toHaveLength(1);
   });
 
   it('getKnowledgeAssetsLifecycleAddress caches the contract address across repeat reads', async () => {
     const a = new EVMChainAdapter(minimalConfig());
-    const getAddress = vi.fn(async () => '0xCONTRACT');
+    const getAddress = recorder(async () => '0xCONTRACT');
     (a as unknown as { init: () => Promise<void> }).init = async () => undefined;
     (a as unknown as { contracts: { knowledgeAssetsLifecycle: { getAddress: () => Promise<string> } } }).contracts = {
       knowledgeAssetsLifecycle: { getAddress: getAddress as unknown as () => Promise<string> },
@@ -1330,78 +1650,90 @@ describe('PR3 / RC11 — publish-preflight TTL cache', () => {
 
     expect(await a.getKnowledgeAssetsLifecycleAddress()).toBe('0xCONTRACT');
     expect(await a.getKnowledgeAssetsLifecycleAddress()).toBe('0xCONTRACT');
-    expect(getAddress).toHaveBeenCalledTimes(1);
+    expect(getAddress.calls).toHaveLength(1);
   });
 
   it('getMinimumRequiredSignatures caches across repeat reads', async () => {
     const a = new EVMChainAdapter(minimalConfig());
-    const minimumRequiredSignatures = vi.fn(async () => 3n);
+    const minimumRequiredSignatures = recorder(async () => 3n);
     (a as unknown as { init: () => Promise<void> }).init = async () => undefined;
     (a as unknown as { contracts: { parametersStorage: { minimumRequiredSignatures: () => Promise<bigint> } } }).contracts = {
-      parametersStorage: {
+      parametersStorage: connectable({
         minimumRequiredSignatures: minimumRequiredSignatures as unknown as () => Promise<bigint>,
-      },
+      }),
     };
 
     expect(await a.getMinimumRequiredSignatures()).toBe(3);
     expect(await a.getMinimumRequiredSignatures()).toBe(3);
     expect(await a.getMinimumRequiredSignatures()).toBe(3);
-    expect(minimumRequiredSignatures).toHaveBeenCalledTimes(1);
+    expect(minimumRequiredSignatures.calls).toHaveLength(1);
   });
 
   it('refreshes after the 1h TTL expires', async () => {
     vi.useFakeTimers({ now: 0 });
     const a = new EVMChainAdapter(minimalConfig());
     let returned = 31337n;
-    const getNetwork = vi.fn(async () => ({ chainId: returned }));
-    (a as unknown as { provider: { getNetwork: () => Promise<{ chainId: bigint }> } }).provider = {
+    const getNetwork = recorder(async () => ({ chainId: returned }));
+    // R1/#1336: getEvmChainId now reads via readProvider (this.rpcFailover.read)
+    // over this.providers[] (was this.provider.getNetwork). Mock this.providers[0];
+    // the TTL-cache / dedup / no-cache-on-failure behaviour is unchanged (the
+    // cache wraps the read facade), so the assertions below are preserved verbatim.
+    (a as unknown as { providers: Array<{ getNetwork: () => Promise<{ chainId: bigint }> }> }).providers = [{
       getNetwork: getNetwork as unknown as () => Promise<{ chainId: bigint }>,
-    };
+    }];
 
     expect(await a.getEvmChainId()).toBe(31337n);
-    expect(getNetwork).toHaveBeenCalledTimes(1);
+    expect(getNetwork.calls).toHaveLength(1);
 
     vi.setSystemTime(60 * 60 * 1000 - 1);
     expect(await a.getEvmChainId()).toBe(31337n);
-    expect(getNetwork).toHaveBeenCalledTimes(1);
+    expect(getNetwork.calls).toHaveLength(1);
 
     vi.setSystemTime(60 * 60 * 1000 + 1);
     returned = 84532n;
     expect(await a.getEvmChainId()).toBe(84532n);
-    expect(getNetwork).toHaveBeenCalledTimes(2);
+    expect(getNetwork.calls).toHaveLength(2);
   });
 
   it('invalidatePublishPreflightCache forces a fresh read on next call', async () => {
     const a = new EVMChainAdapter(minimalConfig());
-    const getNetwork = vi.fn(async () => ({ chainId: 31337n }));
-    (a as unknown as { provider: { getNetwork: () => Promise<{ chainId: bigint }> } }).provider = {
+    const getNetwork = recorder(async () => ({ chainId: 31337n }));
+    // R1/#1336: getEvmChainId now reads via readProvider (this.rpcFailover.read)
+    // over this.providers[] (was this.provider.getNetwork). Mock this.providers[0];
+    // the TTL-cache / dedup / no-cache-on-failure behaviour is unchanged (the
+    // cache wraps the read facade), so the assertions below are preserved verbatim.
+    (a as unknown as { providers: Array<{ getNetwork: () => Promise<{ chainId: bigint }> }> }).providers = [{
       getNetwork: getNetwork as unknown as () => Promise<{ chainId: bigint }>,
-    };
+    }];
 
     await a.getEvmChainId();
     await a.getEvmChainId();
-    expect(getNetwork).toHaveBeenCalledTimes(1);
+    expect(getNetwork.calls).toHaveLength(1);
     a.invalidatePublishPreflightCache();
     await a.getEvmChainId();
-    expect(getNetwork).toHaveBeenCalledTimes(2);
+    expect(getNetwork.calls).toHaveLength(2);
   });
 
   it('does NOT cache failures (next call retries the underlying read)', async () => {
     const a = new EVMChainAdapter(minimalConfig());
     let attempts = 0;
-    const getNetwork = vi.fn(async () => {
+    const getNetwork = recorder(async () => {
       attempts += 1;
       if (attempts === 1) throw new Error('rate limited');
       return { chainId: 31337n };
     });
-    (a as unknown as { provider: { getNetwork: () => Promise<{ chainId: bigint }> } }).provider = {
+    // R1/#1336: getEvmChainId now reads via readProvider (this.rpcFailover.read)
+    // over this.providers[] (was this.provider.getNetwork). Mock this.providers[0];
+    // the TTL-cache / dedup / no-cache-on-failure behaviour is unchanged (the
+    // cache wraps the read facade), so the assertions below are preserved verbatim.
+    (a as unknown as { providers: Array<{ getNetwork: () => Promise<{ chainId: bigint }> }> }).providers = [{
       getNetwork: getNetwork as unknown as () => Promise<{ chainId: bigint }>,
-    };
+    }];
 
     await expect(a.getEvmChainId()).rejects.toThrow('rate limited');
     // Second call should retry — failure was not memoised.
     expect(await a.getEvmChainId()).toBe(31337n);
-    expect(getNetwork).toHaveBeenCalledTimes(2);
+    expect(getNetwork.calls).toHaveLength(2);
   });
 });
 
@@ -1696,44 +2028,49 @@ describe('computeApprovalAction — invariants across all modes', () => {
 
 const V10_KA_ADDRESS = '0x' + 'aa'.repeat(20);
 
-function makeMockToken(allowance: bigint) {
-  const tokenWithSigner = {
-    allowance: vi.fn(async () => allowance),
-    // `approve` is invoked through the adapter's `sendContractTransaction`
-    // (which is stubbed below), so the mock just needs to exist for any
-    // future code path that probes it.
-    approve: vi.fn(),
-  };
+// The bound token contract is a DI seam: the publish/update gate reads its
+// `allowance(...)` and connects it to the signer. `approve` itself goes through
+// the (stubbed) `sendContractTransaction`, so the recorder just needs to exist.
+function makeStubToken(allowance: bigint) {
+  // tokenWithSigner is read via readContract (this.rpcFailover.readContract)
+  // after token→signer rebind, so it too must be .connect-able (self no-op rebind).
+  const tokenWithSigner = connectable({
+    allowance: recorder(async (..._a: unknown[]) => allowance),
+    approve: recorder(() => undefined),
+  });
   const tokenRoot = {
-    connect: vi.fn(() => tokenWithSigner),
+    connect: recorder((..._a: unknown[]) => tokenWithSigner),
   };
   return { tokenRoot, tokenWithSigner };
 }
 
 function makeV10Adapter(approvalPolicy?: ApprovalPolicy, allowance: bigint = 0n) {
   const a = new EVMChainAdapter(minimalConfig({ approvalPolicy }));
-  const { tokenRoot, tokenWithSigner } = makeMockToken(allowance);
+  const { tokenRoot, tokenWithSigner } = makeStubToken(allowance);
   (a as any).contracts.token = tokenRoot;
-  const sendSpy = vi.fn(async () => ({} as unknown));
+  const sendSpy = recorder(async (..._a: unknown[]) => ({} as unknown));
   (a as any).sendContractTransaction = sendSpy;
   const signer = new ethers.Wallet(DEPLOYER_PK);
   return { a, signer, tokenRoot, tokenWithSigner, sendSpy };
 }
 
-function getApproveCallArgs(sendSpy: ReturnType<typeof vi.fn>): {
+type SendRecorder = { calls: unknown[][] };
+
+function getApproveCallArgs(sendSpy: SendRecorder): {
   contract: unknown;
   method: string;
   args: readonly unknown[];
   signer: unknown;
   label: string;
 } {
-  expect(sendSpy).toHaveBeenCalledTimes(1);
-  const [contract, method, args, signerArg, label] = sendSpy.mock.calls[0];
+  expect(sendSpy.calls).toHaveLength(1);
+  const [contract, method, args, signerArg, label] = sendSpy.calls[0] as [
+    unknown, string, readonly unknown[], unknown, string,
+  ];
   return { contract, method, args, signer: signerArg, label };
 }
 
 describe('ensureV10ApproveTrac — per-publish (default) approval gate', () => {
-  afterEach(() => { vi.restoreAllMocks(); });
 
   it('zero-cost publish on a fresh wallet → approves the 1n floor (#720 mainnet revert fix)', async () => {
     // The exact scenario that reverted on mainnet pre-#720: a publish with
@@ -1750,8 +2087,8 @@ describe('ensureV10ApproveTrac — per-publish (default) approval gate', () => {
       'approve V10 publish TRAC',
     );
 
-    expect(tokenWithSigner.allowance).toHaveBeenCalledTimes(1);
-    expect(tokenWithSigner.allowance).toHaveBeenCalledWith(signer.address, V10_KA_ADDRESS);
+    expect(tokenWithSigner.allowance.calls).toHaveLength(1);
+    expect(tokenWithSigner.allowance.calls.at(-1)).toEqual([signer.address, V10_KA_ADDRESS]);
 
     const call = getApproveCallArgs(sendSpy);
     expect(call.method).toBe('approve');
@@ -1774,8 +2111,8 @@ describe('ensureV10ApproveTrac — per-publish (default) approval gate', () => {
       'approve V10 update TRAC',
     );
 
-    expect(tokenWithSigner.allowance).toHaveBeenCalledTimes(1);
-    expect(sendSpy).not.toHaveBeenCalled();
+    expect(tokenWithSigner.allowance.calls).toHaveLength(1);
+    expect(sendSpy.calls).toEqual([]);
   });
 
   it('zero-cost publish with comfortable leftover allowance → NO approve', async () => {
@@ -1791,7 +2128,7 @@ describe('ensureV10ApproveTrac — per-publish (default) approval gate', () => {
       'approve V10 publish TRAC',
     );
 
-    expect(sendSpy).not.toHaveBeenCalled();
+    expect(sendSpy.calls).toEqual([]);
   });
 
   it('positive tokenAmount with empty allowance → approve(tokenAmount)', async () => {
@@ -1840,7 +2177,7 @@ describe('ensureV10ApproveTrac — per-publish (default) approval gate', () => {
       'approve V10 publish TRAC',
     );
 
-    expect(sendSpy).not.toHaveBeenCalled();
+    expect(sendSpy.calls).toEqual([]);
   });
 
   it('positive tokenAmount with allowance exactly matching → NO approve (boundary case)', async () => {
@@ -1853,7 +2190,7 @@ describe('ensureV10ApproveTrac — per-publish (default) approval gate', () => {
       'approve V10 publish TRAC',
     );
 
-    expect(sendSpy).not.toHaveBeenCalled();
+    expect(sendSpy.calls).toEqual([]);
   });
 
   it('read-only adapter (no token contract bound) → no-op, no allowance read, no approve', async () => {
@@ -1861,7 +2198,7 @@ describe('ensureV10ApproveTrac — per-publish (default) approval gate', () => {
     // contract. The gate must be a clean no-op there — not throw on
     // `this.contracts.token.connect(...)`.
     const a = new EVMChainAdapter(minimalConfig());
-    const sendSpy = vi.fn(async () => ({} as unknown));
+    const sendSpy = recorder(async (..._a: unknown[]) => ({} as unknown));
     (a as any).sendContractTransaction = sendSpy;
     (a as any).contracts.token = undefined;
     const signer = new ethers.Wallet(DEPLOYER_PK);
@@ -1873,7 +2210,7 @@ describe('ensureV10ApproveTrac — per-publish (default) approval gate', () => {
       'approve V10 publish TRAC',
     )).resolves.toBeUndefined();
 
-    expect(sendSpy).not.toHaveBeenCalled();
+    expect(sendSpy.calls).toEqual([]);
   });
 
   it('zero-cost publish (#720 floor kicked in) → emits the operator-facing warn', async () => {
@@ -1882,26 +2219,32 @@ describe('ensureV10ApproveTrac — per-publish (default) approval gate', () => {
     // `console.warn` so operators inspecting on-chain allowance can
     // recognise the resulting "1 wei dust" as the documented #720
     // workaround instead of mistaking it for a stuck approval.
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const { a, signer, sendSpy } = makeV10Adapter(undefined, 0n);
+    const origWarn = console.warn;
+    const warnSpy = recorder((..._a: unknown[]) => undefined);
+    console.warn = warnSpy as unknown as typeof console.warn;
+    try {
+      const { a, signer, sendSpy } = makeV10Adapter(undefined, 0n);
 
-    await (a as any).ensureV10ApproveTrac(
-      signer,
-      V10_KA_ADDRESS,
-      0n,
-      'approve V10 publish TRAC',
-    );
+      await (a as any).ensureV10ApproveTrac(
+        signer,
+        V10_KA_ADDRESS,
+        0n,
+        'approve V10 publish TRAC',
+      );
 
-    // Approve still fires (behaviour unchanged).
-    expect(sendSpy).toHaveBeenCalledTimes(1);
-    expect(getApproveCallArgs(sendSpy).args).toEqual([V10_KA_ADDRESS, 1n]);
+      // Approve still fires (behaviour unchanged).
+      expect(sendSpy.calls).toHaveLength(1);
+      expect(getApproveCallArgs(sendSpy).args).toEqual([V10_KA_ADDRESS, 1n]);
 
-    // And the diagnostic warn fires exactly once with the expected wording.
-    expect(warnSpy).toHaveBeenCalledTimes(1);
-    const message = warnSpy.mock.calls[0][0] as string;
-    expect(message).toContain('V10 per-publish auto-approve floor');
-    expect(message).toContain('#720 transferFrom-minimum workaround');
-    expect(message).toContain('tokenAmount=0');
+      // And the diagnostic warn fires exactly once with the expected wording.
+      expect(warnSpy.calls).toHaveLength(1);
+      const message = warnSpy.calls[0][0] as string;
+      expect(message).toContain('V10 per-publish auto-approve floor');
+      expect(message).toContain('#720 transferFrom-minimum workaround');
+      expect(message).toContain('tokenAmount=0');
+    } finally {
+      console.warn = origWarn;
+    }
   });
 
   it('legitimate 1-wei publish → approves 1n WITHOUT emitting the #720 warn (Codex on PR #875)', async () => {
@@ -1911,28 +2254,33 @@ describe('ensureV10ApproveTrac — per-publish (default) approval gate', () => {
     // The warn line would mislead operators if it fired here, so the
     // guard requires `tokenAmount === 0n` in addition to the
     // `targetAllowance === 1n` check.
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const { a, signer, sendSpy } = makeV10Adapter(undefined, 0n);
+    const origWarn = console.warn;
+    const warnSpy = recorder((..._a: unknown[]) => undefined);
+    console.warn = warnSpy as unknown as typeof console.warn;
+    try {
+      const { a, signer, sendSpy } = makeV10Adapter(undefined, 0n);
 
-    await (a as any).ensureV10ApproveTrac(
-      signer,
-      V10_KA_ADDRESS,
-      1n,
-      'approve V10 publish TRAC',
-    );
+      await (a as any).ensureV10ApproveTrac(
+        signer,
+        V10_KA_ADDRESS,
+        1n,
+        'approve V10 publish TRAC',
+      );
 
-    // Approve still fires for the genuine 1-wei publish.
-    expect(sendSpy).toHaveBeenCalledTimes(1);
-    expect(getApproveCallArgs(sendSpy).args).toEqual([V10_KA_ADDRESS, 1n]);
+      // Approve still fires for the genuine 1-wei publish.
+      expect(sendSpy.calls).toHaveLength(1);
+      expect(getApproveCallArgs(sendSpy).args).toEqual([V10_KA_ADDRESS, 1n]);
 
-    // But the floor-workaround warn must NOT fire (it would be a false
-    // positive — see PR #875 review thread).
-    expect(warnSpy).not.toHaveBeenCalled();
+      // But the floor-workaround warn must NOT fire (it would be a false
+      // positive — see PR #875 review thread).
+      expect(warnSpy.calls).toEqual([]);
+    } finally {
+      console.warn = origWarn;
+    }
   });
 });
 
 describe('ensureV10ApproveTrac — replenishing policy (high-volume operator default)', () => {
-  afterEach(() => { vi.restoreAllMocks(); });
 
   it('approves the default 1000 TRAC ceiling on a fresh wallet', async () => {
     const { a, signer, sendSpy } = makeV10Adapter(
@@ -1968,7 +2316,7 @@ describe('ensureV10ApproveTrac — replenishing policy (high-volume operator def
       'approve V10 publish TRAC',
     );
 
-    expect(sendSpy).not.toHaveBeenCalled();
+    expect(sendSpy.calls).toEqual([]);
   });
 
   it('refills back to target when allowance drops below the refill threshold', async () => {
@@ -2009,13 +2357,12 @@ describe('ensureV10ApproveTrac — replenishing policy (high-volume operator def
     {
       const { a, signer, sendSpy } = makeV10Adapter(policy, 100n);
       await (a as any).ensureV10ApproveTrac(signer, V10_KA_ADDRESS, 0n, 'approve V10 publish TRAC');
-      expect(sendSpy).not.toHaveBeenCalled();
+      expect(sendSpy.calls).toEqual([]);
     }
   });
 });
 
 describe('ensureV10ApproveTrac — unlimited policy (V9 pattern)', () => {
-  afterEach(() => { vi.restoreAllMocks(); });
 
   it('approves MaxUint256 once on a fresh wallet', async () => {
     const { a, signer, sendSpy } = makeV10Adapter(
@@ -2050,7 +2397,7 @@ describe('ensureV10ApproveTrac — unlimited policy (V9 pattern)', () => {
       'approve V10 publish TRAC',
     );
 
-    expect(sendSpy).not.toHaveBeenCalled();
+    expect(sendSpy.calls).toEqual([]);
   });
 
   it('skips re-approve once current >= publish floor (defensive — partial residual allowance from another policy)', async () => {
@@ -2070,7 +2417,7 @@ describe('ensureV10ApproveTrac — unlimited policy (V9 pattern)', () => {
       'approve V10 publish TRAC',
     );
 
-    expect(sendSpy).not.toHaveBeenCalled();
+    expect(sendSpy.calls).toEqual([]);
   });
 
   it('still re-approves MaxUint256 if an external actor revoked allowance to 0', async () => {
@@ -2095,18 +2442,17 @@ describe('ensureV10ApproveTrac — unlimited policy (V9 pattern)', () => {
 });
 
 describe('ensureV10ApproveTrac — call-site invariants (publish vs update)', () => {
-  afterEach(() => { vi.restoreAllMocks(); });
 
   it('passes the publish label through verbatim (so on-chain tracing distinguishes publish from update)', async () => {
     const { a, signer, sendSpy } = makeV10Adapter(undefined, 0n);
     await (a as any).ensureV10ApproveTrac(signer, V10_KA_ADDRESS, 0n, 'approve V10 publish TRAC');
-    expect(sendSpy.mock.calls[0][4]).toBe('approve V10 publish TRAC');
+    expect(sendSpy.calls[0][4]).toBe('approve V10 publish TRAC');
   });
 
   it('passes the update label through verbatim', async () => {
     const { a, signer, sendSpy } = makeV10Adapter(undefined, 0n);
     await (a as any).ensureV10ApproveTrac(signer, V10_KA_ADDRESS, 0n, 'approve V10 update TRAC');
-    expect(sendSpy.mock.calls[0][4]).toBe('approve V10 update TRAC');
+    expect(sendSpy.calls[0][4]).toBe('approve V10 update TRAC');
   });
 
   it('connects the bound token contract to the operational signer (not the admin signer)', async () => {
@@ -2122,8 +2468,8 @@ describe('ensureV10ApproveTrac — call-site invariants (publish vs update)', ()
       'approve V10 publish TRAC',
     );
 
-    expect(tokenRoot.connect).toHaveBeenCalledTimes(1);
-    expect(tokenRoot.connect).toHaveBeenCalledWith(signer);
+    expect(tokenRoot.connect.calls).toHaveLength(1);
+    expect(tokenRoot.connect.calls.at(-1)).toEqual([signer]);
   });
 
   it('reads allowance against the passed-in KA address (not a globally cached one)', async () => {
@@ -2139,7 +2485,7 @@ describe('ensureV10ApproveTrac — call-site invariants (publish vs update)', ()
       'approve V10 publish TRAC',
     );
 
-    expect(tokenWithSigner.allowance).toHaveBeenCalledWith(signer.address, otherKa);
+    expect(tokenWithSigner.allowance.calls).toContainEqual([signer.address, otherKa]);
   });
 
   it('propagates approve failures to the caller (so publish/update aborts cleanly)', async () => {
@@ -2148,9 +2494,9 @@ describe('ensureV10ApproveTrac — call-site invariants (publish vs update)', ()
     // lead to a downstream `publishV10` that reverts deep in the
     // contract's `transferFrom`.
     const a = new EVMChainAdapter(minimalConfig());
-    const { tokenRoot } = makeMockToken(0n);
+    const { tokenRoot } = makeStubToken(0n);
     (a as any).contracts.token = tokenRoot;
-    (a as any).sendContractTransaction = vi.fn(async () => {
+    (a as any).sendContractTransaction = recorder(async () => {
       throw new Error('approve broadcast failed');
     });
     const signer = new ethers.Wallet(DEPLOYER_PK);
@@ -2178,7 +2524,7 @@ describe('ensureV10ApproveTrac — call-site invariants (publish vs update)', ()
       'approve V10 publish TRAC',
     );
 
-    expect(sendSpy).not.toHaveBeenCalled();
+    expect(sendSpy.calls).toEqual([]);
   });
 });
 
@@ -2202,7 +2548,6 @@ describe('ensureV10ApproveTrac — call-site invariants (publish vs update)', ()
 // -----------------------------------------------------------------------------
 
 describe('createKnowledgeAssets / updateKnowledgeCollectionV10 — approval signer parity (#870)', () => {
-  afterEach(() => { vi.restoreAllMocks(); });
 
   const PARITY_KA_ADDRESS = '0x' + 'cd'.repeat(20);
 
@@ -2210,55 +2555,87 @@ describe('createKnowledgeAssets / updateKnowledgeCollectionV10 — approval sign
     return new Map<string, bigint>();
   }
 
-  function makeMultiWalletV10Adapter(allowanceByOwner: Map<string, bigint>) {
+  const ABUNDANT_WEI = 10n ** 18n;
+
+  // Hardhat account #3 — a third distinct operational key for pool-rotation tests.
+  const THIRD_PK = '0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6';
+
+  function makeMultiWalletV10Adapter(
+    allowanceByOwner: Map<string, bigint>,
+    funding?: { native?: Map<string, bigint>; trac?: Map<string, bigint> },
+    extraOperationalKeys: string[] = [],
+    configOverrides: Partial<EVMAdapterConfig> = {},
+  ) {
     const a = new EVMChainAdapter(minimalConfig({
       privateKey: DEPLOYER_PK,
-      additionalKeys: [OTHER_PK],
+      additionalKeys: [OTHER_PK, ...extraOperationalKeys],
+      ...configOverrides,
     }));
-    const [walletA, walletB] = (a as any).signerPool as [ethers.Wallet, ethers.Wallet];
+    const signerPool = (a as any).signerPool as ethers.Wallet[];
+    const [walletA, walletB] = signerPool;
 
     (a as any).initialized = true;
 
-    const tokenWithSigner = {
-      allowance: vi.fn(async (owner: string, _spender: string) => {
+    // Funding-aware selection reads native (provider.getBalance) + TRAC
+    // (token.balanceOf) for each candidate. Stub both deterministically —
+    // default ABUNDANT so funding-aware selection is a no-op (round-robin)
+    // unless a test sets specific per-wallet balances. Without these stubs the
+    // adapter would hit the dead test RPC (slow) and rely on fail-open.
+    const nativeByAddr = funding?.native ?? new Map<string, bigint>();
+    const tracByAddr = funding?.trac ?? new Map<string, bigint>();
+    (a as any).provider.getBalance = recorder(async (addr: string) =>
+      nativeByAddr.get(String(addr).toLowerCase()) ?? ABUNDANT_WEI);
+
+    // R1/#1336: readTracBalance now reads via readContractWith (failOpenFundingRead
+    // policy) → rebindContract does `token.connect(p).balanceOf(addr)`, so the
+    // CONNECTED contract (what token.connect returns) must expose balanceOf — not
+    // just the top-level token. (Native getBalance still works: the helper mutates
+    // this.provider.getBalance and this.provider === this.providers[0], so the
+    // shared object is what the read facade reads.)
+    const balanceOf = recorder(async (addr: string) =>
+      tracByAddr.get(String(addr).toLowerCase()) ?? ABUNDANT_WEI);
+    const tokenWithSigner = connectable({
+      allowance: recorder(async (owner: string, _spender: string) => {
         return allowanceByOwner.get(owner.toLowerCase()) ?? 0n;
       }),
-      approve: vi.fn(),
-    };
+      approve: recorder(() => undefined),
+      balanceOf,
+    });
     (a as any).contracts.token = {
-      connect: vi.fn(() => tokenWithSigner),
+      connect: recorder(() => tokenWithSigner),
+      balanceOf, // kept for any direct (non-connected) top-level reader
     };
 
-    const populateSpy = vi.fn(async () => ({
+    const populateSpy = recorder(async () => ({
       to: PARITY_KA_ADDRESS,
       data: '0xdeadbeef',
     }));
-    const kavContract = {
-      getAddress: vi.fn(async () => PARITY_KA_ADDRESS),
+    const kavContract = connectable({
+      getAddress: recorder(async () => PARITY_KA_ADDRESS),
       publish: { populateTransaction: populateSpy },
       update: { populateTransaction: populateSpy },
-    };
+    });
     (a as any).contracts.knowledgeAssetsLifecycle = {
-      connect: vi.fn(() => kavContract),
-      getAddress: vi.fn(async () => PARITY_KA_ADDRESS),
+      connect: recorder(() => kavContract),
+      getAddress: recorder(async () => PARITY_KA_ADDRESS),
     };
 
-    (a as any).contracts.contextGraphs = {
-      isAuthorizedPublisher: vi.fn(async () => true),
-    };
+    (a as any).contracts.contextGraphs = connectable({
+      isAuthorizedPublisher: recorder(async () => true),
+    });
 
-    const sendSpy = vi.fn(async () => ({} as unknown));
+    const sendSpy = recorder(async (..._a: unknown[]) => ({} as unknown));
     (a as any).sendContractTransaction = sendSpy;
 
     // Stop the publish/update flow right after the approval gate by throwing
     // a sentinel at the signing step. We only need to observe the signer
     // arguments at `ensureV10ApproveTrac` and `signPopulatedTransaction`.
-    const signSpy = vi.fn(async () => {
+    const signSpy = recorder(async (..._a: unknown[]) => {
       throw new Error('SENTINEL_STOP_AFTER_APPROVE');
     });
     (a as any).signPopulatedTransaction = signSpy;
 
-    return { a, walletA, walletB, tokenWithSigner, sendSpy, signSpy, populateSpy };
+    return { a, walletA, walletB, wallets: signerPool, tokenWithSigner, sendSpy, signSpy, populateSpy, nativeByAddr, tracByAddr };
   }
 
   function makeV10PublishParams(publisherAddress?: string): any {
@@ -2317,23 +2694,27 @@ describe('createKnowledgeAssets / updateKnowledgeCollectionV10 — approval sign
       a.createKnowledgeAssets(makeV10PublishParams(walletB.address)),
     ).rejects.toThrow('SENTINEL_STOP_AFTER_APPROVE');
 
-    expect(tokenWithSigner.allowance).toHaveBeenCalledWith(
+    expect(tokenWithSigner.allowance.calls).toContainEqual([
       walletB.address,
       PARITY_KA_ADDRESS,
-    );
-    expect(tokenWithSigner.allowance).not.toHaveBeenCalledWith(
+    ]);
+    expect(tokenWithSigner.allowance.calls).not.toContainEqual([
       walletA.address,
       PARITY_KA_ADDRESS,
-    );
+    ]);
 
-    expect(sendSpy).toHaveBeenCalledTimes(1);
-    const [, approveMethod, approveArgs, approveSender] = sendSpy.mock.calls[0];
+    expect(sendSpy.calls).toHaveLength(1);
+    const [, approveMethod, approveArgs, approveSender] = sendSpy.calls[0];
     expect(approveMethod).toBe('approve');
     expect(approveArgs).toEqual([PARITY_KA_ADDRESS, 1n]);
     expect(approveSender).toBe(walletB);
 
-    expect(signSpy).toHaveBeenCalledTimes(1);
-    expect(signSpy.mock.calls[0][0]).toBe(walletB);
+    expect(signSpy.calls).toHaveLength(1);
+    // R1/OBS-1: populateAndSignAcrossProviders signs on the per-provider runner
+    // (signer.connect(providers[i])) — same key/ADDRESS as walletB, new object.
+    // Assert the signer ADDRESS, not object identity (#870 "publish signed by
+    // walletB, no mid-flight rotation" invariant is preserved).
+    expect((signSpy.calls[0][0] as ethers.Wallet).address).toBe(walletB.address);
   });
 
   it('publish path: when publisherAddress is omitted, round-robin signer is also the approve signer (no mid-flight rotation)', async () => {
@@ -2351,15 +2732,16 @@ describe('createKnowledgeAssets / updateKnowledgeCollectionV10 — approval sign
       a.createKnowledgeAssets(makeV10PublishParams()),
     ).rejects.toThrow('SENTINEL_STOP_AFTER_APPROVE');
 
-    expect(tokenWithSigner.allowance).toHaveBeenCalledWith(
+    expect(tokenWithSigner.allowance.calls).toContainEqual([
       walletA.address,
       PARITY_KA_ADDRESS,
-    );
-    const [, approveMethod, approveArgs, approveSender] = sendSpy.mock.calls[0];
+    ]);
+    const [, approveMethod, approveArgs, approveSender] = sendSpy.calls[0];
     expect(approveMethod).toBe('approve');
     expect(approveArgs).toEqual([PARITY_KA_ADDRESS, 1n]);
     expect(approveSender).toBe(walletA);
-    expect(signSpy.mock.calls[0][0]).toBe(walletA);
+    // R1/OBS-1: signer reconnected per-provider — assert ADDRESS not identity.
+    expect((signSpy.calls[0][0] as ethers.Wallet).address).toBe(walletA.address);
   });
 
   it('update path: approve fires from the on-chain publisher wallet, NOT a round-robin pick from the pool', async () => {
@@ -2378,23 +2760,25 @@ describe('createKnowledgeAssets / updateKnowledgeCollectionV10 — approval sign
     allowanceByOwner.set(walletA.address.toLowerCase(), 10n * 10n ** 18n);
     allowanceByOwner.set(walletB.address.toLowerCase(), 0n);
 
-    // Mocks the update path needs in addition to the publish ones.
+    // Injected DI seams the update path needs in addition to the publish ones.
     const kaId = 42n;
-    (a as any).contracts.knowledgeAssetStorage = {
-      getLatestMerkleRootPublisher: vi.fn(async () => walletB.address),
-      getMerkleRoots: vi.fn(async () => []),
-    };
-    (a as any).contracts.contextGraphStorage = {
-      kaToContextGraph: vi.fn(async () => 0n),
-    };
-    (a as any).resolveCurrentTokenAmount = vi.fn(async () => 0n);
-    (a as any).computeUpdateNewTokenAmount = vi.fn(async () => 0n);
-    (a as any).getIdentityId = vi.fn(async () => 0n);
-    // `provider.getNetwork()` is called for chainId; stub it so the update
-    // path doesn't try to hit the placeholder RPC.
-    (a as any).provider = {
-      getNetwork: vi.fn(async () => ({ chainId: 31337n })),
-    };
+    (a as any).contracts.knowledgeAssetStorage = connectable({
+      getLatestMerkleRootPublisher: recorder(async () => walletB.address),
+      getMerkleRoots: recorder(async () => []),
+    });
+    (a as any).contracts.contextGraphStorage = connectable({
+      kaToContextGraph: recorder(async () => 0n),
+    });
+    (a as any).resolveCurrentTokenAmount = recorder(async () => 0n);
+    (a as any).computeUpdateNewTokenAmount = recorder(async () => 0n);
+    (a as any).getIdentityId = recorder(async () => 0n);
+    // `provider.getNetwork()` is called for chainId; stub it so the update path
+    // doesn't hit the placeholder RPC. R1/#1336: getEvmChainId reads via
+    // readProvider over this.providers[0] (=== this.provider), so MUTATE
+    // getNetwork on the shared object — REPLACING this.provider would orphan
+    // this.providers[0] (and the helper's getBalance mock) and the read would
+    // dial the dead RPC instead.
+    (a as any).provider.getNetwork = recorder(async () => ({ chainId: 31337n }));
 
     const updateParams: any = {
       kaId,
@@ -2420,26 +2804,409 @@ describe('createKnowledgeAssets / updateKnowledgeCollectionV10 — approval sign
       a.updateKnowledgeCollectionV10(updateParams),
     ).rejects.toThrow('SENTINEL_STOP_AFTER_APPROVE');
 
-    expect(tokenWithSigner.allowance).toHaveBeenCalledWith(
+    expect(tokenWithSigner.allowance.calls).toContainEqual([
       walletB.address,
       PARITY_KA_ADDRESS,
-    );
-    expect(tokenWithSigner.allowance).not.toHaveBeenCalledWith(
+    ]);
+    expect(tokenWithSigner.allowance.calls).not.toContainEqual([
       walletA.address,
       PARITY_KA_ADDRESS,
-    );
+    ]);
 
-    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(sendSpy.calls).toHaveLength(1);
     const [, approveMethod, approveArgs, approveSender, approveLabel] =
-      sendSpy.mock.calls[0];
+      sendSpy.calls[0];
     expect(approveMethod).toBe('approve');
     expect(approveArgs).toEqual([PARITY_KA_ADDRESS, 1n]);
     expect(approveSender).toBe(walletB);
     expect(approveLabel).toBe('approve V10 update TRAC');
 
-    expect(signSpy).toHaveBeenCalledTimes(1);
-    expect(signSpy.mock.calls[0][0]).toBe(walletB);
+    expect(signSpy.calls).toHaveLength(1);
+    // R1/OBS-1: populateAndSignAcrossProviders signs on the per-provider runner
+    // (signer.connect(providers[i])) — same key/ADDRESS as walletB, new object.
+    // Assert the signer ADDRESS, not object identity (#870 "publish signed by
+    // walletB, no mid-flight rotation" invariant is preserved).
+    expect((signSpy.calls[0][0] as ethers.Wallet).address).toBe(walletB.address);
   });
+
+// -----------------------------------------------------------------------------
+// Funding-aware publish wallet selection. `nextAuthorizedSigner` must PREFER an
+// authorized wallet that holds native gas AND TRAC, so a publish is never
+// routed to an authorized-but-empty wallet (the unfunded-wallet publish
+// failure). Selection only PREFERS — when none is fundable it falls back to the
+// best-funded wallet, and the publish then surfaces an actionable
+// InsufficientPublisherFundsError instead of a raw "insufficient funds" string.
+// -----------------------------------------------------------------------------
+describe('createKnowledgeAssets — funding-aware wallet selection', () => {
+  const CG = 7n;
+  const lc = (addr: string) => addr.toLowerCase();
+  const ONE = 10n ** 18n;
+
+  it('prefers a funded authorized wallet over an unfunded one (skips the empty round-robin head)', async () => {
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    // walletA (round-robin head) has gas but ZERO TRAC; walletB is funded.
+    nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);
+    tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), ONE);
+    const chosen = await (a as any).nextAuthorizedSigner(CG);
+    expect(chosen.address).toBe(walletB.address);
+  });
+
+  it('rotates among multiple funded wallets (preserves cross-wallet nonce concurrency)', async () => {
+    const { a, walletA, walletB } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    // Both abundantly funded (helper default) → behaves like plain round-robin.
+    const first = await (a as any).nextAuthorizedSigner(CG);
+    const second = await (a as any).nextAuthorizedSigner(CG);
+    expect(first.address).toBe(walletA.address);
+    expect(second.address).toBe(walletB.address);
+    expect(first.address).not.toBe(second.address);
+  });
+
+  it('falls back to the best-funded authorized wallet when none is fundable', async () => {
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    // Neither fundable (both have 0 gas); walletB holds more TRAC → best-funded.
+    nativeByAddr.set(lc(walletA.address), 0n); nativeByAddr.set(lc(walletB.address), 0n);
+    tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), 5n);
+    const chosen = await (a as any).nextAuthorizedSigner(CG);
+    expect(chosen.address).toBe(walletB.address);
+  });
+
+  it('fails open: a balance-read error never blocks selection (returns the round-robin head)', async () => {
+    const { a, walletA } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    (a as any).provider.getBalance = recorder(async () => { throw new Error('rpc down'); });
+    const chosen = await (a as any).nextAuthorizedSigner(CG);
+    expect(chosen.address).toBe(walletA.address);
+  });
+
+  it('no token contract: only native gas gates selection', async () => {
+    const { a, walletA, walletB, nativeByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    nativeByAddr.set(lc(walletA.address), 0n); nativeByAddr.set(lc(walletB.address), ONE);
+    (a as any).contracts.token = undefined; // read-only / no-token adapter
+    const chosen = await (a as any).nextAuthorizedSigner(CG);
+    // walletA has 0 gas → skipped; walletB has gas → chosen (TRAC not gating).
+    expect(chosen.address).toBe(walletB.address);
+  });
+
+  it('treats a covering PCA agent wallet (zero own-TRAC) as fundable, preferring it over the unfundable round-robin head', async () => {
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    // walletA (head): gas, ZERO own-TRAC, NOT a PCA agent → unfundable.
+    // walletB: gas, ZERO own-TRAC, but a registered+covering PCA agent → its
+    // publish is paid from the conviction account, so it IS fundable.
+    nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);
+    tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), 0n);
+    (a as any).contracts.dkgPublishingConvictionNFT = {}; // PCA NFT deployed
+    (a as any).getConvictionAgentAccountId = recorder(async (addr: string) =>
+      addr.toLowerCase() === lc(walletB.address) ? 7n : 0n);
+    (a as any).convictionAccountCanCover = recorder(async () => true);
+    const chosen = await (a as any).nextAuthorizedSigner(CG);
+    expect(chosen.address).toBe(walletB.address); // chosen ONLY via the PCA fallback
+  });
+
+  it('does NOT treat a non-covering (squat) PCA agent wallet as fundable', async () => {
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    // walletA (head): gas, ZERO own-TRAC, registered PCA but CANNOT cover (squat).
+    // walletB: gas + own-TRAC → genuinely fundable.
+    nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);
+    tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), ONE);
+    (a as any).contracts.dkgPublishingConvictionNFT = {};
+    (a as any).getConvictionAgentAccountId = recorder(async () => 9n); // registered
+    (a as any).convictionAccountCanCover = recorder(async () => false); // but can't cover
+    const chosen = await (a as any).nextAuthorizedSigner(CG);
+    expect(chosen.address).toBe(walletB.address); // squat PCA head skipped for the funded wallet
+  });
+
+  it('still throws "no authorized publisher" when no wallet is authorized (unchanged)', async () => {
+    const { a } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    (a as any).contracts.contextGraphs = connectable({ isAuthorizedPublisher: recorder(async () => false) });
+    await expect((a as any).nextAuthorizedSigner(CG)).rejects.toThrow(/No authorized publisher wallet/);
+  });
+
+  it('wraps an insufficient-funds publish failure into an actionable InsufficientPublisherFundsError listing per-wallet balances', async () => {
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    nativeByAddr.set(lc(walletA.address), 0n); nativeByAddr.set(lc(walletB.address), 0n);
+    tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), 0n);
+    // The signing step throws an ethers-style INSUFFICIENT_FUNDS error.
+    (a as any).signPopulatedTransaction = recorder(async () => {
+      const e: any = new Error('insufficient funds for gas * price + value');
+      e.code = 'INSUFFICIENT_FUNDS';
+      throw e;
+    });
+
+    let caught: any;
+    try {
+      await a.createKnowledgeAssets(makeV10PublishParams());
+    } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(InsufficientPublisherFundsError);
+    expect(caught.code).toBe('NO_FUNDED_PUBLISHER_WALLET');
+    expect(caught.message).toContain(walletA.address);
+    expect(caught.message).toContain(walletB.address);
+    expect(caught.message).toMatch(/Fund one of these wallets/i);
+    expect(caught.cause).toBeDefined(); // original error preserved
+  });
+
+  it('kill-switch DKG_DISABLE_FUNDED_WALLET_SELECTION reverts to balance-blind round-robin', async () => {
+    const prev = process.env.DKG_DISABLE_FUNDED_WALLET_SELECTION;
+    process.env.DKG_DISABLE_FUNDED_WALLET_SELECTION = '1';
+    try {
+      // Kill-switch is read in the constructor, so it must be set BEFORE the
+      // adapter is built (inside the helper).
+      const { a, walletA, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+      nativeByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletA.address), 0n);
+      const chosen = await (a as any).nextAuthorizedSigner(CG);
+      expect(chosen.address).toBe(walletA.address); // round-robin head, balance-blind
+      expect((a as any).provider.getBalance.calls.length).toBe(0); // no balance reads
+    } finally {
+      if (prev === undefined) delete process.env.DKG_DISABLE_FUNDED_WALLET_SELECTION;
+      else process.env.DKG_DISABLE_FUNDED_WALLET_SELECTION = prev;
+    }
+  });
+
+  it('no-contextGraphs adapter: funding-aware selection over the whole pool', async () => {
+    const { a, walletA, walletB, nativeByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    (a as any).contracts.contextGraphs = undefined; // no on-chain publish-authority surface
+    nativeByAddr.set(lc(walletA.address), 0n); nativeByAddr.set(lc(walletB.address), ONE);
+    const chosen = await (a as any).nextAuthorizedSigner(CG);
+    expect(chosen.address).toBe(walletB.address); // skips the unfunded round-robin head
+  });
+
+  it('caches funding within the TTL (one balance read per wallet across selections; forceRefresh bypasses)', async () => {
+    const { a } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    await (a as any).nextAuthorizedSigner(CG);
+    const afterFirst = (a as any).provider.getBalance.calls.length;
+    expect(afterFirst).toBeGreaterThan(0);
+    await (a as any).nextAuthorizedSigner(CG);
+    expect((a as any).provider.getBalance.calls.length).toBe(afterFirst); // cache hit, no new reads
+    await (a as any).getWalletFunding((a as any).signer.address, { forceRefresh: true });
+    expect((a as any).provider.getBalance.calls.length).toBeGreaterThan(afterFirst); // forceRefresh re-reads
+  });
+
+  it('rotates among the FUNDED subset when a middle wallet is unfunded (preserves #953 concurrency)', async () => {
+    const { a, wallets, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner(), undefined, [THIRD_PK]);
+    expect(wallets.length).toBe(3);
+    const [w0, w1, w2] = wallets;
+    nativeByAddr.set(lc(w1.address), 0n); tracByAddr.set(lc(w1.address), 0n); // middle wallet unfunded
+    const first = await (a as any).nextAuthorizedSigner(CG);
+    const second = await (a as any).nextAuthorizedSigner(CG);
+    const picked = [first.address, second.address];
+    expect(picked).not.toContain(w1.address);       // never the unfunded one
+    expect(new Set(picked).size).toBe(2);            // distinct → cross-wallet concurrency preserved
+    expect(picked.slice().sort()).toEqual([w0.address, w2.address].slice().sort());
+  });
+
+  it('does NOT wrap a non-funds contract revert on a funded wallet (no masking)', async () => {
+    const { a } = makeMultiWalletV10Adapter(makeAllowanceByOwner()); // both abundantly funded
+    (a as any).signPopulatedTransaction = recorder(async () => {
+      const e: any = new Error('execution reverted: InvalidAuthorAttestation');
+      e.code = 'CALL_EXCEPTION';
+      throw e;
+    });
+    let caught: any;
+    try { await a.createKnowledgeAssets(makeV10PublishParams()); } catch (e) { caught = e; }
+    expect(caught).not.toBeInstanceOf(InsufficientPublisherFundsError);
+    expect(caught.message).toContain('InvalidAuthorAttestation');
+  });
+
+  it('does NOT wrap a non-revert error (nonce) even on a zero-TRAC wallet', async () => {
+    const { a, walletA, walletB, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), 0n);
+    (a as any).signPopulatedTransaction = recorder(async () => {
+      const e: any = new Error('nonce has already been used');
+      e.code = 'NONCE_EXPIRED';
+      throw e;
+    });
+    let caught: any;
+    try { await a.createKnowledgeAssets(makeV10PublishParams()); } catch (e) { caught = e; }
+    expect(caught).not.toBeInstanceOf(InsufficientPublisherFundsError);
+    expect(caught.code).toBe('NONCE_EXPIRED');
+  });
+
+  it('emits NO_FUNDED when the only funded wallet is NOT authorized for the context graph (cannot be routed to)', async () => {
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    // walletA (selected/pinned): authorized, gas, ZERO TRAC. walletB: funded but UNAUTHORIZED.
+    nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);
+    tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), ONE);
+    (a as any).contracts.contextGraphs.isAuthorizedPublisher = recorder(async (_cg: bigint, addr: string) =>
+      addr.toLowerCase() === walletA.address.toLowerCase());
+    const params = makeV10PublishParams(walletA.address);
+    params.tokenAmount = 1000n;
+    (a as any).signPopulatedTransaction = recorder(async () => {
+      const e: any = new Error('execution reverted: ERC20: transfer amount exceeds balance');
+      e.code = 'CALL_EXCEPTION';
+      throw e;
+    });
+    let caught: any;
+    try { await a.createKnowledgeAssets(params); } catch (e) { caught = e; }
+    // The funded wallet is unauthorized → not a viable reroute → terminal NO_FUNDED.
+    expect(caught).toBeInstanceOf(InsufficientPublisherFundsError);
+    expect(caught.code).toBe('NO_FUNDED_PUBLISHER_WALLET');
+  });
+
+  it('does NOT wrap a non-funds contract revert on a zero-TRAC signer (no funds marker, not masked)', async () => {
+    const { a, walletA, walletB, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), 0n);
+    // A generic contract revert (CALL_EXCEPTION) on a short wallet must surface
+    // unchanged — NOT be converted to NO_FUNDED_PUBLISHER_WALLET.
+    (a as any).signPopulatedTransaction = recorder(async () => {
+      const e: any = new Error('execution reverted: InvalidAuthorAttestation');
+      e.code = 'CALL_EXCEPTION';
+      throw e;
+    });
+    let caught: any;
+    try { await a.createKnowledgeAssets(makeV10PublishParams()); } catch (e) { caught = e; }
+    expect(caught).not.toBeInstanceOf(InsufficientPublisherFundsError);
+    expect(caught.message).toContain('InvalidAuthorAttestation');
+  });
+
+  it('does NOT claim NO_FUNDED when the SELECTED wallet is short but another authorized wallet can cover the cost', async () => {
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    // Pin walletA (gas + ZERO TRAC); walletB is funded for the cost.
+    nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);
+    tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), ONE);
+    const params = makeV10PublishParams(walletA.address);
+    params.tokenAmount = 1000n;
+    (a as any).signPopulatedTransaction = recorder(async () => {
+      const e: any = new Error('execution reverted: ERC20: transfer amount exceeds balance');
+      e.code = 'CALL_EXCEPTION';
+      throw e;
+    });
+    let caught: any;
+    try { await a.createKnowledgeAssets(params); } catch (e) { caught = e; }
+    // Pool has a funded wallet → preserve the original error (retry can reroute),
+    // do NOT mislabel as "no operational wallet has funds".
+    expect(caught).not.toBeInstanceOf(InsufficientPublisherFundsError);
+    expect(caught.message).toContain('transfer amount exceeds balance');
+  });
+
+  it('wraps a TRAC transferFrom revert on a zero-TRAC wallet that holds gas', async () => {
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);
+    tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), 0n);
+    (a as any).signPopulatedTransaction = recorder(async () => {
+      const e: any = new Error('execution reverted: ERC20: transfer amount exceeds balance');
+      e.code = 'CALL_EXCEPTION';
+      throw e;
+    });
+    let caught: any;
+    try { await a.createKnowledgeAssets(makeV10PublishParams()); } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(InsufficientPublisherFundsError);
+    expect(caught.code).toBe('NO_FUNDED_PUBLISHER_WALLET');
+  });
+
+  it('expires the funding cache past the TTL: a newly funded wallet is re-read and selected', async () => {
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    // walletA (head) unfunded (0 TRAC); walletB funded → B chosen first.
+    nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);
+    tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), ONE);
+    const first = await (a as any).nextAuthorizedSigner(CG);
+    expect(first.address).toBe(walletB.address);
+    // walletA is funded, but its zero balance is still cached. Backdate every
+    // cache entry past the TTL so the next selection must re-read.
+    tracByAddr.set(lc(walletA.address), ONE);
+    for (const entry of ((a as any).fundingCache as Map<string, { ts: number }>).values()) entry.ts = 0;
+    const second = await (a as any).nextAuthorizedSigner(CG);
+    expect(second.address).toBe(walletA.address); // re-read picks up the now-funded head
+  });
+
+  it('honors a non-zero minPublisherTracWei floor (strict > boundary)', async () => {
+    const FLOOR = 100n;
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    (a as any).minPublisherTracWei = FLOOR;
+    nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);
+    tracByAddr.set(lc(walletA.address), FLOOR); tracByAddr.set(lc(walletB.address), FLOOR + 1n);
+    const chosen = await (a as any).nextAuthorizedSigner(CG);
+    expect(chosen.address).toBe(walletB.address); // A at exactly the floor is NOT fundable (strict >)
+  });
+
+  it('honors a non-zero minPublisherNativeWei floor (strict > boundary)', async () => {
+    const FLOOR = 100n;
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    (a as any).minPublisherNativeWei = FLOOR;
+    nativeByAddr.set(lc(walletA.address), FLOOR); nativeByAddr.set(lc(walletB.address), FLOOR + 1n);
+    tracByAddr.set(lc(walletA.address), ONE); tracByAddr.set(lc(walletB.address), ONE);
+    const chosen = await (a as any).nextAuthorizedSigner(CG);
+    expect(chosen.address).toBe(walletB.address); // A at exactly the native floor is NOT fundable
+  });
+
+  // The two tests above mutate the instance field AFTER construction, so they
+  // would pass even if the constructor stopped reading the config. These pin the
+  // CONSTRUCTOR path: the floor is injected via the adapter config and must be
+  // both stored on the instance and honored by selection.
+  it('reads minPublisherTracWei from the CONSTRUCTOR config (not a post-construction mutation)', async () => {
+    const FLOOR = 100n;
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } =
+      makeMultiWalletV10Adapter(makeAllowanceByOwner(), undefined, [], { minPublisherTracWei: FLOOR });
+    expect((a as any).minPublisherTracWei).toBe(FLOOR); // constructor consumed config.minPublisherTracWei
+    nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);
+    tracByAddr.set(lc(walletA.address), FLOOR); tracByAddr.set(lc(walletB.address), FLOOR + 1n);
+    const chosen = await (a as any).nextAuthorizedSigner(CG);
+    expect(chosen.address).toBe(walletB.address); // A at exactly the floor is skipped (strict >)
+  });
+
+  it('reads minPublisherNativeWei from the CONSTRUCTOR config (not a post-construction mutation)', async () => {
+    const FLOOR = 100n;
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } =
+      makeMultiWalletV10Adapter(makeAllowanceByOwner(), undefined, [], { minPublisherNativeWei: FLOOR });
+    expect((a as any).minPublisherNativeWei).toBe(FLOOR); // constructor consumed config.minPublisherNativeWei
+    nativeByAddr.set(lc(walletA.address), FLOOR); nativeByAddr.set(lc(walletB.address), FLOOR + 1n);
+    tracByAddr.set(lc(walletA.address), ONE); tracByAddr.set(lc(walletB.address), ONE);
+    const chosen = await (a as any).nextAuthorizedSigner(CG);
+    expect(chosen.address).toBe(walletB.address);
+  });
+
+  it('cost-aware fallback selection: skips a dust-TRAC wallet that cannot cover the publish cost', async () => {
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    // walletA (head): gas + 1 wei TRAC (dust — above the 0n floor but below the
+    // publish cost). walletB: covers. createKnowledgeAssets (no publisherAddress)
+    // selects cost-aware against floorPublishTokenAmount(params.tokenAmount).
+    nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);
+    tracByAddr.set(lc(walletA.address), 1n); tracByAddr.set(lc(walletB.address), ONE);
+    const params = makeV10PublishParams();
+    params.tokenAmount = 1000n; // publish costs 1000 wei TRAC
+    let chosenSigner: any;
+    (a as any).signPopulatedTransaction = recorder(async (signer: any) => { chosenSigner = signer; throw new Error('SENTINEL'); });
+    await expect(a.createKnowledgeAssets(params)).rejects.toThrow('SENTINEL');
+    expect(chosenSigner.address).toBe(walletB.address); // dust-TRAC head skipped for the covering wallet
+  });
+
+  it('skips a funded round-robin HEAD that is NOT authorized and selects a later authorized+funded wallet', async () => {
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    // Mixed case: both wallets abundantly funded, but walletA (the round-robin
+    // head) is UNAUTHORIZED for the CG and walletB is authorized. Authorization
+    // must gate selection so the funded-but-unauthorized head is never picked.
+    nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);
+    tracByAddr.set(lc(walletA.address), ONE); tracByAddr.set(lc(walletB.address), ONE);
+    (a as any).contracts.contextGraphs.isAuthorizedPublisher = recorder(async (_cg: bigint, addr: string) =>
+      addr.toLowerCase() === lc(walletB.address));
+    const chosen = await (a as any).nextAuthorizedSigner(CG);
+    expect(chosen.address).toBe(walletB.address); // funded-but-unauthorized head filtered out
+  });
+
+  it('cost-aware PCA: prices convictionAccountCanCover at the publish cost and skips a PCA that covers only the 1-wei probe', async () => {
+    const { a, walletA, walletB, nativeByAddr, tracByAddr } = makeMultiWalletV10Adapter(makeAllowanceByOwner());
+    // walletA (head): gas, ZERO own-TRAC, a registered PCA agent whose conviction
+    // account covers the 1-wei liveness probe but NOT a real publish cost.
+    // walletB: own-TRAC covers the cost. createKnowledgeAssets must price the PCA
+    // coverage check at floorPublishTokenAmount(tokenAmount) (NOT the 1-wei probe),
+    // so walletA is rejected and walletB is chosen.
+    nativeByAddr.set(lc(walletA.address), ONE); nativeByAddr.set(lc(walletB.address), ONE);
+    tracByAddr.set(lc(walletA.address), 0n); tracByAddr.set(lc(walletB.address), ONE);
+    (a as any).contracts.dkgPublishingConvictionNFT = {};
+    (a as any).getConvictionAgentAccountId = recorder(async (addr: string) =>
+      addr.toLowerCase() === lc(walletA.address) ? 42n : 0n);
+    const coverCalls: bigint[] = [];
+    (a as any).convictionAccountCanCover = recorder(async (_id: bigint, cost: bigint) => {
+      coverCalls.push(cost);
+      return cost <= 1n; // covers the 1-wei liveness probe only, NOT a real publish cost
+    });
+    const params = makeV10PublishParams();
+    params.tokenAmount = 1000n;
+    let chosenSigner: any;
+    (a as any).signPopulatedTransaction = recorder(async (signer: any) => { chosenSigner = signer; throw new Error('SENTINEL'); });
+    await expect(a.createKnowledgeAssets(params)).rejects.toThrow('SENTINEL');
+    expect(chosenSigner.address).toBe(walletB.address); // PCA head can't cover the REAL cost → skipped
+    expect(coverCalls.length).toBe(1); // only walletA's PCA was probed (walletB fundable via own-TRAC)
+    expect(coverCalls[0] > 1n).toBe(true); // priced at the REAL publish cost, not the 1-wei liveness probe
+  });
+});
 });
 
 // -----------------------------------------------------------------------------
@@ -2488,20 +3255,19 @@ describe('isTooLowAllowanceError (#888)', () => {
 function makeV10AdapterWithAllowanceSequence(values: bigint[]) {
   const a = new EVMChainAdapter(minimalConfig());
   let i = 0;
-  const tokenWithSigner = {
-    allowance: vi.fn(async () => values[Math.min(i++, values.length - 1)]),
-    approve: vi.fn(),
-  };
-  const tokenRoot = { connect: vi.fn(() => tokenWithSigner) };
+  const tokenWithSigner = connectable({
+    allowance: recorder(async () => values[Math.min(i++, values.length - 1)]),
+    approve: recorder(() => undefined),
+  });
+  const tokenRoot = { connect: recorder(() => tokenWithSigner) };
   (a as any).contracts.token = tokenRoot;
-  const sendSpy = vi.fn(async () => ({} as unknown));
+  const sendSpy = recorder(async (..._a: unknown[]) => ({} as unknown));
   (a as any).sendContractTransaction = sendSpy;
   const signer = new ethers.Wallet(DEPLOYER_PK);
   return { a, signer, tokenWithSigner, sendSpy };
 }
 
 describe('ensureV10ApproveTrac — forced re-approve + visibility poll (#888)', () => {
-  afterEach(() => { vi.restoreAllMocks(); });
 
   it('force=true re-approves even when the gating read says the allowance is already sufficient (stale-high skip)', async () => {
     // The "stale-high" sub-race: the per-publish 1-wei floor consumed by
@@ -2523,7 +3289,7 @@ describe('ensureV10ApproveTrac — forced re-approve + visibility poll (#888)', 
     expect(call.method).toBe('approve');
     expect(call.args).toEqual([V10_KA_ADDRESS, 1n]);
     // gating read (1n) + one visibility-poll read (1n ≥ target → confirmed).
-    expect(tokenWithSigner.allowance).toHaveBeenCalledTimes(2);
+    expect(tokenWithSigner.allowance.calls).toHaveLength(2);
   });
 
   it('force=false with a sufficient allowance issues NO approve and NO visibility poll (steady-state unchanged)', async () => {
@@ -2536,9 +3302,9 @@ describe('ensureV10ApproveTrac — forced re-approve + visibility poll (#888)', 
       'approve V10 publish TRAC',
     );
 
-    expect(sendSpy).not.toHaveBeenCalled();
+    expect(sendSpy.calls).toEqual([]);
     // Only the single gating read — the poll is gated on `force`.
-    expect(tokenWithSigner.allowance).toHaveBeenCalledTimes(1);
+    expect(tokenWithSigner.allowance.calls).toHaveLength(1);
   });
 
   it('forced re-approve polls until the fresh approve becomes visible on the RPC read path', async () => {
@@ -2550,8 +3316,8 @@ describe('ensureV10ApproveTrac — forced re-approve + visibility poll (#888)', 
 
     await (a as any).ensureV10ApproveTrac(signer, V10_KA_ADDRESS, 0n, 'forced', true);
 
-    expect(sendSpy).toHaveBeenCalledTimes(1); // exactly one approve
-    expect(tokenWithSigner.allowance).toHaveBeenCalledTimes(3); // gating + 2 polls
+    expect(sendSpy.calls).toHaveLength(1); // exactly one approve
+    expect(tokenWithSigner.allowance.calls).toHaveLength(3); // gating + 2 polls
   });
 
   it('forced re-approve is best-effort: gives up after the bounded poll budget without throwing', async () => {
@@ -2561,11 +3327,11 @@ describe('ensureV10ApproveTrac — forced re-approve + visibility poll (#888)', 
       (a as any).ensureV10ApproveTrac(signer, V10_KA_ADDRESS, 0n, 'forced', true),
     ).resolves.toBeUndefined();
 
-    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(sendSpy.calls).toHaveLength(1);
     // gating read + 6 bounded poll attempts. Proves the poll is bounded
     // (no hang); the caller's gas-estimation then surfaces a definitive
     // revert if the allowance genuinely never propagates.
-    expect(tokenWithSigner.allowance).toHaveBeenCalledTimes(7);
+    expect(tokenWithSigner.allowance.calls).toHaveLength(7);
   }, 15_000);
 
   // PR #896 review (🔴): each visibility-poll read must be bounded by a
@@ -2579,8 +3345,8 @@ describe('ensureV10ApproveTrac — forced re-approve + visibility poll (#888)', 
     try {
       const a = new EVMChainAdapter(minimalConfig());
       // allowance() returns a promise that never settles — a hung RPC read.
-      const token = { allowance: vi.fn(() => new Promise<bigint>(() => {})) };
-      const done = vi.fn();
+      const token = connectable({ allowance: recorder(() => new Promise<bigint>(() => {})) });
+      const done = recorder(() => undefined);
       const poll = (a as any)
         .confirmAllowanceVisible(token, '0xowner', V10_KA_ADDRESS, 1n)
         .then(done);
@@ -2589,8 +3355,8 @@ describe('ensureV10ApproveTrac — forced re-approve + visibility poll (#888)', 
       await poll;
       // Resolved rather than hanging, and each of the 6 bounded reads was
       // attempted (and timed out) instead of blocking on the first one.
-      expect(done).toHaveBeenCalledTimes(1);
-      expect(token.allowance).toHaveBeenCalledTimes(6);
+      expect(done.calls).toHaveLength(1);
+      expect(token.allowance.calls).toHaveLength(6);
     } finally {
       vi.useRealTimers();
     }
@@ -2604,8 +3370,8 @@ describe('ensureV10ApproveTrac — forced re-approve + visibility poll (#888)', 
 // These tests pin that shared behaviour directly.
 function makeRecoveryAdapter() {
   const a = new EVMChainAdapter(minimalConfig());
-  const ensureSpy = vi.fn(async () => {});
-  const signSpy = vi.fn(async () => ({ signedTx: '0xsigned', txHash: '0xhash' }));
+  const ensureSpy = recorder(async (..._a: unknown[]) => {});
+  const signSpy = recorder(async (..._a: unknown[]) => ({ signedTx: '0xsigned', txHash: '0xhash' }));
   (a as any).ensureV10ApproveTrac = ensureSpy;
   (a as any).signPopulatedTransaction = signSpy;
   return { a, ensureSpy, signSpy, signer: new ethers.Wallet(DEPLOYER_PK) };
@@ -2614,8 +3380,20 @@ function makeRecoveryAdapter() {
 const tooLowAllowanceRevert = () =>
   new Error('execution reverted: TooLowAllowance(0xTRAC, 0, 1)');
 
+const rawTooLowAllowanceRevert = () => {
+  const iface = new Interface([
+    'error TooLowAllowance(address tokenAddress, uint256 allowance, uint256 expected)',
+  ]);
+  const err = new Error('execution reverted (unknown custom error)');
+  (err as any).data = iface.encodeErrorResult('TooLowAllowance', [
+    V10_KA_ADDRESS,
+    0n,
+    1n,
+  ]);
+  return err;
+};
+
 describe('populateAndSignV10WithAllowanceRecovery — shared publish/update recovery (#888/#896)', () => {
-  afterEach(() => { vi.restoreAllMocks(); });
 
   // The 🔴 fix: BOTH write paths recover from a pre-broadcast
   // `TooLowAllowance` revert, not just publish.
@@ -2623,10 +3401,16 @@ describe('populateAndSignV10WithAllowanceRecovery — shared publish/update reco
     'forces a fresh approve and retries populate+sign exactly once on a stale TooLowAllowance (%s)',
     async (method) => {
       const { a, ensureSpy, signSpy, signer } = makeRecoveryAdapter();
-      const populate = vi.fn()
-        .mockRejectedValueOnce(tooLowAllowanceRevert())
-        .mockResolvedValueOnce({ to: V10_KA_ADDRESS, data: '0xabcd' });
-      const kaContract = { [method]: { populateTransaction: populate } };
+      // mockRejectedValueOnce → mockResolvedValueOnce chain as a shift()ed queue
+      // (rejection modelled by throwing).
+      const populateQueue: Array<() => Promise<{ to: string; data: string }>> = [
+        async () => { throw tooLowAllowanceRevert(); },
+        async () => ({ to: V10_KA_ADDRESS, data: '0xabcd' }),
+      ];
+      const populate = recorder(async () => (
+        populateQueue.shift() ?? (async () => ({ to: V10_KA_ADDRESS, data: '0xabcd' }))
+      )());
+      const kaContract = connectable({ [method]: { populateTransaction: populate } });
 
       const result = await (a as any).populateAndSignV10WithAllowanceRecovery(
         signer,
@@ -2639,20 +3423,48 @@ describe('populateAndSignV10WithAllowanceRecovery — shared publish/update reco
       );
 
       expect(result).toEqual({ signedTx: '0xsigned', txHash: '0xhash' });
-      expect(populate).toHaveBeenCalledTimes(2); // initial revert + one retry
-      expect(signSpy).toHaveBeenCalledTimes(1);  // signed only after the retry
+      expect(populate.calls).toHaveLength(2); // initial revert + one retry
+      expect(signSpy.calls).toHaveLength(1);  // signed only after the retry
       // forced re-approve fired once, against the right KA + with force=true.
-      expect(ensureSpy).toHaveBeenCalledTimes(1);
-      expect(ensureSpy.mock.calls[0][0]).toBe(signer);
-      expect(ensureSpy.mock.calls[0][1]).toBe(V10_KA_ADDRESS);
-      expect(ensureSpy.mock.calls[0][4]).toBe(true);
+      expect(ensureSpy.calls).toHaveLength(1);
+      expect(ensureSpy.calls[0][0]).toBe(signer);
+      expect(ensureSpy.calls[0][1]).toBe(V10_KA_ADDRESS);
+      expect(ensureSpy.calls[0][4]).toBe(true);
     },
   );
 
+  it('enriches raw unknown-custom-error data before deciding whether to force re-approve', async () => {
+    const { a, ensureSpy, signSpy, signer } = makeRecoveryAdapter();
+    const populateQueue: Array<() => Promise<{ to: string; data: string }>> = [
+      async () => { throw rawTooLowAllowanceRevert(); },
+      async () => ({ to: V10_KA_ADDRESS, data: '0xabcd' }),
+    ];
+    const populate = recorder(async () => (
+      populateQueue.shift() ?? (async () => ({ to: V10_KA_ADDRESS, data: '0xabcd' }))
+    )());
+    const kaContract = connectable({ publish: { populateTransaction: populate } });
+
+    const result = await (a as any).populateAndSignV10WithAllowanceRecovery(
+      signer,
+      kaContract,
+      'publish',
+      {},
+      V10_KA_ADDRESS,
+      0n,
+      'approve V10 publish TRAC (forced re-approve, #888)',
+    );
+
+    expect(result).toEqual({ signedTx: '0xsigned', txHash: '0xhash' });
+    expect(populate.calls).toHaveLength(2);
+    expect(signSpy.calls).toHaveLength(1);
+    expect(ensureSpy.calls).toHaveLength(1);
+    expect(ensureSpy.calls[0][4]).toBe(true);
+  });
+
   it('propagates a SECOND consecutive TooLowAllowance (recovery is one-shot, no infinite loop)', async () => {
     const { a, ensureSpy, signSpy, signer } = makeRecoveryAdapter();
-    const populate = vi.fn().mockRejectedValue(tooLowAllowanceRevert());
-    const kaContract = { publish: { populateTransaction: populate } };
+    const populate = recorder(async () => { throw tooLowAllowanceRevert(); });
+    const kaContract = connectable({ publish: { populateTransaction: populate } });
 
     await expect(
       (a as any).populateAndSignV10WithAllowanceRecovery(
@@ -2660,15 +3472,93 @@ describe('populateAndSignV10WithAllowanceRecovery — shared publish/update reco
       ),
     ).rejects.toThrow('TooLowAllowance');
 
-    expect(populate).toHaveBeenCalledTimes(2); // initial + one forced retry, then give up
-    expect(ensureSpy).toHaveBeenCalledTimes(1);
-    expect(signSpy).not.toHaveBeenCalled();
+    expect(populate.calls).toHaveLength(2); // initial + one forced retry, then give up
+    expect(ensureSpy.calls).toHaveLength(1);
+    expect(signSpy.calls).toEqual([]);
+  });
+
+  it('C6 (G-OBS1b): forces EXACTLY ONE approve across a provider-failover × TooLowAllowance interleaving (shared OUTER latch, not per-provider)', async () => {
+    // The case a PER-PROVIDER latch would double-fire: the inner per-provider
+    // populate loop fails over on provider #1's RETRYABLE 429, then provider #2
+    // reverts TooLowAllowance (non-retryable → propagates to the OUTER recovery),
+    // which fires ONE forced approve and re-runs the WHOLE inner loop (now
+    // succeeds). The forcedReapprove latch lives at the recovery OUTER scope, so
+    // it fires exactly once no matter how many endpoints the inner loop tried —
+    // immediate failover introduces ZERO extra approve txs (INV-1 + G-OBS1b).
+    const { a, ensureSpy, signSpy, signer } = makeRecoveryAdapter();
+    (a as any).providers = [{}, {}]; // two endpoints so the inner loop fails over
+    const r429 = () => { const e = new Error('429 too many requests'); (e as any).status = 429; return e; };
+    let call = 0;
+    const populate = recorder(async () => {
+      call += 1;
+      if (call === 1) throw r429();                   // provider[0], pass 1 → retryable → fail over
+      if (call === 2) throw tooLowAllowanceRevert();  // provider[1], pass 1 → non-retryable → propagate
+      return { to: V10_KA_ADDRESS, data: '0xabcd' };  // provider[0], pass 2 (post-approve) → succeeds
+    });
+    const kaContract = connectable({ publish: { populateTransaction: populate } });
+
+    const result = await (a as any).populateAndSignV10WithAllowanceRecovery(
+      signer, kaContract, 'publish', {}, V10_KA_ADDRESS, 0n, 'label',
+    );
+
+    expect(result).toEqual({ signedTx: '0xsigned', txHash: '0xhash' });
+    expect(ensureSpy.calls).toHaveLength(1);  // EXACTLY ONE forced approve across the failover
+    expect(ensureSpy.calls[0][4]).toBe(true); // force=true
+    expect(signSpy.calls).toHaveLength(1);    // publish signed exactly once (INV-1)
+    expect(populate.calls).toHaveLength(3);   // p0(429) → p1(TooLow) → [approve] → p0(ok)
+  });
+
+  it('OBS-1: a RETRYABLE populate failure fails over to the next provider and signs exactly once (no double-sign)', async () => {
+    // Plain OBS-1 populate failover (no allowance recovery): provider #1's
+    // populate is rate-limited, provider #2 populates fine → signed once on #2.
+    const { a, ensureSpy, signSpy, signer } = makeRecoveryAdapter();
+    (a as any).providers = [{}, {}];
+    const r429 = () => { const e = new Error('429 too many requests'); (e as any).status = 429; return e; };
+    let call = 0;
+    const populate = recorder(async () => {
+      call += 1;
+      if (call === 1) throw r429();                  // provider[0] → fail over
+      return { to: V10_KA_ADDRESS, data: '0xabcd' }; // provider[1] → populates
+    });
+    const kaContract = connectable({ publish: { populateTransaction: populate } });
+
+    const result = await (a as any).populateAndSignV10WithAllowanceRecovery(
+      signer, kaContract, 'publish', {}, V10_KA_ADDRESS, 0n, 'label',
+    );
+
+    expect(result).toEqual({ signedTx: '0xsigned', txHash: '0xhash' });
+    expect(populate.calls).toHaveLength(2); // p0(429) → p1(ok)
+    expect(signSpy.calls).toHaveLength(1);  // signed once, on the healthy provider
+    expect(ensureSpy.calls).toEqual([]);    // no TooLowAllowance → no forced approve
+  });
+
+  it('enriches the SECOND raw TooLowAllowance before throwing the one-shot failure', async () => {
+    const { a, ensureSpy, signSpy, signer } = makeRecoveryAdapter();
+    const populate = recorder(async () => { throw rawTooLowAllowanceRevert(); });
+    const kaContract = connectable({ publish: { populateTransaction: populate } });
+
+    let thrown: any;
+    try {
+      await (a as any).populateAndSignV10WithAllowanceRecovery(
+        signer, kaContract, 'publish', {}, V10_KA_ADDRESS, 0n, 'label',
+      );
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown.message).toContain('TooLowAllowance');
+    expect(thrown.message).not.toContain('unknown custom error');
+    expect(thrown.revert?.name).toBe('TooLowAllowance');
+    expect(populate.calls).toHaveLength(2);
+    expect(ensureSpy.calls).toHaveLength(1);
+    expect(signSpy.calls).toEqual([]);
   });
 
   it('propagates an unrelated revert immediately without forcing a re-approve', async () => {
     const { a, ensureSpy, signSpy, signer } = makeRecoveryAdapter();
-    const populate = vi.fn().mockRejectedValue(new Error('execution reverted: NotBatchPublisher()'));
-    const kaContract = { update: { populateTransaction: populate } };
+    const populate = recorder(async () => { throw new Error('execution reverted: NotBatchPublisher()'); });
+    const kaContract = connectable({ update: { populateTransaction: populate } });
 
     await expect(
       (a as any).populateAndSignV10WithAllowanceRecovery(
@@ -2676,8 +3566,8 @@ describe('populateAndSignV10WithAllowanceRecovery — shared publish/update reco
       ),
     ).rejects.toThrow('NotBatchPublisher');
 
-    expect(populate).toHaveBeenCalledTimes(1); // no retry on a non-allowance error
-    expect(ensureSpy).not.toHaveBeenCalled();
-    expect(signSpy).not.toHaveBeenCalled();
+    expect(populate.calls).toHaveLength(1); // no retry on a non-allowance error
+    expect(ensureSpy.calls).toEqual([]);
+    expect(signSpy.calls).toEqual([]);
   });
 });

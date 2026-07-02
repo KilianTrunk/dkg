@@ -31,29 +31,29 @@
 # Flow:
 #   1. Curator (edge node 5) creates an assertion + writes 200 triples
 #      in WM (large enough to widen the in-flight promote window).
-#   2. POST /api/assertion/<name>/promote-async → jobId.
-#   3. Tight-poll GET /api/assertion/promote-async/<jobId> until
+#   2. POST /api/knowledge-assets/<name>/swm/share-async → jobId.
+#   3. Tight-poll GET /api/knowledge-assets/swm/share-jobs/<jobId> until
 #      state === "running" (worker has claimed the lease).
 #   4. SIGKILL the daemon (NOT SIGTERM — we explicitly want to bypass
 #      graceful shutdown so the worker can't drain).
 #   5. `./scripts/devnet.sh restart-node 5` brings node 5 back. The
 #      daemon's lifecycle wiring calls `queue.recoverOnStartup()`
 #      against the persisted triple-store queue state.
-#   6. GET /api/assertion/promote-async/<jobId> on the restarted node
+#   6. GET /api/knowledge-assets/swm/share-jobs/<jobId> on the restarted node
 #      → classify per the matrix below.
 #
 # Flow:
 #   1. Curator (edge node 5) creates an assertion + writes 5 triples
 #      in WM under a unique context graph subgraph.
-#   2. POST /api/assertion/<name>/promote-async → jobId.
-#   3. Tight-poll GET /api/assertion/promote-async/<jobId> until
+#   2. POST /api/knowledge-assets/<name>/swm/share-async → jobId.
+#   3. Tight-poll GET /api/knowledge-assets/swm/share-jobs/<jobId> until
 #      state === "running" (means worker has claimed the lease).
 #   4. SIGKILL the daemon (NOT SIGTERM — we explicitly want to bypass
 #      graceful shutdown so the worker can't drain).
 #   5. `./scripts/devnet.sh restart-node 5` brings node 5 back. The
 #      daemon's lifecycle wiring calls `queue.recoverOnStartup()`
 #      against the persisted triple-store queue state.
-#   6. GET /api/assertion/promote-async/<jobId> on the restarted node
+#   6. GET /api/knowledge-assets/swm/share-jobs/<jobId> on the restarted node
 #      → expect state === "failed", reason matching
 #      /partial promote ambiguity/i (per
 #      `async-promote-queue-impl.ts:abandonStartupRecovery`).
@@ -141,7 +141,7 @@ ASSERTION_NAME="rc11-promote-crash-${STAMP}"
 log "Curator: node $CURATOR_NODE; context graph: $CG_ID"
 log "Assertion: $ASSERTION_NAME (default subgraph)"
 
-CREATE_RESP=$(api_call "$CURATOR_NODE" POST /api/assertion/create "$(cat <<EOF
+CREATE_RESP=$(api_call "$CURATOR_NODE" POST /api/knowledge-assets "$(cat <<EOF
 { "contextGraphId": "$CG_ID", "name": "$ASSERTION_NAME" }
 EOF
 )")
@@ -171,7 +171,7 @@ QUADS_JSON=$(node -e "
     quads,
   }));
 ")
-WRITE_RESP=$(api_call "$CURATOR_NODE" POST "/api/assertion/$ASSERTION_NAME/write" "$QUADS_JSON")
+WRITE_RESP=$(api_call "$CURATOR_NODE" POST "/api/knowledge-assets/$ASSERTION_NAME/wm/write" "$QUADS_JSON")
 log "write response: $(printf '%s' "$WRITE_RESP" | head -c 200)"
 WRITTEN=$(parse_json "$WRITE_RESP" '.written')
 [ "$WRITTEN" = "$TRIPLE_COUNT" ] || fail "expected $TRIPLE_COUNT quads written; got '$WRITTEN': $WRITE_RESP"
@@ -183,7 +183,7 @@ log "✓ wrote $TRIPLE_COUNT triples to WM"
 
 log ""
 log "Enqueueing promote-async job..."
-ENQUEUE=$(api_call "$CURATOR_NODE" POST "/api/assertion/$ASSERTION_NAME/promote-async" "$(cat <<EOF
+ENQUEUE=$(api_call "$CURATOR_NODE" POST "/api/knowledge-assets/$ASSERTION_NAME/swm/share-async" "$(cat <<EOF
 { "contextGraphId": "$CG_ID", "entities": "all" }
 EOF
 )")
@@ -200,7 +200,7 @@ RACE_DEADLINE=$(( $(date +%s) + 5 ))
 SAW_RUNNING=0
 LAST_STATE=""
 while [ "$(date +%s)" -lt "$RACE_DEADLINE" ]; do
-  STATUS=$(api_call "$CURATOR_NODE" GET "/api/assertion/promote-async/$JOB_ID" 2>/dev/null || echo '{}')
+  STATUS=$(api_call "$CURATOR_NODE" GET "/api/knowledge-assets/swm/share-jobs/$JOB_ID" 2>/dev/null || echo '{}')
   LAST_STATE=$(parse_json "$STATUS" '.state' 2>/dev/null || echo "")
   case "$LAST_STATE" in
     running)
@@ -308,7 +308,7 @@ log "✓ node $CURATOR_NODE responsive"
 
 log ""
 log "Querying job status post-restart..."
-POST_RESTART=$(api_call "$CURATOR_NODE" GET "/api/assertion/promote-async/$JOB_ID")
+POST_RESTART=$(api_call "$CURATOR_NODE" GET "/api/knowledge-assets/swm/share-jobs/$JOB_ID")
 log "post-restart status: $POST_RESTART"
 POST_STATE=$(parse_json "$POST_RESTART" '.state')
 POST_REASON=$(parse_json "$POST_RESTART" '.reason' 2>/dev/null || echo "")

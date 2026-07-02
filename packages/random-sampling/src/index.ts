@@ -18,11 +18,12 @@
  * registered.
  */
 
-export const RANDOM_SAMPLING_PACKAGE_VERSION = '10.0.0-rc.2';
+export const RANDOM_SAMPLING_PACKAGE_VERSION = '10.0.0-rc.19';
 
 export {
   extractV10KCFromStore,
   extractV10KCQuads,
+  POST_PUBLISH_PREDICATES_TO_SKIP,
   KCNotFoundError,
   KCRootEntitiesNotFoundError,
   KCDataMissingError,
@@ -31,12 +32,10 @@ export {
 } from './ka-extractor.js';
 
 export {
-  extractCiphertextChunksFromStore,
-  CiphertextChunksMissingError,
-  CiphertextChunksMalformedError,
-  type ExtractCiphertextChunksInput,
-  type CiphertextChunksExtractionResult,
-} from './ciphertext-chunks-extractor.js';
+  extractCatalogLeavesFromStore,
+  CatalogLeavesMissingError,
+  type ExtractCatalogLeavesInput,
+} from './catalog-extractor.js';
 
 export {
   type ProofBuilder,
@@ -55,9 +54,6 @@ export {
   type RandomSamplingProverDeps,
   type ProverLogger,
   type TickOutcome,
-  type CiphertextChunkBackfillFn,
-  type CiphertextChunkBackfillRequest,
-  type CiphertextChunkBackfillResult,
 } from './prover.js';
 
 export {

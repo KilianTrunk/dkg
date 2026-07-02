@@ -287,23 +287,23 @@ get_peer_id() {
 
 assertion_create_write_finalize() {
   local node="$1" assertion="$2" root="$3" value="$4" response count payload assertion_uri merkle_root
-  response=$(api_call "$node" POST /api/assertion/create "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$assertion\"}")
+  response=$(api_call "$node" POST /api/knowledge-assets "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$assertion\"}")
   assertion_uri=$(parse_json "$response" '.assertionUri')
   [ -n "$assertion_uri" ] || fail "create response missing assertionUri: $response"
 
   payload=$(json_write_payload "$root" "$value")
-  response=$(api_call "$node" POST "/api/assertion/${assertion}/write" "$payload")
+  response=$(api_call "$node" POST "/api/knowledge-assets/${assertion}/wm/write" "$payload")
   count=$(parse_json "$response" '.written')
   [ "$count" = "1" ] || fail "expected one written quad for $assertion, got '$count': $response"
 
-  response=$(api_call "$node" POST "/api/assertion/${assertion}/finalize" "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}")
+  response=$(api_call "$node" POST "/api/knowledge-assets/${assertion}/wm/finalize" "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}")
   merkle_root=$(parse_json "$response" '.merkleRoot')
   [ -n "$merkle_root" ] || fail "finalize response missing merkleRoot: $response"
 }
 
 promote_expect_success() {
   local node="$1" assertion="$2" response count
-  response=$(api_call "$node" POST "/api/assertion/${assertion}/promote" "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}")
+  response=$(api_call "$node" POST "/api/knowledge-assets/${assertion}/swm/share" "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}")
   count=$(parse_json "$response" '.promotedCount')
   [ "$count" = "1" ] || fail "expected one promoted quad for $assertion, got '$count': $response"
 }
@@ -393,7 +393,7 @@ assertion_create_write_finalize "$ATTACKER_NODE" "$ATTACKER_ASSERTION" "$ROOT" "
 
 PROMOTE_BODY=""
 PROMOTE_CODE=""
-api_capture "$ATTACKER_NODE" POST "/api/assertion/${ATTACKER_ASSERTION}/promote" "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}" PROMOTE_BODY PROMOTE_CODE
+api_capture "$ATTACKER_NODE" POST "/api/knowledge-assets/${ATTACKER_ASSERTION}/swm/share" "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}" PROMOTE_BODY PROMOTE_CODE
 if [ "$PROMOTE_CODE" -ge 200 ] && [ "$PROMOTE_CODE" -lt 300 ]; then
   fail "cross-owner promote unexpectedly succeeded with HTTP $PROMOTE_CODE: $PROMOTE_BODY"
 fi
@@ -404,7 +404,7 @@ case "$PROMOTE_BODY" in
 esac
 
 act "6. Failed promote left WM, SWM, and ownership metadata intact"
-ASSERTION_QUERY=$(api_call "$ATTACKER_NODE" POST "/api/assertion/${ATTACKER_ASSERTION}/query" "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}")
+ASSERTION_QUERY=$(api_call "$ATTACKER_NODE" GET "/api/knowledge-assets/${ATTACKER_ASSERTION}/wm/quads?contextGraphId=$CONTEXT_GRAPH")
 ASSERTION_CT=$(quads_count "$ASSERTION_QUERY")
 [ "$ASSERTION_CT" = "1" ] || fail "attacker WM assertion should still have 1 quad after failed promote, got '$ASSERTION_CT': $ASSERTION_QUERY"
 

@@ -9,14 +9,15 @@ test.describe('Bottom Panel', () => {
     expect(await bottomPanel.isCollapsed()).toBe(true);
   });
 
-  test('has three tabs: Node Log, Transactions, Gossip', async ({ bottomPanel }) => {
-    // The PanelBottom component now ships exactly three tabs (the
-    // legacy `Agent Runs` + `SPARQL` placeholders were removed once
-    // those flows moved into the Operations and Memory views). The
+  test('has two tabs: Node Log, Transactions', async ({ bottomPanel }) => {
+    // The PanelBottom component ships exactly two tabs. The legacy
+    // `Agent Runs` + `SPARQL` placeholders were removed once those flows
+    // moved into the Operations and Memory views, and the `Gossip` tab was
+    // retired (libp2p/GossipSub traffic stays in the Node Log). The
     // assertion is intentionally exact-match so that re-adding tabs
     // without updating the spec is caught as a regression.
     const names = (await bottomPanel.getTabNames()).map((n) => n.trim());
-    expect(names).toEqual(['Node Log', 'Transactions', 'Gossip']);
+    expect(names).toEqual(['Node Log', 'Transactions']);
   });
 
   test('Node Log is the default active tab', async ({ bottomPanel }) => {
@@ -68,25 +69,15 @@ test.describe('Bottom Panel', () => {
     await bottomPanel.switchTab('Transactions');
     const body = page.locator('.v10-bottom-content');
     const table = body.locator('table');
-    const emptyState = body.getByText(/No on-chain transactions/i);
+    const emptyState = body.getByText(/No publish, update, or verify activity/i);
     await expect(table.or(emptyState).first()).toBeVisible();
-  });
-
-  test('Gossip tab renders a log container (libp2p / GossipSub stream)', async ({ bottomPanel, page }) => {
-    await bottomPanel.toggle();
-    await bottomPanel.switchTab('Gossip');
-    // The Gossip tab is wired (not a placeholder anymore): it shows a
-    // log-output container regardless of whether any gossip lines are
-    // currently in the buffer. Asserting the container — not "coming
-    // soon" copy — is the durable check.
-    await expect(page.locator('.v10-log-output').last()).toBeVisible();
   });
 
   test('switching tabs updates active state', async ({ bottomPanel }) => {
     await bottomPanel.toggle();
-    await bottomPanel.switchTab('Gossip');
+    await bottomPanel.switchTab('Transactions');
     const active = await bottomPanel.getActiveTabName();
-    expect(active?.trim()).toBe('Gossip');
+    expect(active?.trim()).toBe('Transactions');
   });
 
   test('collapsing hides content area', async ({ bottomPanel }) => {

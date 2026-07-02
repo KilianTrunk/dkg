@@ -17,7 +17,6 @@ import { registerMcpCommand } from './commands/mcp.js';
 import { registerHermesCommand } from './commands/hermes.js';
 import { registerCclCommand } from './commands/ccl.js';
 import { registerIndexCommand } from './commands/index-command.js';
-import { registerSharedMemoryCommand } from './commands/shared-memory.js';
 import { registerSourceWorkerCommand } from './commands/source-worker.js';
 import { registerPcaCommand } from './commands/pca.js';
 import { registerPublisherCommand } from './commands/publisher.js';
@@ -26,6 +25,7 @@ import { registerNodeOpsCommands } from './commands/node-ops.js';
 import { registerQueryCatalogCommand } from './commands/query-catalog.js';
 import { registerMaintenanceCommands } from './commands/maintenance.js';
 import { registerRandomSamplingCommand } from './commands/random-sampling.js';
+import { registerOkfCommand } from './commands/okf.js';
 
 const program = new Command();
 program
@@ -47,7 +47,6 @@ registerMcpCommand(program);
 registerHermesCommand(program);
 registerCclCommand(program);
 registerIndexCommand(program);
-registerSharedMemoryCommand(program);
 registerSourceWorkerCommand(program);
 registerPcaCommand(program);
 registerPublisherCommand(program);
@@ -56,6 +55,7 @@ registerNodeOpsCommands(program);
 registerQueryCatalogCommand(program);
 registerMaintenanceCommands(program);
 registerRandomSamplingCommand(program);
+registerOkfCommand(program);
 
 // ─── dkg integration ─────────────────────────────────────────────────
 

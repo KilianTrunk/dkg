@@ -30,6 +30,15 @@ const ONE_AND_HALF_X = (15n * SCALE18) / 10n;
 const TWO_X = 2n * SCALE18;
 const THREE_AND_HALF_X = (35n * SCALE18) / 10n;
 const SIX_X = 6n * SCALE18;
+const DAY = 24n * 60n * 60n;
+const EXPIRY_BUCKET_SECONDS = 12n * 60n * 60n;
+
+function bucketExpiry(rawExpiry: bigint): bigint {
+  return (
+    ((rawExpiry + EXPIRY_BUCKET_SECONDS - 1n) / EXPIRY_BUCKET_SECONDS) *
+    EXPIRY_BUCKET_SECONDS
+  );
+}
 
 type Fixture = {
   accounts: SignerWithAddress[];
@@ -549,9 +558,8 @@ describe('@unit DKGStakingConvictionNFT', () => {
       const txReceipt = await tx.wait();
       const txBlock = await hre.ethers.provider.getBlock(txReceipt!.blockHash);
       const relockTs = BigInt(txBlock!.timestamp);
-      // Tier 12 wall-clock duration = 366 days.
-      const DAY = 24n * 60n * 60n;
-      const expectedExpiryTs = relockTs + 366n * DAY;
+      // Tier 12 boost expires on the next half-day bucket after 366 days.
+      const expectedExpiryTs = bucketExpiry(relockTs + 366n * DAY);
 
       await expect(tx).to.emit(NFT, 'PositionRelocked').withArgs(1n, newTokenId, 12);
       await expect(tx)
@@ -611,9 +619,8 @@ describe('@unit DKGStakingConvictionNFT', () => {
       const receipt = await tx.wait();
       const txBlock = await hre.ethers.provider.getBlock(receipt!.blockHash);
       const relockTs = BigInt(txBlock!.timestamp);
-      // D26: tier 6 commits 180 days of boost exactly.
-      const DAY = 24n * 60n * 60n;
-      const expectedExpiryTs = relockTs + 180n * DAY;
+      // D26: tier 6 commits at least 180 days of boost, rounded to the next half-day bucket.
+      const expectedExpiryTs = bucketExpiry(relockTs + 180n * DAY);
       const pos = await ConvictionStakingStorageContract.getPosition(newTokenId);
       expect(pos.expiryTimestamp).to.equal(expectedExpiryTs);
       expect(pos.multiplier18).to.equal(THREE_AND_HALF_X);
@@ -633,19 +640,24 @@ describe('@unit DKGStakingConvictionNFT', () => {
       ).to.be.revertedWithCustomError(StakingV10Contract, 'OnlyConvictionNFT');
     });
 
-    it('boundary: relock succeeds at exactly currentEpoch == pos.expiryTimestamp', async () => {
+    it('boundary: relock succeeds at exactly the bucketed expiry timestamp', async () => {
       const { identityId } = await createProfile();
       const amount = hre.ethers.parseEther('1000');
       await mintAndApprove(accounts[0], amount);
       await NFT.connect(accounts[0]).createConviction(identityId, amount, 1);
-      // 1-epoch lock at creation epoch C → expiryTimestamp = C + 1. Advance
-      // exactly 1 epoch so currentEpoch == expiryTimestamp — under the old
-      // `<=` check this would still revert as LockStillActive.
-      await advanceEpochs(1);
+
+      const expiryTimestamp = (await ConvictionStakingStorageContract.getPosition(1))
+        .expiryTimestamp;
+      // Claim just before the lock boundary so the relock transaction itself can
+      // land exactly at `expiryTimestamp`.
+      await time.setNextBlockTimestamp(Number(expiryTimestamp - 1n));
       await NFT.connect(accounts[0]).claim(1); // satisfy UnclaimedEpochs guard
 
-      const newTokenId = await NFT.connect(accounts[0]).relock.staticCall(1, 6);
-      await NFT.connect(accounts[0]).relock(1, 6);
+      await time.setNextBlockTimestamp(Number(expiryTimestamp));
+      const newTokenId = (await NFT.nextTokenId()) + 1n;
+      await expect(NFT.connect(accounts[0]).relock(1, 6))
+        .to.emit(NFT, 'PositionRelocked')
+        .withArgs(1n, newTokenId, 6);
       const pos = await ConvictionStakingStorageContract.getPosition(newTokenId);
       expect(pos.lockTier).to.equal(6);
       expect(pos.multiplier18).to.equal(THREE_AND_HALF_X);
@@ -987,17 +999,16 @@ describe('@unit DKGStakingConvictionNFT', () => {
       );
     });
 
-    it('boundary: withdraw succeeds at exactly currentEpoch == pos.expiryTimestamp', async () => {
+    it('boundary: withdraw succeeds at exactly the bucketed expiry timestamp', async () => {
       const { identityId } = await createProfile();
       const amount = hre.ethers.parseEther('1000');
       await mintAndApprove(accounts[0], amount);
       await NFT.connect(accounts[0]).createConviction(identityId, amount, 1);
-      // 1-tier lock at creation epoch C → expiryTimestamp ~ C + 1. Advance
-      // exactly 1 epoch so currentEpoch == expiryTimestamp (the unlock
-      // boundary). Under `currentEpoch >= expiryTimestamp` this must pass.
-      await advanceEpochs(1);
+      const expiryTimestamp = (await ConvictionStakingStorageContract.getPosition(1))
+        .expiryTimestamp;
 
       // `withdraw` auto-claims internally — no separate claim() required.
+      await time.setNextBlockTimestamp(Number(expiryTimestamp));
       await NFT.connect(accounts[0]).withdraw(1);
 
       expect(
@@ -1267,30 +1278,122 @@ describe('@unit DKGStakingConvictionNFT', () => {
       expect(vaultBalance).to.be.gte(totalStake);
     };
 
+    // Permissionless settlement lives on StakingV10.claimFor (any caller); the
+    // wrapper's `claim` and every stake-moving mutation stay owner-only.
+    const expectPermissionlessClaimButOwnerGatedMutations = async (
+      tokenId: bigint | number,
+      newIdentityId: number,
+    ) => {
+      const nonOwner = accounts[4];
+
+      // Permissionless: a non-owner CAN settle rewards via StakingV10.claimFor.
+      await expect(StakingV10Contract.connect(nonOwner).claimFor(tokenId)).to.not.be.reverted;
+      // Owner-only: the wrapper's claim + all stake-moving mutations reject them.
+      await expect(
+        NFT.connect(nonOwner).claim(tokenId),
+      ).to.be.revertedWithCustomError(NFT, 'NotPositionOwner');
+      await expect(
+        NFT.connect(nonOwner).withdraw(tokenId),
+      ).to.be.revertedWithCustomError(NFT, 'NotPositionOwner');
+      await expect(
+        NFT.connect(nonOwner).relock(tokenId, 3),
+      ).to.be.revertedWithCustomError(NFT, 'NotPositionOwner');
+      await expect(
+        NFT.connect(nonOwner).redelegate(tokenId, newIdentityId),
+      ).to.be.revertedWithCustomError(NFT, 'NotPositionOwner');
+    };
+
     // -----------------------------------------------------------------
     // Revert / gate paths
     // -----------------------------------------------------------------
 
-    it('reverts if not owner (non-owner caller)', async () => {
+    it('permissionless claimFor lets a non-owner settle; owner-gated NFT.claim rejects them', async () => {
       const { identityId } = await createProfile();
       const amount = hre.ethers.parseEther('1000');
       await mintAndApprove(accounts[0], amount);
       await NFT.connect(accounts[0]).createConviction(identityId, amount, 12);
-      // `accounts[4]` does not own tokenId 0 — wrapper-layer guard.
+      // Permissionless settlement entry point — any caller may trigger it.
+      await expect(StakingV10Contract.connect(accounts[4]).claimFor(1)).to.not.be.reverted;
+      // The wrapper's claim stays owner-only.
       await expect(NFT.connect(accounts[4]).claim(1)).to.be.revertedWithCustomError(
         NFT,
         'NotPositionOwner',
       );
     });
 
-    it('direct StakingV10.claim call from non-NFT caller reverts via gate', async () => {
+    it('keeps NFT.claim + stake-moving mutations owner-only (only claimFor is permissionless)', async () => {
+      const { identityId } = await createProfile();
+      const { identityId: newIdentityId } = await createProfile(accounts[0], accounts[2]);
+      const amount = hre.ethers.parseEther('1000');
+      await mintAndApprove(accounts[0], amount);
+      await NFT.connect(accounts[0]).createConviction(identityId, amount, 1);
+      await advanceEpochs(2);
+
+      await expectPermissionlessClaimButOwnerGatedMutations(1, newIdentityId);
+    });
+
+    it('direct StakingV10.claim from a non-wrapper caller reverts via the onlyConvictionNFT gate', async () => {
       const { identityId } = await createProfile();
       const amount = hre.ethers.parseEther('1000');
       await mintAndApprove(accounts[0], amount);
       await NFT.connect(accounts[0]).createConviction(identityId, amount, 12);
+      // 2-arg `claim(staker, tokenId)` is wrapper-only; an EOA is rejected.
       await expect(
         StakingV10Contract.connect(accounts[0]).claim(accounts[0].address, 0),
       ).to.be.revertedWithCustomError(StakingV10Contract, 'OnlyConvictionNFT');
+    });
+
+    it('claimFor reverts PositionNotFound for a nonexistent token id', async () => {
+      const { identityId } = await createProfile();
+      const amount = hre.ethers.parseEther('1000');
+      await mintAndApprove(accounts[0], amount);
+      await NFT.connect(accounts[0]).createConviction(identityId, amount, 12);
+      await advanceEpochs(1);
+
+      const posBefore = await ConvictionStakingStorageContract.getPosition(1);
+      await expect(
+        StakingV10Contract.connect(accounts[4]).claimFor(999),
+      ).to.be.revertedWithCustomError(StakingV10Contract, 'PositionNotFound');
+      // The live position's cursor is untouched.
+      const posAfter = await ConvictionStakingStorageContract.getPosition(1);
+      expect(posAfter.lastClaimedEpoch).to.equal(posBefore.lastClaimedEpoch);
+    });
+
+    it('rejects a nonexistent token id at the NFT boundary without advancing a live cursor', async () => {
+      const { identityId } = await createProfile();
+      const amount = hre.ethers.parseEther('1000');
+      await mintAndApprove(accounts[0], amount);
+      await NFT.connect(accounts[0]).createConviction(identityId, amount, 12);
+      await advanceEpochs(1);
+
+      const posBefore = await ConvictionStakingStorageContract.getPosition(1);
+      await expect(
+        NFT.connect(accounts[4]).claim(2),
+      ).to.be.revertedWithCustomError(NFT, 'ERC721NonexistentToken').withArgs(2n);
+
+      const posAfter = await ConvictionStakingStorageContract.getPosition(1);
+      expect(posAfter.lastClaimedEpoch).to.equal(posBefore.lastClaimedEpoch);
+    });
+
+    it('rejects a burned token id at the NFT boundary without advancing the replacement cursor', async () => {
+      const { identityId } = await createProfile();
+      const amount = hre.ethers.parseEther('1000');
+      await mintAndApprove(accounts[0], amount);
+      await NFT.connect(accounts[0]).createConviction(identityId, amount, 1);
+      await advanceEpochs(2);
+      await NFT.connect(accounts[0]).claim(1);
+
+      const newTokenId = await NFT.connect(accounts[0]).relock.staticCall(1, 12);
+      await NFT.connect(accounts[0]).relock(1, 12);
+      await advanceEpochs(1);
+
+      const posBefore = await ConvictionStakingStorageContract.getPosition(newTokenId);
+      await expect(
+        NFT.connect(accounts[4]).claim(1),
+      ).to.be.revertedWithCustomError(NFT, 'ERC721NonexistentToken').withArgs(1n);
+
+      const posAfter = await ConvictionStakingStorageContract.getPosition(newTokenId);
+      expect(posAfter.lastClaimedEpoch).to.equal(posBefore.lastClaimedEpoch);
     });
 
     // -----------------------------------------------------------------
@@ -1346,6 +1449,31 @@ describe('@unit DKGStakingConvictionNFT', () => {
       // Totals unchanged.
       expect(await ConvictionStakingStorageContract.getNodeStakeV10(identityId)).to.equal(nodeStakeBefore);
       expect(await ConvictionStakingStorageContract.totalStakeV10()).to.equal(totalStakeBefore);
+    });
+
+    it('no-op: non-owner claimFor with zero scorePerStake advances lastClaimedEpoch but emits nothing', async () => {
+      const { identityId } = await createProfile();
+      const amount = hre.ethers.parseEther('1000');
+      await mintAndApprove(accounts[0], amount);
+      await NFT.connect(accounts[0]).createConviction(identityId, amount, 12);
+      await advanceEpochs(1);
+
+      const posBefore = await ConvictionStakingStorageContract.getPosition(1);
+      const nodeStakeBefore = await ConvictionStakingStorageContract.getNodeStakeV10(identityId);
+      const totalStakeBefore = await ConvictionStakingStorageContract.totalStakeV10();
+
+      const tx = await StakingV10Contract.connect(accounts[4]).claimFor(1);
+      await expect(tx).to.not.emit(StakingV10Contract, 'RewardsClaimed');
+
+      const posAfter = await ConvictionStakingStorageContract.getPosition(1);
+      const currentEpoch = await ChronosContract.getCurrentEpoch();
+      expect(posAfter.lastClaimedEpoch).to.equal(currentEpoch - 1n);
+      expect(posAfter.lastClaimedEpoch).to.equal(posBefore.lastClaimedEpoch + 1n);
+      expect(posAfter.raw).to.equal(posBefore.raw);
+      expect(posAfter.cumulativeRewardsClaimed).to.equal(posBefore.cumulativeRewardsClaimed);
+      expect(await ConvictionStakingStorageContract.getNodeStakeV10(identityId)).to.equal(nodeStakeBefore);
+      expect(await ConvictionStakingStorageContract.totalStakeV10()).to.equal(totalStakeBefore);
+      expect(await NFT.ownerOf(1)).to.equal(accounts[0].address);
     });
 
     // -----------------------------------------------------------------
@@ -2214,27 +2342,33 @@ describe('@unit DKGStakingConvictionNFT', () => {
       expect(posAfter.cumulativeRewardsClaimed).to.equal(expectedReward);
     });
 
-    it('Alice cannot claim after transfer (reverts NotPositionOwner)', async () => {
+    it('Alice can trigger claimFor after transfer; rewards settle to Bob-owned position', async () => {
       const { identityId } = await createProfile();
       const amount = hre.ethers.parseEther('1000');
       await mintAndApprove(accounts[0], amount);
       await NFT.connect(accounts[0]).createConviction(identityId, amount, 12);
 
-      // Advance + inject so there's actual reward on the table — otherwise
-      // a revert at the ownership gate would be indistinguishable from a
-      // no-op window. This verifies the gate fires BEFORE the walk.
       const creationEpoch = await ChronosContract.getCurrentEpoch();
       await advanceEpochs(1);
       const scorePerStake36 = hre.ethers.parseEther('0.001');
       const nodeScore18 = hre.ethers.parseEther('100');
+      const pool = hre.ethers.parseEther('1000');
       await injectEpochRewardState(
         creationEpoch,
         identityId,
         scorePerStake36,
         nodeScore18,
         nodeScore18,
-        hre.ethers.parseEther('1000'),
+        pool,
       );
+      const expectedReward = computeReward(
+        (amount * SIX_X) / SCALE18,
+        scorePerStake36,
+        pool,
+        nodeScore18,
+        nodeScore18,
+      );
+      await fundVault(expectedReward);
 
       await NFT.connect(accounts[0]).transferFrom(
         accounts[0].address,
@@ -2242,11 +2376,18 @@ describe('@unit DKGStakingConvictionNFT', () => {
         1,
       );
 
-      // Alice no longer owns the NFT — wrapper-layer ownership gate fires.
-      await expect(NFT.connect(accounts[0]).claim(1)).to.be.revertedWithCustomError(
-        NFT,
-        'NotPositionOwner',
-      );
+      const rawBefore = (await ConvictionStakingStorageContract.getPosition(1)).raw;
+      // Alice no longer owns the NFT, but claimFor is permissionless and settles
+      // to the tokenId-keyed position (now Bob's).
+      const tx = await StakingV10Contract.connect(accounts[0]).claimFor(1);
+      await expect(tx)
+        .to.emit(StakingV10Contract, 'RewardsClaimed')
+        .withArgs(1n, expectedReward);
+
+      expect(await NFT.ownerOf(1)).to.equal(accounts[4].address);
+      const posAfter = await ConvictionStakingStorageContract.getPosition(1);
+      expect(posAfter.raw).to.equal(rawBefore + expectedReward);
+      expect(posAfter.cumulativeRewardsClaimed).to.equal(expectedReward);
     });
 
     it('Alice cannot relock / redelegate / withdraw after transfer', async () => {
@@ -2468,6 +2609,17 @@ describe('@unit DKGStakingConvictionNFT', () => {
       expect((await ConvictionStakingStorageContract.getPosition(2)).multiplier18).to.equal(
         THREE_AND_HALF_X,
       );
+    });
+  });
+
+  describe('version()', () => {
+    it('wrapper reverts to 10.0.3 (no redeploy); StakingV10 bumps to 10.0.5 (claimFor)', async () => {
+      // Permissionless claim now lives on StakingV10.claimFor, so the ERC-721
+      // wrapper is unchanged from 10.0.0 (10.0.3) — it does NOT get redeployed
+      // and existing position NFTs are never orphaned. StakingV10 carries the
+      // new entry point (+ the #1297 boost-expiry fix) at 10.0.5.
+      expect(await NFT.version()).to.equal('10.0.3');
+      expect(await StakingV10Contract.version()).to.equal('10.0.5');
     });
   });
 

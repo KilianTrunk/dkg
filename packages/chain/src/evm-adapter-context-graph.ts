@@ -9,16 +9,21 @@
  * via applyMixins(); see evm-adapter.ts for the assembly.
  */
 
-import { EVMChainAdapterBase } from './evm-adapter-base.js';
-import { ethers, Contract } from 'ethers';
-import type { CreateContextGraphParams, TxResult, ContextGraphOnChain, CreateOnChainContextGraphParams, CreateOnChainContextGraphResult, VerifyParams, PublishToContextGraphParams, OnChainPublishResult } from './chain-adapter.js';
+import { EVMChainAdapterBase, CG_REGISTRY_MAX_SCAN_PAGES, CG_REGISTRY_REORG_BUFFER_BLOCKS } from './evm-adapter-base.js';
+import { isTooLowAllowanceError } from './evm-adapter-errors.js';
+import { ethers, Contract, type JsonRpcProvider } from 'ethers';
+import { ContextGraphChainScanPartialError, type CreateContextGraphParams, type TxResult, type ContextGraphOnChain, type ContextGraphChainScanOptions, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type VerifyParams, type PublishToContextGraphParams, type OnChainPublishResult } from './chain-adapter.js';
 import { buildAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1 } from '@origintrail-official/dkg-core';
 
 export class ContextGraphMethods extends EVMChainAdapterBase {
   /**
    * Reserve the next authorized signer and return its address. The publisher
    * uses this to bind off-chain signatures to the tx signer before
-   * `publishDirect` is submitted.
+   * `publishDirect` is submitted. This pre-pin runs BEFORE the publish cost is
+   * known (and the ChainAdapter interface advertises no cost arg), so it selects
+   * on the funding floor only — cost-aware selection lives inside
+   * `createKnowledgeAssets` (the no-`publisherAddress` path), and pin-time
+   * pricing is tracked as a follow-up (#1328).
    */
   async getAuthorizedPublisherAddress(contextGraphId: bigint): Promise<string> {
     await this.init();
@@ -100,31 +105,126 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
     return { hash: receipt.hash, blockNumber: receipt.blockNumber, txIndex: receipt.index, success: true };
   }
 
-  async listContextGraphsFromChain(fromBlock?: number): Promise<ContextGraphOnChain[]> {
+  async hasContextGraphRegistryScanWatermark(): Promise<boolean> {
+    await this.init();
+    const registry = this.contracts.contextGraphNameRegistry;
+    if (!registry) return false;
+    const registryAddress = (await registry.getAddress()).toLowerCase();
+    return this.contextGraphRegistryScanWatermarks.has(registryAddress);
+  }
+
+  async listContextGraphsFromChain(
+    fromBlock?: number,
+    options?: ContextGraphChainScanOptions,
+  ): Promise<ContextGraphOnChain[]> {
     await this.init();
     const registry = this.contracts.contextGraphNameRegistry;
     if (!registry) return [];
     const eventFilter = registry.filters.NameClaimed();
-    const head = await this.provider.getBlockNumber();
-    const PAGE = 9_000;
-    const start = fromBlock ?? 0;
-    const results: ContextGraphOnChain[] = [];
-
-    // Paginate in PAGE-sized chunks to stay within RPC range limits.
-    for (let lo = start; lo <= head; lo += PAGE) {
-      const hi = Math.min(lo + PAGE - 1, head);
-      const logs = await registry.queryFilter(eventFilter, lo, hi);
-      for (const log of logs) {
-        const parsed = registry.interface.parseLog({ topics: [...log.topics], data: log.data });
-        if (!parsed || parsed.name !== 'NameClaimed') continue;
-        results.push({
-          contextGraphId: String(parsed.args.nameHash),
-          creator: String(parsed.args.creator),
-          accessPolicy: Number(parsed.args.accessPolicy),
-          blockNumber: log.blockNumber,
-          metadataRevealed: false,
-        });
+    const registryAddress = (await registry.getAddress()).toLowerCase();
+    const incremental = options?.incremental === true && fromBlock === undefined;
+    const seedIncrementalWatermark =
+      options?.seedIncrementalWatermark === true && !incremental && fromBlock === undefined;
+    const watermark = incremental
+      ? this.contextGraphRegistryScanWatermarks.get(registryAddress)
+      : undefined;
+    const scan =
+      fromBlock === undefined
+        ? incremental && watermark !== undefined
+          ? { fromBlock: 0, ...(await this.resolveLogScanHead('listContextGraphsFromChain')) }
+          : await this.resolveContractDeployBlock(
+              registryAddress,
+              'listContextGraphsFromChain',
+              'ContextGraphNameRegistry',
+            )
+        : { fromBlock, ...(await this.resolveLogScanHead('listContextGraphsFromChain')) };
+    const { fromBlock: deployBlock, head, scanProviders, degradedFromGenesis = false } = scan;
+    const start = fromBlock ?? (
+      incremental && watermark !== undefined
+        ? Math.max(0, watermark - CG_REGISTRY_REORG_BUFFER_BLOCKS)
+        : deployBlock
+    );
+    if (start > head) {
+      if (seedIncrementalWatermark) {
+        this.contextGraphRegistryScanWatermarks.set(registryAddress, head + 1);
       }
+      return [];
+    }
+
+    const pageSize = this.cgRegistryScanPageSize;
+    const pages = Math.ceil((head - start + 1) / pageSize);
+    const blockBudget = CG_REGISTRY_MAX_SCAN_PAGES * pageSize;
+    if (incremental && !degradedFromGenesis && pages > CG_REGISTRY_MAX_SCAN_PAGES) {
+      throw new Error(
+        `listContextGraphsFromChain: incremental ContextGraphNameRegistry scan would need ` +
+          `${pages} eth_getLogs calls over blocks [${start}, ${head}] at a ` +
+          `${pageSize}-block window (budget ${CG_REGISTRY_MAX_SCAN_PAGES} pages / ` +
+          `${blockBudget} blocks). ` +
+          `Use an RPC that can anchor the registry deploy block and serve the ` +
+          `requested log range, or increase cgRegistryScanPageSize for an RPC ` +
+          `known to support larger ranges.`,
+      );
+    }
+
+    const results: ContextGraphOnChain[] = [];
+    const connected = new Map<JsonRpcProvider, Contract>();
+    let preferred: JsonRpcProvider | undefined;
+    let scannedAnyPage = false;
+
+    // Incremental daemon scans can resume from the scanned prefix after a later
+    // page failure. Public list-all calls should remain all-or-error.
+    for (let lo = start; lo <= head; lo += pageSize) {
+      const hi = Math.min(lo + pageSize - 1, head);
+      try {
+        const page = await this.queryEventLogsPage(
+          registry,
+          eventFilter,
+          lo,
+          hi,
+          scanProviders,
+          connected,
+          'listContextGraphsFromChain NameClaimed',
+          preferred,
+        );
+        preferred = page.provider;
+        const pageResults: ContextGraphOnChain[] = [];
+        for (const log of page.logs) {
+          const parsed = registry.interface.parseLog({ topics: [...log.topics], data: log.data });
+          if (!parsed || parsed.name !== 'NameClaimed') continue;
+          pageResults.push({
+            contextGraphId: String(parsed.args.nameHash),
+            creator: String(parsed.args.creator),
+            accessPolicy: Number(parsed.args.accessPolicy),
+            blockNumber: log.blockNumber,
+            metadataRevealed: false,
+          });
+        }
+        results.push(...pageResults);
+        scannedAnyPage = true;
+        if (incremental) {
+          this.contextGraphRegistryScanWatermarks.set(registryAddress, hi + 1);
+        }
+      } catch (err) {
+        if (incremental && scannedAnyPage) {
+          const message = err instanceof Error ? err.message : String(err);
+          throw new ContextGraphChainScanPartialError(
+            `listContextGraphsFromChain: partial ContextGraphNameRegistry scan ` +
+              `stopped after block ${lo - 1}; failed page [${lo}, ${hi}]: ${message}`,
+            {
+              partialResults: results,
+              scannedToBlock: lo - 1,
+              failedFromBlock: lo,
+              failedToBlock: hi,
+              cause: err,
+            },
+          );
+        }
+        throw err;
+      }
+    }
+
+    if (seedIncrementalWatermark) {
+      this.contextGraphRegistryScanWatermarks.set(registryAddress, head + 1);
     }
 
     return results;
@@ -137,12 +237,10 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
   /** True when `contextGraphId` is an active minted CG in ContextGraphStorage. */
   async isContextGraphActiveOnChain(contextGraphId: bigint): Promise<boolean> {
     await this.init();
-    if (!this.contracts.contextGraphStorage) return false;
-    try {
-      return Boolean(await this.contracts.contextGraphStorage.isContextGraphActive(contextGraphId));
-    } catch {
-      return false;
-    }
+    const cgs = this.requireContextGraphStorage();
+    return Boolean(await this.readContract(
+      cgs, 'cgStorage.isContextGraphActive', 'isContextGraphActive', contextGraphId,
+    ));
   }
 
   async createOnChainContextGraph(params: CreateOnChainContextGraphParams): Promise<CreateOnChainContextGraphResult> {
@@ -157,25 +255,67 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
         'Pass both explicitly — e.g. { accessPolicy: 1, publishPolicy: 0 } for invite-only + curators-only.',
       );
     }
-    const receipt = await this.sendContractTransaction(
-      this.contracts.contextGraphs,
-      'createContextGraph',
-      [
-        params.participantAgents ?? [],
-        params.metadataBatchId ?? 0n,
-        params.accessPolicy,
-        params.publishPolicy,
-        params.publishAuthority ?? ethers.ZeroAddress,
-        params.publishAuthorityAccountId ?? 0n,
-        // OT-RFC-38 / LU-6 Phase B — opt-in wire-id commitment. Default
-        // `bytes32(0)` opts out; the agent supplies a non-zero hash
-        // (typically `keccak256(bytes(cleartextId))`) to enable cores'
-        // chain-event-driven host-mode auto-subscribe path.
-        params.nameHash ?? ethers.ZeroHash,
-      ],
-      this.signer,
-      'create on-chain context graph',
-    );
+
+    const contextGraphs = this.contracts.contextGraphs;
+    const createArgs = [
+      params.participantAgents ?? [],
+      params.metadataBatchId ?? 0n,
+      params.accessPolicy,
+      params.publishPolicy,
+      params.publishAuthority ?? ethers.ZeroAddress,
+      params.publishAuthorityAccountId ?? 0n,
+      // OT-RFC-38 / LU-6 Phase B — opt-in wire-id commitment. Default
+      // `bytes32(0)` opts out; the agent supplies a non-zero hash
+      // (typically `keccak256(bytes(cleartextId))`) to enable cores'
+      // chain-event-driven host-mode auto-subscribe path.
+      params.nameHash ?? ethers.ZeroHash,
+    ];
+    const submitCreate = () =>
+      this.sendContractTransaction(
+        contextGraphs,
+        'createContextGraph',
+        createArgs,
+        this.signer,
+        'create on-chain context graph',
+      );
+
+    // OT-RFC-53: when the registration deposit is active, createContextGraph
+    // pulls it via transferFrom and reverts until the ContextGraphs facade is
+    // approved. Recover LAZILY (mirrors the publish/update #888 allowance
+    // recovery): on a first-attempt revert, if a deposit is actually configured,
+    // approve it to the facade and retry once. The common path (deposit dormant)
+    // is a single tx with NO extra eth_call, so it never perturbs timing-
+    // sensitive integration tests.
+    const receipt = await (async () => {
+      try {
+        return await submitCreate();
+      } catch (err) {
+        // Only the deposit-allowance revert is recoverable here. Mirror the
+        // publish/update allowance recovery (`isTooLowAllowanceError`): an
+        // unrelated first-attempt revert (invalid access/publish policy, PCA
+        // coherence failure, paused contract, insufficient balance, RPC error)
+        // must NOT trigger a state-changing TRAC approval before re-failing.
+        if (!isTooLowAllowanceError(err)) {
+          throw err;
+        }
+        const ps = this.contracts.parametersStorage as Contract | undefined;
+        let deposit = 0n;
+        try {
+          deposit = ps ? await ps.contextGraphRegistrationDeposit() : 0n;
+        } catch {
+          deposit = 0n;
+        }
+        if (deposit === 0n) throw err;
+        await this.ensureV10ApproveTrac(
+          this.signer,
+          await contextGraphs.getAddress(),
+          deposit,
+          'cg registration deposit',
+          true,
+        );
+        return submitCreate();
+      }
+    })();
 
     let contextGraphId: bigint | undefined;
     for (const log of receipt.logs) {
@@ -241,6 +381,23 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
       throw new Error('KnowledgeAssetsStorage contract not deployed (required for log parsing).');
     }
 
+    // V9→V10 mirror — NOT SUPPORTED under OT-RFC-43 Option-1 / §F2. A V10
+    // Knowledge Asset id is author-namespaced and the AuthorAttestation digest
+    // binds the reserved packed kaId; this legacy mirror has no allocator and no
+    // reserved id to sign over, so it cannot synthesize a mintable attestation
+    // (the on-chain createKnowledgeAssets rejects a namespace-mismatched id).
+    // Publish through the V10 lifecycle (finalize → swm/share → vm/publish).
+    //
+    // This guard MUST run before ANY on-chain side effect (the TRAC approve and
+    // the legacy `ka.publishToContextGraph` tx below): throwing after the send
+    // would leave a partially-applied publish on-chain and invite duplicate
+    // publishes on caller retry.
+    throw new Error(
+      'publishToContextGraph (V9→V10 mirror) is not supported under OT-RFC-43 Option-1: ' +
+        'publish through the V10 lifecycle (finalize → swm/share → vm/publish), which allocates ' +
+        'and binds the per-author reservedKaId into the author attestation.',
+    );
+
     const signer = await this.nextAuthorizedSigner(params.contextGraphId);
     const receiverIdentityIds = params.receiverSignatures.map((s) => s.identityId);
     const receiverRs = params.receiverSignatures.map((s) => ethers.hexlify(s.r));
@@ -249,11 +406,15 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
     const participantRs = params.participantSignatures.map((s) => ethers.hexlify(s.r));
     const participantVSs = params.participantSignatures.map((s) => ethers.hexlify(s.vs));
 
-    const ka = this.contracts.knowledgeAssets.connect(signer) as any;
-    const kaAddress = await this.contracts.knowledgeAssets.getAddress();
+    // Non-null assertions: the guards above (and the unsupported-mirror throw)
+    // make this block unreachable, so TS no longer carries the `knowledgeAssets`/
+    // `token` presence narrowing here. Kept for type-completeness until the
+    // mirror is removed.
+    const ka = this.contracts.knowledgeAssets!.connect(signer) as any;
+    const kaAddress = await this.contracts.knowledgeAssets!.getAddress();
 
     if (this.contracts.token && params.tokenAmount > 0n) {
-      const token = this.contracts.token.connect(signer) as Contract;
+      const token = this.contracts.token!.connect(signer) as Contract;
       const currentAllowance: bigint = await token.allowance(signer.address, kaAddress);
       if (currentAllowance < params.tokenAmount) {
         await this.sendContractTransaction(
@@ -309,18 +470,17 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
       );
     }
 
-    // V9→V10 mirror: synthesize an RFC-001 author attestation using the
-    // V9 publish signer as the author of record. The signer is the same
-    // wallet that signed the V9 publisher digest above, so attribution
-    // stays consistent across the legacy/canonical pair.
-    const v10ChainId = (await this.provider.getNetwork()).chainId;
+    // Unreachable below (kept for type-completeness until the mirror is removed);
+    // the unsupported-mirror guard above throws before any on-chain side effect.
+    const v10ChainId = (await this.readProvider('getNetwork (chainId)', (p) => p.getNetwork())).chainId;
     const v10KavAddress = await this.contracts.knowledgeAssetsLifecycle!.getAddress();
     const authorTypedData = buildAuthorAttestationTypedData({
       chainId: v10ChainId,
       kav10Address: v10KavAddress,
-      contextGraphId: params.contextGraphId,
+      // #1116: AuthorAttestation no longer binds contextGraphId.
       merkleRoot: params.merkleRoot,
       authorAddress: signer.address,
+      reservedKaId: 0n,
     });
     const authorSig = ethers.Signature.from(
       await signer.signTypedData(
@@ -356,21 +516,27 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
   async getKAContextGraphId(kaId: bigint): Promise<bigint> {
     await this.init();
     const cgs = this.requireContextGraphStorage();
-    const cgId: bigint = await cgs.kaToContextGraph(kaId);
+    const cgId: bigint = await this.readContract(
+      cgs, 'cgStorage.kaToContextGraph', 'kaToContextGraph', kaId,
+    );
     return BigInt(cgId);
   }
 
   async getContextGraphKCCount(contextGraphId: bigint): Promise<bigint> {
     await this.init();
     const cgs = this.requireContextGraphStorage();
-    const count: bigint = await cgs.getContextGraphKCCount(contextGraphId);
+    const count: bigint = await this.readContract(
+      cgs, 'cgStorage.getContextGraphKaCount', 'getContextGraphKaCount', contextGraphId,
+    );
     return BigInt(count);
   }
 
   async getContextGraphKCAt(contextGraphId: bigint, index: bigint): Promise<bigint> {
     await this.init();
     const cgs = this.requireContextGraphStorage();
-    const kaId: bigint = await cgs.getContextGraphKCAt(contextGraphId, index);
+    const kaId: bigint = await this.readContract(
+      cgs, 'cgStorage.getContextGraphKaAt', 'getContextGraphKaAt', contextGraphId, index,
+    );
     return BigInt(kaId);
   }
 
@@ -386,11 +552,15 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
     await this.init();
     const cgs = this.requireContextGraphStorage();
     try {
-      const raw: bigint = BigInt(await cgs.getAccessPolicy(contextGraphId));
+      const raw: bigint = BigInt(await this.readContract(
+        cgs, 'cgStorage.getAccessPolicy', 'getAccessPolicy', contextGraphId,
+      ));
       return Number(raw);
     } catch (primaryErr) {
       try {
-        const cg = await cgs.getContextGraph(contextGraphId);
+        const cg = await this.readContract(
+          cgs, 'cgStorage.getContextGraph', 'getContextGraph', contextGraphId,
+        );
         const raw =
           cg?.accessPolicy
           ?? (Array.isArray(cg) ? cg[5] : undefined);
@@ -423,7 +593,9 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
   }> {
     await this.init();
     const cgs = this.requireContextGraphStorage();
-    const result = await cgs.getPublishPolicy(contextGraphId);
+    const result = await this.readContract(
+      cgs, 'cgStorage.getPublishPolicy', 'getPublishPolicy', contextGraphId,
+    );
     // Ethers v6 returns named tuple as both array and object access;
     // destructure positionally to stay robust against ABI naming
     // changes.
@@ -451,7 +623,9 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
   async getContextGraphParticipantAgents(contextGraphId: bigint): Promise<string[]> {
     await this.init();
     const cgs = this.requireContextGraphStorage();
-    const raw: string[] = await cgs.getParticipantAgents(contextGraphId);
+    const raw: string[] = await this.readContract(
+      cgs, 'cgStorage.getParticipantAgents', 'getParticipantAgents', contextGraphId,
+    );
     return raw.map((addr: string) => ethers.getAddress(addr));
   }
 
@@ -475,7 +649,9 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
   async getContextGraphNameHash(contextGraphId: bigint): Promise<string | null> {
     await this.init();
     const cgs = this.requireContextGraphStorage();
-    const raw: string = await cgs.getNameHash(contextGraphId);
+    const raw: string = await this.readContract(
+      cgs, 'cgStorage.getNameHash', 'getNameHash', contextGraphId,
+    );
     if (!raw || raw === ethers.ZeroHash) return null;
     return raw.toLowerCase();
   }

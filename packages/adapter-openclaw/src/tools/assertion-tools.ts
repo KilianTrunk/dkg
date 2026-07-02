@@ -14,15 +14,50 @@ export function buildAssertionTools(ctx: DkgToolHost): OpenClawTool[] {
   return [
     // ── Assertion lifecycle (Working Memory) ───────────────────────────────
     {
-      name: 'dkg_assertion_create',
+      name: 'dkg_knowledge_asset_create',
       description:
-        'Step 1 of the canonical flow. Create a per-agent Working Memory assertion graph. Idempotent: a ' +
-        'duplicate name returns `{ assertionUri: null, alreadyExists: true }`.',
+        'Step 1 of the canonical flow (create → write → finalize → share → publish). Create a per-agent ' +
+        'Working Memory draft for a knowledge asset. Idempotent: a duplicate name returns ' +
+        '`{ assertionUri: null, alreadyExists: true }`. ' +
+        'ONE-SHOT (optional): pass non-empty `quads` to write + seal in this one call — it STOPS at a ' +
+        'sealed Working Memory draft (private; does NOT auto-share). Add `also_share_swm: true` to also share ' +
+        'to Shared Working Memory in the same call, landing a publish-ready knowledge asset in SWM (the ' +
+        'recommended create → write → seal → share one-shot). This NEVER mints on-chain: to publish to ' +
+        'Verifiable Memory you then call `dkg_knowledge_asset_publish`. Omit `quads` for the stepwise flow ' +
+        '(`dkg_knowledge_asset_write` / `_finalize` / `_share` separately).',
       parameters: {
         type: 'object',
         properties: {
           context_graph_id: { type: 'string', description: `Target context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
-          name: { type: 'string', description: 'Assertion name (lowercase letters, digits, hyphens).' },
+          name: { type: 'string', description: 'Knowledge asset name. Any IRI-safe name up to 256 chars: no "/", no whitespace, no <>"{}|^`\\ characters. (Mixed case, dots, and underscores are fine — it is NOT restricted to a lowercase-hyphen slug.)' },
+          // [D3] optional one-shot quads — same auto-typed shape as dkg_knowledge_asset_write
+          // (object values starting with http://, https://, urn:, did: are URIs; anything else is a
+          // literal). No per-quad `graph` field — the daemon pins quads to the per-KA WM graph.
+          quads: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                subject: { type: 'string', description: 'Subject URI.' },
+                predicate: { type: 'string', description: 'Predicate URI.' },
+                object: { type: 'string', description: 'Object URI or literal (auto-typed).' },
+              },
+              required: ['subject', 'predicate', 'object'],
+            },
+            description:
+              'Optional one-shot triples. When present, the create call also writes these quads and SEALS the ' +
+              'draft (stops at a sealed WM draft). Omit for an empty draft you fill with dkg_knowledge_asset_write.',
+          },
+          // [D3] also_share_swm — only meaningful with `quads`. Defaults to FALSE; the handler passes it
+          // EXPLICITLY so the client helper's internal seal-true default cannot leak and silently auto-share.
+          also_share_swm: {
+            type: 'boolean',
+            description:
+              'When true (and `quads` are supplied), also SHARE the sealed asset to Shared Working Memory in ' +
+              'the same call, landing a publish-ready knowledge asset in SWM (the full create → write → seal → ' +
+              'share one-shot). Default false: stop at a sealed, private WM draft — sharing (the ' +
+              'private→networked step) stays explicit. Ignored when there are no `quads`.',
+          },
           sub_graph_name: { type: 'string', description: 'Optional sub-graph (must be pre-registered).' },
         },
         required: ['context_graph_id', 'name'],
@@ -30,15 +65,17 @@ export function buildAssertionTools(ctx: DkgToolHost): OpenClawTool[] {
       execute: async (_toolCallId, args) => ctx.handleAssertionCreate(args),
     },
     {
-      name: 'dkg_assertion_write',
+      name: 'dkg_knowledge_asset_write',
       description:
-        'Step 2 of the canonical flow. Append quads to an existing assertion. Object values are auto-typed as ' +
-        'URI or literal. Example: `{ subject: "https://example.org/a", predicate: "https://schema.org/name", object: "Alpha" }`.',
+        'Step 2 of the canonical flow. Append triples to a knowledge asset\'s Working Memory draft. Object ' +
+        'values are auto-typed as URI or literal. The daemon pins every triple to the per-asset WM graph, so ' +
+        'no named-graph field is accepted. Example: ' +
+        '`{ subject: "https://example.org/a", predicate: "https://schema.org/name", object: "Alpha" }`.',
       parameters: {
         type: 'object',
         properties: {
           context_graph_id: { type: 'string', description: `Target context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
-          name: { type: 'string', description: 'Assertion name (must already exist).' },
+          name: { type: 'string', description: 'Knowledge asset name (must already exist).' },
           quads: {
             type: 'array',
             items: {
@@ -47,11 +84,10 @@ export function buildAssertionTools(ctx: DkgToolHost): OpenClawTool[] {
                 subject: { type: 'string', description: 'Subject URI.' },
                 predicate: { type: 'string', description: 'Predicate URI.' },
                 object: { type: 'string', description: 'Object URI or literal.' },
-                graph: { type: 'string', description: 'Optional named graph URI.' },
               },
               required: ['subject', 'predicate', 'object'],
             },
-            description: 'Non-empty array of quads to append.',
+            description: 'Non-empty array of triples to append.',
           },
           sub_graph_name: { type: 'string', description: 'Must match the one used at create time.' },
         },
@@ -60,22 +96,79 @@ export function buildAssertionTools(ctx: DkgToolHost): OpenClawTool[] {
       execute: async (_toolCallId, args) => ctx.handleAssertionWrite(args),
     },
     {
-      name: 'dkg_assertion_promote',
+      name: 'dkg_knowledge_asset_finalize',
       description:
-        'Step 3 of the canonical flow. Promote an assertion (or selected root entities) from Working Memory ' +
-        'into Shared Working Memory. Finalize with dkg_shared_memory_publish (NOT dkg_publish — that helper ' +
-        'expects fresh quads and would append duplicates to SWM).',
+        'Step 3 of the canonical flow. Seal a knowledge asset\'s Working Memory draft — computes the merkle ' +
+        'root and signs the EIP-712 AuthorAttestation. Finalize always seals the WHOLE draft (there is no ' +
+        'subset parameter). A FULL share (dkg_knowledge_asset_share with entities omitted or "all") ' +
+        'auto-seals for you, so you only need to call this explicitly before sharing a SELECTIVE subset of ' +
+        'entities, or to re-seal after editing a previously-sealed draft. Sealing works even if the context ' +
+        'graph is NOT yet registered on-chain (registration happens at publish). Pass layer:"swm" to seal an ' +
+        'asset already shared to SWM (e.g. shared with skip_seal) — it recovers and seals the SWM content ' +
+        'without a delete-and-recreate. (External-signer / pre-signed ' +
+        'attestation is a tracked follow-up and is not exposed by this tool — author with author_agent_address.)',
       parameters: {
         type: 'object',
         properties: {
           context_graph_id: { type: 'string', description: `Target context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
-          name: { type: 'string', description: 'Assertion name to promote.' },
+          name: { type: 'string', description: 'Knowledge asset name to finalize.' },
+          author_agent_address: {
+            type: 'string',
+            description:
+              'Optional 0x author address to attest as. Omit to let the daemon default the author to the ' +
+              'request token\'s agent.',
+          },
+          scheme_version: { type: 'integer', description: 'Optional attestation scheme version.' },
+          layer: {
+            type: 'string',
+            enum: ['wm', 'swm'],
+            description:
+              'Which layer holds the content to seal. Default "wm" seals the open Working Memory draft. ' +
+              'Pass "swm" to seal an asset already shared to SWM (recovers + seals the SWM content without ' +
+              'delete-and-recreate).',
+          },
+          sub_graph_name: { type: 'string', description: 'Must match the one used at write time.' },
+        },
+        required: ['context_graph_id', 'name'],
+      },
+      execute: async (_toolCallId, args) => ctx.handleAssertionFinalize(args),
+    },
+    {
+      name: 'dkg_knowledge_asset_share',
+      description:
+        'Step 4 of the canonical flow. Share a knowledge asset (or selected root entities) from Working ' +
+        'Memory into Shared Working Memory. A FULL share (omit `entities` or pass "all") SEALS BY DEFAULT ' +
+        'and is then publish-ready — follow it with dkg_knowledge_asset_publish to mint the asset on-chain ' +
+        '(Verifiable Memory). Pass skip_seal:true to share WITHOUT sealing (an unsealed SWM share — seal it ' +
+        'later with dkg_knowledge_asset_finalize, where layer:"swm" works after sharing). If a default ' +
+        '(sealing) share cannot seal it fails CLOSED (409, Working Memory preserved) and returns a recovery ' +
+        'hint. For custom finalize/attestation options — ' +
+        'author_agent_address / scheme_version — call dkg_knowledge_asset_finalize EXPLICITLY first (the ' +
+        'default seal cannot carry them). A SELECTIVE subset ' +
+        '(`entities` set to a proper subset) shares ' +
+        'to SWM ONLY for peer visibility, is NOT sealed, and is NOT publishable to Verifiable Memory: ' +
+        'dkg_knowledge_asset_publish reconstructs the seal\'s full root set and rejects a truncated SWM with ' +
+        'a merkleRoot mismatch. To publish on-chain, share the full asset (or model the subset as its own ' +
+        'knowledge asset).',
+      parameters: {
+        type: 'object',
+        properties: {
+          context_graph_id: { type: 'string', description: `Target context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
+          name: { type: 'string', description: 'Knowledge asset name to share.' },
           entities: {
-            type: 'array',
+            type: ['string', 'array'],
             items: { type: 'string', description: 'Root entity URI.' },
             description:
-              'Root entity URIs to promote. Omit to promote every root entity in the assertion (default). ' +
-              'When provided, must be a non-empty array of URIs that already exist in the assertion.',
+              'Root entities to share. Omit (or pass the string "all") to share every root entity (full share, ' +
+              'seals by default + publish-ready). Provide a non-empty array of URIs that already exist in the asset to ' +
+              'share a subset — a subset shares to SWM only and is NOT publishable to Verifiable Memory. The only ' +
+              'accepted string value is "all".',
+          },
+          skip_seal: {
+            type: 'boolean',
+            description:
+              'Set true to share to SWM WITHOUT sealing (not publish-ready). Default (false) seals a full ' +
+              'share so it is immediately publish-ready. Ignored for a subset share, which is never sealed.',
           },
           sub_graph_name: { type: 'string', description: 'Must match the one used at write time.' },
         },
@@ -84,7 +177,84 @@ export function buildAssertionTools(ctx: DkgToolHost): OpenClawTool[] {
       execute: async (_toolCallId, args) => ctx.handleAssertionPromote(args),
     },
     {
-      name: 'dkg_assertion_discard',
+      name: 'dkg_knowledge_asset_publish',
+      description:
+        'Step 5 of the canonical flow. Publish ONE finalized + shared knowledge asset (by name) from Shared ' +
+        'Working Memory to Verifiable Memory on-chain, minting or updating it. Returns the asset\'s UAL ' +
+        '(Universal Asset Locator, `did:dkg:<chainId>/<knowledgeAssetsContractAddress>/<number>` — the middle ' +
+        'segment is the KnowledgeAssets (KAV10) contract address, NOT the author; the separate `authorAddress` ' +
+        'response field is the (different) seal author) plus `kaId`, `txHash`, `status`, ' +
+        'and `kas`. The seal already selects the author and the whole asset — do not pass author or selection ' +
+        'overrides. Multi-root-safe. This is THE canonical publish for a single named asset. Fails 409 if the ' +
+        'asset is not yet finalized + shared (run dkg_knowledge_asset_finalize / dkg_knowledge_asset_share ' +
+        'first). vm/publish ' +
+        'AUTO-registers an unregistered context graph on-chain at gas/TRAC cost regardless of ' +
+        '`register_if_needed` (no explicit register step is needed). `register_if_needed: true` only lets you ' +
+        'choose the registration\'s access_policy first.',
+      parameters: {
+        type: 'object',
+        properties: {
+          context_graph_id: { type: 'string', description: `Target context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
+          name: { type: 'string', description: 'Knowledge asset name to publish (must be finalized + shared).' },
+          publish_epochs: { type: 'integer', description: 'Optional number of epochs to publish for (positive integer).' },
+          publisher_node_identity_id_override: {
+            type: 'string',
+            description: 'Optional publisher node identity id override (non-negative integer, decimal string).',
+          },
+          register_if_needed: {
+            type: 'boolean',
+            description:
+              'Run an EXPLICIT on-chain registration before publishing, which lets you set access_policy on ' +
+              'that registration. NOTE: this does NOT gate whether registration happens — vm/publish ' +
+              'AUTO-registers an unregistered context graph at gas/TRAC cost regardless of this flag. Set it ' +
+              'only to choose the registration\'s access_policy (the implicit auto-register on publish ' +
+              'otherwise defaults the policy). CAVEAT: this explicit register route registers with the ' +
+              'daemon\'s DEFAULT publishPolicy (derived from access_policy) and does NOT preserve a context ' +
+              'graph\'s stored custom publishPolicy / contribution governance. For a CG created with a ' +
+              'non-default publishPolicy/PCA, register it explicitly with the desired policy first rather than ' +
+              'relying on register_if_needed. (Read access is unaffected; daemon-side rehydration tracked in ' +
+              'OriginTrail/dkg#1085.)',
+          },
+          access_policy: {
+            type: 'number',
+            description: 'Optional registration access policy: `0` for open, `1` for private. Requires `register_if_needed: true` — it only applies when registering the CG, and is rejected otherwise. Sets only the access policy; it does NOT preserve a stored custom publishPolicy (see register_if_needed; OriginTrail/dkg#1085).',
+          },
+          sub_graph_name: { type: 'string', description: 'Must match the one used at write/share time.' },
+        },
+        required: ['context_graph_id', 'name'],
+      },
+      execute: async (_toolCallId, args) => ctx.handleAssertionPublish(args),
+    },
+    {
+      name: 'dkg_knowledge_asset_pull_from',
+      description:
+        'Seed a fresh Working Memory draft for a knowledge asset from its current Shared Working Memory (swm) ' +
+        'or Verifiable Memory (vm) state — the edit-loop primitive (like git checkout). Use this to re-open ' +
+        'an already-shared or published asset for editing. Fails 409 (WM_DRAFT_CONFLICT) if an open draft ' +
+        'already exists; pass `on_conflict: "replace"` to overwrite it or discard the draft first.',
+      parameters: {
+        type: 'object',
+        properties: {
+          context_graph_id: { type: 'string', description: `Target context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
+          name: { type: 'string', description: 'Knowledge asset name to seed a draft for.' },
+          layer: {
+            type: 'string',
+            enum: ['swm', 'vm'],
+            description: 'Which layer to seed the draft from: "swm" (Shared Working Memory) or "vm" (Verifiable Memory).',
+          },
+          on_conflict: {
+            type: 'string',
+            enum: ['reject', 'replace'],
+            description: 'What to do if an open WM draft already exists. Defaults to "reject".',
+          },
+          sub_graph_name: { type: 'string', description: 'Must match the one used at write/share time.' },
+        },
+        required: ['context_graph_id', 'name', 'layer'],
+      },
+      execute: async (_toolCallId, args) => ctx.handleAssertionPullFrom(args),
+    },
+    {
+      name: 'dkg_knowledge_asset_discard',
       description:
         'Discard a Working Memory assertion without promoting it. Errors (400) if the assertion is missing.',
       parameters: {
@@ -99,7 +269,7 @@ export function buildAssertionTools(ctx: DkgToolHost): OpenClawTool[] {
       execute: async (_toolCallId, args) => ctx.handleAssertionDiscard(args),
     },
     {
-      name: 'dkg_assertion_import_file',
+      name: 'dkg_knowledge_asset_import_file',
       description:
         'Import a local document (markdown, PDF, etc.) into an assertion: the daemon runs its extraction ' +
         'pipeline and writes the resulting triples. text/markdown is native; other types need a registered ' +
@@ -119,10 +289,13 @@ export function buildAssertionTools(ctx: DkgToolHost): OpenClawTool[] {
       execute: async (_toolCallId, args) => ctx.handleAssertionImportFile(args),
     },
     {
-      name: 'dkg_assertion_query',
+      name: 'dkg_knowledge_asset_query',
       description:
-        'Dump every quad in an assertion as `{ quads, count }`. NOT a SPARQL endpoint — use dkg_query for ' +
-        'ad-hoc SPARQL.',
+        'Dump every triple in a knowledge asset\'s Working Memory DRAFT (the un-shared working copy) as ' +
+        '`{ quads, count }`. Query it BEFORE sharing: a FULL share empties the WM draft, so a query after ' +
+        'sharing returns 0 quads. To inspect already-shared content use dkg_query with view ' +
+        '"shared-working-memory" (or "verifiable-memory" once published). NOT a SPARQL endpoint — use ' +
+        'dkg_query for ad-hoc SPARQL.',
       parameters: {
         type: 'object',
         properties: {
@@ -135,7 +308,7 @@ export function buildAssertionTools(ctx: DkgToolHost): OpenClawTool[] {
       execute: async (_toolCallId, args) => ctx.handleAssertionQuery(args),
     },
     {
-      name: 'dkg_import_artifact_resolve',
+      name: 'dkg_knowledge_asset_import_artifact_resolve',
       description:
         'Optional validation/debug helper. Resolve a completed imported attachment/assertion into deterministic artifact metadata: source file hash, ' +
         'Markdown hash/form when available, extraction method, root entity, and structural counts. Skipped imports are rejected.',
@@ -153,7 +326,7 @@ export function buildAssertionTools(ctx: DkgToolHost): OpenClawTool[] {
       execute: async (_toolCallId, args) => ctx.handleImportArtifactResolve(args),
     },
     {
-      name: 'dkg_import_artifact_read_markdown',
+      name: 'dkg_knowledge_asset_import_artifact_read_markdown',
       description:
         'Read the Markdown source for a completed imported attachment through the daemon content-addressed file store. ' +
         'Never reads arbitrary filesystem paths; the daemon resolves the Markdown hash from import metadata.',
@@ -172,7 +345,7 @@ export function buildAssertionTools(ctx: DkgToolHost): OpenClawTool[] {
       execute: async (_toolCallId, args) => ctx.handleImportArtifactReadMarkdown(args),
     },
     {
-      name: 'dkg_semantic_enrichment_write',
+      name: 'dkg_knowledge_asset_semantic_enrichment_write',
       description:
         'Append model-derived semantic triples into the completed imported assertion with daemon-stamped provenance. ' +
         'This does not promote, finalize, or publish.',
@@ -206,7 +379,7 @@ export function buildAssertionTools(ctx: DkgToolHost): OpenClawTool[] {
       execute: async (_toolCallId, args) => ctx.handleSemanticEnrichmentWrite(args),
     },
     {
-      name: 'dkg_assertion_history',
+      name: 'dkg_knowledge_asset_history',
       description:
         'Fetch an assertion\'s lifecycle descriptor (author, extraction status, promotion state). ' +
         'Returns 404 if no record exists.',

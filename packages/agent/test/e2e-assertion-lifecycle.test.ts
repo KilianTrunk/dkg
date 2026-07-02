@@ -62,7 +62,8 @@ describe('Assertion lifecycle (single agent)', () => {
 
     const uri = await agent.assertion.create(CG_ID, 'draft-1');
     expect(uri).toContain(CG_ID);
-    expect(uri).toContain('draft-1');
+    // Uniform layout: WM graph is number-keyed (…/_working_memory/{addr}/{number}), not name-keyed.
+    expect(uri).toContain('/_working_memory/');
 
     await agent.assertion.write(CG_ID, 'draft-1', [
       { subject: 'urn:alice', predicate: 'http://schema.org/name', object: '"Alice"' },

@@ -8,11 +8,11 @@ The adapter is a thin bridge into the DKG node. It does not run its own DKG node
 
 - bridges the DKG node UI to a local OpenClaw agent
 - keeps connected-agent chat persisted in DKG Working Memory via the `chat-turns` assertion of the `agent-context` context graph
-- registers the DKG memory provider as OpenClaw's memory-slot capability, so slot-backed recall reads flow through real V10 primitives (assertion-scoped SPARQL queries with `view: 'working-memory'`, `'shared-working-memory'`, and `'verified-memory'`) rather than the legacy filesystem-watcher path
+- registers the DKG memory provider as OpenClaw's memory-slot capability, so slot-backed recall reads flow through real V10 primitives (assertion-scoped SPARQL queries with `view: 'working-memory'`, `'shared-working-memory'`, and `'verifiable-memory'`) rather than the legacy filesystem-watcher path
 - exposes DKG agent-network tools to the OpenClaw runtime
 - funds the generated admin wallet plus operational wallets via the testnet faucet on first setup (skippable with `--no-fund`; failures are non-fatal and log manual `curl` instructions)
 
-Memory writes are not exposed as an adapter tool. The agent persists memory through direct daemon routes listed in `packages/cli/skills/dkg-node/SKILL.md` §5 (`POST /api/assertion/create` on first use of a fresh project CG, then `POST /api/assertion/:name/write` for each write). The daemon serves the skill document at `GET /.well-known/skill.md`, so the agent sees it on startup and calls the routes directly.
+Memory writes are not exposed as an adapter tool. The agent persists memory through direct daemon routes listed in `packages/cli/skills/dkg-node/SKILL.md` §5: `POST /api/knowledge-assets` (create) on first use of a fresh project CG, then `POST /api/knowledge-assets/:name/wm/write` for each write. To anchor knowledge beyond Working Memory, the agent continues the canonical 5-stage lifecycle — `wm/finalize` (seal) → `swm/share` → `vm/publish` (mint on chain, returns the asset's UAL) — see SKILL.md §5 / §10 for the full flow and response body. The daemon serves the skill document at `GET /.well-known/skill.md`, so the agent sees it on startup and calls the routes directly.
 
 ## What It Does Not Do Anymore
 
@@ -43,12 +43,13 @@ openclaw gateway restart
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
+| `--network <name>` | `mainnet-gnosis` (fresh node) | Network to set up on (`mainnet-gnosis` \| `mainnet-base` \| `testnet`), persisted as `config.networkConfig`. Applies to a FRESH node only; an existing node keeps its current network (switch with `dkg init --network`). |
 | `--no-fund` | off | Skip the testnet faucet call during setup. Use this if your wallets are already funded, the faucet is unreachable, or you're running offline. |
 | `--no-start` | off | Skip starting the DKG daemon (configure only). |
 | `--no-verify` | off | Skip the post-setup verification pass. |
 | `--dry-run` | off | Preview the setup actions without writing anything. |
 
-Faucet funding is best-effort: a failed call logs a manual `curl` block and setup continues. See the main repo's [Testnet Funding](../../README.md#testnet-funding) section and [`docs/setup/TESTNET_FAUCET.md`](../../docs/setup/TESTNET_FAUCET.md) for request/response semantics, rate limits, and error codes.
+Faucet funding only runs on testnet (mainnet networks have no faucet) and is best-effort: a failed call logs a manual `curl` block and setup continues. See the main repo's [Funding](../../README.md#funding) section and [`TESTNET_FAUCET.md`](../../docs/archive/internal/setup/TESTNET_FAUCET.md) for request/response semantics, rate limits, and error codes.
 
 ## Verification
 
@@ -83,7 +84,7 @@ Environment override: `OPENCLAW_STATE_DIR` overrides the adapter state root at r
 
 **Disconnect semantics.** The node UI's "Disconnect" button removes `plugins.entries.adapter-openclaw` entirely from `~/.openclaw/openclaw.json` (including any customized `config` values) AND removes `$WORKSPACE_DIR/skills/dkg-node/SKILL.md` (the canonical DKG node skill installed by setup). Other skills under `skills/` and sibling files under `skills/dkg-node/` are untouched. If you had set a non-default `daemonUrl` (for example via `dkg openclaw setup --port 9300` or a remote daemon URL), re-run `dkg openclaw setup --port <N>` after Reconnect to restore it — Reconnect also re-installs the skill document. Default-port users see no visible difference across a Disconnect/Reconnect cycle aside from the brief absence of the skill file.
 
-Memory flows exclusively through `api.registerMemoryCapability` for slot-backed recall reads (handled by `DkgMemorySearchManager`, which fans out four parallel SPARQL queries — one against `agent-context` / `chat-turns` in working memory plus three against the resolved project CG's `memory` assertion with `view: 'working-memory'`, `'shared-working-memory'`, and `'verified-memory'` — and ranks the merged results with a trust-weighted score) and through the daemon routes documented in `packages/cli/skills/dkg-node/SKILL.md` for writes (`POST /api/assertion/create` on the first write to a fresh project CG, then `POST /api/assertion/:name/write` for each write after that).
+Memory flows exclusively through `api.registerMemoryCapability` for slot-backed recall reads (handled by `DkgMemorySearchManager`, which fans out four parallel SPARQL queries — one against `agent-context` / `chat-turns` in working memory plus three against the resolved project CG's `memory` assertion with `view: 'working-memory'`, `'shared-working-memory'`, and `'verifiable-memory'` — and ranks the merged results with a trust-weighted score) and through the daemon routes documented in `packages/cli/skills/dkg-node/SKILL.md` for writes (`POST /api/knowledge-assets` on the first write to a fresh project CG, then `POST /api/knowledge-assets/:name/wm/write` for each write after that).
 
 ## Notes
 

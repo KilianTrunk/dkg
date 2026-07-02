@@ -16,6 +16,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { DkgClient, ProjectRow } from './client.js';
+import { normalizeContextGraphId } from './client.js';
 import type { DkgConfig } from './config.js';
 import {
   NS,
@@ -25,6 +26,9 @@ import {
   bindingsToParagraphs,
   escapeSparqlLiteral,
   prettyTerm,
+  parseEntitySource,
+  sourceLabel,
+  type EntitySource,
 } from './sparql.js';
 import { EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION } from './tools/context-graph-description.js';
 
@@ -168,7 +172,7 @@ export function registerReadTools(
   // The two-axis schema migration (audit §7 item 5):
   //   - Old single `layer: 'wm' | 'swm' | 'union' | 'vm'` enum
   //   - New separate axes:
-  //       view: 'working-memory' | 'shared-working-memory' | 'verified-memory'
+  //       view: 'working-memory' | 'shared-working-memory' | 'verifiable-memory'
   //       includeSharedMemory?: boolean   (orthogonal — combines with view)
   //   - The legacy `'union'` mode (`view: 'working-memory'` ∪ SWM)
   //     was an enum-conflation of two orthogonal axes; callers
@@ -187,7 +191,7 @@ export function registerReadTools(
         'DKG context graph. Known prefixes are auto-prepended so you can ' +
         'just write `SELECT ?d WHERE { ?d a decisions:Decision }`. Scope ' +
         'with `view` — "working-memory" (default, private), ' +
-        '"shared-working-memory" (team), or "verified-memory" (on-chain). ' +
+        '"shared-working-memory" (team), or "verifiable-memory" (on-chain). ' +
         '`contextGraphId` and `view` are authoritative: local `GRAPH ?g` ' +
         'patterns are constrained to that resolved graph set. ' +
         'Set `includeSharedMemory: true` alongside `view: "working-memory"` ' +
@@ -200,9 +204,9 @@ export function registerReadTools(
           .describe(`${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION} Defaults to .dkg/config.yaml.`),
         subGraphName: z.string().optional().describe('Limit the query to a single sub-graph'),
         view: z
-          .enum(['working-memory', 'shared-working-memory', 'verified-memory'])
+          .enum(['working-memory', 'shared-working-memory', 'verifiable-memory'])
           .optional()
-          .describe('Memory tier: working-memory (default, private), shared-working-memory (team), verified-memory (on-chain).'),
+          .describe('Memory tier: working-memory (default, private), shared-working-memory (team), verifiable-memory (on-chain).'),
         includeSharedMemory: z
           .boolean()
           .optional()
@@ -249,13 +253,13 @@ export function registerReadTools(
           .optional()
           .describe(`${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION} Defaults to .dkg/config.yaml.`),
         view: z
-          .enum(['working-memory', 'shared-working-memory', 'verified-memory'])
+          .enum(['working-memory', 'shared-working-memory', 'verifiable-memory'])
           .optional()
           .describe(
             'Memory tier (explicit selection is STRICT — pick one tier only): ' +
               '"working-memory" (private WM only — pair with includeSharedMemory: true to add SWM), ' +
               '"shared-working-memory" (team SWM only), ' +
-              '"verified-memory" (on-chain VM only). ' +
+              '"verifiable-memory" (on-chain VM only). ' +
               'Omit `view` to get the WM ∪ SWM default (the V9-era `layer: "union"` shape).',
           ),
         includeSharedMemory: z
@@ -270,13 +274,13 @@ export function registerReadTools(
       // Default behaviour mirrors the historical `layer: 'union'` default:
       // when neither `view` nor `includeSharedMemory` is set, return WM∪SWM
       // (the shape callers learned via the V9 surface). Explicit
-      // `view: 'verified-memory'` routes to VM; explicit
+      // `view: 'verifiable-memory'` routes to VM; explicit
       // `view: 'shared-working-memory'` routes to SWM only;
       // `view: 'working-memory'` (without `includeSharedMemory: true`)
       // returns WM only.
       const scope =
-        view === 'verified-memory'
-          ? { view: 'verified-memory' as const }
+        view === 'verifiable-memory'
+          ? { view: 'verifiable-memory' as const }
           : view === 'shared-working-memory'
           ? { graphSuffix: '_shared_memory' as const }
           : view === 'working-memory'
@@ -306,7 +310,7 @@ SELECT DISTINCT ?s ?p WHERE { ?s ?p <${uri}> } LIMIT 50`,
         const inc = incoming.bindings ?? [];
         if (!out.length && !inc.length) {
           const scopeLabel =
-            view === 'verified-memory' ? 'verified-memory' :
+            view === 'verifiable-memory' ? 'verifiable-memory' :
             view === 'shared-working-memory' ? 'shared-working-memory' :
             view === 'working-memory'
               ? (includeSharedMemory === true ? 'working-memory∪swm' : 'working-memory')
@@ -340,6 +344,187 @@ SELECT DISTINCT ?s ?p WHERE { ?s ?p <${uri}> } LIMIT 50`,
     },
   );
 
+  // ── dkg_get_entity_sources ──────────────────────────────────────
+  // Verifiable grounding: return an entity's facts each tagged with the
+  // published Knowledge Asset that asserted it. This is an ADDRESSED read —
+  // the tool owns the query shape (one entity, a single view, no user solution
+  // modifiers), so the source named graph binds and stays scoped to the CG.
+  // That is why provenance is sound here but not for arbitrary `dkg_query`
+  // SELECTs (DISTINCT/LIMIT/UNION/SWM-union/minTrust all perturb a rewrite of
+  // a user query — see the closed #1252).
+  //
+  // A VM/SWM read binds MORE than per-KA partitions (root, per-collection
+  // `/context/{id}`, the SWM bucket), and a fact can live in both a per-KA
+  // partition and the root. Only the per-KA partition encodes a citable KA
+  // identity, so the handler attributes facts to a KA ONLY from those graphs,
+  // collapses the root duplicate, and discloses (not drops) unattributed
+  // facts. working-memory is not offered (private; needs an agent identity).
+  server.registerTool(
+    'dkg_get_entity_sources',
+    {
+      title: 'Describe Entity with Verifiable Sources',
+      description:
+        'Fetch the facts about an entity, each tagged with the Knowledge Asset that asserted it (author + KA number). With the default verifiable-memory view these are PUBLISHED, on-chain KA identities you can cite or verify; with shared-working-memory they are PRE-PUBLISH DRAFT handles (a reserved, not-yet-on-chain UAL that may still change or be discarded — not citable on chain). Answers "what is known about X, and who asserted each fact?". Reads ONE memory tier. Facts present only in non-per-KA graphs (root / reconcile / bucket) carry no per-KA identity; their count is disclosed, not listed as sources.',
+      inputSchema: {
+        uri: z.string().describe('Entity URI (e.g. urn:dkg:decision:shacl-on-vm-promotion)'),
+        projectId: z
+          .string()
+          .optional()
+          .describe(`${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION} Defaults to .dkg/config.yaml.`),
+        view: z
+          .enum(['shared-working-memory', 'verifiable-memory'])
+          .optional()
+          .describe('Memory tier to read sources from. Defaults to verifiable-memory (on-chain, citable). working-memory is intentionally not offered: it is private draft state (the engine requires an agent identity to read it) and is not a citable source.'),
+        subGraphName: z.string().optional().describe('Limit the read to a single sub-graph'),
+        limit: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe('Max attributed facts to render (default 100). A high-degree or many-publisher entity is truncated deterministically and the remainder disclosed, so the response cannot exhaust agent context.'),
+      },
+    },
+    async ({ uri, projectId, view, subGraphName, limit }): Promise<ToolResult> => {
+      const pid = resolveProject(projectId, config);
+      if (!pid) return projectErr();
+      // The client accepts a full `did:dkg:context-graph:<id>` and normalises it
+      // for the wire query, so the returned graphs are keyed by the bare id.
+      // Anchor parseEntitySource on the SAME normalised id (and scope the query
+      // with it), or a DID-form pid would double-prefix and mark every per-KA
+      // graph unattributed.
+      const cgId = normalizeContextGraphId(pid);
+      // Unwrap only a MATCHED `<…>` pair. Stripping `<` and `>` independently
+      // would rewrite a mismatched input like `<urn:x` to a different, valid
+      // entity (`urn:x`) and silently query it; leaving the stray delimiter in
+      // place lets the unsafe-char guard below reject it (fail closed).
+      const safeIri = uri.startsWith('<') && uri.endsWith('>') ? uri.slice(1, -1) : uri;
+      // Guard the IRI interpolation: reject anything that could break out of
+      // the `<…>` term. (A SPARQL injection here would let a caller widen the
+      // query beyond the single entity.) Mirrors core's UNSAFE_IRI_CHARS — the
+      // full control-char range (incl. NUL), not just `\s` — so the tool fails
+      // closed cleanly instead of surfacing a raw oxigraph parse error.
+      if (!safeIri || /[<>"{}|\\^\x60\x00-\x20]/.test(safeIri)) {
+        return err(`Unsafe entity URI: ${uri}`);
+      }
+      const scopeView = view ?? 'verifiable-memory';
+      try {
+        // Tool-owned shape: one entity, GRAPH ?g to bind the source, a single
+        // view (NOT includeSharedMemory — the union path would duplicate), no
+        // DISTINCT/LIMIT/ORDER. The engine constrains ?g to this CG's content
+        // graphs, so no `_meta`/`_private` and no cross-context bleed.
+        const result = await client.query({
+          sparql: `${PREFIXES}
+SELECT ?p ?o ?g WHERE { GRAPH ?g { <${safeIri}> ?p ?o } }`,
+          contextGraphId: cgId,
+          subGraphName,
+          view: scopeView,
+        });
+        const rows = result.bindings ?? [];
+        if (!rows.length) {
+          return ok(`No facts found for <${safeIri}> in '${cgId}' (view=${scopeView}).`);
+        }
+        // A VM/SWM read binds MORE than per-KA partitions: the root context
+        // graph, per-collection `/context/{id}` graphs, and the SWM bucket also
+        // appear, and a fact can be materialised in BOTH a per-KA partition and
+        // the root. Only the per-KA partition `…/_{layer}/{addr}/{number}`
+        // encodes a citable KA identity. So: group rows by fact (predicate +
+        // object); attribute a fact to a KA ONLY from per-KA sources; collapse
+        // the root duplicate (a fact in a per-KA partition AND the root is one
+        // attributed fact); keep multiple DISTINCT per-KA sources for one fact
+        // (genuine multi-publisher); and DISCLOSE — not silently drop — facts
+        // that have no per-KA source at all.
+        interface Fact {
+          p: string;
+          o: string;
+          ka: EntitySource[];
+        }
+        const facts = new Map<string, Fact>();
+        for (const b of rows) {
+          const p = bindingValue(b.p);
+          const o = bindingValue(b.o);
+          const src = parseEntitySource(bindingValue(b.g), cgId);
+          const key = JSON.stringify([p, o]);
+          const fact = facts.get(key) ?? { p, o, ka: [] };
+          if (src.author && src.kaNumber && !fact.ka.some((s) => s.sourceGraph === src.sourceGraph)) {
+            fact.ka.push(src);
+          }
+          facts.set(key, fact);
+        }
+        // Stable ordering BEFORE the cap so truncation is genuinely deterministic
+        // — the SPARQL query has no ORDER BY, so raw row order is backend/
+        // discovery-dependent. Facts sort by (predicate, object); each fact's KA
+        // sources by sourceGraph.
+        const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+        const attributed = [...facts.values()]
+          .filter((f) => f.ka.length > 0)
+          .map((f) => ({ ...f, ka: [...f.ka].sort((x, y) => cmp(x.sourceGraph, y.sourceGraph)) }))
+          .sort((a, b) => cmp(a.p, b.p) || cmp(a.o, b.o));
+        const unattributed = [...facts.values()].filter((f) => f.ka.length === 0);
+
+        if (!attributed.length) {
+          return ok(
+            `No KA-attributable facts for <${safeIri}> in '${cgId}' (view=${scopeView}). ` +
+              `${unattributed.length} fact(s) are present only in non-per-KA graphs ` +
+              `(root / reconcile / bucket), which do not encode a citable KA identity.`,
+          );
+        }
+
+        // Deterministic output cap: render at most `limit` attributed facts and
+        // only the sources THEY cite, so a high-degree / many-publisher entity
+        // cannot dump an unbounded MCP response. Remainder disclosed, not dropped.
+        const cap = limit ?? 100;
+        const shown = attributed.slice(0, cap);
+        const truncated = attributed.length - shown.length;
+        const kaSources = new Map<string, EntitySource>();
+        for (const f of shown) for (const s of f.ka) kaSources.set(s.sourceGraph, s);
+
+        const factLines = shown.map(
+          (f) => `- **${prettyTerm(f.p)}**: ${prettyTerm(f.o)}  ←  ${f.ka.map((s) => sourceLabel(s)).join(', ')}`,
+        );
+        const sourceLines = [...kaSources.values()]
+          .sort((a, b) => cmp(a.sourceGraph, b.sourceGraph))
+          .map((s) => `- ${sourceLabel(s)} (${s.memoryLayer}) — \`${s.sourceGraph}\``);
+        // Verifiable-memory sources are published/on-chain; shared-working-memory
+        // sources are pre-publish DRAFT (reserved, not-yet-on-chain) handles —
+        // condition the framing so a per-fact line can't be cited as on-chain.
+        const isVm = scopeView === 'verifiable-memory';
+        const n = kaSources.size;
+        const factsHeader = isVm
+          ? '## Facts (with verifiable KA sources)'
+          : '## Facts (with draft KA sources — shared-working-memory, not yet on-chain)';
+        const sourcesHeader = isVm
+          ? `## Sources (${n} verifiable KA${n === 1 ? '' : 's'})`
+          : `## Sources (${n} draft KA${n === 1 ? '' : 's'} — reserved UAL, not yet on-chain)`;
+        const parts = [
+          `# ${prettyTerm(safeIri)}`,
+          `<${safeIri}>  ·  view=${scopeView}`,
+          '',
+          factsHeader,
+          factLines.join('\n'),
+          '',
+          sourcesHeader,
+          sourceLines.join('\n'),
+        ];
+        if (truncated > 0) {
+          parts.push(
+            '',
+            `_${truncated} more attributed fact(s) not shown — raise \`limit\` (currently ${cap})._`,
+          );
+        }
+        if (unattributed.length) {
+          parts.push(
+            '',
+            `_${unattributed.length} additional fact(s) present only in non-per-KA graphs ` +
+              `(root / reconcile / bucket) — no citable KA identity — omitted._`,
+          );
+        }
+        return ok(parts.join('\n'));
+      } catch (e) {
+        return err(`Failed to describe entity sources: ${formatError(e)}`);
+      }
+    },
+  );
+
   // ── dkg_list_activity ───────────────────────────────────────────
   server.registerTool(
     'dkg_list_activity',
@@ -356,13 +541,13 @@ SELECT DISTINCT ?s ?p WHERE { ?s ?p <${uri}> } LIMIT 50`,
         agentUri: z.string().optional().describe('Only items attributed to this agent'),
         sinceIso: z.string().optional().describe('Earliest timestamp, ISO-8601'),
         view: z
-          .enum(['working-memory', 'shared-working-memory', 'verified-memory'])
+          .enum(['working-memory', 'shared-working-memory', 'verifiable-memory'])
           .optional()
           .describe(
             'Memory tier (explicit selection is STRICT — pick one tier only): ' +
               '"working-memory" (private WM only — pair with includeSharedMemory: true to add SWM), ' +
               '"shared-working-memory" (team SWM only), ' +
-              '"verified-memory" (on-chain VM only). ' +
+              '"verifiable-memory" (on-chain VM only). ' +
               'Omit `view` to get the WM ∪ SWM default (the V9-era `layer: "union"` shape).',
           ),
         includeSharedMemory: z
@@ -379,8 +564,8 @@ SELECT DISTINCT ?s ?p WHERE { ?s ?p <${uri}> } LIMIT 50`,
       // `view` nor `includeSharedMemory` is supplied. Explicit values
       // route to the requested tier (see dkg_get_entity for the parallel).
       const scope =
-        view === 'verified-memory'
-          ? { view: 'verified-memory' as const }
+        view === 'verifiable-memory'
+          ? { view: 'verifiable-memory' as const }
           : view === 'shared-working-memory'
           ? { graphSuffix: '_shared_memory' as const }
           : view === 'working-memory'

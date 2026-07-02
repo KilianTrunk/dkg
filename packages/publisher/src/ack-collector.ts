@@ -1,9 +1,6 @@
 import {
   PROTOCOL_STORAGE_ACK,
-  PROTOCOL_STORAGE_ACK_V2,
   PROTOCOL_STORAGE_UPDATE_ACK,
-  ACK_PROTOCOL_VERSION_V1_LU5,
-  ACK_PROTOCOL_VERSION_V2_LU11,
   encodePublishIntent,
   encodeUpdateIntent,
   decodeStorageACK,
@@ -11,7 +8,10 @@ import {
   computeUpdateACKDigest,
   isStorageACKDecline,
   isTransientStorageACKDeclineCode,
+  boundedDeclineCodeLabel,
   isSubscriptionSource,
+  withSpan,
+  getMetrics,
   type PublishIntentMsg,
   type UpdateIntentMsg,
   type StorageACKMsg,
@@ -88,7 +88,13 @@ export interface ACKCollectionResult {
   contextGraphId: bigint;
 }
 
-const DEFAULT_REQUIRED_ACKS = 3;
+/**
+ * Default ACK quorum when the chain's `minimumRequiredSignatures()` is
+ * unavailable. Exported so peer-pool providers (see
+ * `DKGAgent.getACKCandidatePeers`) can size their candidate pools to the
+ * same floor instead of hardcoding a drifting copy of this number.
+ */
+export const DEFAULT_REQUIRED_ACKS = 3;
 const ACK_TIMEOUT_MS = 120_000;
 const MAX_RETRIES = 3;
 // #887: transient declines (the core's SWM replica is still catching up
@@ -111,6 +117,24 @@ function transientDeclineBackoffMs(retry: number): number {
 }
 const MAX_DECLINE_CODE_CHARS = 64;
 const MAX_DECLINE_MESSAGE_CHARS = 240;
+
+/**
+ * Map a terminal {@link QuorumUnmetError} to the low-cardinality
+ * `ackQuorumTotal` outcome label. The collector encodes the failure kind
+ * only in the embedded `legacyMessage` prefix (no structured `kind`
+ * field): `storage_ack_timeout*` ⇒ the round ran out of time, every other
+ * quorum-fail throw (`no connected core peers`, `quorum impossible`,
+ * `storage_ack_insufficient`) ⇒ quorum was/became impossible.
+ */
+export function quorumOutcomeFromError(err: QuorumUnmetError): 'timeout' | 'impossible' {
+  const msg = err.legacyMessage ?? err.message ?? '';
+  // Classify on the structured PREFIX only. The message tail can embed
+  // sanitized peer-supplied decline text (`…Declines: ab12→NO_DATA_IN_SWM`),
+  // so a substring match on the whole string would let a peer that writes
+  // "storage_ack_timeout" into its decline message flip an insufficient/
+  // impossible quorum to 'timeout'. Only the timeout throw STARTS with the prefix.
+  return msg.startsWith('storage_ack_timeout') ? 'timeout' : 'impossible';
+}
 
 function sanitizeDeclineField(value: string, maxChars: number): string {
   const compacted = value.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
@@ -200,9 +224,18 @@ export class ACKCollector {
      * issuing curated publishes. A per-peer capability probe + V1
      * downgrade is filed as a follow-up — see TODO(rc.12.1) below.
      */
-    chunkedCommitment?: {
-      ciphertextChunksRoot: Uint8Array;
-      ciphertextChunkCount: number;
+    /**
+     * OT-RFC-49 / WS-D — the curated PUBLIC `_catalog` commitment (REPLACED
+     * the stripped ciphertext-chunks commitment). When present,
+     * `isEncryptedPayload` MUST be `true` and `stagingQuads` carries the
+     * catalog N-quads (plaintext, public). The collector packs
+     * `(catalogRoot, catalogLeafCount)` into the PublishIntent + the ACK
+     * digest; cores rebuild the same root over the inline catalog and DECLINE
+     * `CATALOG_ROOT_MISMATCH` on disagreement.
+     */
+    catalogCommitment?: {
+      catalogRoot: Uint8Array;
+      catalogLeafCount: number;
     };
   }): Promise<ACKCollectionResult> {
     const {
@@ -211,11 +244,76 @@ export class ACKCollector {
       kaCount, rootEntities, chainId, kav10Address,
     } = params;
     const REQUIRED_ACKS = params.requiredACKs ?? DEFAULT_REQUIRED_ACKS;
+    const chainIdLabel = chainId != null ? chainId.toString() : undefined;
+
+    return withSpan('publisher.ack_collect', async (span) => {
+      span.setAttributes({
+        'dkg.context_graph_id': contextGraphIdStr,
+        'dkg.required_acks': REQUIRED_ACKS,
+      });
+      try {
+        const result = await this.collectInner({
+          merkleRoot, contextGraphId, contextGraphIdStr,
+          publisherPeerId, publicByteSize, isPrivate,
+          kaCount, rootEntities, chainId, kav10Address,
+          REQUIRED_ACKS,
+          params,
+        });
+        span.setAttribute('dkg.collected_acks', result.acks.length);
+        getMetrics().ackQuorumTotal.add(1, {
+          outcome: 'reached',
+          ...(chainIdLabel ? { chain_id: chainIdLabel } : {}),
+        });
+        return result;
+      } catch (err) {
+        // QuorumUnmetError throw is auto-recorded by withSpan (ERROR status).
+        // Map its failure kind to the terminal quorum metric outcome.
+        if (err instanceof QuorumUnmetError) {
+          getMetrics().ackQuorumTotal.add(1, {
+            outcome: quorumOutcomeFromError(err),
+            ...(chainIdLabel ? { chain_id: chainIdLabel } : {}),
+          });
+        }
+        throw err;
+      }
+    });
+  }
+
+  /**
+   * Body of {@link collect}, split out so the public method is a thin
+   * `withSpan('publisher.ack_collect')` wrapper. Preserves the exact
+   * control flow + error propagation of the original method body.
+   */
+  private async collectInner(ctx: {
+    merkleRoot: Uint8Array;
+    contextGraphId: bigint;
+    contextGraphIdStr: string;
+    publisherPeerId: string;
+    publicByteSize: bigint;
+    isPrivate: boolean;
+    kaCount: number;
+    rootEntities: string[];
+    chainId: bigint;
+    kav10Address: string;
+    REQUIRED_ACKS: number;
+    params: Parameters<ACKCollector['collect']>[0];
+  }): Promise<ACKCollectionResult> {
+    const {
+      merkleRoot, contextGraphId, contextGraphIdStr,
+      publisherPeerId, publicByteSize, isPrivate,
+      kaCount, rootEntities, chainId, kav10Address,
+      REQUIRED_ACKS, params,
+    } = ctx;
 
     const log = this.deps.log ?? (() => {});
     if (!Number.isInteger(params.merkleLeafCount) || params.merkleLeafCount < 1) {
       throw new Error(
         `ACK collection failed: merkleLeafCount must be a positive integer, got ${params.merkleLeafCount}`,
+      );
+    }
+    if (params.kaCount !== 1) {
+      throw new Error(
+        `ACK collection failed: V10 publish requires exactly one Knowledge Asset (kaCount=1); got ${params.kaCount}`,
       );
     }
 
@@ -228,46 +326,37 @@ export class ACKCollector {
     // the ACK against. `swmGraphId` (optional) is the SOURCE graph where
     // data lives in SWM — only set when the publisher is remapping a named
     // SWM graph to a numeric on-chain id.
-    // OT-RFC-38 LU-11: chunked path requires V2 ACK protocol id and
-    // empty `stagingQuads` (chunks live on SWM, not on the ACK wire).
-    // Anything else is a programmer error in the publisher's branch
-    // selection — surface it loudly instead of silently shipping a
-    // V1 envelope that pre-LU-11 cores would still accept.
-    if (params.chunkedCommitment) {
+    // OT-RFC-49 / WS-D — a curated publish carries a non-zero catalog
+    // commitment AND the inline catalog N-quads (plaintext, public) so the
+    // core can rebuild + verify the catalog root self-contained. Surface a
+    // mis-wired branch loudly rather than ship a half-formed intent.
+    if (params.catalogCommitment) {
       if (!params.isEncryptedPayload) {
         throw new Error(
-          'ACKCollector: chunkedCommitment requires isEncryptedPayload=true (curated-CG-only path)',
+          'ACKCollector: catalogCommitment requires isEncryptedPayload=true (curated-CG-only path)',
         );
       }
-      if (params.stagingQuads && params.stagingQuads.length > 0) {
+      if (!params.stagingQuads || params.stagingQuads.length === 0) {
         throw new Error(
-          'ACKCollector: chunkedCommitment + non-empty stagingQuads is invalid — ' +
-          'on the LU-11 chunked path the ciphertext lives in SWM, not on the ACK wire',
+          'ACKCollector: catalogCommitment requires non-empty stagingQuads — ' +
+          'the curated ACK ships the public catalog N-quads inline so the core can ' +
+          'rebuild and verify the catalog root',
         );
       }
-      if (params.chunkedCommitment.ciphertextChunkCount <= 0) {
+      if (params.catalogCommitment.catalogLeafCount <= 0) {
         throw new Error(
-          `ACKCollector: chunkedCommitment.ciphertextChunkCount must be positive; got ${params.chunkedCommitment.ciphertextChunkCount}`,
+          `ACKCollector: catalogCommitment.catalogLeafCount must be positive; got ${params.catalogCommitment.catalogLeafCount}`,
         );
       }
-      if (params.chunkedCommitment.ciphertextChunksRoot.length !== 32) {
+      if (params.catalogCommitment.catalogRoot.length !== 32) {
         throw new Error(
-          `ACKCollector: chunkedCommitment.ciphertextChunksRoot must be 32 bytes; got ${params.chunkedCommitment.ciphertextChunksRoot.length}`,
+          `ACKCollector: catalogCommitment.catalogRoot must be 32 bytes; got ${params.catalogCommitment.catalogRoot.length}`,
         );
       }
     }
-    const ackProtocolVersion = params.chunkedCommitment
-      ? ACK_PROTOCOL_VERSION_V2_LU11
-      : ACK_PROTOCOL_VERSION_V1_LU5;
-    // TODO(rc.12.1, Codex review on PR #715): add per-peer capability
-    // probe so chunked publishes can opportunistically downgrade to V1
-    // for cores that don't advertise V2. Until then, chunked publishes
-    // require every quorum-target core to support V2 — see the
-    // `chunkedCommitment` field doc for the cluster-wide requirement
-    // and the rc.12 release-runbook rationale.
-    const ackProtocolId = params.chunkedCommitment
-      ? PROTOCOL_STORAGE_ACK_V2
-      : PROTOCOL_STORAGE_ACK;
+    // OT-RFC-49 collapsed the V2 chunked-ciphertext ACK path; the curated
+    // catalog ACK rides the V1 protocol with inline catalog stagingQuads.
+    const ackProtocolId = PROTOCOL_STORAGE_ACK;
     const p2pMsg: PublishIntentMsg = {
       merkleRoot,
       contextGraphId: contextGraphIdStr,
@@ -285,9 +374,8 @@ export class ACKCollector {
       subGraphName: params.subGraphName,
       merkleLeafCount: params.merkleLeafCount,
       isEncryptedPayload: params.isEncryptedPayload === true ? true : undefined,
-      ciphertextChunksRoot: params.chunkedCommitment?.ciphertextChunksRoot,
-      ciphertextChunkCount: params.chunkedCommitment?.ciphertextChunkCount,
-      ackProtocolVersion: params.chunkedCommitment ? ackProtocolVersion : undefined,
+      catalogRoot: params.catalogCommitment?.catalogRoot,
+      catalogLeafCount: params.catalogCommitment?.catalogLeafCount,
     };
     const intentBytes = encodePublishIntent(p2pMsg);
 
@@ -321,9 +409,9 @@ export class ACKCollector {
     }
     log(`[ACKCollector] Requesting ACKs from ${corePeers.length} core peers (need ${REQUIRED_ACKS})`);
 
-    const ciphertextRoot = params.chunkedCommitment?.ciphertextChunksRoot
+    const catalogRoot = params.catalogCommitment?.catalogRoot
       ?? new Uint8Array(32);
-    const ciphertextCount = BigInt(params.chunkedCommitment?.ciphertextChunkCount ?? 0);
+    const catalogLeafCount = BigInt(params.catalogCommitment?.catalogLeafCount ?? 0);
     const ackDigest = computePublishACKDigest(
       chainId,
       kav10Address,
@@ -334,8 +422,8 @@ export class ACKCollector {
       BigInt(params.epochs ?? 1),
       params.tokenAmount ?? 0n,
       BigInt(params.merkleLeafCount),
-      ciphertextRoot,
-      ciphertextCount,
+      catalogRoot,
+      catalogLeafCount,
       false,
     );
 
@@ -381,8 +469,8 @@ export class ACKCollector {
     mintAmount: bigint;
     burnTokenIds: bigint[];
     newMerkleLeafCount: number;
-    newCiphertextChunksRoot?: Uint8Array;
-    newCiphertextChunkCount?: number;
+    newCatalogRoot?: Uint8Array;
+    newCatalogLeafCount?: number;
     /** Numeric EVM chain id. Required by the H5 prefix in the UPDATE ACK digest. */
     chainId: bigint;
     /** Deployed `KnowledgeAssetsLifecycle` address. Required by the H5 prefix. */
@@ -417,8 +505,8 @@ export class ACKCollector {
     }
 
     const contextGraphIdStr = contextGraphId.toString();
-    const ciphertextRoot = params.newCiphertextChunksRoot ?? new Uint8Array(32);
-    const ciphertextCount = BigInt(params.newCiphertextChunkCount ?? 0);
+    const catalogRoot = params.newCatalogRoot ?? new Uint8Array(32);
+    const catalogCount = BigInt(params.newCatalogLeafCount ?? 0);
 
     const p2pMsg: UpdateIntentMsg = {
       kaId: kaId.toString(),
@@ -430,8 +518,8 @@ export class ACKCollector {
       mintAmount: Number(mintAmount),
       burnTokenIds: burnTokenIds.map((id) => id.toString()),
       newMerkleLeafCount,
-      newCiphertextChunksRoot: params.newCiphertextChunksRoot,
-      newCiphertextChunkCount: params.newCiphertextChunkCount,
+      newCatalogRoot: params.newCatalogRoot,
+      newCatalogLeafCount: params.newCatalogLeafCount,
       publisherPeerId,
       swmGraphId: params.swmGraphId && params.swmGraphId !== contextGraphIdStr
         ? params.swmGraphId
@@ -483,8 +571,8 @@ export class ACKCollector {
       mintAmount,
       burnTokenIds,
       BigInt(newMerkleLeafCount),
-      ciphertextRoot,
-      ciphertextCount,
+      catalogRoot,
+      catalogCount,
     );
 
     return this.runACKRound({
@@ -540,6 +628,17 @@ export class ACKCollector {
     // and follow the legacy retry path below — declines are strictly
     // additive on the wire.
     const declines = new Map<string, { code: string; message: string }>();
+    // ACKs that arrived over the protocol but failed publisher-side validation
+    // are not "no response". Track them separately so QuorumUnmetError can
+    // distinguish transport silence from an ACK the publisher rejected locally
+    // (signature, merkle root, or chain/RPC identity verification).
+    const ackFailures = new Map<string, { reason: string }>();
+    const recordACKFailure = (peerId: string, reason: string): void => {
+      ackFailures.set(peerId, { reason });
+      // A later terminal ACK-validation failure is more actionable than an
+      // earlier transient decline from the same peer.
+      declines.delete(peerId);
+    };
 
     const formatDeclineDetail = (): string => {
       if (declines.size === 0) return '';
@@ -586,6 +685,15 @@ export class ACKCollector {
             reason: ack.subscriptionSource ? `ACK:${ack.subscriptionSource}` : 'ACK',
           };
         }
+        const ackFailure = ackFailures.get(peerId);
+        if (ackFailure) {
+          return {
+            peerId,
+            dialOk: true,
+            protocolSupported: true,
+            reason: ackFailure.reason,
+          };
+        }
         const decline = declines.get(peerId);
         if (decline) {
           const code = decline.code;
@@ -629,8 +737,42 @@ export class ACKCollector {
       let declineRetries = 0;
       for (;;) {
         try {
-          const response = await this.deps.sendP2P(peerId, ackProtocolId, intentBytes);
-          const ack: StorageACKMsg = decodeStorageACK(response);
+          // publisher.ack_peer_request — one per-peer sendP2P attempt.
+          // Transport throw → withSpan auto-records ERROR; the catch below
+          // tags ackPeerTotal{result:'transport_error'}. A decline response
+          // is an expected negative (status stays OK, dkg.decline_code set).
+          const ack: StorageACKMsg = await withSpan(
+            'publisher.ack_peer_request',
+            async (span) => {
+              const response = await this.deps.sendP2P(peerId, ackProtocolId, intentBytes);
+              const decoded: StorageACKMsg = decodeStorageACK(response);
+              if (isStorageACKDecline(decoded)) {
+                const declineCode = sanitizeDeclineField(
+                  decoded.declineCode ?? 'UNKNOWN',
+                  MAX_DECLINE_CODE_CHARS,
+                ) || 'UNKNOWN';
+                span.setAttribute('dkg.decline_code', declineCode);
+                getMetrics().ackPeerTotal.add(1, {
+                  result: 'decline',
+                  // `declineCode` is peer-supplied and untrusted — bound it to the
+                  // known enum so a peer can't explode metric cardinality with
+                  // unique codes. Full code stays on the span + declines map.
+                  decline_code: boundedDeclineCodeLabel(declineCode),
+                });
+              }
+              // A non-decline response is NOT counted as a successful ACK here:
+              // it is still unverified. The terminal ackPeerTotal{result:'ack'}
+              // is recorded only after signature/merkle/identity validation
+              // passes below; failed validation is counted {result:'rejected'}.
+              return decoded;
+            },
+            {
+              attributes: {
+                'dkg.protocol_id': ackProtocolId,
+                'dkg.peer': peerId.slice(0, 8),
+              },
+            },
+          );
 
           if (isStorageACKDecline(ack)) {
             const code = sanitizeDeclineField(
@@ -646,6 +788,7 @@ export class ACKCollector {
             // prior entry is intentional — operators care most about
             // why the peer ultimately could not ACK.
             declines.set(peerId, { code, message: declineMessage });
+            ackFailures.delete(peerId);
 
             // Transient declines (SWM replication catching up via
             // gossip) can resolve on a retry, so re-send with backoff
@@ -696,11 +839,15 @@ export class ACKCollector {
 
           const recoveredAddress = this.recoverACKSigner(ack, ackDigest);
           if (!recoveredAddress) {
+            recordACKFailure(peerId, 'INVALID_SIGNATURE');
+            getMetrics().ackPeerTotal.add(1, { result: 'rejected' });
             log(`[ACKCollector] Invalid ACK signature from ${peerId.slice(-8)}`);
             return null;
           }
 
           if (!this.merkleRootsMatch(ack.merkleRoot, merkleRoot)) {
+            recordACKFailure(peerId, 'MERKLE_ROOT_MISMATCH');
+            getMetrics().ackPeerTotal.add(1, { result: 'rejected' });
             log(`[ACKCollector] Merkle root mismatch from ${peerId.slice(-8)}`);
             return null;
           }
@@ -717,9 +864,24 @@ export class ACKCollector {
           // the chain to check" (infra-side, retryable). Pre-PR every
           // failure surfaced as the same "not registered" string.
           if (this.deps.verifyIdentityDetailed) {
-            const verdict = await this.deps.verifyIdentityDetailed(recoveredAddress, identityId);
+            const verdict = await withSpan(
+              'publisher.ack_verify_identity',
+              async (span) => {
+                const v = await this.deps.verifyIdentityDetailed!(recoveredAddress, identityId);
+                // A rejected identity is an expected negative, not a span
+                // error (status stays OK). withSpan only flips ERROR on throw.
+                span.setAttribute('dkg.verify_result', v.valid ? 'valid' : (v.reason ?? 'unknown'));
+                getMetrics().ackVerifyTotal.add(1, {
+                  result: v.valid ? 'valid' : (v.reason ?? 'key-not-registered'),
+                });
+                return v;
+              },
+              { attributes: { 'dkg.identity_id': String(identityId) } },
+            );
             if (!verdict.valid) {
-              const reason = verdict.reason ?? 'unknown';
+              const reason = sanitizeDeclineField(verdict.reason ?? 'unknown', MAX_DECLINE_CODE_CHARS) || 'unknown';
+              recordACKFailure(peerId, `ACK_VERIFY:${reason}`);
+              getMetrics().ackPeerTotal.add(1, { result: 'rejected' });
               log(
                 `[ACKCollector] ACK from ${peerId.slice(-8)} rejected: ${reason}` +
                 ` (signer=${recoveredAddress.slice(0, 10)}..., identity=${identityId})`,
@@ -727,8 +889,23 @@ export class ACKCollector {
               return null;
             }
           } else if (this.deps.verifyIdentity) {
-            const valid = await this.deps.verifyIdentity(recoveredAddress, identityId);
+            const valid = await withSpan(
+              'publisher.ack_verify_identity',
+              async (span) => {
+                const ok = await this.deps.verifyIdentity!(recoveredAddress, identityId);
+                // Legacy boolean verifier surfaces no structured reason; an
+                // invalid result maps to the generic registration gate.
+                span.setAttribute('dkg.verify_result', ok ? 'valid' : 'key-not-registered');
+                getMetrics().ackVerifyTotal.add(1, {
+                  result: ok ? 'valid' : 'key-not-registered',
+                });
+                return ok;
+              },
+              { attributes: { 'dkg.identity_id': String(identityId) } },
+            );
             if (!valid) {
+              recordACKFailure(peerId, 'ACK_VERIFY:key-not-registered');
+              getMetrics().ackPeerTotal.add(1, { result: 'rejected' });
               log(`[ACKCollector] Signer ${recoveredAddress.slice(0, 10)}... not registered for identity ${identityId} — rejecting ACK from ${peerId.slice(-8)}`);
               return null;
             }
@@ -739,6 +916,7 @@ export class ACKCollector {
           // stale decline would still appear in `storage_ack_insufficient`
           // if quorum fails for unrelated reasons.
           declines.delete(peerId);
+          ackFailures.delete(peerId);
 
           // PR5: capture the peer-reported ACK-provenance source if
           // present. Pre-PR5 cores never set the field; treat any
@@ -751,6 +929,11 @@ export class ACKCollector {
           const sourceTag = subscriptionSource ? ` source=${subscriptionSource}` : '';
           log(`[ACKCollector] Valid ACK from ${peerId.slice(-8)} (identity=${identityId}, signer=${recoveredAddress.slice(0, 10)}...${sourceTag})`);
 
+          // Terminal: a fully-validated ACK (signature + merkle + identity all
+          // passed). Counted here, not at decode time, so the 'ack' result
+          // reflects accepted ACKs only.
+          getMetrics().ackPeerTotal.add(1, { result: 'ack' });
+
           return {
             peerId,
             signatureR: ack.coreNodeSignatureR,
@@ -761,6 +944,7 @@ export class ACKCollector {
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           transportAttempts += 1;
+          getMetrics().ackPeerTotal.add(1, { result: 'transport_error' });
           if (transportAttempts < MAX_RETRIES) {
             if (roundIsOver()) {
               log(

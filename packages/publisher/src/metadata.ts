@@ -5,6 +5,8 @@ import {
   isSafeIri,
   assertionLifecycleUri,
   contextGraphAssertionUri,
+  contextGraphSharedMemoryUri,
+  contextGraphLayerUri,
   contextGraphDataUri,
   contextGraphMetaUri,
   MemoryLayer,
@@ -20,21 +22,19 @@ const DKG = 'http://dkg.io/ontology/';
 const PROV = 'http://www.w3.org/ns/prov#';
 const XSD = 'http://www.w3.org/2001/XMLSchema#';
 
-// OT-RFC-43 §10.1 / OT-RFC-44 §4 — entity-list predicate rename migration.
-// The predicates were misnamed: they hold graph ENTITIES, not Merkle roots.
-//   dkg:rootEntity          -> dkg:entity
-//   dkg:assertionRootEntity -> dkg:assertionEntity
-// Migration is dual-write + dual-read: every emitter writes BOTH names so a
-// mixed fleet (and pre-rename data) keeps resolving; readers accept either
-// (see ENTITY_PRED_ALT / isEntityPredicate in @origintrail-official/dkg-core). The
-// legacy predicate is dropped only in a later release, after all nodes
-// dual-read.
-/** Emit the entity-member predicate under BOTH the new and legacy names. */
+// RFC ka-metadata-trim Phase 2: the OT-RFC-43 §10.1 dual-write
+// (`dkg:rootEntity` + `dkg:entity`, same object) was collapsed back to a
+// SINGLE `dkg:rootEntity` row — the predicate every deployed reader already
+// resolves. The §10.1 rename is cancelled for the KA/share member list; the
+// honest name can land at the next deliberate ontology bump instead of
+// doubling every member row in the meantime. Readers stay dual-read
+// (ENTITY_PRED_ALT / isEntityPredicate in @origintrail-official/dkg-core)
+// because replicas hold dual-written rows synced from older nodes. The
+// seal's `assertionRootEntity`/`assertionEntity` pair is untouched
+// (author-signed block, assertion-seal.ts).
+/** Emit the single member-entity row (`dkg:rootEntity`). */
 function entityMemberQuads(subject: string, entity: string, graph: string): Quad[] {
-  return [
-    mq(subject, DKG_ROOT_ENTITY_LEGACY, entity, graph), // legacy (dropped in a later release)
-    mq(subject, DKG_ENTITY, entity, graph),             // new (OT-RFC-43 §10.1)
-  ];
+  return [mq(subject, DKG_ROOT_ENTITY_LEGACY, entity, graph)];
 }
 
 export function toHex(bytes: Uint8Array): string {
@@ -47,7 +47,6 @@ export interface KCMetadata {
   ual: string;
   contextGraphId: string;
   merkleRoot: Uint8Array;
-  kaCount: number;
   publisherPeerId: string;
   /**
    * Durable on-chain agent identifier (EVM address, bare `0x…`). When
@@ -62,24 +61,14 @@ export interface KCMetadata {
   timestamp: Date;
   subGraphName?: string;
   /**
-   * RFC-001 §3.5 off-chain provenance mirror. When both `authorAddress`
-   * and `publishOperationId` are supplied, `generateKCMetadata` emits a
-   * `dkg:Publication` resource at `urn:dkg:publication:{publishOperationId}`
-   * carrying:
-   *   a dkg:Publication ;
-   *   dkg:publishOperationId "..." ;
-   *   dkg:contextGraphId "..." ;
-   *   dkg:merkleRoot "0x..."^^xsd:hexBinary ;
-   *   dkg:authoredBy "0x..." .
-   * and links each KA via `<kaUri> dkg:publication <publication-uri>`.
-   *
-   * These triples are pure SPARQL-filtering convenience — the on-chain
-   * `KnowledgeBatch.authorAddress` remains canonical (RFC-001 §3.5,
-   * point 1). Implementations that don't need rich provenance queries
-   * can omit these fields and the publication subject is not emitted.
+   * On-chain author address (bare `0x…`). Used as the
+   * `prov:wasAttributedTo` fallback when `agentAddress` isn't threaded —
+   * the on-chain `KnowledgeBatch.authorAddress` remains canonical.
+   * (The former `dkg:Publication` provenance mirror keyed on
+   * `publishOperationId` was dropped — RFC ka-metadata-trim Phase 1,
+   * zero readers.)
    */
   authorAddress?: string;
-  publishOperationId?: string;
 }
 
 export interface KAMetadata {
@@ -129,11 +118,17 @@ export function generateKCMetadata(
   const metaGraph = `did:dkg:context-graph:${meta.contextGraphId}/_meta`;
   const quads: Quad[] = [];
 
-  // KC metadata
+  // KC metadata. RFC ka-metadata-trim: the `rdf:type dkg:KnowledgeCollection`
+  // row and `dkg:kaCount` were dropped (zero readers; the daemon KC counter
+  // now counts `dkg:status` subjects). Old-store rows synced from older nodes
+  // may still carry them — readers must not assume either shape exclusively.
   quads.push(
-    mq(meta.ual, `${RDF}type`, `${DKG}KnowledgeCollection`, metaGraph),
     mq(meta.ual, `${DKG}merkleRoot`, lit(toHex(meta.merkleRoot)), metaGraph),
-    mq(meta.ual, `${DKG}kaCount`, intLit(meta.kaCount), metaGraph),
+    // KEPT (initially slated as a Phase-1 drop): kafka-plugin discovery
+    // (packages/kafka-plugin/src/discovery.ts buildListQuery) joins
+    // `?ual dkg:publishedAt ?receivedAt` and ORDERs the KA list by it —
+    // a load-bearing reader, so the write stays (+1 quad).
+    mq(meta.ual, `${DKG}publishedAt`, dateLit(meta.timestamp), metaGraph),
     mq(meta.ual, `${DKG}accessPolicy`, lit(meta.accessPolicy ?? 'public'), metaGraph),
     mq(meta.ual, `${DKG}publisherPeerId`, lit(meta.publisherPeerId || 'unknown'), metaGraph),
     mq(
@@ -156,12 +151,6 @@ export function generateKCMetadata(
       })(),
       metaGraph,
     ),
-    mq(
-      meta.ual,
-      `${DKG}publishedAt`,
-      dateLit(meta.timestamp),
-      metaGraph,
-    ),
     mq(meta.ual, `${DKG}contextGraph`, `did:dkg:context-graph:${meta.contextGraphId}`, metaGraph),
   );
 
@@ -177,102 +166,60 @@ export function generateKCMetadata(
     }
   }
 
-  // OT-RFC-44 Design B: the bare <ual> IS the Knowledge Asset (one file = one
-  // KA, any entity count), but #980 only typed it dkg:KnowledgeCollection — the
-  // bare UAL was never typed dkg:KnowledgeAsset. Emit an aggregate KA node on
-  // the bare UAL (type + summed counts + every member tokenId + every member
-  // entity) so consumers can resolve the KA directly from <ual> (PR #968
-  // salvage; uses ka.tokenId, no metadataTokenId). The per-row <ual>/N rows
-  // below are retained for not-yet-migrated per-root consumers.
+  // OT-RFC-44 Design B + RFC ka-metadata-trim Phase 3 (P3.1): the bare <ual>
+  // IS the Knowledge Asset (post-rc.17 invariant: 1 publish = 1 KA = 1 UAL).
+  // The legacy per-token `<ual>/<n>` label rows (`dkg:partOf` + entity pair)
+  // are NO LONGER minted — member entities, private counts and private merkle
+  // roots all live on the UAL subject directly.
   // NB: deliberately NO `<ual> partOf <ual>` self-edge — that would make the
   // bare node match `?x partOf <ual>` member-enumeration (incl. resolveKA) and
-  // double-count members; the aggregate node is purely self-describing.
+  // double-count members; the collapsed node is purely self-describing.
+  // Readers are read-both (UAL-subject ‖ legacy `<ual>/<n>`+partOf) because
+  // replicas hold old-shape rows synced from older nodes.
   if (kaEntries.length > 0) {
-    const aggPublicTripleCount = kaEntries.reduce((sum, ka) => sum + ka.publicTripleCount, 0);
     const aggPrivateTripleCount = kaEntries.reduce((sum, ka) => sum + ka.privateTripleCount, 0);
-    const memberTokenIds = [...new Set(kaEntries.map((ka) => ka.tokenId.toString()))];
     const memberRoots = [...new Set(kaEntries.map((ka) => ka.rootEntity))];
-    quads.push(
-      mq(meta.ual, `${RDF}type`, `${DKG}KnowledgeAsset`, metaGraph),
-      mq(meta.ual, `${DKG}publicTripleCount`, intLit(aggPublicTripleCount), metaGraph),
-    );
-    for (const tokenId of memberTokenIds) {
-      quads.push(mq(meta.ual, `${DKG}tokenId`, intLit(BigInt(tokenId)), metaGraph));
-    }
     for (const root of memberRoots) {
-      // dual-write dkg:rootEntity + dkg:entity, matching the per-row rows (§10.1).
+      // dual-write dkg:rootEntity + dkg:entity (OT-RFC-43 §10.1).
       quads.push(...entityMemberQuads(meta.ual, root, metaGraph));
     }
     if (aggPrivateTripleCount > 0) {
       quads.push(mq(meta.ual, `${DKG}privateTripleCount`, intLit(aggPrivateTripleCount), metaGraph));
-      const privateRoots = kaEntries.filter((ka) => ka.privateMerkleRoot);
-      if (privateRoots.length === 1 && privateRoots[0].privateMerkleRoot) {
-        quads.push(mq(meta.ual, `${DKG}privateMerkleRoot`, lit(toHex(privateRoots[0].privateMerkleRoot)), metaGraph));
-      }
     }
-  }
-
-  // KA metadata. OT-RFC-44 keeps one on-chain KA per file/lifecycle, but the
-  // current update and private-access paths still resolve per-root label rows
-  // at <ual>/1, <ual>/2, ... . Keep this compatibility shape until those
-  // consumers are migrated to aggregate multi-root KA metadata directly.
-  const kaUriFor = (ka: KAMetadata): string => `${ka.kcUal}/${ka.tokenId}`;
-  for (const ka of kaEntries) {
-    const kaUri = kaUriFor(ka);
-    quads.push(
-      mq(kaUri, `${RDF}type`, `${DKG}KnowledgeAsset`, metaGraph),
-      // OT-RFC-43 §10.1 — dual-WRITE the member-entity predicate (legacy
-      // dkg:rootEntity + new dkg:entity) on the per-root label so the rename is
-      // forward-compatible ahead of the reader migration.
-      ...entityMemberQuads(kaUri, ka.rootEntity, metaGraph),
-      mq(kaUri, `${DKG}partOf`, ka.kcUal, metaGraph),
-      mq(kaUri, `${DKG}tokenId`, intLit(ka.tokenId), metaGraph),
-      mq(
-        kaUri,
-        `${DKG}publicTripleCount`,
-        intLit(ka.publicTripleCount),
-        metaGraph,
-      ),
-    );
-
-    if (ka.privateTripleCount > 0) {
-      quads.push(
-        mq(
-          kaUri,
-          `${DKG}privateTripleCount`,
-          intLit(ka.privateTripleCount),
-          metaGraph,
-        ),
-      );
-      if (ka.privateMerkleRoot) {
-        quads.push(
-          mq(
-            kaUri,
-            `${DKG}privateMerkleRoot`,
-            lit(toHex(ka.privateMerkleRoot)),
-            metaGraph,
-          ),
-        );
-      }
-    }
-  }
-
-  // RFC-001 §3.5 — optional `dkg:Publication` provenance subject. Emitted
-  // only when both `authorAddress` and `publishOperationId` are supplied
-  // so existing callers that don't propagate author identity see no
-  // behavior change.
-  if (meta.authorAddress && meta.publishOperationId) {
-    const publicationUri = `urn:dkg:publication:${meta.publishOperationId}`;
-    quads.push(
-      mq(publicationUri, `${RDF}type`, `${DKG}Publication`, metaGraph),
-      mq(publicationUri, `${DKG}publishOperationId`, lit(meta.publishOperationId), metaGraph),
-      mq(publicationUri, `${DKG}contextGraphId`, lit(meta.contextGraphId), metaGraph),
-      mq(publicationUri, `${DKG}merkleRoot`, hexLit(toHex(meta.merkleRoot)), metaGraph),
-      mq(publicationUri, `${DKG}authoredBy`, lit(meta.authorAddress), metaGraph),
-    );
+    // All per-root private merkle roots land on the UAL subject (the
+    // `<ual>/<n>` row that used to carry them is gone). Distinct-hex dedupe;
+    // verifiers treat them as an unordered leaf set (V10MerkleTree dedupes).
+    const seenPrivRoots = new Set<string>();
     for (const ka of kaEntries) {
-      const kaUri = kaUriFor(ka);
-      quads.push(mq(kaUri, `${DKG}publication`, publicationUri, metaGraph));
+      if (!ka.privateMerkleRoot) continue;
+      const hex = toHex(ka.privateMerkleRoot);
+      if (seenPrivRoots.has(hex)) continue;
+      seenPrivRoots.add(hex);
+      quads.push(mq(meta.ual, `${DKG}privateMerkleRoot`, lit(hex), metaGraph));
+    }
+    // Codex review "multi-root-access": the collapsed shape cannot tie member
+    // root N to private bag N — every rootEntity/privateMerkleRoot row shares
+    // the bare UAL subject, so the AccessHandler could only pick an
+    // engine-arbitrary root (denying or silently mis-serving multi-root
+    // private KAs). For MULTI-root publishes, ADDITIONALLY re-emit the
+    // pre-trim per-token pairing rows (`<ual>/<tokenId>` + rootEntity/partOf/
+    // privateTripleCount/privateMerkleRoot — the 75c53a2ed shape minus the
+    // Phase-1/2 zero-reader rows). Single-root publishes — the measured,
+    // dominant case — keep the full collapse.
+    if (memberRoots.length > 1) {
+      for (const ka of kaEntries) {
+        const kaUri = `${meta.ual}/${ka.tokenId}`;
+        quads.push(
+          ...entityMemberQuads(kaUri, ka.rootEntity, metaGraph),
+          mq(kaUri, `${DKG}partOf`, meta.ual, metaGraph),
+        );
+        if (ka.privateTripleCount > 0) {
+          quads.push(mq(kaUri, `${DKG}privateTripleCount`, intLit(ka.privateTripleCount), metaGraph));
+        }
+        if (ka.privateMerkleRoot) {
+          quads.push(mq(kaUri, `${DKG}privateMerkleRoot`, lit(toHex(ka.privateMerkleRoot)), metaGraph));
+        }
+      }
     }
   }
 
@@ -323,19 +270,15 @@ export function generateConfirmedMetadata(
   provenance: OnChainProvenance,
 ): Quad[] {
   const metaGraph = `did:dkg:context-graph:${contextGraphId}/_meta`;
+  // RFC ka-metadata-trim Phase 1: `dkg:blockNumber`, `dkg:blockTimestamp`,
+  // `dkg:publisherAddress` and `dkg:chainId` were dropped (zero readers;
+  // block number is derivable from `transactionHash` via RPC on demand).
+  // The `OnChainProvenance` shape is unchanged — it mirrors the chain
+  // receipt, not what gets persisted.
   const quads: Quad[] = [
     mq(ual, `${DKG}status`, lit('confirmed'), metaGraph),
     mq(ual, `${DKG}transactionHash`, lit(provenance.txHash), metaGraph),
-    mq(ual, `${DKG}blockNumber`, intLit(provenance.blockNumber), metaGraph),
-    mq(
-      ual,
-      `${DKG}blockTimestamp`,
-      dateLit(new Date(provenance.blockTimestamp * 1000)),
-      metaGraph,
-    ),
-    mq(ual, `${DKG}publisherAddress`, lit(provenance.publisherAddress), metaGraph),
     mq(ual, `${DKG}batchId`, intLit(provenance.batchId), metaGraph),
-    mq(ual, `${DKG}chainId`, lit(provenance.chainId), metaGraph),
   ];
   return quads;
 }
@@ -355,6 +298,47 @@ export function generateConfirmedFullMetadata(
   ];
 }
 
+/**
+ * GH #936 — explicit, deterministic per-root token map
+ * (`<ual>/<tokenId>` dkg:tokenId / dkg:entity) for MULTI-root KCs. Emitted via a
+ * SHARED helper so the publisher (originator) and the gossip / chain-reconcile
+ * replica paths expose an IDENTICAL, queryable rootEntity→tokenId mapping — the
+ * same multi-root KC must not surface different token rows depending on which
+ * node materialised it. Kept OUT of generateKCMetadata (metadata.test.ts pins
+ * that output to the collapsed `dkg:rootEntity` shape and forbids these
+ * predicates); both call sites append these rows alongside the confirmed
+ * metadata. `kaEntries` MUST already be in the canonical
+ * (lexicographically-sorted-by-rootEntity) tokenId order — both call sites sort
+ * before minting.
+ */
+/**
+ * GH #936 — the canonical root ordering used for deterministic compatibility
+ * tokenId assignment. The publisher (originator), the gossip path, and the
+ * chain-reconcile path MUST all assign `<ual>/<tokenId>` over roots sorted by
+ * THIS comparator, so every node derives the identical rootEntity→tokenId map.
+ * Shared here so the invariant is API-enforced rather than comment-enforced.
+ */
+export function compareRootIris(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+export function buildDeterministicTokenRows(
+  ual: string,
+  kaEntries: ReadonlyArray<{ tokenId: bigint; rootEntity: string }>,
+  metaGraph: string,
+): Quad[] {
+  if (kaEntries.length <= 1) return [];
+  const rows: Quad[] = [];
+  for (const ka of kaEntries) {
+    const subject = `${ual}/${ka.tokenId}`;
+    rows.push(
+      mq(subject, `${DKG}tokenId`, intLit(ka.tokenId), metaGraph),
+      mq(subject, DKG_ENTITY, ka.rootEntity, metaGraph),
+    );
+  }
+  return rows;
+}
+
 function mq(s: string, p: string, o: string, g: string): Quad {
   return { subject: s, predicate: p, object: o, graph: g };
 }
@@ -370,6 +354,69 @@ function lit(val: string): string {
 
 function intLit(val: number | bigint): string {
   return `"${val}"^^<${XSD}integer>`;
+}
+
+/**
+ * Canonical builder for the "minimal scoped meta" rows the RS prover + access
+ * handler read off a scoped context-graph meta graph: `dkg:batchId` (the UAL
+ * resolution edge) + `dkg:merkleRoot`, the collapsed `dkg:rootEntity`
+ * (+ `dkg:privateMerkleRoot`) member rows on the UAL subject, and — for
+ * MULTI-root KCs only — the `<ual>/<tokenId>` `rootEntity`/`partOf`/
+ * `privateMerkleRoot` pairing rows so each member root↔privateMerkleRoot stays
+ * joinable on its own token subject (single-root keeps the full collapse).
+ *
+ * Single source of truth for the two PUBLISH paths that promote a confirmed KC
+ * into a scoped meta graph: `DKGPublisher.publishFromSharedMemory` (the SWM
+ * path) and `DKGPublisher.promoteConfirmedKCToScopedGraph` (the one-shot
+ * `publish()` RS promotion, #1266). Output is byte-identical to the inline blocks
+ * those two previously carried.
+ *
+ * `restateKaPartition` below writes the SAME shape but from a different data
+ * model — per-root Maps + POSITIONAL `<ual>/<n>` token labels + a DELETE/INSERT
+ * restate — so it intentionally does NOT call this builder. Keep the two shapes
+ * in sync (see the note in `restateKaPartition`).
+ */
+export function buildScopedMinimalMeta(
+  ual: string,
+  kaId: bigint,
+  merkleRoot: Uint8Array,
+  manifestEntries: ReadonlyArray<{ rootEntity: string; tokenId: bigint; privateMerkleRoot?: Uint8Array }>,
+  metaGraph: string,
+): Quad[] {
+  const out: Quad[] = [
+    mq(ual, `${DKG}batchId`, intLit(kaId), metaGraph),
+    mq(ual, `${DKG}merkleRoot`, lit(toHex(merkleRoot)), metaGraph),
+  ];
+  const multiRoot = new Set(manifestEntries.map((ka) => ka.rootEntity)).size > 1;
+  const seenRoots = new Set<string>();
+  const seenPrivRoots = new Set<string>();
+  for (const ka of manifestEntries) {
+    if (!seenRoots.has(ka.rootEntity)) {
+      seenRoots.add(ka.rootEntity);
+      out.push(...entityMemberQuads(ual, ka.rootEntity, metaGraph));
+    }
+    if (ka.privateMerkleRoot && ka.privateMerkleRoot.length > 0) {
+      const privHex = toHex(ka.privateMerkleRoot);
+      if (!seenPrivRoots.has(privHex)) {
+        seenPrivRoots.add(privHex);
+        out.push(mq(ual, `${DKG}privateMerkleRoot`, lit(privHex), metaGraph));
+      }
+    }
+    // MULTI-root only: re-emit the `<ual>/<tokenId>` token rows so each member
+    // root carries its OWN privateMerkleRoot on a shared subject (recoverable
+    // pairing). Not deduped — every token keeps its pairing row.
+    if (multiRoot) {
+      const kaUri = `${ual}/${ka.tokenId}`;
+      out.push(
+        ...entityMemberQuads(kaUri, ka.rootEntity, metaGraph),
+        mq(kaUri, `${DKG}partOf`, ual, metaGraph),
+      );
+      if (ka.privateMerkleRoot && ka.privateMerkleRoot.length > 0) {
+        out.push(mq(kaUri, `${DKG}privateMerkleRoot`, lit(toHex(ka.privateMerkleRoot)), metaGraph));
+      }
+    }
+  }
+  return out;
 }
 
 function dateLit(d: Date): string {
@@ -398,68 +445,12 @@ export function agentDid(address: string): string {
   return `did:dkg:agent:${subject}`;
 }
 
-function hexLit(hex: string): string {
-  // `xsd:hexBinary` lexical space is hex digits ONLY — no `0x` prefix
-  // (per XML Schema Part 2: Datatypes, §3.2.16). A typed literal
-  // `"0x..."^^xsd:hexBinary` is invalid for RDF value-equality
-  // semantics (SPARQL `=` operator on hexBinary compares decoded
-  // bytes; an invalid lexical form yields no match). Emit the bare
-  // hex digits as the lexical value, no `0x` prefix.
-  const bare = hex.startsWith('0x') ? hex.slice(2) : hex;
-  return `"${bare}"^^<${XSD}hexBinary>`;
-}
-
-/**
- * Agent authorship proof per spec §9.0.6.
- * The agent signs keccak256(merkleRoot) and the proof is stored in _meta.
- */
-export interface AuthorshipProof {
-  kcUal: string;
-  contextGraphId: string;
-  agentAddress: string;
-  signature: string;
-  signedHash: string;
-}
-
-export function generateAuthorshipProof(proof: AuthorshipProof): Quad[] {
-  const metaGraph = `did:dkg:context-graph:${proof.contextGraphId}/_meta`;
-  const blankNode = `_:authorship_${proof.kcUal.replace(/[^a-zA-Z0-9]/g, '_')}`;
-  return [
-    mq(proof.kcUal, `${DKG}authoredBy`, blankNode, metaGraph),
-    mq(blankNode, `${RDF}type`, `${DKG}AuthorshipProof`, metaGraph),
-    mq(blankNode, `${DKG}agent`, agentDid(proof.agentAddress), metaGraph),
-    mq(blankNode, `${DKG}signature`, lit(proof.signature), metaGraph),
-    mq(blankNode, `${DKG}signedHash`, lit(proof.signedHash), metaGraph),
-  ];
-}
-
-/**
- * ShareTransition metadata per spec §8.
- * Recorded in _shared_memory_meta when data is promoted from WM → SWM.
- */
-export interface ShareTransitionMetadata {
-  contextGraphId: string;
-  operationId: string;
-  agentAddress: string;
-  assertionName: string;
-  entities: string[];
-  timestamp: Date;
-}
-
-export function generateShareTransitionMetadata(meta: ShareTransitionMetadata): Quad[] {
-  const metaGraph = `did:dkg:context-graph:${meta.contextGraphId}/_shared_memory_meta`;
-  const subject = `urn:dkg:share:${meta.operationId}`;
-  const quads: Quad[] = [
-    mq(subject, `${RDF}type`, `${DKG}ShareTransition`, metaGraph),
-    mq(subject, `${DKG}source`, lit(`assertion/${meta.agentAddress}/${meta.assertionName}`), metaGraph),
-    mq(subject, `${DKG}agent`, agentDid(meta.agentAddress), metaGraph),
-    mq(subject, `${DKG}timestamp`, dateLit(meta.timestamp), metaGraph),
-  ];
-  for (const entity of meta.entities) {
-    quads.push(mq(subject, `${DKG}entities`, entity, metaGraph));
-  }
-  return quads;
-}
+// RFC ka-metadata-trim Phase 3 (P3.4): `generateShareTransitionMetadata`
+// (spec §8, the `urn:dkg:share:{opId} a dkg:ShareTransition` record in
+// `_shared_memory_meta`) was deleted. Its only repo-wide consumer was the
+// node-ui on-chain-receipt hook's first hop, which now reads the
+// seal-subject receipt rows in `_meta` directly and only falls back to
+// ShareTransition rows for old stores (read-both).
 
 /** Shared memory metadata: no UAL; stored in _shared_memory_meta graph. */
 export interface ShareMetadata {
@@ -753,8 +744,9 @@ export async function withMaterializationLock<T>(
 
 /**
  * Full-restatement of a KA into a given data+meta partition pair, with the
- * minimal meta shape the RS prover needs (`partOf` / `rootEntity` /
- * `privateMerkleRoot` / `batchId` / `merkleRoot`). Used for the per-cgId
+ * minimal meta shape the RS prover needs (`rootEntity`/`entity` pair +
+ * `privateMerkleRoot` + `batchId` + `merkleRoot`, all on the UAL subject —
+ * the collapsed shape, RFC ka-metadata-trim P3.1). Used for the per-cgId
  * partition. Returns false (no-op) when a newer version is already
  * materialised — see {@link shouldApplyMaterialization}.
  */
@@ -801,12 +793,17 @@ async function _restateKaPartitionLocked(opts: {
   }
 
   // 1. Discover prior roots so their now-stale data is purged (restatement).
+  //    Read-both (RFC ka-metadata-trim P3.1): collapsed-shape rows carry the
+  //    entity pair directly on the UAL subject; legacy rows are
+  //    `<ual>/<n> partOf <ual>` (still present in pre-upgrade local stores
+  //    and on replicas synced from older nodes).
   const rootsToPurge = new Set<string>(payloadByRoot.keys());
   const priorRes = await store.query(
     `SELECT DISTINCT ?root WHERE { GRAPH <${metaGraph}> {
        VALUES ?entityPred { <${DKG_ROOT_ENTITY_LEGACY}> <${DKG_ENTITY}> }
-       ?ka <${DKG}partOf> <${ual}> .
-       ?ka ?entityPred ?root .
+       { ?ka <${DKG}partOf> <${ual}> . ?ka ?entityPred ?root . }
+       UNION
+       { <${ual}> ?entityPred ?root . }
      } }`,
   );
   if (priorRes.type === 'bindings') {
@@ -820,15 +817,21 @@ async function _restateKaPartitionLocked(opts: {
     await store.deleteBySubjectPrefix(dataGraph, root + SKOLEM_INFIX);
   }
 
-  // 2. Delete prior KA meta rows (?ka partOf <ual>); KC-level <ual> rows stay.
+  // 2. Delete prior KA meta rows: legacy `?ka partOf <ual>` token subjects
+  //    entirely, plus the collapsed-shape member rows on the UAL subject
+  //    itself. Other KC-level <ual> rows (status, merkleRoot, batchId, …)
+  //    stay.
   const priorKaRes = await store.query(
     `SELECT DISTINCT ?ka WHERE { GRAPH <${metaGraph}> { ?ka <${DKG}partOf> <${ual}> } }`,
   );
   if (priorKaRes.type === 'bindings') {
     for (const row of priorKaRes.bindings) {
       const ka = row['ka'];
-      if (ka) await store.deleteByPattern({ graph: metaGraph, subject: ka });
+      if (ka && ka !== ual) await store.deleteByPattern({ graph: metaGraph, subject: ka });
     }
+  }
+  for (const pred of [DKG_ROOT_ENTITY_LEGACY, DKG_ENTITY, `${DKG}privateMerkleRoot`, `${DKG}privateTripleCount`]) {
+    await store.deleteByPattern({ graph: metaGraph, subject: ual, predicate: pred });
   }
 
   // 3. Insert payload public triples.
@@ -838,27 +841,38 @@ async function _restateKaPartitionLocked(opts: {
   }
   if (dataQuads.length > 0) await store.insert(dataQuads);
 
-  // 4. Insert fresh minimal KA meta rows.
-  //    Iterate roots in INSERTION order (= manifest/publisher order), NOT
-  //    lex order. `<ual>/1`, `<ual>/2`, ... are stable, numerically-keyed
-  //    KA identifiers; a lex sort would put `<ual>/10` before `<ual>/2` and
-  //    permute the token→root binding on every restate (Codex review on
-  //    PR #845).
-  const roots = [...payloadByRoot.keys()];
+  // 4. Insert fresh minimal KA meta rows on the UAL subject (collapsed shape,
+  //    RFC ka-metadata-trim P3.1): no `<ual>/<n>` token subjects, no
+  //    `dkg:partOf`. Member entities are an unordered set on the UAL; private
+  //    merkle roots are an unordered leaf set (V10MerkleTree sorts + dedupes).
+  //    Codex review "multi-root-access": MULTI-root payloads additionally
+  //    re-emit the legacy `<ual>/<n>` token rows (insertion = manifest order,
+  //    matching the pre-trim tokenIdx mint) so the root↔privateMerkleRoot
+  //    pairing stays recoverable; single-root keeps the full collapse.
+  //    SAME SHAPE as `buildScopedMinimalMeta` (the publish-path builder) but
+  //    NOT shared: this path works from per-root Maps with POSITIONAL token
+  //    labels and a DELETE/INSERT restate, vs. the builder's manifest + minted
+  //    `ka.tokenId`. Keep the two shapes in sync if either changes.
   const metaQuads: Quad[] = [];
-  let tokenIdx = 1;
-  for (const root of roots) {
-    const kaUri = `${ual}/${tokenIdx++}`;
-    metaQuads.push(
-      mq(kaUri, `${RDF}type`, `${DKG}KnowledgeAsset`, metaGraph),
-      mq(kaUri, `${DKG}partOf`, ual, metaGraph),
-      mq(kaUri, `${DKG}rootEntity`, root, metaGraph),
-      mq(kaUri, `${DKG}entity`, root, metaGraph), // OT-RFC-43 §10.1 dual-write
-    );
+  const partitionMultiRoot = payloadByRoot.size > 1;
+  let partitionTokenIdx = 1;
+  for (const root of payloadByRoot.keys()) {
+    metaQuads.push(...entityMemberQuads(ual, root, metaGraph));
     const privRoot = privateRootByRoot?.get(root);
     if (privRoot && privRoot.length > 0) {
-      metaQuads.push(mq(kaUri, `${DKG}privateMerkleRoot`, lit(toHex(privRoot)), metaGraph));
+      metaQuads.push(mq(ual, `${DKG}privateMerkleRoot`, lit(toHex(privRoot)), metaGraph));
     }
+    if (partitionMultiRoot) {
+      const kaUri = `${ual}/${partitionTokenIdx}`;
+      metaQuads.push(
+        ...entityMemberQuads(kaUri, root, metaGraph),
+        mq(kaUri, `${DKG}partOf`, ual, metaGraph),
+      );
+      if (privRoot && privRoot.length > 0) {
+        metaQuads.push(mq(kaUri, `${DKG}privateMerkleRoot`, lit(toHex(privRoot)), metaGraph));
+      }
+    }
+    partitionTokenIdx++;
   }
   if (metaQuads.length > 0) await store.insert(metaQuads);
 
@@ -879,11 +893,14 @@ async function _restateKaPartitionLocked(opts: {
  * Full-restatement of a KA in the app-facing LABEL graph after an update.
  *
  * Unlike {@link restateKaPartition} (per-cgId, minimal meta), this PRESERVES
- * the KA's rich publish metadata (type, provenance, …) and only:
+ * the KA's rich publish metadata (status, provenance, …) on the UAL subject
+ * and only:
  *  - deletes the prior root entities' DATA (so `agent.query` no longer returns
  *    stale pre-update triples — the full-restatement bug, GH#842 §7.1), and
- *  - repoints `dkg:rootEntity` / `dkg:privateMerkleRoot` on the existing KA
- *    rows to the new payload roots (so `resolveKA` doesn't dangle), and
+ *  - re-stamps the member-entity pair / `dkg:privateMerkleRoot` on the UAL
+ *    subject to the new payload roots (collapsed shape, RFC ka-metadata-trim
+ *    P3.1; legacy `<ual>/<n>` token rows found in the store are removed —
+ *    the restate is the migration), and
  *  - refreshes `dkg:merkleRoot`.
  *
  * Returns false (no-op) when a newer version is already materialised.
@@ -927,18 +944,23 @@ async function _restateLabelGraphForUpdateLocked(opts: {
     return false;
   }
 
-  // Preserve INSERTION order from the caller (manifest order). Lex-sorting
-  // breaks the token→root binding for KAs with ≥10 batches because
-  // `<ual>/10` sorts before `<ual>/2` (Codex review on PR #845).
+  // Insertion order (= manifest order). Under the collapsed shape the member
+  // entities are an unordered set on the UAL subject, so order is only for
+  // deterministic logs/inserts.
   const newRoots = [...payloadByRoot.keys()];
 
-  // 1. Resolve prior KA rows (ka↔root) from the label meta.
+  // 1. Resolve prior KA rows (ka↔root) from the label meta. Read-both
+  //    (RFC ka-metadata-trim P3.1): the collapsed shape carries the entity
+  //    pair on the UAL subject itself; legacy `<ual>/<n> partOf <ual>` token
+  //    rows still exist in pre-upgrade local stores and on replicas synced
+  //    from older nodes.
   const priorKaRows: { ka: string; root: string }[] = [];
   const priorRes = await store.query(
     `SELECT DISTINCT ?ka ?root WHERE { GRAPH <${metaGraph}> {
        VALUES ?entityPred { <${DKG_ROOT_ENTITY_LEGACY}> <${DKG_ENTITY}> }
-       ?ka <${DKG}partOf> <${ual}> .
-       ?ka ?entityPred ?root .
+       { ?ka <${DKG}partOf> <${ual}> . ?ka ?entityPred ?root . }
+       UNION
+       { <${ual}> ?entityPred ?root . BIND(<${ual}> AS ?ka) }
      } }`,
   );
   if (priorRes.type === 'bindings') {
@@ -962,49 +984,45 @@ async function _restateLabelGraphForUpdateLocked(opts: {
   }
   if (dataQuads.length > 0) await store.insert(dataQuads);
 
-  // 3. Repoint rootEntity / privateMerkleRoot on existing KA rows (by token
-  //    order), minting rows only when the update grew the KA's root count.
-  //    Everything else on the ?ka subject (provenance, type, …) is preserved.
-  //    Sort kaSubjects by NUMERIC token suffix (`<ual>/<n>`), not lex —
-  //    otherwise `<ual>/10` sorts before `<ual>/2` and the retained tokens
-  //    get bound to the wrong roots (Codex review on PR #845).
-  const kaPrefix = `${ual}/`;
-  const kaSubjects = [...new Set(priorKaRows.map((r) => r.ka))].sort((a, b) => {
-    const na = Number(a.startsWith(kaPrefix) ? a.slice(kaPrefix.length) : NaN);
-    const nb = Number(b.startsWith(kaPrefix) ? b.slice(kaPrefix.length) : NaN);
-    if (Number.isFinite(na) && Number.isFinite(nb)) return na - nb;
-    return a.localeCompare(b);
-  });
-  for (const ka of kaSubjects) {
-    await store.deleteByPattern({ graph: metaGraph, subject: ka, predicate: `${DKG}rootEntity` });
-    await store.deleteByPattern({ graph: metaGraph, subject: ka, predicate: `${DKG}entity` }); // OT-RFC-43 §10.1 dual-write cleanup
-    await store.deleteByPattern({ graph: metaGraph, subject: ka, predicate: `${DKG}privateMerkleRoot` });
+  // 3. Collapse (RFC ka-metadata-trim P3.1): member-entity + private-root
+  //    rows live on the UAL subject itself. Delete the legacy `<ual>/<n>`
+  //    token subjects entirely — their only remaining writer-side content is
+  //    the entity pair + partOf + private roots, all replaced by the
+  //    collapsed shape (this restate IS the migration for pre-upgrade local
+  //    rows) — then re-stamp the UAL-subject member rows to the new payload
+  //    roots. Everything else on the <ual> subject (status, provenance,
+  //    merkleRoot, batchId, …) is preserved.
+  const legacyKaSubjects = [...new Set(priorKaRows.map((r) => r.ka))].filter((ka) => ka !== ual);
+  for (const ka of legacyKaSubjects) {
+    await store.deleteByPattern({ graph: metaGraph, subject: ka });
   }
-  // If the update SHRANK the root count, the surplus ka subjects must be
-  // removed entirely. Just dropping `dkg:rootEntity` leaves them with
-  // `rdf:type dkg:KnowledgeAsset` + `dkg:partOf <ual>` still present, so
-  // enumeration queries would keep returning phantom tokens from the prior
-  // version (Codex review on PR #845).
-  if (kaSubjects.length > newRoots.length) {
-    for (let i = newRoots.length; i < kaSubjects.length; i++) {
-      await store.deleteByPattern({ graph: metaGraph, subject: kaSubjects[i] });
-    }
+  for (const pred of [DKG_ROOT_ENTITY_LEGACY, DKG_ENTITY, `${DKG}privateMerkleRoot`]) {
+    await store.deleteByPattern({ graph: metaGraph, subject: ual, predicate: pred });
   }
+  // Codex review "multi-root-access": MULTI-root updates additionally
+  // re-emit the legacy `<ual>/<n>` token rows (manifest order, matching the
+  // pre-trim mint) so the AccessHandler keeps an unambiguous
+  // root↔privateMerkleRoot pairing — this label `_meta` is exactly what
+  // `queryKAMeta` resolves `<ual>/<n>` requests against. Single-root keeps
+  // the full collapse.
   const metaQuads: Quad[] = [];
+  const labelMultiRoot = newRoots.length > 1;
   for (let i = 0; i < newRoots.length; i++) {
     const root = newRoots[i];
-    const existing = kaSubjects[i];
-    const ka = existing ?? `${ual}/${i + 1}`;
-    metaQuads.push(...entityMemberQuads(ka, root, metaGraph));
-    if (!existing) {
-      metaQuads.push(
-        mq(ka, `${RDF}type`, `${DKG}KnowledgeAsset`, metaGraph),
-        mq(ka, `${DKG}partOf`, ual, metaGraph),
-      );
-    }
+    metaQuads.push(...entityMemberQuads(ual, root, metaGraph));
     const privRoot = privateRootByRoot?.get(root);
     if (privRoot && privRoot.length > 0) {
-      metaQuads.push(mq(ka, `${DKG}privateMerkleRoot`, lit(toHex(privRoot)), metaGraph));
+      metaQuads.push(mq(ual, `${DKG}privateMerkleRoot`, lit(toHex(privRoot)), metaGraph));
+    }
+    if (labelMultiRoot) {
+      const kaUri = `${ual}/${i + 1}`;
+      metaQuads.push(
+        ...entityMemberQuads(kaUri, root, metaGraph),
+        mq(kaUri, `${DKG}partOf`, ual, metaGraph),
+      );
+      if (privRoot && privRoot.length > 0) {
+        metaQuads.push(mq(kaUri, `${DKG}privateMerkleRoot`, lit(toHex(privRoot)), metaGraph));
+      }
     }
   }
   if (metaQuads.length > 0) await store.insert(metaQuads);
@@ -1187,19 +1205,24 @@ export function subGraphWritersSparql(contextGraphId: string, subGraphName: stri
 // provenance across all three memory layers (WM → SWM → VM).
 //
 // Uses W3C PROV-O (http://www.w3.org/ns/prov#) as the backbone:
-//   - Assertion entity = prov:Entity + dkg:Assertion
 //   - Transition event = prov:Activity + dkg:Assertion{Created,Promoted,...}
 //   - prov:wasAttributedTo links entity → agent
-//   - prov:wasGeneratedBy links entity → creation activity
-//   - prov:wasAssociatedWith links activity → agent
 //   - prov:startedAtTime records when the activity happened
 //   - prov:generated links activity → entity it produced/modified
+// (RFC ka-metadata-trim Phase 1: the entity-side `a prov:Entity` /
+// `a dkg:Assertion` type rows and `prov:wasGeneratedBy` are no longer
+// written — history joins the event-side `prov:generated`/`prov:used`.
+// Phase 2: `prov:wasAssociatedWith`, `dkg:fromLayer`/`dkg:toLayer` and the
+// event-side member-entity rows are no longer written either — the agent is
+// the subject's `prov:wasAttributedTo`, the layer transition is derived from
+// the event class, and the member list lives on the stable lifecycle
+// subject. Readers stay read-both for old-store events.)
 //
 // DKG-specific extensions (no PROV equivalent):
 //   - dkg:state, dkg:memoryLayer — current mutable position
-//   - dkg:fromLayer, dkg:toLayer — layer transition on each event
 //   - dkg:assertionGraph, dkg:assertionName — DKG identity
-//   - dkg:shareOperationId, dkg:kcUal, dkg:rootEntity — operation metadata
+//   - dkg:shareOperationId, dkg:kcUal — operation metadata
+//   - dkg:rootEntity — member entities, on the stable lifecycle subject
 
 // ── OT-RFC-43 A2 / B3 — per-layer pointers + KA identity on the lifecycle URN ──
 //
@@ -1308,35 +1331,86 @@ export interface AssertionCreatedMeta {
   assertionName: string;
   subGraphName?: string;
   timestamp: Date;
+  /** D1 (identity-at-create) — per-author KA number minted at create. */
+  kaNumber?: string | number | bigint;
+  /** D1 (identity-at-create) — reserved UAL `did:dkg:{chain}/{addr}/{number}`. */
+  reservedUal?: string;
 }
 
-export function generateAssertionCreatedMetadata(meta: AssertionCreatedMeta): Quad[] {
+/**
+ * RFC ka-metadata-trim Phase 3 (P3.3): writer-side gate for the PROV event
+ * rows. When `provenanceEvents` is `false` ("lite mode" for high-throughput
+ * publishers / core nodes), the lifecycle generators skip the per-transition
+ * `prov:Activity` event nodes but KEEP every state/identity row on the
+ * lifecycle subject (state, memoryLayer, assertionGraph, assertionName,
+ * kaId, reservedUal, member-entity stamps, pointers). The history API then
+ * returns `events: []` gracefully — the descriptor itself is unaffected.
+ */
+export interface LifecycleMetadataOptions {
+  /** Default `true`. Set `false` to skip the PROV event-node rows. */
+  provenanceEvents?: boolean;
+}
+
+export function generateAssertionCreatedMetadata(meta: AssertionCreatedMeta, opts?: LifecycleMetadataOptions): Quad[] {
   const metaGraph = `did:dkg:context-graph:${meta.contextGraphId}/_meta`;
   const subject = assertionLifecycleUri(meta.contextGraphId, meta.agentAddress, meta.assertionName, meta.subGraphName);
-  const graphUri = contextGraphAssertionUri(meta.contextGraphId, meta.agentAddress, meta.assertionName, meta.subGraphName);
+  // Uniform layout: the assertionGraph pointer must name the SAME per-KA WM graph the
+  // data is written to (else _meta-driven discovery/promote follows an empty name-keyed
+  // graph). Number-keyed once the KA has an identity (D1), else legacy name-keyed.
+  const graphUri = meta.kaNumber !== undefined
+    ? contextGraphLayerUri(meta.contextGraphId, MemoryLayer.WorkingMemory, meta.agentAddress, meta.kaNumber, meta.subGraphName)
+    : contextGraphAssertionUri(meta.contextGraphId, meta.agentAddress, meta.assertionName, meta.subGraphName);
   const agentUri = agentDid(meta.agentAddress);
   const eventUri = `${subject}/event/${nextEventId()}`;
 
   const quads: Quad[] = [
-    // Assertion entity (prov:Entity + DKG identity)
-    mq(subject, `${RDF}type`, `${PROV}Entity`, metaGraph),
-    mq(subject, `${RDF}type`, `${DKG}Assertion`, metaGraph),
+    // Assertion entity (DKG identity). RFC ka-metadata-trim Phase 1: the
+    // `a prov:Entity` / `a dkg:Assertion` type rows, `dkg:contextGraph` and
+    // `prov:wasGeneratedBy` were dropped — history joins the event-side
+    // `prov:generated`/`prov:used`. Old-store rows synced from older nodes
+    // may still carry them.
+    // "Zero readers" correction (Codex review "graph-viz", F1-style): one
+    // client-side reader DOES generically match `prov:wasGeneratedBy` —
+    // graph-viz's provenance-resolver (provenance-resolver.ts) populates
+    // ProvenanceInfo.generatedBy from any loaded node. The drop still
+    // strands nothing: (a) `_meta` lifecycle rows are not fed to the viz in
+    // any node-ui flow (data-layer SPARQL only); (b) generatedBy/
+    // generatedByName have no renderer anywhere in the repo; (c) the
+    // resolver's live feed is content-layer `prov:wasGeneratedBy` writers
+    // (semantic enrichment, agent profiles, user data) untouched by the
+    // trim. See docs/rfcs/ka-metadata-trim.md Phase 1.
     mq(subject, `${PROV}wasAttributedTo`, agentUri, metaGraph),
-    mq(subject, `${PROV}wasGeneratedBy`, eventUri, metaGraph),
-    mq(subject, `${DKG}contextGraph`, `did:dkg:context-graph:${meta.contextGraphId}`, metaGraph),
     mq(subject, `${DKG}assertionName`, lit(meta.assertionName), metaGraph),
     mq(subject, `${DKG}assertionGraph`, graphUri, metaGraph),
     mq(subject, `${DKG}state`, lit('created'), metaGraph),
     mq(subject, `${DKG}memoryLayer`, lit(MemoryLayer.WorkingMemory), metaGraph),
-    // Event entity (prov:Activity + DKG layer transition)
-    mq(eventUri, `${RDF}type`, `${PROV}Activity`, metaGraph),
-    mq(eventUri, `${RDF}type`, `${DKG}AssertionCreated`, metaGraph),
-    mq(eventUri, `${PROV}startedAtTime`, dateLit(meta.timestamp), metaGraph),
-    mq(eventUri, `${PROV}wasAssociatedWith`, agentUri, metaGraph),
-    mq(eventUri, `${PROV}generated`, subject, metaGraph),
-    mq(eventUri, `${DKG}fromLayer`, lit('none'), metaGraph),
-    mq(eventUri, `${DKG}toLayer`, lit(MemoryLayer.WorkingMemory), metaGraph),
   ];
+  if (opts?.provenanceEvents !== false) {
+    quads.push(
+      // Event entity (prov:Activity). RFC ka-metadata-trim Phase 2:
+      // `dkg:fromLayer`/`dkg:toLayer` are no longer written — they are 100%
+      // determined by the event class (AssertionCreated ⇒ none→WM) and the
+      // history reader derives them; `prov:wasAssociatedWith` is no longer
+      // written — readers fall back to the subject's `prov:wasAttributedTo`
+      // (same agent DID). Old-store events still carry both (read-both).
+      mq(eventUri, `${RDF}type`, `${PROV}Activity`, metaGraph),
+      mq(eventUri, `${RDF}type`, `${DKG}AssertionCreated`, metaGraph),
+      mq(eventUri, `${PROV}startedAtTime`, dateLit(meta.timestamp), metaGraph),
+      mq(eventUri, `${PROV}generated`, subject, metaGraph),
+    );
+  }
+
+  // D1 (identity-at-create): stamp the KA number + reserved UAL on the lifecycle URN
+  // so the UAL is the KA's identity from the first write — the per-KA graph name
+  // {addr}/{number} and the _meta row key both derive from it. Finalize's
+  // hasExistingKaId guard then finds this stamp and skips re-allocation. Consensus-
+  // neutral: the seal commits content+author, never the kaId.
+  if (meta.kaNumber !== undefined) {
+    quads.push(mq(subject, KA_ID_PRED, intLit(BigInt(meta.kaNumber)), metaGraph));
+  }
+  if (meta.reservedUal) {
+    quads.push(mq(subject, RESERVED_UAL_PRED, lit(meta.reservedUal), metaGraph));
+  }
 
   if (meta.subGraphName) {
     quads.push(mq(subject, `${DKG}subGraphName`, lit(meta.subGraphName), metaGraph));
@@ -1350,6 +1424,8 @@ export interface AssertionPromotedMeta {
   agentAddress: string;
   assertionName: string;
   subGraphName?: string;
+  /** D1 — KA number, so the WM-delete targets the per-KA _working_memory/{addr}/{number} graph. */
+  kaNumber?: bigint | number | string;
   shareOperationId: string;
   rootEntities: string[];
   timestamp: Date;
@@ -1362,30 +1438,48 @@ export interface AssertionPromotedMeta {
   merkleHex?: string;
 }
 
-export function generateAssertionPromotedMetadata(meta: AssertionPromotedMeta): { insert: Quad[]; delete: Quad[] } {
+export function generateAssertionPromotedMetadata(meta: AssertionPromotedMeta, opts?: LifecycleMetadataOptions): { insert: Quad[]; delete: Quad[] } {
   const metaGraph = `did:dkg:context-graph:${meta.contextGraphId}/_meta`;
   const subject = assertionLifecycleUri(meta.contextGraphId, meta.agentAddress, meta.assertionName, meta.subGraphName);
-  const agentUri = agentDid(meta.agentAddress);
   const eventUri = `${subject}/event/${nextEventId()}`;
+  const provenanceEvents = opts?.provenanceEvents !== false;
+  // SUBSTRATE-2: the layer-aware assertionGraph re-stamp. At create the pointer names
+  // the WM graph (metadata.ts generateAssertionCreatedMetadata); on promote it must
+  // re-point to the SWM-layer graph so the _meta index locates SWM data correctly.
+  // rc.17a: the shared bucket (contextGraphSharedMemoryUri); rc.17b flips this target
+  // to the per-KA SWM graph. Without this re-stamp the index follows a stale WM pointer.
+  const wmGraphUri = meta.kaNumber !== undefined
+    ? contextGraphLayerUri(meta.contextGraphId, MemoryLayer.WorkingMemory, meta.agentAddress, meta.kaNumber, meta.subGraphName)
+    : contextGraphAssertionUri(meta.contextGraphId, meta.agentAddress, meta.assertionName, meta.subGraphName);
+  const swmGraphUri = meta.kaNumber !== undefined
+    ? contextGraphLayerUri(meta.contextGraphId, MemoryLayer.SharedWorkingMemory, meta.agentAddress, meta.kaNumber, meta.subGraphName)
+    : contextGraphSharedMemoryUri(meta.contextGraphId, meta.subGraphName);
 
   const del = [
     assertionStateQuad(subject, 'created', metaGraph),
     assertionLayerQuad(subject, MemoryLayer.WorkingMemory, metaGraph),
+    mq(subject, `${DKG}assertionGraph`, wmGraphUri, metaGraph),
   ];
   const ins: Quad[] = [
     // Update assertion entity (mutable fields)
     mq(subject, `${DKG}state`, lit('promoted'), metaGraph),
     mq(subject, `${DKG}memoryLayer`, lit(MemoryLayer.SharedWorkingMemory), metaGraph),
-    // Event entity (prov:Activity + DKG layer transition)
-    mq(eventUri, `${RDF}type`, `${PROV}Activity`, metaGraph),
-    mq(eventUri, `${RDF}type`, `${DKG}AssertionPromoted`, metaGraph),
-    mq(eventUri, `${PROV}startedAtTime`, dateLit(meta.timestamp), metaGraph),
-    mq(eventUri, `${PROV}wasAssociatedWith`, agentUri, metaGraph),
-    mq(eventUri, `${PROV}used`, subject, metaGraph),
-    mq(eventUri, `${DKG}fromLayer`, lit(MemoryLayer.WorkingMemory), metaGraph),
-    mq(eventUri, `${DKG}toLayer`, lit(MemoryLayer.SharedWorkingMemory), metaGraph),
-    mq(eventUri, `${DKG}shareOperationId`, lit(meta.shareOperationId), metaGraph),
+    mq(subject, `${DKG}assertionGraph`, swmGraphUri, metaGraph),
+    mq(subject, `${DKG}shareOperationId`, lit(meta.shareOperationId), metaGraph),
   ];
+  if (provenanceEvents) {
+    ins.push(
+      // Event entity (prov:Activity). RFC ka-metadata-trim Phase 2: no
+      // `dkg:fromLayer`/`dkg:toLayer` (derived from the event class —
+      // AssertionPromoted ⇒ WM→SWM) and no `prov:wasAssociatedWith`
+      // (readers fall back to the subject's `prov:wasAttributedTo`).
+      mq(eventUri, `${RDF}type`, `${PROV}Activity`, metaGraph),
+      mq(eventUri, `${RDF}type`, `${DKG}AssertionPromoted`, metaGraph),
+      mq(eventUri, `${PROV}startedAtTime`, dateLit(meta.timestamp), metaGraph),
+      mq(eventUri, `${PROV}used`, subject, metaGraph),
+      mq(eventUri, `${DKG}shareOperationId`, lit(meta.shareOperationId), metaGraph),
+    );
+  }
   // OT-RFC-43 A2 — stamp the SWM pointer (swmCurrentAssertion). DELETE handled
   // by the caller's stampLayerPointerSparql when restamping; here we INSERT the
   // current merkle so generateAssertionPromotedMetadata callers that go through
@@ -1394,7 +1488,19 @@ export function generateAssertionPromotedMetadata(meta: AssertionPromotedMeta): 
     ins.push(assertionLayerPointerQuad(subject, SWM_CURRENT_ASSERTION_PRED, meta.merkleHex, metaGraph));
   }
   for (const entity of meta.rootEntities) {
-    ins.push(...entityMemberQuads(eventUri, entity, metaGraph));
+    // RFC ka-metadata-trim Phase 2: the per-event membership rows were
+    // dropped — the event node no longer duplicates the member list. The
+    // history/feed readers resolve a promote's entities from the STABLE
+    // subject-side stamp below (read-both: old-store events still carry
+    // event-side rows).
+    //
+    // SUBSTRATE-1: membership on the STABLE lifecycle URN, so the _meta index can
+    // resolve "which KAs contain member-entity X" by binding the member
+    // predicate on the URN instead of walking per-event nodes. (Member
+    // entities are first known once the KA is sealed; promote is the first
+    // lifecycle event that carries them. The create-and-seal path (D2)
+    // should stamp the same rows on the URN.)
+    ins.push(...entityMemberQuads(subject, entity, metaGraph));
   }
   if (meta.subGraphName) {
     ins.push(mq(subject, `${DKG}subGraphName`, lit(meta.subGraphName), metaGraph));
@@ -1402,53 +1508,11 @@ export function generateAssertionPromotedMetadata(meta: AssertionPromotedMeta): 
   return { insert: ins, delete: del };
 }
 
-export interface AssertionPublishedMeta {
-  contextGraphId: string;
-  agentAddress: string;
-  assertionName: string;
-  subGraphName?: string;
-  kcUal: string;
-  timestamp: Date;
-  /**
-   * OT-RFC-43 A2 — the assertion's merkle root hex (no 0x) confirmed on-chain.
-   * Stamps `dkg:vmCurrentAssertion` on the lifecycle URN. Optional for
-   * back-compat.
-   */
-  merkleHex?: string;
-}
-
-export function generateAssertionPublishedMetadata(meta: AssertionPublishedMeta): { insert: Quad[]; delete: Quad[] } {
-  const metaGraph = `did:dkg:context-graph:${meta.contextGraphId}/_meta`;
-  const subject = assertionLifecycleUri(meta.contextGraphId, meta.agentAddress, meta.assertionName, meta.subGraphName);
-  const agentUri = agentDid(meta.agentAddress);
-  const eventUri = `${subject}/event/${nextEventId()}`;
-  const ins: Quad[] = [
-    mq(subject, `${DKG}state`, lit('published'), metaGraph),
-    mq(subject, `${DKG}memoryLayer`, lit(MemoryLayer.VerifiedMemory), metaGraph),
-    mq(eventUri, `${RDF}type`, `${PROV}Activity`, metaGraph),
-    mq(eventUri, `${RDF}type`, `${DKG}AssertionPublished`, metaGraph),
-    mq(eventUri, `${PROV}startedAtTime`, dateLit(meta.timestamp), metaGraph),
-    mq(eventUri, `${PROV}wasAssociatedWith`, agentUri, metaGraph),
-    mq(eventUri, `${PROV}used`, subject, metaGraph),
-    mq(eventUri, `${DKG}fromLayer`, lit(MemoryLayer.SharedWorkingMemory), metaGraph),
-    mq(eventUri, `${DKG}toLayer`, lit(MemoryLayer.VerifiedMemory), metaGraph),
-    mq(eventUri, `${DKG}kcUal`, meta.kcUal, metaGraph),
-  ];
-  // OT-RFC-43 A2 — stamp the VM pointer (vmCurrentAssertion).
-  if (meta.merkleHex) {
-    ins.push(assertionLayerPointerQuad(subject, VM_CURRENT_ASSERTION_PRED, meta.merkleHex, metaGraph));
-  }
-  if (meta.subGraphName) {
-    ins.push(mq(subject, `${DKG}subGraphName`, lit(meta.subGraphName), metaGraph));
-  }
-  return {
-    insert: ins,
-    delete: [
-      assertionStateQuad(subject, 'promoted', metaGraph),
-      assertionLayerQuad(subject, MemoryLayer.SharedWorkingMemory, metaGraph),
-    ],
-  };
-}
+// RFC ka-metadata-trim Phase 0: `generateAssertionPublishedMetadata` (and its
+// `AssertionPublishedMeta` input) was deleted — its sole caller was a dead
+// SPARQL gate in dkg-publisher.ts that joined `dkg:agent`, a predicate the
+// lifecycle writer never emits, so it never fired. The SWM→VM flip is done
+// imperatively in dkg-agent-publish.ts.
 
 export interface AssertionUpdatedMeta {
   contextGraphId: string;
@@ -1474,34 +1538,39 @@ export interface AssertionUpdatedMeta {
 
 /**
  * OT-RFC-43 A2 §4 — provenance for an UPDATE (a second publish of the same
- * lifecycle name). Mirrors `generateAssertionPublishedMetadata`'s insert/delete
- * shape: it re-stamps `dkg:vmCurrentAssertion` (and `dkg:wmCurrentAssertion`,
- * which converges back to VM after the update mint) to the NEW merkle and
- * records `<lifecycle> prov:wasRevisionOf <prior>` so the version chain is
- * walkable.
+ * lifecycle name). Uses the lifecycle writers' insert/delete shape: it
+ * re-stamps `dkg:vmCurrentAssertion` (and `dkg:wmCurrentAssertion`, which
+ * converges back to VM after the update mint) to the NEW merkle and records
+ * `<lifecycle> prov:wasRevisionOf <prior>` so the version chain is walkable.
  */
-export function generateAssertionUpdatedMetadata(meta: AssertionUpdatedMeta): { insert: Quad[]; delete: Quad[] } {
+export function generateAssertionUpdatedMetadata(meta: AssertionUpdatedMeta, opts?: LifecycleMetadataOptions): { insert: Quad[]; delete: Quad[] } {
   const metaGraph = `did:dkg:context-graph:${meta.contextGraphId}/_meta`;
   const subject = assertionLifecycleUri(meta.contextGraphId, meta.agentAddress, meta.assertionName, meta.subGraphName);
-  const agentUri = agentDid(meta.agentAddress);
   const eventUri = `${subject}/event/${nextEventId()}`;
   const newBare = meta.newMerkleHex.startsWith('0x') ? meta.newMerkleHex.slice(2) : meta.newMerkleHex;
 
   const ins: Quad[] = [
+    // State/identity rows — ALWAYS written, even in lite mode (P3.3).
     mq(subject, `${DKG}state`, lit('published'), metaGraph),
-    mq(subject, `${DKG}memoryLayer`, lit(MemoryLayer.VerifiedMemory), metaGraph),
-    mq(eventUri, `${RDF}type`, `${PROV}Activity`, metaGraph),
-    mq(eventUri, `${RDF}type`, `${DKG}AssertionUpdated`, metaGraph),
-    mq(eventUri, `${PROV}startedAtTime`, dateLit(meta.timestamp), metaGraph),
-    mq(eventUri, `${PROV}wasAssociatedWith`, agentUri, metaGraph),
-    mq(eventUri, `${PROV}used`, subject, metaGraph),
-    mq(eventUri, `${DKG}fromLayer`, lit(MemoryLayer.VerifiedMemory), metaGraph),
-    mq(eventUri, `${DKG}toLayer`, lit(MemoryLayer.VerifiedMemory), metaGraph),
-    mq(eventUri, `${DKG}kcUal`, meta.kcUal, metaGraph),
-    // New per-layer pointers — WM converges back to VM after the update mint.
+    mq(subject, `${DKG}memoryLayer`, lit(MemoryLayer.VerifiableMemory), metaGraph),
+    // New VM pointer. RFC ka-metadata-trim Phase 2: the WM pointer is NO
+    // LONGER re-written here — after the update mint WM converges back to
+    // VM, and the wm/swm pointers are only materialised when they DIVERGE
+    // from VM. Readers COALESCE a missing wm/swm to the vm value.
     assertionLayerPointerQuad(subject, VM_CURRENT_ASSERTION_PRED, newBare, metaGraph),
-    assertionLayerPointerQuad(subject, WM_CURRENT_ASSERTION_PRED, newBare, metaGraph),
   ];
+  if (opts?.provenanceEvents !== false) {
+    ins.push(
+      // RFC ka-metadata-trim Phase 2: no `dkg:fromLayer`/`dkg:toLayer`
+      // (AssertionUpdated ⇒ VM→VM, derived by the history reader) and no
+      // `prov:wasAssociatedWith` (subject `prov:wasAttributedTo` fallback).
+      mq(eventUri, `${RDF}type`, `${PROV}Activity`, metaGraph),
+      mq(eventUri, `${RDF}type`, `${DKG}AssertionUpdated`, metaGraph),
+      mq(eventUri, `${PROV}startedAtTime`, dateLit(meta.timestamp), metaGraph),
+      mq(eventUri, `${PROV}used`, subject, metaGraph),
+      mq(eventUri, `${DKG}kcUal`, meta.kcUal, metaGraph),
+    );
+  }
 
   if (meta.priorMerkleHex) {
     const priorBare = meta.priorMerkleHex.startsWith('0x') ? meta.priorMerkleHex.slice(2) : meta.priorMerkleHex;
@@ -1533,22 +1602,30 @@ export interface AssertionDiscardedMeta {
   timestamp: Date;
 }
 
-export function generateAssertionDiscardedMetadata(meta: AssertionDiscardedMeta): { insert: Quad[]; delete: Quad[] } {
+export function generateAssertionDiscardedMetadata(meta: AssertionDiscardedMeta, opts?: LifecycleMetadataOptions): { insert: Quad[]; delete: Quad[] } {
   const metaGraph = `did:dkg:context-graph:${meta.contextGraphId}/_meta`;
   const subject = assertionLifecycleUri(meta.contextGraphId, meta.agentAddress, meta.assertionName, meta.subGraphName);
-  const agentUri = agentDid(meta.agentAddress);
   const eventUri = `${subject}/event/${nextEventId()}`;
   const ins: Quad[] = [
+    // The state change is ALWAYS written, even in lite mode (P3.3): it is a
+    // state/identity row, not a PROV event row.
     mq(subject, `${DKG}state`, lit('discarded'), metaGraph),
-    mq(subject, `${PROV}wasInvalidatedBy`, eventUri, metaGraph),
-    mq(eventUri, `${RDF}type`, `${PROV}Activity`, metaGraph),
-    mq(eventUri, `${RDF}type`, `${DKG}AssertionDiscarded`, metaGraph),
-    mq(eventUri, `${PROV}startedAtTime`, dateLit(meta.timestamp), metaGraph),
-    mq(eventUri, `${PROV}wasAssociatedWith`, agentUri, metaGraph),
-    mq(eventUri, `${PROV}used`, subject, metaGraph),
-    mq(eventUri, `${DKG}fromLayer`, lit(MemoryLayer.WorkingMemory), metaGraph),
-    mq(eventUri, `${DKG}toLayer`, lit('none'), metaGraph),
   ];
+  if (opts?.provenanceEvents !== false) {
+    ins.push(
+      // `prov:wasInvalidatedBy` points AT the event node, so it is gated
+      // together with the event — writing it without the node would leave a
+      // dangling edge in lite mode.
+      mq(subject, `${PROV}wasInvalidatedBy`, eventUri, metaGraph),
+      // RFC ka-metadata-trim Phase 2: no `dkg:fromLayer`/`dkg:toLayer`
+      // (AssertionDiscarded ⇒ WM→none, derived by the history reader) and no
+      // `prov:wasAssociatedWith` (subject `prov:wasAttributedTo` fallback).
+      mq(eventUri, `${RDF}type`, `${PROV}Activity`, metaGraph),
+      mq(eventUri, `${RDF}type`, `${DKG}AssertionDiscarded`, metaGraph),
+      mq(eventUri, `${PROV}startedAtTime`, dateLit(meta.timestamp), metaGraph),
+      mq(eventUri, `${PROV}used`, subject, metaGraph),
+    );
+  }
   if (meta.subGraphName) {
     ins.push(mq(subject, `${DKG}subGraphName`, lit(meta.subGraphName), metaGraph));
   }

@@ -1,6 +1,17 @@
 import { keccak256 } from './keccak.js';
 
 /**
+ * OT-RFC-49 / WS-B Trap 3: ACK-digest domain-separation version, prepended as
+ * the FIRST packed member of the publish/update ACK preimage. MUST equal the
+ * `KnowledgeAssetsLifecycle.ACK_DIGEST_VERSION` constant the contract packs, or
+ * every publish/update ACK fails `SignerIsNotNodeOperator` (a SILENT failure —
+ * the signature simply recovers to the wrong address). Bump in lockstep with the
+ * contract whenever the ACK field-set changes (here: the ciphertext→catalog
+ * cutover) so an ACK signed under one field-set is unusable against another.
+ */
+export const ACK_DIGEST_VERSION = 1n;
+
+/**
  * Encode a uint256 as a big-endian 32-byte Uint8Array (abi.encodePacked format).
  */
 function uint256ToBytes(value: bigint): Uint8Array {
@@ -152,8 +163,9 @@ export function floorPublishTokenAmount(tokenAmount: bigint): bigint {
 /**
  * Compute the V10 publish ACK digest that each receiving core node signs.
  *
- * Layout matches `KnowledgeAssetsV10.sol` `_executePublishCore` exactly:
+ * Layout matches `KnowledgeAssetsLifecycle._executePublishCore` exactly:
  *   keccak256(abi.encodePacked(
+ *     ACK_DIGEST_VERSION,       // uint256 (32) — OT-RFC-49 Trap 3 prefix
  *     block.chainid,            // uint256 (32)
  *     address(this),            // address (20) — the deployed KAV10 address
  *     contextGraphId,           // uint256 (32)
@@ -162,20 +174,29 @@ export function floorPublishTokenAmount(tokenAmount: bigint): bigint {
  *     uint256(byteSize),        // uint256 (32) — cast from uint88 in contract
  *     uint256(epochs),          // uint256 (32) — cast from uint40 in contract
  *     uint256(tokenAmount),     // uint256 (32) — cast from uint96 in contract
- *     uint256(merkleLeafCount)  // uint256 (32) — cast from uint32 in contract
- *   ))                          // total packed width = 276 bytes
+ *     uint256(merkleLeafCount), // uint256 (32) — cast from uint32 in contract
+ *     catalogRoot,              // bytes32 (32) — OT-RFC-49 (was ciphertextChunksRoot)
+ *     uint256(catalogLeafCount),// uint256 (32) — OT-RFC-49 (was ciphertextChunkCount)
+ *     uint256(isImmutable)      // uint256 (32)
+ *   ))                          // total packed width = 404 bytes
  *
  * The contract wraps this with `ECDSA.toEthSignedMessageHash` (EIP-191)
  * before recovery; off-chain, `signer.signMessage(returnedBytes)` applies
  * the same wrap.
  *
- * H5 closure: the leading (chainid, kav10Address) prefix pins signatures to
- * this chain and this contract. Replay across chains / forks / contract
- * redeployments is rejected at signature verification.
+ * H5 closure: the leading (version, chainid, kav10Address) prefix pins
+ * signatures to this ACK-digest version, this chain, and this contract. Replay
+ * across chains / forks / contract redeployments / field-set versions is
+ * rejected at signature verification.
  *
  * KAV10 10.1.1: `tokenAmount` is run through {@link floorPublishTokenAmount}
  * so a free-publish flow (`tokenAmount === 0n`) hashes the same `1n` value
  * the adapter sends on-chain.
+ *
+ * OT-RFC-49: `catalogRoot`/`catalogLeafCount` are the curated PUBLIC `_catalog`
+ * commitment that replaced the stripped ciphertext one (same byte widths /
+ * positions). `version` defaults to {@link ACK_DIGEST_VERSION}; pass it
+ * explicitly only when intentionally testing a cross-version mismatch.
  */
 export function computePublishACKDigest(
   chainId: bigint,
@@ -187,21 +208,23 @@ export function computePublishACKDigest(
   epochs: bigint,
   tokenAmount: bigint,
   merkleLeafCount: bigint,
-  ciphertextChunksRoot: Uint8Array = new Uint8Array(32),
-  ciphertextChunkCount: bigint = 0n,
+  catalogRoot: Uint8Array = new Uint8Array(32),
+  catalogLeafCount: bigint = 0n,
   isImmutable: boolean = false,
+  version: bigint = ACK_DIGEST_VERSION,
 ): Uint8Array {
   if (merkleRoot.length !== 32) {
     throw new Error(`merkleRoot must be 32 bytes, got ${merkleRoot.length}`);
   }
-  if (ciphertextChunksRoot.length !== 32) {
-    throw new Error(`ciphertextChunksRoot must be 32 bytes, got ${ciphertextChunksRoot.length}`);
+  if (catalogRoot.length !== 32) {
+    throw new Error(`catalogRoot must be 32 bytes, got ${catalogRoot.length}`);
   }
   const addrBytes = addressToBytes(kav10Address);
   const flooredTokenAmount = floorPublishTokenAmount(tokenAmount);
 
-  const packed = new Uint8Array(372);
+  const packed = new Uint8Array(404);
   let offset = 0;
+  packed.set(uint256ToBytes(version), offset); offset += 32;
   packed.set(uint256ToBytes(chainId), offset); offset += 32;
   packed.set(addrBytes, offset); offset += 20;
   packed.set(uint256ToBytes(contextGraphId), offset); offset += 32;
@@ -211,8 +234,8 @@ export function computePublishACKDigest(
   packed.set(uint256ToBytes(epochs), offset); offset += 32;
   packed.set(uint256ToBytes(flooredTokenAmount), offset); offset += 32;
   packed.set(uint256ToBytes(merkleLeafCount), offset); offset += 32;
-  packed.set(ciphertextChunksRoot, offset); offset += 32;
-  packed.set(uint256ToBytes(ciphertextChunkCount), offset); offset += 32;
+  packed.set(catalogRoot, offset); offset += 32;
+  packed.set(uint256ToBytes(catalogLeafCount), offset); offset += 32;
   packed.set(uint256ToBytes(isImmutable ? 1n : 0n), offset); offset += 32;
 
   return keccak256(packed);
@@ -238,8 +261,9 @@ export function computePublishACKDigest(
 /**
  * Compute the V10 update ACK digest that core nodes sign.
  *
- * Layout matches `KnowledgeAssetsV10.sol` `_executeUpdateCore`:
+ * Layout matches `KnowledgeAssetsLifecycle._executeUpdateCore`:
  *   keccak256(abi.encodePacked(
+ *     ACK_DIGEST_VERSION,                     // uint256 (32) — OT-RFC-49 Trap 3 prefix
  *     block.chainid,                          // uint256 (32)
  *     address(this),                          // address (20)
  *     contextGraphId,                         // uint256 (32)
@@ -250,8 +274,10 @@ export function computePublishACKDigest(
  *     uint256(p.newTokenAmount),              // uint256 (32)
  *     p.mintKnowledgeAssetsAmount,            // uint256 (32)
  *     keccak256(abi.encodePacked(burnIds)),   // bytes32 (32)
- *     uint256(newMerkleLeafCount)             // uint256 (32) — cast from uint32
- *   ))                                        // total packed width = 340 bytes
+ *     uint256(newMerkleLeafCount),            // uint256 (32) — cast from uint32
+ *     newCatalogRoot,                         // bytes32 (32) — OT-RFC-49 (was newCiphertextChunksRoot)
+ *     uint256(newCatalogLeafCount)            // uint256 (32) — OT-RFC-49 (was newCiphertextChunkCount)
+ *   ))                                        // total packed width = 436 bytes
  */
 export function computeUpdateACKDigest(
   chainId: bigint,
@@ -265,14 +291,15 @@ export function computeUpdateACKDigest(
   mintAmount: bigint,
   burnTokenIds: bigint[],
   newMerkleLeafCount: bigint,
-  newCiphertextChunksRoot: Uint8Array = new Uint8Array(32),
-  newCiphertextChunkCount: bigint = 0n,
+  newCatalogRoot: Uint8Array = new Uint8Array(32),
+  newCatalogLeafCount: bigint = 0n,
+  version: bigint = ACK_DIGEST_VERSION,
 ): Uint8Array {
   if (newMerkleRoot.length !== 32) {
     throw new Error(`newMerkleRoot must be 32 bytes, got ${newMerkleRoot.length}`);
   }
-  if (newCiphertextChunksRoot.length !== 32) {
-    throw new Error(`newCiphertextChunksRoot must be 32 bytes, got ${newCiphertextChunksRoot.length}`);
+  if (newCatalogRoot.length !== 32) {
+    throw new Error(`newCatalogRoot must be 32 bytes, got ${newCatalogRoot.length}`);
   }
   const addrBytes = addressToBytes(kav10Address);
   // KAV10 10.1.1 — kept in lockstep with the adapter's update struct so the
@@ -293,9 +320,10 @@ export function computeUpdateACKDigest(
   }
   const burnHash = keccak256(burnPacked);
 
-  // Packed width = 32 (chainId) + 20 (addr) + 32*11 fields = 404.
-  const packed = new Uint8Array(404);
+  // Packed width = 32 (version) + 32 (chainId) + 20 (addr) + 32*12 fields = 436.
+  const packed = new Uint8Array(436);
   let offset = 0;
+  packed.set(uint256ToBytes(version), offset); offset += 32;
   packed.set(uint256ToBytes(chainId), offset); offset += 32;
   packed.set(addrBytes, offset); offset += 20;
   packed.set(uint256ToBytes(contextGraphId), offset); offset += 32;
@@ -307,8 +335,8 @@ export function computeUpdateACKDigest(
   packed.set(uint256ToBytes(mintAmount), offset); offset += 32;
   packed.set(burnHash, offset); offset += 32;
   packed.set(uint256ToBytes(newMerkleLeafCount), offset); offset += 32;
-  packed.set(newCiphertextChunksRoot, offset); offset += 32;
-  packed.set(uint256ToBytes(newCiphertextChunkCount), offset); offset += 32;
+  packed.set(newCatalogRoot, offset); offset += 32;
+  packed.set(uint256ToBytes(newCatalogLeafCount), offset); offset += 32;
 
   return keccak256(packed);
 }
@@ -361,11 +389,16 @@ export const AUTHOR_ATTESTATION_DOMAIN_NAME = 'KnowledgeAssetsLifecycle';
 
 /**
  * EIP-712 domain version. Bound to the major.minor portion of the
- * contract's `_VERSION` literal ("10.1"). Patch bumps do NOT change
- * this; only major.minor changes do. See
- * `KnowledgeAssetsV10._EIP712_VERSION_HASH`.
+ * contract's `_VERSION` literal. Patch bumps do NOT change this; only
+ * major.minor changes do. See `KnowledgeAssetsV10._EIP712_VERSION_HASH`.
+ *
+ * BUMPED for the CG-independent `AuthorAttestation` (the `contextGraphId`
+ * struct field was removed — see below). This MUST match the matching
+ * smart-contract PR's new `_EIP712_VERSION` exactly, or every on-chain
+ * `_verifyAuthorAttestation` reverts with `InvalidAuthorSignature`.
+ * CROSS-PR COORDINATION POINT — reconcile the literal with the contract PR.
  */
-export const AUTHOR_ATTESTATION_DOMAIN_VERSION = '2.0.0';
+export const AUTHOR_ATTESTATION_DOMAIN_VERSION = '3.0.0';
 
 /**
  * Currently-supported `authorSchemeVersion` value. v1 is single-key
@@ -381,8 +414,20 @@ export const AUTHOR_SCHEME_VERSION_V1 = 1;
  * `_AUTHOR_ATTESTATION_TYPEHASH` literal in
  * `KnowledgeAssetsV10.sol`:
  *
- *   AuthorAttestation(uint256 contextGraphId, bytes32 merkleRoot,
- *                     address authorAddress, uint8 schemeVersion)
+ *   AuthorAttestation(bytes32 merkleRoot, address authorAddress,
+ *                     uint8 schemeVersion, uint256 reservedKaId)
+ *
+ * The `contextGraphId` field was REMOVED (#1116): the seal is now
+ * context-graph-independent so an assertion can be finalized before its CG
+ * is registered on-chain. The CG is still bound to the publication at
+ * publish time (the contract's `PublishParams.contextGraphId` + the
+ * separate ACK digest) — just not by the author signature.
+ *
+ * OT-RFC-43 Option-1 (variant 1a): `reservedKaId` — the packed
+ * `(uint160(author) << 96) | uint96(number)` slot this publish claims — is
+ * bound into the attestation so the author signs the *slot*, not just the
+ * content. This MUST stay byte-for-byte aligned with the on-chain
+ * `abi.encode(...)` order; the field is appended LAST.
  */
 export const AUTHOR_ATTESTATION_PRIMARY_TYPE = 'AuthorAttestation';
 
@@ -398,10 +443,10 @@ export interface AuthorAttestationTypedData {
   };
   primaryType: typeof AUTHOR_ATTESTATION_PRIMARY_TYPE;
   message: {
-    contextGraphId: bigint;
     merkleRoot: string;
     authorAddress: string;
     schemeVersion: number;
+    reservedKaId: bigint;
   };
 }
 
@@ -409,10 +454,16 @@ export interface AuthorAttestationTypedData {
  * Build the EIP-712 typed-data payload for the V10 author attestation.
  *
  * Domain pins `(chainId, verifyingContract)` to defeat cross-chain and
- * cross-deployment replay. Struct hash binds the publication's
- * `(contextGraphId, merkleRoot)` to a specific
- * `(authorAddress, schemeVersion)` — leaked signatures cannot be
- * redirected to a different CG, root, or author.
+ * cross-deployment replay. Struct hash binds the publication's `merkleRoot`
+ * to a specific `(authorAddress, schemeVersion, reservedKaId)` — leaked
+ * signatures cannot be redirected to a different content root, author, or
+ * KA id/slot. The seal is intentionally CG-independent (#1116); CG binding
+ * happens at publish (PublishParams.contextGraphId + the ACK digest).
+ *
+ * `reservedKaId` is the packed `(uint160(author) << 96) | uint96(number)`
+ * the publish will mint; it is REQUIRED under OT-RFC-43 Option-1 variant 1a
+ * and must equal the `reservedKaId` placed in `PublishParams`, or on-chain
+ * recovery will revert with `InvalidAuthorSignature`.
  *
  * Pass directly to `ethers.Signer.signTypedData(domain, types, message)`
  * or to a wallet-of-record (EIP-1271 contract).
@@ -420,9 +471,9 @@ export interface AuthorAttestationTypedData {
 export function buildAuthorAttestationTypedData(args: {
   chainId: bigint;
   kav10Address: string;
-  contextGraphId: bigint;
   merkleRoot: Uint8Array;
   authorAddress: string;
+  reservedKaId: bigint;
   schemeVersion?: number;
 }): AuthorAttestationTypedData {
   if (args.merkleRoot.length !== 32) {
@@ -445,18 +496,18 @@ export function buildAuthorAttestationTypedData(args: {
     },
     types: {
       AuthorAttestation: [
-        { name: 'contextGraphId', type: 'uint256' },
         { name: 'merkleRoot', type: 'bytes32' },
         { name: 'authorAddress', type: 'address' },
         { name: 'schemeVersion', type: 'uint8' },
+        { name: 'reservedKaId', type: 'uint256' },
       ],
     },
     primaryType: AUTHOR_ATTESTATION_PRIMARY_TYPE,
     message: {
-      contextGraphId: args.contextGraphId,
       merkleRoot: merkleRootHex,
       authorAddress: args.authorAddress,
       schemeVersion,
+      reservedKaId: args.reservedKaId,
     },
   };
 }

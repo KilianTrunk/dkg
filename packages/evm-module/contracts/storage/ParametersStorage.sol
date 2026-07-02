@@ -15,11 +15,13 @@ contract ParametersStorage is INamed, IVersioned, HubDependent {
     ///         typed `address` field.
     event ProtocolTreasurySet(address indexed treasury);
 
+    error ZeroShardingTableSizeLimit();
+
     string private constant _NAME = "ParametersStorage";
     // protocol treasury fee (`protocolTreasuryFee`, `protocolTreasury`,
     // `MAX_PROTOCOL_TREASURY_FEE`) skimmed from the staker-bound TRAC on
     // every paid publish / update / lifetime-extension.
-    string private constant _VERSION = "10.0.2";
+    string private constant _VERSION = "10.0.4";
 
     uint96 public minimumStake;
     uint96 public maximumStake;
@@ -56,6 +58,15 @@ contract ParametersStorage is INamed, IVersioned, HubDependent {
     ///         disables the fee entirely regardless of `protocolTreasuryFee`.
     address public protocolTreasury;
 
+    /// @notice Minimum TRAC deposit required to register a Context Graph
+    ///         on-chain (`ContextGraphs.createContextGraph`). The deposit is
+    ///         held as the CG's prepaid publishing escrow — spendable by the
+    ///         CG owner on publish/update/extend into that CG — and is never
+    ///         cash-refundable (residue sweeps to the staker reward pool on
+    ///         deactivation). Anti-spam for the unbounded-CG-creation DoS
+    ///         (OT-RFC-53). Setting it to 0 disables the deposit (dormant).
+    uint96 public contextGraphRegistrationDeposit;
+
     /// @notice Hard upper bound on `protocolTreasuryFee` (10%). Bounds
     ///         governance so the fee can never be set to an extractive level
     ///         that would starve the staker reward pool.
@@ -75,6 +86,18 @@ contract ParametersStorage is INamed, IVersioned, HubDependent {
     /// the block limit while leaving room for the surrounding
     /// `publish` / `topUp` / NFT-transfer work.
     uint256 public constant MAX_PUBLISHING_CONVICTION_EPOCHS = 60;
+
+    /// @notice OT-RFC-53: minimum PCA `committedTRAC` required for a PCA-backed
+    ///         Context Graph to qualify for the registration-deposit WAIVER. The
+    ///         waiver lets a PCA's locked TRAC pay the per-CG anti-spam cost
+    ///         instead of separate liquid TRAC, but only up to a per-PCA quota
+    ///         (`committedTRAC / contextGraphRegistrationDeposit`); this floor
+    ///         keeps the perk to serious PCAs and blocks the dust-PCA bypass
+    ///         (a 1-wei PCA minting unlimited deposit-free CGs). Defaults to the
+    ///         first conviction discount tier (25k TRAC).
+    /// @dev    Declared at the END of the state variables ON PURPOSE: appending
+    ///         (not inserting) keeps every prior storage slot unchanged.
+    uint96 public minPcaCommitmentForCgWaiver;
 
     // @dev Only transactions by HubController owner or one of the owners of the MultiSig Wallet
     modifier onlyOwnerOrMultiSigOwner() {
@@ -109,6 +132,19 @@ contract ParametersStorage is INamed, IVersioned, HubDependent {
         // the zero address), so a fresh deploy behaves exactly as before
         // until governance opts in.
         protocolTreasuryFee = 300;
+
+        // OT-RFC-53: constructor leaves the registration deposit at 0; the
+        // standard deploy sets the live value (100 TRAC) via a post-deploy
+        // script that calls `setContextGraphRegistrationDeposit`. This protects
+        // production automatically (no manual step, no silent-off) while keeping
+        // test fixtures — which don't run that script — unaffected. Governance
+        // can retune or disable it anytime.
+
+        // OT-RFC-53 waiver floor: unlike the deposit, this ships at a sane
+        // non-zero default (the first conviction discount tier, 25k TRAC) so the
+        // waiver is never accidentally floor-less. It is moot until the deposit
+        // is activated (the waiver path is gated on deposit > 0). Governance-tunable.
+        minPcaCommitmentForCgWaiver = 25_000 ether;
     }
 
     function name() external pure virtual override returns (string memory) {
@@ -172,6 +208,12 @@ contract ParametersStorage is INamed, IVersioned, HubDependent {
     }
 
     function setShardingTableSizeLimit(uint16 shardingTableSizeLimit_) external onlyOwnerOrMultiSigOwner {
+        // Reject 0: ShardingTable._insertNode now enforces this cap
+        // (`nodesCount >= limit` reverts ShardingTableIsFull), so a 0 limit would
+        // freeze ALL node admission (even the first insert), bricking staking. 0
+        // is never a meaningful table size — reject it rather than let it act as
+        // an implicit pause switch.
+        if (shardingTableSizeLimit_ == 0) revert ZeroShardingTableSizeLimit();
         shardingTableSizeLimit = shardingTableSizeLimit_;
 
         emit ParameterChanged("shardingTableSizeLimit", shardingTableSizeLimit);
@@ -203,6 +245,18 @@ contract ParametersStorage is INamed, IVersioned, HubDependent {
         publishingConvictionEpochs = _publishingConvictionEpochs;
 
         emit ParameterChanged("publishingConvictionEpochs", _publishingConvictionEpochs);
+    }
+
+    function setContextGraphRegistrationDeposit(uint96 amount) external onlyOwnerOrMultiSigOwner {
+        contextGraphRegistrationDeposit = amount;
+
+        emit ParameterChanged("contextGraphRegistrationDeposit", amount);
+    }
+
+    function setMinPcaCommitmentForCgWaiver(uint96 amount) external onlyOwnerOrMultiSigOwner {
+        minPcaCommitmentForCgWaiver = amount;
+
+        emit ParameterChanged("minPcaCommitmentForCgWaiver", amount);
     }
 
     function setProtocolTreasuryFee(uint16 protocolTreasuryFee_) external onlyOwnerOrMultiSigOwner {

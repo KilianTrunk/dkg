@@ -11,11 +11,16 @@
 
 import { EVMChainAdapterBase } from './evm-adapter-base.js';
 import { ethers, Contract } from 'ethers';
-import type { TxResult, V10PublishingConvictionAccountInfo } from './chain-adapter.js';
+import type {
+  TxResult,
+  V10PublishingConvictionAccountInfo,
+  NodePublishingConvictionAccount,
+  ConvictionReader,
+} from './chain-adapter.js';
 import { PcaUnavailableError } from './pca-errors.js';
 import { enrichEvmError, getPcaLogicInterface } from './evm-adapter-errors.js';
 
-export class ConvictionMethods extends EVMChainAdapterBase {
+export class ConvictionMethods extends EVMChainAdapterBase implements ConvictionReader {
   // =====================================================================
   // Staking + Publishing Conviction Account legacy surface — ARCHIVED
   /**
@@ -39,7 +44,9 @@ export class ConvictionMethods extends EVMChainAdapterBase {
     if (!this.contracts.dkgPublishingConvictionNFT) return 0n;
     if (!ethers.isAddress(agent)) return 0n;
     try {
-      const id: bigint = await this.contracts.dkgPublishingConvictionNFT.agentToAccountId(agent);
+      const id: bigint = await this.readContract(
+        this.contracts.dkgPublishingConvictionNFT, 'pcaNFT.agentToAccountId', 'agentToAccountId', agent,
+      );
       return BigInt(id);
     } catch (err: any) {
       if (err?.code === 'CALL_EXCEPTION') return 0n;
@@ -56,7 +63,9 @@ export class ConvictionMethods extends EVMChainAdapterBase {
       // (committedTRAC, createdAtEpoch, expiresAtEpoch, createdAtTimestamp,
       //  expiresAtTimestamp, lockDurationEpochs, discountBps,
       //  lastSettledWindow, fullySwept). Pull index 5.
-      const tuple = await this.contracts.dkgPublishingConvictionNFT.accounts(accountId);
+      const tuple = await this.readContract(
+        this.contracts.dkgPublishingConvictionNFT, 'pcaNFT.accounts', 'accounts', accountId,
+      );
       const lock = tuple[5];
       return Number(lock);
     } catch (err: any) {
@@ -65,10 +74,85 @@ export class ConvictionMethods extends EVMChainAdapterBase {
     }
   }
 
+  /**
+   * Whether the PCA `accountId` can cover the DISCOUNTED cost of a publish
+   * whose undiscounted (base) cost is `baseCost`, right now.
+   *
+   * Mirrors `PublishingConviction.coverPublishingCost` exactly so the SDK's
+   * pre-flight matches the on-chain decision: reject once the account is past
+   * its (TIMESTAMP-based) `expiresAtTimestamp`, then apply the account's
+   * discount tier (`discountedCost = baseCost * (BPS_DENOMINATOR -
+   * discountBps) / BPS_DENOMINATOR`, with the contract's post-discount 1-wei
+   * floor), then compare against `getRemainingAllowance(accountId,
+   * currentEpoch)` — which folds in the top-up buffer and the current-window
+   * spend.
+   *
+   * The publisher SDK gates the `publishEpochs → lockDurationEpochs`
+   * coercion on this: agent registration is consent-free (RFC-001 §3.6) and
+   * the contract's conviction branch now falls through to direct spend
+   * instead of reverting, so coercing an account that can't actually fund
+   * THIS publish would direct-spend at the PCA-lock lifetime AND full price
+   * instead of the caller's default. A coarse "balance > 0" check is not
+   * enough — a nonzero-but-insufficient account (or a squat funded with a
+   * few wei so its base allowance rounds up to ≥1) would still slip through;
+   * gating on real coverage of the pending cost closes that.
+   *
+   * Returns `false` when the NFT is not deployed, the id is non-positive,
+   * the account is missing, or the chain call reverts — callers treat the
+   * unknown case as "cannot fund", which fails safe to "do not coerce".
+   * `baseCost <= 0` is treated as trivially coverable.
+   */
+  async convictionAccountCanCover(accountId: bigint, baseCost: bigint): Promise<boolean> {
+    await this.init();
+    if (!this.contracts.dkgPublishingConvictionNFT) return false;
+    if (accountId <= 0n) return false;
+    if (baseCost <= 0n) return true;
+    try {
+      const info = await this.getPublishingConvictionAccountInfo(accountId);
+      if (!info) return false;
+
+      // Expiry is TIMESTAMP-based on-chain: `coverPublishingCost` reverts
+      // `AccountExpired` on `block.timestamp >= expiresAtTimestamp`. The
+      // epoch-based `getRemainingAllowance` below still reports allowance
+      // during the tail of the expiry epoch (for mid-epoch-created accounts
+      // `expiresAtEpoch` rounds up past `expiresAtTimestamp`), so check the
+      // wall clock first to mirror the contract exactly — otherwise the SDK
+      // would coerce, then fall through to full-price direct spend.
+      if (info.expiresAtTimestamp > 0) {
+        const latestBlock = await this.readProvider('conviction getBlock', (p) => p.getBlock('latest'));
+        const nowTs = latestBlock ? Number(latestBlock.timestamp) : Math.floor(Date.now() / 1000);
+        if (nowTs >= info.expiresAtTimestamp) return false;
+      }
+
+      // Mirror PublishingConviction's discount math + post-discount floor.
+      const BPS_DENOMINATOR = 10_000n;
+      const discountBps = BigInt(info.discountBps);
+      let discountedCost = (baseCost * (BPS_DENOMINATOR - discountBps)) / BPS_DENOMINATOR;
+      if (discountedCost === 0n && baseCost > 0n) discountedCost = 1n;
+
+      if (!this.contracts.chronos) {
+        this.contracts.chronos = await this.resolveContract('Chronos');
+      }
+      const currentEpoch: bigint = BigInt(await this.readContract(
+        this.contracts.chronos, 'chronos.getCurrentEpoch', 'getCurrentEpoch',
+      ));
+      const remaining: bigint = await this.readContract(
+        this.contracts.dkgPublishingConvictionNFT, 'pcaNFT.getRemainingAllowance',
+        'getRemainingAllowance', accountId, currentEpoch,
+      );
+      return BigInt(remaining) >= discountedCost;
+    } catch (err: any) {
+      if (err?.code === 'CALL_EXCEPTION') return false;
+      throw err;
+    }
+  }
+
   async getPublishingConvictionAccountOwner(accountId: bigint): Promise<string> {
     await this.init();
     const nft = await this.resolveContract('DKGPublishingConvictionNFT');
-    const owner = await nft.ownerOf(accountId);
+    const owner = await this.readContract(
+      nft, 'pcaNFT.ownerOf', 'ownerOf', accountId,
+    );
     return ethers.getAddress(owner);
   }
 
@@ -122,6 +206,7 @@ export class ConvictionMethods extends EVMChainAdapterBase {
 
   async createPublishingConvictionAccount(
     committedTRAC: bigint,
+    primaryNode: bigint = 0n,
   ): Promise<{ accountId: bigint } & TxResult> {
     await this.init();
     return this.pcaWrite(async () => {
@@ -131,7 +216,9 @@ export class ConvictionMethods extends EVMChainAdapterBase {
       // createAccount() does transferFrom(msg.sender → stakingStorage,
       // committedTRAC) — the signer must allow the NFT to pull the TRAC.
       if (this.contracts.token) {
-        const allowance: bigint = await this.contracts.token.allowance(this.signer.address, nftAddress);
+        const allowance: bigint = await this.readContract(
+          this.contracts.token, 'token.allowance', 'allowance', this.signer.address, nftAddress,
+        );
         if (allowance < committedTRAC) {
           await this.sendContractTransaction(
             this.contracts.token,
@@ -146,7 +233,7 @@ export class ConvictionMethods extends EVMChainAdapterBase {
       const receipt = await this.sendContractTransaction(
         nft,
         'createAccount',
-        [committedTRAC],
+        [committedTRAC, primaryNode],
         this.signer,
         'create publishing conviction account',
       );
@@ -187,7 +274,9 @@ export class ConvictionMethods extends EVMChainAdapterBase {
     // for a genuine account-missing revert so the route can disambiguate.
     if (!this.contracts.dkgPublishingConvictionNFT) throw new PcaUnavailableError();
     try {
-      const t = await this.contracts.dkgPublishingConvictionNFT.getAccountInfo(accountId);
+      const t = await this.readContract(
+        this.contracts.dkgPublishingConvictionNFT, 'pcaNFT.getAccountInfo', 'getAccountInfo', accountId,
+      );
       return {
         owner: ethers.getAddress(t[0]),
         committedTRAC: BigInt(t[1]),
@@ -214,7 +303,9 @@ export class ConvictionMethods extends EVMChainAdapterBase {
       const nft = this.requireConvictionNFT();
       const nftAddress = await nft.getAddress();
       if (this.contracts.token) {
-        const allowance: bigint = await this.contracts.token.allowance(this.signer.address, nftAddress);
+        const allowance: bigint = await this.readContract(
+          this.contracts.token, 'token.allowance', 'allowance', this.signer.address, nftAddress,
+        );
         if (allowance < amount) {
           await this.sendContractTransaction(
             this.contracts.token,
@@ -281,15 +372,197 @@ export class ConvictionMethods extends EVMChainAdapterBase {
     });
   }
 
+  /**
+   * Bulk-clear EVERY registered agent of a PCA. Owner-gated on-chain (ownerOf
+   * == caller). Unlike register/deregister (NFT-wrapper methods), `clearAgents`
+   * lives on the PublishingConviction LOGIC contract — the non-upgradeable
+   * wrapper has no entry point for it — so resolve the logic directly. Note PCA
+   * transfers PRESERVE the allow-list; this is the explicit reset a new owner
+   * uses to drop inherited agents.
+   */
+  async clearPublishingConvictionAgents(accountId: bigint): Promise<TxResult> {
+    await this.init();
+    return this.pcaWrite(async () => {
+      const logic = await this.resolveContract('PublishingConviction');
+      const receipt = await this.sendContractTransaction(
+        logic,
+        'clearAgents',
+        [accountId],
+        this.signer,
+        'clear publishing conviction agents',
+      );
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, txIndex: receipt.index, success: receipt.status === 1 };
+    });
+  }
+
+  /**
+   * Bulk-register MULTIPLE agents on a PCA in one tx. Owner-gated on-chain
+   * (ownerOf == caller). Like clearAgents, `registerAgents` lives on the
+   * PublishingConviction LOGIC contract (the frozen NFT wrapper has no batch
+   * entry point). All-or-nothing: any invalid entry reverts the whole batch.
+   */
+  async registerPublishingConvictionAgents(accountId: bigint, agents: string[]): Promise<TxResult> {
+    await this.init();
+    return this.pcaWrite(async () => {
+      const logic = await this.resolveContract('PublishingConviction');
+      const receipt = await this.sendContractTransaction(
+        logic,
+        'registerAgents',
+        [accountId, agents],
+        this.signer,
+        'bulk-register publishing conviction agents',
+      );
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, txIndex: receipt.index, success: receipt.status === 1 };
+    });
+  }
+
   async isPublishingConvictionAgent(accountId: bigint, agent: string): Promise<boolean> {
     await this.init();
     if (!this.contracts.dkgPublishingConvictionNFT) return false;
     if (!ethers.isAddress(agent)) return false;
     try {
-      return Boolean(await this.contracts.dkgPublishingConvictionNFT.isAgent(accountId, agent));
+      return Boolean(await this.readContract(
+        this.contracts.dkgPublishingConvictionNFT, 'pcaNFT.isAgent', 'isAgent', accountId, agent,
+      ));
     } catch (err: any) {
       if (err?.code === 'CALL_EXCEPTION') return false;
       throw err;
     }
+  }
+
+  /**
+   * OT-RFC-51 designated primary node for a PCA. Reads index 9 of the
+   * `accounts(uint256)` tuple
+   * `(committedTRAC, createdAtEpoch, expiresAtEpoch, createdAtTimestamp,
+   *   expiresAtTimestamp, lockDurationEpochs, discountBps, lastSettledWindow,
+   *   fullySwept, primaryNode, lastPrimaryNodeChangeEpoch)`.
+   * `getAccountInfo` (used by {@link getPublishingConvictionAccountInfo}) does
+   * NOT carry `primaryNode`, so this is a separate read. Returns `0n` when
+   * unset, the account is missing, or the NFT is undeployed.
+   */
+  /**
+   * Addresses + numeric chain id a browser wallet needs to build owner-signed
+   * PCA txs client-side (wallet-connect path). The node's RPC URL is
+   * deliberately NOT included — the browser signs/reads over the user's own
+   * wallet provider, so the node's (possibly tenant-secret) RPC never leaks.
+   */
+  async getPcaContractContext(): Promise<{
+    chainId: number;
+    hubAddress: string;
+    nftAddress: string;
+    tokenAddress: string;
+    publishingConvictionAddress: string;
+    clearAgentsSupported: boolean;
+  }> {
+    await this.init();
+    const nft = this.requireConvictionNFT();
+    const nftAddress = ethers.getAddress(await nft.getAddress());
+    if (!this.contracts.token) {
+      throw new Error('Token contract not available on this chain');
+    }
+    const tokenAddress = ethers.getAddress(await this.contracts.token.getAddress());
+    // PublishingConviction is the LOGIC contract that owns clearAgents (the NFT
+    // wrapper has no entry point for it), so the browser wallet-connect path
+    // needs its address to wallet-sign the bulk agent reset.
+    const logic = await this.resolveContract('PublishingConviction');
+    const publishingConvictionAddress = ethers.getAddress(await logic.getAddress());
+    // `clearAgents` lands in PublishingConviction 10.0.6. Gate the UI on the
+    // DEPLOYED version so the button only enables once the upgrade is live —
+    // self-healing (no node software redeploy needed when the contract is
+    // upgraded). Fail closed (unsupported) if the version can't be read.
+    let clearAgentsSupported = false;
+    try {
+      const v = String(await logic.version()).split('.').map((n) => parseInt(n, 10) || 0);
+      const [maj, min, pat] = [v[0] ?? 0, v[1] ?? 0, v[2] ?? 0];
+      clearAgentsSupported = maj > 10 || (maj === 10 && (min > 0 || (min === 0 && pat >= 6)));
+    } catch {
+      /* unknown / pre-versioned contract → treat as unsupported */
+    }
+    const chainId = Number(await this.getEvmChainId());
+    return {
+      chainId,
+      hubAddress: ethers.getAddress(this.hubAddress),
+      nftAddress,
+      tokenAddress,
+      publishingConvictionAddress,
+      clearAgentsSupported,
+    };
+  }
+
+  async getConvictionPrimaryNode(accountId: bigint): Promise<bigint> {
+    await this.init();
+    if (!this.contracts.dkgPublishingConvictionNFT) return 0n;
+    if (accountId <= 0n) return 0n;
+    try {
+      const tuple = await this.readContract(
+        this.contracts.dkgPublishingConvictionNFT, 'pcaNFT.accounts', 'accounts', accountId,
+      );
+      return BigInt(tuple[9]);
+    } catch (err: any) {
+      if (err?.code === 'CALL_EXCEPTION') return 0n;
+      throw err;
+    }
+  }
+
+  /**
+   * Enumerate the PCAs owned by the bound operational wallet via the NFT's
+   * ERC721Enumerable surface (`balanceOf` + `tokenOfOwnerByIndex`), annotating
+   * each with its OT-RFC-51 `primaryNode` association and whether it funds this
+   * node's own identity. These are exactly the accounts this wallet can manage
+   * (owner-gated writes). Accounts owned by a different wallet that nonetheless
+   * fund this node are out of scope here — load those by id via
+   * {@link getPublishingConvictionAccountInfo}.
+   */
+  async listNodePublishingConvictionAccounts(): Promise<NodePublishingConvictionAccount[]> {
+    await this.init();
+    if (!this.contracts.dkgPublishingConvictionNFT) throw new PcaUnavailableError();
+    const nft = this.requireConvictionNFT();
+    const owner = this.signer.address;
+    // 0n when this node has no on-chain profile yet — then no PCA "funds this node".
+    const myIdentity = await this.getIdentityId();
+
+    const balance: bigint = BigInt(await this.readContract(
+      nft, 'pcaNFT.balanceOf', 'balanceOf', owner,
+    ));
+
+    const out: NodePublishingConvictionAccount[] = [];
+    for (let i = 0n; i < balance; i += 1n) {
+      const accountId: bigint = BigInt(await this.readContract(
+        nft, 'pcaNFT.tokenOfOwnerByIndex', 'tokenOfOwnerByIndex', owner, i,
+      ));
+      const info = await this.getPublishingConvictionAccountInfo(accountId);
+      if (!info) continue; // raced burn / inconsistent enumeration — skip
+      const primaryNode = await this.getConvictionPrimaryNode(accountId);
+      out.push({
+        accountId,
+        primaryNode,
+        fundsThisNode: myIdentity !== 0n && primaryNode === myIdentity,
+        info,
+      });
+    }
+    // Surface the PCAs that fund this node first.
+    out.sort((a, b) => Number(b.fundsThisNode) - Number(a.fundsThisNode));
+    return out;
+  }
+
+  /**
+   * OT-RFC-51 owner-gated re-designation of a PCA's primary node. Moves FUTURE
+   * epochs' publishing allocation from the old node to `primaryNode`. The
+   * on-chain rate-limit (at most once per epoch) and the owner check surface as
+   * reverts that `pcaWrite` → the daemon classifier maps to 409 / 403.
+   */
+  async setPublishingConvictionPrimaryNode(accountId: bigint, primaryNode: bigint): Promise<TxResult> {
+    await this.init();
+    return this.pcaWrite(async () => {
+      const nft = this.requireConvictionNFT();
+      const receipt = await this.sendContractTransaction(
+        nft,
+        'setPrimaryNode',
+        [accountId, primaryNode],
+        this.signer,
+        'set publishing conviction primary node',
+      );
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, txIndex: receipt.index, success: receipt.status === 1 };
+    });
   }
 }

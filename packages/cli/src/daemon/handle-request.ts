@@ -181,8 +181,6 @@ import {
 } from './manifest.js';
 import {
   resolveNameToPeerId,
-  isPublishQuad,
-  parsePublishRequestBody,
   jsonResponse,
   safeDecodeURIComponent,
   safeParseJson,
@@ -209,6 +207,7 @@ import {
   shortId,
   sleep,
   deriveBlockExplorerUrl,
+  type AdmissionStatsView,
 } from './http-utils.js';
 import {
   normalizeRepo,
@@ -321,13 +320,15 @@ import { handleHermesRoutes } from './routes/hermes.js';
 import { handleMemoryRoutes } from './routes/memory.js';
 import { handlePublisherRoutes } from './routes/publisher.js';
 import { handleContextGraphRoutes } from './routes/context-graph.js';
-import { handleAssertionRoutes } from './routes/assertion.js';
 import { handleKnowledgeAssetsRoutes } from './routes/knowledge-assets.js';
+import { handleKcChainMetadataRoutes } from './routes/kc-chain-metadata.js';
+import { handleFileServingRoutes } from './routes/file-serving.js';
 import { handleQueryRoutes } from './routes/query.js';
 import { handleLocalAgentsRoutes } from './routes/local-agents.js';
 import { handleGuardianRoutes } from './routes/guardian.js';
 import { handleEpcisRoutes } from './routes/epcis.js';
 import { handlePcaRoutes } from './routes/pca.js';
+import { handleOperationalWalletRoutes } from './routes/operational-wallets.js';
 import { handleNotificationRoutes } from './routes/notifications.js';
 import { handlePluginRoutes } from './routes/plugins.js';
 import type { RoutePlugin } from './plugin-api.js';
@@ -363,6 +364,7 @@ export async function handleRequest(
   apiHost: string,
   apiPortRef: { value: number },
   routePlugins: RoutePlugin[],
+  admission: AdmissionStatsView,
   emitMemoryGraphChanged?: (event: MemoryGraphChangedEvent) => void,
   emitNotification?: (event: NotificationSseEvent) => void,
 ): Promise<void> {
@@ -402,6 +404,7 @@ export async function handleRequest(
     apiHost,
     apiPortRef,
     routePlugins,
+    admission,
     url,
     path,
     requestToken,
@@ -434,7 +437,10 @@ export async function handleRequest(
   await handleKnowledgeAssetsRoutes(ctx);
   if (res.writableEnded) return;
 
-  await handleAssertionRoutes(ctx);
+  await handleKcChainMetadataRoutes(ctx);
+  if (res.writableEnded) return;
+
+  await handleFileServingRoutes(ctx);
   if (res.writableEnded) return;
 
   await handleQueryRoutes(ctx);
@@ -450,6 +456,9 @@ export async function handleRequest(
   if (res.writableEnded) return;
 
   await handlePcaRoutes(ctx);
+  if (res.writableEnded) return;
+
+  await handleOperationalWalletRoutes(ctx);
   if (res.writableEnded) return;
 
   await handleNotificationRoutes(ctx);

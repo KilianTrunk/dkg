@@ -35,6 +35,9 @@ logger = logging.getLogger(__name__)
 # Entry delimiter matching built-in memory format
 _ENTRY_SEP = "\n\xA7\n"  # §
 
+# Daemon cap on publishEpochs (knowledge-assets.ts MAX_PUBLISH_EPOCHS = 0xffffffff).
+_MAX_PUBLISH_EPOCHS = 0xFFFFFFFF
+
 
 # Existing-target context graph wording is intentionally shared across Hermes
 # tool schemas so agents see the same rule as MCP/OpenClaw.
@@ -251,7 +254,7 @@ DKG_QUERY_SCHEMA = {
     "name": "dkg_query",
     "description": (
         "Query the DKG knowledge graph using SPARQL. Pass view to select "
-        "Working Memory, Shared Working Memory, or Verified Memory."
+        "Working Memory, Shared Working Memory, or Verifiable Memory."
     ),
     "parameters": {
         "type": "object",
@@ -271,7 +274,7 @@ DKG_QUERY_SCHEMA = {
             "view": {
                 "type": "string",
                 "description": (
-                    "Optional layer: working-memory, shared-working-memory, or verified-memory. "
+                    "Optional layer: working-memory, shared-working-memory, or verifiable-memory. "
                     "When supplied, context_graph_id is required."
                 ),
             },
@@ -288,68 +291,6 @@ DKG_QUERY_SCHEMA = {
     },
 }
 
-DKG_SHARE_SCHEMA = {
-    "name": "dkg_share",
-    "description": (
-        "Share knowledge to Shared Working Memory — visible to all team "
-        "members and agents in the Context Graph. Free, gossip-replicated."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "content": {
-                "type": "string",
-                "description": "Knowledge to share with the team.",
-            },
-            "context_graph_id": {
-                "type": "string",
-                "description": TARGET_CONTEXT_GRAPH_DESCRIPTION,
-            },
-            "sub_graph_name": {
-                "type": "string",
-                "description": "Optional sub-graph scope.",
-            },
-        },
-        "required": ["content", "context_graph_id"],
-    },
-}
-
-DKG_PUBLISH_SCHEMA = {
-    "name": "dkg_publish",
-    "description": (
-        "One-shot write + publish helper: write supplied quads to Shared Working Memory, "
-        "then publish SWM to Verified Memory. Chain-anchored, permanent, costs TRAC. "
-        "Object values starting with http://, https://, urn:, or did: are treated as "
-        "URIs. Everything else becomes a string literal automatically.\n"
-        "Always call dkg_wallet_balances first to verify sufficient TRAC."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "context_graph_id": {
-                "type": "string",
-                "description": TARGET_CONTEXT_GRAPH_DESCRIPTION,
-            },
-            "quads": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "subject": {"type": "string", "description": "Subject URI (e.g. 'https://example.org/finding/001')"},
-                        "predicate": {"type": "string", "description": "Predicate URI (e.g. 'https://schema.org/name')"},
-                        "object": {"type": "string", "description": "Object — URI or literal (e.g. 'Warfarin interaction' or 'https://schema.org/MedicalEntity')"},
-                        "graph": {"type": "string", "description": "Optional named graph URI."},
-                    },
-                    "required": ["subject", "predicate", "object"],
-                },
-                "description": "Array of RDF triples to write and publish.",
-            },
-            "sub_graph_name": {"type": "string", "description": "Optional sub-graph scope."},
-        },
-        "required": ["context_graph_id", "quads"],
-    },
-}
-
 DKG_STATUS_SCHEMA = {
     "name": "dkg_status",
     "description": "Check DKG node health, connected peers, and Context Graph status.",
@@ -360,7 +301,7 @@ DKG_WALLET_SCHEMA = {
     "name": "dkg_wallet_balances",
     "description": (
         "Check TRAC and ETH balances for the node's operational wallets. "
-        "Call this BEFORE using dkg_publish to verify you have enough TRAC "
+        "Call this BEFORE using dkg_knowledge_asset_publish to verify you have enough TRAC "
         "to cover publishing costs. Returns per-wallet balances and chain info."
     ),
     "parameters": {"type": "object", "properties": {}, "required": []},
@@ -494,7 +435,7 @@ DKG_CREATE_CONTEXT_GRAPH_SCHEMA = {
     "description": (
         "Create a new Context Graph — a bounded knowledge space for a project "
         "or team. Context Graphs organize knowledge into Working Memory, "
-        "Shared Memory, and Verified Memory layers. Use dkg_status first to "
+        "Shared Memory, and Verifiable Memory layers. Use dkg_status first to "
         "check if the Context Graph already exists. "
         "Defaults to a curated/private context graph — the creator is "
         "auto-included in the allowlist and can immediately write to working "
@@ -575,8 +516,10 @@ QUAD_SCHEMA = {
         "subject": {"type": "string", "description": "Subject URI."},
         "predicate": {"type": "string", "description": "Predicate URI."},
         "object": {"type": "string", "description": "Object URI or literal text."},
-        "graph": {"type": "string", "description": "Optional graph name."},
     },
+    # No per-quad `graph` field: the write wire shape is {subject,predicate,object}
+    # and the daemon pins every triple to the per-KA WM graph itself, overriding
+    # any client-supplied graph (CONTRACT §0 invariant 2). Matches OpenClaw + MCP.
     "required": ["subject", "predicate", "object"],
 }
 
@@ -591,13 +534,44 @@ SEMANTIC_TRIPLE_SCHEMA = {
 }
 
 DKG_ASSERTION_CREATE_SCHEMA = {
-    "name": "dkg_assertion_create",
-    "description": "Create a Working Memory assertion in a context graph.",
+    "name": "dkg_knowledge_asset_create",
+    "description": (
+        "Step 1 of the canonical flow. Create a Working Memory knowledge asset draft in a "
+        "context graph. Optionally pass quads to WRITE them into the new draft and SEAL it in "
+        "the same call (a one-shot create+write+finalize); add also_share_swm=true to also SHARE "
+        "the sealed asset to Shared Working Memory (publish-ready). With no quads it creates an "
+        "empty editable draft -- use dkg_knowledge_asset_write / _finalize / _share for the "
+        "step-by-step flow."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
             "context_graph_id": {"type": "string", "description": TARGET_CONTEXT_GRAPH_DESCRIPTION},
-            "name": {"type": "string", "description": "Assertion name."},
+            "name": {
+                "type": "string",
+                "description": (
+                    "Knowledge asset name. Must not contain '/', whitespace, or IRI-unsafe "
+                    "characters (<>\"{}|^`\\), must be at most 256 characters, and must not be a "
+                    "reserved B3 KA identifier."
+                ),
+            },
+            "quads": {
+                "type": "array",
+                "items": QUAD_SCHEMA,
+                "description": (
+                    "Optional RDF triples to write into the new draft. When supplied, the draft "
+                    "is written and SEALED (finalized) in this one call. Omit to create an empty "
+                    "editable draft."
+                ),
+            },
+            "also_share_swm": {
+                "type": "boolean",
+                "description": (
+                    "When true and quads are supplied, additionally SHARE the sealed asset to "
+                    "Shared Working Memory (team-visible, publish-ready) in this same call. "
+                    "Default false. Ignored when there are no quads."
+                ),
+            },
             "sub_graph_name": {"type": "string", "description": "Optional sub-graph name."},
         },
         "required": ["context_graph_id", "name"],
@@ -605,8 +579,8 @@ DKG_ASSERTION_CREATE_SCHEMA = {
 }
 
 DKG_ASSERTION_WRITE_SCHEMA = {
-    "name": "dkg_assertion_write",
-    "description": "Append quads to an existing Working Memory assertion.",
+    "name": "dkg_knowledge_asset_write",
+    "description": "Append quads to an existing Working Memory knowledge asset draft.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -619,24 +593,179 @@ DKG_ASSERTION_WRITE_SCHEMA = {
     },
 }
 
-DKG_ASSERTION_PROMOTE_SCHEMA = {
-    "name": "dkg_assertion_promote",
-    "description": "Promote a Working Memory assertion into Shared Working Memory.",
+DKG_ASSERTION_FINALIZE_SCHEMA = {
+    "name": "dkg_knowledge_asset_finalize",
+    "description": (
+        "Step 3 of the canonical flow. Seal a knowledge asset's Working Memory draft -- computes "
+        "the merkle root and signs the EIP-712 AuthorAttestation node-side. Finalize always seals "
+        "the WHOLE draft (there is no subset parameter). A FULL share "
+        "(dkg_knowledge_asset_share with entities omitted or \"all\") auto-seals for you, so you "
+        "only need to call this explicitly before sharing a SELECTIVE subset of entities, or to "
+        "re-seal after editing a previously-sealed draft. Sealing works even if the context graph "
+        "is NOT yet registered on-chain (registration happens at publish). Pass layer=\"swm\" to "
+        "seal an asset already shared to SWM (e.g. shared with skip_seal) -- it recovers and seals "
+        "the SWM content without a delete-and-recreate. Author signing is node-side via "
+        "author_agent_address; external-signer (pre-signed) attestation is a tracked follow-up, "
+        "not exposed by the agent tools."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
             "context_graph_id": {"type": "string", "description": TARGET_CONTEXT_GRAPH_DESCRIPTION},
-            "name": {"type": "string", "description": "Assertion name."},
-            "entities": {"type": "array", "items": {"type": "string"}, "description": "Optional root entity URI list."},
+            "name": {"type": "string", "description": "Knowledge asset name to finalize."},
+            "author_agent_address": {
+                "type": "string",
+                "description": (
+                    "Optional 0x author address to attest as. Omit to let the daemon default the "
+                    "author to the request token's agent (node-side signing)."
+                ),
+            },
+            "scheme_version": {"type": "integer", "minimum": 1, "description": "Optional attestation scheme version."},
+            "layer": {
+                "type": "string",
+                "enum": ["wm", "swm"],
+                "description": (
+                    "Which layer holds the content to seal. Default \"wm\" seals the open Working "
+                    "Memory draft. Pass \"swm\" to seal an asset already shared to SWM (recovers + "
+                    "seals the SWM content without delete-and-recreate)."
+                ),
+            },
+            "sub_graph_name": {"type": "string", "description": "Optional sub-graph name (must match write time)."},
+        },
+        "required": ["context_graph_id", "name"],
+    },
+}
+
+DKG_ASSERTION_PULL_FROM_SCHEMA = {
+    "name": "dkg_knowledge_asset_pull_from",
+    "description": (
+        "Seed a fresh Working Memory draft for a knowledge asset from its current Shared Working "
+        "Memory (swm) or Verifiable Memory (vm) state -- the edit-loop primitive (like git "
+        "checkout). Use this to re-open an already-shared or published asset for editing. Fails "
+        "409 (WM_DRAFT_CONFLICT) if an open draft already exists; pass on_conflict=\"replace\" to "
+        "overwrite it or discard the draft first."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "context_graph_id": {"type": "string", "description": TARGET_CONTEXT_GRAPH_DESCRIPTION},
+            "name": {"type": "string", "description": "Knowledge asset name to seed a draft for."},
+            "layer": {
+                "type": "string",
+                "enum": ["swm", "vm"],
+                "description": "Which layer to seed the draft from: \"swm\" (Shared Working Memory) or \"vm\" (Verifiable Memory).",
+            },
+            "on_conflict": {
+                "type": "string",
+                "enum": ["reject", "replace"],
+                "description": "What to do if an open WM draft already exists. Defaults to \"reject\".",
+            },
+            "sub_graph_name": {"type": "string", "description": "Optional sub-graph name (must match write/share time)."},
+        },
+        "required": ["context_graph_id", "name", "layer"],
+    },
+}
+
+DKG_ASSERTION_SHARE_SCHEMA = {
+    "name": "dkg_knowledge_asset_share",
+    "description": (
+        "Step 4 of the canonical flow (create -> write -> finalize -> share -> publish). "
+        "Share a knowledge asset (or selected root entities) from Working Memory into Shared "
+        "Working Memory. A FULL share (omit `entities` or pass \"all\") SEALS BY DEFAULT and is "
+        "then publish-ready -- follow with dkg_knowledge_asset_publish to mint it on-chain "
+        "(Verifiable Memory). Pass skip_seal=true to share WITHOUT sealing (an unsealed SWM share "
+        "-- seal it later with dkg_knowledge_asset_finalize, where layer=\"swm\" works after "
+        "sharing). If a default (sealing) share cannot seal it fails CLOSED (409, Working Memory "
+        "preserved) and returns a recovery hint. For CUSTOM finalize options "
+        "such as author_agent_address / scheme_version, call dkg_knowledge_asset_finalize "
+        "EXPLICITLY first (the default seal cannot carry them). A SELECTIVE subset "
+        "(`entities` set to a proper subset) shares to SWM ONLY for peer visibility, is NOT "
+        "sealed, and is NOT publishable to Verifiable Memory: dkg_knowledge_asset_publish "
+        "reconstructs the seal's full root set and rejects a truncated SWM with a merkleRoot "
+        "mismatch. To publish on-chain, share the full asset (or model the subset as its own "
+        "knowledge asset)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "context_graph_id": {"type": "string", "description": TARGET_CONTEXT_GRAPH_DESCRIPTION},
+            "name": {"type": "string", "description": "Knowledge asset name to share."},
+            "entities": {
+                "anyOf": [
+                    {"type": "string", "enum": ["all"]},
+                    {"type": "array", "items": {"type": "string"}},
+                ],
+                "description": (
+                    "Optional: \"all\" (or omitted) shares every root entity (default, seals by "
+                    "default + publish-ready); a non-empty array of root entity URIs shares only "
+                    "that subset to SWM (NOT sealed, NOT publishable to Verifiable Memory)."
+                ),
+            },
+            "skip_seal": {
+                "type": "boolean",
+                "description": (
+                    "Set true to share to SWM WITHOUT sealing (not publish-ready). Default (false) "
+                    "seals a full share so it is immediately publish-ready. Ignored for a subset "
+                    "share, which is never sealed."
+                ),
+            },
             "sub_graph_name": {"type": "string", "description": "Optional sub-graph name."},
         },
         "required": ["context_graph_id", "name"],
     },
 }
 
+DKG_ASSERTION_PUBLISH_SCHEMA = {
+    "name": "dkg_knowledge_asset_publish",
+    "description": (
+        "Step 5 of the canonical flow. Publish ONE finalized + shared knowledge asset (by name) "
+        "from Shared Working Memory to Verifiable Memory on-chain, minting or updating it. "
+        "Chain-anchored, permanent, costs TRAC. Returns the asset's UAL (Universal Asset Locator, "
+        "did:dkg:<chainId>/<knowledgeAssetsContractAddress>/<id> -- the middle segment is the "
+        "KnowledgeAssets (KAV10) contract address, NOT the author) plus kaId, txHash, and status. "
+        "The separate authorAddress response field is the seal author (a different value). The seal "
+        "already selects the author and the whole asset -- do not pass author or selection overrides. "
+        "Multi-root safe. This is the canonical publish for a single named asset. "
+        "Fails 409 if the asset is not yet finalized + shared (run dkg_knowledge_asset_finalize / "
+        "dkg_knowledge_asset_share first). vm/publish AUTO-registers an unregistered context graph "
+        "on-chain at gas/TRAC cost regardless of register_if_needed (no explicit register step is "
+        "needed); register_if_needed=true only lets you choose the registration's access_policy first. "
+        "Call dkg_wallet_balances first to verify TRAC."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "context_graph_id": {"type": "string", "description": TARGET_CONTEXT_GRAPH_DESCRIPTION},
+            "name": {"type": "string", "description": "Knowledge asset name to publish (must be finalized + shared)."},
+            "publish_epochs": {"type": "integer", "minimum": 1, "description": "Optional number of epochs to publish for (positive integer)."},
+            "publisher_node_identity_id_override": {"type": "string", "pattern": "^[0-9]+$", "description": "Optional publisher node identity id override (non-negative integer as a decimal string; preserved verbatim to avoid bigint precision loss)."},
+            "register_if_needed": {
+                "type": "boolean",
+                "description": (
+                    "Run an EXPLICIT on-chain registration before publishing, which lets you set "
+                    "access_policy on that registration. NOTE: this does NOT gate whether "
+                    "registration happens -- vm/publish AUTO-registers an unregistered context graph "
+                    "at gas/TRAC cost regardless of this flag. Set it only to choose the "
+                    "registration's access_policy (the implicit auto-register on publish otherwise "
+                    "defaults the policy). CAVEAT: this explicit register route registers with the "
+                    "daemon's DEFAULT publishPolicy (derived from access_policy) and does NOT "
+                    "preserve a context graph's stored custom publishPolicy / contribution "
+                    "governance. For a CG created with a non-default publishPolicy/PCA, register it "
+                    "explicitly with the desired policy first rather than relying on "
+                    "register_if_needed. (Read access is unaffected; daemon-side rehydration tracked "
+                    "in OriginTrail/dkg#1085.)"
+                ),
+            },
+            "access_policy": {"type": "integer", "description": "Optional registration access policy (0 open, 1 private). REQUIRES register_if_needed: true — it only applies when registering the context graph, and is rejected if sent without it. Sets only the access policy; it does NOT preserve a stored custom publishPolicy (see register_if_needed; OriginTrail/dkg#1085)."},
+            "sub_graph_name": {"type": "string", "description": "Optional sub-graph name (must match write/share time)."},
+        },
+        "required": ["context_graph_id", "name"],
+    },
+}
+
 DKG_ASSERTION_DISCARD_SCHEMA = {
-    "name": "dkg_assertion_discard",
-    "description": "Discard a Working Memory assertion without promoting it.",
+    "name": "dkg_knowledge_asset_discard",
+    "description": "Discard a Working Memory knowledge asset draft without sharing it.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -649,8 +778,8 @@ DKG_ASSERTION_DISCARD_SCHEMA = {
 }
 
 DKG_ASSERTION_IMPORT_FILE_SCHEMA = {
-    "name": "dkg_assertion_import_file",
-    "description": "Upload a local document from an operator-approved import root into a Working Memory assertion and run daemon extraction.",
+    "name": "dkg_knowledge_asset_import_file",
+    "description": "Upload a local document from an operator-approved import root into a Working Memory knowledge asset draft and run daemon extraction.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -666,8 +795,15 @@ DKG_ASSERTION_IMPORT_FILE_SCHEMA = {
 }
 
 DKG_ASSERTION_QUERY_SCHEMA = {
-    "name": "dkg_assertion_query",
-    "description": "Dump every quad from one Working Memory assertion. Use dkg_query for SPARQL. Use this to inspect deterministic import quads before semantic enrichment.",
+    "name": "dkg_knowledge_asset_query",
+    "description": (
+        "Dump every quad from one knowledge asset's WORKING MEMORY DRAFT. Reads the WM draft "
+        "ONLY: a FULL share (dkg_knowledge_asset_share with entities omitted or \"all\") empties "
+        "the WM draft, so a query AFTER sharing returns 0 quads. Query the draft BEFORE sharing "
+        "(e.g. to inspect deterministic import quads before semantic enrichment); to inspect "
+        "shared content after a share, use dkg_query with view \"shared-working-memory\". "
+        "Not a SPARQL endpoint — use dkg_query for SPARQL."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
@@ -680,7 +816,7 @@ DKG_ASSERTION_QUERY_SCHEMA = {
 }
 
 DKG_IMPORT_ARTIFACT_RESOLVE_SCHEMA = {
-    "name": "dkg_import_artifact_resolve",
+    "name": "dkg_knowledge_asset_import_artifact_resolve",
     "description": "Optional validation/debug helper. Resolve a completed imported attachment/assertion into deterministic artifact metadata. Skipped imports are rejected.",
     "parameters": {
         "type": "object",
@@ -696,7 +832,7 @@ DKG_IMPORT_ARTIFACT_RESOLVE_SCHEMA = {
 }
 
 DKG_IMPORT_ARTIFACT_READ_MARKDOWN_SCHEMA = {
-    "name": "dkg_import_artifact_read_markdown",
+    "name": "dkg_knowledge_asset_import_artifact_read_markdown",
     "description": "Read Markdown for a completed imported attachment through daemon content-addressed storage, never arbitrary filesystem paths.",
     "parameters": {
         "type": "object",
@@ -713,7 +849,7 @@ DKG_IMPORT_ARTIFACT_READ_MARKDOWN_SCHEMA = {
 }
 
 DKG_SEMANTIC_ENRICHMENT_WRITE_SCHEMA = {
-    "name": "dkg_semantic_enrichment_write",
+    "name": "dkg_knowledge_asset_semantic_enrichment_write",
     "description": "Append model-derived triples to a completed imported assertion with daemon-stamped provenance. Does not promote, finalize, or publish.",
     "parameters": {
         "type": "object",
@@ -733,8 +869,8 @@ DKG_SEMANTIC_ENRICHMENT_WRITE_SCHEMA = {
 }
 
 DKG_ASSERTION_HISTORY_SCHEMA = {
-    "name": "dkg_assertion_history",
-    "description": "Read an assertion lifecycle descriptor.",
+    "name": "dkg_knowledge_asset_history",
+    "description": "Read a knowledge asset lifecycle descriptor.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -744,26 +880,6 @@ DKG_ASSERTION_HISTORY_SCHEMA = {
             "sub_graph_name": {"type": "string", "description": "Optional sub-graph name."},
         },
         "required": ["context_graph_id", "name"],
-    },
-}
-
-DKG_SHARED_MEMORY_PUBLISH_SCHEMA = {
-    "name": "dkg_shared_memory_publish",
-    "description": (
-        "Publish existing Shared Working Memory to Verified Memory. "
-        "Use after dkg_assertion_promote in the canonical write → promote → publish flow."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "context_graph_id": {"type": "string", "description": TARGET_CONTEXT_GRAPH_DESCRIPTION},
-            "root_entities": {"type": "array", "items": {"type": "string"}, "description": "Optional subset of root entity URIs."},
-            "clear_after": {"type": "boolean", "description": "Clear published SWM after publish."},
-            "sub_graph_name": {"type": "string", "description": "Optional sub-graph name."},
-            "register_if_needed": {"type": "boolean", "description": "Register a local CG before publishing."},
-            "access_policy": {"type": "integer", "description": "Optional registration access policy: 0 open, 1 private."},
-        },
-        "required": ["context_graph_id"],
     },
 }
 
@@ -796,7 +912,7 @@ MEMORY_SEARCH_SCHEMA = {
     "name": "memory_search",
     "description": (
         "Search DKG-backed memory by free text across Working Memory, Shared Working Memory, "
-        "and Verified Memory. Prefer this over dkg_query for recall."
+        "and Verifiable Memory. Prefer this over dkg_query for recall."
     ),
     "parameters": {
         "type": "object",
@@ -1003,8 +1119,10 @@ class DKGMemoryProvider(MemoryProvider):
         if not facts:
             return (
                 "DKG memory is connected but empty. Use dkg_memory to store facts, "
-                "memory_search or dkg_query to search, and dkg_share to share with team. "
-                "Verified Memory publish and context-graph collaboration tools are available."
+                "memory_search or dkg_query to search, and the dkg_knowledge_asset_* "
+                "lifecycle (create -> write -> finalize -> share) to share named knowledge "
+                "assets with the team. Verifiable Memory publish and context-graph "
+                "collaboration tools are available."
             )
 
         memory_facts = [f for f in facts if f.get("target") == "memory"]
@@ -1029,9 +1147,17 @@ class DKGMemoryProvider(MemoryProvider):
             )
 
         publish_guidance = (
-            "  dkg_shared_memory_publish / dkg_publish — Verified Memory publish flows\n"
+            "  dkg_knowledge_asset_publish — Publish a finalized + shared knowledge asset to Verifiable Memory (chain, TRAC cost)\n"
             if self._direct_publish_allowed()
-            else "  Verified Memory publish tools are disabled by operator policy; ask before chain publish\n"
+            else "  Verifiable Memory publish tools are disabled by operator policy; ask before chain publish\n"
+        )
+        # dkg_knowledge_asset_publish is only registered when direct publish is
+        # allowed (get_tool_schemas gates it). Gate its mention here behind the
+        # SAME condition so the agent is never told to call an unregistered tool.
+        ka_lifecycle_line = (
+            "  dkg_knowledge_asset_create/write/finalize/share/publish — Canonical knowledge asset lifecycle (create -> write -> finalize -> share -> publish)\n"
+            if self._direct_publish_allowed()
+            else "  dkg_knowledge_asset_create/write/finalize/share — Knowledge asset lifecycle up to Shared Working Memory (chain publish is disabled by operator policy)\n"
         )
         admin_guidance = (
             "  dkg_context_graph_invite / dkg_participant_* / dkg_join_request_* — Manage project access\n"
@@ -1046,13 +1172,14 @@ class DKGMemoryProvider(MemoryProvider):
             "  dkg_memory — Store/update/remove persistent facts (your primary memory)\n"
             "  memory_search — Free-text recall across DKG memory layers\n"
             "  dkg_query — Search knowledge via SPARQL (fast, local)\n"
-            "  dkg_assertion_create/write/promote/query/history/discard/import_file — Work with V10 WM assertions\n"
+            f"{ka_lifecycle_line}"
+            "  dkg_knowledge_asset_pull_from/query/history/discard/import_file — Reseed a draft, inspect quads, read lifecycle state, discard, or import a document\n"
             "\n"
-            "  dkg_import_artifact_read_markdown + dkg_semantic_enrichment_write - Read imported attachment Markdown and append semantic triples to the imported assertion\n"
-            "  dkg_import_artifact_resolve - Optional metadata re-check for imported attachments\n"
+            "  dkg_knowledge_asset_import_artifact_read_markdown + dkg_knowledge_asset_semantic_enrichment_write - Read imported attachment Markdown and append semantic triples to the imported assertion\n"
+            "  dkg_knowledge_asset_import_artifact_resolve - Optional metadata re-check for imported attachments\n"
             "\n"
             "COLLABORATION WORKFLOW:\n"
-            "  dkg_share — Share findings to Shared Working Memory (team-visible, free)\n"
+            "  dkg_knowledge_asset_share — Share a named knowledge asset's entities to Shared Working Memory (team-visible, free; full share seals by default)\n"
             f"{publish_guidance}"
             "  dkg_wallet_balances — Check TRAC balance BEFORE publishing\n"
             "\n"
@@ -1071,7 +1198,7 @@ class DKGMemoryProvider(MemoryProvider):
             "  dkg_status — Node health, peers, context graphs\n"
             "\n"
             "TRUST FLOW: Working Memory (local, free) → SHARE → Shared Memory "
-            "(team, free) → PUBLISH → Verified Memory (chain, TRAC cost, permanent).\n"
+            "(team, free) → PUBLISH → Verifiable Memory (chain, TRAC cost, permanent).\n"
             "Knowledge gains trust as it moves through layers. Only publish when "
             "findings are verified and ready for permanent record.\n"
             "\n"
@@ -1080,7 +1207,7 @@ class DKGMemoryProvider(MemoryProvider):
             "Memory gossip. The creator is auto-included; invite collaborators "
             "with dkg_participant_add or pass allowed_agents at creation. Use "
             "public:true to opt into a discoverable/open context graph. Working "
-            "Memory is per-agent regardless of visibility. Verified Memory "
+            "Memory is per-agent regardless of visibility. Verifiable Memory "
             "anchors are public on-chain; the underlying private quads stay "
             "local on the publishing node."
         )
@@ -1092,7 +1219,6 @@ class DKGMemoryProvider(MemoryProvider):
             DKG_MEMORY_SCHEMA,
             MEMORY_SEARCH_SCHEMA,
             DKG_QUERY_SCHEMA,
-            DKG_SHARE_SCHEMA,
             DKG_STATUS_SCHEMA,
             DKG_WALLET_SCHEMA,
             DKG_LIST_CONTEXT_GRAPHS_SCHEMA,
@@ -1106,7 +1232,9 @@ class DKGMemoryProvider(MemoryProvider):
             DKG_JOIN_REQUEST_LIST_SCHEMA,
             DKG_ASSERTION_CREATE_SCHEMA,
             DKG_ASSERTION_WRITE_SCHEMA,
-            DKG_ASSERTION_PROMOTE_SCHEMA,
+            DKG_ASSERTION_FINALIZE_SCHEMA,
+            DKG_ASSERTION_SHARE_SCHEMA,
+            DKG_ASSERTION_PULL_FROM_SCHEMA,
             DKG_ASSERTION_DISCARD_SCHEMA,
             DKG_ASSERTION_IMPORT_FILE_SCHEMA,
             DKG_ASSERTION_QUERY_SCHEMA,
@@ -1120,8 +1248,7 @@ class DKGMemoryProvider(MemoryProvider):
         if self._direct_publish_allowed():
             publish_index = schemas.index(DKG_STATUS_SCHEMA)
             schemas[publish_index:publish_index] = [
-                DKG_PUBLISH_SCHEMA,
-                DKG_SHARED_MEMORY_PUBLISH_SCHEMA,
+                DKG_ASSERTION_PUBLISH_SCHEMA,
             ]
         if self._context_graph_admin_tools_allowed():
             admin_index = schemas.index(DKG_PARTICIPANT_LIST_SCHEMA)
@@ -1139,9 +1266,6 @@ class DKGMemoryProvider(MemoryProvider):
             "dkg_memory": self._handle_memory,
             "memory_search": self._handle_memory_search,
             "dkg_query": self._handle_query,
-            "dkg_share": self._handle_share,
-            "dkg_publish": self._handle_publish,
-            "dkg_shared_memory_publish": self._handle_shared_memory_publish,
             "dkg_status": self._handle_status,
             "dkg_wallet_balances": self._handle_wallet,
             "dkg_list_context_graphs": self._handle_list_context_graphs,
@@ -1158,16 +1282,19 @@ class DKGMemoryProvider(MemoryProvider):
             "dkg_join_request_list": self._handle_join_request_list,
             "dkg_join_request_approve": self._handle_join_request_approve,
             "dkg_join_request_reject": self._handle_join_request_reject,
-            "dkg_assertion_create": self._handle_assertion_create,
-            "dkg_assertion_write": self._handle_assertion_write,
-            "dkg_assertion_promote": self._handle_assertion_promote,
-            "dkg_assertion_discard": self._handle_assertion_discard,
-            "dkg_assertion_import_file": self._handle_assertion_import_file,
-            "dkg_assertion_query": self._handle_assertion_query,
-            "dkg_import_artifact_resolve": self._handle_import_artifact_resolve,
-            "dkg_import_artifact_read_markdown": self._handle_import_artifact_read_markdown,
-            "dkg_semantic_enrichment_write": self._handle_semantic_enrichment_write,
-            "dkg_assertion_history": self._handle_assertion_history,
+            "dkg_knowledge_asset_create": self._handle_assertion_create,
+            "dkg_knowledge_asset_write": self._handle_assertion_write,
+            "dkg_knowledge_asset_finalize": self._handle_assertion_finalize,
+            "dkg_knowledge_asset_share": self._handle_assertion_share,
+            "dkg_knowledge_asset_publish": self._handle_assertion_publish,
+            "dkg_knowledge_asset_pull_from": self._handle_assertion_pull_from,
+            "dkg_knowledge_asset_discard": self._handle_assertion_discard,
+            "dkg_knowledge_asset_import_file": self._handle_assertion_import_file,
+            "dkg_knowledge_asset_query": self._handle_assertion_query,
+            "dkg_knowledge_asset_import_artifact_resolve": self._handle_import_artifact_resolve,
+            "dkg_knowledge_asset_import_artifact_read_markdown": self._handle_import_artifact_read_markdown,
+            "dkg_knowledge_asset_semantic_enrichment_write": self._handle_semantic_enrichment_write,
+            "dkg_knowledge_asset_history": self._handle_assertion_history,
             "dkg_sub_graph_create": self._handle_sub_graph_create,
             "dkg_sub_graph_list": self._handle_sub_graph_list,
         }
@@ -1388,8 +1515,8 @@ class DKGMemoryProvider(MemoryProvider):
             return tool_error('"context_graph" is not a supported parameter on dkg_query. Use "context_graph_id".')
         cg = _first_text(args, "context_graph_id") or self._context_graph
         view = _first_text(args, "view")
-        if view and view not in ("working-memory", "shared-working-memory", "verified-memory"):
-            return tool_error('"view" must be one of: working-memory, shared-working-memory, verified-memory.')
+        if view and view not in ("working-memory", "shared-working-memory", "verifiable-memory"):
+            return tool_error('"view" must be one of: working-memory, shared-working-memory, verifiable-memory.')
         if view and not _first_text(args, "context_graph_id"):
             return tool_error(f'"view: {view}" requires "context_graph_id".')
         if view and _first_text(args, "sub_graph_name"):
@@ -1446,7 +1573,7 @@ class DKGMemoryProvider(MemoryProvider):
             for view, weight in (
                 ("working-memory", 1.0),
                 ("shared-working-memory", 1.15),
-                ("verified-memory", 1.3),
+                ("verifiable-memory", 1.3),
             ):
                 if view == "working-memory" and not agent_address:
                     continue
@@ -1523,142 +1650,6 @@ class DKGMemoryProvider(MemoryProvider):
             "scope": project_context_graph if project_context_graph != "agent-context" else None,
             "hits": public_hits,
         })
-
-    def _handle_share(self, args: Dict[str, Any]) -> str:
-        if self._offline:
-            return tool_error("DKG daemon is offline. Cannot share to team.")
-        # Type-validate at the runtime boundary. Without this, a malformed MCP
-        # call passing `content: {}` or `False` would crash inside _quote_literal
-        # with AttributeError on .replace, instead of returning a structured
-        # tool_error. Mirrors the OpenClaw boundary checks (PR #413 round 7).
-        if "content" not in args or args["content"] is None or args["content"] == "":
-            return tool_error("Content is required.")
-        if not isinstance(args["content"], str):
-            return tool_error('"content" must be a string.')
-        if "context_graph" in args:
-            return tool_error('"context_graph" is not a supported parameter on dkg_share. Use "context_graph_id".')
-        if "context_graph_id" in args and args["context_graph_id"] is not None and not isinstance(args["context_graph_id"], str):
-            return tool_error('"context_graph_id" must be a string.')
-        sub_graph_name_raw = args.get("sub_graph_name")
-        if sub_graph_name_raw is not None and not isinstance(sub_graph_name_raw, str):
-            return tool_error('"sub_graph_name" must be a string.')
-        content = args["content"]
-        # Aligned with OpenClaw: context_graph_id is required (no implicit
-        # current-project fallback). Keeps both adapter contracts identical
-        # so portable agent code works unchanged across either surface.
-        cg = _first_text(args, "context_graph_id")
-        if not cg:
-            return tool_error("context_graph_id is required.")
-        # Mint a unique root entity per share. The publisher upserts SWM by
-        # root entity (packages/publisher/src/dkg-publisher.ts:422-429), so
-        # a stable subject would mean each share replaces the previous one
-        # rather than appending a new fact.
-        share_id = f"{int(time.time() * 1000)}-{secrets.token_hex(4)}"
-        subject = f"urn:hermes:{self._agent_name}:shared:{share_id}"
-        # Wrap content as an N-Triples literal. The storage layer's
-        # formatTerm (packages/storage/src/adapters/oxigraph.ts:233-244)
-        # treats any object value not starting with `"` as an IRI, so raw
-        # text like `hello` would be coerced to `<hello>` — invalid IRI.
-        quads = [{
-            "subject": subject,
-            "predicate": "urn:hermes:sharedContent",
-            "object": _quote_literal(content),
-        }]
-        result = self._client.share(cg, quads, sub_graph_name=_first_text(args, "sub_graph_name"))
-        # Only surface the minted subject on a successful write. Hermes'
-        # Python client returns failure shapes (`{success: False, error: ...}`,
-        # `{ok: False}`, or bare `{error: ...}`) without throwing — see
-        # client.py:213 and the canonical detector at _client_result_failed
-        # below. Attaching subject/root_entities to a failure would mask it
-        # and let chained dkg_shared_memory_publish calls publish a root
-        # entity that was never written. Use the canonical helper so this
-        # path stays aligned with every other failure check in the module.
-        if _client_result_failed(result):
-            return json.dumps(result)
-        # Surface the minted subject so callers can target THIS share in a
-        # follow-up `dkg_shared_memory_publish({ root_entities: [...] })`.
-        # Field name is snake_case to match the consuming tool's argument
-        # shape (matches OpenClaw's response, PR #413).
-        if isinstance(result, dict):
-            response = {**result, "subject": subject, "root_entities": [subject]}
-        else:
-            response = {"raw": result, "subject": subject, "root_entities": [subject]}
-        return json.dumps(response)
-
-    def _handle_publish(self, args: Dict[str, Any]) -> str:
-        if not self._direct_publish_allowed():
-            return tool_error(
-                "Direct DKG publish is disabled by the adapter publish guard. "
-                "Use an operator-reviewed publish request or enable DKG_ALLOW_DIRECT_PUBLISH explicitly."
-            )
-        if self._offline:
-            return tool_error("DKG daemon is offline. Cannot publish to chain.")
-        cg = _first_text(args, "context_graph_id")
-        if not cg:
-            return tool_error("context_graph_id is required.")
-        quads = _normalize_quads(args.get("quads"))
-        if not quads:
-            return tool_error("quads must contain at least one item with subject, predicate, and object.")
-        share_result = self._client.share(cg, quads, sub_graph_name=_first_text(args, "sub_graph_name"))
-        if share_result.get("success") is False:
-            return json.dumps(share_result)
-        roots = _quad_root_entities(quads)
-        result = self._client.publish(
-            cg,
-            selection="all",
-            clear_after=True,
-            sub_graph_name=_first_text(args, "sub_graph_name"),
-        )
-        result["quadsPublished"] = len(quads)
-        result["rootEntities"] = roots
-        return json.dumps(result)
-
-    def _handle_shared_memory_publish(self, args: Dict[str, Any]) -> str:
-        if not self._direct_publish_allowed():
-            return tool_error(
-                "Direct DKG publish is disabled by the adapter publish guard. "
-                "Use an operator-reviewed publish request or enable DKG_ALLOW_DIRECT_PUBLISH explicitly."
-            )
-        if self._offline:
-            return tool_error("DKG daemon is offline. Cannot publish to chain.")
-        if "context_graph" in args:
-            return tool_error('"context_graph" is not a supported parameter on dkg_shared_memory_publish. Use "context_graph_id".')
-        cg = _first_text(args, "context_graph_id")
-        if not cg:
-            return tool_error("context_graph_id is required.")
-        root_entities = args.get("root_entities")
-        if root_entities is None:
-            selection: Any = "all"
-        elif isinstance(root_entities, list) and root_entities and all(isinstance(e, str) and e.strip() for e in root_entities):
-            selection = [str(e).strip() for e in root_entities]
-        else:
-            return tool_error("root_entities must be omitted or a non-empty array of strings.")
-        clear_after = args.get("clear_after")
-        if clear_after is None:
-            clear_after = not isinstance(selection, list)
-        elif not isinstance(clear_after, bool):
-            return tool_error("clear_after must be a boolean.")
-        registration = None
-        if args.get("register_if_needed") is not None and not isinstance(args.get("register_if_needed"), bool):
-            return tool_error("register_if_needed must be a boolean.")
-        if args.get("register_if_needed") is True:
-            access_policy = args.get("access_policy")
-            if access_policy is not None and access_policy not in (0, 1):
-                return tool_error("access_policy must be 0 or 1.")
-            registration = self._client.register_context_graph(cg, access_policy)
-            if _client_result_failed(registration):
-                error = str(registration.get("error") or registration.get("message") or "").lower()
-                if "already registered" not in error and "already exists" not in error:
-                    return json.dumps(registration)
-        result = self._client.publish(
-            cg,
-            selection=selection,
-            clear_after=bool(clear_after),
-            sub_graph_name=_first_text(args, "sub_graph_name"),
-        )
-        if registration is not None:
-            result["registration"] = registration
-        return json.dumps(result)
 
     def _handle_status(self, args: Dict[str, Any]) -> str:
         if self._offline:
@@ -1942,7 +1933,35 @@ class DKGMemoryProvider(MemoryProvider):
             return tool_error("context_graph_id is required.")
         if not name:
             return tool_error("name is required.")
-        return json.dumps(self._client.create_assertion(cg, name, _first_text(args, "sub_graph_name")))
+        # [D3] Optional one-call create+write(+share). `quads` (when present) are
+        # written into the new draft and SEALED by the daemon; `also_share_swm`
+        # (default FALSE, explicit) additionally shares the sealed asset to SWM.
+        quads = None
+        if args.get("quads") is not None:
+            quads = _normalize_quads(args.get("quads"))
+            if not quads:
+                return tool_error("quads must contain at least one item with subject, predicate, and object.")
+        also_share_swm = args.get("also_share_swm")
+        if also_share_swm is not None and not isinstance(also_share_swm, bool):
+            return tool_error("also_share_swm must be a boolean.")
+        # also_share_swm shares a SEALED asset, so it is only meaningful with quads.
+        # When there are no quads it is IGNORED (parity with MCP + OpenClaw and the
+        # plan §2.6 contract) — the client never emits it without quads, so a bare
+        # create stays a plain WM draft. (A stray also_share_swm:true with no quads
+        # would also be a daemon 400, but it never reaches the wire.)
+        result = self._client.create_assertion(
+            cg, name, _first_text(args, "sub_graph_name"),
+            quads=quads, also_share_swm=bool(also_share_swm))
+        # The daemon returns 207 + errors:[{phase:"swm-share"}] when create+seal lands but
+        # the opt-in SWM share fails; the client treats 207 as success. Judge from the
+        # OUTCOME, not the requested flag (parity with MCP + OpenClaw), so agents don't
+        # publish an asset that never reached SWM.
+        share_failure = _create_swm_share_error(result, bool(also_share_swm))
+        if share_failure is not None:
+            return tool_error(
+                "Created and sealed knowledge asset '" + name + "' in '" + cg
+                + "', but " + share_failure)
+        return json.dumps(result)
 
     def _handle_assertion_write(self, args: Dict[str, Any]) -> str:
         if self._offline:
@@ -1957,7 +1976,7 @@ class DKGMemoryProvider(MemoryProvider):
             return tool_error("quads must contain at least one item with subject, predicate, and object.")
         return json.dumps(self._client.write_assertion(name, cg, quads, _first_text(args, "sub_graph_name")))
 
-    def _handle_assertion_promote(self, args: Dict[str, Any]) -> str:
+    def _handle_assertion_share(self, args: Dict[str, Any]) -> str:
         if self._offline:
             return tool_error("DKG daemon is offline.")
         cg, name = _required_cg_and_name(args)
@@ -1965,12 +1984,170 @@ class DKGMemoryProvider(MemoryProvider):
             return tool_error("context_graph_id is required.")
         if not name:
             return tool_error("name is required.")
+        # entities accepts "all" | string[] | omitted (CONTRACT §B). "all" and
+        # omitted are both a full share; pass either straight through. Reject an
+        # empty array fast (the daemon would 400 it as empty SWM selection) and
+        # do NOT coerce "all" -> [] or omitted -> "all".
         entities = args.get("entities")
-        if entities is not None and not (
-            isinstance(entities, list) and entities and all(isinstance(e, str) and e.strip() for e in entities)
-        ):
-            return tool_error("entities must be omitted or a non-empty array of strings.")
-        return json.dumps(self._client.promote_assertion(name, cg, entities, _first_text(args, "sub_graph_name")))
+        if entities is not None:
+            if isinstance(entities, str):
+                if entities.strip() != "all":
+                    return tool_error('entities must be "all", a non-empty array of strings, or omitted.')
+                entities = "all"
+            elif isinstance(entities, list):
+                if not entities or not all(isinstance(e, str) and e.strip() for e in entities):
+                    return tool_error('entities must be "all", a non-empty array of strings, or omitted.')
+                # Normalize to the stripped values (Codex #1079:2157) — the
+                # validation strips each entity but the UNSTRIPPED list was being
+                # forwarded, so " urn:a " reached the daemon with surrounding
+                # whitespace and resolved to the wrong / no root entity.
+                entities = [str(e).strip() for e in entities]
+            else:
+                return tool_error('entities must be "all", a non-empty array of strings, or omitted.')
+        # #1116: a full share SEALS BY DEFAULT; skip_seal=true shares unsealed.
+        # Present-but-invalid is a tool error, never a silent default.
+        skip_seal = args.get("skip_seal")
+        if skip_seal is not None and not isinstance(skip_seal, bool):
+            return tool_error("skip_seal must be a boolean.")
+        result = self._client.promote_assertion(
+            name, cg, entities, _first_text(args, "sub_graph_name"), skip_seal=skip_seal)
+        # #1116: surface the seal outcome. A 409 UNSEALED_SHARE_BLOCKED (default
+        # seal failed, WM preserved) is returned by the client as the parsed body
+        # dict — surface its recovery hint; otherwise add the publishReady:false
+        # warning when the share is not publish-ready. Pass the parsed `entities`
+        # so the warning branches subset (not sealable) vs full skip_seal (sealable).
+        return json.dumps(_annotate_share_seal(result, entities))
+
+    def _handle_assertion_finalize(self, args: Dict[str, Any]) -> str:
+        if self._offline:
+            return tool_error("DKG daemon is offline.")
+        cg, name = _required_cg_and_name(args)
+        if not cg:
+            return tool_error("context_graph_id is required.")
+        if not name:
+            return tool_error("name is required.")
+        scheme_version, error = _validate_int_arg(args.get("scheme_version"), "scheme_version", minimum=1)
+        if error:
+            return tool_error(error)
+        author = _first_text(args, "author_agent_address")
+        author = _normalize_wm_agent_address(author) if author else None
+        # #1116: optional `layer` selects WHERE the content to seal lives. Default
+        # (omitted/null) seals the open WM draft; "swm" seals an asset already
+        # shared to SWM. Validate args.get("layer") DIRECTLY (NOT via _first_text,
+        # which coerces any non-string to "" → an absent/omitted layer): a PRESENT
+        # non-string (True / a list / a number) or a string outside {wm,swm} is a
+        # tool error, never a silent fall-through to the default WM seal.
+        layer_raw = args.get("layer")
+        if layer_raw is None:
+            layer = None
+        elif layer_raw in ("wm", "swm"):
+            layer = layer_raw
+        else:
+            return tool_error('layer must be "wm" or "swm".')
+        return json.dumps(self._client.finalize_assertion(
+            name,
+            cg,
+            sub_graph_name=_first_text(args, "sub_graph_name"),
+            author_agent_address=author,
+            scheme_version=scheme_version,
+            layer=layer,
+        ))
+
+    def _handle_assertion_publish(self, args: Dict[str, Any]) -> str:
+        if not self._direct_publish_allowed():
+            return tool_error(
+                "Direct DKG publish is disabled by the adapter publish guard. "
+                "Use an operator-reviewed publish request or enable DKG_ALLOW_DIRECT_PUBLISH explicitly."
+            )
+        if self._offline:
+            return tool_error("DKG daemon is offline. Cannot publish to chain.")
+        cg, name = _required_cg_and_name(args)
+        if not cg:
+            return tool_error("context_graph_id is required.")
+        if not name:
+            return tool_error("name is required.")
+        options: Dict[str, Any] = {}
+        publish_epochs, error = _validate_int_arg(
+            args.get("publish_epochs"), "publish_epochs", minimum=1, maximum=_MAX_PUBLISH_EPOCHS)
+        if error:
+            return tool_error(error)
+        if publish_epochs is not None:
+            options["publishEpochs"] = publish_epochs
+        override, error = _validate_decimal_string_arg(
+            args.get("publisher_node_identity_id_override"),
+            "publisher_node_identity_id_override")
+        if error:
+            return tool_error(error)
+        if override is not None:
+            # Preserved as a decimal string end-to-end (daemon regex /^\d+$/) —
+            # no int() round-trip, so a bigint node id above 2**53 keeps its
+            # precision (Codex #1079:750).
+            options["publisherNodeIdentityIdOverride"] = override
+        # No clear_after / clear_shared_memory_after on the per-asset publish:
+        # on vm/publish that flag is GRAPH-WIDE destructive (wipes every other
+        # agent's/asset's unpublished SWM in the CG), and this asset's own SWM is
+        # cleared unconditionally regardless (CONTRACT §D). There is no longer a
+        # CG-wide clear path exposed by the agent tools.
+        #
+        # register_if_needed (CONTRACT §G): vm/publish AUTO-registers an
+        # unregistered CG transparently (#1116) regardless of this flag. When true,
+        # run an EXPLICIT register first (idempotent — short-circuits if already
+        # registered) BEFORE publishing so the caller can choose the registration's
+        # access_policy.
+        registration = None
+        if args.get("register_if_needed") is not None and not isinstance(args.get("register_if_needed"), bool):
+            return tool_error("register_if_needed must be a boolean.")
+        access_policy_dep_error = _access_policy_requires_register_error(args)
+        if access_policy_dep_error:
+            return tool_error(access_policy_dep_error)
+        if args.get("register_if_needed") is True:
+            access_policy = args.get("access_policy")
+            access_policy_error = _validate_access_policy(access_policy)
+            if access_policy_error:
+                return tool_error(access_policy_error)
+            registration = self._client.register_context_graph(cg, access_policy)
+            if _client_result_failed(registration):
+                error = str(registration.get("error") or registration.get("message") or "").lower()
+                # "already registered"/"already exists" is success — continue to
+                # publish. Any other registration failure is fatal: surface it and
+                # do NOT publish.
+                if "already registered" not in error and "already exists" not in error:
+                    return json.dumps(registration)
+                # Normalize the already-registered short-circuit to a success
+                # shape (Codex #1084:1810) — leaving the raw {success:false,...} on
+                # result["registration"] makes a clean publish look partly failed.
+                registration = {"alreadyRegistered": True}
+        result = self._client.publish_finalized_assertion(
+            name,
+            cg,
+            sub_graph_name=_first_text(args, "sub_graph_name"),
+            options=options or None,
+        )
+        if registration is not None and isinstance(result, dict):
+            result["registration"] = registration
+        return json.dumps(_annotate_vm_publish_partial(result))
+
+    def _handle_assertion_pull_from(self, args: Dict[str, Any]) -> str:
+        if self._offline:
+            return tool_error("DKG daemon is offline.")
+        cg, name = _required_cg_and_name(args)
+        if not cg:
+            return tool_error("context_graph_id is required.")
+        if not name:
+            return tool_error("name is required.")
+        layer = _first_text(args, "layer")
+        if layer not in ("swm", "vm"):
+            return tool_error('layer must be "swm" or "vm".')
+        on_conflict = _first_text(args, "on_conflict")
+        if on_conflict and on_conflict not in ("reject", "replace"):
+            return tool_error('on_conflict must be "reject" or "replace".')
+        return json.dumps(self._client.pull_from(
+            name,
+            cg,
+            layer,
+            on_conflict=on_conflict or None,
+            sub_graph_name=_first_text(args, "sub_graph_name"),
+        ))
 
     def _handle_assertion_discard(self, args: Dict[str, Any]) -> str:
         if self._offline:
@@ -2348,6 +2525,29 @@ def _is_uri(value: str) -> bool:
     return bool(value) and any(value.startswith(prefix) for prefix in ("http://", "https://", "urn:", "did:"))
 
 
+# #1265 cross-adapter create/write one-shot quad-object contract. Shares the
+# URI/blank-node/literal CLASSIFICATION and angle-bracket stripping with MCP's
+# normalizeRdfObject/isRdfTerm (mcp-dkg assertions.ts) and core's
+# normalizeDkgPublisherObject/isDkgRdfTerm (publisher-extension.ts) — keep that
+# classification in sync. NOTE: literal escaping is Hermes-local (_quote_literal
+# also UCHAR-escapes ASCII control bytes; MCP/core escape only the ECHAR set), so
+# this is not a byte-for-byte parity guarantee for control-byte literals.
+_RDF_URI_SCHEME_RE = re.compile(r"^(?:https?://|urn:|did:)", re.IGNORECASE)
+
+
+def _strip_angle_brackets(term: str) -> str:
+    """`<urn:foo>` -> `urn:foo`. Mirrors the MCP/OpenClaw bracket strip applied to
+    subject/predicate/object before classification, so a bracketed URI stays a URI."""
+    return term[1:-1] if len(term) >= 2 and term.startswith("<") and term.endswith(">") else term
+
+
+def _is_rdf_term(value: str) -> bool:
+    """Object-term predicate for the create/write one-shot (parity with MCP isRdfTerm /
+    core isDkgRdfTerm): a CASE-INSENSITIVE http(s)/urn/did URI, a blank node (`_:`), or an
+    already-quoted literal (`"`). Anything else is a bare literal to quote + ECHAR-escape."""
+    return bool(_RDF_URI_SCHEME_RE.match(value)) or value.startswith("_:") or value.startswith('"')
+
+
 def _escape_sparql(text: str) -> str:
     """Escape text for use in SPARQL string literal."""
     return text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
@@ -2477,18 +2677,27 @@ def _normalize_quads(raw_quads: Any) -> List[Dict[str, str]]:
     for raw in raw_quads:
         if not isinstance(raw, dict):
             return []
-        subject = str(raw.get("subject", "")).strip()
-        predicate = str(raw.get("predicate", "")).strip()
-        object_value = str(raw.get("object", "")).strip()
+        # Strip surrounding <…> on all three terms (parity with MCP/OpenClaw) so a
+        # bracketed URI stays a URI rather than being quoted as a literal. Do NOT trim
+        # whitespace: MCP/OpenClaw pass strings through (only bracket-stripping), so
+        # `.strip()` here would silently rewrite a padded literal ("  x  " -> "x") and
+        # diverge from the cross-adapter contract.
+        subject = _strip_angle_brackets(str(raw.get("subject", "")))
+        predicate = _strip_angle_brackets(str(raw.get("predicate", "")))
+        object_value = _strip_angle_brackets(str(raw.get("object", "")))
         if not subject or not predicate or not object_value:
             return []
+        # Emit {subject,predicate,object} only — no per-quad `graph`. The daemon
+        # pins every triple to the per-KA WM graph itself and overrides any
+        # client-supplied graph (CONTRACT §0 invariant 2). A `graph` key on the
+        # input is silently dropped here, matching OpenClaw + MCP.
         quad = {
             "subject": subject,
             "predicate": predicate,
-            "object": object_value if _is_uri(object_value) or object_value.startswith('"') else _quote_literal(object_value),
+            # Object auto-typing identical to MCP/core: RDF term passes through, else
+            # quote + ECHAR-escape as an N-Triples literal.
+            "object": object_value if _is_rdf_term(object_value) else _quote_literal(object_value),
         }
-        if raw.get("graph") is not None:
-            quad["graph"] = str(raw.get("graph", ""))
         quads.append(quad)
     return quads
 
@@ -2515,21 +2724,275 @@ def _normalize_semantic_quads(raw_quads: Any) -> Tuple[List[Dict[str, str]], Opt
     return quads, None
 
 
-def _quad_root_entities(quads: List[Dict[str, str]]) -> List[str]:
-    roots: List[str] = []
-    for quad in quads:
-        subject = str(quad.get("subject", "")).strip()
-        if subject and subject not in roots:
-            roots.append(subject)
-    return roots
-
-
 def _coerce_limit(value: Any, default: int, maximum: int) -> int:
     try:
         parsed = int(value)
     except Exception:
         parsed = default
     return max(1, min(maximum, parsed))
+
+
+def _validate_int_arg(
+    value: Any,
+    label: str,
+    *,
+    minimum: int,
+    maximum: Optional[int] = None,
+) -> Tuple[Optional[int], Optional[str]]:
+    """Validate an optional integer arg: absent -> omit, present-but-invalid -> error.
+
+    Returns ``(int, None)`` for a valid value, ``(None, None)`` only when the arg
+    is truly ABSENT (``None``) — the caller omits the wire key and lets the
+    daemon default — and ``(None, message)`` when the arg is PRESENT but invalid,
+    which the caller must surface as a tool error rather than silently dropping
+    it (CONTRACT §C). A present blank/whitespace-only string (``""`` / ``"   "``)
+    is present-but-INVALID, NOT absent (Codex #2805). Accepts ``int``,
+    integral-``float`` (e.g. ``2.0``), and numeric-string forms; rejects ``bool``
+    (an ``int`` subclass), non-INTEGRAL numerics (``1.9`` / ``"1.9"`` — never
+    silently truncate via ``int()``), non-numeric, and out-of-range. Mirrors the
+    daemon's integer predicates.
+    """
+    if value is None:
+        return None, None
+    if isinstance(value, bool):
+        return None, f"{label} must be an integer."
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float):
+        # Reject a float with a fractional part rather than truncating it; an
+        # integral float (2.0) is accepted as its integer value.
+        if not value.is_integer():
+            return None, f"{label} must be an integer."
+        parsed = int(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            # Present but blank/whitespace: invalid, not omitted (Codex #2805).
+            return None, f"{label} must be an integer."
+        try:
+            # int() on a string rejects "1.9" with ValueError (no truncation),
+            # which is exactly the integral-only contract we want.
+            parsed = int(text)
+        except ValueError:
+            return None, f"{label} must be an integer."
+    else:
+        return None, f"{label} must be an integer."
+    if parsed < minimum:
+        bound = "non-negative" if minimum == 0 else f">= {minimum}"
+        return None, f"{label} must be {bound}."
+    if maximum is not None and parsed > maximum:
+        return None, f"{label} must be <= {maximum}."
+    return parsed, None
+
+
+_DIGIT_STRING_RE = re.compile(r"^\d+$")
+
+
+def _validate_decimal_string_arg(value: Any, label: str) -> Tuple[Optional[str], Optional[str]]:
+    """Validate an optional non-negative-integer arg PRESERVED as a decimal STRING.
+
+    Some ids (e.g. publisherNodeIdentityIdOverride) are uint/bigint on the daemon
+    and arrive as a decimal string matching ``/^\\d+$/``. Modeling them as a
+    JSON ``integer`` loses precision above JS's safe-integer range (2**53) BEFORE
+    serialization — the wrong node identity could be attributed (Codex #1079:750).
+    So accept a digit string and pass it through VERBATIM (no int() round-trip).
+
+    Returns ``(str, None)`` for a valid digit string, ``(None, None)`` when truly
+    absent (``None``), and ``(None, message)`` when present-but-invalid. A
+    non-negative ``int`` is also accepted (normalized to its decimal string) for
+    convenience; ``bool``, floats, blank/whitespace strings, negative/non-digit
+    values are rejected.
+    """
+    if value is None:
+        return None, None
+    if isinstance(value, bool):
+        return None, f"{label} must be a non-negative integer (decimal string)."
+    if isinstance(value, int):
+        if value < 0:
+            return None, f"{label} must be a non-negative integer (decimal string)."
+        return str(value), None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            # Present but blank/whitespace: invalid, not omitted (Codex #2805).
+            return None, f"{label} must be a non-negative integer (decimal string)."
+        if not _DIGIT_STRING_RE.match(text):
+            return None, f"{label} must be a non-negative integer (decimal string)."
+        return text, None  # preserved verbatim — no precision loss
+    return None, f"{label} must be a non-negative integer (decimal string)."
+
+
+# #1116: the publishReady:false warning surfaced after a FULL share that opted
+# out of sealing (skip_seal=true) — a later finalize(layer:swm) DOES seal it.
+# Kept byte-identical across the MCP, OpenClaw, and Hermes adapters
+# (cross-adapter parity invariant).
+SHARE_NOT_PUBLISH_READY_WARNING = (
+    "Shared to SWM but NOT publish-ready (sealed:false). Seal it with "
+    "dkg_knowledge_asset_finalize (layer:swm works after sharing), then publish."
+)
+
+# #1116: a SUBSET share is publishReady:false too, but unlike a skip_seal full
+# share it is NOT sealable — finalize(layer:swm) now REJECTS it with
+# SWM_SUBSET_NOT_SEALABLE. Surface the real recovery (full share / new asset)
+# instead of the dead-end "seal it" advice. Byte-identical across all three
+# adapters (cross-adapter parity invariant).
+SHARE_SUBSET_NOT_PUBLISH_READY_WARNING = (
+    "Shared a SUBSET to SWM for peer visibility. A subset is NOT sealable/"
+    "publishable (finalize layer:swm will reject it). To publish on-chain, share "
+    "the full asset (entities:\"all\"), or model this subset as its own knowledge asset."
+)
+
+# #1116: a FULL share can come back sealed:true but publishReady:false when NOT
+# every sealed root reached SWM (promotedAllRoots false — e.g. foreign-owned roots
+# were skipped). The engine did NOT set the swmShareComplete marker, so
+# finalize(layer:swm) would REJECT — do NOT recommend it here. Re-sharing the full
+# asset is the recovery. Byte-identical across all three adapters (cross-adapter
+# parity invariant).
+SHARE_INCOMPLETE_PROMOTE_WARNING = (
+    "Sealed, but not all roots reached SWM (some roots may be owned by other "
+    "agents) — not yet publishable; re-share the full asset so every sealed root "
+    "is in SWM."
+)
+
+
+def _create_swm_share_error(result: Any, also_share_swm: bool) -> Optional[str]:
+    """Return the share-failure tail when a create one-shot's opt-in SWM share failed.
+
+    The daemon returns 207 + ``errors:[{phase:"swm-share"}]`` when create+seal lands but
+    the opt-in ``also_share_swm`` tail fails; the client treats 207 as success. So judge
+    from the OUTCOME (parity with the MCP + OpenClaw adapters), not the requested flag.
+    Returns ``None`` when the share succeeded or was not requested.
+    """
+    if not also_share_swm or not isinstance(result, dict):
+        return None
+    errors = result.get("errors")
+    share_error = next(
+        (e for e in errors if isinstance(e, dict) and e.get("phase") == "swm-share"),
+        None,
+    ) if isinstance(errors, list) else None
+    if share_error is None and result.get("publishReady") is not False:
+        return None
+    detail = ""
+    if isinstance(share_error, dict) and share_error.get("error"):
+        detail = ": " + str(share_error["error"])
+    return (
+        "the opt-in Shared Working Memory share FAILED" + detail + ". The asset did NOT "
+        "reach Shared Working Memory and is NOT publish-ready -- do not publish yet; retry "
+        "the share with dkg_knowledge_asset_share, then publish."
+    )
+
+
+def _annotate_share_seal(result: Any, entities: Any = None) -> Any:
+    """Surface the #1116 seal outcome of a knowledge-asset share.
+
+    On a default (sealing) share the daemon returns
+    ``{ swmShared, promotedCount, sealed, publishReady }``. When ``publishReady``
+    is false, add a parity warning that branches on the ACTUAL outcome (three
+    cases):
+
+      1. ``sealed:false`` + SUBSET (a non-empty specific list) → NOT sealable
+         (``finalize layer:swm`` rejects it with ``SWM_SUBSET_NOT_SEALABLE``);
+         recover via a full share or a new asset.
+      2. ``sealed:false`` + FULL ("all"/omitted ``skip_seal``) → sealable later
+         (``finalize layer:swm`` works — the marker is set).
+      3. ``sealed:true`` + ``publishReady:false`` → an incomplete full promote
+         (not every sealed root reached SWM, e.g. foreign-owned roots skipped). The
+         ``swmShareComplete`` marker is NOT set, so ``finalize layer:swm`` would
+         REJECT — re-share the full asset instead.
+
+    A default share that CANNOT seal fails CLOSED: the daemon returns 409
+    ``UNSEALED_SHARE_BLOCKED`` with a ``recovery`` hint and Working Memory
+    preserved; ``client._post`` surfaces that body as a dict, so re-raise the
+    recovery text as the tool error (parity with MCP/OpenClaw, which return only
+    the recovery string). Anything else passes through untouched.
+    """
+    if not isinstance(result, dict):
+        return result
+    if result.get("code") == "UNSEALED_SHARE_BLOCKED":
+        recovery = result.get("recovery")
+        if isinstance(recovery, str) and recovery:
+            return {"error": recovery}
+        return result
+    if result.get("publishReady") is False:
+        if result.get("sealed") is True:
+            warning = SHARE_INCOMPLETE_PROMOTE_WARNING
+        elif isinstance(entities, list) and len(entities) > 0:
+            warning = SHARE_SUBSET_NOT_PUBLISH_READY_WARNING
+        else:
+            warning = SHARE_NOT_PUBLISH_READY_WARNING
+        return {**result, "warning": warning}
+    return result
+
+
+def _annotate_vm_publish_partial(result: Any) -> Any:
+    """Flag a vm/publish 207 partial result (KA minted, CG-binding failed).
+
+    The daemon's per-KA ``/vm/publish`` route returns HTTP 207 when the asset was
+    minted on-chain (UAL/kaId valid) but the context-graph binding step FAILED —
+    the signal is a non-empty ``contextGraphError`` in the body (``classifyVmPublish``,
+    knowledge-assets.ts:291-300). Python ``requests`` does not raise on 207, so the
+    body flows through as plain success. This is NOT a hard failure (the asset IS
+    published), but it must NOT be reported as full success: add ``partial: true``
+    + a ``warning`` while the UAL stays visible. A 200 with no ``contextGraphError``
+    is left untouched (clean success).
+
+    The warning MUST NOT tell the agent to retry the publish (Codex #1076:3663):
+    the mint already succeeded and a confirmed publish clears SWM, so re-running
+    ``dkg_knowledge_asset_publish`` would 409 the VM precondition (SWM already
+    cleared) — and it does not re-bind the CG (there is no client-side re-bind
+    route). The CG-binding failure is a node-side / operator concern. Parity with
+    OpenClaw 54998c9c7 / MCP f8c364e5a.
+    """
+    if not isinstance(result, dict):
+        return result
+    context_graph_error = result.get("contextGraphError")
+    if isinstance(context_graph_error, str) and context_graph_error:
+        return {
+            **result,
+            "partial": True,
+            "warning": (
+                "Partial publish: the knowledge asset was minted on-chain (UAL/kaId are valid) "
+                f"and IS published, but the context-graph binding failed ({context_graph_error}). "
+                "Do NOT re-run publish — dkg_knowledge_asset_publish would fail the VM precondition "
+                "(a confirmed publish clears Shared Working Memory), and it does not re-bind the "
+                "context graph. Surface this binding failure to the node operator."
+            ),
+        }
+    return result
+
+
+def _validate_access_policy(value: Any) -> Optional[str]:
+    """Validate an optional registration access_policy (0 open | 1 private).
+
+    Returns an error message for a present-but-invalid value, or ``None`` when
+    absent or valid. ``bool`` is REJECTED explicitly: it is an ``int`` subclass
+    in Python, so ``True``/``False`` would pass a bare ``not in (0, 1)`` check
+    (``True == 1``, ``False == 0``) and serialize as JSON ``true``/``false`` —
+    which the daemon's ``typeof === 'number'`` guard drops, silently resolving to
+    its default. Use ``type(...) is int`` so only true ints 0/1 are accepted.
+    """
+    if value is None:
+        return None
+    if type(value) is not int or value not in (0, 1):
+        return "access_policy must be 0 (open) or 1 (private)."
+    return None
+
+
+def _access_policy_requires_register_error(args: Dict[str, Any]) -> Optional[str]:
+    """Reject access_policy supplied without register_if_needed (Codex #1084:1792).
+
+    access_policy is only honored inside the register_if_needed branch (it is the
+    privacy of the on-chain registration). A caller that sends access_policy
+    WITHOUT register_if_needed=true would silently lose the setting, so return a
+    tool error instead of dropping it. Returns ``None`` when there is nothing to
+    reject.
+    """
+    if args.get("access_policy") is not None and args.get("register_if_needed") is not True:
+        return (
+            "access_policy requires register_if_needed: true — it only applies when "
+            "registering the context graph on-chain."
+        )
+    return None
 
 
 def _build_memory_search_sparql(keywords: List[str], limit: int) -> str:
@@ -2567,7 +3030,7 @@ def _memory_search_layer(context_graph_id: str, view: str) -> str:
     suffix = {
         "working-memory": "wm",
         "shared-working-memory": "swm",
-        "verified-memory": "vm",
+        "verifiable-memory": "vm",
     }.get(view, "wm")
     prefix = "agent-context" if context_graph_id == "agent-context" else "project"
     return f"{prefix}-{suffix}"

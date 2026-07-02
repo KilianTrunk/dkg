@@ -1,6 +1,6 @@
 {
   "name": "dkg-v10",
-  "version": "10.0.0-rc.16",
+  "version": "10.0.2",
   "private": true,
   "packageManager": "pnpm@10.28.1",
   "dkgBuild": {
@@ -9,7 +9,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "build:packages": "turbo build",
-    "build:runtime:packages": "pnpm -r --filter @origintrail-official/dkg-core --filter @origintrail-official/dkg-storage --filter @origintrail-official/dkg-query --filter @origintrail-official/dkg-publisher --filter @origintrail-official/dkg-chain --filter @origintrail-official/dkg-epcis --filter @origintrail-official/dkg-random-sampling --filter @origintrail-official/dkg-agent --filter @origintrail-official/dkg-graph-viz --filter @origintrail-official/dkg-node-ui --filter @origintrail-official/dkg-adapter-openclaw --filter @origintrail-official/dkg-adapter-hermes --filter @origintrail-official/kafka-plugin --filter @origintrail-official/dkg run build",
+    "build:runtime:packages": "pnpm -r --filter @origintrail-official/dkg-core --filter @origintrail-official/dkg-storage --filter @origintrail-official/dkg-query --filter @origintrail-official/dkg-publisher --filter @origintrail-official/dkg-chain --filter @origintrail-official/dkg-epcis --filter @origintrail-official/dkg-okf --filter @origintrail-official/dkg-random-sampling --filter @origintrail-official/dkg-agent --filter @origintrail-official/dkg-graph-viz --filter @origintrail-official/dkg-node-ui --filter @origintrail-official/dkg-adapter-openclaw --filter @origintrail-official/dkg-adapter-hermes --filter @origintrail-official/kafka-plugin --filter @origintrail-official/dkg run build",
     "build:runtime": "pnpm run build:runtime:packages && pnpm --filter @origintrail-official/dkg-node-ui run build:ui",
     "test": "turbo test",
     "test:watch": "vitest --config vitest.config.ts",
@@ -48,11 +48,21 @@
     "test:devnet:v10-e2e": "vitest run --config devnet/v10-end-to-end/vitest.config.ts",
     "test:devnet:v10-stress": "vitest run --config devnet/v10-stress/vitest.config.ts",
     "test:devnet:conviction-lazy-settle": "vitest run --config devnet/conviction-lazy-settle/vitest.config.ts",
+    "test:devnet:rfc51-publishing-allocation": "vitest run --config devnet/rfc51-publishing-allocation/vitest.config.ts",
     "test:devnet:core-peers-features": "vitest run --config devnet/core-peers-features/vitest.config.ts",
     "test:devnet:edge-update-flow": "vitest run --config devnet/edge-update-flow/vitest.config.ts",
     "test:devnet:greenfield-10min": "vitest run --config devnet/greenfield-10min/vitest.config.ts",
     "test:devnet:rich-scenario": "vitest run --config devnet/rich-scenario/vitest.config.ts",
-    "test:all": "pnpm test && pnpm test:evm"
+    "test:devnet:v10-rs-prune": "vitest run --config devnet/v10-rs-prune/vitest.config.ts",
+    "test:all": "pnpm test && pnpm test:evm",
+    "test:devnet:pr1386-term-canon": "vitest run --config devnet/pr1386-term-canon/vitest.config.ts",
+    "test:devnet:pr1385-subgraph-rs": "vitest run --config devnet/pr1385-subgraph-rs/vitest.config.ts",
+    "test:devnet:pr1388-okf-integration": "vitest run --config devnet/pr1388-okf-integration/vitest.config.ts",
+    "test:devnet:pr1366-pca-deposit-waiver": "vitest run --config devnet/pr1366-pca-deposit-waiver/vitest.config.ts",
+    "test:devnet:pr1387-bulk-register-agents": "vitest run --config devnet/pr1387-bulk-register-agents/vitest.config.ts",
+    "test:devnet:pr1384-preserve-agents-on-transfer": "vitest run --config devnet/pr1384-preserve-agents-on-transfer/vitest.config.ts",
+    "test:devnet:pr1370-admin-op-wallet": "vitest run --config devnet/pr1370-admin-op-wallet/vitest.config.ts",
+    "test:devnet:manifest": "vitest run --config devnet/_bootstrap/vitest.manifest.config.ts"
   },
   "devDependencies": {
     "@origintrail-official/dkg": "workspace:*",

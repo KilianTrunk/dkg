@@ -11,21 +11,24 @@
  * the external public API is unchanged.
  */
 
-import { JsonRpcProvider, FallbackProvider, Wallet, Contract, ethers } from 'ethers';
+import { JsonRpcProvider, Wallet, Contract, ethers } from 'ethers';
 import { createFilterErrorSilencer, installFilterNotFoundConsoleSuppressor, formatProviderError } from './filter-error-silencer.js';
 import type { FilterErrorSilencer } from './filter-error-silencer.js';
 import { DEFAULT_APPROVAL_POLICY } from './chain-adapter.js';
-import type { ApprovalPolicy, V10PublishParams, OnChainPublishResult } from './chain-adapter.js';
+import type { ApprovalPolicy, V10PublishParams, OnChainPublishResult, ConvictionReader } from './chain-adapter.js';
 import { HubResolutionCache } from './hub-resolution-cache.js';
 import { KeyedSerializer } from './keyed-mutex.js';
-import { floorPublishTokenAmount } from '@origintrail-official/dkg-core';
+import { floorPublishTokenAmount, withSpan, getMetrics } from '@origintrail-official/dkg-core';
 import { loadAbi } from './evm-adapter-abi.js';
-import { errorMessage, isTooLowAllowanceError, enrichEvmError, HUB_STALE_ERROR_MARKERS } from './evm-adapter-errors.js';
-import { resolveRpcUrls, boundedRetryFetchRequest, withTimeout, isKnownTransactionError, isRetryableRpcError, assertSuccessfulReceipt, sleep } from './evm-adapter-rpc.js';
+import { errorCode, errorMessage, errorStatus, isTooLowAllowanceError, enrichEvmError, HUB_STALE_ERROR_MARKERS, isInsufficientFundsError, InsufficientPublisherFundsError, formatNoFundedPublisherWalletMessage, type PublisherWalletBalance } from './evm-adapter-errors.js';
+import { resolveRpcUrls, boundedRetryFetchRequest, withTimeout, isRetryableRpcError, assertSuccessfulReceipt, sleep } from './evm-adapter-rpc.js';
+import { rpcHost } from './rpc-failover-log.js';
+import { ChainRpcTransportError, createRpcTimeoutError } from './chain-rpc-transport-error.js';
+import { RpcFailoverClient, type ReadOpts } from './rpc-failover-client.js';
 import { computeApprovalAction, effectivePublishAllowance, V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE } from './evm-adapter-allowance.js';
 import { formatProviderContext } from './evm-adapter-types.js';
 import type { ContractCache, EVMAdapterConfig } from './evm-adapter-types.js';
-import { RPC_READ_STALL_TIMEOUT_MS, DEFAULT_RANDOM_SAMPLING_HUB_REFRESH_MS, RPC_BROADCAST_ATTEMPT_TIMEOUT_MS, RPC_RECEIPT_ATTEMPT_TIMEOUT_MS, RPC_RECEIPT_TIMEOUT_MS, RPC_RECEIPT_POLL_INTERVAL_MS, RPC_TRANSACTION_POPULATION_ATTEMPT_TIMEOUT_MS, ADMIN_KEY_PURPOSE, OPERATIONAL_KEY_PURPOSE } from './evm-adapter-constants.js';
+import { RPC_READ_STALL_TIMEOUT_MS, DEFAULT_RANDOM_SAMPLING_HUB_REFRESH_MS, RPC_RECEIPT_TIMEOUT_MS, RPC_RECEIPT_POLL_INTERVAL_MS, RPC_ENDPOINT_SET_RETRIES, RPC_ENDPOINT_SET_RETRY_BACKOFF_MS, ADMIN_KEY_PURPOSE, OPERATIONAL_KEY_PURPOSE, PUBLISHER_FUNDING_CACHE_TTL_MS } from './evm-adapter-constants.js';
 
 /**
  * Maps a Hub-registered contract name to the function that invalidates
@@ -69,6 +72,242 @@ const BOUND_CONTRACT_INVALIDATORS = new Map<string, (adapter: EVMChainAdapterBas
   ['Chronos',                    (a) => { (a as any).contracts.chronos = undefined; }],
 ]);
 
+const KA_HIGH_WATER_VIEW_SIGNATURE = 'getMaxKaNumberForAuthor(address)';
+
+/**
+ * Upper bound on the pre-10.0.4 KnowledgeAssetCreated fallback scan, in
+ * 2,000-block eth_getLogs pages. The scan is anchored at the contract's deploy
+ * block (not genesis) and runs ONCE per author per node lifetime (cached), so a
+ * few hundred pages is fine; this cap only trips for a genuinely old pre-10.0.4
+ * deployment on a small-range-cap RPC, where we fail loud with guidance instead
+ * of silently issuing thousands of sequential calls. At the default 2,000-block
+ * window the budget covers ~3M blocks of contract lifetime; an older pre-10.0.4
+ * deployment is refused with actionable guidance — the dominant cost lever is
+ * the deploy-block anchor (an archive RPC), and the canonical fix is deploying
+ * DKGKnowledgeAssets >= 10.0.4 (which removes the scan via the O(1) view). The
+ * window can be widened (adapter-level `kaHighWaterScanPageSize`) on an RPC that
+ * serves larger eth_getLogs ranges.
+ */
+const KA_HIGH_WATER_MAX_SCAN_PAGES = 1_500;
+
+/** Default pre-10.0.4 fallback eth_getLogs window — the smallest common cap. */
+const KA_HIGH_WATER_DEFAULT_PAGE_SIZE = 2_000;
+
+const CG_REGISTRY_DEFAULT_PAGE_SIZE = 2_000;
+
+const CG_REGISTRY_LEGACY_PAGE_SIZE = 9_000;
+const CG_REGISTRY_LEGACY_MAX_SCAN_PAGES = 1_500;
+
+/**
+ * Preserve the old default registry scan span while using smaller RPC-safe
+ * pages. Larger configured page windows extend the block span at the same call
+ * budget.
+ */
+export const CG_REGISTRY_MAX_SCAN_PAGES = Math.ceil(
+  (CG_REGISTRY_LEGACY_PAGE_SIZE * CG_REGISTRY_LEGACY_MAX_SCAN_PAGES) /
+  CG_REGISTRY_DEFAULT_PAGE_SIZE,
+);
+
+export const CG_REGISTRY_REORG_BUFFER_BLOCKS = 50;
+
+/**
+ * Per-backend timeout for a single KnowledgeAssetCreated scan page before
+ * failing over to the next eligible backend — generous enough for a slow
+ * archive getLogs, short enough that a hung backend can't add its stall to every
+ * page (the sticky preferred-backend ordering then keeps the hung one out of the
+ * front of the line for subsequent pages).
+ */
+const KA_HIGH_WATER_PAGE_TIMEOUT_MS = 15_000;
+
+type ScanProvider = { provider: JsonRpcProvider; backendHead: number };
+
+function normalizeScanPageSize(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 1
+    ? Math.floor(value)
+    : fallback;
+}
+
+/**
+ * True for the UNAMBIGUOUS "the deployed DKGKnowledgeAssets has no
+ * `getMaxKaNumberForAuthor` selector" error shapes — the cases where we can pick
+ * the pre-10.0.4 log-scan fallback without any extra RPC call:
+ *   - `BAD_DATA` "could not decode result data" with an EMPTY `value="0x"`
+ *     payload (the provider returned nothing for the int256). A non-empty
+ *     `value="0x…"` is a malformed/garbage decode and is rethrown. This
+ *     classifier is only reached from the single `getMaxKaNumberForAuthor` view
+ *     call, so a contract-name match in the message is not required (ethers
+ *     versions vary on whether they include it).
+ *   - an explicit "function selector"/"selector not recognized" message.
+ *
+ * The CALL_EXCEPTION / "missing revert data" shape that some RPCs (e.g. Base
+ * Sepolia) return for an absent selector is AMBIGUOUS with a genuine bare
+ * revert, so it is handled by `isKaHighWaterBareRevert` + a deployed-bytecode
+ * selector probe (`kaHighWaterViewSelectorInCode`) — see
+ * `getMaxKaNumberForAuthor`.
+ */
+function isKaHighWaterViewUnavailable(err: unknown): boolean {
+  if (err instanceof Error) enrichEvmError(err);
+  const code = errorCode(err);
+  const msg = errorMessage(err).toLowerCase();
+
+  if (code === 'BAD_DATA') {
+    return msg.includes('could not decode result data')
+      && msg.includes('value="0x"');
+  }
+  return msg.includes('function selector')
+    || msg.includes('selector not recognized');
+}
+
+/**
+ * True for a CALL_EXCEPTION that carries NO revert payload (ethers v6:
+ * `reason=null`, `data=null`, message "missing revert data"). A deployed
+ * contract that lacks the called selector and has no fallback reverts exactly
+ * this way — but so does a genuine bare `revert()` from a function that DOES
+ * exist — so this shape is only treated as "view absent" once
+ * `kaHighWaterViewSelectorInCode` confirms the selector is genuinely missing
+ * from the deployed bytecode. A revert that carries a reason/data (e.g.
+ * `execution reverted: Paused`) is NOT a bare revert and is rethrown.
+ */
+function isKaHighWaterBareRevert(err: unknown): boolean {
+  if (errorCode(err) !== 'CALL_EXCEPTION') return false;
+  const e = err as { data?: unknown; reason?: unknown };
+  const hasRevertPayload =
+    (e.data != null && e.data !== '0x') ||
+    (typeof e.reason === 'string' && e.reason.length > 0);
+  if (hasRevertPayload) return false;
+  return errorMessage(err).toLowerCase().includes('missing revert data');
+}
+
+/**
+ * True iff the `getMaxKaNumberForAuthor(address)` selector appears as a
+ * `PUSH4 <selector>` dispatcher entry in `code` (the resolved contract's
+ * deployed runtime bytecode). A Solidity function dispatcher compares
+ * `msg.sig` against each external selector via `PUSH4 <selector>` (opcode
+ * `0x63`), so we match `63<selector>` rather than the bare 4 selector bytes —
+ * a plain substring match would false-POSITIVE on the same 4 bytes appearing
+ * inside an unrelated constant or the metadata blob, making a pre-10.0.4
+ * contract look like it implements the view and wrongly rethrowing the
+ * bare-revert path. Absence of the PUSH4 entry reliably signals the view is
+ * not deployed (the pre-10.0.4 case) — for a DIRECT deployment. DKGKnowledgeAssets
+ * is resolved straight from the Hub (not behind a proxy), so this probe sees the
+ * real dispatcher; if it were ever proxied, the implementation's selectors would
+ * not appear in the proxy bytecode (a proxying change MUST revisit this probe).
+ * The selector is derived from the contract interface so it tracks the
+ * signature; if it can't be derived we return false (treat as absent → fall
+ * back, which is safe: the scan yields the correct high-water either way).
+ */
+function kaHighWaterViewSelectorInCode(storage: Contract, code: string): boolean {
+  let selector: string | undefined;
+  try {
+    selector = storage.interface.getFunction(KA_HIGH_WATER_VIEW_SIGNATURE)?.selector;
+  } catch {
+    selector = undefined;
+  }
+  if (!selector) return false;
+  // `63` = PUSH4 opcode; the 4 selector bytes must follow it to count as a real
+  // dispatcher entry (not a coincidental byte run elsewhere in the bytecode).
+  return code.toLowerCase().includes(`63${selector.toLowerCase().slice(2)}`);
+}
+
+/**
+ * True only for errors that mean "this RPC cannot serve historical state at the
+ * requested block" — a pruned/non-archive node — as opposed to a real RPC
+ * outage / auth failure / timeout. The deploy-block search degrades to a
+ * genesis-anchored scan ONLY for these; every other failure is rethrown so a
+ * broken provider surfaces loudly instead of being masked as a pre-10.0.4
+ * fallback that triggers a large log sweep. Conservative substring match over
+ * the common provider phrasings (geth/erigon/nethermind/managed endpoints).
+ */
+/**
+ * Flatten an error into a single lowercased string across the nested fields
+ * ethers v6 / managed RPCs actually populate — `message`, `shortMessage`,
+ * `reason`, `body`, and recursively `error` / `info` / `cause` / `data`. The
+ * plain `errorMessage` reads only `.message`, so a managed-RPC denial whose text
+ * lives in `err.info.error.message` / `err.body` would otherwise be invisible.
+ */
+function allErrorText(err: unknown): string {
+  const parts: string[] = [];
+  const seen = new Set<unknown>();
+  const visit = (e: any, depth: number): void => {
+    if (e == null || depth > 5 || seen.has(e)) return;
+    if (typeof e === 'string') { parts.push(e); return; }
+    if (typeof e !== 'object') return;
+    seen.add(e);
+    for (const k of ['message', 'shortMessage', 'reason', 'body']) {
+      if (typeof e[k] === 'string') parts.push(e[k]);
+    }
+    for (const k of ['error', 'info', 'cause', 'data']) visit(e[k], depth + 1);
+  };
+  visit(err, 0);
+  return parts.join(' ').toLowerCase();
+}
+
+/**
+ * True when `err` is a TRANSIENT rate-limit / throttle from the RPC provider —
+ * keyed on the provider HTTP status (`429`; `errorStatus` recurses nested
+ * `cause`/`info`/`error` fields) plus a rate-limit / quota / compute-unit
+ * vocabulary guard, since providers routinely concatenate the upstream node's
+ * pruned-state text into their own throttle envelope.
+ *
+ * This is the ONE class the deploy-block search surfaces early instead of
+ * degrading: degrading would fire getCode retries + a page-1 `eth_getLogs` that
+ * only WORSEN a throttle, and it clears on its own. Everything else — a pruned
+ * node, a STATIC access/plan/archive denial, a transient timeout/503, or a hard
+ * 401 — falls through to the genesis scan. Crucially a "not archive / archive not
+ * on your plan" denial is NOT here: `eth_getLogs` does not need archive state, so
+ * the scan still computes the high-water mark on a non-archive provider, and
+ * surfacing it would needlessly fail a publish that would otherwise succeed (the
+ * scan surfaces a genuine TOTAL outage itself, on page 1).
+ */
+function isTransientThrottle(err: unknown): boolean {
+  if (errorStatus(err) === 429) return true;
+  const msg = allErrorText(err);
+  return /\b(too many requests|rate[ -]?limit|throttl|compute units?|capacity|quota|credits?|(daily|monthly|request|compute)[^.]{0,12}\blimit|limit reached|over (the )?limit)\b/.test(msg);
+}
+
+/**
+ * True ONLY when the deploy-block getCode failure is a genuine "this node does
+ * not retain historical state" condition. A transient throttle is excluded FIRST
+ * (see `isTransientThrottle`). Used by the head probe; the deploy-block search no
+ * longer gates degrade-vs-throw on it (it degrades on everything except a
+ * transient throttle, letting the genesis scan arbitrate).
+ */
+function isHistoricalStateUnavailable(err: unknown): boolean {
+  if (isTransientThrottle(err)) return false;
+
+  const msg = allErrorText(err);
+
+  // Genuine "node lacks historical state" shapes → degrade to the genesis log scan.
+  // NOTE: a bare `header not found` is intentionally NOT here — nodes also return
+  // it while out-of-sync / restarting, so it must surface rather than mask a real
+  // fault as a degrade (a "header not found" caused by pruning is accompanied by a
+  // pruned/older-than/archive phrase below, which still degrades).
+  return (
+    msg.includes('missing trie node') ||
+    msg.includes('state not available') ||
+    msg.includes('state is not available') ||
+    msg.includes('historical state') ||
+    msg.includes('pruned') ||
+    // "block is older than the latest N blocks" — the pruned-window shape, not a
+    // bare "older than" (which appears in unrelated messages).
+    /older than\b[^.]*\bblocks?\b/.test(msg) ||
+    // "requires an archive node" / "needs archive" — anchored on requires/needs.
+    /\b(requires?|needs?)\s+(an?\s+)?archive/.test(msg)
+  );
+}
+
+async function contractAddress(contract: Contract): Promise<string> {
+  const getAddress = (contract as any).getAddress;
+  if (typeof getAddress === 'function') {
+    return ethers.getAddress(await getAddress.call(contract));
+  }
+  const target = (contract as any).target;
+  if (typeof target === 'string') {
+    return ethers.getAddress(target);
+  }
+  throw new Error('DKGKnowledgeAssets address is unavailable from the resolved contract handle.');
+}
+
 export class EVMChainAdapterBase {
   /** See `ChainAdapter.deploymentId`. */
   get deploymentId(): string {
@@ -79,13 +318,31 @@ export class EVMChainAdapterBase {
 
   readonly chainId: string;
 
-  protected readonly provider: JsonRpcProvider | FallbackProvider;
+  /**
+   * The bare primary RPC provider (== `primaryProvider`). The nominal runner
+   * that signers, boot-bound contract handles, and the Hub-rotation event
+   * subscription bind to — NOT the read-failover surface. Every read reconnects
+   * to a per-endpoint provider via the read facades (`readContract`/`readProvider`
+   * → `this.rpcFailover`); the `FallbackProvider` was removed (see the
+   * constructor). Kept as a distinct field name for the binding sites; reads must
+   * never call `this.provider.<read>()` directly (route through the read facades).
+   */
+  protected readonly provider: JsonRpcProvider;
 
   protected readonly primaryProvider: JsonRpcProvider;
 
   protected readonly providers: JsonRpcProvider[];
 
   protected readonly rpcUrls: string[];
+
+  /**
+   * The pure per-endpoint RPC transport mechanism. Owns the read-failover loop +
+   * the named timeout-policy matrix + typed exhaustion; constructed with a LIVE
+   * endpoint thunk over `this.providers` / `this.rpcUrls` and the
+   * `signPopulatedTransaction` callback, so it never holds a back-reference to
+   * the adapter and never owns tx-safety state.
+   */
+  protected readonly rpcFailover: RpcFailoverClient;
 
   protected readonly filterErrorSilencer: FilterErrorSilencer;
 
@@ -111,6 +368,31 @@ export class EVMChainAdapterBase {
    * preserved.
    */
   protected readonly signerTxSerializer = new KeyedSerializer();
+
+  /**
+   * Funding-aware publish selection floors. A wallet is "fundable" (preferred
+   * by `nextAuthorizedSigner`) when its native balance > `minPublisherNativeWei`
+   * AND its TRAC balance > `minPublisherTracWei`. Default `0n` (strictly
+   * positive). See `EVMAdapterBaseConfig.minPublisher*Wei`.
+   */
+  protected readonly minPublisherNativeWei: bigint;
+
+  protected readonly minPublisherTracWei: bigint;
+
+  /**
+   * Kill-switch (env `DKG_DISABLE_FUNDED_WALLET_SELECTION=1`): when set,
+   * `nextAuthorizedSigner` reverts to the pre-funding-aware behaviour
+   * (first authorized wallet in round-robin order, no balance reads).
+   */
+  protected readonly fundedWalletSelectionDisabled: boolean;
+
+  /**
+   * Short-TTL per-wallet funding cache (lowercased address → native+TRAC wei).
+   * A `null` metric means the read failed / no token contract; callers FAIL
+   * OPEN (treat null as fundable). Reused across a bulk publish loop so it
+   * does not re-read the same wallet on every iteration.
+   */
+  protected readonly fundingCache = new Map<string, { native: bigint | null; trac: bigint | null; ts: number }>();
 
   protected readonly hubAddress: string;
 
@@ -240,6 +522,28 @@ export class EVMChainAdapterBase {
   protected cachedMinRequiredSignatures: { value: number; cachedAt: number } | undefined;
 
   /**
+   * Cached deploy blocks, keyed by lowercase contract address. Anchors long
+   * event-log scans at the contract's birth instead of genesis. A contract's
+   * deploy block is immutable, so this needs no TTL.
+   */
+  protected readonly cachedContractDeployBlocks: Map<string, number> = new Map();
+
+  /**
+   * Next unbuffered block for ContextGraphNameRegistry scans, keyed by lowercase
+   * registry address. Read with a reorg buffer; duplicate delivery is harmless.
+   */
+  protected readonly contextGraphRegistryScanWatermarks: Map<string, number> = new Map();
+
+  /**
+   * eth_getLogs block-window for the pre-10.0.4 getMaxKaNumberForAuthor fallback
+   * scan (adapter-level config `kaHighWaterScanPageSize`; non-integer / `< 1`
+   * values fall back to KA_HIGH_WATER_DEFAULT_PAGE_SIZE = 2,000).
+   */
+  protected readonly kaHighWaterScanPageSize: number;
+
+  protected readonly cgRegistryScanPageSize: number;
+
+  /**
    * Reset the PR3 publish-preflight cache. Public so daemon code that
    * knows about an external chain reconfiguration (e.g. a hot-reload
    * of `chainRpcUrl` or a deliberate governance-vote test fixture)
@@ -250,6 +554,8 @@ export class EVMChainAdapterBase {
     this.cachedChainId = undefined;
     this.cachedKav10Address = undefined;
     this.cachedMinRequiredSignatures = undefined;
+    this.cachedContractDeployBlocks.clear();
+    this.contextGraphRegistryScanWatermarks.clear();
   }
 
   protected static preflightCacheFresh(
@@ -262,6 +568,17 @@ export class EVMChainAdapterBase {
 
   constructor(config: EVMAdapterConfig) {
     this.rpcUrls = resolveRpcUrls(config.rpcUrl, config.rpcUrls);
+    // Floor a finite `>= 1` value (so e.g. 10000.5 -> 10000, preserving the
+    // window); only a `< 1` (or non-finite) value falls back to the default — a
+    // fractional value in (0,1) must NOT floor to 0 (which makes pages Infinity).
+    this.kaHighWaterScanPageSize = normalizeScanPageSize(
+      config.kaHighWaterScanPageSize,
+      KA_HIGH_WATER_DEFAULT_PAGE_SIZE,
+    );
+    this.cgRegistryScanPageSize = normalizeScanPageSize(
+      config.cgRegistryScanPageSize,
+      CG_REGISTRY_DEFAULT_PAGE_SIZE,
+    );
     // BUG-022 root-cause fix: force ethers' `PollingEventSubscriber`
     // (eth_getLogs over a sliding block window) instead of the default
     // `FilterIdEventSubscriber` (eth_newFilter + eth_getFilterChanges).
@@ -299,26 +616,56 @@ export class EVMChainAdapterBase {
     // (gossip-publish-handler / finalization-handler `verifyOnChain`). Batching
     // is a transport optimisation only — disabling it is semantically inert and
     // does not change the number of `eth_getLogs` operations issued.
+    // Immediate-failover (R1): per-endpoint retries are 0 when ≥2 endpoints are
+    // configured, so the FIRST retryable failure propagates at once and the
+    // explicit per-provider failover loops (reads: the `RpcFailoverClient` read
+    // facades; writes: `sendContractTransaction` / broadcast / receipt / the V10 populate loop)
+    // advance to the next endpoint immediately instead of burning ~7.5s of
+    // same-endpoint backoff on an endpoint we already know is failing. A
+    // single-RPC node keeps the bounded `RPC_REQUEST_MAX_RETRIES` retry (its
+    // only resilience; #894) via the default. See `boundedRetryFetchRequest`.
+    const perEndpointRetries = this.rpcUrls.length > 1 ? 0 : undefined;
     this.providers = this.rpcUrls.map(
-      (url) => new JsonRpcProvider(boundedRetryFetchRequest(url), undefined, {
+      (url) => new JsonRpcProvider(boundedRetryFetchRequest(url, perEndpointRetries), undefined, {
         cacheTimeout: -1,
         polling: true,
         batchMaxCount: 1,
       }),
     );
     this.primaryProvider = this.providers[0];
-    this.provider = this.providers.length === 1
-      ? this.primaryProvider
-      : new FallbackProvider(
-        this.providers.map((provider, index) => ({
-          provider,
-          priority: index + 1,
-          stallTimeout: RPC_READ_STALL_TIMEOUT_MS,
-          weight: 1,
-        })),
-        undefined,
-        { quorum: 1 },
-      );
+    // No `FallbackProvider`: reads route through the `RpcFailoverClient` read
+    // facades over the bare `this.providers[]` for TRUE immediate failover. ethers' quorum:1
+    // FallbackProvider threw a fast error straight to the caller WITHOUT
+    // consulting a backup (it advanced only on a ~4s stall) — empirically
+    // unreliable read failover even with per-endpoint retries > 0 — and its
+    // sub-providers shared this same `this.providers[]` array, so the
+    // multi-RPC `retries=0` above would have disabled its staller-based failover
+    // anyway. Removing it also eliminates the sticky `_lastFatalError` /
+    // one-shot `#initialSync` latch. `this.provider` is now just the bare
+    // primary: the nominal runner that signers, boot-bound contract handles, and
+    // the Hub-rotation event subscription bind to. Every actual READ reconnects
+    // to the loop provider (via the `RpcFailoverClient` read facades) and every
+    // WRITE reconnects per-endpoint explicitly, so this binding is never the
+    // failover surface.
+    this.provider = this.primaryProvider;
+    // Construct the transport client AFTER `this.providers`/`this.rpcUrls` are
+    // set (above). The endpoint thunk reads `providers`/`rpcUrls` live (so a
+    // reassignment of `(a as any).providers` is observed) and signing routes back
+    // to `signPopulatedTransaction` so that helper stays on the adapter. No
+    // failover read can run before this point — the constructor below only builds
+    // Wallets/Contracts and a lazily-resolved HubResolutionCache.
+    this.rpcFailover = new RpcFailoverClient(
+      // Mapped at CALL time inside the thunk (NOT captured), so a reassignment of
+      // `(a as any).providers` / `(a as any).rpcUrls` after construction still
+      // propagates live. `providers`/`rpcUrls` are built in lockstep
+      // (`providers = rpcUrls.map(...)`), so index i pairs provider[i]↔rpcUrl[i].
+      () => this.providers.map((provider, i) => ({ provider, rpcUrl: this.rpcUrls[i] })),
+      (signer, populated) => this.signPopulatedTransaction(signer, populated),
+      // `this.chainId` is assigned later in this constructor (after the client is
+      // built), so pass a LIVE thunk — resolved at metric-record time — rather
+      // than capturing the still-undefined field value here.
+      () => this.chainId,
+    );
     const providerContext = formatProviderContext(config);
     // PR-8: install the filter-not-found silencer. Without this, RPC
     // nodes that GC filters faster than ethers' polling cadence
@@ -384,6 +731,9 @@ export class EVMChainAdapterBase {
     this.tokenAddress = config.tokenAddress ? ethers.getAddress(config.tokenAddress) : undefined;
     this.chainId = config.chainId ?? 'evm:31337';
     this.approvalPolicy = config.approvalPolicy ?? DEFAULT_APPROVAL_POLICY;
+    this.minPublisherNativeWei = config.minPublisherNativeWei ?? 0n;
+    this.minPublisherTracWei = config.minPublisherTracWei ?? 0n;
+    this.fundedWalletSelectionDisabled = process.env.DKG_DISABLE_FUNDED_WALLET_SELECTION === '1';
 
     this.contracts = {
       hub: new Contract(config.hubAddress, loadAbi('Hub'), this.signer),
@@ -423,61 +773,94 @@ export class EVMChainAdapterBase {
     return this.signerPool.find((signer) => signer.address.toLowerCase() === normalized);
   }
 
-  protected async broadcastSignedTransactionWithFailover(
+  /**
+   * Classify an RPC error for low-cardinality metric labels: `timeout` for the
+   * synthetic `withTimeout` TIMEOUT code, else `error`. Used by the adapter's own
+   * instrumented `eth_getLogs` page scan (`queryEventLogsPage`) so the `outcome`
+   * label stays bounded. (The failover transports — broadcast / receipt / eth_call
+   * / populate — now record their outcomes inside `RpcFailoverClient`.)
+   */
+  private _rpcOutcomeForError(err: unknown): 'error' | 'timeout' {
+    return errorCode(err) === 'TIMEOUT' ? 'timeout' : 'error';
+  }
+
+  /**
+   * Thin delegator to `this.rpcFailover.broadcast` — the per-endpoint broadcast
+   * loop. `sendSignedTransactionAndWait`'s set-retry loop calls this method; it
+   * only forwards an already-signed tx, so no tx-safety state crosses here.
+   */
+  protected broadcastSignedTransactionWithFailover(
     signedTx: string,
     txHash: string,
     label: string,
   ): Promise<void> {
-    let lastRetryable: unknown;
-    for (let i = 0; i < this.providers.length; i += 1) {
-      const provider = this.providers[i];
-      try {
-        await withTimeout(
-          provider.broadcastTransaction(signedTx),
-          RPC_BROADCAST_ATTEMPT_TIMEOUT_MS,
-          `${label} broadcast via RPC #${i + 1}`,
-        );
-        return;
-      } catch (err) {
-        if (isKnownTransactionError(err)) return;
-        if (!isRetryableRpcError(err)) throw err;
-        lastRetryable = err;
-      }
-    }
-    throw new Error(
-      `${label} broadcast failed on all configured RPC endpoints for tx ${txHash}: ${errorMessage(lastRetryable)}`,
-      { cause: lastRetryable },
-    );
+    return this.rpcFailover.broadcast(signedTx, txHash, label);
   }
 
-  protected async getTransactionReceiptWithFailover(txHash: string): Promise<ethers.TransactionReceipt | null> {
-    let lastRetryable: unknown;
-    let sawNonErrorResponse = false;
-    for (let i = 0; i < this.providers.length; i += 1) {
-      const provider = this.providers[i];
-      try {
-        const receipt = await withTimeout(
-          provider.getTransactionReceipt(txHash),
-          RPC_RECEIPT_ATTEMPT_TIMEOUT_MS,
-          `receipt lookup via RPC #${i + 1}`,
-        );
-        sawNonErrorResponse = true;
-        if (receipt) return receipt;
-      } catch (err) {
-        if (!isRetryableRpcError(err)) throw err;
-        lastRetryable = err;
-      }
-    }
-    if (lastRetryable && !sawNonErrorResponse) {
-      const err = new Error(
-        `Receipt lookup for tx ${txHash} failed on all configured RPC endpoints: ${errorMessage(lastRetryable)}`,
-        { cause: lastRetryable },
-      );
-      (err as any).code = 'RPC_RECEIPT_LOOKUP_FAILED';
-      (err as any).txHash = txHash;
-      throw err;
-    }
-    return null;
+  /**
+   * Thin delegator to `this.rpcFailover.getReceipt` — the per-endpoint receipt
+   * loop. Used by `waitForReceiptWithFailover` and the `publish.ts` callers.
+   */
+  protected getTransactionReceiptWithFailover(txHash: string): Promise<ethers.TransactionReceipt | null> {
+    return this.rpcFailover.getReceipt(txHash);
+  }
+
+  /**
+   * Common point-view CONTRACT read — the chain-concept surface the domain mixins
+   * call: a `contract`, a `label`, a string `method` name, and its args, run with
+   * the default `pointRead` policy + the `isContractViewRetryable` classifier. The
+   * untyped ethers `Contract` resolves the string method through `any`, so this
+   * loses NO static checking versus a `c.method(...)` lambda.
+   */
+  protected readContract<T = any>(
+    contract: Contract,
+    label: string,
+    method: string,
+    ...args: unknown[]
+  ): Promise<T> {
+    return this.rpcFailover.readContract(label, contract, (c) => c[method](...args));
+  }
+
+  /**
+   * CONTRACT view read needing a non-default policy or classifier — the funding
+   * reads (`failOpenFundingRead`), the events scan (`wideLogScan`), or a bespoke
+   * `isRetryable`. Keeps the `fn` lambda (vs the string-method `readContract`) for
+   * reads whose call shape isn't a plain `c.method(...args)`.
+   */
+  protected readContractWith<T>(
+    contract: Contract,
+    label: string,
+    fn: (c: Contract) => Promise<T>,
+    opts?: ReadOpts,
+  ): Promise<T> {
+    return this.rpcFailover.readContract(label, contract, fn, opts);
+  }
+
+  /**
+   * Raw PROVIDER read (no contract rebind) — `getCode` / `getBlock` /
+   * `getNetwork` / `getBalance` / `getBlockNumber`, the fail-open native-balance
+   * funding read, and the `getMaxKaNumberForAuthor` staticCall with its bespoke
+   * absent-view classifier. Default `pointRead` + `isRetryableRpcError`; override
+   * the policy/classifier via `opts`.
+   */
+  protected readProvider<T>(
+    label: string,
+    fn: (provider: JsonRpcProvider) => Promise<T>,
+    opts?: ReadOpts,
+  ): Promise<T> {
+    return this.rpcFailover.read(label, fn, opts);
+  }
+
+  /**
+   * Rebind a CONTRACT to a `provider` for one per-endpoint VIEW read, leaving the
+   * boot-bound `this.contracts.*` handle untouched. The sole remaining base caller
+   * is the `getMaxKaNumberForAuthor` staticCall (a `readProvider` lambda); the
+   * write-path signer rebind lives in the module's `populateAndSign`. The
+   * `as Contract` recovers the dynamic-method index signature ethers'
+   * `BaseContract.connect` drops.
+   */
+  protected rebindContract(contract: Contract, runner: JsonRpcProvider | Wallet): Contract {
+    return contract.connect(runner) as Contract;
   }
 
   protected async waitForReceiptWithFailover(
@@ -499,14 +882,11 @@ export class EVMChainAdapterBase {
       }
       await sleep(RPC_RECEIPT_POLL_INTERVAL_MS);
     }
-    const err = new Error(
+    throw createRpcTimeoutError(
       `${label} tx ${txHash} timed out waiting for a receipt after ${RPC_RECEIPT_TIMEOUT_MS}ms` +
       (lastError ? ` (last RPC error: ${errorMessage(lastError)})` : ''),
-      { cause: lastError },
+      { cause: lastError, txHash },
     );
-    (err as any).code = 'TIMEOUT';
-    (err as any).txHash = txHash;
-    throw err;
   }
 
   protected async signPopulatedTransaction(
@@ -520,19 +900,12 @@ export class EVMChainAdapterBase {
   }
 
   /**
-   * #888: populate + sign a V10 write tx with one-shot recovery for a
-   * stale-RPC `TooLowAllowance` revert, shared by BOTH V10 write paths
-   * (`createKnowledgeAssets` publish and `updateV10` — incl. metadata-only
-   * updates). ethers estimates gas while populating; on an internally
-   * load-balanced RPC that estimate can read a stale TRAC allowance and
-   * revert `TooLowAllowance` even though the approve above succeeded
-   * (post-approve propagation lag) or was skipped on a stale-high read of an
-   * allowance the prior write already consumed. This is strictly
-   * pre-broadcast (before the `onBroadcast` WAL checkpoint), so on that one
-   * revert we force a fresh approve up to the publish floor — confirming it
-   * is visible on the same read path via `ensureV10ApproveTrac(force=true)` —
-   * and retry populate+sign exactly once. Any other error, or a second
-   * `TooLowAllowance`, propagates unchanged.
+   * #888: populate + sign a V10 write tx (shared by publish + update) with a
+   * one-shot recovery for a stale-RPC `TooLowAllowance` revert. Gas estimation
+   * during populate can read a stale TRAC allowance and revert even though the
+   * approve succeeded; this is strictly pre-broadcast, so on that ONE revert we
+   * force a fresh approve (`ensureV10ApproveTrac(force=true)`) and retry exactly
+   * once. Any other error, or a second `TooLowAllowance`, propagates.
    */
   protected async populateAndSignV10WithAllowanceRecovery(
     signer: Wallet,
@@ -543,14 +916,28 @@ export class EVMChainAdapterBase {
     tokenAmount: bigint,
     reapproveLabel: string,
   ): Promise<{ signedTx: string; txHash: string }> {
+    // Per-endpoint populate+sign failover lives in the shared
+    // `populateAndSignAcrossProviders` (so a 429ing primary can't fail-fast the
+    // publish); the #888 stale-allowance recovery stays a strict ONE-SHOT. OUTER
+    // (this loop) owns the SINGLE `forcedReapprove` latch + the lone forced
+    // approve; INNER iterates the bare providers. `TooLowAllowance` is a
+    // CALL_EXCEPTION (non-retryable), so the inner loop does NOT fail over on it —
+    // it propagates up here. The latch is never reset per endpoint, so at most
+    // ONE forced approve fires per publish regardless of endpoints tried. Only the
+    // one returned signed tx is broadcast; the whole thing runs inside the
+    // per-wallet `KeyedSerializer` (#953), strictly pre-broadcast / pre-WAL.
     let forcedReapprove = false;
     for (;;) {
       try {
-        const populated = await (kaContract as any)[method].populateTransaction(
-          methodParams,
+        return await this.populateAndSignAcrossProviders(
+          kaContract,
+          method,
+          [methodParams],
+          signer,
+          `V10 ${method}`,
         );
-        return await this.signPopulatedTransaction(signer, populated);
       } catch (err) {
+        enrichEvmError(err);
         if (!forcedReapprove && isTooLowAllowanceError(err)) {
           forcedReapprove = true;
           console.warn(
@@ -565,9 +952,9 @@ export class EVMChainAdapterBase {
             reapproveLabel,
             true,
           );
-          continue;
+          continue; // re-run the WHOLE inner per-provider populate loop, allowance now in place
         }
-        throw err;
+        throw err; // any other error, or a SECOND TooLowAllowance, propagates
       }
     }
   }
@@ -577,7 +964,27 @@ export class EVMChainAdapterBase {
     txHash: string,
     label: string,
   ): Promise<ethers.TransactionReceipt> {
-    await this.broadcastSignedTransactionWithFailover(signedTx, txHash, label);
+    // Bounded set-retry, BROADCAST phase ONLY: after a full per-endpoint
+    // broadcast pass exhausts with a retryable error (a brief all-endpoints-429),
+    // re-broadcast the SAME signed tx up to `RPC_ENDPOINT_SET_RETRIES` extra
+    // passes with a short backoff. tx-safe: this seam is SIGNER-FREE so re-signing
+    // is structurally impossible, re-broadcasting the byte-identical tx is
+    // idempotent (`isKnownTransactionError`), and the WAL `onBroadcast` already
+    // fired once upstream. The receipt wait is NOT re-broadcast (it owns its own
+    // poll + deadline), so lock-hold (held across the retries for the V10 path)
+    // stays bounded.
+    for (let pass = 0; ; pass += 1) {
+      try {
+        await this.broadcastSignedTransactionWithFailover(signedTx, txHash, label);
+        break;
+      } catch (err) {
+        if (isRetryableRpcError(err) && pass < RPC_ENDPOINT_SET_RETRIES) {
+          await sleep(RPC_ENDPOINT_SET_RETRY_BACKOFF_MS);
+          continue;
+        }
+        throw err;
+      }
+    }
     return this.waitForReceiptWithFailover(txHash, label);
   }
 
@@ -636,58 +1043,62 @@ export class EVMChainAdapterBase {
     return this.sendSignedTransactionAndWait(signedTx, txHash, label);
   }
 
+  /**
+   * Thin delegator to `this.rpcFailover.populateAndSign` — the per-endpoint
+   * populate+sign loop (which reaches `signPopulatedTransaction` via the injected
+   * callback). Called by `populateAndSignV10WithAllowanceRecovery` (the
+   * `forcedReapprove` latch owner) and `sendContractTransaction`. STRICTLY
+   * pre-broadcast — the caller owns the WAL split and broadcasts the single
+   * returned tx.
+   */
+  protected populateAndSignAcrossProviders(
+    contract: Contract,
+    method: string,
+    args: readonly unknown[],
+    signer: Wallet,
+    label: string,
+    opts?: { gasLimitBufferBps?: number },
+  ): Promise<{ signedTx: string; txHash: string }> {
+    return this.rpcFailover.populateAndSign(contract, method, args, signer, label, opts);
+  }
+
   protected async sendContractTransaction(
     contract: Contract,
     method: string,
     args: readonly unknown[],
     signer: Wallet,
     label: string,
+    // Optional gas headroom for methods whose on-chain gas cost depends on
+    // per-block randomness. ethers fills `gasLimit` from a single
+    // `eth_estimateGas` with NO margin, but that estimate runs against the
+    // CURRENT block while the tx is mined in a LATER block with different
+    // `prevrandao`/`blockhash`/`timestamp`. If the mined block's entropy
+    // drives a more expensive code path than the estimate's, the tx runs
+    // out of gas and reverts with empty (`0x`) data. `RandomSampling.createChallenge`
+    // is exactly this case (weighted CG draw + historical blockhash access):
+    // observed estimate-vs-execution spread is small here but unbounded in
+    // production with many CGs/KCs. When set, we estimate once and inflate
+    // the limit by `gasLimitBufferBps` basis points so the drift can't OOG.
+    opts?: { gasLimitBufferBps?: number },
   ): Promise<ethers.TransactionReceipt> {
-    let lastRetryable: unknown;
-    for (let i = 0; i < this.providers.length; i += 1) {
-      const rpcSigner = signer.connect(this.providers[i]);
-      let prepared: { signedTx: string; txHash: string } | undefined;
-      try {
-        const connected = contract.connect(rpcSigner) as any;
-        const populated = await withTimeout<ethers.TransactionRequest>(
-          connected[method].populateTransaction(...args) as Promise<ethers.TransactionRequest>,
-          RPC_TRANSACTION_POPULATION_ATTEMPT_TIMEOUT_MS,
-          `${label} transaction population via RPC #${i + 1}`,
+    // Parent span for the whole send. Broadcast + receipt-wait open their own
+    // nested spans/metrics (chain.tx_submit / chain.tx_wait) inside
+    // sendSignedTransactionAndWait; populate+sign failover is counted inside
+    // populateAndSignAcrossProviders.
+    return withSpan(
+      'chain.tx_send',
+      async (span) => {
+        // Populate+sign with per-endpoint failover (shared with the V10 path),
+        // then broadcast+confirm the single signed tx. Split so `onBroadcast`
+        // (the WAL checkpoint) can sit between sign and broadcast for V10 callers.
+        const { signedTx, txHash } = await this.populateAndSignAcrossProviders(
+          contract, method, args, signer, label, opts,
         );
-        prepared = await withTimeout(
-          this.signPopulatedTransaction(rpcSigner, populated),
-          RPC_TRANSACTION_POPULATION_ATTEMPT_TIMEOUT_MS,
-          `${label} transaction signing via RPC #${i + 1}`,
-        );
-      } catch (err) {
-        if (!isRetryableRpcError(err)) throw err;
-        lastRetryable = err;
-        continue;
-      }
-      if (!prepared) continue;
-      return this.sendSignedTransactionAndWait(prepared.signedTx, prepared.txHash, label);
-    }
-    // A retryable error from the only configured RPC is still an "endpoints
-    // exhausted" condition: downstream classifiers (e.g.
-    // `/api/context-graph/register` → `classifyRegisterContextGraphError`)
-    // key the transient-outage 503 off the `RPC_ENDPOINTS_EXHAUSTED` code, so
-    // the code MUST be present even for a single-provider adapter (Codex
-    // PR #901). What we must NOT do for one provider is REWRITE the
-    // `.message` into the multi-endpoint "failed on all endpoints (url1,
-    // url2): ..." aggregate — there is no second endpoint, so the original
-    // message (e.g. a plain `connect ECONNREFUSED`) reads cleaner and any
-    // message-inspecting caller keeps seeing it verbatim. So: single provider
-    // → carry the code on a new error but keep the message byte-identical;
-    // multiple providers → the aggregated "all endpoints" message is
-    // meaningful and is asserted by evm-adapter.unit.test.ts.
-    const message = this.providers.length <= 1
-      ? errorMessage(lastRetryable)
-      : `${label} transaction preparation failed on all configured RPC endpoints ` +
-        `(${this.rpcUrls.join(', ')}): ${errorMessage(lastRetryable)}`;
-    const err = new Error(message, { cause: lastRetryable });
-    (err as any).code = 'RPC_ENDPOINTS_EXHAUSTED';
-    (err as any).rpcUrls = [...this.rpcUrls];
-    throw err;
+        span.setAttribute('dkg.tx_hash', txHash);
+        return this.sendSignedTransactionAndWait(signedTx, txHash, label);
+      },
+      { attributes: { 'rpc.method': 'eth_sendRawTransaction', 'dkg.chain_id': this.chainId } },
+    );
   }
 
   /**
@@ -721,7 +1132,10 @@ export class EVMChainAdapterBase {
   ): Promise<void> {
     if (!this.contracts.token) return;
     const tokenWithSigner = this.contracts.token.connect(signer) as Contract;
-    const currentAllowance: bigint = await tokenWithSigner.allowance(
+    const currentAllowance: bigint = await this.readContract(
+      tokenWithSigner,
+      'token.allowance',
+      'allowance',
       signer.address,
       kav10Address,
     );
@@ -808,10 +1222,11 @@ export class EVMChainAdapterBase {
         // recovery poll indefinitely. `withTimeout` rejects after
         // `RPC_READ_STALL_TIMEOUT_MS`, which the catch below treats as a
         // not-yet-visible read and backs off (same as a thrown read error).
-        current = (await withTimeout(
-          token.allowance(owner, spender),
-          RPC_READ_STALL_TIMEOUT_MS,
+        current = (await this.readContractWith(
+          token,
           'allowance visibility poll',
+          (c) => c.allowance(owner, spender),
+          { policy: 'failOpenFundingRead' },
         )) as bigint;
       } catch {
         // Transient read failure / stall timeout — treat as not-yet-visible
@@ -826,38 +1241,315 @@ export class EVMChainAdapterBase {
   }
 
   /**
-   * Pick the next signer in the pool that the on-chain ContextGraphs contract
-   * authorizes for the target context graph. Falls back to round-robin only
-   * when the auth surface is unavailable.
+   * Pick the operational wallet that signs the next publish tx. Among the
+   * wallets the on-chain ContextGraphs contract authorizes for this context
+   * graph (round-robin order from `signerIndex`), PREFER one that is funded
+   * (native gas AND TRAC above the configured floors, or a covering PCA agent)
+   * so a publish is never routed to an authorized-but-empty wallet — the
+   * unfunded-wallet publish-failure this selector exists to fix. When the
+   * ContextGraphs auth surface is unavailable, every operational wallet is a
+   * candidate — still funding-aware over the full pool, NOT a plain pick. When
+   * no candidate is fundable, falls back to the best-funded one (the publish
+   * then surfaces an actionable InsufficientPublisherFundsError rather than a
+   * raw revert). The DKG_DISABLE_FUNDED_WALLET_SELECTION kill-switch is the only
+   * path that reverts to a plain round-robin pick (the first authorized wallet).
+   * Selection is serialized via `signerSelectionQueue` so concurrent publishes
+   * advance the `signerIndex` cursor coherently.
    */
-  protected async nextAuthorizedSigner(contextGraphId: bigint): Promise<Wallet> {
+  protected async nextAuthorizedSigner(contextGraphId: bigint, requiredTracWei: bigint = 0n): Promise<Wallet> {
     const previousSelection = this.signerSelectionQueue;
     let releaseSelection!: () => void;
     this.signerSelectionQueue = new Promise<void>((resolve) => { releaseSelection = resolve; });
     await previousSelection;
     try {
-      if (!this.contracts.contextGraphs) {
-        return this.nextSigner();
+      // Candidate wallets in round-robin order from the current cursor.
+      const start = this.signerIndex % this.signerPool.length;
+      const ordered: Wallet[] = [];
+      for (let i = 0; i < this.signerPool.length; i += 1) {
+        ordered.push(this.signerPool[(start + i) % this.signerPool.length]);
       }
 
-      const start = this.signerIndex % this.signerPool.length;
-      for (let i = 0; i < this.signerPool.length; i += 1) {
-        const idx = (start + i) % this.signerPool.length;
-        const signer = this.signerPool[idx];
-        const authorized = await this.contracts.contextGraphs.isAuthorizedPublisher(contextGraphId, signer.address);
-        if (authorized) {
-          this.signerIndex = idx + 1;
-          return signer;
+      // Filter to on-chain authorized publishers. With no ContextGraphs
+      // surface, every operational wallet is a candidate (was: a single
+      // round-robin pick; now funding-aware over the whole pool).
+      let authorized: Wallet[];
+      if (!this.contracts.contextGraphs) {
+        authorized = ordered;
+      } else {
+        authorized = [];
+        for (const signer of ordered) {
+          if (await this.readContract(
+            this.contracts.contextGraphs, 'contextGraphs.isAuthorizedPublisher',
+            'isAuthorizedPublisher', contextGraphId, signer.address,
+          )) {
+            authorized.push(signer);
+          }
         }
       }
 
-      throw new Error(
-        `No authorized publisher wallet found in signer pool for context graph ${contextGraphId.toString()}. ` +
-        'Ensure at least one configured wallet is permitted by on-chain publish authority.',
-      );
+      if (authorized.length === 0) {
+        throw new Error(
+          `No authorized publisher wallet found in signer pool for context graph ${contextGraphId.toString()}. ` +
+          'Ensure at least one configured wallet is permitted by on-chain publish authority.',
+        );
+      }
+
+      const chosen = this.fundedWalletSelectionDisabled
+        ? authorized[0]
+        : await this.selectFundedSigner(authorized, requiredTracWei);
+
+      // Advance the cursor just past the chosen wallet so the next selection
+      // rotates — preserving cross-wallet nonce concurrency (#953) when more
+      // than one wallet is funded.
+      const chosenPoolIdx = this.signerPool.findIndex((s) => s.address === chosen.address);
+      this.signerIndex = (chosenPoolIdx >= 0 ? chosenPoolIdx : 0) + 1;
+      return chosen;
     } finally {
       releaseSelection();
     }
+  }
+
+  /**
+   * Among `authorized` wallets (already in round-robin order), return the first
+   * that is fundable (native > floor AND TRAC > floor). Balance reads are
+   * short-TTL cached, run in parallel, and FAIL OPEN (a read error / timeout
+   * counts the wallet as fundable) so a flaky RPC never blocks a publish. When
+   * none is fundable, return the best-funded wallet (max native, then max TRAC)
+   * so the publish still attempts and the contract gives the real verdict.
+   */
+  protected async selectFundedSigner(authorized: Wallet[], requiredTracWei: bigint): Promise<Wallet> {
+    const fundings = await Promise.all(authorized.map((s) => this.getWalletFunding(s.address)));
+    // Fundability is own-balance first (cheap), with a Publishing Conviction
+    // Account (PCA) fallback: a registered+covering PCA agent wallet pays the
+    // publish from its conviction account, NOT its own TRAC (the contract only
+    // `transferFrom`s the wallet on the direct-spend branch). Such a wallet
+    // legitimately holds gas + zero own-TRAC, so without this fallback the
+    // funding gate would skip it and lose the conviction discount.
+    const fundable = await Promise.all(
+      authorized.map((s, i) => this.isWalletPublishFundable(s.address, fundings[i], requiredTracWei)),
+    );
+    for (let i = 0; i < authorized.length; i += 1) {
+      if (fundable[i]) return authorized[i];
+    }
+    let bestIdx = 0;
+    for (let i = 1; i < authorized.length; i += 1) {
+      const a = fundings[i];
+      const b = fundings[bestIdx];
+      const an = a.native ?? -1n;
+      const bn = b.native ?? -1n;
+      if (an > bn || (an === bn && (a.trac ?? -1n) > (b.trac ?? -1n))) bestIdx = i;
+    }
+    return authorized[bestIdx];
+  }
+
+  /**
+   * The single fundability predicate: native gas above the floor AND own-TRAC
+   * covers the publish (above the operator floor AND `>= requiredTracWei`, the
+   * publish cost — `0n` when the cost is unknown, so only the floor applies), OR
+   * the wallet is a registered, covering PCA agent (publish paid from its
+   * conviction account, not its own TRAC). A `null` metric (read failed / no
+   * token contract) is treated as satisfied so selection FAILS OPEN. The PCA
+   * conviction reads run only when own-TRAC is short, so a normally funded
+   * wallet pays no extra RPC.
+   */
+  protected async isWalletPublishFundable(
+    address: string,
+    f: { native: bigint | null; trac: bigint | null },
+    requiredTracWei: bigint,
+  ): Promise<boolean> {
+    const nativeOk = f.native === null || f.native > this.minPublisherNativeWei;
+    if (!nativeOk) return false; // even a PCA agent needs gas
+    const ownTracOk = f.trac === null
+      || (f.trac > this.minPublisherTracWei && f.trac >= requiredTracWei);
+    if (ownTracOk) return true;
+    return this.isConvictionFundedAgent(address, requiredTracWei);
+  }
+
+  /**
+   * True iff `address` is a registered Publishing Conviction Account agent whose
+   * account can cover a publish costing `requiredCostWei` — i.e. it can publish
+   * without holding its own TRAC. A `0n`/unknown cost falls back to a `1n`
+   * liveness probe (account exists, not expired, has allowance). Cheap-exit when
+   * the PCA NFT is not deployed; best-effort otherwise (any read failure ⇒
+   * false, so the wallet then relies on its own-TRAC gate rather than being
+   * optimistically selected and reverting). NOTE: with the `1n` liveness probe
+   * (cost unknown), a tiny consent-free "squat" PCA (RFC-001 §3.6) whose
+   * allowance rounds up to ≥1 wei but cannot cover a real publish can still pass;
+   * that is an attacker-induced edge that degrades to a single retry, not a fund
+   * loss. When the real cost is threaded (the createKnowledgeAssets paths) the
+   * probe prices the actual publish and rejects such squats.
+   */
+  protected async isConvictionFundedAgent(address: string, requiredCostWei: bigint): Promise<boolean> {
+    if (!this.contracts.dkgPublishingConvictionNFT) return false;
+    // Typed against the shared ConvictionReader interface that ConvictionMethods
+    // `implements`, so a rename/signature change in the mixin is a compile error.
+    const conv = this as unknown as ConvictionReader;
+    try {
+      const accountId = await withTimeout(
+        conv.getConvictionAgentAccountId(address),
+        RPC_READ_STALL_TIMEOUT_MS,
+        'pca agent account lookup',
+      );
+      if (accountId <= 0n) return false;
+      return await withTimeout(
+        conv.convictionAccountCanCover(accountId, requiredCostWei > 0n ? requiredCostWei : 1n),
+        RPC_READ_STALL_TIMEOUT_MS,
+        'pca account coverage probe',
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Best-effort native + TRAC balance read for one operational wallet, cached
+   * for `PUBLISHER_FUNDING_CACHE_TTL_MS`. A read failure / timeout yields
+   * `null` for that metric (callers fail open). `forceRefresh` bypasses and
+   * warms the cache (used on the error-enrichment path).
+   */
+  protected async getWalletFunding(
+    address: string,
+    opts?: { forceRefresh?: boolean },
+  ): Promise<{ native: bigint | null; trac: bigint | null }> {
+    const key = address.toLowerCase();
+    const now = Date.now();
+    if (!opts?.forceRefresh) {
+      const cached = this.fundingCache.get(key);
+      if (cached && now - cached.ts < PUBLISHER_FUNDING_CACHE_TTL_MS) {
+        return { native: cached.native, trac: cached.trac };
+      }
+    }
+    const [native, trac] = await Promise.all([
+      this.readNativeBalance(address),
+      this.readTracBalance(address),
+    ]);
+    this.fundingCache.set(key, { native, trac, ts: now });
+    return { native, trac };
+  }
+
+  private async readNativeBalance(address: string): Promise<bigint | null> {
+    try {
+      return await this.readProvider(
+        'publish wallet native balance',
+        (p) => p.getBalance(address),
+        // Fail-open funding read: keep a HARD per-attempt cap even on the
+        // last / single provider so a hung RPC can't stall wallet selection.
+        { policy: 'failOpenFundingRead' },
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  private async readTracBalance(address: string): Promise<bigint | null> {
+    const token = this.contracts.token;
+    if (!token) return null; // no token contract: TRAC does not gate selection
+    try {
+      return (await this.readContractWith(
+        token, 'token.balanceOf', (c) => c.balanceOf(address),
+        { policy: 'failOpenFundingRead' },
+      )) as bigint;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Snapshot native+TRAC balances for every operational wallet (best-effort,
+   *  force-refreshed) for the no-funded-wallet diagnostic. */
+  protected async snapshotPublisherWalletBalances(): Promise<PublisherWalletBalance[]> {
+    return Promise.all(
+      this.signerPool.map(async (s) => {
+        const f = await this.getWalletFunding(s.address, { forceRefresh: true });
+        return { address: s.address, nativeWei: f.native, tracWei: f.trac };
+      }),
+    );
+  }
+
+  /**
+   * If `err` is (or looks like) an insufficient-funds publish failure on
+   * `signer`, replace it with an actionable {@link InsufficientPublisherFundsError}
+   * carrying every operational wallet's balances; otherwise return `err`
+   * unchanged. Best-effort — never lets the enrichment mask the original error.
+   */
+  protected async enrichInsufficientPublisherFundsError(
+    err: unknown,
+    signer: Wallet,
+    contextGraphId: bigint,
+    requiredTracWei: bigint = 0n,
+  ): Promise<unknown> {
+    try {
+      let selectedShort = isInsufficientFundsError(err);
+      if (!selectedShort && this.looksLikeFundsRevert(err)) {
+        // A TRAC shortfall surfaces as a token transferFrom revert (not an
+        // "insufficient funds" string). looksLikeFundsRevert is restricted to
+        // funds-SHAPED reverts (not any CALL_EXCEPTION), so an unrelated contract
+        // revert is never re-read as a funds problem. Reuse the SINGLE
+        // isWalletPublishFundable predicate so selection and enrichment can't
+        // drift on the funding rules.
+        const f = await this.getWalletFunding(signer.address, { forceRefresh: true });
+        selectedShort = !(await this.isWalletPublishFundable(signer.address, f, requiredTracWei));
+      }
+      // Only emit NO_FUNDED_PUBLISHER_WALLET — which asserts the WHOLE pool is
+      // unfunded and maps downstream to a TERMINAL insufficient_funds failure —
+      // when no wallet AUTHORIZED for this context graph can fund the cost. If the
+      // selected wallet was short but another authorized wallet could cover it (a
+      // cost-blind pre-pin, an explicit pinned address, or a stale cached
+      // balance), preserve the original error so a retry can reroute to that
+      // wallet instead of being told no wallet is funded.
+      if (selectedShort && !(await this.poolHasFundableSigner(contextGraphId, requiredTracWei))) {
+        const balances = await this.snapshotPublisherWalletBalances();
+        return new InsufficientPublisherFundsError(
+          formatNoFundedPublisherWalletMessage(balances),
+          balances,
+          { cause: err },
+        );
+      }
+    } catch {
+      /* never let enrichment mask the original failure */
+    }
+    return err;
+  }
+
+  /**
+   * True iff some operational wallet AUTHORIZED for `contextGraphId` is fundable
+   * for a publish costing `requiredTracWei` (own balance above floor+cost, or a
+   * covering PCA agent). Only an authorized+funded wallet is a viable reroute, so
+   * a funded-but-unauthorized wallet does NOT suppress NO_FUNDED. Used to
+   * distinguish a whole-pool funding problem (→ NO_FUNDED, terminal) from the
+   * selected wallet merely being the wrong, recoverable pick. Cached reads;
+   * fail-open per wallet.
+   */
+  protected async poolHasFundableSigner(contextGraphId: bigint, requiredTracWei: bigint): Promise<boolean> {
+    const contextGraphs = this.contracts.contextGraphs;
+    const checks = await Promise.all(
+      this.signerPool.map(async (s) => {
+        // No ContextGraphs surface ⇒ every operational wallet is a candidate
+        // (mirrors nextAuthorizedSigner); otherwise only authorized wallets are
+        // viable reroutes.
+        if (contextGraphs && !(await this.readContract(
+          contextGraphs, 'contextGraphs.isAuthorizedPublisher',
+          'isAuthorizedPublisher', contextGraphId, s.address,
+        ))) return false;
+        return this.isWalletPublishFundable(s.address, await this.getWalletFunding(s.address), requiredTracWei);
+      }),
+    );
+    return checks.some(Boolean);
+  }
+
+  /**
+   * True iff `err` is a FUNDS-SHAPED chain revert (a TRAC transfer / allowance
+   * shortfall) worth a balance re-read in {@link enrichInsufficientPublisherFundsError}.
+   * Deliberately NOT every `CALL_EXCEPTION` / "execution reverted" — a generic
+   * contract revert (e.g. an InvalidAuthorAttestation) must never be re-read and
+   * masked as an insufficient-funds error. Also excludes our own control-flow
+   * sentinels (null/dropped receipt, write-ahead-hook failure).
+   */
+  protected looksLikeFundsRevert(err: unknown): boolean {
+    const msg = errorMessage(err).toLowerCase();
+    if (/receipt is null|receipt was null|replaced or dropped|write-?ahead/.test(msg)) {
+      return false;
+    }
+    return /transfer amount exceeds balance|erc20insufficientbalance|insufficient allowance|toolowallowance|insufficient funds/.test(msg);
   }
 
   /** All operational wallet addresses (for display / funding). */
@@ -904,10 +1596,9 @@ export class EVMChainAdapterBase {
     identityId: bigint,
     address: string,
   ): Promise<boolean> {
-    return identityStorage.keyHasPurpose(
-      identityId,
-      this.walletKeyHash(address),
-      ADMIN_KEY_PURPOSE,
+    return this.readContract(
+      identityStorage, 'identityStorage.keyHasPurpose',
+      'keyHasPurpose', identityId, this.walletKeyHash(address), ADMIN_KEY_PURPOSE,
     );
   }
 
@@ -916,10 +1607,9 @@ export class EVMChainAdapterBase {
     identityId: bigint,
     address: string,
   ): Promise<boolean> {
-    return identityStorage.keyHasPurpose(
-      identityId,
-      this.walletKeyHash(address),
-      OPERATIONAL_KEY_PURPOSE,
+    return this.readContract(
+      identityStorage, 'identityStorage.keyHasPurpose',
+      'keyHasPurpose', identityId, this.walletKeyHash(address), OPERATIONAL_KEY_PURPOSE,
     );
   }
 
@@ -932,7 +1622,12 @@ export class EVMChainAdapterBase {
   protected async resolveContract(name: string, abiName?: string): Promise<Contract> {
     let address: string;
     try {
-      address = await this.contracts.hub.getContractAddress(name);
+      address = await this.readContract(
+        this.contracts.hub,
+        `Hub.getContractAddress(${name})`,
+        'getContractAddress',
+        name,
+      );
     } catch (err) {
       if (this.isContractMissingRevert(err)) {
         throw new Error(`Contract "${name}" not found in Hub at ${this.hubAddress}`, { cause: err });
@@ -948,7 +1643,12 @@ export class EVMChainAdapterBase {
   protected async resolveAssetStorage(name: string, abiName?: string): Promise<Contract> {
     let address: string;
     try {
-      address = await this.contracts.hub.getAssetStorageAddress(name);
+      address = await this.readContract(
+        this.contracts.hub,
+        `Hub.getAssetStorageAddress(${name})`,
+        'getAssetStorageAddress',
+        name,
+      );
     } catch (err) {
       if (this.isContractMissingRevert(err)) {
         throw new Error(`Asset storage "${name}" not found in Hub at ${this.hubAddress}`, { cause: err });
@@ -991,13 +1691,11 @@ export class EVMChainAdapterBase {
       // non-RPC error (e.g. a genuine "contract not in Hub" misconfig) keeps
       // its original shape.
       if (isRetryableRpcError(err)) {
-        const wrapped = new Error(
-          `chain initialisation failed on all configured RPC endpoints (${this.rpcUrls.join(', ')}): ${errorMessage(err)}`,
-          { cause: err },
+        throw new ChainRpcTransportError(
+          'RPC_ENDPOINTS_EXHAUSTED',
+          `chain initialisation failed on all configured RPC endpoints (${this.rpcUrls.map(rpcHost).join(', ')}): ${errorMessage(err)}`,
+          { cause: err, rpcUrls: this.rpcUrls },
         );
-        (wrapped as any).code = 'RPC_ENDPOINTS_EXHAUSTED';
-        (wrapped as any).rpcUrls = [...this.rpcUrls];
-        throw wrapped;
       }
       throw err;
     }
@@ -1093,7 +1791,12 @@ export class EVMChainAdapterBase {
 
     await this.startHubRotationListener();
 
-    const tokenAddress: string = this.tokenAddress ?? await this.contracts.hub.getContractAddress('Token');
+    const tokenAddress: string = this.tokenAddress ?? await this.readContract(
+      this.contracts.hub,
+      'Hub.getContractAddress(Token)',
+      'getContractAddress',
+      'Token',
+    );
     if (tokenAddress !== ethers.ZeroAddress) {
       this.contracts.token = new Contract(
         tokenAddress,
@@ -1119,7 +1822,7 @@ export class EVMChainAdapterBase {
   }
 
   protected async getBlockTimestamp(blockNumber: number): Promise<number> {
-    const block = await this.provider.getBlock(blockNumber);
+    const block = await this.readProvider('getBlock', (p) => p.getBlock(blockNumber));
     return block?.timestamp ?? 0;
   }
 
@@ -1130,7 +1833,9 @@ export class EVMChainAdapterBase {
   async getIdentityId(): Promise<bigint> {
     await this.init();
     const identityStorage = await this.getIdentityStorage();
-    const id: bigint = await identityStorage.getIdentityId(this.signer.address);
+    const id: bigint = await this.readContract(
+      identityStorage, 'identityStorage.getIdentityId', 'getIdentityId', this.signer.address,
+    );
     return id;
   }
 
@@ -1147,33 +1852,490 @@ export class EVMChainAdapterBase {
 
   /**
    * OT-RFC-43 Option 1 — highest per-author KA `number` already minted on chain,
-   * or `-1n` if `author` never minted. Enumerates `KnowledgeAssetCreated(id,
-   * author, ...)` logs filtered by the indexed `author` topic and returns
-   * `max(id & ((1<<96)-1))`. Backs the allocator's cold-start reconciliation so
-   * a stale-local-DB / fresh device never re-hands a burned `(author, number)`.
+   * or `-1n` if `author` never minted. Backs the allocator's cold-start
+   * reconciliation so a stale-local-DB / fresh device never re-hands a burned
+   * `(author, number)`.
+   *
+   * Resolution order:
+   *   1. `DKGKnowledgeAssets >= 10.0.4` exposes the O(1)
+   *      `getMaxKaNumberForAuthor(address) -> int256` view — a single `eth_call`.
+   *   2. Pre-10.0.4 deployments do not have that selector, so they fall back to
+   *      a paginated `KnowledgeAssetCreated(id, author)` scan ANCHORED at the
+   *      contract's deploy block. The original `queryFilter(filter, 0)` scanned
+   *      `[0, latest]` in one RPC call and hit provider block-range caps (#1080);
+   *      a naive from-genesis paginated scan is ~21k calls under a 2,000-block
+   *      cap (e.g. Base Sepolia), so we start at the deploy block instead.
+   *
+   * An absent selector surfaces in two provider-dependent shapes: `BAD_DATA`
+   * (empty `value="0x"`) on some RPCs, or `CALL_EXCEPTION` / "missing revert
+   * data" on others (Base Sepolia). The former is unambiguous; the latter is
+   * ambiguous with a genuine bare revert, so we only fall back for it once a
+   * deployed-bytecode probe confirms the selector is genuinely missing —
+   * otherwise the view exists and reverted for real, and we rethrow. Transient
+   * RPC failures and decoded reverts are always rethrown, never hidden behind a
+   * historical crawl. Empty selector-call responses only reach the scan after
+   * confirming bytecode exists at the resolved storage address, so a bad Hub
+   * address fails loudly instead of reconciling from empty logs.
    */
   async getMaxKaNumberForAuthor(author: string): Promise<bigint> {
+    // Re-resolve contract handles first. The Hub-rotation listener flips
+    // `initialized` to false but leaves the old bindings in place, so without
+    // this a long-lived adapter keeps querying the PRE-rotation
+    // DKGKnowledgeAssets after the 10.0.4 redeploy this getter exists for.
+    // Mirrors every other contract-reading method (e.g.
+    // getKnowledgeAssetsLifecycleAddress).
+    await this.init();
     const storage = this.contracts.knowledgeAssetStorage;
     if (!storage) {
       throw new Error('DKGKnowledgeAssets not deployed on this chain.');
     }
     const normalized = ethers.getAddress(author);
-    // KnowledgeAssetCreated(uint256 indexed id, address indexed author, ...):
-    // filter by the second indexed topic (author). fromBlock 0 — devnets are
-    // cheap; a production fromBlock = deployment block is a future optimization
-    // (there is no per-author counter view on-chain under variant 1a).
+
+    // A CALL_EXCEPTION/"missing revert data" from the view is ambiguous between
+    // "pre-10.0.4 contract lacks the selector" (→ scan) and "the view exists and
+    // bare-reverted" (→ rethrow). Defer that decision until the deployed
+    // bytecode is fetched below.
+    let bareRevert: unknown;
+    const getMax = (storage as any).getMaxKaNumberForAuthor;
+    if (typeof getMax?.staticCall === 'function') {
+      try {
+        // Route through `readProvider` (which gives the per-attempt stall
+        // timeout + endpoint failover for free) with a CUSTOM classifier: the
+        // absent-view shapes (`BAD_DATA` empty-`0x`, bare `CALL_EXCEPTION`) are
+        // DETERMINISTIC across endpoints and mean "pre-10.0.4 contract lacks the
+        // selector", so they are NON-retryable here — `readProvider` rethrows
+        // them straight to the catch below (→ scan / bytecode-confirm) instead of
+        // failing over and masking them as `RPC_ENDPOINTS_EXHAUSTED`. ONLY a
+        // genuine transient advances to the next endpoint. `isKaHighWaterViewUnavailable`
+        // runs FIRST (it enriches the error) so the ordering invariant the catch
+        // below also relies on is preserved.
+        const max = await this.readProvider(
+          'DKGKnowledgeAssets.getMaxKaNumberForAuthor',
+          (p) => this.rebindContract(storage, p).getMaxKaNumberForAuthor.staticCall(normalized),
+          {
+            isRetryable: (err) =>
+              isRetryableRpcError(err)
+              && !isKaHighWaterViewUnavailable(err)
+              && !isKaHighWaterBareRevert(err),
+          },
+        );
+        return BigInt(max);
+      } catch (err) {
+        if (isKaHighWaterViewUnavailable(err)) {
+          // Unambiguous absent-view shape → fall through to the bounded scan.
+        } else if (isKaHighWaterBareRevert(err)) {
+          bareRevert = err; // confirm against the deployed bytecode below
+        } else {
+          throw err; // transient exhaustion / decoded revert → never crawl
+        }
+      }
+    }
+
+    const storageAddress = await contractAddress(storage);
+    const code = await this.readProvider(
+      'DKGKnowledgeAssets getCode',
+      (p) => p.getCode(storageAddress),
+    );
+    if (!code || code === '0x') {
+      throw new Error(`DKGKnowledgeAssets resolved to ${storageAddress}, but no contract code is deployed there.`);
+    }
+
+    // A bare revert is only "view absent" when the selector is genuinely missing
+    // from the deployed bytecode; if it IS present the view exists and the
+    // revert was real, so rethrow rather than mask it behind a log crawl.
+    if (bareRevert !== undefined && kaHighWaterViewSelectorInCode(storage, code)) {
+      throw bareRevert;
+    }
+
+    // `fromBlock`, `head` and the candidate `scanProviders` come together so the
+    // range is consistent (head is the freshest backend's tip) AND each page is
+    // crawled on a backend whose tip covers it (querying a lagging backend for
+    // blocks above its tip can reject the range or silently truncate it).
+    const { fromBlock, head, scanProviders } = await this.resolveKaStorageDeployBlock(storageAddress);
+    const pageSize = this.kaHighWaterScanPageSize; // default 2,000 = smallest common eth_getLogs cap
+    const pages = Math.ceil((head - fromBlock + 1) / pageSize);
+    if (pages > KA_HIGH_WATER_MAX_SCAN_PAGES) {
+      throw new Error(
+        `getMaxKaNumberForAuthor: the pre-10.0.4 KnowledgeAssetCreated fallback ` +
+          `would need ${pages} eth_getLogs calls over blocks [${fromBlock}, ${head}] at a ` +
+          `${pageSize}-block window (budget ${KA_HIGH_WATER_MAX_SCAN_PAGES} pages). The deployed ` +
+          `DKGKnowledgeAssets (${storageAddress}) lacks the O(1) getMaxKaNumberForAuthor view. ` +
+          `Remediations: use an archive RPC that serves historical eth_getCode so the scan ` +
+          `anchors at the deploy block${fromBlock === 0 ? ' (it fell back to genesis here)' : ''}, ` +
+          `or deploy DKGKnowledgeAssets >= 10.0.4 to remove the scan entirely (a single eth_call).`,
+      );
+    }
+
     const filter = storage.filters.KnowledgeAssetCreated(null, normalized);
-    const logs = await storage.queryFilter(filter, 0);
-    const MASK = (1n << 96n) - 1n;
+    const connected = new Map<JsonRpcProvider, Contract>();
+    const mask = (1n << 96n) - 1n;
     let max = -1n;
-    for (const log of logs) {
-      const args = (log as ethers.EventLog).args;
-      const rawId = args?.id ?? args?.[0];
-      if (rawId === undefined || rawId === null) continue;
-      const num = BigInt(rawId) & MASK;
-      if (num > max) max = num;
+    // Sticky preferred backend: the one that served the previous page. It is tried
+    // first for the next page (when it still covers it), so a backend that hung on
+    // an earlier page (and was failed-over past) doesn't sit at the front of the
+    // line re-stalling every subsequent page on its full timeout.
+    let preferred: JsonRpcProvider | undefined;
+    for (let lo = fromBlock; lo <= head; lo += pageSize) {
+      const hi = Math.min(lo + pageSize - 1, head);
+      const { logs, provider } = await this.queryKaCreatedPage(
+        storage,
+        filter,
+        lo,
+        hi,
+        scanProviders,
+        connected,
+        preferred,
+      );
+      preferred = provider;
+      for (const log of logs) {
+        const args = (log as ethers.EventLog).args;
+        const rawId = args?.id ?? args?.[0];
+        if (rawId === undefined || rawId === null) continue;
+        const num = BigInt(rawId) & mask;
+        if (num > max) max = num;
+      }
     }
     return max;
+  }
+
+  /**
+   * Query one `[lo, hi]` page of `KnowledgeAssetCreated` logs, trying each
+   * reachable backend whose tip COVERS the page (`backendHead >= hi`) — the
+   * sticky `preferred` backend first (when it still covers the page), then the
+   * rest freshest-first — and failing over to the next eligible backend on error.
+   * This keeps FallbackProvider-style resilience for the scan while never asking a
+   * backend for blocks above its own tip (which some nodes reject and others
+   * silently truncate). The freshest backend always covers the page (`hi <= head`
+   * = its tip), so there is always at least one candidate.
+   *
+   * Each attempt is bounded by `KA_HIGH_WATER_PAGE_TIMEOUT_MS` so a hung backend
+   * fails over after a bounded wait instead of stalling the whole scan; the
+   * serving backend is returned so the caller can stick to it for the next page.
+   */
+  private async queryKaCreatedPage(
+    storage: Contract,
+    filter: unknown,
+    lo: number,
+    hi: number,
+    scanProviders: ReadonlyArray<ScanProvider>,
+    connected: Map<JsonRpcProvider, Contract>,
+    preferred?: JsonRpcProvider,
+  ): Promise<{ logs: ReadonlyArray<ethers.EventLog | ethers.Log>; provider: JsonRpcProvider }> {
+    return this.queryEventLogsPage(
+      storage,
+      filter,
+      lo,
+      hi,
+      scanProviders,
+      connected,
+      'getMaxKaNumberForAuthor KnowledgeAssetCreated',
+      preferred,
+    );
+  }
+
+  protected async queryEventLogsPage(
+    baseContract: Contract,
+    filter: unknown,
+    lo: number,
+    hi: number,
+    scanProviders: ReadonlyArray<ScanProvider>,
+    connected: Map<JsonRpcProvider, Contract>,
+    label: string,
+    preferred?: JsonRpcProvider,
+  ): Promise<{ logs: ReadonlyArray<ethers.EventLog | ethers.Log>; provider: JsonRpcProvider }> {
+    return withSpan(
+      'chain.eth_getLogs',
+      async (span) => {
+        const metrics = getMetrics();
+        const startedAt = Date.now();
+        // Eligible backends (tip covers the page), with the sticky preferred one moved
+        // to the front when it still qualifies; the remainder keep their freshest-first
+        // order from `scanProviders`.
+        const eligible = scanProviders.filter(({ backendHead }) => backendHead >= hi);
+        const ordered =
+          preferred && eligible.some(({ provider }) => provider === preferred)
+            ? [
+                ...eligible.filter(({ provider }) => provider === preferred),
+                ...eligible.filter(({ provider }) => provider !== preferred),
+              ]
+            : eligible;
+        let pageError: unknown;
+        for (const { provider } of ordered) {
+          let contract = connected.get(provider);
+          if (!contract) {
+            contract = baseContract.connect(provider) as Contract;
+            connected.set(provider, contract);
+          }
+          try {
+            const logs = await withTimeout(
+              contract.queryFilter(filter as any, lo, hi),
+              KA_HIGH_WATER_PAGE_TIMEOUT_MS,
+              `${label} getLogs [${lo}, ${hi}]`,
+            );
+            metrics.chainRpcTotal.add(1, {
+              rpc_method: 'eth_getLogs', outcome: 'ok', retryable: false, chain_id: this.chainId,
+            });
+            metrics.chainRpcDuration.record(Date.now() - startedAt, {
+              rpc_method: 'eth_getLogs', chain_id: this.chainId,
+            });
+            return { logs, provider };
+          } catch (err) {
+            pageError = err; // hung or errored — fail over to the next eligible backend
+          }
+        }
+        // Every eligible backend failed for this page → one error/timeout outcome.
+        const outcome = pageError ? this._rpcOutcomeForError(pageError) : 'error';
+        metrics.chainRpcTotal.add(1, {
+          rpc_method: 'eth_getLogs', outcome, retryable: isRetryableRpcError(pageError), chain_id: this.chainId,
+        });
+        metrics.chainRpcDuration.record(Date.now() - startedAt, {
+          rpc_method: 'eth_getLogs', chain_id: this.chainId,
+        });
+        throw new Error(
+          `${label}: no configured RPC could serve the log range [${lo}, ${hi}]` +
+            `${pageError ? `: ${errorMessage(pageError)}` : ''}.`,
+          pageError ? { cause: pageError } : undefined,
+        );
+      },
+      {
+        attributes: {
+          'rpc.method': 'eth_getLogs', 'dkg.chain_id': this.chainId,
+          'dkg.block_lo': lo, 'dkg.block_hi': hi,
+        },
+      },
+    );
+  }
+
+  /**
+   * Resolve the pre-10.0.4 KnowledgeAssetCreated fallback's scan range — the
+   * contract's deploy block (`fromBlock`, so the scan starts at the contract's
+   * birth instead of genesis) and the chain `head` — returned together so the
+   * caller's `[fromBlock, head]` is internally consistent (a separately-read head
+   * could be a lagging backend BELOW the deploy block, yielding an empty range
+   * and a wrong `-1n`).
+   *
+   * `head` is the FRESHEST block number across all reachable backends, so the
+   * scan never stops at a slightly-stale backend and under-reports the current
+   * max (which would re-hand a burned `(author, number)`). The deploy block is
+   * immutable, so pairing it with the max head is safe.
+   *
+   * The deploy block is cached (immutable per address); otherwise it is binary-
+   * searched on a backend that serves historical getCode, with each backend's
+   * search pinned to ITS OWN head (a quorum-1 `FallbackProvider` could otherwise
+   * mix block-number and getCode across backends and cache a stale head as the
+   * "deploy block"). We fail over across backends, so a pruned/lagging endpoint
+   * yields to a healthier archive secondary.
+   *
+   * If NO backend can pin the deploy block we DEGRADE to block 0 — the safe lower
+   * bound (`<= deploy`, so the scan never misses an event), bounded by the page
+   * budget — rather than hard-failing (pruned nodes still serve `queryFilter`).
+   * The degraded `0` is NOT cached. A real outage / auth / timeout (not a
+   * historical-state-unavailable shape) on every backend is RETHROWN, not masked
+   * as a pre-10.0.4 fallback (see `isHistoricalStateUnavailable`).
+   */
+  protected async resolveKaStorageDeployBlock(
+    address: string,
+  ): Promise<{
+    fromBlock: number;
+    head: number;
+    scanProviders: ReadonlyArray<ScanProvider>;
+  }> {
+    return this.resolveContractDeployBlock(
+      address,
+      'getMaxKaNumberForAuthor',
+      'DKGKnowledgeAssets',
+    );
+  }
+
+  protected async resolveLogScanHead(
+    operationLabel: string,
+  ): Promise<{
+    head: number;
+    scanProviders: ReadonlyArray<ScanProvider>;
+  }> {
+    let probeError: unknown;
+    const reachable: ScanProvider[] = [];
+    for (const provider of this.providers) {
+      try {
+        const backendHead = await withTimeout(
+          provider.getBlockNumber(),
+          RPC_READ_STALL_TIMEOUT_MS,
+          `${operationLabel} backend head probe`,
+        );
+        reachable.push({ provider, backendHead });
+      } catch (err) {
+        if (!isHistoricalStateUnavailable(err)) probeError = err;
+      }
+    }
+    if (reachable.length === 0) {
+      if (probeError !== undefined) throw probeError;
+      throw new Error(`${operationLabel}: no RPC backend returned a block number to anchor the log scan.`);
+    }
+    reachable.sort((a, b) => b.backendHead - a.backendHead);
+    return { head: reachable[0].backendHead, scanProviders: reachable };
+  }
+
+  protected async resolveContractDeployBlock(
+    address: string,
+    operationLabel: string,
+    contractLabel: string,
+  ): Promise<{
+    fromBlock: number;
+    head: number;
+    scanProviders: ReadonlyArray<ScanProvider>;
+    degradedFromGenesis?: boolean;
+  }> {
+    // 1. Probe every reachable backend for its head; order freshest-first. A
+    //    head-probe failure on an UNREACHABLE backend is kept separate — it only
+    //    matters when NO backend is reachable at all; it must NOT force a throw
+    //    when a reachable (e.g. pruned) backend could still degrade to the scan.
+    let probeError: unknown;
+    const reachable: ScanProvider[] = [];
+    for (const provider of this.providers) {
+      try {
+        // Bound the probe: these are direct per-backend reads (not via the
+        // FallbackProvider), so without a timeout a hung `getBlockNumber()` would
+        // stall the whole resolution instead of failing over. A stall rejects and
+        // is treated like any other unreachable-backend error below.
+        const backendHead = await withTimeout(
+          provider.getBlockNumber(),
+          RPC_READ_STALL_TIMEOUT_MS,
+          `${operationLabel} backend head probe`,
+        );
+        reachable.push({ provider, backendHead });
+      } catch (err) {
+        if (!isHistoricalStateUnavailable(err)) probeError = err;
+      }
+    }
+    if (reachable.length === 0) {
+      if (probeError !== undefined) throw probeError;
+      throw new Error(`${operationLabel}: no RPC backend returned a block number to anchor the log scan.`);
+    }
+    reachable.sort((a, b) => b.backendHead - a.backendHead);
+    // `head` is the FRESHEST backend's tip. The caller crawls each page on the
+    // freshest backend whose tip COVERS that page (with failover), so it never
+    // queries blocks above a backend's own tip. The deploy block is immutable, so
+    // pairing it with this head is safe even when a different (archive) backend
+    // resolves it below.
+    const head = reachable[0].backendHead;
+
+    // 2. Deploy block (immutable): cache hit, else binary-search a backend that
+    //    serves historical getCode — each search uses ITS OWN head (self-
+    //    consistent); fail over across backends, freshest-first.
+    const cacheKey = address.toLowerCase();
+    const cached = this.cachedContractDeployBlocks.get(cacheKey);
+    if (cached !== undefined) return { fromBlock: cached, head, scanProviders: reachable };
+    let throttle: unknown; // a transient rate-limit/throttle seen during the search
+    const throttledProviders = new Set<JsonRpcProvider>();
+    for (const { provider: searchProvider, backendHead } of reachable) {
+      try {
+        // Verify code at this backend's head before searching it; a head BEFORE
+        // deploy on this backend is skipped (would otherwise cache a stale value).
+        if ((await this.getContractCodeAtBlock(
+          searchProvider,
+          address,
+          backendHead,
+          operationLabel,
+          contractLabel,
+        )) === '0x') {
+          continue;
+        }
+        let lo = 0;
+        let hi = backendHead;
+        while (lo < hi) {
+          const mid = lo + Math.floor((hi - lo) / 2);
+          const codeAtMid = await this.getContractCodeAtBlock(
+            searchProvider,
+            address,
+            mid,
+            operationLabel,
+            contractLabel,
+          );
+          if (codeAtMid !== '0x') hi = mid;
+          else lo = mid + 1;
+        }
+        this.cachedContractDeployBlocks.set(cacheKey, lo);
+        // Drop any backend that throttled earlier in this search from the scan too
+        // (same rationale as the degraded path below — a throttled endpoint must not
+        // be re-queried by the log scan). The backend that just pinned the deploy
+        // block isn't throttled, so this is always non-empty.
+        return { fromBlock: lo, head, scanProviders: reachable.filter((r) => !throttledProviders.has(r.provider)) };
+      } catch (err) {
+        // Always fail over to the next backend FIRST (a healthy archive can still
+        // pin the deploy block even if this one is denied/pruned/flaky). Track a
+        // transient throttle per-backend: re-querying that endpoint in the scan
+        // would only worsen its throttle, so it is dropped from the scan providers
+        // below. Everything else — pruned state, a STATIC access/plan/archive
+        // denial, a transient timeout/503, a hard 401 — is just dropped: the deploy
+        // anchor is a scan-range optimization, not a liveness gate, and the genesis
+        // scan still computes the answer on a non-archive backend (it needs no
+        // archive state) or surfaces a total outage.
+        if (isTransientThrottle(err)) {
+          throttle = err;
+          throttledProviders.add(searchProvider);
+        }
+      }
+    }
+    // No backend pinned the deploy block. Degrade to the genesis-anchored scan on
+    // the NON-throttled backends: dropping a throttled endpoint keeps the scan from
+    // worsening its throttle, while a healthy / non-archive backend still serves
+    // `eth_getLogs` (the scan needs no archive state) and computes the high-water
+    // mark — so one throttled archive must not abort a publish another backend can
+    // complete. `head` stays the FRESHEST tip (never lowered to a stale backend),
+    // so the scan can't under-report by skipping recent blocks: a page only a
+    // dropped backend could cover instead surfaces via `queryKaCreatedPage`. Only if
+    // EVERY reachable backend was throttled — nothing left to scan — do we surface
+    // the throttle. A genuine total outage on the remaining backends is likewise
+    // surfaced by the scan (page-1 throw with cause). The degraded `0` is not cached.
+    const scanProviders = reachable.filter((r) => !throttledProviders.has(r.provider));
+    if (scanProviders.length === 0) throw throttle;
+    return { fromBlock: 0, head, scanProviders, degradedFromGenesis: true };
+  }
+
+  /**
+   * `eth_getCode(address, block)` on a SPECIFIC `provider` (pinned to one backend
+   * for the deploy-block search), normalised to `'0x'` when there is genuinely no
+   * code, with a small retry so a transient blip is not misread as "no code"
+   * (which would anchor the scan too high). A persistent failure throws a wrapped
+   * error carrying the contract/block context, with the ORIGINAL error preserved
+   * as `cause` so `resolveKaStorageDeployBlock` (and operators) can classify and
+   * diagnose it — degrade only for historical-state-unavailable, surface real
+   * outages/auth/timeouts.
+   */
+  private async getContractCodeAtBlock(
+    provider: JsonRpcProvider,
+    address: string,
+    block: number,
+    operationLabel: string,
+    contractLabel: string,
+  ): Promise<string> {
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        // Bound each attempt: this is a direct per-backend read (the deploy-block
+        // search is pinned to one backend, so it bypasses the FallbackProvider's
+        // own stall timeout). Without this, a hung `getCode` would block the search
+        // forever instead of failing over to the next backend; a stall rejects and
+        // is retried, then surfaced as the wrapped failure below. `getCode` is a
+        // light single-block state lookup, so the adapter-wide read-stall bound
+        // fits (the heavier getLogs scan page gets the larger
+        // `KA_HIGH_WATER_PAGE_TIMEOUT_MS`); the 3 attempts also absorb a transient
+        // blip before failing over.
+        const code = await withTimeout(
+          provider.getCode(address, block),
+          RPC_READ_STALL_TIMEOUT_MS,
+          `${operationLabel} eth_getCode at block ${block}`,
+        );
+        return code && code !== '0x' ? code : '0x';
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    throw new Error(
+      `${operationLabel}: eth_getCode for ${contractLabel} ${address} at block ${block} ` +
+        `failed after 3 attempts: ${errorMessage(lastErr)}`,
+      { cause: lastErr },
+    );
   }
 
   async getKnowledgeAssetsLifecycleAddress(): Promise<string> {
@@ -1204,7 +2366,7 @@ export class EVMChainAdapterBase {
     if (EVMChainAdapterBase.preflightCacheFresh(this.cachedChainId, now)) {
       return this.cachedChainId!.value;
     }
-    const network = await this.provider.getNetwork();
+    const network = await this.readProvider('getNetwork (chainId)', (p) => p.getNetwork());
     this.cachedChainId = { value: network.chainId, cachedAt: now };
     return network.chainId;
   }
@@ -1221,7 +2383,7 @@ export class EVMChainAdapterBase {
    */
   async hasContractCode(address: string): Promise<boolean> {
     try {
-      const code = await this.provider.getCode(address);
+      const code = await this.readProvider('hasContractCode getCode', (p) => p.getCode(address));
       return code !== undefined && code !== null && code !== '0x' && code.length > 2;
     } catch {
       return false;
@@ -1263,9 +2425,9 @@ export class EVMChainAdapterBase {
         );
       }
       if (this.contracts.contextGraphs) {
-        const authorized = await this.contracts.contextGraphs.isAuthorizedPublisher(
-          params.contextGraphId,
-          selected.address,
+        const authorized = await this.readContract(
+          this.contracts.contextGraphs, 'contextGraphs.isAuthorizedPublisher',
+          'isAuthorizedPublisher', params.contextGraphId, selected.address,
         );
         if (!authorized) {
           throw new Error(
@@ -1276,7 +2438,13 @@ export class EVMChainAdapterBase {
       }
       txSigner = selected;
     } else {
-      txSigner = await this.nextAuthorizedSigner(params.contextGraphId);
+      // No pre-pinned publisher address: select cost-aware here, where the
+      // publish `tokenAmount` IS known (unlike the publisher's pre-pin via
+      // getAuthorizedPublisherAddress, which runs before the cost is sized).
+      txSigner = await this.nextAuthorizedSigner(
+        params.contextGraphId,
+        floorPublishTokenAmount(params.tokenAmount),
+      );
     }
     const ka = this.contracts.knowledgeAssetsLifecycle.connect(txSigner) as Contract;
     const kaAddress = await ka.getAddress();
@@ -1338,38 +2506,37 @@ export class EVMChainAdapterBase {
       tokenAmount: flooredTokenAmount,
       isImmutable: params.isImmutable,
       merkleLeafCount: params.merkleLeafCount,
-      // RFC-39 Phase A.5 / LU-11 — ciphertext-commitment pair.
+      // OT-RFC-49 — curated `_catalog` commitment pair (REPLACED the stripped
+      // ciphertext-chunks pair; same on-chain PublishParams struct slot).
       //
       // The two fields MUST be set together or omitted together.
-      // - Both omitted (or root=ZeroHash + count=0) = legacy /
-      //   public-KC path: picker skips this KC in the curated draw
-      //   today (commit 8 baseline) and RFC-39 random sampling never
-      //   indexes it; safe wire-compatible default for non-chunked
-      //   callers.
-      // - Both set = LU-11 chunked publish: cores already hold the
-      //   matching per-chunk ciphertexts under
-      //   urn:dkg:swm:v10-publish-ciphertext-chunk/<batchId>/<i> and
-      //   recomputed the same root before signing the V2 ACK.
-      // Anything else is a programmer error — fail loud instead of
-      // silently defaulting one side and producing an asymmetric
-      // commitment that on-chain `_pickWeightedChallenge` would
-      // skip (count=0) or that core-side V2 verifiers would never
-      // try to satisfy (root=ZeroHash but count>0).
-      ciphertextChunksRoot: (() => {
-        const haveRoot = !!params.ciphertextChunksRoot && params.ciphertextChunksRoot.length === 32;
-        const haveCount = typeof params.ciphertextChunkCount === 'number' && params.ciphertextChunkCount > 0;
+      // - Both omitted (or root=ZeroHash + count=0) = legacy / public-KC
+      //   path: picker skips this KC in the curated draw and RFC-39 random
+      //   sampling never indexes it; safe wire-compatible default for
+      //   public callers.
+      // - Both set = curated publish: the publisher committed
+      //   `computeCatalogRoot(catalogCommittedLeaves(...))` and the cores
+      //   recomputed the same root over their locally-served `<cg>/_catalog`
+      //   before signing the ACK; the prover proves the same tree.
+      // Anything else is a programmer error — fail loud instead of silently
+      // defaulting one side and producing an asymmetric commitment that
+      // on-chain `_pickWeightedChallenge` would skip (count=0) or that the
+      // prover could never satisfy (root=ZeroHash but count>0).
+      catalogRoot: (() => {
+        const haveRoot = !!params.catalogRoot && params.catalogRoot.length === 32;
+        const haveCount = typeof params.catalogLeafCount === 'number' && params.catalogLeafCount > 0;
         if (haveRoot !== haveCount) {
           throw new Error(
-            `evm-adapter.createKnowledgeAssets: ciphertextChunksRoot and ciphertextChunkCount ` +
+            `evm-adapter.createKnowledgeAssets: catalogRoot and catalogLeafCount ` +
             `must both be set or both omitted; got root=${haveRoot ? 'set' : 'unset'}, ` +
-            `count=${haveCount ? params.ciphertextChunkCount : 'unset'}. ` +
+            `count=${haveCount ? params.catalogLeafCount : 'unset'}. ` +
             `An asymmetric pair would leave RandomSampling._pickWeightedChallenge unable to ` +
-            `verify the curated draw against off-chain ciphertext storage.`,
+            `verify the curated draw against the off-chain catalog.`,
           );
         }
-        return haveRoot ? ethers.hexlify(params.ciphertextChunksRoot!) : ethers.ZeroHash;
+        return haveRoot ? ethers.hexlify(params.catalogRoot!) : ethers.ZeroHash;
       })(),
-      ciphertextChunkCount: params.ciphertextChunkCount ?? 0,
+      catalogLeafCount: params.catalogLeafCount ?? 0,
       publisherNodeIdentityId: params.publisherNodeIdentityId,
       authorAddress: params.author.address,
       authorR: ethers.hexlify(params.author.signature.r),
@@ -1443,7 +2610,19 @@ export class EVMChainAdapterBase {
       () => {
         throw new Error('Transaction receipt is null');
       },
-    );
+    ).catch(async (err: unknown) => {
+      // Turn an insufficient-funds failure (native gas OR a zero-TRAC
+      // transferFrom revert) on the selected wallet into an actionable
+      // InsufficientPublisherFundsError listing every operational wallet's
+      // balances, so the user is told which wallet to fund instead of seeing a
+      // raw ethers "insufficient funds" string. Non-funds errors pass through.
+      throw await this.enrichInsufficientPublisherFundsError(
+        err,
+        txSigner,
+        params.contextGraphId,
+        floorPublishTokenAmount(params.tokenAmount),
+      );
+    });
 
     let kaId = 0n;
     let startKAId = 0n;
@@ -1531,14 +2710,23 @@ export class EVMChainAdapterBase {
   }
 
   async getBlockNumber(): Promise<number> {
-    return this.provider.getBlockNumber();
+    return this.readProvider('getBlockNumber', (p) => p.getBlockNumber());
   }
 
   getProvider(): JsonRpcProvider {
     return this.primaryProvider;
   }
 
-  getReadProvider(): JsonRpcProvider | FallbackProvider {
+  /**
+   * @deprecated Returns the bare PRIMARY provider, which does NOT fail over: the
+   * ethers `FallbackProvider` was removed and reads now route through the
+   * adapter's own read facades (`readContract`/`readProvider` over
+   * `this.providers[]`). Call those read methods instead, or `getProvider()` if
+   * you explicitly want the bare primary. Retained only for backward
+   * compatibility — this adapter is a
+   * published export, so removing a public method would be a breaking change.
+   */
+  getReadProvider(): JsonRpcProvider {
     return this.provider;
   }
 

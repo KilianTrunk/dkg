@@ -28,10 +28,12 @@ import {
   ensureDkgNodeConfig,
   fundWalletsBestEffort,
   logManualFundingInstructions,
+  readPersistedNetworkConfigName,
   readWallets,
   readWalletsWithRetry,
   resolveCliPackageDir,
   resolveDkgConfigHome,
+  resolveSetupNetworkName,
   startDaemon,
 } from '@origintrail-official/dkg-core';
 import type { DkgOpenClawConfig } from './types.js';
@@ -73,6 +75,13 @@ export interface SetupOptions {
    * failed call logs manual `curl` instructions and setup continues.
    */
   fund?: boolean;
+  /**
+   * Network overlay to set up on (e.g. `mainnet-gnosis`, `mainnet-base`,
+   * `testnet`). Persisted as `config.networkConfig`. When omitted, a fresh
+   * node defaults to mainnet-gnosis and an existing node keeps its current
+   * network — see `resolveSetupNetworkName`.
+   */
+  network?: string;
   /**
    * Abort signal for cooperative cancellation. Checked at each step boundary
    * so an aborted job stops between steps without further filesystem writes
@@ -313,10 +322,11 @@ function readPersistedAgentName(): string | undefined {
 // `resolveCliPackageDir` was extracted to `@origintrail-official/dkg-core` in
 // S1 of issue #386. See the import + re-export at the top of this file.
 
-export function loadNetworkConfig(): NetworkConfig {
+export function loadNetworkConfig(networkName = 'testnet'): NetworkConfig {
+  const file = `${networkName}.json`;
   const cliDir = resolveCliPackageDir();
   if (cliDir) {
-    const candidate = join(cliDir, 'network', 'testnet.json');
+    const candidate = join(cliDir, 'network', file);
     if (existsSync(candidate)) {
       return JSON.parse(readFileSync(candidate, 'utf-8'));
     }
@@ -325,21 +335,60 @@ export function loadNetworkConfig(): NetworkConfig {
   // Monorepo pre-build fallback: the cli package copies `network/*.json`
   // from the repo root into `packages/cli/network/` during its build, so
   // before `pnpm build` has run the cli-scoped path above won't resolve.
-  // Probe the repo-root `network/testnet.json` directly so the monorepo dev
+  // Probe the repo-root `network/<name>.json` directly so the monorepo dev
   // flow (tests, scratch checkouts) keeps working pre-build.
-  const monorepoPath = resolve(__dirname, '..', '..', '..', 'network', 'testnet.json');
+  const monorepoPath = resolve(__dirname, '..', '..', '..', 'network', file);
   if (existsSync(monorepoPath)) {
     return JSON.parse(readFileSync(monorepoPath, 'utf-8'));
   }
-  const devPath = resolve(__dirname, '..', '..', '..', '..', 'network', 'testnet.json');
+  const devPath = resolve(__dirname, '..', '..', '..', '..', 'network', file);
   if (existsSync(devPath)) {
     return JSON.parse(readFileSync(devPath, 'utf-8'));
   }
 
   throw new Error(
-    'Could not find network/testnet.json. Ensure the DKG CLI is installed ' +
+    `Could not find network/${file}. Ensure the DKG CLI is installed ` +
     '(npm install -g @origintrail-official/dkg).',
   );
+}
+
+/**
+ * Resolve which network this setup run should use and load its config.
+ *
+ * The name follows {@link resolveSetupNetworkName}: an explicit `--network`
+ * wins; otherwise an existing node keeps its persisted `networkConfig`; a
+ * fresh node defaults to mainnet-gnosis; and a legacy config that never set
+ * a network stays on testnet. Loading the SAME name we persist keeps the
+ * written `networkConfig` and the network slice (relays/faucet/chain) in
+ * agreement.
+ */
+export function resolveSetupNetwork(
+  explicitNetwork?: string,
+): { networkName: string; network: NetworkConfig } {
+  const home = dkgDir();
+  const configExisted = existsSync(join(home, 'config.json')) || existsSync(join(home, 'config.yaml'));
+  const existingNetworkConfig = readPersistedNetworkConfigName(home);
+  // `--network` is honored only for a FRESH node (the user's stated scope:
+  // "when there is no config yet"). An existing node keeps its current
+  // network — switching is a deliberate `dkg init --network` or config edit,
+  // guarded at boot by detectNetworkSwitch.
+  const explicit = configExisted ? undefined : explicitNetwork;
+  const networkName = resolveSetupNetworkName({
+    explicit,
+    existingNetworkConfig,
+    configExisted,
+  });
+  const requested = explicitNetwork?.trim();
+  if (configExisted && requested && requested !== networkName) {
+    const current = existingNetworkConfig
+      ? `is already configured for "${networkName}"`
+      : `has no explicit network (defaults to "${networkName}")`;
+    warn(
+      `--network ${requested} ignored: this node ${current}. ` +
+      'Use `dkg init --network` to switch an existing node.',
+    );
+  }
+  return { networkName, network: loadNetworkConfig(networkName) };
 }
 
 export function resolveCanonicalNodeSkillSourcePath(): string {
@@ -396,6 +445,10 @@ function pruneNetworkPinnedDefaults(
   if (existing.autoUpdate && typeof existing.autoUpdate === 'object' && network.autoUpdate) {
     for (const key of Object.keys(existing.autoUpdate)) {
       if (key === 'enabled') continue;
+      // Never strip an explicit `channel` pin, even when it equals the current
+      // network default — it's a deliberate cohort lock whose whole point is to
+      // survive a later change to that default.
+      if (key === 'channel') continue;
       if (existing.autoUpdate[key] === (network.autoUpdate as any)[key]) {
         delete existing.autoUpdate[key];
       }
@@ -454,6 +507,10 @@ export function writeDkgConfig(
   network: NetworkConfig,
   apiPort: number,
   overrides?: DkgConfigOverrides,
+  // Trailing + defaulted so legacy positional callers (and tests) keep
+  // working; `runSetup` always passes the resolved selection. The default
+  // mirrors this function's historical testnet-only behaviour.
+  networkConfigName = 'testnet',
 ): void {
   const configPath = join(dkgDir(), 'config.json');
 
@@ -493,7 +550,7 @@ export function writeDkgConfig(
 
   // Delegate the agent-agnostic field-level merge + write to dkg-core.
   // adapter-hermes will use the same helper in S2 (issue #386).
-  ensureDkgNodeConfig({ agentName, network, apiPort, existing, overrides });
+  ensureDkgNodeConfig({ agentName, network, networkConfigName, apiPort, existing, overrides });
 }
 
 // ---------------------------------------------------------------------------
@@ -860,6 +917,44 @@ export function mergeOpenClawConfig(
     log(`Set plugins.entries.${pluginId}.config.installedWorkspace = "${installedWorkspace}"`);
   }
 
+  // `dkgSetupState` holds the connect/disconnect bookkeeping (the pre-merge
+  // "previous" snapshots and the adapter-owned "merged" snapshots) that
+  // `unmergeOpenClawConfig` needs to reverse a merge. It lives INSIDE
+  // `entry.config` — the plugin-owned passthrough space — NOT at the entry root,
+  // where OpenClaw's gateway schema strict-rejects unknown keys (the same reason
+  // `installedWorkspace` lives in `entry.config`; see the comment above). The
+  // container is created lazily so a no-op merge that captures nothing leaves no
+  // empty object behind (preserving the `updated === raw` early return below).
+  const ensureSetupState = (): Record<string, any> => {
+    const existing = entryForConfig.config.dkgSetupState;
+    if (existing && typeof existing === 'object') return existing;
+    return (entryForConfig.config.dkgSetupState = {});
+  };
+
+  // Migrate bookkeeping written at the entry root by older adapter versions into
+  // `entry.config.dkgSetupState`. First-wins is preserved (a legacy value is
+  // adopted only when the container does not already own the key); the stale
+  // root key is always deleted so OpenClaw stops flagging it as an unknown
+  // config key on the next load. Runs before the capture sites below so their
+  // first-wins guards see the migrated values.
+  const SETUP_STATE_KEYS = [
+    'previousToolsProfile',
+    'previousChannelsDkgUi',
+    'mergedChannelsDkgUi',
+    'mergedToolsShape',
+    'previousMemorySlotOwner',
+  ] as const;
+  if (SETUP_STATE_KEYS.some((key) => key in entryForConfig)) {
+    const ss = ensureSetupState();
+    for (const key of SETUP_STATE_KEYS) {
+      if (key in entryForConfig) {
+        if (!(key in ss)) ss[key] = entryForConfig[key];
+        delete entryForConfig[key];
+      }
+    }
+    log(`Migrated adapter setup state from the entry root into config.dkgSetupState`);
+  }
+
   // Ensure plugin-registered tools are visible to the agent. Track whether THIS
   // merge pass actually mutates anything under `config.tools` so `mergedToolsShape`
   // can be refreshed only when we've genuinely written to the section. If the user
@@ -884,21 +979,23 @@ export function mergeOpenClawConfig(
   // plugin-registered tools out of the default `"coding"` profile, making
   // `dkg_*` invisible to the agent even when the plugin loads in full mode.
   //
-  // Capture the pre-merge profile onto the adapter entry so `unmergeOpenClawConfig`
-  // can restore it on disconnect. First-wins: once captured, re-running merge
-  // does not clobber the original (matches the `previousMemorySlotOwner` pattern).
-  // `null` sentinel = "absent before merge" → disconnect should delete the key.
-  const adapterEntryForCapture = config.plugins.entries[pluginId] as Record<string, any>;
+  // Capture the pre-merge profile into `config.dkgSetupState` so
+  // `unmergeOpenClawConfig` can restore it on disconnect. First-wins: once
+  // captured, re-running merge does not clobber the original (matches the
+  // `previousMemorySlotOwner` pattern). `null` sentinel = "absent before merge"
+  // → disconnect should delete the key.
   if (!config.tools.profile) {
-    if (adapterEntryForCapture && !('previousToolsProfile' in adapterEntryForCapture)) {
-      adapterEntryForCapture.previousToolsProfile = null;
+    const ss = ensureSetupState();
+    if (!('previousToolsProfile' in ss)) {
+      ss.previousToolsProfile = null;
     }
     config.tools.profile = 'full';
     mutatedTools = true;
     log('Set tools.profile = "full" to expose plugin tools');
   } else if (config.tools.profile === 'coding') {
-    if (adapterEntryForCapture && !('previousToolsProfile' in adapterEntryForCapture)) {
-      adapterEntryForCapture.previousToolsProfile = 'coding';
+    const ss = ensureSetupState();
+    if (!('previousToolsProfile' in ss)) {
+      ss.previousToolsProfile = 'coding';
     }
     config.tools.profile = 'full';
     mutatedTools = true;
@@ -945,17 +1042,17 @@ export function mergeOpenClawConfig(
   // port) would otherwise leave a stale snapshot and break the deep-equal
   // ownership check on disconnect.
   const dkgUiChannel = config.channels['dkg-ui'];
-  const lastMergedChannel = adapterEntryForCapture?.mergedChannelsDkgUi as Record<string, unknown> | undefined;
+  const lastMergedChannel = (entryForConfig.config.dkgSetupState as Record<string, any> | undefined)
+    ?.mergedChannelsDkgUi as Record<string, unknown> | undefined;
   if (!dkgUiChannel || typeof dkgUiChannel !== 'object') {
     // Channel absent before merge → on disconnect, delete it (only if still
     // matches the shape we wrote).
     const created = { enabled: adapterChannelEnabled, port: adapterChannelPort };
-    if (adapterEntryForCapture) {
-      if (!('previousChannelsDkgUi' in adapterEntryForCapture)) {
-        adapterEntryForCapture.previousChannelsDkgUi = null; // first-wins
-      }
-      adapterEntryForCapture.mergedChannelsDkgUi = { ...created }; // always refresh
+    const ss = ensureSetupState();
+    if (!('previousChannelsDkgUi' in ss)) {
+      ss.previousChannelsDkgUi = null; // first-wins
     }
+    ss.mergedChannelsDkgUi = { ...created }; // always refresh
     config.channels['dkg-ui'] = created;
     log(`Created channels.dkg-ui with port ${adapterChannelPort} to keep plugin in full runtime mode`);
   } else {
@@ -964,12 +1061,11 @@ export function mergeOpenClawConfig(
     if (!hasNonEnabledKey) {
       // Degenerate shape → upgrade.
       const upgraded = { ...dkgUiChannel, port: adapterChannelPort };
-      if (adapterEntryForCapture) {
-        if (!('previousChannelsDkgUi' in adapterEntryForCapture)) {
-          adapterEntryForCapture.previousChannelsDkgUi = { ...dkgUiChannel }; // first-wins
-        }
-        adapterEntryForCapture.mergedChannelsDkgUi = { ...upgraded }; // always refresh
+      const ss = ensureSetupState();
+      if (!('previousChannelsDkgUi' in ss)) {
+        ss.previousChannelsDkgUi = { ...dkgUiChannel }; // first-wins
       }
+      ss.mergedChannelsDkgUi = { ...upgraded }; // always refresh
       config.channels['dkg-ui'] = upgraded;
       log(`Added port ${adapterChannelPort} to channels.dkg-ui to keep plugin in full runtime mode`);
     } else if (lastMergedChannel && isDeepStrictEqual(dkgUiChannel, lastMergedChannel)) {
@@ -980,9 +1076,7 @@ export function mergeOpenClawConfig(
       // channel instead of leaving the old adapter-written port in place.
       const refreshed: Record<string, unknown> = { ...dkgUiChannel, port: adapterChannelPort };
       if (!isDeepStrictEqual(refreshed, lastMergedChannel)) {
-        if (adapterEntryForCapture) {
-          adapterEntryForCapture.mergedChannelsDkgUi = { ...refreshed };
-        }
+        ensureSetupState().mergedChannelsDkgUi = { ...refreshed };
         config.channels['dkg-ui'] = refreshed;
         log(`Refreshed channels.dkg-ui.port to ${adapterChannelPort} (last merge output preserved)`);
       }
@@ -1011,8 +1105,8 @@ export function mergeOpenClawConfig(
   // skipped. On the no-op first merge (tools.profile already "full" + alsoAllow
   // already present), no snapshot is captured at all — also correct, because we
   // never took ownership of the section.
-  if (mutatedTools && adapterEntryForCapture) {
-    adapterEntryForCapture.mergedToolsShape = structuredClone(config.tools);
+  if (mutatedTools) {
+    ensureSetupState().mergedToolsShape = structuredClone(config.tools);
   }
 
   // Elect the adapter into OpenClaw's memory slot. Combined with
@@ -1038,12 +1132,12 @@ export function mergeOpenClawConfig(
     // losing the original owner if the slot gets manipulated between merges.
     const currentOwner = config.plugins.slots.memory;
     if (currentOwner && currentOwner !== pluginId) {
-      const adapterEntry = config.plugins.entries[pluginId];
-      if (adapterEntry && typeof adapterEntry === 'object' && !adapterEntry.previousMemorySlotOwner) {
-        adapterEntry.previousMemorySlotOwner = currentOwner;
+      const ss = ensureSetupState();
+      if (!ss.previousMemorySlotOwner) {
+        ss.previousMemorySlotOwner = currentOwner;
         log(`plugins.slots.memory was "${currentOwner}" — saved as previousMemorySlotOwner for restoration on disconnect`);
-      } else if (adapterEntry && typeof adapterEntry === 'object') {
-        log(`plugins.slots.memory was "${currentOwner}" — existing previousMemorySlotOwner="${adapterEntry.previousMemorySlotOwner}" preserved (first-wins)`);
+      } else {
+        log(`plugins.slots.memory was "${currentOwner}" — existing previousMemorySlotOwner="${ss.previousMemorySlotOwner}" preserved (first-wins)`);
       }
     }
     config.plugins.slots.memory = pluginId;
@@ -1166,28 +1260,44 @@ export function unmergeOpenClawConfig(openclawConfigPath: string): UnmergeResult
   let mergedToolsShape: Record<string, unknown> | undefined;
   const entry = config.plugins?.entries?.[pluginId];
   if (entry && typeof entry === 'object') {
-    if (typeof entry.previousMemorySlotOwner === 'string') {
-      previousMemorySlotOwner = entry.previousMemorySlotOwner;
+    // Bookkeeping now lives in `entry.config.dkgSetupState` (current layout).
+    // Fall back to the entry root for configs written by older adapter versions
+    // that were never re-merged after upgrading — those carry the keys at the
+    // root. Either way the whole entry is deleted below, so both locations get
+    // cleaned up regardless of where the values were read from.
+    const setupState = (entry.config && typeof entry.config === 'object'
+      && entry.config.dkgSetupState && typeof entry.config.dkgSetupState === 'object')
+      ? entry.config.dkgSetupState as Record<string, any>
+      : undefined;
+    const hasKey = (key: string): boolean =>
+      (!!setupState && key in setupState) || (key in entry);
+    const readKey = (key: string): any =>
+      (setupState && key in setupState) ? setupState[key] : entry[key];
+
+    if (typeof readKey('previousMemorySlotOwner') === 'string') {
+      previousMemorySlotOwner = readKey('previousMemorySlotOwner');
     }
-    if ('previousToolsProfile' in entry) {
-      previousToolsProfile = entry.previousToolsProfile;
+    if (hasKey('previousToolsProfile')) {
+      previousToolsProfile = readKey('previousToolsProfile');
     }
-    if ('previousChannelsDkgUi' in entry) {
-      previousChannelsDkgUi = entry.previousChannelsDkgUi;
+    if (hasKey('previousChannelsDkgUi')) {
+      previousChannelsDkgUi = readKey('previousChannelsDkgUi');
     }
-    if (entry.mergedChannelsDkgUi && typeof entry.mergedChannelsDkgUi === 'object') {
-      mergedChannelsDkgUi = entry.mergedChannelsDkgUi as Record<string, unknown>;
+    const mc = readKey('mergedChannelsDkgUi');
+    if (mc && typeof mc === 'object') {
+      mergedChannelsDkgUi = mc as Record<string, unknown>;
     }
-    if (entry.mergedToolsShape && typeof entry.mergedToolsShape === 'object') {
-      mergedToolsShape = entry.mergedToolsShape as Record<string, unknown>;
+    const mt = readKey('mergedToolsShape');
+    if (mt && typeof mt === 'object') {
+      mergedToolsShape = mt as Record<string, unknown>;
     }
   }
 
   // Delete the adapter entry entirely. The adapter owns this entry — all of
-  // its fields (enabled, config, previousMemorySlotOwner) are setup-written,
-  // so there's no user-customizable state to preserve. A fresh merge will
-  // rebuild everything from scratch, including re-capturing the current slot
-  // owner into previousMemorySlotOwner.
+  // its fields (enabled, config — including config.dkgSetupState — and any
+  // legacy root bookkeeping) are setup-written, so there's no user-customizable
+  // state to preserve. A fresh merge will rebuild everything from scratch,
+  // including re-capturing the current slot owner into config.dkgSetupState.
   if (config.plugins && config.plugins.entries && pluginId in config.plugins.entries) {
     delete config.plugins.entries[pluginId];
     log(`Removed ${pluginId} from plugins.entries`);
@@ -1530,7 +1640,23 @@ export function verifyMemorySlotInvariants(configPath?: string): void {
 // Main entry point
 // ---------------------------------------------------------------------------
 
-export async function runSetup(options: SetupOptions): Promise<void> {
+/**
+ * Injected runtime deps for `runSetup`. Kept separate from the user-facing
+ * `SetupOptions` so the adapter stays free of a `@origintrail-official/dkg-agent`
+ * dependency: the cli layer (which has dkg-agent) provides `loadOpWallets`.
+ */
+export interface RunSetupDeps {
+  /**
+   * Eagerly create the node's operational wallets (generate-if-absent) after
+   * the config write and before the daemon starts, so faucet funding and
+   * manual mainnet funding have wallets even if the daemon never fully boots
+   * (issue #1306). Best-effort; omitted by callers where the daemon is already
+   * running (the node-UI route) or in unit tests.
+   */
+  loadOpWallets?: (dir: string) => Promise<unknown>;
+}
+
+export async function runSetup(options: SetupOptions, deps: RunSetupDeps = {}): Promise<void> {
   const dryRun = options.dryRun ?? false;
   const shouldVerify = options.verify !== false;
   const shouldStart = options.start !== false;
@@ -1569,8 +1695,11 @@ export async function runSetup(options: SetupOptions): Promise<void> {
   // Step 3: Write DKG config
   throwIfAborted();
   let network: NetworkConfig | null = null;
+  let networkConfigName: string | undefined;
   try {
-    network = loadNetworkConfig();
+    const resolved = resolveSetupNetwork(options.network);
+    network = resolved.network;
+    networkConfigName = resolved.networkName;
   } catch (err: any) {
     if (dryRun) {
       warn(`Could not load network config: ${err.message}`);
@@ -1590,11 +1719,11 @@ export async function runSetup(options: SetupOptions): Promise<void> {
   // value so the dry-run / skipped-writeDkgConfig path still has something
   // sensible to pass.
   let effectiveAgentName = agentName;
-  if (!dryRun && network) {
+  if (!dryRun && network && networkConfigName) {
     writeDkgConfig(agentName, network, apiPort, {
       nameExplicit: options.name != null,
       portExplicit: options.port != null,
-    });
+    }, networkConfigName);
     // Read back the effective port AND effective name from the merged
     // config so downstream steps (daemon start, workspace config, verify,
     // faucet funding) use the persisted values even when an existing config
@@ -1611,6 +1740,21 @@ export async function runSetup(options: SetupOptions): Promise<void> {
     } catch { /* use pre-merge values */ }
   } else if (network) {
     log(`[dry-run] Would write ${join(dkgDir(), 'config.json')} (${network.networkName}, port ${apiPort})`);
+  }
+
+  // Eagerly ensure the node's wallets exist BEFORE the daemon starts (issue
+  // #1306) — matching `dkg init` — so faucet funding (testnet) and manual
+  // mainnet funding have wallets to target even if the daemon never fully
+  // boots. Runs regardless of `--no-fund` (mainnet has no faucet but still
+  // needs wallets). Best-effort; the daemon's boot-time loadOpWallets is an
+  // idempotent fallback. `loadOpWallets` is injected by the cli layer so the
+  // adapter stays dkg-agent-free.
+  if (!dryRun && deps.loadOpWallets) {
+    try {
+      await deps.loadOpWallets(dkgDir());
+    } catch (err: any) {
+      warn(`Could not pre-create wallets (${err?.message ?? String(err)}); the daemon will generate them on first start.`);
+    }
   }
 
   // Step 4: Preflight ~/.openclaw/openclaw.json BEFORE the daemon spins up

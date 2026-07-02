@@ -88,6 +88,43 @@ describe('V10 Publishing Conviction NFT — chain-adapter lifecycle', () => {
     expect(await owner.getConvictionAgentAccountId(agent)).toBe(0n);
   });
 
+  it('clearPublishingConvictionAgents bulk-removes every agent (owner-gated, via the logic contract)', async () => {
+    const owner = await fundedOwner();
+    const { accountId } = await owner.createPublishingConvictionAccount(COMMITTED);
+
+    const agent1 = ethers.Wallet.createRandom().address;
+    const agent2 = ethers.Wallet.createRandom().address;
+    await owner.registerPublishingConvictionAgent(accountId, agent1);
+    await owner.registerPublishingConvictionAgent(accountId, agent2);
+    expect((await owner.getPublishingConvictionAccountInfo(accountId))!.agentCount).toBe(2);
+
+    const cleared = await owner.clearPublishingConvictionAgents(accountId);
+    expect(cleared.success).toBe(true);
+
+    expect(await owner.isPublishingConvictionAgent(accountId, agent1)).toBe(false);
+    expect(await owner.isPublishingConvictionAgent(accountId, agent2)).toBe(false);
+    expect(await owner.getConvictionAgentAccountId(agent1)).toBe(0n);
+    expect((await owner.getPublishingConvictionAccountInfo(accountId))!.agentCount).toBe(0);
+  });
+
+  it('registerPublishingConvictionAgents bulk-adds multiple agents in one tx (owner-gated, via the logic contract)', async () => {
+    const owner = await fundedOwner();
+    const { accountId } = await owner.createPublishingConvictionAccount(COMMITTED);
+
+    const agent1 = ethers.Wallet.createRandom().address;
+    const agent2 = ethers.Wallet.createRandom().address;
+    const agent3 = ethers.Wallet.createRandom().address;
+
+    const res = await owner.registerPublishingConvictionAgents(accountId, [agent1, agent2, agent3]);
+    expect(res.success).toBe(true);
+
+    expect(await owner.isPublishingConvictionAgent(accountId, agent1)).toBe(true);
+    expect(await owner.isPublishingConvictionAgent(accountId, agent2)).toBe(true);
+    expect(await owner.isPublishingConvictionAgent(accountId, agent3)).toBe(true);
+    expect(await owner.getConvictionAgentAccountId(agent2)).toBe(accountId);
+    expect((await owner.getPublishingConvictionAccountInfo(accountId))!.agentCount).toBe(3);
+  });
+
   it('owner topUpPublishingConvictionAccount + settlePublishingConvictionAccount succeed and topUpBuffer updates', async () => {
     const owner = await fundedOwner();
     const { accountId } = await owner.createPublishingConvictionAccount(COMMITTED);

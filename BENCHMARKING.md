@@ -12,7 +12,7 @@ models the important layers explicitly:
 
 - working memory, where benchmark triples are first written
 - shared working memory, where payloads are staged for publishing
-- verified memory, where sync or async publish finalizes readable content
+- verifiable memory, where sync or async publish finalizes readable content
 - publisher jobs, where async enqueue is separated from runtime finalization
 
 The ESBench suite measures focused memory-layer flows:

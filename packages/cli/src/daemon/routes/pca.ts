@@ -6,7 +6,7 @@ import {
   isPcaUnavailableError,
   type V10PublishingConvictionAccountInfo,
 } from '@origintrail-official/dkg-chain';
-import { jsonResponse, readBody, SMALL_BODY_BYTES } from '../http-utils.js';
+import { jsonResponse, readBody, SMALL_BODY_BYTES, respondIfChainRpcTransportError } from '../http-utils.js';
 import type { RequestContext } from './context.js';
 
 const ZERO = '0x0000000000000000000000000000000000000000';
@@ -52,9 +52,22 @@ function classifyPcaRevert(msg: string): { status: number; error: string } | nul
   if (/\bAgentCapReached\b/.test(msg)) return { status: 409, error: 'AgentCapReached' };
   if (/\bAccountExpired\b/.test(msg)) return { status: 409, error: 'AccountExpired' };
   if (/\bAccountAlreadyFullySettled\b/.test(msg)) return { status: 409, error: 'AccountAlreadyFullySettled' };
+  // OT-RFC-51 primary-node reverts. `PrimaryNodeNotInShardingTable` is reachable
+  // from POST /api/pca (createAccount validates a non-zero node against the
+  // sharding table) → a bad-but-well-formed node id is a 400, not a 500. The
+  // rest are setPrimaryNode-only (re-designation, not yet wired via the daemon)
+  // but classified here so they map cleanly the moment that route lands.
+  if (/\bPrimaryNodeNotInShardingTable\b/.test(msg)) return { status: 400, error: 'PrimaryNodeNotInShardingTable' };
+  if (/\bZeroPrimaryNode\b/.test(msg)) return { status: 400, error: 'ZeroPrimaryNode' };
+  if (/\bPrimaryNodeUnchanged\b/.test(msg)) return { status: 409, error: 'PrimaryNodeUnchanged' };
+  if (/\bPrimaryNodeChangeRateLimited\b/.test(msg)) return { status: 409, error: 'PrimaryNodeChangeRateLimited' };
   // OZ v5 _requireOwned on an unminted NFT id → caller mistake, 404.
   // Legacy string-revert fallback for older OZ ERC721 builds.
+  // `UnknownAccount`/`NoConvictionAccount` are the PublishingConviction-logic
+  // forms (e.g. settle() forwards directly without _requireOwned); enrichEvmError
+  // decodes the logic name into the message so this matches on the write paths.
   if (/\bERC721NonexistentToken\b/.test(msg) ||
+      /\bUnknownAccount\b/.test(msg) || /\bNoConvictionAccount\b/.test(msg) ||
       /nonexistent token|owner query for nonexistent token|ERC721: invalid token ID/i.test(msg)) {
     return { status: 404, error: 'UnknownAccount' };
   }
@@ -69,6 +82,44 @@ function parseAccountId(idStr: string): bigint | null {
   } catch {
     return null;
   }
+}
+
+// OT-RFC-51: a PCA's committed TRAC funds the publishing factor P(t) of ONE
+// node (`primaryNode`), seeded per-epoch over the lock. The value is that
+// node's identityId (uint72). `0` is the contract's "no designated node"
+// sentinel — but the daemon does not expose `setPrimaryNode`, so a PCA created
+// here with node 0 would be permanently inert (it funds nobody and cannot be
+// re-pointed). We therefore REQUIRE an explicit, non-zero node at creation.
+const MAX_UINT72 = (1n << 72n) - 1n;
+
+function parsePrimaryNode(raw: unknown): bigint | { error: string } {
+  if (typeof raw === 'number') {
+    // A uint72 identityId can exceed Number.MAX_SAFE_INTEGER. By the time we
+    // see a JSON number, JSON.parse has ALREADY rounded it to the nearest
+    // double — so String(raw)/BigInt() below would silently read a different
+    // node. Only safe-integer numbers survive losslessly; larger ids must come
+    // as strings.
+    if (!Number.isSafeInteger(raw)) {
+      return { error: 'primaryNode exceeds JSON safe-integer range — pass the node identityId as a string' };
+    }
+  } else if (typeof raw !== 'string') {
+    return { error: 'primaryNode is required: the node identityId (uint72) this PCA allocates publishing to' };
+  }
+  const s = String(raw).trim();
+  if (!/^\d+$/.test(s)) {
+    return { error: 'primaryNode must be a positive integer node identityId' };
+  }
+  let id: bigint;
+  try {
+    id = BigInt(s);
+  } catch (e: any) {
+    return { error: `primaryNode parse error: ${e?.message ?? String(e)}` };
+  }
+  if (id <= 0n) {
+    return { error: 'primaryNode must be > 0 (0 designates no node; daemon-created PCAs must allocate to a node)' };
+  }
+  if (id > MAX_UINT72) return { error: 'primaryNode exceeds the uint72 node identityId range' };
+  return id;
 }
 
 function parseTokenAmount(raw: unknown, field: string): bigint | { error: string } {
@@ -91,6 +142,7 @@ function parseTokenAmount(raw: unknown, field: string): bigint | { error: string
 function serializeAccountInfo(
   accountId: bigint,
   info: V10PublishingConvictionAccountInfo,
+  extra?: { primaryNode?: bigint | null; fundsThisNode?: boolean; owned?: boolean },
 ): Record<string, unknown> {
   return {
     accountId: accountId.toString(),
@@ -108,25 +160,112 @@ function serializeAccountInfo(
     agentCount: info.agentCount,
     lastSettledWindow: info.lastSettledWindow,
     fullySwept: info.fullySwept,
+    // OT-RFC-51 node association: the node identityId this PCA funds.
+    // `0` = unset. `fundsThisNode` is true when it equals this node's identity.
+    ...(extra?.primaryNode != null ? { primaryNode: extra.primaryNode.toString() } : {}),
+    ...(extra?.fundsThisNode !== undefined ? { fundsThisNode: extra.fundsThisNode } : {}),
+    // Whether this PCA is owned (and thus manageable) by this node's wallets.
+    ...(extra?.owned !== undefined ? { owned: extra.owned } : {}),
   };
 }
 
 export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
-  const { req, res, agent, path } = ctx;
+  const { req, res, agent, path, config, requestToken, validTokens, opWallets } = ctx;
 
   if (!path.startsWith('/api/pca')) return;
 
+  // The node can SERVER-MANAGE a PCA only when its ERC-721 owner is the daemon's
+  // PRIMARY operational wallet (opWallets.wallets[0]) — that is the single signer
+  // every server-side, bearer-token-driven PCA write is signed with. Admin keys
+  // and secondary operational wallets cannot drive these writes (the chain
+  // adapter holds only the primary signer for the PCA path), so flagging a PCA
+  // they own as owned:true would light up a manage UI whose owner-gated writes
+  // revert on-chain (ownerOf mismatch), not a clean 403. Ownership for the
+  // wallet-connect (client-signed) path is resolved separately in the browser.
+  const serverSignerAddr = opWallets.wallets[0]?.address.toLowerCase() ?? null;
+  const isOwnedByNode = (owner: string): boolean =>
+    serverSignerAddr != null && owner.toLowerCase() === serverSignerAddr;
+
+  // PCA writes are signed with the daemon's OWNER EOA, so the on-chain
+  // owner gate is satisfied by the daemon for every node-owned PCA — the
+  // bearer token is the only caller gate. Creating/funding/re-pointing a PCA
+  // or attaching a publishing agent are operator actions: require a node-level
+  // admin token, not a per-agent (dkg_at_) token. Mirrors isNodeAdminCaller in
+  // context-graph.ts. Reads and the permissionless `settle` are NOT gated.
+  const authEnabled = config.auth?.enabled !== false;
+  const isNodeAdmin = (): boolean =>
+    !authEnabled ||
+    (!!requestToken && validTokens.has(requestToken) && !agent.resolveAgentByToken(requestToken));
+  const requireNodeAdmin = (): boolean => {
+    if (isNodeAdmin()) return true;
+    jsonResponse(res, 403, {
+      error: 'Node-admin token required (~/.dkg/auth.token) to manage Publishing Conviction Accounts; agent-scoped tokens cannot drive owner-signed PCA writes.',
+    });
+    return false;
+  };
+
+  // GET /api/pca — list the PCAs owned by this node's operational wallet
+  // (ERC721Enumerable), each annotated with its OT-RFC-51 `primaryNode`
+  // association and `fundsThisNode`. These are the accounts this node can
+  // manage; accounts that fund this node but are owned elsewhere are loadable
+  // by id via GET /api/pca/:id.
+  if (req.method === 'GET' && path === '/api/pca') {
+    try {
+      const list = await agent.listNodePublishingConvictionAccounts();
+      if (list === null) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      return jsonResponse(res, 200, {
+        accounts: list.map((a) =>
+          serializeAccountInfo(a.accountId, a.info, {
+            primaryNode: a.primaryNode,
+            fundsThisNode: a.fundsThisNode,
+            owned: true, // the list enumerates accounts owned by this node's wallet
+          }),
+        ),
+      });
+    } catch (err: any) {
+      const msg = err?.message ?? String(err);
+      if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (respondIfChainRpcTransportError(res, err)) return;
+      return jsonResponse(res, 500, {
+        error: `listNodePublishingConvictionAccounts failed: ${msg}`,
+      });
+    }
+  }
+
+  // GET /api/pca/contracts — addresses + chainId for the browser wallet-connect
+  // path (owner signs owner-gated PCA txs client-side). Must be matched BEFORE
+  // the `/api/pca/:id` GET, else "contracts" is parsed as an accountId → 400.
+  if (req.method === 'GET' && path === '/api/pca/contracts') {
+    try {
+      const ctxAddrs = await agent.getPcaContractContext();
+      if (ctxAddrs === null) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      return jsonResponse(res, 200, ctxAddrs);
+    } catch (err: any) {
+      const msg = err?.message ?? String(err);
+      if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (respondIfChainRpcTransportError(res, err)) return;
+      return jsonResponse(res, 500, { error: `getPcaContractContext failed: ${msg}` });
+    }
+  }
+
   // POST /api/pca — mint a conviction NFT to the daemon EOA (the owner).
-  // No `lockEpochs` (global protocol param). Body: { tokens: "100000" }
+  // No `lockEpochs` (global protocol param). Body: { tokens: "100000",
+  // primaryNode: "42" } — `primaryNode` (the node identityId this PCA funds,
+  // OT-RFC-51) is REQUIRED; see parsePrimaryNode for why node 0 is rejected.
   if (req.method === 'POST' && path === '/api/pca') {
+    if (!requireNodeAdmin()) return;
     const body = await readBody(req, SMALL_BODY_BYTES);
     const parsed = safeParseJson(body);
     if (!parsed.ok) return jsonResponse(res, 400, { error: parsed.error });
-    const { tokens } = parsed.value ?? {};
+    const { tokens, primaryNode } = parsed.value ?? {};
     const amount = parseTokenAmount(tokens, 'tokens');
     if (typeof amount !== 'bigint') return jsonResponse(res, 400, amount);
+    const node = parsePrimaryNode(primaryNode);
+    if (typeof node !== 'bigint') return jsonResponse(res, 400, node);
     try {
-      const result = await agent.createPublishingConvictionAccount(amount);
+      const result = await agent.createPublishingConvictionAccount(amount, node);
       if (result === null) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       return jsonResponse(res, 200, {
         accountId: result.accountId.toString(),
@@ -138,6 +277,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       const msg = err?.message ?? String(err);
       if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (respondIfChainRpcTransportError(res, err)) return;
       const revert = classifyPcaRevert(msg);
       if (revert) return jsonResponse(res, revert.status, { error: revert.error });
       return jsonResponse(res, 500, {
@@ -149,6 +289,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
   // POST /api/pca/:id/agent — register a publishing agent. Owner-gated;
   // the daemon's EOA must be the PCA NFT owner. Body: { agent: "0x..." }
   if (req.method === 'POST' && /^\/api\/pca\/[^/]+\/agent$/.test(path)) {
+    if (!requireNodeAdmin()) return;
     const idStr = decodeURIComponent(path.split('/')[3] ?? '');
     const accountId = parseAccountId(idStr);
     if (accountId === null) {
@@ -189,6 +330,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       const msg = err?.message ?? String(err);
       if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (respondIfChainRpcTransportError(res, err)) return;
       if (isOwnerRevert(msg)) {
         return jsonResponse(res, 403, {
           error: 'NotAccountOwner — daemon EOA is not the PCA owner',
@@ -204,6 +346,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
   // DELETE /api/pca/:id/agent/:address — deregister a publishing agent.
   // Owner-gated; the daemon's EOA must be the PCA NFT owner.
   if (req.method === 'DELETE' && /^\/api\/pca\/[^/]+\/agent\/[^/]+$/.test(path)) {
+    if (!requireNodeAdmin()) return;
     const parts = path.split('/');
     const idStr = decodeURIComponent(parts[3] ?? '');
     const agentAddr = decodeURIComponent(parts[5] ?? '');
@@ -233,6 +376,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       const msg = err?.message ?? String(err);
       if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (respondIfChainRpcTransportError(res, err)) return;
       if (isOwnerRevert(msg)) {
         return jsonResponse(res, 403, {
           error: 'NotAccountOwner — daemon EOA is not the PCA owner',
@@ -247,6 +391,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
 
   // POST /api/pca/:id/funds — top-up a PCA. Owner-gated. Body: { tokens: "50000" }
   if (req.method === 'POST' && /^\/api\/pca\/[^/]+\/funds$/.test(path)) {
+    if (!requireNodeAdmin()) return;
     const idStr = decodeURIComponent(path.split('/')[3] ?? '');
     const accountId = parseAccountId(idStr);
     if (accountId === null) {
@@ -271,6 +416,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       const msg = err?.message ?? String(err);
       if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (respondIfChainRpcTransportError(res, err)) return;
       if (isOwnerRevert(msg)) {
         return jsonResponse(res, 403, {
           error: 'NotAccountOwner — daemon EOA is not the PCA owner',
@@ -304,9 +450,51 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       const msg = err?.message ?? String(err);
       if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (respondIfChainRpcTransportError(res, err)) return;
       const revert = classifyPcaRevert(msg);
       if (revert) return jsonResponse(res, revert.status, { error: revert.error, accountId: idStr });
       return jsonResponse(res, 500, { error: `settlePublishingConvictionAccount failed: ${msg}` });
+    }
+  }
+
+  // POST /api/pca/:id/primary-node — OT-RFC-51 owner-gated re-designation of
+  // the node this PCA funds. Body: { node: "42" } (required, non-zero uint72).
+  // Rate-limited on-chain to once per epoch (→ 409 PrimaryNodeChangeRateLimited).
+  if (req.method === 'POST' && /^\/api\/pca\/[^/]+\/primary-node$/.test(path)) {
+    if (!requireNodeAdmin()) return;
+    const idStr = decodeURIComponent(path.split('/')[3] ?? '');
+    const accountId = parseAccountId(idStr);
+    if (accountId === null) {
+      return jsonResponse(res, 400, { error: 'Invalid accountId — must be a non-negative integer' });
+    }
+    const body = await readBody(req, SMALL_BODY_BYTES);
+    const parsed = safeParseJson(body);
+    if (!parsed.ok) return jsonResponse(res, 400, { error: parsed.error });
+    const node = parsePrimaryNode((parsed.value ?? {}).node);
+    if (typeof node !== 'bigint') return jsonResponse(res, 400, node);
+    try {
+      const result = await agent.setPublishingConvictionPrimaryNode(accountId, node);
+      if (result === null) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      return jsonResponse(res, 200, {
+        accountId: idStr,
+        primaryNode: node.toString(),
+        txHash: result.hash,
+        blockNumber: result.blockNumber,
+      });
+    } catch (err: any) {
+      const msg = err?.message ?? String(err);
+      if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (respondIfChainRpcTransportError(res, err)) return;
+      if (isOwnerRevert(msg)) {
+        return jsonResponse(res, 403, {
+          error: 'NotAccountOwner — daemon EOA is not the PCA owner',
+          accountId: idStr,
+        });
+      }
+      const revert = classifyPcaRevert(msg);
+      if (revert) return jsonResponse(res, revert.status, { error: revert.error, accountId: idStr });
+      return jsonResponse(res, 500, { error: `setPublishingConvictionPrimaryNode failed: ${msg}` });
     }
   }
 
@@ -328,8 +516,30 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
         }
         return jsonResponse(res, 404, { error: `Unknown PCA accountId ${idStr}` });
       }
+      // OT-RFC-51 node association — a separate read (getAccountInfo omits it).
+      // Best-effort: a probe failure must not 500 the snapshot.
+      let primaryNode: bigint | null = null;
+      try {
+        primaryNode = await agent.getConvictionPrimaryNode(accountId);
+      } catch {
+        primaryNode = null;
+      }
+      // Annotate fundsThisNode + owned so the UI can highlight the association
+      // and disable owner-gated actions for accounts owned elsewhere — this is
+      // the lookup-by-id path, which is exactly the cross-owner case.
+      let fundsThisNode: boolean | undefined;
+      try {
+        const myIdentity = await agent.getNodeIdentityId();
+        if (primaryNode != null) fundsThisNode = myIdentity !== 0n && primaryNode === myIdentity;
+      } catch {
+        fundsThisNode = undefined;
+      }
       const probedKey = ctx.url.searchParams.get('key');
-      const result: Record<string, unknown> = serializeAccountInfo(accountId, info);
+      const result: Record<string, unknown> = serializeAccountInfo(accountId, info, {
+        primaryNode,
+        fundsThisNode,
+        owned: isOwnedByNode(info.owner),
+      });
       if (probedKey) {
         if (!ethers.isAddress(probedKey)) {
           result.probedKey = { key: probedKey, error: 'invalid EVM address' };
@@ -347,6 +557,7 @@ export async function handlePcaRoutes(ctx: RequestContext): Promise<void> {
       const msg = err?.message ?? String(err);
       if (isNoChain(msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
       if (isPcaUnavailable(err, msg)) return jsonResponse(res, 503, FEATURE_UNAVAILABLE_503);
+      if (respondIfChainRpcTransportError(res, err)) return;
       return jsonResponse(res, 500, {
         error: `getPublishingConvictionAccountInfo failed: ${msg}`,
       });

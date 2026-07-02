@@ -74,11 +74,33 @@ export { DKGAgent } from './dkg-agent.js';
 export {
   verifyBatch,
   buildBatchRejectionRecord,
+  batchRejectionAssertionName,
+  batchRejectionRecordToQuads,
   type VerifyBatchInput,
   type VerifyBatchResult,
   type BatchRejectionRecord,
 } from './swm/verify-batch.js';
+export {
+  reportBatchRejectionWithLifecycle,
+  type BatchRejectionReporterAgent,
+  type BatchRejectionAgentLaneOptions,
+  type BatchRejectionAuthorLaneOptions,
+  type ReportBatchRejectionInput,
+  type ReportBatchRejectionResult,
+} from './swm/batch-rejection-reporter.js';
 export { createCGHostEnumerator, type CGHostEnumerator, type CGHostEnumeratorDeps } from './swm/enumerate-cg-hosts.js';
+export {
+  createSwmCatchupPeerSelector,
+  classifySwmCatchupPeerOutcome,
+  SwmCatchupPeerSelector,
+  SWM_CATCHUP_FALLBACK_PROBE_LIMIT,
+  SWM_CATCHUP_PEER_GOOD_TTL_MS,
+  SWM_CATCHUP_PEER_NEGATIVE_TTL_MS,
+  type SelectSwmCatchupPeersInput,
+  type SelectSwmCatchupPeersResult,
+  type SwmCatchupPeerOutcome,
+  type SwmCatchupPeerSelectorOptions,
+} from './swm/swm-catchup-peer-selection.js';
 export {
   mintMemberAttestation,
   verifyMemberAttestation,
@@ -105,12 +127,25 @@ export {
   type ContextGraphMembershipRecord,
   type ContextGraphMembershipStore,
   type ContextGraphSubscriptionRecord,
+  type ContextGraphSubscriptionRehydrationStatus,
   type ContextGraphSubscriptionStore,
+  type ContextGraphWritePreflightProbe,
   type PeerHealth,
   type CclPublishedEvaluationRecord,
   type CclPublishedResultEntry,
   type PendingSenderKeyEntry,
+  type AssertionArtifactKind,
+  type ImportedArtifactByteStore,
 } from './dkg-agent-types.js';
+export {
+  computeImportedArtifactSelector,
+  IMPORTED_ARTIFACT_AUTH_PURPOSE,
+  IMPORTED_ARTIFACT_MAX_PAGE_BYTES,
+  type AssertionArtifactAvailabilityParams,
+  type ImportedArtifactRequest,
+  type ImportedArtifactResponse,
+  type ReadAssertionArtifactParams,
+} from './imported-artifact.js';
 export {
   bindRandomSampling,
   type RandomSamplingBindOptions,
@@ -152,7 +187,26 @@ export {
   type TrackInput,
   type TrackedRecordSnapshot,
 } from './swm/ack-quorum.js';
+export {
+  classifySwmFanoutPeerOutcome,
+  createSwmFanoutPeerSelector,
+  SWM_FANOUT_PEER_GOOD_TTL_MS,
+  SWM_FANOUT_PEER_NEGATIVE_TTL_MS,
+  SWM_FANOUT_UNKNOWN_PROBE_LIMIT,
+  type SelectSwmFanoutPeersInput,
+  type SelectSwmFanoutPeersResult,
+  type SwmFanoutPeerOutcome,
+  type SwmFanoutPeerSelectorOptions,
+} from './swm/swm-fanout-peer-selection.js';
 export * from './source-worker.js';
 export * from './source-registry.js';
 export * from './generic-sql-source.js';
 export { KaNumberAllocator, type KaAllocation } from './allocator.js';
+// OT-RFC-49 WS-D — the curated public `_catalog` floor builder. Exported on the
+// public surface so off-band tooling (e.g. the devnet update-seal helper) can
+// re-inject the SAME deterministic floor the producer's curated update() does,
+// without deep-importing the compiled `dist/` module.
+export {
+  buildPublicProjection,
+  type PublicProjectionInput,
+} from './context-graph-public-projection.js';

@@ -6,17 +6,30 @@ import {
   TypedEventBus,
   generateEd25519Keypair,
   contextGraphAssertionUri,
+  contextGraphDataUri,
   contextGraphMetaUri,
   contextGraphSharedMemoryUri,
+  contextGraphLayerUri,
+  MemoryLayer,
   assertionLifecycleUri,
 } from '@origintrail-official/dkg-core';
-import { DKGPublisher, AssertionNotPersistedError } from '../src/index.js';
+import {
+  DKGPublisher,
+  AssertionNotPersistedError,
+  generatedPrivateCatalogFloorQuads,
+  generatedPrivateCatalogTripleKeys,
+} from '../src/index.js';
 import { ethers } from 'ethers';
 import { createEVMAdapter, getSharedContext, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 
 const CG_ID = 'test-assertion-cg';
 const SWM_GRAPH = `did:dkg:context-graph:${CG_ID}/_shared_memory`;
 const SWM_META_GRAPH = `did:dkg:context-graph:${CG_ID}/_shared_memory_meta`;
+const ONTOLOGY_GRAPH = 'did:dkg:context-graph:ontology';
+const AGENTS_GRAPH = 'did:dkg:context-graph:agents';
+const ON_CHAIN_ID_PREDICATE = 'https://dkg.network/ontology#ContextGraphOnChainId';
+const ACCESS_POLICY_PREDICATE = 'https://dkg.network/ontology#accessPolicy';
+const ALLOWED_AGENT_PREDICATE = 'https://dkg.network/ontology#allowedAgent';
 const AGENT = '0x1234567890abcdef1234567890abcdef12345678';
 const AGENT_B = '0xabcdefabcdefabcdefabcdefabcdefabcdefabcd';
 const PEER = '12D3KooWPromoteBoundary';
@@ -48,6 +61,42 @@ function largePayloadQuads(prefix: string, bytes: number): Quad[] {
   return quads;
 }
 
+function onChainIdQuad(id = '1'): Quad {
+  return {
+    subject: contextGraphDataUri(CG_ID),
+    predicate: ON_CHAIN_ID_PREDICATE,
+    object: `"${id}"`,
+    graph: ONTOLOGY_GRAPH,
+  };
+}
+
+function localPrivateContextGraphQuad(): Quad {
+  return {
+    subject: contextGraphDataUri(CG_ID),
+    predicate: ACCESS_POLICY_PREDICATE,
+    object: '"private"',
+    graph: contextGraphMetaUri(CG_ID),
+  };
+}
+
+function agentsPublicContextGraphQuad(): Quad {
+  return {
+    subject: contextGraphDataUri(CG_ID),
+    predicate: ACCESS_POLICY_PREDICATE,
+    object: '"public"',
+    graph: AGENTS_GRAPH,
+  };
+}
+
+function localAllowedAgentQuad(): Quad {
+  return {
+    subject: contextGraphDataUri(CG_ID),
+    predicate: ALLOWED_AGENT_PREDICATE,
+    object: `"${AGENT}"`,
+    graph: contextGraphMetaUri(CG_ID),
+  };
+}
+
 describe('Working Memory Assertion Lifecycle', () => {
   let store: OxigraphStore;
   let publisher: DKGPublisher;
@@ -69,6 +118,71 @@ describe('Working Memory Assertion Lifecycle', () => {
   it('create returns the correct assertion graph URI', async () => {
     const uri = await publisher.assertionCreate(CG_ID, ASSERTION_NAME, AGENT);
     expect(uri).toBe(contextGraphAssertionUri(CG_ID, AGENT, ASSERTION_NAME));
+  });
+
+  it('D1: create stamps kaId + reservedUal on the URN when given an allocate callback', async () => {
+    const name = 'd1-mint';
+    const ual = `did:dkg:31337/${AGENT.toLowerCase()}/42`;
+    await publisher.assertionCreate(CG_ID, name, AGENT, undefined, {
+      allocateKaNumber: async () => ({ number: 42n, reservedUal: ual }),
+    });
+    const metaGraph = contextGraphMetaUri(CG_ID);
+    const urn = assertionLifecycleUri(CG_ID, AGENT, name);
+    const kaId = await store.query(`SELECT ?n WHERE { GRAPH <${metaGraph}> { <${urn}> <http://dkg.io/ontology/kaId> ?n } }`);
+    expect(kaId.type).toBe('bindings');
+    if (kaId.type === 'bindings') {
+      expect(kaId.bindings.map((r) => r['n'])).toEqual(['"42"^^<http://www.w3.org/2001/XMLSchema#integer>']);
+    }
+    const ru = await store.query(`SELECT ?u WHERE { GRAPH <${metaGraph}> { <${urn}> <http://dkg.io/ontology/reservedUal> ?u } }`);
+    if (ru.type === 'bindings') {
+      expect(ru.bindings.map((r) => r['u'])).toEqual([`"${ual}"`]);
+    }
+  });
+
+  it('D1: re-create does NOT re-allocate — the preserved kaId is reused (re-open guard)', async () => {
+    const name = 'd1-reopen';
+    const ual42 = `did:dkg:31337/${AGENT.toLowerCase()}/42`;
+    await publisher.assertionCreate(CG_ID, name, AGENT, undefined, {
+      allocateKaNumber: async () => ({ number: 42n, reservedUal: ual42 }),
+    });
+    // Re-create with a callback that WOULD allocate a different number — it must NOT be invoked,
+    // because the draft already carries a preserved kaId (the re-open guard lives in assertionCreate).
+    let called = false;
+    await publisher.assertionCreate(CG_ID, name, AGENT, undefined, {
+      allocateKaNumber: async () => {
+        called = true;
+        return { number: 99n, reservedUal: `did:dkg:31337/${AGENT.toLowerCase()}/99` };
+      },
+    });
+    expect(called).toBe(false);
+    const metaGraph = contextGraphMetaUri(CG_ID);
+    const urn = assertionLifecycleUri(CG_ID, AGENT, name);
+    const kaId = await store.query(`SELECT ?n WHERE { GRAPH <${metaGraph}> { <${urn}> <http://dkg.io/ontology/kaId> ?n } }`);
+    if (kaId.type === 'bindings') {
+      expect(kaId.bindings.map((r) => r['n'])).toEqual(['"42"^^<http://www.w3.org/2001/XMLSchema#integer>']);
+    }
+  });
+
+  it('WM flip: a numbered KA stores + reads WM data in the per-KA _working_memory graph', async () => {
+    const name = 'wm-numbered';
+    await publisher.assertionCreate(CG_ID, name, AGENT, undefined, {
+      allocateKaNumber: async () => ({ number: 42n, reservedUal: `did:dkg:31337/${AGENT.toLowerCase()}/42` }),
+    });
+    await publisher.assertionWrite(CG_ID, name, AGENT, [
+      { subject: 'urn:test:entity:x', predicate: 'http://schema.org/name', object: '"X"' },
+    ]);
+    // data must live in the per-KA WM graph keyed by {number}, NOT the legacy name-keyed graph
+    const wmGraph = contextGraphLayerUri(CG_ID, MemoryLayer.WorkingMemory, AGENT, 42n);
+    const res = await store.query(`SELECT ?o WHERE { GRAPH <${wmGraph}> { <urn:test:entity:x> <http://schema.org/name> ?o } }`);
+    expect(res.type).toBe('bindings');
+    if (res.type === 'bindings') expect(res.bindings.map((r) => r['o'])).toEqual(['"X"']);
+    // the legacy name-keyed graph must be empty (no data leaked to the old layout)
+    const legacy = contextGraphAssertionUri(CG_ID, AGENT, name);
+    const legacyRes = await store.query(`SELECT ?o WHERE { GRAPH <${legacy}> { <urn:test:entity:x> ?p ?o } }`);
+    if (legacyRes.type === 'bindings') expect(legacyRes.bindings).toHaveLength(0);
+    // assertionQuery (which resolves the number internally) returns the data
+    const q = await publisher.assertionQuery(CG_ID, name, AGENT);
+    expect(q.length).toBeGreaterThan(0);
   });
 
   it('write inserts triples into the assertion graph', async () => {
@@ -115,6 +229,130 @@ describe('Working Memory Assertion Lifecycle', () => {
     if (swmResult.type === 'bindings') {
       expect(swmResult.bindings.length).toBe(3);
     }
+  });
+
+  it('promote strips generated private-CG catalog floor from SWM and WM when trusted', async () => {
+    const name = 'private-catalog-promote';
+    const cgDid = contextGraphDataUri(CG_ID);
+    await publisher.assertionCreate(CG_ID, name, AGENT);
+    await publisher.assertionWrite(CG_ID, name, AGENT, [
+      { subject: 'urn:test:entity:catalog-content', predicate: 'http://schema.org/name', object: '"Content"' },
+      ...generatedPrivateCatalogFloorQuads(CG_ID),
+    ]);
+    await store.insert([onChainIdQuad('1')]);
+    (publisher as any).chain.getContextGraphAccessPolicy = async () => 1;
+    (publisher as any).chain.getContextGraphNameHash = async () => ethers.keccak256(ethers.toUtf8Bytes(CG_ID));
+
+    const result = await publisher.assertionPromote(CG_ID, name, AGENT, {
+      publisherPeerId: PEER,
+      trustedNonManifestCatalogTriples: generatedPrivateCatalogTripleKeys(CG_ID),
+      onChainContextGraphId: '1',
+    });
+
+    expect(result.promotedCount).toBe(1);
+    const swmCatalog = await store.query(
+      `SELECT ?p ?o WHERE { GRAPH <${SWM_GRAPH}> { <${cgDid}> ?p ?o } }`,
+    );
+    expect(swmCatalog.type).toBe('bindings');
+    if (swmCatalog.type === 'bindings') expect(swmCatalog.bindings).toHaveLength(0);
+
+    const remaining = await publisher.assertionQuery(CG_ID, name, AGENT);
+    expect(remaining).toHaveLength(0);
+  });
+
+  it('rejects generated private-CG catalog floor stripping without private CG proof', async () => {
+    const name = 'private-catalog-promote-reject';
+    await publisher.assertionCreate(CG_ID, name, AGENT);
+    await publisher.assertionWrite(CG_ID, name, AGENT, [
+      { subject: 'urn:test:entity:catalog-content', predicate: 'http://schema.org/name', object: '"Content"' },
+      ...generatedPrivateCatalogFloorQuads(CG_ID),
+    ]);
+
+    await expect(
+      publisher.assertionPromote(CG_ID, name, AGENT, {
+        publisherPeerId: PEER,
+        trustedNonManifestCatalogTriples: generatedPrivateCatalogTripleKeys(CG_ID),
+      }),
+    ).rejects.toThrow(/trustedNonManifestCatalogTriples is only allowed/);
+  });
+
+  it('promote strips finalized private-CG catalog floor for local private CGs before first registration', async () => {
+    const name = 'private-catalog-promote-local-private';
+    const cgDid = contextGraphDataUri(CG_ID);
+    await store.insert([localPrivateContextGraphQuad()]);
+    await publisher.assertionCreate(CG_ID, name, AGENT);
+    await publisher.assertionWrite(CG_ID, name, AGENT, [
+      { subject: 'urn:test:entity:catalog-content', predicate: 'http://schema.org/name', object: '"Content"' },
+      ...generatedPrivateCatalogFloorQuads(CG_ID),
+    ]);
+
+    const result = await publisher.assertionPromote(CG_ID, name, AGENT, {
+      publisherPeerId: PEER,
+      trustedNonManifestCatalogTriples: generatedPrivateCatalogTripleKeys(CG_ID),
+    });
+
+    expect(result.promotedCount).toBe(1);
+    const swmCatalog = await store.query(
+      `SELECT ?p ?o WHERE { GRAPH <${SWM_GRAPH}> { <${cgDid}> ?p ?o } }`,
+    );
+    expect(swmCatalog.type).toBe('bindings');
+    if (swmCatalog.type === 'bindings') expect(swmCatalog.bindings).toHaveLength(0);
+  });
+
+  it('rejects generated private-CG catalog floor stripping with a borrowed private on-chain id', async () => {
+    const name = 'private-catalog-promote-borrowed-id';
+    await publisher.assertionCreate(CG_ID, name, AGENT);
+    await publisher.assertionWrite(CG_ID, name, AGENT, [
+      { subject: 'urn:test:entity:catalog-content', predicate: 'http://schema.org/name', object: '"Content"' },
+      ...generatedPrivateCatalogFloorQuads(CG_ID),
+    ]);
+    await store.insert([onChainIdQuad('2')]);
+    (publisher as any).chain.getContextGraphAccessPolicy = async () => 1;
+    (publisher as any).chain.getContextGraphNameHash = async () => null;
+
+    await expect(
+      publisher.assertionPromote(CG_ID, name, AGENT, {
+        publisherPeerId: PEER,
+        trustedNonManifestCatalogTriples: generatedPrivateCatalogTripleKeys(CG_ID),
+        onChainContextGraphId: '1',
+      }),
+    ).rejects.toThrow(/trustedNonManifestCatalogTriples is only allowed/);
+  });
+
+  it('rejects local private-CG catalog floor stripping when a stored on-chain id is public', async () => {
+    const name = 'private-catalog-promote-stale-local-policy';
+    await store.insert([localPrivateContextGraphQuad(), onChainIdQuad('1')]);
+    (publisher as any).chain.getContextGraphAccessPolicy = async () => 0;
+    (publisher as any).chain.getContextGraphNameHash = async () => ethers.keccak256(ethers.toUtf8Bytes(CG_ID));
+    await publisher.assertionCreate(CG_ID, name, AGENT);
+    await publisher.assertionWrite(CG_ID, name, AGENT, [
+      { subject: 'urn:test:entity:catalog-content', predicate: 'http://schema.org/name', object: '"Content"' },
+      ...generatedPrivateCatalogFloorQuads(CG_ID),
+    ]);
+
+    await expect(
+      publisher.assertionPromote(CG_ID, name, AGENT, {
+        publisherPeerId: PEER,
+        trustedNonManifestCatalogTriples: generatedPrivateCatalogTripleKeys(CG_ID),
+      }),
+    ).rejects.toThrow(/trustedNonManifestCatalogTriples is only allowed/);
+  });
+
+  it('rejects local catalog floor stripping when agents graph declares the CG public', async () => {
+    const name = 'private-catalog-promote-agents-public';
+    await store.insert([agentsPublicContextGraphQuad(), localAllowedAgentQuad()]);
+    await publisher.assertionCreate(CG_ID, name, AGENT);
+    await publisher.assertionWrite(CG_ID, name, AGENT, [
+      { subject: 'urn:test:entity:catalog-content', predicate: 'http://schema.org/name', object: '"Content"' },
+      ...generatedPrivateCatalogFloorQuads(CG_ID),
+    ]);
+
+    await expect(
+      publisher.assertionPromote(CG_ID, name, AGENT, {
+        publisherPeerId: PEER,
+        trustedNonManifestCatalogTriples: generatedPrivateCatalogTripleKeys(CG_ID),
+      }),
+    ).rejects.toThrow(/trustedNonManifestCatalogTriples is only allowed/);
   });
 
   // Issue #864 — when the assertion data graph is empty but `_meta` says
@@ -249,7 +487,7 @@ describe('Working Memory Assertion Lifecycle', () => {
     expect(result.promotedCount).toBe(0);
   });
 
-  it('durable SWM ownership blocks cross-author promote after publisher restart with empty map', async () => {
+  it('durable SWM ownership skips (advisory) cross-author promote after publisher restart with empty map', async () => {
     const root = 'urn:test:entity:restart-owned';
     const firstAssertion = 'restart-owner-a';
     const secondAssertion = 'restart-owner-b';
@@ -285,11 +523,18 @@ describe('Working Memory Assertion Lifecycle', () => {
       { subject: root, predicate: 'http://schema.org/name', object: '"Overwritten"' },
     ]);
 
-    await expect(
-      restartedPublisher.assertionPromote(CG_ID, secondAssertion, AGENT_B, { publisherPeerId: PEER_B }),
-    ).rejects.toThrow(
-      `Cannot promote entity <${root}>: owned by peer ${PEER}, not by caller ${PEER_B}.`,
+    // OT-RFC-46 §17.4 / rc.17 D6: a cross-author promote is no longer REJECTED — the
+    // foreign-owned root is skipped (workspaceOwner is now advisory, not a hard gate).
+    // Under the still-bucket SWM the skip preserves the owner's data (no clobber); the
+    // assertions below confirm SWM content and ownership are unchanged. Once SWM is
+    // per-KA (rc.17b) the co-claim coexists in its own graph instead of being skipped.
+    const promoteResult = await restartedPublisher.assertionPromote(
+      CG_ID,
+      secondAssertion,
+      AGENT_B,
+      { publisherPeerId: PEER_B },
     );
+    expect(promoteResult.promotedCount).toBe(0);
 
     const remaining = await restartedPublisher.assertionQuery(CG_ID, secondAssertion, AGENT_B);
     expect(remaining).toHaveLength(1);
@@ -523,7 +768,7 @@ describe('Working Memory Assertion Lifecycle', () => {
     expect(result.promotedCount).toBe(0);
   });
 
-  it('promote records ShareTransition metadata in _shared_memory_meta', async () => {
+  it('RFC ka-metadata-trim P3.4: promote writes NO ShareTransition record', async () => {
     const SWM_META = `did:dkg:context-graph:${CG_ID}/_shared_memory_meta`;
     await publisher.assertionCreate(CG_ID, ASSERTION_NAME, AGENT);
     await publisher.assertionWrite(CG_ID, ASSERTION_NAME, AGENT, TRIPLES);
@@ -541,8 +786,10 @@ describe('Working Memory Assertion Lifecycle', () => {
       const shareTransitions = result.bindings.filter(
         (b) => b['type'] === 'http://dkg.io/ontology/ShareTransition',
       );
-      expect(shareTransitions.length).toBe(1);
-      expect(shareTransitions[0]['s']).toMatch(/^urn:dkg:share:/);
+      // Dropped (RFC ka-metadata-trim P3.4): the node-ui receipt hook now
+      // reads the seal-subject receipt rows directly; ShareTransition rows
+      // only exist on stores written by older nodes (read-both fallback).
+      expect(shareTransitions.length).toBe(0);
     }
   });
 
@@ -1138,6 +1385,18 @@ describe('Assertion Lifecycle Provenance (Event-Sourced, PROV-O)', () => {
     return result.bindings[0]['layer']?.replace(/^"|"$/g, '');
   }
 
+  // Read-both event shape (RFC ka-metadata-trim Phase 2): the writers no
+  // longer persist `dkg:fromLayer`/`dkg:toLayer` — they are 100% determined
+  // by the event class. Mirror the production history reader: OPTIONAL
+  // patterns for old-store rows, derived-by-class otherwise. The layer
+  // assertions in the tests below now pin the DERIVATION contract.
+  const LAYER_BY_EVENT_TYPE: Record<string, { from: string; to: string }> = {
+    AssertionCreated: { from: 'none', to: 'WM' },
+    AssertionPromoted: { from: 'WM', to: 'SWM' },
+    AssertionUpdated: { from: 'VM', to: 'VM' },
+    AssertionDiscarded: { from: 'WM', to: 'none' },
+  };
+
   async function queryEvents(name: string = ASSERTION_NAME): Promise<Array<{ type: string; fromLayer: string; toLayer: string }>> {
     const uri = assertionLifecycleUri(CG_ID, AGENT, name);
     const result = await store.query(
@@ -1149,17 +1408,21 @@ describe('Assertion Lifecycle Provenance (Event-Sourced, PROV-O)', () => {
           ?event a <${PROV}Activity> .
           ?event <${RDF_TYPE}> ?type .
           FILTER(STRSTARTS(STR(?type), "${DKG}"))
-          ?event <${DKG}fromLayer> ?from .
-          ?event <${DKG}toLayer> ?to .
+          OPTIONAL { ?event <${DKG}fromLayer> ?from }
+          OPTIONAL { ?event <${DKG}toLayer> ?to }
         }
       } ORDER BY ?event`,
     );
     if (result.type !== 'bindings') return [];
-    return result.bindings.map(b => ({
-      type: (b['type'] ?? '').replace(DKG, ''),
-      fromLayer: (b['from'] ?? '').replace(/^"|"$/g, ''),
-      toLayer: (b['to'] ?? '').replace(/^"|"$/g, ''),
-    }));
+    return result.bindings.map(b => {
+      const type = (b['type'] ?? '').replace(DKG, '');
+      const derived = LAYER_BY_EVENT_TYPE[type];
+      return {
+        type,
+        fromLayer: b['from'] ? b['from'].replace(/^"|"$/g, '') : derived?.from ?? '',
+        toLayer: b['to'] ? b['to'].replace(/^"|"$/g, '') : derived?.to ?? '',
+      };
+    });
   }
 
   it('assertionCreate writes state "created" and memoryLayer "WM"', async () => {
@@ -1210,7 +1473,7 @@ describe('Assertion Lifecycle Provenance (Event-Sourced, PROV-O)', () => {
     expect(events[1].toLayer).toBe('SWM');
   });
 
-  it('promote event records rootEntities and shareOperationId', async () => {
+  it('promote records shareOperationId on the event; member entities on the stable lifecycle subject', async () => {
     await publisher.assertionCreate(CG_ID, ASSERTION_NAME, AGENT);
     await publisher.assertionWrite(CG_ID, ASSERTION_NAME, AGENT, TRIPLES);
     await publisher.assertionPromote(CG_ID, ASSERTION_NAME, AGENT);
@@ -1226,11 +1489,21 @@ describe('Assertion Lifecycle Provenance (Event-Sourced, PROV-O)', () => {
         `SELECT ?opId WHERE { GRAPH <${META_GRAPH}> { <${eventUri}> <${DKG}shareOperationId> ?opId } } LIMIT 1`,
       );
       expect(opResult.type === 'bindings' && opResult.bindings.length).toBeGreaterThan(0);
-      const entityResult = await store.query(
+      // RFC ka-metadata-trim Phase 2: the event node no longer duplicates
+      // the member list — the SUBSTRATE-1 stamp on the stable lifecycle
+      // subject is the canonical member index (read-both for old rows).
+      const eventEntityResult = await store.query(
         `SELECT ?entity WHERE { GRAPH <${META_GRAPH}> { <${eventUri}> <${DKG}rootEntity> ?entity } }`,
       );
-      if (entityResult.type === 'bindings') {
-        expect(entityResult.bindings.length).toBeGreaterThanOrEqual(2);
+      if (eventEntityResult.type === 'bindings') {
+        expect(eventEntityResult.bindings.length).toBe(0);
+      }
+      const subjectEntityResult = await store.query(
+        `SELECT ?entity WHERE { GRAPH <${META_GRAPH}> { <${uri}> <${DKG}rootEntity> ?entity } }`,
+      );
+      expect(subjectEntityResult.type).toBe('bindings');
+      if (subjectEntityResult.type === 'bindings') {
+        expect(subjectEntityResult.bindings.length).toBeGreaterThanOrEqual(2);
       }
     }
   });

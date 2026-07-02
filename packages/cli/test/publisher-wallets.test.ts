@@ -140,6 +140,30 @@ describe('publisher wallets', () => {
     ).rejects.toThrow('dkg publisher wallet add <privateKey>');
   });
 
+  it('resolves publisher chain defaults from config.networkConfig', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'dkg-publisher-runtime-'));
+    const wallet = ethers.Wallet.createRandom();
+    await addPublisherWallet(dataDir, wallet.privateKey);
+
+    // Selecting a still-pre-deployment mainnet must surface the network
+    // readiness gate before any chain wiring. NeuroWeb is the remaining gated
+    // chain (Base + Gnosis were un-gated in #1292), so use it here.
+    await expect(
+      createPublisherRuntime({
+        dataDir,
+        config: {
+          name: 'test-node',
+          networkConfig: 'mainnet-neuroweb',
+          apiPort: 9200,
+          listenPort: 0,
+          nodeRole: 'edge',
+          contextGraphs: [],
+          store: { backend: 'oxigraph' },
+        },
+      }),
+    ).rejects.toThrow(/DKG V10 NeuroWeb Mainnet is marked pre-deployment/);
+  });
+
   it('bootstraps publisher runtime from an existing agent store', async () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'dkg-publisher-runtime-'));
     const wallet = ethers.Wallet.createRandom();

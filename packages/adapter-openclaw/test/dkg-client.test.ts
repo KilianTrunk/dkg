@@ -319,62 +319,10 @@ describe('DkgDaemonClient', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Workspace write
-  // ---------------------------------------------------------------------------
-
-  it('share should POST quads to /api/shared-memory/write with localOnly defaulted to false', async () => {
-    // SWM gossips to peers in the context graph's allowlist by default —
-    // privacy is governed by the CG's curation policy, not by suppressing
-    // gossip. Aligned with Hermes adapter's default and the daemon's own
-    // default at packages/cli/src/daemon/routes/memory.ts:490
-    // (`const localOnly = parsed.localOnly === true`).
-    fetchResponses.push(
-      new Response(JSON.stringify({ shareOperationId: 'op-1' }), { status: 200 }),
-    );
-
-    const quads = [{ subject: 'urn:a', predicate: 'urn:b', object: '"hello"' }];
-    await client.share('research-x', quads);
-
-    const body = JSON.parse(fetchCalls[0][1]?.body as string);
-    expect(body.contextGraphId).toBe('research-x');
-    expect(body.quads).toHaveLength(1);
-    expect(body.localOnly).toBe(false);
-  });
-
-  it('share should pass through localOnly:true when the caller explicitly opts in', async () => {
-    fetchResponses.push(
-      new Response(JSON.stringify({ shareOperationId: 'op-2' }), { status: 200 }),
-    );
-
-    const quads = [{ subject: 'urn:a', predicate: 'urn:b', object: '"hello"' }];
-    await client.share('research-x', quads, { localOnly: true });
-
-    const body = JSON.parse(fetchCalls[0][1]?.body as string);
-    expect(body.localOnly).toBe(true);
-  });
-
-  it('share should forward explicit team-visible sub-graph writes', async () => {
-    fetchResponses.push(
-      new Response(JSON.stringify({ shareOperationId: 'op-2' }), { status: 200 }),
-    );
-
-    const quads = [{ subject: 'urn:a', predicate: 'urn:b', object: '"hello"' }];
-    await client.share('research-x', quads, { localOnly: false, subGraphName: 'protocols' });
-
-    const body = JSON.parse(fetchCalls[0][1]?.body as string);
-    expect(body).toEqual({
-      contextGraphId: 'research-x',
-      quads,
-      localOnly: false,
-      subGraphName: 'protocols',
-    });
-  });
-
-  // ---------------------------------------------------------------------------
   // Working Memory assertion lifecycle
   // ---------------------------------------------------------------------------
 
-  it('createAssertion should POST to /api/assertion/create', async () => {
+  it('createAssertion should POST to /api/knowledge-assets', async () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
       new Response(JSON.stringify({ assertionUri: 'urn:test:assertion:1' }), { status: 200 }),
     );
@@ -382,7 +330,7 @@ describe('DkgDaemonClient', () => {
     const result = await client.createAssertion('agent-context', 'chat-turns');
 
     const [url, opts] = fetchSpy.mock.calls[0];
-    expect(url).toBe('http://localhost:9200/api/assertion/create');
+    expect(url).toBe('http://localhost:9200/api/knowledge-assets');
     expect(opts?.method).toBe('POST');
     const body = JSON.parse(opts?.body as string);
     expect(body.contextGraphId).toBe('agent-context');
@@ -419,7 +367,7 @@ describe('DkgDaemonClient', () => {
     expect(body.subGraphName).toBe('protocols');
   });
 
-  it('writeAssertion should POST to /api/assertion/:name/write with URL-encoded name', async () => {
+  it('writeAssertion should POST to /api/knowledge-assets/:name/wm/write with URL-encoded name', async () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
       new Response(JSON.stringify({ written: 3 }), { status: 200 }),
     );
@@ -432,7 +380,7 @@ describe('DkgDaemonClient', () => {
     const result = await client.writeAssertion('agent-context', 'chat-turns', quads);
 
     const [url, opts] = fetchSpy.mock.calls[0];
-    expect(url).toBe('http://localhost:9200/api/assertion/chat-turns/write');
+    expect(url).toBe('http://localhost:9200/api/knowledge-assets/chat-turns/wm/write');
     expect(opts?.method).toBe('POST');
     const body = JSON.parse(opts?.body as string);
     expect(body.contextGraphId).toBe('agent-context');
@@ -460,8 +408,8 @@ describe('DkgDaemonClient', () => {
   // destructure, plus URL-encodes the assertion name.
   // ---------------------------------------------------------------------------
 
-  it('promoteAssertion hits /api/assertion/:name/promote with camelCase body', async () => {
-    fetchResponses.push(new Response(JSON.stringify({ promoted: 1 }), { status: 200 }));
+  it('promoteAssertion hits /api/knowledge-assets/:name/swm/share with camelCase body', async () => {
+    fetchResponses.push(new Response(JSON.stringify({ swmShared: true, promotedCount: 1 }), { status: 200 }));
 
     await client.promoteAssertion('ctx', 'chat-turns', {
       entities: ['urn:a', 'urn:b'],
@@ -469,7 +417,7 @@ describe('DkgDaemonClient', () => {
     });
 
     const [url, opts] = fetchCalls[0];
-    expect(url).toBe('http://localhost:9200/api/assertion/chat-turns/promote');
+    expect(url).toBe('http://localhost:9200/api/knowledge-assets/chat-turns/swm/share');
     expect(opts?.method).toBe('POST');
     const body = JSON.parse(opts?.body as string);
     expect(body).toEqual({
@@ -482,32 +430,34 @@ describe('DkgDaemonClient', () => {
   it('promoteAssertion URL-encodes assertion names containing slashes or spaces', async () => {
     fetchResponses.push(new Response(JSON.stringify({}), { status: 200 }));
     await client.promoteAssertion('ctx', 'weird name/with slash');
-    expect(String(fetchCalls[0][0])).toBe('http://localhost:9200/api/assertion/weird%20name%2Fwith%20slash/promote');
+    expect(String(fetchCalls[0][0])).toBe('http://localhost:9200/api/knowledge-assets/weird%20name%2Fwith%20slash/swm/share');
   });
 
-  it('discardAssertion hits /api/assertion/:name/discard with camelCase body', async () => {
+  it('discardAssertion hits /api/knowledge-assets/:name/wm/discard with camelCase body', async () => {
     fetchResponses.push(new Response(JSON.stringify({ discarded: true }), { status: 200 }));
 
     await client.discardAssertion('ctx', 'draft', { subGraphName: 'scratch' });
 
     const [url, opts] = fetchCalls[0];
-    expect(url).toBe('http://localhost:9200/api/assertion/draft/discard');
+    expect(url).toBe('http://localhost:9200/api/knowledge-assets/draft/wm/discard');
     expect(opts?.method).toBe('POST');
     const body = JSON.parse(opts?.body as string);
     expect(body).toEqual({ contextGraphId: 'ctx', subGraphName: 'scratch' });
   });
 
-  it('queryAssertion hits /api/assertion/:name/query as POST with { contextGraphId, subGraphName } only', async () => {
+  it('queryAssertion hits /api/knowledge-assets/:name/wm/quads as GET with { contextGraphId, subGraphName } query params', async () => {
     fetchResponses.push(new Response(JSON.stringify({ quads: [], count: 0 }), { status: 200 }));
 
     await client.queryAssertion('ctx', 'chat-turns', { subGraphName: 'protocols' });
 
     const [url, opts] = fetchCalls[0];
-    expect(url).toBe('http://localhost:9200/api/assertion/chat-turns/query');
-    expect(opts?.method).toBe('POST');
-    const body = JSON.parse(opts?.body as string);
-    expect(body).toEqual({ contextGraphId: 'ctx', subGraphName: 'protocols' });
-    expect(body).not.toHaveProperty('sparql');
+    expect(opts?.method ?? 'GET').toBe('GET');
+    const parsed = new URL(String(url));
+    expect(parsed.pathname).toBe('/api/knowledge-assets/chat-turns/wm/quads');
+    expect(parsed.searchParams.get('contextGraphId')).toBe('ctx');
+    expect(parsed.searchParams.get('subGraphName')).toBe('protocols');
+    expect(parsed.searchParams.get('sparql')).toBeNull();
+    expect(opts?.body).toBeUndefined();
   });
 
   it('resolveImportArtifact POSTs the completed ref to the resolver route', async () => {
@@ -521,7 +471,7 @@ describe('DkgDaemonClient', () => {
     });
 
     const [url, opts] = fetchCalls[0];
-    expect(url).toBe('http://localhost:9200/api/assertion/import-artifact/resolve');
+    expect(url).toBe('http://localhost:9200/api/knowledge-assets/import-artifact/resolve');
     expect(opts?.method).toBe('POST');
     expect(JSON.parse(opts?.body as string)).toEqual({
       contextGraphId: 'ctx',
@@ -541,7 +491,7 @@ describe('DkgDaemonClient', () => {
     });
 
     const [url, opts] = fetchCalls[0];
-    expect(url).toBe('http://localhost:9200/api/assertion/import-artifact/read-markdown');
+    expect(url).toBe('http://localhost:9200/api/knowledge-assets/import-artifact/read-markdown');
     expect(opts?.method).toBe('POST');
     expect(JSON.parse(opts?.body as string)).toEqual({
       contextGraphId: 'ctx',
@@ -565,7 +515,7 @@ describe('DkgDaemonClient', () => {
     });
 
     const [url, opts] = fetchCalls[0];
-    expect(url).toBe('http://localhost:9200/api/assertion/semantic-enrichment/write');
+    expect(url).toBe('http://localhost:9200/api/knowledge-assets/semantic-enrichment/write');
     expect(opts?.method).toBe('POST');
     const body = JSON.parse(opts?.body as string);
     expect(body).toEqual({
@@ -584,7 +534,7 @@ describe('DkgDaemonClient', () => {
     expect(body).not.toHaveProperty('publish');
   });
 
-  it('getAssertionHistory hits /api/assertion/:name/history as GET with camelCase query params', async () => {
+  it('getAssertionHistory hits /api/knowledge-assets/:name as GET with camelCase query params', async () => {
     fetchResponses.push(new Response(JSON.stringify({ createdAt: 't' }), { status: 200 }));
 
     await client.getAssertionHistory('ctx', 'chat-turns', {
@@ -595,14 +545,14 @@ describe('DkgDaemonClient', () => {
     const [url, opts] = fetchCalls[0];
     expect(opts?.method ?? 'GET').toBe('GET');
     const parsed = new URL(String(url));
-    expect(parsed.pathname).toBe('/api/assertion/chat-turns/history');
+    expect(parsed.pathname).toBe('/api/knowledge-assets/chat-turns');
     expect(parsed.searchParams.get('contextGraphId')).toBe('ctx');
     expect(parsed.searchParams.get('agentAddress')).toBe('0xabc');
     expect(parsed.searchParams.get('subGraphName')).toBe('protocols');
     expect(opts?.body).toBeUndefined();
   });
 
-  it('importAssertionFile hits /api/assertion/:name/import-file as POST multipart with camelCase form fields', async () => {
+  it('importAssertionFile hits /api/knowledge-assets/:name/wm/import-file as POST multipart with camelCase form fields', async () => {
     fetchResponses.push(new Response(JSON.stringify({ assertionUri: 'urn:x' }), { status: 200 }));
 
     const buf = new Uint8Array([1, 2, 3, 4]);
@@ -613,9 +563,9 @@ describe('DkgDaemonClient', () => {
     });
 
     const [url, opts] = fetchCalls[0];
-    expect(url).toBe('http://localhost:9200/api/assertion/notes/import-file');
+    expect(url).toBe('http://localhost:9200/api/knowledge-assets/notes/wm/import-file');
     expect(opts?.method).toBe('POST');
-    // `body` must be a FormData — Node's fetch sets the multipart boundary automatically.
+    // `body` must be a FormData -- Node's fetch sets the multipart boundary automatically.
     expect(opts?.body).toBeInstanceOf(FormData);
     const form = opts?.body as FormData;
     expect(form.get('contextGraphId')).toBe('ctx');
@@ -662,57 +612,6 @@ describe('DkgDaemonClient', () => {
     expect(parsed.pathname).toBe('/api/sub-graph/list');
     expect(parsed.searchParams.get('contextGraphId')).toBe('ctx');
     expect(opts?.body).toBeUndefined();
-  });
-
-  it('publishSharedMemory hits /api/shared-memory/publish with selection="all" default and clearAfter=true', async () => {
-    fetchResponses.push(new Response(JSON.stringify({ kaId: 'kc-1', status: 'ok', kas: [] }), { status: 200 }));
-
-    await client.publishSharedMemory('ctx');
-
-    const [url, opts] = fetchCalls[0];
-    expect(url).toBe('http://localhost:9200/api/shared-memory/publish');
-    expect(opts?.method).toBe('POST');
-    const body = JSON.parse(opts?.body as string);
-    expect(body).toEqual({ contextGraphId: 'ctx', selection: 'all', clearAfter: true });
-  });
-
-  it('publishSharedMemory forwards rootEntities as selection array and honors clearAfter:false', async () => {
-    fetchResponses.push(new Response(JSON.stringify({ kaId: 'kc-2', status: 'ok', kas: [] }), { status: 200 }));
-
-    await client.publishSharedMemory('ctx', {
-      rootEntities: ['urn:a', 'urn:b'],
-      clearAfter: false,
-    });
-
-    const body = JSON.parse(fetchCalls[0][1]?.body as string);
-    expect(body).toEqual({ contextGraphId: 'ctx', selection: ['urn:a', 'urn:b'], clearAfter: false });
-  });
-
-  it('publishSharedMemory defaults clearAfter=false for subset publishes to protect unpublished roots', async () => {
-    fetchResponses.push(new Response(JSON.stringify({ kaId: 'kc-3', status: 'ok', kas: [] }), { status: 200 }));
-
-    await client.publishSharedMemory('ctx', { rootEntities: ['urn:a'] });
-
-    const body = JSON.parse(fetchCalls[0][1]?.body as string);
-    expect(body).toEqual({ contextGraphId: 'ctx', selection: ['urn:a'], clearAfter: false });
-  });
-
-  it('publishSharedMemory honors explicit clearAfter=true with rootEntities when caller opts in', async () => {
-    fetchResponses.push(new Response(JSON.stringify({ kaId: 'kc-4', status: 'ok', kas: [] }), { status: 200 }));
-
-    await client.publishSharedMemory('ctx', { rootEntities: ['urn:a'], clearAfter: true });
-
-    const body = JSON.parse(fetchCalls[0][1]?.body as string);
-    expect(body.clearAfter).toBe(true);
-  });
-
-  it('publishSharedMemory forwards subGraphName into the request body when provided', async () => {
-    fetchResponses.push(new Response(JSON.stringify({ kaId: 'kc-5', status: 'ok', kas: [] }), { status: 200 }));
-
-    await client.publishSharedMemory('ctx', { subGraphName: 'protocols' });
-
-    const body = JSON.parse(fetchCalls[0][1]?.body as string);
-    expect(body.subGraphName).toBe('protocols');
   });
 
   // ---------------------------------------------------------------------------
@@ -861,58 +760,8 @@ describe('DkgDaemonClient', () => {
     expect(url).toContain('since=1710000000000');
   });
 
-  // ---------------------------------------------------------------------------
-  // Publish
-  // ---------------------------------------------------------------------------
-
-  it('publish should create an assertion then publish it from SWM', async () => {
-    // V10 assertion lifecycle (Phase B-1/B-2): the openclaw client now
-    // routes through `/api/assertion/create` (which writes the quads to
-    // SWM and finalizes the EIP-712 seal in one daemon hop) followed by
-    // `/api/shared-memory/publish` to lift the assertion to VM. The
-    // legacy `/api/shared-memory/write` route is gone.
-    fetchResponses.push(
-      new Response(JSON.stringify({ assertionUri: 'urn:assertion:test' }), { status: 200 }),
-      new Response(JSON.stringify({ kaId: 'kc-1' }), { status: 200 }),
-    );
-
-    const quads = [{ subject: 'urn:a', predicate: 'urn:b', object: '"value"' }];
-    const result = await client.publish('testing', quads);
-    expect(result.kaId).toBe('kc-1');
-
-    expect(fetchCalls).toHaveLength(2);
-    const [createUrl, createOpts] = fetchCalls[0];
-    expect(createUrl).toBe('http://localhost:9200/api/assertion/create');
-    expect(createOpts?.method).toBe('POST');
-    const createBody = JSON.parse(createOpts?.body as string);
-    expect(createBody.contextGraphId).toBe('testing');
-    expect(createBody.quads).toHaveLength(1);
-    expect(createBody.finalize).toBe(true);
-
-    const [pubUrl, pubOpts] = fetchCalls[1];
-    expect(pubUrl).toBe('http://localhost:9200/api/shared-memory/publish');
-    expect(pubOpts?.method).toBe('POST');
-    const pubBody = JSON.parse(pubOpts?.body as string);
-    expect(pubBody.contextGraphId).toBe('testing');
-    expect(pubBody.assertionName).toMatch(/^openclaw-publish-/);
-  });
-
-  it('publish should reject privateQuads', async () => {
-    const quads = [{ subject: 'urn:a', predicate: 'urn:b', object: '"public"' }];
-    const privateQuads = [{ subject: 'urn:a', predicate: 'urn:c', object: '"secret"' }];
-    await expect(client.publish('testing', quads, privateQuads)).rejects.toThrow(
-      /not supported in the V10/,
-    );
-  });
-
-  it('publish should reject accessPolicy and allowedPeers', async () => {
-    const quads = [{ subject: 'urn:a', predicate: 'urn:b', object: '"val"' }];
-    await expect(
-      client.publish('testing', quads, undefined, {
-        accessPolicy: 'allowList',
-        allowedPeers: ['12D3peer1', '12D3peer2'],
-      }),
-    ).rejects.toThrow(/not supported in the V10/);
+  it('does not expose the retired direct explicit-quads publish helper', () => {
+    expect((client as any).publish).toBeUndefined();
   });
 
   // ---------------------------------------------------------------------------
@@ -945,7 +794,7 @@ describe('DkgDaemonClient', () => {
     expect(body.id).toBe('my-research');
     expect(body.name).toBe('My Research');
     expect(body.description).toBe('A research context graph');
-    // No accessPolicy/allowedAgents passed when caller omits opts — the
+    // No accessPolicy/allowedAgents passed when caller omits opts -- the
     // tool handler decides the default privacy-mode. The client itself
     // is parameter-passing only.
     expect(body.accessPolicy).toBeUndefined();
@@ -991,7 +840,7 @@ describe('DkgDaemonClient', () => {
 
     const body = JSON.parse(fetchCalls[0][1]?.body as string);
     expect(body.accessPolicy).toBe(1);
-    // Empty array is dropped — daemon distinguishes "no allowlist" from
+    // Empty array is dropped -- daemon distinguishes "no allowlist" from
     // "empty allowlist". Sending [] would unhelpfully pin an empty
     // allowlist when the agent's creator-auto-include logic should
     // populate it.
@@ -1107,7 +956,7 @@ describe('DkgDaemonClient', () => {
     expect(token === undefined || typeof token === 'string').toBe(true);
   });
 
-  // ── OT-RFC-43 §10.5 — GitHub-shaped Knowledge Asset client ──────────────
+  // -- OT-RFC-43 Section 10.5 -- GitHub-shaped Knowledge Asset client --------------
   describe('knowledge-assets surface', () => {
     const ok = (body: unknown = {}) =>
       fetchResponses.push(new Response(JSON.stringify(body), { status: 200 }));
@@ -1125,6 +974,65 @@ describe('DkgDaemonClient', () => {
       expect(body()).toMatchObject({ contextGraphId: 'cg-1', name: 'f', alsoShareSwm: true });
     });
 
+    it('createKnowledgeAsset forwards finalize:false for a draft-only write', async () => {
+      ok({ name: 'f', written: 1, status: 'draft-open' });
+      await client.createKnowledgeAsset('cg-1', 'f', {
+        finalize: false,
+        quads: [{ subject: 's', predicate: 'p', object: 'o', graph: '' }],
+      });
+      expect(url()).toBe('http://localhost:9200/api/knowledge-assets');
+      expect(body()).toMatchObject({ contextGraphId: 'cg-1', name: 'f', finalize: false });
+    });
+
+    it('createKnowledgeAsset omits finalize when unspecified, but defaults alsoShareSwm:true (seal+share)', async () => {
+      // #1116 D5: quads present + finalize unspecified => the draft seals (server
+      // default), so the combined CLIENT function also defaults alsoShareSwm to
+      // true. `finalize` is still omitted (the server defaults it to seal).
+      ok({ name: 'f', status: 'swm-shared' });
+      await client.createKnowledgeAsset('cg-1', 'f', {
+        quads: [{ subject: 's', predicate: 'p', object: 'o', graph: '' }],
+      });
+      expect(body()).not.toHaveProperty('finalize');
+      expect(body().alsoShareSwm).toBe(true);
+    });
+
+    it('createKnowledgeAsset does NOT default alsoShareSwm when finalize:false (no seal => no share)', async () => {
+      // #1116 D5: an unsealed draft can't be shared, so the client must NOT
+      // default-on alsoShareSwm -- the route guard would otherwise reject it.
+      ok({ name: 'f', status: 'draft-open' });
+      await client.createKnowledgeAsset('cg-1', 'f', {
+        finalize: false,
+        quads: [{ subject: 's', predicate: 'p', object: 'o', graph: '' }],
+      });
+      expect(body()).not.toHaveProperty('alsoShareSwm');
+    });
+
+    it('createKnowledgeAsset does NOT default alsoShareSwm without quads', async () => {
+      // No quads => nothing to seal => no auto-share default.
+      ok({ name: 'f', status: 'draft-open' });
+      await client.createKnowledgeAsset('cg-1', 'f');
+      expect(body()).not.toHaveProperty('alsoShareSwm');
+    });
+
+    it('createKnowledgeAsset honors an explicit alsoShareSwm:false over the seal-default', async () => {
+      // An explicit false must win -- stop at a sealed WM draft.
+      ok({ name: 'f', status: 'wm-sealed' });
+      await client.createKnowledgeAsset('cg-1', 'f', {
+        quads: [{ subject: 's', predicate: 'p', object: 'o', graph: '' }],
+        alsoShareSwm: false,
+      });
+      expect(body().alsoShareSwm).toBe(false);
+    });
+
+    it('createKnowledgeAsset rejects finalize-only fields when finalize:false (parity with daemon)', async () => {
+      await expect(client.createKnowledgeAsset('cg-1', 'f', {
+        authorAgentAddress: '0xauthor',
+        finalize: false,
+        quads: [{ subject: 's', predicate: 'p', object: 'o', graph: '' }],
+      })).rejects.toThrow(/require non-empty quads and finalize !== false/);
+      expect(fetchCalls).toHaveLength(0);
+    });
+
     it('knowledgeAssetWrite URL-encodes the name and POSTs to .../wm/write', async () => {
       ok({ written: 2 });
       await client.knowledgeAssetWrite('cg-1', 'meeting notes', [
@@ -1132,6 +1040,21 @@ describe('DkgDaemonClient', () => {
       ]);
       expect(url()).toBe('http://localhost:9200/api/knowledge-assets/meeting%20notes/wm/write');
       expect(body().quads).toHaveLength(1);
+    });
+
+    it('knowledgeAssetWrite strips any per-quad `graph` at the client (CONTRACT Section A)', async () => {
+      ok({ written: 1 });
+      // Even a NON-EMPTY graph must be dropped before the POST -- the daemon pins
+      // every quad to the per-KA WM graph, so the write wire shape is
+      // {subject,predicate,object} only. Stripping at the client (not just the
+      // tool schema) defends a hand-built or normalizer-emitted `graph`.
+      await client.knowledgeAssetWrite('cg-1', 'notes', [
+        { subject: 's', predicate: 'p', object: 'o', graph: 'urn:my-graph:forged' },
+      ]);
+      const quads = body().quads as Array<Record<string, unknown>>;
+      expect(quads).toHaveLength(1);
+      expect(quads[0]).not.toHaveProperty('graph');
+      expect(quads[0]).toEqual({ subject: 's', predicate: 'p', object: 'o' });
     });
 
     it('knowledgeAssetPullFrom sends layer + onConflict to .../wm/pull-from', async () => {
@@ -1201,9 +1124,9 @@ describe('DkgDaemonClient', () => {
 
     it('knowledgeAssetFinalize forwards preSignedAuthorAttestation', async () => {
       ok({ merkleRoot: '0xroot', eip712Digest: '0xdig' });
-      const preSignedAuthorAttestation = { address: '0xauthor', signature: { r: '0xr', vs: '0xvs' } };
+      const preSignedAuthorAttestation = { address: '0xauthor', reservedKaId: '1', signature: { r: '0xr', vs: '0xvs' } };
       await client.knowledgeAssetFinalize('cg-1', 'f', {
-        preSignedAuthorAttestation: { address: '0xauthor', signature: { r: '0xr', vs: '0xvs' } },
+        preSignedAuthorAttestation: { address: '0xauthor', reservedKaId: '1', signature: { r: '0xr', vs: '0xvs' } },
         schemeVersion: 1,
       });
       expect(url()).toBe('http://localhost:9200/api/knowledge-assets/f/wm/finalize');
@@ -1217,7 +1140,7 @@ describe('DkgDaemonClient', () => {
     it('knowledgeAssetFinalize rejects mutually exclusive authorship fields before HTTP serialization', async () => {
       await expect(client.knowledgeAssetFinalize('cg-1', 'f', {
         authorAgentAddress: '0xauthor',
-        preSignedAuthorAttestation: { address: '0xauthor', signature: { r: '0xr', vs: '0xvs' } },
+        preSignedAuthorAttestation: { address: '0xauthor', reservedKaId: '1', signature: { r: '0xr', vs: '0xvs' } },
       })).rejects.toThrow('authorAgentAddress and preSignedAuthorAttestation are mutually exclusive');
       expect(fetchCalls).toHaveLength(0);
     });
@@ -1225,7 +1148,7 @@ describe('DkgDaemonClient', () => {
     it('createKnowledgeAsset rejects mutually exclusive authorship fields before HTTP serialization', async () => {
       await expect(client.createKnowledgeAsset('cg-1', 'f', {
         authorAgentAddress: '0xauthor',
-        preSignedAuthorAttestation: { address: '0xauthor', signature: { r: '0xr', vs: '0xvs' } },
+        preSignedAuthorAttestation: { address: '0xauthor', reservedKaId: '1', signature: { r: '0xr', vs: '0xvs' } },
       })).rejects.toThrow('authorAgentAddress and preSignedAuthorAttestation are mutually exclusive');
       expect(fetchCalls).toHaveLength(0);
     });

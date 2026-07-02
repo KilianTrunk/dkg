@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { dkgAuthTokenPath } from '@origintrail-official/dkg-core';
+import { computeNetworkId } from '../../core/src/genesis.js';
 import {
   loadNetworkConfig,
   loadConfig,
@@ -23,9 +24,11 @@ import {
   classifyMonorepoInit,
   sharedHomeInitGate,
   repoDir,
+  resolveNetworkConfigName,
   resolveAutoUpdateSource,
   resolveApprovalPolicy,
   resolveChainConfig,
+  resolveReadyChainConfig,
 } from '../src/config.js';
 
 describe('classifyMonorepoInit (dkg init monorepo home guard — issue #960)', () => {
@@ -140,7 +143,142 @@ describe('loadNetworkConfig', () => {
       expect(config).toBeNull();
       return;
     }
-    expect(config.networkName).toMatch(/testnet/i);
+    expect(config.networkName).toBe('DKG V10 Base Testnet');
+    expect((config as any).genesisId).toBe('base-testnet');
+    expect(config.networkId).toBe('7449c543ff04a550b2dafa999fe8ee577a00b212023bb4d4244e8d58a4792c7b');
+  });
+
+  it('loads mainnet prep configs without activating testnet genesis or relays', async () => {
+    const { _resetNetworkConfigCache } = await import('../src/config.js');
+    const testnetNetworkId = '7449c543ff04a550b2dafa999fe8ee577a00b212023bb4d4244e8d58a4792c7b';
+    const sharedMainnetPrep = {
+      genesisVersion: 1,
+      relays: [
+        '/ip4/178.105.87.39/tcp/9090/p2p/PEER_ID_SOLARIS',
+        '/ip4/178.105.105.102/tcp/9090/p2p/PEER_ID_LUNARIS',
+        '/ip4/178.156.214.4/tcp/9090/p2p/PEER_ID_ORIONIS',
+        '/ip4/178.105.111.185/tcp/9090/p2p/PEER_ID_KEPLER',
+      ],
+      defaultContextGraphs: [],
+      defaultNodeRole: 'edge',
+      // Mainnet tracks a dedicated `mainnet` dist-tag channel (stable-only),
+      // NOT `latest` — so no node ever follows whatever `latest` points at.
+      autoUpdate: {
+        enabled: true,
+        repo: 'OriginTrail/dkg',
+        branch: 'main',
+        checkIntervalMinutes: 5,
+        channel: 'mainnet',
+        allowPrerelease: false,
+      },
+    };
+    _resetNetworkConfigCache();
+    const testnetConfig = await loadNetworkConfig('testnet');
+    const testnetRelays = testnetConfig?.relays ?? [];
+    const mainnets = [
+      {
+        name: 'mainnet-base',
+        networkName: 'DKG V10 Base Mainnet',
+        genesisId: 'base-mainnet',
+        networkId: '562ea760dbe27fb4233d58dfc958bbddf844b82596ec3d51dff98718e6bf61ca',
+        chainName: 'base',
+        chainId: 'base:8453',
+        rpcUrl: 'https://mainnet.base.org',
+        // Default multi-RPC backups shipped with the overlay (failover engine).
+        rpcUrls: ['https://base-rpc.publicnode.com', 'https://base.drpc.org'],
+        hubAddress: '0x99Aa571fD5e681c2D27ee08A7b7989DB02541d13',
+        // Relays populated + pre-deployment gate lifted (#1292).
+        pending: false,
+      },
+      {
+        name: 'mainnet-gnosis',
+        networkName: 'DKG V10 Gnosis Mainnet',
+        genesisId: 'gnosis-mainnet',
+        networkId: 'e08a9fb72a648ec2eb2fd9c152ded90a8ad67bb56f27df4781d9bb7e261fb7a7',
+        chainName: 'gnosis',
+        chainId: 'gnosis:100',
+        rpcUrl: 'https://rpc.gnosischain.com',
+        // Default multi-RPC backups shipped with the overlay (failover engine).
+        rpcUrls: ['https://gnosis-rpc.publicnode.com', 'https://gnosis.drpc.org'],
+        hubAddress: '0x882D0BF07F956b1b94BBfe9E77F47c6fc7D4EC8f',
+        // Relays populated + pre-deployment gate lifted (#1292).
+        pending: false,
+      },
+      {
+        name: 'mainnet-neuroweb',
+        networkName: 'DKG V10 NeuroWeb Mainnet',
+        genesisId: 'neuroweb-mainnet',
+        networkId: '83698bd2a305d6261169bfe96dd7c2f8aa9d24bee92150eee949a9a89bb68729',
+        chainName: 'neuroweb',
+        chainId: 'neuroweb:2043',
+        rpcUrl: 'https://astrosat-parachain-rpc.origin-trail.network',
+        hubAddress: '0x0957e25BD33034948abc28204ddA54b6E1142D6F',
+        // Relays not provisioned yet — still pre-deployment gated.
+        pending: true,
+      },
+    ];
+
+    for (const expected of mainnets) {
+      _resetNetworkConfigCache();
+      const config = await loadNetworkConfig(expected.name);
+      expect(config).not.toBeNull();
+      const cfg = config! as any;
+
+      // Invariants for every mainnet preset, gated or live: it must never
+      // inherit the testnet genesis/relays, and its identity + chain wiring
+      // must match the committed values.
+      expect(cfg.networkId).not.toBe(testnetNetworkId);
+      expect(cfg.relays).not.toEqual(testnetRelays);
+      expect(cfg.networkName).toBe(expected.networkName);
+      expect(cfg.genesisId).toBe(expected.genesisId);
+      expect(cfg.networkId).toBe(expected.networkId);
+      expect(await computeNetworkId(expected.genesisId)).toBe(expected.networkId);
+      // Active networks (base/gnosis) ship default rpcUrls backups so the
+      // failover engine is enabled out of the box; the pre-deployment-gated
+      // neuroweb overlay intentionally stays single-RPC (no rpcUrls key).
+      expect(cfg.chain).toEqual({
+        name: expected.chainName,
+        type: 'evm',
+        chainId: expected.chainId,
+        rpcUrl: expected.rpcUrl,
+        ...(expected.rpcUrls ? { rpcUrls: expected.rpcUrls } : {}),
+        hubAddress: expected.hubAddress,
+      });
+      // Non-relay prep fields are identical across all mainnets regardless of
+      // readiness (relays are asserted per-readiness below).
+      expect({
+        genesisVersion: cfg.genesisVersion,
+        defaultContextGraphs: cfg.defaultContextGraphs,
+        defaultNodeRole: cfg.defaultNodeRole,
+        autoUpdate: cfg.autoUpdate,
+      }).toEqual({
+        genesisVersion: sharedMainnetPrep.genesisVersion,
+        defaultContextGraphs: sharedMainnetPrep.defaultContextGraphs,
+        defaultNodeRole: sharedMainnetPrep.defaultNodeRole,
+        autoUpdate: sharedMainnetPrep.autoUpdate,
+      });
+
+      if (expected.pending) {
+        // Still pre-deployment: the readiness gate (config.ts) refuses these
+        // via the `_status` marker AND the placeholder relay PeerIDs.
+        expect(cfg._status).toMatch(/pre-deployment: replace PEER_ID_\* relay values before enabling/);
+        expect(cfg._status).not.toContain('PLACEHOLDER_MAINNET_NETWORK_ID');
+        expect(cfg.relays).toEqual(sharedMainnetPrep.relays);
+        for (const relay of cfg.relays) {
+          expect(relay).toMatch(/^\/ip4\/178\./);
+          expect(relay).toMatch(/\/p2p\/PEER_ID_/);
+        }
+      } else {
+        // Live: pre-deployment gate lifted — no `_status`, and every relay
+        // carries a real libp2p PeerID (no placeholder), so the node boots.
+        expect(cfg._status).toBeUndefined();
+        expect(cfg.relays.length).toBeGreaterThan(0);
+        for (const relay of cfg.relays) {
+          expect(relay).not.toContain('PEER_ID_');
+          expect(relay).toMatch(/^\/ip4\/\d+\.\d+\.\d+\.\d+\/tcp\/\d+\/p2p\/12D3KooW[1-9A-HJ-NP-Za-km-z]+$/);
+        }
+      }
+    }
   });
 
   it('returns null when network config file does not exist', async () => {
@@ -311,6 +449,25 @@ describe('localAgentIntegrations config round-trip', () => {
     expect(readNodeRoleFromConfigSync()).toBe('edge');
   });
 
+  it('round-trips networkConfig through saveConfig/loadConfig (network selector)', async () => {
+    await saveConfig({
+      name: 'test-node',
+      networkConfig: 'mainnet-base',
+      apiPort: 9200,
+      listenPort: 0,
+      nodeRole: 'core',
+    });
+
+    const loaded = await loadConfig();
+    expect(loaded.networkConfig).toBe('mainnet-base');
+    expect(resolveNetworkConfigName(loaded)).toBe('mainnet-base');
+  });
+
+  it('falls back to project default network when networkConfig is unset or blank', () => {
+    expect(resolveNetworkConfigName({})).toBe('testnet');
+    expect(resolveNetworkConfigName({ networkConfig: '   ' })).toBe('testnet');
+  });
+
   it('round-trips relayServerCapacity through saveConfig/loadConfig (operator override)', async () => {
     // PR #524 review (branarakic): the README documents
     // `relayServerCapacity` as a `config.json` knob, so the CLI
@@ -348,6 +505,20 @@ describe('localAgentIntegrations config round-trip', () => {
     const loaded = await loadConfig();
     expect(loaded.nodeRole).toBe('edge');
     expect(loaded.relayReservationCount).toBe(5);
+  });
+
+  it('round-trips syncAgentsMeta=false through saveConfig/loadConfig (edge store-load optimization)', async () => {
+    await saveConfig({
+      name: 'test-node',
+      apiPort: 9200,
+      listenPort: 0,
+      nodeRole: 'edge',
+      syncAgentsMeta: false,
+    });
+
+    const loaded = await loadConfig();
+    expect(loaded.nodeRole).toBe('edge');
+    expect(loaded.syncAgentsMeta).toBe(false);
   });
 
   it('omits relayReservationCount when not set (so DKGNode.start() applies the default)', async () => {
@@ -462,6 +633,53 @@ describe('resolveChainConfig (field-level merge)', () => {
     });
   });
 
+  it('threads the shipped network rpcUrls defaults through to the failover engine (real overlays)', async () => {
+    const { _resetNetworkConfigCache } = await import('../src/config.js');
+    const overlays = [
+      { name: 'mainnet-base', primary: 'https://mainnet.base.org', backups: ['https://base-rpc.publicnode.com', 'https://base.drpc.org'] },
+      { name: 'mainnet-gnosis', primary: 'https://rpc.gnosischain.com', backups: ['https://gnosis-rpc.publicnode.com', 'https://gnosis.drpc.org'] },
+      { name: 'testnet', primary: 'https://sepolia.base.org', backups: ['https://base-sepolia-rpc.publicnode.com', 'https://base-sepolia.drpc.org'] },
+    ];
+    for (const { name, primary, backups } of overlays) {
+      _resetNetworkConfigCache();
+      const network = await loadNetworkConfig(name);
+      const merged = resolveChainConfig({}, network);
+      // Primary endpoint is unchanged (backwards compatible); backups are
+      // inherited so the adapter builds a multi-RPC FallbackProvider.
+      expect(merged?.rpcUrl).toBe(primary);
+      expect(merged?.rpcUrls).toEqual(backups);
+    }
+  });
+
+  it('a single-RPC overlay (pre-deployment neuroweb) still resolves with NO rpcUrls (back-compat)', async () => {
+    const { _resetNetworkConfigCache } = await import('../src/config.js');
+    _resetNetworkConfigCache();
+    const network = await loadNetworkConfig('mainnet-neuroweb');
+    const merged = resolveChainConfig({}, network);
+    expect(merged?.rpcUrl).toBe('https://astrosat-parachain-rpc.origin-trail.network');
+    expect(merged?.rpcUrls).toBeUndefined();
+  });
+
+  it('keeps raw chain merging side-effect-free for pre-deployment network metadata', () => {
+    const merged = resolveChainConfig({}, {
+      _status: 'pre-deployment: replace PEER_ID_* relay values before enabling Base mainnet',
+      networkName: 'DKG V10 Base Mainnet',
+      relays: ['/ip4/178.105.87.39/tcp/9090/p2p/PEER_ID_SOLARIS'],
+      chain: fullNetworkChain,
+    });
+
+    expect(merged?.hubAddress).toBe(fullNetworkChain.hubAddress);
+  });
+
+  it('refuses ready chain resolution from a pre-deployment network', () => {
+    expect(() => resolveReadyChainConfig({}, {
+      _status: 'pre-deployment: replace PEER_ID_* relay values before enabling Base mainnet',
+      networkName: 'DKG V10 Base Mainnet',
+      relays: ['/ip4/178.105.87.39/tcp/9090/p2p/PEER_ID_SOLARIS'],
+      chain: fullNetworkChain,
+    })).toThrow(/pre-deployment/);
+  });
+
   it('overrides only the fields the operator set, inheriting the rest from network', () => {
     // Operator wants their private RPC but should inherit hub + chainId.
     const merged = resolveChainConfig(
@@ -475,6 +693,72 @@ describe('resolveChainConfig (field-level merge)', () => {
     expect(merged?.type).toBe('evm');
   });
 
+  it('does NOT inherit public backups behind a LOCAL (loopback) primary — avoids a cross-chain FallbackProvider', () => {
+    // A local Hardhat / devnet primary (loopback) on a real-network overlay
+    // must stay single-RPC: ethers rejects a FallbackProvider that spans chains
+    // (local 31337 + public Base Sepolia 84532). This is the kafka-plugin /
+    // devnet e2e regression the default backups would otherwise cause.
+    for (const localUrl of ['http://127.0.0.1:8545', 'http://localhost:9549', 'http://0.0.0.0:8545', 'http://127.0.0.2:8545']) {
+      const merged = resolveChainConfig({ chain: { rpcUrl: localUrl } }, { chain: fullNetworkChain });
+      expect(merged?.rpcUrl).toBe(localUrl);
+      expect(merged?.rpcUrls ?? []).toEqual([]);
+    }
+  });
+
+  it('an explicit operator rpcUrls still wins even with a loopback primary', () => {
+    const merged = resolveChainConfig(
+      { chain: { rpcUrl: 'http://127.0.0.1:8545', rpcUrls: ['http://127.0.0.1:8546'] } },
+      { chain: fullNetworkChain },
+    );
+    expect(merged?.rpcUrl).toBe('http://127.0.0.1:8545');
+    expect(merged?.rpcUrls).toEqual(['http://127.0.0.1:8546']);
+  });
+
+  it('does NOT inherit public backups when the operator pins a DIFFERENT chainId — even on a non-loopback host (#1329 review)', () => {
+    // A Docker/LAN devnet primary that overrides chainId to a different chain
+    // (e.g. local 31337 on the testnet base:84532 overlay) is NOT loopback, but
+    // inheriting the public Base-Sepolia backups would still build a cross-chain
+    // FallbackProvider that ethers rejects at init. Suppress on chain-identity
+    // mismatch, not only on loopback URLs.
+    const merged = resolveChainConfig(
+      { chain: { rpcUrl: 'http://hardhat:8545', chainId: 'evm:31337' } },
+      { chain: fullNetworkChain },
+    );
+    expect(merged?.rpcUrl).toBe('http://hardhat:8545');
+    expect(merged?.chainId).toBe('evm:31337');
+    expect(merged?.rpcUrls ?? []).toEqual([]);
+  });
+
+  it('STILL inherits public backups for a non-loopback private RPC on the SAME chain', () => {
+    // The intended operator case: a private/custom RPC on the overlay's own
+    // chain (chainId omitted, or explicitly equal) keeps the public backups for
+    // failover. Only a DIFFERENT chain (loopback or mismatched chainId) suppresses.
+    const omittedChainId = resolveChainConfig(
+      { chain: { rpcUrl: 'https://my-private-rpc.example/abc' } },
+      { chain: fullNetworkChain },
+    );
+    expect(omittedChainId?.rpcUrls).toEqual(fullNetworkChain.rpcUrls);
+
+    const sameChainId = resolveChainConfig(
+      { chain: { rpcUrl: 'https://my-private-rpc.example/abc', chainId: fullNetworkChain.chainId } },
+      { chain: fullNetworkChain },
+    );
+    expect(sameChainId?.rpcUrls).toEqual(fullNetworkChain.rpcUrls);
+  });
+
+  it('STILL inherits backups when only chainId differs and the operator did NOT pin an rpcUrl (#1332 review)', () => {
+    // A chainId override with NO custom rpcUrl leaves the primary as the network
+    // RPC (same chain as the backups) — there is no cross-chain FallbackProvider
+    // to avoid, so suppressing the backups would needlessly drop failover. The
+    // suppression must trigger only when the operator pins their OWN primary.
+    const merged = resolveChainConfig(
+      { chain: { chainId: 'evm:31337' } },
+      { chain: fullNetworkChain },
+    );
+    expect(merged?.rpcUrl).toBe(fullNetworkChain.rpcUrl);
+    expect(merged?.rpcUrls).toEqual(fullNetworkChain.rpcUrls);
+  });
+
   it('overrides hub independently of rpcUrl (multichain forward-compat)', () => {
     const merged = resolveChainConfig(
       { chain: { hubAddress: '0xOPERATORHUB0000000000000000000000000000' } },
@@ -484,6 +768,20 @@ describe('resolveChainConfig (field-level merge)', () => {
     expect(merged?.rpcUrl).toBe(fullNetworkChain.rpcUrl);
     expect(merged?.rpcUrls).toEqual(fullNetworkChain.rpcUrls);
     expect(merged?.chainId).toBe(fullNetworkChain.chainId);
+  });
+
+  it('merges cgRegistryScanPageSize with operator precedence', () => {
+    const inherited = resolveChainConfig(
+      {},
+      { chain: { ...fullNetworkChain, cgRegistryScanPageSize: 10_000 } },
+    );
+    expect(inherited?.cgRegistryScanPageSize).toBe(10_000);
+
+    const overridden = resolveChainConfig(
+      { chain: { cgRegistryScanPageSize: 4_000 } },
+      { chain: { ...fullNetworkChain, cgRegistryScanPageSize: 10_000 } },
+    );
+    expect(overridden?.cgRegistryScanPageSize).toBe(4_000);
   });
 
   it('dedupes primary + backups while preserving operator priority', () => {
@@ -556,6 +854,73 @@ describe('resolveChainConfig (field-level merge)', () => {
       { chain: { tokenAddress: operatorTokenAddress } },
       { chain: { ...fullNetworkChain, tokenAddress: networkTokenAddress } },
     )?.tokenAddress).toBe(operatorTokenAddress);
+  });
+
+  it('preserves operator approvalPolicy', () => {
+    const operatorApprovalPolicy = {
+      mode: 'replenishing' as const,
+      targetAllowance: '1000000000000000000',
+      refillBelowFraction: 0.5,
+    };
+
+    expect(resolveChainConfig(
+      { chain: { approvalPolicy: operatorApprovalPolicy } },
+      { chain: fullNetworkChain },
+    )?.approvalPolicy).toEqual(operatorApprovalPolicy);
+  });
+
+  it('keeps approvalPolicy local-only even when network config supplies one', () => {
+    const networkApprovalPolicy = {
+      mode: 'unlimited' as const,
+    };
+    const operatorApprovalPolicy = {
+      mode: 'replenishing' as const,
+      targetAllowance: '1000000000000000000',
+    };
+
+    expect(resolveChainConfig(
+      {},
+      { chain: { ...fullNetworkChain, approvalPolicy: networkApprovalPolicy } as any },
+    )?.approvalPolicy).toBeUndefined();
+
+    expect(resolveChainConfig(
+      {},
+      { chain: { ...fullNetworkChain, approvalPolicy: [] } as any },
+    )?.approvalPolicy).toBeUndefined();
+
+    expect(resolveChainConfig(
+      { chain: { approvalPolicy: operatorApprovalPolicy } },
+      { chain: { ...fullNetworkChain, approvalPolicy: networkApprovalPolicy } as any },
+    )?.approvalPolicy).toEqual(operatorApprovalPolicy);
+  });
+
+  it('normalizes operator approvalPolicy string shorthand', () => {
+    expect(resolveChainConfig(
+      { chain: { approvalPolicy: 'unlimited' } },
+      { chain: fullNetworkChain },
+    )?.approvalPolicy).toEqual({ mode: 'unlimited' });
+  });
+
+  it('rejects malformed non-object operator approvalPolicy values', () => {
+    expect(() => resolveChainConfig(
+      { chain: { approvalPolicy: 'forever' as any } },
+      { chain: fullNetworkChain },
+    )).toThrow(/chain\.approvalPolicy must be an object or a valid mode string/);
+
+    expect(() => resolveChainConfig(
+      { chain: { approvalPolicy: [] as any } },
+      { chain: fullNetworkChain },
+    )).toThrow(/chain\.approvalPolicy must be an object/);
+  });
+
+  it('treats null operator approvalPolicy as unset', () => {
+    const merged = resolveChainConfig(
+      { chain: { approvalPolicy: null as any } },
+      { chain: fullNetworkChain },
+    );
+
+    expect(merged?.approvalPolicy).toBeUndefined();
+    expect(merged?.rpcUrl).toBe(fullNetworkChain.rpcUrl);
   });
 
   it('returns a partial block when only config supplies fields (no network)', () => {

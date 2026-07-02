@@ -15,6 +15,8 @@ import {
   getFundableWalletAddresses,
   requestFaucetFunding,
   resolveDkgConfigHome,
+  resolveSetupNetworkName,
+  SELECTABLE_SETUP_NETWORKS,
   toErrorMessage,
   hasErrorCode,
 } from '@origintrail-official/dkg-core';
@@ -23,7 +25,7 @@ import {
   loadConfig, saveConfig, configExists, configPath,
   readPid, readApiPort, isProcessRunning, dkgDir, logPath, ensureDkgDir, removeApiPort,
   apiPortPath,
-  loadNetworkConfig, loadProjectConfig, resolveAutoUpdateConfig, resolveAutoUpdateSource, resolveChainConfig,
+  loadNetworkConfig, loadProjectConfig, resolveAutoUpdateConfig, resolveAutoUpdateSource, resolveChainConfig, validateNetworkConfigReadiness,
   releasesDir, activeSlot, swapSlot,
   slotEntryPoint, isStandaloneInstall, repoDir, isDkgMonorepo, classifyMonorepoInit, sharedHomeInitGate,
   resolveContextGraphs, resolveNetworkDefaultContextGraphs,
@@ -104,13 +106,103 @@ import {
   runForegroundSupervisor,
 } from '../cli-supervisor.js';
 
+/**
+ * Decide whether `dkg init` is SWITCHING an existing node to a different
+ * network (vs a fresh install or a same-network re-init). Only an EXPLICIT
+ * prior `networkConfig` that differs from the selection counts as a switch:
+ *   - fresh node (no networkConfig)               → not a switch (no chain to lose)
+ *   - legacy node (no networkConfig, custom chain) → not a switch (preserve the
+ *     operator's chain/RPC override — its true network is unknown)
+ *   - node with networkConfig === selected        → not a switch (preserve overrides)
+ *   - node with networkConfig !== selected        → SWITCH (drop the stale chain)
+ *
+ * On a switch the caller derives the chain block from the newly-selected
+ * network instead of the stale existing one (prevents a new-network/old-chain
+ * Frankenstein config); otherwise it preserves the existing chain field-merge.
+ * Pure + exported so the decision is unit-testable.
+ */
+export function isInitNetworkSwitch(
+  existingNetworkConfig: string | undefined,
+  selectedNetwork: string,
+): boolean {
+  const prior = existingNetworkConfig?.trim();
+  return !!prior && selectedNetwork !== prior;
+}
+
+/**
+ * Pure builder for the `autoUpdate` block `dkg init` persists. Extracted from
+ * the interactive wizard so it is unit-testable — the decline path (must write
+ * `{ enabled: false }`, NOT fall through to the enabled network default) and
+ * channel/advanced-field preservation across reruns have each regressed before.
+ * The wizard gathers `answers` interactively and passes them in.
+ */
+export function buildInitAutoUpdate(opts: {
+  enableAutoUpdate: boolean;
+  existingAutoUpdate: AutoUpdateConfig | undefined;
+  networkAutoUpdate?: {
+    repo?: string;
+    branch?: string;
+    allowPrerelease?: boolean;
+    sshKeyPath?: string;
+    checkIntervalMinutes?: number;
+  };
+  projRepo: string;
+  projDefaultBranch: string;
+  answers?: {
+    repo: string;
+    branch: string;
+    allowPrerelease: boolean;
+    sshKeyPath: string;
+    interval: number;
+  };
+}): AutoUpdateConfig {
+  const { enableAutoUpdate, existingAutoUpdate, networkAutoUpdate, projRepo, projDefaultBranch, answers } = opts;
+  if (!enableAutoUpdate) {
+    // Explicit decline: persist `enabled: false` so resolveAutoUpdateConfig
+    // does NOT fall through to the enabled network default. Keep any existing
+    // advanced fields (channel, etc.) — the operator only toggled auto-apply.
+    return existingAutoUpdate
+      ? { ...existingAutoUpdate, enabled: false }
+      : { enabled: false };
+  }
+  const a = answers ?? { repo: '', branch: '', allowPrerelease: true, sshKeyPath: '', interval: NaN };
+  // Effective upstream defaults — what the node would use with nothing
+  // persisted. We persist a field only when it differs, so future changes to
+  // the shipped network/project config propagate without a config rewrite.
+  const effectiveRepo = networkAutoUpdate?.repo ?? projRepo;
+  const effectiveBranch = networkAutoUpdate?.branch ?? projDefaultBranch;
+  const effectiveAllowPrerelease = networkAutoUpdate?.allowPrerelease ?? true;
+  const effectiveSshKeyPath = networkAutoUpdate?.sshKeyPath ?? '';
+  const effectiveInterval = networkAutoUpdate?.checkIntervalMinutes ?? 30;
+  return {
+    enabled: true,
+    // OT-RFC-41 Bundle B1d: explicit npm source for fresh installs.
+    source: 'npm' as const,
+    ...(a.repo && a.repo !== effectiveRepo ? { repo: a.repo } : {}),
+    ...(a.branch && a.branch !== effectiveBranch ? { branch: a.branch } : {}),
+    ...(a.allowPrerelease !== effectiveAllowPrerelease ? { allowPrerelease: a.allowPrerelease } : {}),
+    ...(a.sshKeyPath && a.sshKeyPath !== effectiveSshKeyPath ? { sshKeyPath: a.sshKeyPath } : {}),
+    ...(Number.isFinite(a.interval) && a.interval !== effectiveInterval ? { checkIntervalMinutes: a.interval } : {}),
+    // Preserve advanced fields the wizard does not prompt for so a rerun
+    // doesn't silently revert operator tuning: build timeouts, custom SSH
+    // command, and the per-node `channel` cohort pin.
+    ...(existingAutoUpdate?.buildTimeoutMs ? { buildTimeoutMs: existingAutoUpdate.buildTimeoutMs } : {}),
+    ...(existingAutoUpdate?.sshCommand ? { sshCommand: existingAutoUpdate.sshCommand } : {}),
+    ...(existingAutoUpdate?.channel ? { channel: existingAutoUpdate.channel } : {}),
+  } as AutoUpdateConfig;
+}
+
 export function registerInitCommand(program: Command): void {
 // ─── dkg init ────────────────────────────────────────────────────────
 
 program
   .command('init')
-  .description('Interactive setup — set node name, role, and relay')
+  .description('Interactive setup — set node name, network, role, and relay')
   .option('--role <role>', "Node role: 'edge' (default; personal laptop / behind NAT) or 'core' (24/7 relay / SLA)")
+  .option(
+    '--network <name>',
+    'Network to set up on (mainnet-gnosis | mainnet-base | testnet). Skips the interactive network prompt. Default for a fresh node: mainnet-gnosis.',
+  )
   .option(
     '--store <backend>',
     'Pre-fill the triple-store backend prompt (oxigraph | blazegraph | sparql-http).',
@@ -195,7 +287,13 @@ program
 
     await ensureDkgDir();
     const existing = await loadConfig();
-    const network = await loadNetworkConfig();
+    // Distinguish a genuinely fresh install (→ default mainnet) from a
+    // legacy node whose config predates `networkConfig` (→ testnet,
+    // preserved). `loadConfig` merges over defaults, so it can't tell us —
+    // probe the home directly (both json + yaml, like the daemon does).
+    const configExisted = existsSync(join(dkgDir(), 'config.json'))
+      || existsSync(join(dkgDir(), 'config.yaml'));
+
     const rl = createInterface({ input: process.stdin, output: process.stdout });
     const ask = (q: string, def?: string): Promise<string> =>
       new Promise(resolve => {
@@ -203,11 +301,62 @@ program
         rl.question(`${q}${suffix}: `, answer => resolve(answer.trim() || def || ''));
       });
 
-    if (network) {
-      console.log(`DKG Node Setup — ${network.networkName}\n`);
+    // DKG network selection — MUST run before loadNetworkConfig, because the
+    // chosen network drives every downstream default (role, relay, context
+    // graphs, auto-update, and the blockchain-config prompts below). Default:
+    // mainnet-gnosis for a fresh node, the existing network on re-init, and
+    // testnet for a legacy config that never set one. `--network` (or `-y`)
+    // skips the prompt.
+    const explicitNetwork = typeof opts.network === 'string' ? opts.network.trim() : '';
+    const networkDefault = resolveSetupNetworkName({
+      existingNetworkConfig: existing.networkConfig,
+      configExisted,
+    });
+    let selectedNetwork: string;
+    if (explicitNetwork) {
+      selectedNetwork = explicitNetwork;
+    } else if (opts.yes) {
+      selectedNetwork = networkDefault;
     } else {
-      console.log('DKG Node Setup\n');
+      // Numbered menu, matching the triple-store backend prompt's UX. Accepts
+      // either the number (1-3) or a typed network name; an out-of-range
+      // number falls back to the resolved default.
+      const networkLabels: Record<string, string> = {
+        'mainnet-gnosis': 'mainnet-gnosis  (Gnosis mainnet — default; xDAI gas)',
+        'mainnet-base':   'mainnet-base    (Base mainnet; ETH gas)',
+        'testnet':        'testnet         (Base Sepolia testnet — faucet-funded)',
+      };
+      const networks = SELECTABLE_SETUP_NETWORKS as readonly string[];
+      const defaultListed = networks.includes(networkDefault);
+      const defaultIdx = defaultListed ? networks.indexOf(networkDefault) : 0;
+      const defaultAnswer = defaultListed ? String(defaultIdx + 1) : networkDefault;
+      console.log('  DKG network:');
+      networks.forEach((n, i) => console.log(`    ${i + 1}) ${networkLabels[n] ?? n}`));
+      if (!defaultListed) {
+        console.log(`    (current: ${networkDefault} — press Enter to keep it, or type a number / network name)`);
+      }
+      const networkInput = await ask(`Choose (1-${networks.length})`, defaultAnswer);
+      selectedNetwork = /^\d+$/.test(networkInput)
+        ? (networks[parseInt(networkInput, 10) - 1] ?? networkDefault)
+        : networkInput;
     }
+
+    const network = await loadNetworkConfig(selectedNetwork);
+    if (!network) {
+      console.error(
+        `No bundled network config named "${selectedNetwork}". Common options: ${SELECTABLE_SETUP_NETWORKS.join(', ')}.`,
+      );
+      rl.close();
+      process.exit(1);
+    }
+    const readiness = validateNetworkConfigReadiness(network);
+    if (!readiness.ok) {
+      for (const message of readiness.messages) console.error(message);
+      rl.close();
+      process.exit(1);
+    }
+
+    console.log(`DKG Node Setup — ${network.networkName}\n`);
 
     const name = await ask('Node name', existing.name !== 'dkg-node' ? existing.name : undefined);
     // OT-RFC-41 Bundle B1d: `--role <edge|core>` flag short-circuits
@@ -276,21 +425,19 @@ program
       autoUpdateDefault ? 'y' : 'n',
     )).toLowerCase() === 'y';
 
-    let autoUpdate = existing.autoUpdate;
+    const proj = loadProjectConfig();
+    // Gather answers interactively only when enabling; the pure
+    // `buildInitAutoUpdate` (above) does the persist decision for both paths so
+    // it is unit-tested. Prompt defaults show existing value, else the upstream
+    // (network → project) default.
+    let autoUpdateAnswers:
+      | { repo: string; branch: string; allowPrerelease: boolean; sshKeyPath: string; interval: number }
+      | undefined;
     if (enableAutoUpdate) {
-      // Effective upstream defaults — what the node would use if nothing were
-      // persisted in ~/.dkg/config.json. Network config beats project.json.
-      // We persist a field only when it differs from the upstream default, so
-      // future changes to the shipped network or project config propagate on
-      // the next daemon run without requiring a config rewrite. Without this
-      // guard, every accepted-default ends up pinned in the custom config
-      // forever.
-      const proj = loadProjectConfig();
       const effectiveRepo = network?.autoUpdate?.repo ?? proj.repo;
       const effectiveBranch = network?.autoUpdate?.branch ?? proj.defaultBranch;
       const effectiveAllowPrerelease = network?.autoUpdate?.allowPrerelease ?? true;
       const effectiveSshKeyPath = network?.autoUpdate?.sshKeyPath ?? '';
-      // Keep this in sync with `resolveAutoUpdateConfig` in config.ts.
       const effectiveInterval = network?.autoUpdate?.checkIntervalMinutes ?? 30;
 
       const defaultRepo = existing.autoUpdate?.repo ?? effectiveRepo;
@@ -308,33 +455,30 @@ program
       const sshKeyPath = (await ask('SSH private key path (optional; blank uses agent/default SSH config)', defaultSshKeyPath)).trim();
       const interval = parseInt(await ask('Check interval (minutes)', String(defaultInterval)), 10);
 
-      autoUpdate = {
-        enabled: true,
-        // OT-RFC-41 Bundle B1d: explicit source. Under rc.12+, fresh
-        // installs always use the npm path (Edge: install -g; Core:
-        // slot install). The legacy 'auto'/'git' values still parse
-        // (rc.11 nodes carrying them upgrade-in-place) but the
-        // daemon dispatches them as 'npm' under §5 PR 5.
-        source: 'npm' as const,
-        ...(repo && repo !== effectiveRepo ? { repo } : {}),
-        ...(branch && branch !== effectiveBranch ? { branch } : {}),
-        ...(allowPrerelease !== effectiveAllowPrerelease ? { allowPrerelease } : {}),
-        ...(sshKeyPath && sshKeyPath !== effectiveSshKeyPath ? { sshKeyPath } : {}),
-        ...(Number.isFinite(interval) && interval !== effectiveInterval ? { checkIntervalMinutes: interval } : {}),
-        // Preserve advanced fields the wizard does not prompt for so a
-        // rerun of `dkg init` doesn't silently revert operator tuning:
-        //  - `buildTimeoutMs`: per-step overrides for slow ARM64 hosts
-        //  - `sshCommand`: custom GIT_SSH_COMMAND (jump hosts, non-default
-        //    port, custom IdentityFile, etc.)
-        ...(existing.autoUpdate?.buildTimeoutMs ? { buildTimeoutMs: existing.autoUpdate.buildTimeoutMs } : {}),
-        ...(existing.autoUpdate?.sshCommand ? { sshCommand: existing.autoUpdate.sshCommand } : {}),
-      } as AutoUpdateConfig;
+      autoUpdateAnswers = { repo, branch, allowPrerelease, sshKeyPath, interval };
     }
+    const autoUpdate = buildInitAutoUpdate({
+      enableAutoUpdate,
+      existingAutoUpdate: existing.autoUpdate,
+      networkAutoUpdate: network?.autoUpdate,
+      projRepo: proj.repo,
+      projDefaultBranch: proj.defaultBranch,
+      answers: autoUpdateAnswers,
+    });
 
     // Chain configuration. Field-merge: existing config wins per-field over
     // network defaults so an operator who's only customised RPC keeps that
     // override even after `dkg init` re-prompts.
-    const chainDefaults = resolveChainConfig(existing, network);
+    //
+    // EXCEPT on a network SWITCH (an existing node with an explicit
+    // networkConfig that differs from the selection): the existing `chain`
+    // block belongs to the OLD network (e.g. Base-mainnet hub/RPC/chainId) and
+    // must NOT pre-fill or persist — otherwise the node would run the new
+    // network's relays/genesis against the old chain (the Frankenstein config).
+    // See isInitNetworkSwitch — a fresh/legacy node is NOT a switch, so its
+    // chain field-merge (incl. operator RPC overrides) is preserved.
+    const isNetworkSwitch = isInitNetworkSwitch(existing.networkConfig, selectedNetwork);
+    const chainDefaults = resolveChainConfig(isNetworkSwitch ? undefined : existing, network);
     const defaultRpcUrl = chainDefaults?.rpcUrl;
     const defaultRpcUrls = chainDefaults?.rpcUrls?.join(', ') ?? '';
     const defaultHubAddress = chainDefaults?.hubAddress;
@@ -369,12 +513,23 @@ program
     const config = {
       ...existing,
       name: name || 'dkg-node',
+      // Persist the selected network explicitly (see resolveSetupNetworkName)
+      // so the node never silently follows a change to the project.json
+      // default — switching networks must be a deliberate act.
+      networkConfig: selectedNetwork,
       relay: (!existing.relay && relay === networkDefaultRelay) ? undefined : (relay || undefined),
       apiPort,
       nodeRole,
       contextGraphs,
-      autoUpdate: enableAutoUpdate ? autoUpdate : existing.autoUpdate,
-      chain: chainSection ?? existing.chain,
+      // `autoUpdate` already holds the correct value for BOTH branches: the
+      // fully-built block when enabled, or `{ enabled: false }` (preserving
+      // existing advanced fields) when declined. The old ternary here re-read
+      // `existing.autoUpdate` on decline, silently discarding the persisted
+      // disable — so a fresh-config operator who said "no" still auto-updated.
+      autoUpdate,
+      // On a network switch, never fall back to the stale existing chain
+      // block — let an empty chainSection inherit the new network's chain.
+      chain: isNetworkSwitch ? chainSection : (chainSection ?? existing.chain),
       auth: { enabled: enableAuth, tokens: existing.auth?.tokens },
       // Persist the chosen backend. `storeBlock === null` from the
       // wizard means "use the local default" — we explicitly clear any

@@ -5,15 +5,22 @@ import {
   contextGraphPrivateUri,
   contextGraphSharedMemoryUri,
   contextGraphSharedMemoryMetaUri,
-  contextGraphVerifiedMemoryUri,
-  contextGraphVerifiedMemoryMetaUri,
+  contextGraphVerifiableMemoryUri,
+  contextGraphVerifiableMemoryMetaUri,
   contextGraphAssertionUri,
   contextGraphSubGraphUri,
   contextGraphSubGraphMetaUri,
   contextGraphSubGraphPrivateUri,
+  contextGraphCatalogUri,
 } from '@origintrail-official/dkg-core';
 
 const CG_PREFIX = 'did:dkg:context-graph:';
+
+async function listGraphsByPrefix(store: TripleStore, prefix: string): Promise<string[]> {
+  return store.listGraphsByPrefix
+    ? store.listGraphsByPrefix(prefix)
+    : (await store.listGraphs()).filter((graph) => graph.startsWith(prefix));
+}
 
 export class ContextGraphManager {
   private readonly store: TripleStore;
@@ -35,6 +42,10 @@ export class ContextGraphManager {
     return contextGraphPrivateUri(contextGraphId);
   }
 
+  catalogGraphUri(contextGraphId: string): string {
+    return contextGraphCatalogUri(contextGraphId);
+  }
+
   sharedMemoryUri(contextGraphId: string, subGraphName?: string): string {
     return contextGraphSharedMemoryUri(contextGraphId, subGraphName);
   }
@@ -43,12 +54,12 @@ export class ContextGraphManager {
     return contextGraphSharedMemoryMetaUri(contextGraphId, subGraphName);
   }
 
-  verifiedMemoryUri(contextGraphId: string, verifiedMemoryId: string): string {
-    return contextGraphVerifiedMemoryUri(contextGraphId, verifiedMemoryId);
+  verifiableMemoryUri(contextGraphId: string, verifiableMemoryId: string): string {
+    return contextGraphVerifiableMemoryUri(contextGraphId, verifiableMemoryId);
   }
 
-  verifiedMemoryMetaUri(contextGraphId: string, verifiedMemoryId: string): string {
-    return contextGraphVerifiedMemoryMetaUri(contextGraphId, verifiedMemoryId);
+  verifiableMemoryMetaUri(contextGraphId: string, verifiableMemoryId: string): string {
+    return contextGraphVerifiableMemoryMetaUri(contextGraphId, verifiableMemoryId);
   }
 
   assertionUri(contextGraphId: string, agentAddress: string, name: string): string {
@@ -87,7 +98,7 @@ export class ContextGraphManager {
   }
 
   async listContextGraphs(): Promise<string[]> {
-    const graphs = await this.store.listGraphs();
+    const graphs = await listGraphsByPrefix(this.store, CG_PREFIX);
     const contextGraphs = new Set<string>();
     for (const g of graphs) {
       if (g.startsWith(CG_PREFIX)) {
@@ -116,7 +127,7 @@ export class ContextGraphManager {
    */
   async listSubGraphs(contextGraphId: string): Promise<string[]> {
     const prefix = `${CG_PREFIX}${contextGraphId}/`;
-    const allGraphs = await this.store.listGraphs();
+    const allGraphs = await listGraphsByPrefix(this.store, prefix);
     const subGraphNames = new Set<string>();
     const reservedPrefixes = ['_', 'assertion/', 'draft/', 'context/'];
     for (const g of allGraphs) {
@@ -141,6 +152,11 @@ export class ContextGraphManager {
     await this.store.dropGraph(this.privateGraphUri(contextGraphId));
     await this.store.dropGraph(this.sharedMemoryUri(contextGraphId));
     await this.store.dropGraph(this.sharedMemoryMetaUri(contextGraphId));
+    // OT-RFC-49 §5.9: a private CG's public face is its `_catalog` graph (the
+    // bounded, plaintext DCAT entry served over open-serve / P2P without
+    // membership). Drop it too, or deleting a CG leaves stale discovery
+    // metadata that outsiders can still resolve.
+    await this.store.dropGraph(this.catalogGraphUri(contextGraphId));
   }
 
   // ── Deprecated V9 aliases ────────────────────────────────────────────

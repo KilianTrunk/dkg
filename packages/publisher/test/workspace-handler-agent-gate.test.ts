@@ -170,6 +170,50 @@ describe('SharedMemoryHandler agent-gated gossip', () => {
     expect(workspaceOwned.get(CONTEXT_GRAPH_ID)?.get(ENTITY)).toBe(PEER_ID);
   });
 
+  // GH #1124 (otReviewAgent #1239) — PUBLIC-CG host-catchup forgery gate.
+  // Public plaintext is now host-mode-stored + served via catchup; the
+  // catchup-apply path (`trustedReplay`) reaches a member from an UNTRUSTED
+  // relaying host with the `publisherPeerId === fromPeerId` transport bind
+  // skipped. So on `trustedReplay` the public envelope MUST be self-signed and
+  // verify — while the LIVE path stays unchanged (legacy unsigned-public
+  // producer, bound by the transport check).
+  describe('public-CG host-catchup forgery gate (trustedReplay)', () => {
+    it('LIVE (no trustedReplay): unsigned raw public gossip still applies (legacy producer — unchanged)', async () => {
+      const outcome = await handler.handle(workspaceMessage('Live Unsigned', 'ws-live-unsigned'), PEER_ID);
+      expect(outcome.applied).toBe(true);
+      await expectStoredName('Live Unsigned');
+    });
+
+    it('CATCHUP: a genuinely self-signed public envelope applies', async () => {
+      const signer = ethers.Wallet.createRandom();
+      const wire = await signWorkspaceMessage(signer, workspaceMessage('Catchup Signed', 'ws-catchup-signed'));
+      const outcome = await handler.handle(wire, 'host-relay-peer', undefined, { trustedReplay: true });
+      expect(outcome.applied).toBe(true);
+      await expectStoredName('Catchup Signed');
+    });
+
+    it('CATCHUP: an UNSIGNED fabricated public envelope is REJECTED (was applied pre-fix)', async () => {
+      // A malicious host fabricates raw unsigned bytes that never went through
+      // any member's live ingest gate, served only to handle({trustedReplay}).
+      const outcome = await handler.handle(
+        workspaceMessage('Forged Unsigned', 'ws-catchup-unsigned'), 'host-relay-peer', undefined, { trustedReplay: true },
+      );
+      expect(outcome.applied).toBe(false);
+      await expectWorkspaceEmpty();
+    });
+
+    it('CATCHUP: a public envelope whose claimed signer != recovered signer is REJECTED', async () => {
+      const realSigner = ethers.Wallet.createRandom();
+      const claimed = ethers.Wallet.createRandom();
+      // Signed by realSigner but the envelope claims `claimed`'s address — the
+      // self-consistency check ([claimed] as the one-entry allowlist) fails.
+      const wire = await signWorkspaceMessage(realSigner, workspaceMessage('Spoofed Signer', 'ws-catchup-spoof'), claimed.address);
+      const outcome = await handler.handle(wire, 'host-relay-peer', undefined, { trustedReplay: true });
+      expect(outcome.applied).toBe(false);
+      await expectWorkspaceEmpty();
+    });
+  });
+
   it.each([
     ['_meta', META_GRAPH],
     ['ontology', ONTOLOGY_GRAPH],
@@ -203,6 +247,65 @@ describe('SharedMemoryHandler agent-gated gossip', () => {
     await handler.handle(await signWorkspaceMessage(allowed, encrypted), PEER_ID);
 
     await expectStoredName('Private Agent Signed');
+  });
+
+  it('rejects signed SWM gossip when the projection oracle tombstones the agent', async () => {
+    const allowed = ethers.Wallet.createRandom();
+    const recipientKey = recipientKeyFor(allowed.address);
+    let recipientLookups = 0;
+    handler = new SharedMemoryHandler(store, new TypedEventBus(), {
+      sharedMemoryOwnedEntities: workspaceOwned,
+      localAgentAddresses: () => [allowed.address],
+      workspaceRecipientPrivateKeys: () => {
+        recipientLookups += 1;
+        return [recipientKey];
+      },
+      contextGraphMetaOracle: async () => ({
+        accessPolicy: 'private',
+        allowedAgents: [allowed.address],
+        revokedAgents: [allowed.address],
+      }),
+    });
+    await insertAgentGate(DKG_ONTOLOGY.DKG_ALLOWED_AGENT, allowed.address);
+
+    const raw = workspaceMessage('Projection Revoked', 'ws-agent-gate-projection-revoked');
+    const encrypted = await encryptWorkspaceMessage(allowed.address, raw, recipientKey);
+    await handler.handle(await signWorkspaceMessage(allowed, encrypted), PEER_ID);
+
+    await expectWorkspaceEmpty();
+    expect(recipientLookups).toBe(0);
+  });
+
+  it('accepts a store-only participant when the partial projection carried allowedAgents but omitted participantAgents', async () => {
+    // OT-RFC-49 partial-projection regression (round-3): the oracle
+    // record is intentionally partial — here it projected `allowedAgents`
+    // (a DIFFERENT, irrelevant agent) but OMITTED `participantAgents`. The
+    // legitimate writer is a participant whose membership lives ONLY in the
+    // local `_meta` store. Each allowlist field must resolve INDEPENDENTLY
+    // (projection-if-present-else-store), so a projected `allowedAgents`
+    // must NOT suppress the store fallback for `participantAgents`. Before
+    // the fix the gate was built from the projected arrays alone, the
+    // participant fell back to `[]`, and this legitimate writer was dropped.
+    const otherAllowed = ethers.Wallet.createRandom();
+    const participant = ethers.Wallet.createRandom();
+    const recipientKey = recipientKeyFor(participant.address);
+    handler = new SharedMemoryHandler(store, new TypedEventBus(), {
+      sharedMemoryOwnedEntities: workspaceOwned,
+      localAgentAddresses: () => [participant.address],
+      workspaceRecipientPrivateKeys: () => [recipientKey],
+      contextGraphMetaOracle: async () => ({
+        accessPolicy: 'private',
+        allowedAgents: [otherAllowed.address],
+        // participantAgents intentionally omitted (partial record)
+      }),
+    });
+    await insertAgentGate(DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT, participant.address);
+
+    const raw = workspaceMessage('Store-Only Participant', 'ws-agent-gate-store-only-participant');
+    const encrypted = await encryptWorkspaceMessage(participant.address, raw, recipientKey);
+    await handler.handle(await signWorkspaceMessage(participant, encrypted), PEER_ID);
+
+    await expectStoredName('Store-Only Participant');
   });
 
   it.each([

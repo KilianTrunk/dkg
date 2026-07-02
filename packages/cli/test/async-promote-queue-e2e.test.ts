@@ -13,13 +13,13 @@
  *   - real `OxigraphStore` triple store
  *   - real `TripleStoreAsyncPromoteQueue`
  *   - real `createPromoteWorkerSupervisor` (polling, classifying, claiming)
- *   - real `handleAssertionRoutes` HTTP wire contract
+ *   - real `handleKnowledgeAssetsRoutes` HTTP wire contract
  *   - real `node:http` server bound to a random port
  *   - real `fetch()` client
  *
  * What's verified end-to-end:
  *
- *   1. Happy path — POST /promote-async → wait → GET reports `succeeded`
+ *   1. Happy path — POST /swm/share-async → wait → GET reports `succeeded`
  *      + `memoryGraphChanged` fires with `source: 'async-worker'`.
  *   2. Transient failure path — promote throws `fetch failed` → worker
  *      classifies as transient → GET reports `failed_retrying` with a
@@ -42,7 +42,7 @@ import {
   type PromoteListFilter,
   type PromoteRequest,
 } from '@origintrail-official/dkg-publisher';
-import { handleAssertionRoutes } from '../src/daemon/routes/assertion.js';
+import { handleKnowledgeAssetsRoutes } from '../src/daemon/routes/knowledge-assets.js';
 import { daemonState } from '../src/daemon/state.js';
 import {
   createPromoteWorkerSupervisor,
@@ -60,6 +60,8 @@ describe('async-promote queue — end-to-end (routes + worker + queue)', () => {
   let promoteHandler: (req: PromoteRequest) => Promise<{ promotedCount: number }>;
   let promoteCallCount: number;
   let inFlightHigh: number;
+  let requestToken: string | undefined;
+  let tokenAgentAddress: string | undefined;
 
   beforeEach(() => {
     store = new OxigraphStore();
@@ -72,8 +74,10 @@ describe('async-promote queue — end-to-end (routes + worker + queue)', () => {
     memoryGraphChangedEvents = [];
     promoteCallCount = 0;
     inFlightHigh = 0;
+    requestToken = undefined;
+    tokenAgentAddress = undefined;
     promoteHandler = async () => ({ promotedCount: 1 });
-    // PR #660 gates `/promote-async` on `daemonState.promoteWorkerAvailable`;
+    // PR #660 gates `/swm/share-async` on `daemonState.promoteWorkerAvailable`;
     // the e2e test boots its own supervisor without going through the daemon
     // lifecycle that flips this flag, so we set it manually for the routes
     // under test. afterEach resets to the initial-boot value.
@@ -113,11 +117,17 @@ describe('async-promote queue — end-to-end (routes + worker + queue)', () => {
       async contextGraphExists(contextGraphId: string) {
         return ['team-graph', 'graphify', 'cg'].includes(contextGraphId);
       },
+      resolveAgentByToken: (token: string) => (token === requestToken ? tokenAgentAddress : undefined),
       assertion: {
         async promote(
           contextGraphId: string,
           name: string,
-          opts?: { entities?: readonly string[] | 'all'; subGraphName?: string },
+          opts?: {
+            entities?: readonly string[] | 'all';
+            subGraphName?: string;
+            agentAddress?: string;
+            authorAgentAddress?: string;
+          },
         ): Promise<{ promotedCount: number }> {
           inFlight += 1;
           inFlightHigh = Math.max(inFlightHigh, inFlight);
@@ -128,6 +138,8 @@ describe('async-promote queue — end-to-end (routes + worker + queue)', () => {
               assertionName: name,
               subGraphName: opts?.subGraphName,
               entities: opts?.entities ?? 'all',
+              ...(opts?.agentAddress ? { agentAddress: opts.agentAddress } : {}),
+              ...(opts?.authorAgentAddress ? { authorAgentAddress: opts.authorAgentAddress } : {}),
             });
           } finally {
             inFlight -= 1;
@@ -136,13 +148,20 @@ describe('async-promote queue — end-to-end (routes + worker + queue)', () => {
         async promoteAsync(
           contextGraphId: string,
           name: string,
-          opts?: { entities?: readonly string[] | 'all'; subGraphName?: string },
+          opts?: {
+            entities?: readonly string[] | 'all';
+            subGraphName?: string;
+            agentAddress?: string;
+            authorAgentAddress?: string;
+          },
         ): Promise<{ jobId: string }> {
           const jobId = await queue.enqueue({
             contextGraphId,
             assertionName: name,
             subGraphName: opts?.subGraphName,
             entities: opts?.entities ?? 'all',
+            ...(opts?.agentAddress ? { agentAddress: opts.agentAddress } : {}),
+            ...(opts?.authorAgentAddress ? { authorAgentAddress: opts.authorAgentAddress } : {}),
           });
           return { jobId };
         },
@@ -170,7 +189,7 @@ describe('async-promote queue — end-to-end (routes + worker + queue)', () => {
     server = createServer(async (req, res) => {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
       try {
-        await handleAssertionRoutes({
+        await handleKnowledgeAssetsRoutes({
           req,
           res,
           agent,
@@ -178,7 +197,7 @@ describe('async-promote queue — end-to-end (routes + worker + queue)', () => {
           publisherRuntime: null,
           config: {},
           startedAt: Date.now(),
-          dashDb: {},
+          dashDb: { insertNotification: () => 1 },
           opWallets: {},
           network: {},
           tracker: {},
@@ -198,9 +217,10 @@ describe('async-promote queue — end-to-end (routes + worker + queue)', () => {
           apiPortRef: { value: 0 },
           url,
           path: url.pathname,
-          requestToken: undefined,
+          requestToken,
           requestAgentAddress: 'did:dkg:agent:test',
           emitMemoryGraphChanged: () => {},
+          emitNotification: () => {},
         } as any);
         if (!res.writableEnded) {
           res.statusCode = 404;
@@ -254,9 +274,9 @@ describe('async-promote queue — end-to-end (routes + worker + queue)', () => {
     throw new Error(`Timed out waiting for ${jobId} to reach ${target}; current state: ${final?.state}`);
   }
 
-  it('happy path: POST /promote-async → worker drains → GET reports succeeded + SSE event fires', async () => {
+  it('happy path: POST /swm/share-async → worker drains → GET reports succeeded + SSE event fires', async () => {
     await startServerAndSupervisor();
-    const { status, body } = await post('/api/assertion/notes/promote-async', {
+    const { status, body } = await post('/api/knowledge-assets/notes/swm/share-async', {
       contextGraphId: 'team-graph',
       subGraphName: 'docs',
       entities: 'all',
@@ -275,7 +295,7 @@ describe('async-promote queue — end-to-end (routes + worker + queue)', () => {
     // version of this assertion.
     expect(done.commitMarker).toMatchObject({ swmInserted: true });
 
-    const httpView = await get(`/api/assertion/promote-async/${jobId}`);
+    const httpView = await get(`/api/knowledge-assets/swm/share-jobs/${jobId}`);
     expect(httpView.status).toBe(200);
     expect(httpView.body).toMatchObject({ jobId, state: 'succeeded' });
 
@@ -290,12 +310,43 @@ describe('async-promote queue — end-to-end (routes + worker + queue)', () => {
     });
   });
 
+  it('agent-token share-async carries the storage lane and author through queue and worker', async () => {
+    requestToken = 'agent-token-lane';
+    tokenAgentAddress = '0x3333333333333333333333333333333333333333';
+    const promoteRequests: PromoteRequest[] = [];
+    promoteHandler = async (req) => {
+      promoteRequests.push(req);
+      return { promotedCount: 1 };
+    };
+    await startServerAndSupervisor();
+
+    const { status, body } = await post('/api/knowledge-assets/token-notes/swm/share-async', {
+      contextGraphId: 'team-graph',
+      subGraphName: 'docs',
+      entities: 'all',
+    });
+    expect(status).toBe(200);
+    const jobId = body!.jobId as string;
+
+    const done = await waitForJobState(jobId, 'succeeded');
+    expect(done.request).toMatchObject({
+      agentAddress: tokenAgentAddress,
+      authorAgentAddress: tokenAgentAddress,
+    });
+    expect(promoteRequests).toHaveLength(1);
+    expect(promoteRequests[0]).toMatchObject({
+      assertionName: 'token-notes',
+      agentAddress: tokenAgentAddress,
+      authorAgentAddress: tokenAgentAddress,
+    });
+  });
+
   it('transient failure: fetch error → failed_retrying → GET reflects retry schedule', async () => {
     promoteHandler = async () => {
       throw new Error('fetch failed');
     };
     await startServerAndSupervisor();
-    const { body } = await post('/api/assertion/wobbly/promote-async', {
+    const { body } = await post('/api/knowledge-assets/wobbly/swm/share-async', {
       contextGraphId: 'team-graph',
     });
     const jobId = body!.jobId as string;
@@ -306,7 +357,7 @@ describe('async-promote queue — end-to-end (routes + worker + queue)', () => {
     expect(retrying.attempt.lastError?.message).toContain('fetch failed');
     expect(retrying.attempt.nextRetryAt).toBeGreaterThan(Date.now() - 1_000);
 
-    const httpView = await get(`/api/assertion/promote-async/${jobId}`);
+    const httpView = await get(`/api/knowledge-assets/swm/share-jobs/${jobId}`);
     expect(httpView.body).toMatchObject({ state: 'failed_retrying' });
     // No memoryGraphChanged emitted on failed attempts.
     expect(memoryGraphChangedEvents).toHaveLength(0);
@@ -317,7 +368,7 @@ describe('async-promote queue — end-to-end (routes + worker + queue)', () => {
       throw new Error('Promoted assertion too large for gossip (12000 KB, limit 10 MB)');
     };
     await startServerAndSupervisor();
-    const { body } = await post('/api/assertion/giant/promote-async', {
+    const { body } = await post('/api/knowledge-assets/giant/swm/share-async', {
       contextGraphId: 'team-graph',
     });
     const jobId = body!.jobId as string;
@@ -332,16 +383,16 @@ describe('async-promote queue — end-to-end (routes + worker + queue)', () => {
   it('concurrency: three concurrent enqueues all settle and list() reports them', async () => {
     await startServerAndSupervisor({ workerConcurrency: 3 });
     const results = await Promise.all([
-      post('/api/assertion/a/promote-async', { contextGraphId: 'team-graph' }),
-      post('/api/assertion/b/promote-async', { contextGraphId: 'team-graph' }),
-      post('/api/assertion/c/promote-async', { contextGraphId: 'team-graph' }),
+      post('/api/knowledge-assets/a/swm/share-async', { contextGraphId: 'team-graph' }),
+      post('/api/knowledge-assets/b/swm/share-async', { contextGraphId: 'team-graph' }),
+      post('/api/knowledge-assets/c/swm/share-async', { contextGraphId: 'team-graph' }),
     ]);
     const jobIds = results.map((r) => r.body!.jobId as string);
     expect(new Set(jobIds).size).toBe(3); // all unique
 
     for (const id of jobIds) await waitForJobState(id, 'succeeded');
 
-    const listResp = await get('/api/assertion/promote-async?state=succeeded');
+    const listResp = await get('/api/knowledge-assets/swm/share-jobs?state=succeeded');
     expect(listResp.status).toBe(200);
     const succeeded = (listResp.body as { jobs: PromoteJob[] }).jobs;
     expect(succeeded.map((j) => j.jobId).sort()).toEqual([...jobIds].sort());
@@ -354,14 +405,14 @@ describe('async-promote queue — end-to-end (routes + worker + queue)', () => {
     };
     await startServerAndSupervisor({ workerConcurrency: 1, pollIntervalMs: 10 });
     await Promise.all([
-      post('/api/assertion/a/promote-async', { contextGraphId: 'team-graph' }),
-      post('/api/assertion/b/promote-async', { contextGraphId: 'team-graph' }),
-      post('/api/assertion/c/promote-async', { contextGraphId: 'team-graph' }),
+      post('/api/knowledge-assets/a/swm/share-async', { contextGraphId: 'team-graph' }),
+      post('/api/knowledge-assets/b/swm/share-async', { contextGraphId: 'team-graph' }),
+      post('/api/knowledge-assets/c/swm/share-async', { contextGraphId: 'team-graph' }),
     ]);
     // Wait for all three to settle.
     const deadline = Date.now() + 3_000;
     while (Date.now() < deadline) {
-      const stats = (await get('/api/assertion/promote-async')).body as { jobs: PromoteJob[] };
+      const stats = (await get('/api/knowledge-assets/swm/share-jobs')).body as { jobs: PromoteJob[] };
       if (stats.jobs.filter((j) => j.state === 'succeeded').length === 3) break;
       await new Promise((r) => setTimeout(r, 10));
     }

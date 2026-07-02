@@ -4,7 +4,7 @@ import { useMemoryEntities, canonicalEntityUri, type MemoryEntity, type Triple }
 import { decodeRdfStringLiteral } from '../../../../rdf-literal.js';
 import { MEMORY_LABEL_PREDICATES } from '../../../lib/memoryLabels.js';
 import { useLayoutStore } from '../../../stores/layout.js';
-import { useVerifiedMemoryAnchors, type PublishAnchor } from '../../../hooks/useVerifiedMemoryAnchors.js';
+import { useVerifiableMemoryAnchors, type PublishAnchor } from '../../../hooks/useVerifiableMemoryAnchors.js';
 import { useSwmAttributions, type AgentPaletteEntry, type SwmAttributionsResult } from '../../../hooks/useSwmAttributions.js';
 import { TRUST_COLORS, LAYER_CONFIG, buildLayerGraphOptions, humanizeLabel, useLayerTriples, filterTriplesToEntities } from '../helpers.js';
 import { EmptyState, toneForLayer } from '../../../components/ContextGraphPrimitives.js';
@@ -389,7 +389,7 @@ export function LayerGraphPanel({
   // VM-only provenance decorations — synthetic anchor + agent identity
   // triples injected around every published KA root. Keeps the data on-disk
   // untouched; the "halo" of trust lives purely in the viz.
-  const { anchors, decorationTriples } = useVerifiedMemoryAnchors(
+  const { anchors, decorationTriples } = useVerifiableMemoryAnchors(
     layer === 'vm' && contextGraphId ? contextGraphId : undefined,
     visibleEntityUris,
   );
@@ -636,7 +636,7 @@ export function SwmAttributionLegend({ palette, conflicts }: { palette: AgentPal
 
 // ─── Verifiable Memory graph legend (docked rail) ─────────
 // Explains the synthetic VM anchor and agent decoration triples produced by
-// `useVerifiedMemoryAnchors` without pulling in the later VM metadata work.
+// `useVerifiableMemoryAnchors` without pulling in the later VM metadata work.
 export function VerifiedGraphLegend({ anchors }: { anchors: PublishAnchor[] }) {
   const signerCount = useMemo(() => {
     const s = new Set<string>();

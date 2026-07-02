@@ -293,7 +293,7 @@ fi
 hr "Step 2 — N1 publishes some durable data into the CG (so N2 has something to sync after approval)"
 # Create an assertion and write two sample quads into it.
 ASSERTION_NAME="widget-info"
-create_assertion=$(api "$N1" POST /api/assertion/create \
+create_assertion=$(api "$N1" POST /api/knowledge-assets \
   "{\"contextGraphId\":\"$CG_ID\",\"name\":\"$ASSERTION_NAME\"}")
 note "assertion/create response: $create_assertion"
 
@@ -317,7 +317,7 @@ print(json.dumps({
 }))
 PY
 )
-write_resp=$(api "$N1" POST "/api/assertion/$ASSERTION_NAME/write" "$write_body")
+write_resp=$(api "$N1" POST "/api/knowledge-assets/$ASSERTION_NAME/wm/write" "$write_body")
 note "assertion/write response: $write_resp"
 written=$(echo "$write_resp" | jq_field written)
 if [ -n "$written" ] && [ "$written" != "0" ]; then

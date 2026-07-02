@@ -311,7 +311,10 @@ describe('Reordered Publish Flow (replicate-then-publish)', () => {
     await mintTokens(provider, hubAddress, HARDHAT_KEYS.DEPLOYER, publisherWallet.address, ethers.parseEther('5000000'));
 
     const cgChain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
-    const cgId = await createTestContextGraph(cgChain);
+    // PR1072: public CG (accessPolicy 0) — these tests publish plaintext to
+    // exercise publish ordering / V10 path / ACK quorum, not curated/ciphertext
+    // semantics, so they must not require a ciphertext commitment.
+    const cgId = await createTestContextGraph(cgChain, undefined, 0);
     CONTEXT_GRAPH = String(cgId);
     if (!_provider) _provider = provider;
     if (!_kav10Address) _kav10Address = await cgChain.getKnowledgeAssetsLifecycleAddress();
@@ -479,10 +482,20 @@ describe('Reordered Publish Flow (replicate-then-publish)', () => {
     // we'd be exercising the wrong branch and a future regression that
     // restores the catch-then-tentative behaviour on the chain branch
     // could slip past undetected.
+    // PR1072: publish to a CURATED CG (created by a funded CORE_OP adapter) so the
+    // bare publisher — which carries no ciphertext commitment — reverts AT the
+    // chain-submit branch with CuratedCGRequiresCiphertextCommitment. That is a
+    // genuine V10 chain failure (not the ACK pre-flight guard), so it exercises the
+    // PR2 no-silent-tentative-downgrade rethrow exactly as the EXTRA1-no-tokens path
+    // did pre-#1072. The describe's shared CONTEXT_GRAPH is public (for the
+    // plaintext-success tests), which would instead let this publish succeed.
+    const curatedFailCg = String(
+      await createTestContextGraph(createEVMAdapter(HARDHAT_KEYS.CORE_OP), undefined, 1),
+    );
     let err: unknown;
     try {
       await failPublisher.publish({
-        contextGraphId: CONTEXT_GRAPH,
+        contextGraphId: curatedFailCg,
         quads,
       });
     } catch (e) {
@@ -770,7 +783,10 @@ describe('Regression: complete publish result fields', () => {
     await mintTokens(provider, hubAddress, HARDHAT_KEYS.DEPLOYER, pubAddr, ethers.parseEther('5000000'));
 
     const cgChain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
-    const cgId = await createTestContextGraph(cgChain);
+    // PR1072: public CG (accessPolicy 0) — this regression publishes plaintext to
+    // assert confirmed-result fields (txHash/batchId/...), not curated/ciphertext
+    // semantics, so it must not require a ciphertext commitment.
+    const cgId = await createTestContextGraph(cgChain, undefined, 0);
     CONTEXT_GRAPH = String(cgId);
   });
 
@@ -834,7 +850,7 @@ describe('Regression: fail-fast when chain rejects', () => {
     // unconfirmed quads were written to the root data graph as if
     // they had landed on-chain. That silent downgrade was the
     // tentative-VM defect the dzudza incident exposed: failed
-    // publishes appeared in `verified-memory` queries as confirmed
+    // publishes appeared in `verifiable-memory` queries as confirmed
     // data, and the daemon log only ever said "On-chain tx failed".
     //
     // Post-PR2 the catch path re-throws the underlying chain error
@@ -877,7 +893,7 @@ describe('Regression: fail-fast when chain rejects', () => {
     // root data graph is only ever populated by a confirmed publish
     // (or one of the two intentional non-chain skip branches —
     // missing CG id / non-V10 adapter). A failed on-chain publish
-    // must leave the local store untouched so the `verified-memory`
+    // must leave the local store untouched so the `verifiable-memory`
     // view in `dkg-query-engine.ts` cannot surface ghost rows.
     const store = new OxigraphStore();
     const chain = createEVMAdapter(HARDHAT_KEYS.EXTRA2);

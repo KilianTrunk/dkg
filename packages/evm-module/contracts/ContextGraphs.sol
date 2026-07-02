@@ -4,11 +4,21 @@ pragma solidity ^0.8.20;
 
 import {ContractStatus} from "./abstract/ContractStatus.sol";
 import {IDKGPublishingConvictionNFT} from "./interfaces/IDKGPublishingConvictionNFT.sol";
+import {IContextGraphWaiverStorage} from "./interfaces/IContextGraphWaiverStorage.sol";
 import {IInitializable} from "./interfaces/IInitializable.sol";
 import {INamed} from "./interfaces/INamed.sol";
 import {IVersioned} from "./interfaces/IVersioned.sol";
 import {ContextGraphStorage} from "./storage/ContextGraphStorage.sol";
 import {KnowledgeAssetsLib} from "./libraries/KnowledgeAssetsLib.sol";
+import {TokenLib} from "./libraries/TokenLib.sol";
+import {ParametersStorage} from "./storage/ParametersStorage.sol";
+import {ConvictionStakingStorage} from "./storage/ConvictionStakingStorage.sol";
+import {EpochStorage} from "./storage/EpochStorage.sol";
+import {Chronos} from "./storage/Chronos.sol";
+import {CGWeightTreeStorage} from "./storage/CGWeightTreeStorage.sol";
+import {ContextGraphValueStorage} from "./storage/ContextGraphValueStorage.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /**
  * @title ContextGraphs
@@ -52,11 +62,40 @@ import {KnowledgeAssetsLib} from "./libraries/KnowledgeAssetsLib.sol";
  *      the caller — this facade is responsible for the logic being correct
  *      when a correct principal is supplied.
  */
-contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable {
+contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable, ReentrancyGuard {
     string private constant _NAME = "ContextGraphs";
-    string private constant _VERSION = "10.0.2";
+    string private constant _VERSION = "10.0.4";
 
     ContextGraphStorage public contextGraphStorage;
+
+    // OT-RFC-53 — refs for the registration-deposit escrow. The deposit is
+    // pulled into the CSS vault at creation and credited to the staker reward
+    // pool (via EpochStorage) when consumed by publishing or swept by admin.
+    IERC20 public tokenContract;
+    ParametersStorage public parametersStorage;
+    ConvictionStakingStorage public convictionStakingStorage;
+    EpochStorage public epochStorage;
+    Chronos public chronos;
+
+    /// @notice Emitted when a CG registration deposit is pulled at creation.
+    event ContextGraphRegistrationDeposited(
+        uint256 indexed contextGraphId,
+        address indexed payer,
+        uint96 amount
+    );
+
+    /// @notice OT-RFC-53: emitted when the registration deposit is WAIVED because
+    ///         the CG is backed by a PCA the creator owns or is a registered
+    ///         agent of. The PCA's locked commitment is the anti-spam stake;
+    ///         the CG carries no own escrow and its publishing is funded by the PCA.
+    event ContextGraphRegistrationDepositWaived(
+        uint256 indexed contextGraphId,
+        uint256 indexed accountId,
+        address indexed creator
+    );
+
+    /// @notice Emitted when an admin sweeps a CG's residual escrow to the pool.
+    event ContextGraphEscrowSwept(uint256 indexed contextGraphId, uint96 amount);
 
     constructor(address hubAddress) ContractStatus(hubAddress) {}
 
@@ -64,6 +103,39 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable {
         contextGraphStorage = ContextGraphStorage(
             hub.getAssetStorageAddress("ContextGraphStorage")
         );
+        // OT-RFC-53 deposit stack — resolve EACH dependency through a tolerant,
+        // individually-catchable Hub lookup (`getContractAddress` reverts for an
+        // unregistered name). The feature is enabled ONLY when the WHOLE stack
+        // resolves; any missing dependency leaves every ref zero and the deposit
+        // disabled (createContextGraph guards on `parametersStorage != 0`). This
+        // keeps ContextGraphs deployable on partial fixtures/upgrades without
+        // declaring the economic stack as hard deploy dependencies, and avoids
+        // the prior bug where a `try` over only the first lookup let a later
+        // lookup (Token/CSS/Epoch/Chronos) revert uncaught.
+        address ps = _tryResolveContract("ParametersStorage");
+        address tok = _tryResolveContract("Token");
+        address css = _tryResolveContract("ConvictionStakingStorage");
+        address es = _tryResolveContract("EpochStorageV8");
+        address chr = _tryResolveContract("Chronos");
+        if (ps != address(0) && tok != address(0) && css != address(0) && es != address(0) && chr != address(0)) {
+            parametersStorage = ParametersStorage(ps);
+            tokenContract = IERC20(tok);
+            convictionStakingStorage = ConvictionStakingStorage(css);
+            epochStorage = EpochStorage(es);
+            chronos = Chronos(chr);
+        }
+    }
+
+    /// @dev Tolerant single-contract Hub lookup: returns address(0) instead of
+    ///      reverting when the name is unregistered. Used to resolve the
+    ///      OT-RFC-53 deposit stack so a partial deployment disables the feature
+    ///      rather than bricking initialize().
+    function _tryResolveContract(string memory contractName) internal view returns (address) {
+        try hub.getContractAddress(contractName) returns (address a) {
+            return a;
+        } catch {
+            return address(0);
+        }
     }
 
     function name() public pure virtual returns (string memory) {
@@ -105,7 +177,7 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable {
         address publishAuthority,
         uint256 publishAuthorityAccountId,
         bytes32 nameHash
-    ) external returns (uint256 contextGraphId) {
+    ) external nonReentrant returns (uint256 contextGraphId) {
         // Storage validates sorting/dedup/zero-rejection, but a friendly
         // default for curated CGs: if caller passes zero authority and the
         // policy is curated, use msg.sender.
@@ -131,6 +203,134 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable {
             publishAuthorityAccountId,
             nameHash
         );
+
+        // OT-RFC-53: anti-spam registration deposit, held as the CG's prepaid
+        // publishing escrow. Skipped when ParametersStorage is unresolved
+        // (deposit feature off) or the param is 0 (dormant default).
+        //
+        // WAIVER (quota-bounded): a CG backed by a PCA the creator owns or is a
+        // registered agent of can skip the deposit — but only up to the PCA's
+        // per-PCA quota (committedTRAC / deposit), enforced in
+        // ContextGraphWaiverStorage. So N deposit-free CGs still cost N×deposit
+        // of LOCKED PCA commitment (paid by the PCA instead of separate liquid
+        // TRAC), a sub-floor or dust PCA gets none, and a single PCA can no
+        // longer mint unlimited free CGs. A waived CG carries no escrow — the
+        // same state a dormant deposit produces — so the consume path is
+        // unchanged (it falls through to the PCA).
+        if (address(parametersStorage) != address(0)) {
+            uint96 deposit = parametersStorage.contextGraphRegistrationDeposit();
+            if (deposit > 0) {
+                if (_tryWaiveRegistrationDeposit(publishAuthorityAccountId, deposit)) {
+                    emit ContextGraphRegistrationDepositWaived(
+                        contextGraphId, publishAuthorityAccountId, msg.sender
+                    );
+                } else {
+                    _pullRegistrationDeposit(contextGraphId, deposit);
+                }
+            }
+        }
+    }
+
+    /// @dev OT-RFC-53 deposit waiver. Delegates eligibility + the per-PCA quota
+    ///      to ContextGraphWaiverStorage (co-located with its counter, off this
+    ///      contract's bytecode budget). The storage contract verifies the PCA
+    ///      is active/backed, meets the governance stake floor, that `msg.sender`
+    ///      (the CG creator) owns or is a registered agent of the PCA, and that
+    ///      the PCA's quota isn't exhausted — consuming one quota slot when it
+    ///      returns true. Resolved fresh via the Hub; fails CLOSED (charge the
+    ///      deposit) on any resolution/call failure.
+    function _tryWaiveRegistrationDeposit(uint256 accountId, uint96 deposit) internal returns (bool) {
+        if (accountId == 0) return false;
+        address waiverAddr = address(0);
+        try hub.getContractAddress("ContextGraphWaiverStorage") returns (address addr) {
+            waiverAddr = addr;
+        } catch {
+            return false;
+        }
+        if (waiverAddr == address(0)) return false;
+        try IContextGraphWaiverStorage(waiverAddr).tryConsumeWaiver(accountId, msg.sender, deposit) returns (bool waived) {
+            return waived;
+        } catch {
+            return false;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // OT-RFC-53 — registration-deposit pull + admin sweep
+    // -----------------------------------------------------------------------
+
+    /// @dev Pulls the full `deposit` TRAC (GROSS) from the creator into the CSS
+    ///      vault and records it as the CG's escrow. No treasury fee is skimmed
+    ///      HERE (at deposit) — the deposit is escrowed gross. The protocol
+    ///      treasury fee is instead taken per-publish at CONSUME, on the escrow
+    ///      actually spent (`KnowledgeAssetsLifecycle._chargeEscrowTreasuryFee`),
+    ///      at parity with the wallet path's `_addTokens` — so escrow-funded
+    ///      publishing is not a fee loophole, and an unspent or admin-swept
+    ///      deposit owes no fee. The escrow is later spent on publishing or swept
+    ///      by admin — never cash-refunded.
+    function _pullRegistrationDeposit(uint256 contextGraphId, uint96 deposit) internal {
+        IERC20 token = tokenContract;
+        uint256 allowance = token.allowance(msg.sender, address(this));
+        if (allowance < deposit) {
+            revert TokenLib.TooLowAllowance(address(token), allowance, deposit);
+        }
+        if (token.balanceOf(msg.sender) < deposit) {
+            revert TokenLib.TooLowBalance(address(token), token.balanceOf(msg.sender), deposit);
+        }
+        // The deposit is escrowed GROSS in the CSS vault and tracked gross, so the
+        // consume path subtracts it directly from the gross publish cost (no
+        // net-vs-gross mismatch). The protocol treasury fee is NOT skimmed at
+        // deposit; it is taken at CONSUME on the escrow actually spent, via
+        // `KnowledgeAssetsLifecycle._chargeEscrowTreasuryFee` (parity with the
+        // wallet path's `_addTokens`). Charging at consume — not deposit — keeps
+        // the fee on real publishing: an unspent or admin-swept deposit owes none.
+        if (!token.transferFrom(msg.sender, address(convictionStakingStorage), deposit)) {
+            revert TokenLib.TransferFailed();
+        }
+        contextGraphStorage.setRegistrationEscrow(contextGraphId, deposit);
+        emit ContextGraphRegistrationDeposited(contextGraphId, msg.sender, deposit);
+    }
+
+    /// @notice Admin: RETIRE a CG and reclaim its residual registration escrow
+    ///         into the staker reward pool (current epoch). For abandoned / spam
+    ///         CGs whose deposit was never spent on publishing. Deactivation is
+    ///         ATOMIC with the sweep, so this can never silently drain an ACTIVE
+    ///         CG owner's prepaid publishing budget while leaving the CG live —
+    ///         sweeping a CG is retiring it. The TRAC is already in the CSS vault,
+    ///         so this only deactivates, credits the epoch pool, and clears the
+    ///         per-CG accounting. Never refunds to the depositor.
+    function sweepContextGraphEscrow(uint256 contextGraphId) external onlyHubOwner {
+        // RandomSampling invariant (RS leaf-zeroing mandate, see RandomSampling.sol):
+        // retiring a CG must not strand its sampling weight. Settle the CG's leaf to
+        // its TRUE current value first — an abandoned/expired CG (this sweep's target)
+        // settles to 0, so any stale leaf is zeroed before deactivation. A CG that
+        // still holds LIVE value is REFUSED: deactivating a weighted CG strands its
+        // leaf, and past MAX_CG_RETRIES RandomSampling reverts challenge selection.
+        // Gated on the sampling stack being deployed — always true in production; a
+        // minimal deploy without CGWeightTreeStorage has no sampling weight to strand.
+        // Storages resolved at call time (admin-only path; no cached binding to stale).
+        if (hub.isContract("CGWeightTreeStorage")) {
+            CGWeightTreeStorage(hub.getContractAddress("CGWeightTreeStorage")).settle(contextGraphId);
+            if (
+                ContextGraphValueStorage(hub.getContractAddress("ContextGraphValueStorage"))
+                    .getCurrentCGValue(contextGraphId) != 0
+            ) {
+                revert KnowledgeAssetsLib.InvalidContextGraphConfig("CG has live value");
+            }
+        }
+        // Atomic retire-then-reclaim: deactivate first so a live CG's prepaid
+        // budget can't be drained out from under its owner while the CG stays
+        // active (otReviewAgent finding). An already-inactive CG is swept as-is.
+        if (contextGraphStorage.isContextGraphActive(contextGraphId)) {
+            contextGraphStorage.deactivateContextGraph(contextGraphId);
+        }
+        uint96 swept = contextGraphStorage.clearRegistrationEscrow(contextGraphId);
+        if (swept == 0) {
+            revert KnowledgeAssetsLib.InvalidContextGraphConfig("no escrow");
+        }
+        uint256 currentEpoch = chronos.getCurrentEpoch();
+        epochStorage.addTokensToEpochRange(1, currentEpoch, currentEpoch, swept);
+        emit ContextGraphEscrowSwept(contextGraphId, swept);
     }
 
     // --- Governance (token-holder gated) ---
@@ -302,9 +502,11 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable {
      *        authorization. Instead we LIVE-RESOLVE the current PCA NFT
      *        owner via `IDKGPublishingConvictionNFT.ownerOf(accountId)` and
      *        accept either (a) that live owner directly or (b) a registered
-     *        agent whose `agentToAccountId(publisher) == accountId`. Both
-     *        mappings on the NFT contract are cleared by the transfer hook,
-     *        so stale agent entries automatically stop authorizing.
+     *        agent whose `agentToAccountId(publisher) == accountId`. The live
+     *        owner check revokes the FORMER owner immediately on transfer. The
+     *        agent allow-list, however, is PRESERVED across transfer (it travels
+     *        with the PCA), so a former owner's registered agents retain publish
+     *        authority until the new owner calls `PublishingConviction.clearAgents`.
      *
      *      Branch order is IMPORTANT. Because the EOA/Safe branch matches on
      *      the stored authority snapshot, it MUST NOT run in PCA mode — an
@@ -385,17 +587,19 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable {
             return false;
         }
 
-        // Registered agent of the authorized account. `agentToAccountId`
-        // is cleared by the NFT's `_update` transfer hook, so stale agent
-        // entries automatically stop authorizing post-transfer.
+        // Registered agent of the authorized account. The agent allow-list is
+        // PRESERVED across PCA transfer (it travels with the token), so a former
+        // owner's agents keep authorizing here until the new owner explicitly
+        // resets it via `PublishingConviction.clearAgents`. The former OWNER is
+        // still revoked immediately by the live `ownerOf` check above.
         uint256 publisherAccountId = IDKGPublishingConvictionNFT(nftAddr).agentToAccountId(publisher);
         return publisherAccountId != 0 && publisherAccountId == authorityAccountId;
     }
 
-    // --- KC registration (Phase 8 publish flow entry point) ---
+    // --- KA registration (Phase 8 publish flow entry point) ---
 
     /**
-     * @notice Bind a Knowledge Collection to a Context Graph via the facade.
+     * @notice Bind a Knowledge Asset to a Context Graph via the facade.
      * @dev Thin wrapper over `ContextGraphStorage.registerKnowledgeAssetToContextGraph`.
      *      Exists so Phase 8's `KnowledgeAssetsV10.publish` / `publishDirect`
      *      can call the facade (stable interface) instead of reaching into

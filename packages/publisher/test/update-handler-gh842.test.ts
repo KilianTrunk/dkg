@@ -18,8 +18,10 @@ import {
   TypedEventBus,
   encodeKAUpdateRequest,
   contextGraphDataUri,
+  contextGraphLayerUri,
   contextGraphMetaUri,
   generateEd25519Keypair,
+  MemoryLayer,
 } from '@origintrail-official/dkg-core';
 import type { ChainAdapter } from '@origintrail-official/dkg-chain';
 import { NoChainAdapter } from '@origintrail-official/dkg-chain';
@@ -165,9 +167,20 @@ describe('UpdateHandler — GH #842 deterministic-UAL fallback (gossip receiver)
 
     expect(resolverCalls).toBe(1);
 
-    // Label data graph received the verified update.
+    // The verified update is restated into the per-KA verifiable-memory graph
+    // (rc.17 uniform layout) the original publish wrote — keyed by the
+    // on-chain batchId (= the packed kaId), unpacked into author+number. The
+    // restatement still happens even though the per-cgId resolver threw.
+    const vmAuthor = '0x' + (BATCH_ID >> 96n).toString(16).padStart(40, '0');
+    const vmNumber = BATCH_ID & ((1n << 96n) - 1n);
+    const verifiableMemoryGraph = contextGraphLayerUri(
+      CG_NAME,
+      MemoryLayer.VerifiableMemory,
+      vmAuthor,
+      vmNumber,
+    );
     const labelDataCount = await store.query(
-      `SELECT (COUNT(*) AS ?c) WHERE { GRAPH <${labelGraph}> { <urn:upd:r2> ?p ?o } }`,
+      `SELECT (COUNT(*) AS ?c) WHERE { GRAPH <${verifiableMemoryGraph}> { <urn:upd:r2> ?p ?o } }`,
     );
     const labelCount = labelDataCount.type === 'bindings'
       ? Number(String(labelDataCount.bindings[0]['c']).match(/\d+/)?.[0] ?? 0)

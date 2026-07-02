@@ -41,7 +41,7 @@ describe('dkg_query — two-axis schema migration (post-#17 rename + split)', ()
     expect(lastCall.includeSharedMemory).toBe(true);
   });
 
-  it.each(['working-memory', 'shared-working-memory', 'verified-memory'])(
+  it.each(['working-memory', 'shared-working-memory', 'verifiable-memory'])(
     'accepts the canonical view enum value %s',
     async (view) => {
       const result = await server.call('dkg_query', {
@@ -119,7 +119,7 @@ describe('dkg_query — two-axis schema migration (post-#17 rename + split)', ()
     const inner = viewSchema.unwrap() as z.ZodEnum<[string, ...string[]]>;
     expect([...inner.options].sort()).toEqual([
       'shared-working-memory',
-      'verified-memory',
+      'verifiable-memory',
       'working-memory',
     ]);
   });
@@ -153,17 +153,17 @@ describe('F1 schema-migration sweep — no public tool exposes legacy `layer` fi
     }
   });
 
-  it('dkg_get_entity accepts `view: "verified-memory"` post-F1', async () => {
+  it('dkg_get_entity accepts `view: "verifiable-memory"` post-F1', async () => {
     const server = new FakeServer();
     const client = new FakeClient();
     registerReadTools(server.asMcpServer(), client.asDkgClient(), makeConfig());
     const result = await server.call('dkg_get_entity', {
       uri: 'urn:test:entity',
-      view: 'verified-memory',
+      view: 'verifiable-memory',
     });
     expect(result.isError).toBeFalsy();
     const lastCall = client.queryCalls.at(-1)!;
-    expect(lastCall.view).toBe('verified-memory');
+    expect(lastCall.view).toBe('verifiable-memory');
   });
 
   it('F27: dkg_get_entity silently drops legacy `layer: "union"`, falls back to V9-era default WM∪SWM scope', async () => {

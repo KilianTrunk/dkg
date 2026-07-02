@@ -7,36 +7,125 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   PayloadTooLargeError,
+  assertQuadLiteralsMutf8Safe,
+  isOversizedRdfLiteralError,
   validateContextGraphId,
   validateSubGraphName,
   isSafeIri,
+  NO_FUNDED_PUBLISHER_WALLET_CODE,
+  messageIndicatesNoFundedPublisherWallet,
 } from '@origintrail-official/dkg-core';
-import type { DKGAgent } from '@origintrail-official/dkg-agent';
+import { enrichEvmError, isChainRpcTransportError } from '@origintrail-official/dkg-chain';
+import type { DKGAgent, ContextGraphWritePreflightProbe } from '@origintrail-official/dkg-agent';
 import type { DkgConfig } from '../config.js';
 import { enforceSignedRequestPostBody } from '../auth.js';
 
-// Co-located here because the body parser is their only semantic
-// consumer; moving them to `./types.ts` would just add an import
-// cycle with no real benefit.
-export interface PublishQuad {
-  subject: string;
-  predicate: string;
-  object: string;
-  graph: string;
-}
-
-export type PublishAccessPolicy = 'public' | 'ownerOnly' | 'allowList';
-
-export interface PublishRequestBody {
-  contextGraphId: string;
-  quads: PublishQuad[];
-  privateQuads?: PublishQuad[];
-  accessPolicy?: PublishAccessPolicy;
-  allowedPeers?: string[];
-  subGraphName?: string;
-}
-
 import type { CorsAllowlist } from './state.js';
+
+export function isPayloadTooLargeError(err: unknown): err is PayloadTooLargeError {
+  if (err instanceof PayloadTooLargeError) return true;
+  if (!err || typeof err !== 'object') return false;
+  const shaped = err as { name?: unknown; code?: unknown };
+  return (
+    shaped.name === 'PayloadTooLargeError' ||
+    shaped.name === 'SwmGossipPayloadTooLargeError' ||
+    shaped.code === 'PAYLOAD_TOO_LARGE' ||
+    shaped.code === 'SWM_GOSSIP_PAYLOAD_TOO_LARGE'
+  );
+}
+
+export function payloadTooLargeResponseBody(err: unknown): Record<string, unknown> {
+  const shaped = (err && typeof err === 'object') ? err as Record<string, unknown> : {};
+  const message = err instanceof Error ? err.message : String(err ?? 'Payload too large');
+  const body: Record<string, unknown> = {
+    error: message,
+    code: typeof shaped.code === 'string' ? shaped.code : 'PAYLOAD_TOO_LARGE',
+  };
+  const maxBytes = shaped.maxBytes;
+  if (typeof maxBytes === 'number') body.limitBytes = maxBytes;
+  const actualBytes = shaped.actualBytes;
+  if (typeof actualBytes === 'number') body.actualBytes = actualBytes;
+  const hint = shaped.hint;
+  if (typeof hint === 'string' && hint.length > 0) body.hint = hint;
+  return body;
+}
+
+/**
+ * True iff `err` is (or looks like) the funded-wallet-selection failure
+ * (`InsufficientPublisherFundsError`, code `NO_FUNDED_PUBLISHER_WALLET`) —
+ * code-first, with a message-marker fallback for a re-wrap that dropped `.code`.
+ * Code + marker are the shared dkg-core contract so the daemon, publisher
+ * classifier, chain, and node-ui cannot drift. Shared by the `/vm/publish` route
+ * catch and the top-level daemon handler.
+ */
+export function isNoFundedPublisherWalletLike(err: unknown): boolean {
+  const e = err as { code?: unknown; message?: unknown } | null | undefined;
+  if (e?.code === NO_FUNDED_PUBLISHER_WALLET_CODE) return true;
+  return messageIndicatesNoFundedPublisherWallet(e?.message);
+}
+
+/** The HTTP-400 response body for a no-funded-wallet publish failure: the
+ *  structured `code` plus the actionable message (which lists per-wallet
+ *  balances). Single source of truth for both publish routes. */
+export function noFundedPublisherWalletBody(message: string): { code: string; error: string } {
+  return { code: NO_FUNDED_PUBLISHER_WALLET_CODE, error: message };
+}
+
+/**
+ * Map a thrown request error to the daemon's top-level HTTP response — the
+ * single neutral place that rethrowing lifecycle publish routes
+ * and the lifecycle catch agree on status codes: 413 payload-too-large; 400 for
+ * SyntaxError / reserved-namespace / NO_FUNDED_PUBLISHER_WALLET; otherwise a 500
+ * with the EVM-decoded message. Unit-testable in isolation.
+ */
+export function respondWithDaemonError(res: ServerResponse, err: any): void {
+  if (res.headersSent || res.writableEnded) return;
+  if (isPayloadTooLargeError(err)) {
+    jsonResponse(res, 413, payloadTooLargeResponseBody(err));
+  } else if (err instanceof SyntaxError) {
+    jsonResponse(res, 400, { error: err.message });
+  } else if (
+    // Round 9 Bug 25: user-authored quads with reserved URN prefixes map to 400
+    // so share/publish routes that rethrow get the correct status.
+    err?.name === 'ReservedNamespaceError' ||
+    (typeof err?.message === 'string' && err.message.includes('reserved namespace'))
+  ) {
+    jsonResponse(res, 400, { error: err.message });
+  } else if (isNoFundedPublisherWalletLike(err)) {
+    // Funded-wallet selection found no operational wallet with gas + TRAC — a
+    // user-actionable funding condition (4xx), not a server bug.
+    jsonResponse(res, 400, noFundedPublisherWalletBody(typeof err?.message === 'string' ? err.message : String(err)));
+  } else if (respondIfChainRpcTransportError(res, err)) {
+    // Transient transport exhaustion (RPC_ENDPOINTS_EXHAUSTED /
+    // RPC_RECEIPT_LOOKUP_FAILED → 503, TIMEOUT → 504) is retryable — a route
+    // that RE-THROWS to this top-level handler gets the retryable status instead
+    // of 500.
+    // Code-keyed, so on-chain reverts (no transport code) fall through to 500.
+  } else {
+    enrichEvmError(err);
+    jsonResponse(res, 500, { error: err?.message ?? String(err) });
+  }
+}
+
+export function oversizedRdfLiteralResponseBody(err: unknown): Record<string, unknown> {
+  const shaped = (err && typeof err === 'object') ? err as Record<string, unknown> : {};
+  const message = err instanceof Error ? err.message : String(err ?? 'Oversized RDF literal');
+  const body: Record<string, unknown> = {
+    error: message,
+    code: 'OVERSIZED_RDF_LITERAL',
+  };
+  const maxBytes = shaped.maxBytes;
+  if (typeof maxBytes === 'number') body.limitBytes = maxBytes;
+  const actualBytes = shaped.actualBytes;
+  if (typeof actualBytes === 'number') body.actualBytes = actualBytes;
+  const subject = shaped.subject;
+  if (typeof subject === 'string') body.subject = subject;
+  const predicate = shaped.predicate;
+  if (typeof predicate === 'string') body.predicate = predicate;
+  const graph = shaped.graph;
+  if (typeof graph === 'string') body.graph = graph;
+  return body;
+}
 
 export async function resolveNameToPeerId(
   agent: DKGAgent,
@@ -60,131 +149,190 @@ export async function resolveNameToPeerId(
   return match?.peerId ?? null;
 }
 
-export function isPublishQuad(value: unknown): value is PublishQuad {
-  if (!value || typeof value !== "object") return false;
+/**
+ * GH #306 / #787 — shape guard for the WRITE routes (wm/write,
+ * shared-memory/write). The `graph` term is OPTIONAL here: those routes
+ * legitimately accept `{subject,predicate,object}`
+ * and fill the graph internally. Without this guard, a string-shaped quad
+ * (e.g. an N-Quad line `"<s> <p> <o> ."`) slips past a bare `Array.isArray`
+ * check and crashes the agent write path with a TypeError → HTTP 500 instead
+ * of an actionable 4xx.
+ */
+export function isWritableQuad(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const v = value as Record<string, unknown>;
   return (
     typeof v.subject === "string" &&
     typeof v.predicate === "string" &&
     typeof v.object === "string" &&
-    typeof v.graph === "string"
+    (v.graph === undefined || typeof v.graph === "string")
   );
 }
 
-export function parsePublishRequestBody(
-  body: string,
-): { ok: true; value: PublishRequestBody } | { ok: false; error: string } {
-  let parsed: unknown;
+export function validateWritableQuadLiteralSizes(
+  label: string,
+  quads: Array<{ subject: string; predicate: string; object: string; graph?: string }>,
+): { ok: true } | { ok: false; body: Record<string, unknown> } {
   try {
-    parsed = JSON.parse(body);
-  } catch {
-    return { ok: false, error: "Invalid JSON body" };
-  }
-
-  if (!parsed || typeof parsed !== "object") {
-    return { ok: false, error: "Body must be a JSON object" };
-  }
-
-  const payload = parsed as Record<string, unknown>;
-  const { quads, privateQuads, accessPolicy, allowedPeers, subGraphName } =
-    payload;
-  const contextGraphId = payload.contextGraphId as unknown;
-
-  if (typeof contextGraphId !== "string" || contextGraphId.trim().length === 0) {
-    return {
-      ok: false,
-      error: 'Missing or invalid "contextGraphId"',
-    };
-  }
-
-  if (
-    !Array.isArray(quads) ||
-    quads.length === 0 ||
-    !quads.every(isPublishQuad)
-  ) {
-    return {
-      ok: false,
-      error: 'Missing or invalid "quads" (must be a non-empty quad array)',
-    };
-  }
-
-  if (
-    privateQuads !== undefined &&
-    (!Array.isArray(privateQuads) || !privateQuads.every(isPublishQuad))
-  ) {
-    return {
-      ok: false,
-      error: 'Invalid "privateQuads" (must be a quad array)',
-    };
-  }
-
-  if (
-    accessPolicy !== undefined &&
-    accessPolicy !== "public" &&
-    accessPolicy !== "ownerOnly" &&
-    accessPolicy !== "allowList"
-  ) {
-    return {
-      ok: false,
-      error: 'Invalid "accessPolicy" (must be public, ownerOnly, or allowList)',
-    };
-  }
-
-  if (
-    allowedPeers !== undefined &&
-    (!Array.isArray(allowedPeers) ||
-      !allowedPeers.every((p) => typeof p === "string" && p.trim().length > 0))
-  ) {
-    return {
-      ok: false,
-      error: 'Invalid "allowedPeers" (must be an array of non-empty strings)',
-    };
-  }
-
-  if (
-    accessPolicy === "allowList" &&
-    (!allowedPeers || allowedPeers.length === 0)
-  ) {
-    return {
-      ok: false,
-      error: '"allowList" accessPolicy requires non-empty "allowedPeers"',
-    };
-  }
-
-  if (accessPolicy !== "allowList" && allowedPeers && allowedPeers.length > 0) {
-    return {
-      ok: false,
-      error: '"allowedPeers" is only valid when "accessPolicy" is "allowList"',
-    };
-  }
-
-  if (subGraphName !== undefined) {
-    if (typeof subGraphName !== "string" || subGraphName.trim().length === 0) {
-      return {
-        ok: false,
-        error: 'Invalid "subGraphName" (must be a non-empty string)',
-      };
+    assertQuadLiteralsMutf8Safe(quads, { label });
+    return { ok: true };
+  } catch (err) {
+    if (isOversizedRdfLiteralError(err)) {
+      return { ok: false, body: oversizedRdfLiteralResponseBody(err) };
     }
-    const sgValidation = validateSubGraphName(subGraphName);
-    if (!sgValidation.valid) {
+    throw err;
+  }
+}
+
+/**
+ * GH #306 / #787 (follow-up) — validate each quad's `object` term is either a
+ * quoted RDF literal (`"…"`) or an absolute IRI. Shared by lifecycle write
+ * routes and other quad-accepting validation paths: the shape guard
+ * ({@link isWritableQuad}) only checks that fields
+ * are strings, so an object that is neither a literal nor an IRI (e.g. a bare
+ * word `hello` or a number `123`) slips past them and crashes the RDF parser
+ * with an uncaught "No scheme found in an absolute IRI" → HTTP 500 instead of an
+ * actionable 400.
+ */
+export function validateQuadObjectTerms(
+  label: string,
+  quads: ReadonlyArray<{ object: string }>,
+): string | null {
+  const badIndex = quads.findIndex((q) => {
+    const object = q.object.trim();
+    return !object.startsWith('"') && !isSafeIri(object);
+  });
+  if (badIndex === -1) return null;
+  return `Invalid "${label}[${badIndex}].object": RDF object must be a quoted literal term or absolute IRI`;
+}
+
+/**
+ * KA-number-floor reconcile resilience (follow-up to the "KA create 500-on-429"
+ * fix). If `e` is a **transient** reconcile failure — the chain RPC couldn't serve
+ * the one-time-per-author floor read (e.g. a 429 after the bounded retry in
+ * `allocator.ts` is exhausted) — send a retryable **503** and return true;
+ * otherwise return false so the caller falls through to its normal mapping.
+ *
+ * The transient-vs-deterministic verdict comes from `retryable` (derived from
+ * `isTransientChainError`): the typed `KaFloorReconcileError` carries it, and the
+ * finalize/selection re-wrap sites in `dkg-agent-publish.ts` tag the same marker.
+ * A deterministic failure (`retryable === false`, e.g. a revert) is NOT a 503 —
+ * advertising a retry would be pointless — so it falls through. The legacy
+ * message-text match is honored ONLY when the error explicitly marks itself
+ * retryable, so a bare re-wrapped message can never force a deterministic error
+ * into a retryable 503 (PR #1319 review). Used by every route that can trigger the
+ * reconcile (named create, one-shot publish, shared-memory publish, and the
+ * WM-verb routes via `respondAssertionError`) so they answer consistently.
+ */
+export function respondIfReconcileUnavailable(res: ServerResponse, e: any): boolean {
+  const msg = e?.message ?? String(e);
+  const isTyped = e?.code === "KA_FLOOR_RECONCILE_UNAVAILABLE";
+  // Message-text fallback (for errors re-wrapped on the way up) is accepted only
+  // when the error explicitly carries a retryable marker — never for a bare
+  // message, which might be hiding a deterministic revert.
+  const isMarkedLegacyTransient =
+    e?.retryable === true && /failed to reconcile KA-number floor/i.test(msg);
+  if ((!isTyped && !isMarkedLegacyTransient) || e?.retryable === false) {
+    return false;
+  }
+  jsonResponse(res, 503, {
+    error: msg,
+    code: "KA_FLOOR_RECONCILE_UNAVAILABLE",
+    retryable: true,
+  });
+  return true;
+}
+
+/**
+ * Strip http(s) URLs from a chain error message before it is returned in an
+ * HTTP response body. The adapter's multi-provider `RPC_ENDPOINTS_EXHAUSTED`
+ * message embeds `this.rpcUrls.join(', ')`, and with default-backup inheritance
+ * an operator-set private `chain.rpcUrl` may carry an API key — so a response
+ * body must never echo raw RPC URLs (the failover logger is already host-only).
+ */
+export function sanitizeRpcMessage(msg: string): string {
+  return msg.replace(/https?:\/\/[^\s,)'"]+/gi, "[rpc]");
+}
+
+/**
+ * Maps a TRANSPORT-level chain RPC failure to a RETRYABLE HTTP status,
+ * keyed STRICTLY on `err.code` (never message text):
+ *   - `RPC_ENDPOINTS_EXHAUSTED`   → 503 (all configured endpoints failed over)
+ *   - `RPC_RECEIPT_LOOKUP_FAILED` → 503 (receipt lookup failed on every endpoint)
+ *   - `TIMEOUT`                   → 504 (receipt wait / RPC request timed out)
+ *
+ * Returns `undefined` for anything else. On-chain reverts (`CALL_EXCEPTION`),
+ * `INSUFFICIENT_FUNDS`, and application errors carry NO `RPC_*`/`TIMEOUT`
+ * transport code (the chain adapter only stamps these on the multi-RPC
+ * failover loops), so they fall through to each route's own mapping — which
+ * preserves the #988 contract that a genuine publish/on-chain failure stays
+ * 5xx/4xx and is NEVER down-classified by message text.
+ *
+ * Shared chokepoint for `/api/context-graph/register`, the `/vm/publish`
+ * catch, `respondAssertionError` (WM-verb writes), the SWM→VM publish
+ * auto-register leg, and the top-level daemon catch, so EVERY chain-write
+ * surface answers a transient RPC outage with the SAME retryable status
+ * instead of a generic 500 (or, in the auto-register leg, a misleading 400).
+ * Mirrors the failover engine's own multi-RPC awareness at the HTTP boundary.
+ */
+export function classifyChainRpcTransportStatus(
+  err: unknown,
+): { status: number; body: Record<string, unknown> } | undefined {
+  if (!isChainRpcTransportError(err)) return undefined;
+  const { code } = err;
+  const msg = sanitizeRpcMessage(typeof err.message === "string" ? err.message : "");
+  const txHash = typeof err.txHash === "string" && err.txHash ? err.txHash : "";
+  // Exhaustive over ChainRpcTransportCode: a new code added to the boundary
+  // without a case here is a COMPILE error (the `never` default), so the
+  // classifier can never silently inherit timeout/504 semantics for a new code.
+  switch (code) {
+    case "RPC_ENDPOINTS_EXHAUSTED":
+      return { status: 503, body: { error: msg || "Configured chain RPC endpoints were exhausted.", code } };
+    case "RPC_RECEIPT_LOOKUP_FAILED":
       return {
-        ok: false,
-        error: `Invalid "subGraphName": ${sgValidation.reason}`,
+        status: 503,
+        body: {
+          error: msg || "Transaction receipt lookup failed on all configured chain RPC endpoints.",
+          code,
+          ...(txHash ? { txHash } : {}),
+        },
       };
+    case "RPC_TIMEOUT":
+      // Internal, chain-namespaced timeout code. Expose the public/legacy
+      // `code: "TIMEOUT"` in the 504 body (clients key on that), keeping the
+      // wire contract stable while the boundary stays namespaced internally.
+      return {
+        status: 504,
+        body: { error: msg || "Chain transaction timed out.", code: "TIMEOUT", ...(txHash ? { txHash } : {}) },
+      };
+    default: {
+      const _exhaustive: never = code;
+      return _exhaustive;
     }
   }
+}
 
-  return {
-    ok: true,
-    value: {
-      contextGraphId,
-      quads,
-      privateQuads,
-      accessPolicy,
-      allowedPeers,
-      subGraphName: subGraphName as string | undefined,
-    },
-  };
+/**
+ * Single responder for a transient chain-RPC transport failure: maps it to a
+ * retryable 503/504 (via {@link classifyChainRpcTransportStatus}), writes the
+ * response, and returns true. Returns false (writing nothing) for any
+ * non-transport error so the caller falls through to its own mapping.
+ * `extraBody` adds route-specific fields to the response body (e.g. the identity
+ * route's `{ identityId, hasIdentity }`). The canonical transport fields
+ * (`error`, `code`, `txHash`) are merged LAST so a caller can never shadow them
+ * — `extraBody` may only ADD fields, keeping this responder the single source of
+ * truth for the transport response shape. Use this instead of repeating the
+ * classify→jsonResponse branch in every chain-write catch.
+ */
+export function respondIfChainRpcTransportError(
+  res: ServerResponse,
+  err: unknown,
+  extraBody?: Record<string, unknown>,
+): boolean {
+  const transport = classifyChainRpcTransportStatus(err);
+  if (!transport) return false;
+  jsonResponse(res, transport.status, extraBody ? { ...extraBody, ...transport.body } : transport.body);
+  return true;
 }
 
 /**
@@ -540,6 +688,84 @@ function rejectKnownNonWritableContextGraph(
   return null;
 }
 
+function contextGraphValidationUnavailable(
+  res: ServerResponse,
+  message: string,
+): null {
+  jsonResponse(res, 503, {
+    code: "CONTEXT_GRAPH_VALIDATION_UNAVAILABLE",
+    error: `Failed to validate contextGraphId against known context graphs: ${message}`,
+  });
+  return null;
+}
+
+function hasActiveSyncedSubscription(probe: ContextGraphWritePreflightProbe): boolean {
+  return (
+    probe.inMemorySubscription?.subscribed === true &&
+    probe.inMemorySubscription.synced === true
+  );
+}
+
+function hasAnySyncedSubscription(probe: ContextGraphWritePreflightProbe): boolean {
+  return (
+    hasActiveSyncedSubscription(probe) ||
+    (probe.persistedSubscription?.subscribed === true && probe.persistedSubscription.synced === true)
+  );
+}
+
+function exactProbeIsLocallyWritable(
+  probe: ContextGraphWritePreflightProbe,
+  requireLocalWritable: boolean,
+): boolean {
+  if (!probe.exists) return false;
+  if (!requireLocalWritable) {
+    return hasActiveSyncedSubscription(probe) || probe.hasLocalContent || probe.declarationFound;
+  }
+  return hasActiveSyncedSubscription(probe) || (probe.hasLocalContent && probe.exists);
+}
+
+function exactProbeCanFastAccept(
+  probe: ContextGraphWritePreflightProbe,
+  requireLocalWritable: boolean,
+  callerAgentAddress: string | null,
+): boolean {
+  if (!exactProbeIsLocallyWritable(probe, requireLocalWritable)) return false;
+  if (!callerAgentAddress) return probe.accessPolicy === "public";
+  return probe.callerAuthorized === true;
+}
+
+function exactProbeIsAuthoritativeBearerDeny(
+  probe: ContextGraphWritePreflightProbe,
+  callerAgentAddress: string | null,
+): boolean {
+  return (
+    !!callerAgentAddress &&
+    probe.exists &&
+    probe.declarationFound &&
+    probe.accessPolicy === "private" &&
+    probe.callerAuthorized === false
+  );
+}
+
+function exactProbeIsStaleSubscription(probe: ContextGraphWritePreflightProbe): boolean {
+  return hasAnySyncedSubscription(probe) && !probe.exists && !probe.hasLocalContent;
+}
+
+function rejectUnknownContextGraph(
+  res: ServerResponse,
+  raw: string,
+): null {
+  jsonResponse(res, 400, {
+    code: "CONTEXT_GRAPH_NOT_FOUND",
+    error:
+      `Unknown contextGraphId "${raw}". Write operations must target an existing ` +
+      `context graph. Use /api/context-graph/list or dkg_list_context_graphs and ` +
+      `pass the canonical id (for curated graphs, "<curatorAddress>/<slug>") ` +
+      `or full did:dkg:context-graph:... URI.`,
+  });
+  return null;
+}
+
 /**
  * Resolve a write target to a known, canonical context graph id.
  *
@@ -554,6 +780,10 @@ export async function resolveRequiredWriteContextGraphId(
     }): Promise<ExistingContextGraphRow[]>;
     contextGraphHasLocalContent?: (contextGraphId: string) => Promise<boolean>;
     contextGraphExists?: (contextGraphId: string) => Promise<boolean>;
+    probeContextGraphWritePreflight?: (
+      contextGraphId: string,
+      opts?: { callerAgentAddress?: string | null },
+    ) => Promise<ContextGraphWritePreflightProbe>;
   },
   contextGraphId: unknown,
   res: ServerResponse,
@@ -576,27 +806,58 @@ export async function resolveRequiredWriteContextGraphId(
     return null;
   }
 
+  const callerAgentAddress = normalizeContextGraphCallerAddress(
+    opts.callerAgentAddress,
+  );
+  const isBareCandidateId = !candidateId.includes("/");
+  let deferredExactProbeReject = false;
+  let exactProbeErrorMessage: string | null = null;
+  if (agent.probeContextGraphWritePreflight) {
+    try {
+      const probe = await agent.probeContextGraphWritePreflight(candidateId, {
+        callerAgentAddress,
+      });
+      if (exactProbeCanFastAccept(probe, requireLocalWritable, callerAgentAddress)) {
+        return candidateId;
+      }
+      if (exactProbeIsStaleSubscription(probe)) {
+        if (isBareCandidateId) {
+          deferredExactProbeReject = true;
+        } else {
+          return rejectUnknownContextGraph(res, raw);
+        }
+      }
+      if (exactProbeIsAuthoritativeBearerDeny(probe, callerAgentAddress)) {
+        if (isBareCandidateId) {
+          deferredExactProbeReject = true;
+        } else {
+          return rejectUnknownContextGraph(res, raw);
+        }
+      }
+    } catch (err) {
+      exactProbeErrorMessage = err instanceof Error ? err.message : String(err);
+      // Fall back to the composite list path. If that is also unavailable,
+      // the caller receives the bounded validation-unavailable response below.
+    }
+  }
+
   let contextGraphs: ExistingContextGraphRow[];
   try {
-    const callerAgentAddress = normalizeContextGraphCallerAddress(
-      opts.callerAgentAddress,
-    );
     contextGraphs = callerAgentAddress
       ? await agent.listContextGraphs({ callerAgentAddress })
       : await agent.listContextGraphs();
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    jsonResponse(res, 500, {
-      error: `Failed to validate contextGraphId against known context graphs: ${message}`,
-    });
-    return null;
+    const listMessage = err instanceof Error ? err.message : String(err);
+    const message = exactProbeErrorMessage
+      ? `exact preflight failed: ${exactProbeErrorMessage}; list validation failed: ${listMessage}`
+      : listMessage;
+    return contextGraphValidationUnavailable(res, message);
   }
 
   const knownIds = contextGraphs
     .map((row) => (typeof row.id === "string" ? row.id : ""))
     .filter((id) => id.length > 0);
 
-  const isBareCandidateId = !candidateId.includes("/");
   const exact = contextGraphs.find((row) => {
     const id = typeof row.id === "string" ? row.id : "";
     const uri = typeof row.uri === "string" ? row.uri : "";
@@ -621,12 +882,13 @@ export async function resolveRequiredWriteContextGraphId(
       ),
     );
     if (exact?.id && typeof exact.id === "string" && suffixMatches.length > 0 && exactWritable) {
-      return exact.id;
+      if (!deferredExactProbeReject) return exact.id;
     }
     if (
       exact?.id &&
       typeof exact.id === "string" &&
       suffixMatches.length > 0 &&
+      !deferredExactProbeReject &&
       !isShadowLikeBareContextGraphRow(exact)
     ) {
       if (requireLocalWritable && !exactWritable) {
@@ -654,6 +916,9 @@ export async function resolveRequiredWriteContextGraphId(
         canonicalContextGraphIds: suffixMatches,
       });
       return null;
+    }
+    if (deferredExactProbeReject) {
+      return rejectUnknownContextGraph(res, raw);
     }
     if (exact?.id && typeof exact.id === "string") {
       if (requireLocalWritable && !exactWritable) {
@@ -684,15 +949,7 @@ export async function resolveRequiredWriteContextGraphId(
     }
   }
 
-  jsonResponse(res, 400, {
-    code: "CONTEXT_GRAPH_NOT_FOUND",
-    error:
-      `Unknown contextGraphId "${raw}". Write operations must target an existing ` +
-      `context graph. Use /api/context-graph/list or dkg_list_context_graphs and ` +
-      `pass the canonical id (for curated graphs, "<curatorAddress>/<slug>") ` +
-      `or full did:dkg:context-graph:... URI.`,
-  });
-  return null;
+  return rejectUnknownContextGraph(res, raw);
 }
 
 export function validateEntities(entities: unknown, res: ServerResponse): boolean {
@@ -722,7 +979,7 @@ export function validateConditions(conditions: unknown, res: ServerResponse): bo
   if (!Array.isArray(conditions) || conditions.length === 0) {
     jsonResponse(res, 400, {
       error:
-        '"conditions" must be a non-empty array (use /api/shared-memory/write for unconditional writes)',
+        '"conditions" must be a non-empty array (use the knowledge asset lifecycle routes for unconditional writes)',
     });
     return false;
   }
@@ -788,6 +1045,16 @@ export interface ImportFileExtractionPayload {
   pipelineUsed: string | null;
   mdIntermediateHash?: string;
   error?: string;
+  code?: string;
+  limitBytes?: number;
+  actualBytes?: number;
+  subject?: string;
+  predicate?: string;
+  graph?: string;
+  // #1101: when status === "skipped", explain WHY extraction was skipped so
+  // callers don't have to guess (the dominant cause is an unrecognized
+  // content type with no registered converter).
+  skipReason?: string;
 }
 
 export function buildImportFileResponse(args: {
@@ -810,6 +1077,13 @@ export function buildImportFileResponse(args: {
         ? { mdIntermediateHash: args.extraction.mdIntermediateHash }
         : {}),
       ...(args.extraction.error ? { error: args.extraction.error } : {}),
+      ...(args.extraction.code ? { code: args.extraction.code } : {}),
+      ...(args.extraction.limitBytes != null ? { limitBytes: args.extraction.limitBytes } : {}),
+      ...(args.extraction.actualBytes != null ? { actualBytes: args.extraction.actualBytes } : {}),
+      ...(args.extraction.subject ? { subject: args.extraction.subject } : {}),
+      ...(args.extraction.predicate ? { predicate: args.extraction.predicate } : {}),
+      ...(args.extraction.graph ? { graph: args.extraction.graph } : {}),
+      ...(args.extraction.skipReason ? { skipReason: args.extraction.skipReason } : {}),
     },
   };
 }
@@ -1052,6 +1326,212 @@ export class HttpRateLimiter {
   }
 }
 
+/**
+ * Read-only view of {@link InFlightLimiter}'s admission-control counters. This
+ * is what `/api/status` (and the plugin-facing `RequestContext`) consume, so
+ * route/plugin code can read inFlight/max/rejectedTotal without gaining access
+ * to the mutating `tryAcquire()`/`release()` and corrupting slot accounting.
+ */
+export interface AdmissionStatsView {
+  /** Requests currently holding a slot. */
+  readonly inFlight: number;
+  /** Effective concurrency cap; 0 disables the limiter (always admits). */
+  readonly max: number;
+  /** Monotonic count of requests shed (503) since boot. */
+  readonly rejectedTotal: number;
+}
+
+/**
+ * Bounds the number of HTTP requests being processed concurrently by the
+ * daemon, independent of client IP. This is admission control, not rate
+ * limiting: the single-process daemon funnels every request onto one event
+ * loop (and, on the embedded store backend, one Oxigraph worker thread), so a
+ * burst of concurrent in-flight requests — including local/loopback traffic
+ * that bypasses {@link HttpRateLimiter} — can pile pending work onto the heap
+ * and stall the node. When the cap is reached, callers should shed load with a
+ * 503 + Retry-After rather than queue unboundedly.
+ *
+ * `tryAcquire()` must be paired with exactly one `release()` in a `finally`.
+ */
+export class InFlightLimiter implements AdmissionStatsView {
+  private _inFlight = 0;
+  private _rejectedTotal = 0;
+  private readonly _max: number;
+
+  constructor(max: number) {
+    // A non-positive cap disables the limiter (always admits).
+    this._max = Number.isFinite(max) && max > 0 ? Math.floor(max) : 0;
+  }
+
+  get inFlight(): number {
+    return this._inFlight;
+  }
+
+  get max(): number {
+    return this._max;
+  }
+
+  /** Monotonic count of requests shed (tryAcquire returned false) — for metrics/logging. */
+  get rejectedTotal(): number {
+    return this._rejectedTotal;
+  }
+
+  /** Returns true and reserves a slot, or false if at capacity (shed load). */
+  tryAcquire(): boolean {
+    if (this._max > 0 && this._inFlight >= this._max) {
+      this._rejectedTotal += 1;
+      return false;
+    }
+    this._inFlight += 1;
+    return true;
+  }
+
+  release(): void {
+    if (this._inFlight > 0) this._inFlight -= 1;
+  }
+}
+
+/**
+ * Parse a base-10 integer from an env-style string. Returns null for
+ * `undefined`, empty/whitespace, or any non-integer text — so malformed input
+ * falls through to the next source instead of becoming `NaN`/`0`.
+ */
+function parseIntOrNull(value: string | undefined): number | null {
+  if (value === undefined) return null;
+  const t = value.trim();
+  if (t === '' || !/^-?\d+$/.test(t)) return null;
+  const n = Number(t);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Resolve an integer setting from an env var (highest precedence), then a
+ * config value, then a fallback. Malformed / empty / NaN inputs are IGNORED
+ * (fall through) rather than silently disabling the setting — a typo like
+ * `DKG_MAX_INFLIGHT=abc` or an empty string yields the documented default, not
+ * `NaN`/`0`.
+ *
+ * Pass `allowNonPositive` when `<= 0` is a meaningful value (e.g. "disable the
+ * cap"): then ANY integer is accepted, so `0` or a negative flows through to
+ * disable rather than falling back to the default. Without it the minimum
+ * accepted value is 1. (Named for what it does — it admits negatives too, not
+ * just zero.)
+ */
+export function resolveIntSetting(
+  envValue: string | undefined,
+  configValue: number | undefined,
+  fallback: number,
+  opts: { allowNonPositive?: boolean } = {},
+): number {
+  const accepts = (n: number | null | undefined): n is number =>
+    typeof n === 'number' && Number.isInteger(n) && (opts.allowNonPositive === true || n >= 1);
+  const fromEnv = parseIntOrNull(envValue);
+  if (accepts(fromEnv)) return fromEnv;
+  if (accepts(configValue)) return configValue;
+  return fallback;
+}
+
+/** Minimal shape of the bits of `http.Server` that {@link applyServerLimits} sets. */
+export interface ServerLimitsTarget {
+  maxConnections: number;
+  headersTimeout: number;
+}
+
+/**
+ * Resolve and APPLY the socket-level limits to an HTTP server: `maxConnections`
+ * (cap simultaneous sockets) and `headersTimeout` (kill slow-header
+ * connections). `requestTimeout` is intentionally left at the Node default so
+ * legitimately long publishes / SPARQL queries aren't truncated. Extracted from
+ * the daemon so the resolution precedence AND the assignment are unit-testable.
+ */
+export function applyServerLimits(
+  server: ServerLimitsTarget,
+  opts: {
+    maxConnectionsEnv?: string;
+    maxConnectionsConfig?: number;
+    headersTimeoutEnv?: string;
+  },
+): void {
+  server.maxConnections = resolveIntSetting(opts.maxConnectionsEnv, opts.maxConnectionsConfig, 256);
+  server.headersTimeout = resolveIntSetting(opts.headersTimeoutEnv, undefined, 60_000);
+}
+
+/**
+ * Cheap GET/HEAD paths exempt from concurrency admission control — liveness /
+ * health / manifest handlers that must stay answerable under load (monitoring,
+ * `dkg status`, doctor, MCP setup probes), plus the long-lived `/api/events`
+ * SSE stream (which must NOT hold an in-flight slot for the connection's whole
+ * lifetime, or a few open dashboard tabs would exhaust the pool).
+ *
+ * NOTE: this is one of several HTTP path-category tables in the daemon (see
+ * `auth.ts` public paths, `isLoopbackRateLimitExemptPath`, and the default
+ * rate-limit exempt list in `lifecycle.ts`). Centralizing them behind one
+ * source of truth is a worthwhile follow-up; kept local here for now.
+ */
+const ADMISSION_EXEMPT_GET_PATHS: ReadonlySet<string> = new Set([
+  '/api/status',
+  '/api/chain/rpc-health',
+  '/api/events',
+  '/.well-known/skill.md',
+  '/.well-known/skill-importer.md',
+]);
+
+/**
+ * Whether a request bypasses admission control. METHOD-AWARE on purpose: only
+ * `OPTIONS` (CORS preflight, any path) and safe `GET`/`HEAD` reads of the cheap
+ * liveness/doc/SSE paths bypass. A `POST`/`PUT`/etc. to those same paths is NOT
+ * exempt — it falls through to the router/route-plugins and so must still take
+ * a slot, otherwise a buggy/authenticated local client could run real work
+ * outside the cap via e.g. `POST /api/status`.
+ */
+export function isAdmissionExempt(method: string | undefined, pathname: string): boolean {
+  if (method === 'OPTIONS') return true;
+  if ((method === 'GET' || method === 'HEAD') && ADMISSION_EXEMPT_GET_PATHS.has(pathname)) return true;
+  return false;
+}
+
+/**
+ * Apply concurrency admission control to one request. Exempt requests (see
+ * {@link isAdmissionExempt}) always pass and take no slot. Otherwise a slot is
+ * reserved; on capacity it writes `503` + `Retry-After` (with CORS headers so
+ * browsers surface it) and returns `{ admitted: false }`.
+ *
+ * Ownership model: the slot is released automatically when the RESPONSE
+ * completes (`res` `close`), NOT when the request handler returns — route
+ * plugins and SSE can return with the response still streaming, and releasing
+ * on handler return would free the slot mid-stream and let that work run
+ * outside the cap. The release is registered here so callers cannot get it
+ * wrong; they only need to honor `admitted`.
+ */
+export function admitRequest(
+  limiter: InFlightLimiter,
+  method: string | undefined,
+  pathname: string,
+  res: ServerResponse,
+  corsOrigin: string | null,
+): { admitted: boolean } {
+  if (isAdmissionExempt(method, pathname)) {
+    return { admitted: true };
+  }
+  if (!limiter.tryAcquire()) {
+    res.writeHead(503, {
+      'Content-Type': 'application/json',
+      'Retry-After': '1',
+      ...corsHeaders(corsOrigin),
+    });
+    res.end(JSON.stringify({ error: 'Server busy, retry shortly' }));
+    return { admitted: false };
+  }
+  // Release exactly once, when the response completes (finish or abort).
+  let released = false;
+  res.once('close', () => {
+    if (released) return;
+    released = true;
+    limiter.release();
+  });
+  return { admitted: true };
+}
+
 export function isLoopbackClientIp(ip: string): boolean {
   const normalized = ip.trim().toLowerCase();
   if (normalized === '::1') return true;
@@ -1141,7 +1621,7 @@ export function classifyClientError(
   | null {
   const sanitized = sanitizeRevertMessage(msg);
   if (
-    /\b(not found|does not exist|no such|unknown (policy|contextGraph|context.?graph|peer|verified.?memory)|peer is not connected|cannot resolve|no addresses)\b/i.test(
+    /\b(not found|does not exist|no such|unknown (policy|contextGraph|context.?graph|peer|verifiable.?memory)|peer is not connected|cannot resolve|no addresses)\b/i.test(
       msg,
     )
   ) {
@@ -1166,7 +1646,7 @@ export function classifyClientError(
     return { status: 504, sanitized };
   }
   if (
-    /\b(invalid (peer|peerId|multihash|base|batchId|verifiedMemoryId|contextGraphId|policyUri|contextGraphId)|could not parse|parse (peer|peerId)|peer (id|ID) (is not valid|invalid)|malformed|bad request|incorrect length)\b/i.test(
+    /\b(invalid (peer|peerId|multihash|base|batchId|verifiableMemoryId|contextGraphId|policyUri|contextGraphId)|could not parse|parse (peer|peerId)|peer (id|ID) (is not valid|invalid)|malformed|bad request|incorrect length)\b/i.test(
       msg,
     )
   ) {

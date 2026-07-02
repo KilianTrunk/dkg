@@ -55,7 +55,7 @@ const daemonRequire = createRequire(import.meta.url);
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
-import { enrichEvmError, MockChainAdapter, resolveRpcUrls } from '@origintrail-official/dkg-chain';
+import { enrichEvmError, MockChainAdapter, resolveRpcUrls, getRpcFailoverStats } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
 import { isExternalBackend } from '@origintrail-official/dkg-storage';
 import { resolveManagedOxigraphPort } from '../oxigraph-managed.js';
@@ -94,6 +94,7 @@ import {
   type LocalAgentIntegrationTransport,
   resolveContextGraphs,
   resolveNetworkDefaultContextGraphs,
+  resolveNetworkConfigName,
   resolveSharedMemoryTtlMs,
   repoDir,
   releasesDir,
@@ -196,8 +197,6 @@ import {
 } from '../manifest.js';
 import {
   resolveNameToPeerId,
-  isPublishQuad,
-  parsePublishRequestBody,
   jsonResponse,
   safeDecodeURIComponent,
   safeParseJson,
@@ -224,6 +223,7 @@ import {
   shortId,
   sleep,
   deriveBlockExplorerUrl,
+  respondIfChainRpcTransportError,
 } from '../http-utils.js';
 import {
   normalizeRepo,
@@ -518,6 +518,7 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
     validTokens,
     apiHost,
     apiPortRef,
+    admission,
     url,
     path,
     requestToken,
@@ -616,11 +617,15 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
     const circuitAddrs = agent.multiaddrs.filter((a) =>
       a.includes("/p2p-circuit/"),
     );
-    const networkId = await computeNetworkId();
+    const networkId = network?.networkId ?? await computeNetworkId(network?.genesisId);
     const chainConf = resolveChainConfig(config, network);
     const rpcEndpointCount = chainConf?.rpcUrl
       ? resolveRpcUrls(chainConf.rpcUrl, chainConf.rpcUrls).length
       : 0;
+    // Process-wide multi-RPC write-failover counters (host-only; no URLs).
+    // Reflects WRITE failover/exhaustion across all chain adapters in this
+    // daemon process; read-path failover is internal to the FallbackProvider.
+    const rpcFailoverStats = getRpcFailoverStats();
     const blockExplorerUrl =
       config.blockExplorerUrl ?? deriveBlockExplorerUrl(chainConf?.chainId);
     const identityId = agent.publisher.getIdentityId();
@@ -659,7 +664,8 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
       installMode: detectInstallMode(),
       peerId: agent.peerId,
       nodeRole: config.nodeRole ?? "edge",
-      networkId: networkId.slice(0, 16),
+      networkConfig: resolveNetworkConfigName(config),
+      networkId,
       networkName: network?.networkName ?? null,
       storeBackend: config.store?.backend ?? "oxigraph-worker",
       // External backend visibility (RFC 120 / plan PR 1 item 3). For
@@ -694,6 +700,15 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
           ? await getCachedExternalStoreQuads(agent, Date.now())
           : null,
       uptimeMs: Date.now() - startedAt,
+      // Concurrency admission control (PR #1209): inFlight = requests currently
+      // holding a slot, max = the configured cap (0 = disabled), rejectedTotal =
+      // monotonic count of 503-shed requests since boot. Surfaced so operators
+      // can see whether the daemon is shedding load (and read the effective cap).
+      admission: {
+        inFlight: admission.inFlight,
+        max: admission.max,
+        rejectedTotal: admission.rejectedTotal,
+      },
       connectedPeers: uniquePeers.size,
       connections: {
         total: allConns.length,
@@ -716,10 +731,18 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
             configured: Boolean(chainConf.rpcUrl && chainConf.hubAddress),
             rpcEndpointCount,
             hubConfigured: Boolean(chainConf.hubAddress),
+            // Multi-RPC failover observability (counts only — no RPC URLs).
+            rpcFailovers: rpcFailoverStats.failovers,
+            rpcExhaustions: rpcFailoverStats.exhaustions,
+            rpcFailoversByClass: rpcFailoverStats.byErrorClass,
           }
         : null,
       updateAvailable:
         daemonState.lastUpdateCheck.checkedAt > 0 ? !daemonState.lastUpdateCheck.upToDate : null,
+      // True when this node pins an auto-update channel that has no acceptable
+      // target yet (e.g. the `mainnet` tag is unpublished, or points at a
+      // prerelease under allowPrerelease=false). Distinct from updateAvailable.
+      updateChannelTargetMissing: daemonState.lastUpdateCheck.channelTargetMissing,
       latestCommit: daemonState.lastUpdateCheck.latestCommit || null,
       latestVersion: daemonState.lastUpdateCheck.latestVersion || null,
     });
@@ -1026,6 +1049,10 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
         hasIdentity: identityId > 0n,
       });
     } catch (err: any) {
+      // A transient chain-RPC transport failure during on-chain identity
+      // creation is retryable (503/504), not a hard 500. The extra body fields
+      // preserve the route's identity contract on the retryable response.
+      if (respondIfChainRpcTransportError(res, err, { identityId: "0", hasIdentity: false })) return;
       return jsonResponse(res, 500, {
         error: err.message,
         identityId: "0",
@@ -1059,9 +1086,8 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
   // shape `generateKCMetadata` emits (`packages/publisher/src/metadata.ts`):
   //   - KC UAL subjects (carry `dkg:batchId`, `dkg:merkleRoot`, `dkg:status`, …).
   //   - KA UAL subjects (`<UAL/tokenId>`; identified by `dkg:partOf <KC>`).
-  //   - Publication URIs (`<urn:dkg:publication:opId>`; reached from a KA
-  //     via `<KA> dkg:publication <pub>`; carry `dkg:authoredBy`,
-  //     `dkg:Publication` type, etc).
+  // (RFC ka-metadata-trim Phase 1: the Publication-URI arm was removed —
+  // `generateKCMetadata` no longer emits `dkg:Publication` subjects.)
   //
   // Granularity is PER-KC, not per-CG: each KC is gated by an
   // independent `FILTER NOT EXISTS` against the target graph, so a
@@ -1123,7 +1149,6 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
 
     const DKG_BATCH_ID = 'http://dkg.io/ontology/batchId';
     const DKG_PART_OF = 'http://dkg.io/ontology/partOf';
-    const DKG_PUBLICATION = 'http://dkg.io/ontology/publication';
 
     const reports: CgReport[] = [];
     for (const [cgName, onChainId] of cgEntries) {
@@ -1149,23 +1174,24 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
         }
 
         // CONSTRUCT only the meta for KCs that are MISSING from the
-        // target per-cgId graph. Three UNION arms:
+        // target per-cgId graph. Two UNION arms:
         //   1. KC subjects (`?kc`) whose `dkg:batchId` is in source
         //      but not in target.
         //   2. KA subjects (`?ka`) whose parent KC is in that
         //      missing-from-target set.
-        //   3. Publication subjects (`?pub`) reached from a KA via
-        //      `<KA> dkg:publication <pub>`. This is the actual
-        //      provenance shape `generateKCMetadata` emits — earlier
-        //      revisions of this endpoint used the wrong direction
-        //      (`<KC> dkg:authoredBy <pub>`) and silently dropped all
-        //      `dkg:Publication` / `dkg:authoredBy` triples (Codex
-        //      review on PR #763).
+        // (RFC ka-metadata-trim Phase 1: the third arm that copied
+        // `dkg:Publication` subjects via `<KA> dkg:publication <pub>` was
+        // removed together with the writer.)
+        // Read-both (RFC ka-metadata-trim P3.1/P3.5): the collapsed shape
+        // carries the member-entity pair + privateMerkleRoot directly on the
+        // UAL subject, so arm 1 already copies everything a collapsed KC
+        // needs (the RS prover's extractor is read-both too); arm 2 only
+        // fires for legacy `<ual>/<n> partOf <ual>` token rows.
         //
         // The `FILTER NOT EXISTS` is anchored on the KC's `dkg:batchId`
         // because every per-KC promotion writes that triple — so its
         // presence in the target is the canonical signal that the KC
-        // (and its KAs + publication) are already there. Set semantics
+        // (and its KAs) are already there. Set semantics
         // of `store.insert` mean accidentally re-inserting a quad is a
         // no-op; the filter is for efficiency + clean diagnostic
         // counts, not for correctness.
@@ -1180,12 +1206,6 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
               ?s <${DKG_PART_OF}> ?kc .
               ?kc <${DKG_BATCH_ID}> ?bid2 .
               FILTER NOT EXISTS { GRAPH <${targetMeta}> { ?kc <${DKG_BATCH_ID}> ?bidT2 } }
-            } UNION {
-              ?s ?p ?o .
-              ?ka <${DKG_PUBLICATION}> ?s .
-              ?ka <${DKG_PART_OF}> ?kc3 .
-              ?kc3 <${DKG_BATCH_ID}> ?bid3 .
-              FILTER NOT EXISTS { GRAPH <${targetMeta}> { ?kc3 <${DKG_BATCH_ID}> ?bidT3 } }
             }
           }
         }`);

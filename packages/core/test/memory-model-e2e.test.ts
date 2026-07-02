@@ -21,7 +21,7 @@ describe('V10 memory model e2e: full lifecycle simulation', () => {
     const layers: MemoryLayer[] = [
       MemoryLayer.WorkingMemory,
       MemoryLayer.SharedWorkingMemory,
-      MemoryLayer.VerifiedMemory,
+      MemoryLayer.VerifiableMemory,
     ];
 
     for (let i = 0; i < layers.length - 1; i++) {
@@ -38,12 +38,12 @@ describe('V10 memory model e2e: full lifecycle simulation', () => {
 
     expect(transitions).toHaveLength(2);
     expect(transitions[0].from).toBe(MemoryLayer.WorkingMemory);
-    expect(transitions[1].to).toBe(MemoryLayer.VerifiedMemory);
+    expect(transitions[1].to).toBe(MemoryLayer.VerifiableMemory);
   });
 
   it('illegal backward transitions are rejected', () => {
     const layers = [
-      MemoryLayer.VerifiedMemory,
+      MemoryLayer.VerifiableMemory,
       MemoryLayer.SharedWorkingMemory,
       MemoryLayer.WorkingMemory,
     ];
@@ -54,7 +54,7 @@ describe('V10 memory model e2e: full lifecycle simulation', () => {
   });
 
   it('skip transitions are rejected', () => {
-    expect(isValidTransition(MemoryLayer.WorkingMemory, MemoryLayer.VerifiedMemory)).toBe(false);
+    expect(isValidTransition(MemoryLayer.WorkingMemory, MemoryLayer.VerifiableMemory)).toBe(false);
   });
 
   it('Publication progresses through all states', () => {
@@ -180,7 +180,7 @@ describe('V10 memory model e2e: full lifecycle simulation', () => {
       authority: { type: 'owner', proofRef: 'sig:0x...' },
       swmOperationId: share.operationId,
     };
-    expect(isValidTransition(MemoryLayer.SharedWorkingMemory, MemoryLayer.VerifiedMemory)).toBe(true);
+    expect(isValidTransition(MemoryLayer.SharedWorkingMemory, MemoryLayer.VerifiableMemory)).toBe(true);
     expect(pubRequest.swmOperationId).toBe('op-share-1');
   });
 });

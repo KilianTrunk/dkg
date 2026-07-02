@@ -32,7 +32,7 @@ export function parseBenchmarkArgs(argv = process.argv.slice(2), env = process.e
     pollIntervalMs:
       parseOptionalPositiveInt(env.DKG_BENCH_POLL_INTERVAL_MS, 'DKG_BENCH_POLL_INTERVAL_MS') ?? DEFAULT_POLL_INTERVAL_MS,
     asyncSuccessStatuses: parseStatusList(env.DKG_BENCH_ASYNC_SUCCESS_STATUS ?? 'finalized'),
-    getView: parseGetView(env.DKG_BENCH_GET_VIEW ?? 'verified-memory'),
+    getView: parseGetView(env.DKG_BENCH_GET_VIEW ?? 'verifiable-memory'),
     apiPort: parseOptionalPositiveInt(env.DKG_API_PORT, 'DKG_API_PORT'),
     apiUrl: env.DKG_API_URL,
     authToken: env.DKG_AUTH_TOKEN,
@@ -189,8 +189,8 @@ function parseFixture(value: string): FixtureName {
 }
 
 function parseGetView(value: string): GetView {
-  if (value === 'working-memory' || value === 'shared-working-memory' || value === 'verified-memory') return value;
-  throw new Error(`Invalid get view "${value}". Expected working-memory, shared-working-memory, or verified-memory.`);
+  if (value === 'working-memory' || value === 'shared-working-memory' || value === 'verifiable-memory') return value;
+  throw new Error(`Invalid get view "${value}". Expected working-memory, shared-working-memory, or verifiable-memory.`);
 }
 
 function parseStatusList(value: string): string[] {
@@ -213,7 +213,7 @@ Options:
   --fixture <generated|minimal>  Payload fixture (default generated)
   --output-format <json|ndjson>  Output format (default json)
   --poll-interval-ms <ms>        Async publisher job polling interval (default ${DEFAULT_POLL_INTERVAL_MS})
-  --get-view <view>              Query view for get validation (default verified-memory)
+  --get-view <view>              Query view for get validation (default verifiable-memory)
   --api-url <url>                Local loopback API URL or remote URL with --auth-token
   --api-port <port>              Local daemon API port; loads auth token from DKG_HOME
   --auth-token <token>           Explicit API bearer token

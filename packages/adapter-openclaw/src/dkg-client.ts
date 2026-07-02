@@ -8,13 +8,47 @@
 
 import { loadAuthTokenSync } from '@origintrail-official/dkg-core';
 
+/**
+ * Typed daemon HTTP error. Carries the response `status` and the parsed JSON
+ * `body` (when the daemon returned JSON) so callers can branch structurally
+ * (e.g. a 409 `UNSEALED_SHARE_BLOCKED` recovery hint) instead of re-parsing
+ * JSON out of the message string. The human-readable `message` is preserved
+ * verbatim (`DKG daemon <path> responded <status>: <text>`) for back-compat
+ * with the existing `responded NNN` substring checks (e.g. the chat-turns 404
+ * probe and the `wm/import-file` 404 path).
+ */
+export class DkgDaemonHttpError extends Error {
+  readonly status: number;
+  readonly body?: unknown;
+  constructor(message: string, status: number, body?: unknown) {
+    super(message);
+    this.name = 'DkgDaemonHttpError';
+    this.status = status;
+    this.body = body;
+  }
+}
+
+/**
+ * Build a {@link DkgDaemonHttpError} from a non-2xx daemon response. Attempts to
+ * parse `text` as JSON for the typed `body`; a non-JSON body leaves `body`
+ * undefined (the raw text still appears in the message). The message format is
+ * fixed -- do NOT change it without auditing the `responded ` substring checks.
+ */
+function daemonHttpError(message: string, status: number, text: string): DkgDaemonHttpError {
+  let body: unknown;
+  if (text) {
+    try { body = JSON.parse(text); } catch { body = undefined; }
+  }
+  return new DkgDaemonHttpError(message, status, body);
+}
+
 export interface DkgClientOptions {
   /** Base URL of the DKG daemon (default: "http://127.0.0.1:9200"). */
   baseUrl?: string;
   /** Bearer token for daemon API auth. If omitted, tries `<dkgHome>/auth.token`. */
   apiToken?: string;
   /**
-   * T70 — DKG home directory used to read `auth.token` when `apiToken` is
+   * T70 -- DKG home directory used to read `auth.token` when `apiToken` is
    * not supplied. Caller (typically `DkgNodePlugin.register`) passes the
    * runtime-resolved home (`resolveDkgHome({daemonUrl})`) so the constructor
    * fallback reads from the right place when the active daemon is in
@@ -137,7 +171,7 @@ export interface LocalAgentIntegrationRecord extends LocalAgentIntegrationPayloa
 }
 
 /**
- * T63 — Shape of `/api/agent/identity` response.
+ * T63 -- Shape of `/api/agent/identity` response.
  *
  * Mirrors the daemon route handler at
  * `packages/cli/src/daemon/routes/agent-chat.ts:391`. `agentAddress` is the
@@ -188,10 +222,6 @@ export function normalizeContextGraphId(value: string): string {
 function optionalContextGraphId(value: string | undefined): string | undefined {
   if (typeof value !== 'string') return undefined;
   return normalizeContextGraphId(value) || undefined;
-}
-
-function toContextGraphUri(value: string): string {
-  return `${CONTEXT_GRAPH_URI_PREFIX}${normalizeContextGraphId(value)}`;
 }
 
 function normalizeContextGraphRequest<T extends { contextGraphId: string }>(request: T): T {
@@ -260,6 +290,12 @@ function isChatTurnStoreNotFoundError(err: unknown): boolean {
  */
 export interface PreSignedAuthorAttestationPayload {
   address: string;
+  /**
+   * OT-RFC-43 Section F2 -- the packed reservedKaId the author signed the
+   * AuthorAttestation over, as a decimal string (uint256-safe over JSON).
+   * Required: the daemon binds it into the digest and honours the reserved slot.
+   */
+  reservedKaId: string;
   signature: { r: string; vs: string };
 }
 
@@ -296,6 +332,7 @@ function assertExclusiveAuthorFields(args: {
 
 function assertCreateFinalizeFieldsHaveQuads(args: {
   quads?: unknown[];
+  finalize?: boolean;
   authorAgentAddress?: string;
   preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
   schemeVersion?: number;
@@ -304,8 +341,11 @@ function assertCreateFinalizeFieldsHaveQuads(args: {
     args.authorAgentAddress != null ||
     args.preSignedAuthorAttestation != null ||
     args.schemeVersion !== undefined;
-  if (hasFinalizeOnlyField && !(Array.isArray(args.quads) && args.quads.length > 0)) {
-    throw new Error('authorAgentAddress, preSignedAuthorAttestation, and schemeVersion require non-empty quads');
+  // These fields only take effect at finalize, so they require both non-empty
+  // quads AND finalize !== false -- mirrors the daemon create-route guard.
+  const willFinalize = Array.isArray(args.quads) && args.quads.length > 0 && args.finalize !== false;
+  if (hasFinalizeOnlyField && !willFinalize) {
+    throw new Error('authorAgentAddress, preSignedAuthorAttestation, and schemeVersion require non-empty quads and finalize !== false');
   }
 }
 
@@ -418,7 +458,7 @@ export class DkgDaemonClient {
 
   /**
    * Run a SPARQL query against the daemon. Forwards the full V10 field set
-   * the `/api/query` route accepts — `view` (`'working-memory' | 'shared-working-memory' | 'verified-memory'`),
+   * the `/api/query` route accepts -- `view` (`'working-memory' | 'shared-working-memory' | 'verifiable-memory'`),
    * `agentAddress` (required for WM reads), `assertionName` (scopes WM reads
    * to a single per-agent assertion), `subGraphName`, `verifiedGraph`,
    * `graphSuffix`, `includeSharedMemory`.
@@ -429,16 +469,16 @@ export class DkgDaemonClient {
       contextGraphId?: string;
       graphSuffix?: string;
       includeSharedMemory?: boolean;
-      view?: 'working-memory' | 'shared-working-memory' | 'verified-memory';
+      view?: 'working-memory' | 'shared-working-memory' | 'verifiable-memory';
       agentAddress?: string;
       assertionName?: string;
       subGraphName?: string;
       verifiedGraph?: string;
       /**
        * P-13: minimum trust level. Only meaningful for
-       * `view: "verified-memory"`; ignored (silently) on WM/SWM views.
+       * `view: "verifiable-memory"`; ignored (silently) on WM/SWM views.
        *
-       * The daemon implements only `SelfAttested` / `Endorsed` today —
+       * The daemon implements only `SelfAttested` / `Endorsed` today --
        * higher tiers (Q-1 follow-up) are rejected with HTTP 400, so the
        * public client surface only advertises the implementable values.
        * See `packages/query/src/query-engine.ts QueryOptions.minTrust`.
@@ -490,40 +530,7 @@ export class DkgDaemonClient {
   }
 
   // ---------------------------------------------------------------------------
-  // Shared memory write (SWM layer — NOT used by v1 chat-turn / memory paths)
-  // ---------------------------------------------------------------------------
-
-  /**
-   * Write quads to a context graph's Shared Working Memory graph. Retained
-   * as a general primitive for callers that deliberately want SWM semantics
-   * (e.g. user-initiated promotion). v1 chat-turn and per-project memory
-   * writes use `writeAssertion` instead — SWM is the wrong layer for private
-   * per-agent memory per `21_TRI_MODAL_MEMORY.md §5`.
-   */
-  async share(
-    contextGraphId: string,
-    quads: Array<{ subject: string; predicate: string; object: string; graph?: string }>,
-    opts?: { localOnly?: boolean; subGraphName?: string },
-  ): Promise<{ shareOperationId: string }> {
-    const cgId = normalizeContextGraphId(contextGraphId);
-    // SWM data gossips to peers in the context graph's allowlist by default.
-    // Privacy is governed by the CG's curation policy (curated CGs gate
-    // gossip to allowed peers; public CGs gossip to all subscribers).
-    // Callers that explicitly want a local-only write can still pass
-    // `localOnly: true`. Aligned with Hermes's default in
-    // `packages/adapter-hermes/hermes-plugin/client.py` which omits the
-    // field and relies on the daemon's `false` default at
-    // `packages/cli/src/daemon/routes/memory.ts:490`.
-    return this.post('/api/shared-memory/write', {
-      contextGraphId: cgId,
-      quads,
-      localOnly: opts?.localOnly ?? false,
-      subGraphName: opts?.subGraphName,
-    });
-  }
-
-  // ---------------------------------------------------------------------------
-  // Working Memory — assertion lifecycle
+  // Working Memory -- assertion lifecycle
   // ---------------------------------------------------------------------------
 
   /**
@@ -540,7 +547,7 @@ export class DkgDaemonClient {
     const cgId = normalizeContextGraphId(contextGraphId);
     try {
       const response = await this.post<{ assertionUri: string }>(
-        '/api/assertion/create',
+        '/api/knowledge-assets',
         { contextGraphId: cgId, name, subGraphName: opts?.subGraphName },
       );
       return { assertionUri: response.assertionUri, alreadyExists: false };
@@ -555,7 +562,7 @@ export class DkgDaemonClient {
 
   /**
    * Append quads into an existing Working Memory assertion. The assertion
-   * must have been created first — callers that create-then-write in a
+   * must have been created first -- callers that create-then-write in a
    * single call should use `ensureAssertion` + `writeAssertion` together,
    * with `createAssertion` swallowing duplicates.
    */
@@ -565,7 +572,7 @@ export class DkgDaemonClient {
     quads: Array<{ subject: string; predicate: string; object: string; graph?: string }>,
     opts?: { subGraphName?: string },
   ): Promise<{ written: number }> {
-    return this.post(`/api/assertion/${encodeURIComponent(name)}/write`, {
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/write`, {
       contextGraphId: normalizeContextGraphId(contextGraphId),
       quads,
       subGraphName: opts?.subGraphName,
@@ -582,7 +589,7 @@ export class DkgDaemonClient {
     name: string,
     opts?: { entities?: string[] | 'all'; subGraphName?: string },
   ): Promise<Record<string, unknown>> {
-    return this.post(`/api/assertion/${encodeURIComponent(name)}/promote`, {
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/swm/share`, {
       contextGraphId: normalizeContextGraphId(contextGraphId),
       entities: opts?.entities,
       subGraphName: opts?.subGraphName,
@@ -599,7 +606,7 @@ export class DkgDaemonClient {
     name: string,
     opts?: { subGraphName?: string },
   ): Promise<{ discarded: boolean }> {
-    return this.post(`/api/assertion/${encodeURIComponent(name)}/discard`, {
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/discard`, {
       contextGraphId: normalizeContextGraphId(contextGraphId),
       subGraphName: opts?.subGraphName,
     });
@@ -607,7 +614,7 @@ export class DkgDaemonClient {
 
   /**
    * Dump all quads from a single Working Memory assertion's graph. This is
-   * not a SPARQL endpoint — the daemon returns every quad in the assertion
+   * not a SPARQL endpoint -- the daemon returns every quad in the assertion
    * as `{ quads, count }`. For ad-hoc SPARQL use `query()` with
    * `view: 'working-memory'` + `assertionName` instead.
    */
@@ -616,10 +623,13 @@ export class DkgDaemonClient {
     name: string,
     opts?: { subGraphName?: string },
   ): Promise<{ quads: unknown[]; count: number }> {
-    return this.post(`/api/assertion/${encodeURIComponent(name)}/query`, {
+    const params = new URLSearchParams({
       contextGraphId: normalizeContextGraphId(contextGraphId),
-      subGraphName: opts?.subGraphName,
     });
+    if (opts?.subGraphName) params.set('subGraphName', opts.subGraphName);
+    return this.get(
+      `/api/knowledge-assets/${encodeURIComponent(name)}/wm/quads?${params.toString()}`,
+    );
   }
 
   /**
@@ -630,7 +640,7 @@ export class DkgDaemonClient {
   async resolveImportArtifact(
     request: ImportedArtifactRequest,
   ): Promise<{ artifact: ImportedArtifactResolution }> {
-    return this.post('/api/assertion/import-artifact/resolve', normalizeContextGraphRequest(request));
+    return this.post('/api/knowledge-assets/import-artifact/resolve', normalizeContextGraphRequest(request));
   }
 
   /**
@@ -647,7 +657,7 @@ export class DkgDaemonClient {
     bytes: number;
     markdown: string;
   }> {
-    return this.post('/api/assertion/import-artifact/read-markdown', normalizeContextGraphRequest(request));
+    return this.post('/api/knowledge-assets/import-artifact/read-markdown', normalizeContextGraphRequest(request));
   }
 
   /**
@@ -657,7 +667,7 @@ export class DkgDaemonClient {
   async writeSemanticEnrichment(
     request: SemanticEnrichmentWriteRequest,
   ): Promise<Record<string, unknown>> {
-    return this.post('/api/assertion/semantic-enrichment/write', normalizeContextGraphRequest(request));
+    return this.post('/api/knowledge-assets/semantic-enrichment/write', normalizeContextGraphRequest(request));
   }
 
   /**
@@ -674,7 +684,7 @@ export class DkgDaemonClient {
     if (opts?.agentAddress) params.set('agentAddress', opts.agentAddress);
     if (opts?.subGraphName) params.set('subGraphName', opts.subGraphName);
     return this.get(
-      `/api/assertion/${encodeURIComponent(name)}/history?${params.toString()}`,
+      `/api/knowledge-assets/${encodeURIComponent(name)}?${params.toString()}`,
     );
   }
 
@@ -710,7 +720,7 @@ export class DkgDaemonClient {
     if (opts?.subGraphName) form.append('subGraphName', opts.subGraphName);
 
     const res = await fetch(
-      `${this.baseUrl}/api/assertion/${encodeURIComponent(name)}/import-file`,
+      `${this.baseUrl}/api/knowledge-assets/${encodeURIComponent(name)}/wm/import-file`,
       {
         method: 'POST',
         headers: { Accept: 'application/json', ...this.authHeaders() },
@@ -720,8 +730,10 @@ export class DkgDaemonClient {
     );
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw new Error(
-        `DKG daemon /api/assertion/${name}/import-file responded ${res.status}: ${text}`,
+      throw daemonHttpError(
+        `DKG daemon /api/knowledge-assets/${name}/wm/import-file responded ${res.status}: ${text}`,
+        res.status,
+        text,
       );
     }
     return res.json() as Promise<Record<string, unknown>>;
@@ -1034,87 +1046,6 @@ export class DkgDaemonClient {
   }
 
   // ---------------------------------------------------------------------------
-  // Publish
-  // ---------------------------------------------------------------------------
-
-  /**
-   * One-shot publish: routes through the assertion lifecycle (RFC-001
-   * §9.x). The daemon creates an auto-named assertion, writes the
-   * supplied quads, finalizes (computing the merkleRoot and signing
-   * the EIP-712 AuthorAttestation stored in `_meta`), promotes to
-   * SWM, and the second call publishes verbatim — the publisher
-   * forwards the seal and never re-signs.
-   */
-  async publish(
-    contextGraphId: string,
-    quads: Array<{ subject: string; predicate: string; object: string; graph?: string }>,
-    privateQuads?: Array<{ subject: string; predicate: string; object: string; graph?: string }>,
-    opts?: { accessPolicy?: 'public' | 'ownerOnly' | 'allowList'; allowedPeers?: string[] },
-  ): Promise<any> {
-    const cgId = normalizeContextGraphId(contextGraphId);
-    if (privateQuads?.length || opts?.accessPolicy || opts?.allowedPeers?.length) {
-      throw new Error(
-        'privateQuads, accessPolicy, and allowedPeers are not supported in the V10 ' +
-        'assertion-lifecycle publish — every published assertion goes through finalize, ' +
-        'which signs an EIP-712 attestation over the public quads.',
-      );
-    }
-    const assertionName = `openclaw-publish-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const quadsWithGraph = quads.map((q) => ({
-      subject: q.subject,
-      predicate: q.predicate,
-      object: q.object,
-      graph: q.graph || toContextGraphUri(cgId),
-    }));
-    const created: any = await this.post('/api/assertion/create', {
-      contextGraphId: cgId,
-      name: assertionName,
-      quads: quadsWithGraph,
-      finalize: true,
-      promote: true,
-    });
-    const published = await this.post('/api/shared-memory/publish', {
-      contextGraphId: cgId,
-      assertionName,
-    });
-    return {
-      ...(typeof published === 'object' && published !== null ? published : {}),
-      assertionUri: created?.assertionUri,
-      ...(created?.seal ? { seal: created.seal } : {}),
-    };
-  }
-
-  /**
-   * Final canonical-flow step: publish a single root from a context graph's
-   * Shared Working Memory to Verified Memory (on-chain). The daemon route
-   * accepts `selection` as either the literal `"all"` or an array of root entity
-   * URIs, but V10 synchronous publish only proceeds when that selection resolves
-   * to exactly one publishable root.
-   *
-   * Returns the daemon's publish descriptor: `{ kaId, status, kas: [{tokenId, rootEntity}],
-   * txHash?, blockNumber?, ... }`.
-   */
-  async publishSharedMemory(
-    contextGraphId: string,
-    opts?: { rootEntities?: string[]; clearAfter?: boolean; subGraphName?: string },
-  ): Promise<Record<string, unknown>> {
-    const cgId = normalizeContextGraphId(contextGraphId);
-    // Default `clearAfter` to `false` for subset publishes so unpublished root
-    // entities aren't dropped from SWM as a side-effect of publishing a few.
-    // Omitted rootEntities still maps to `"all"` for compatibility, but the
-    // daemon rejects it if SWM currently contains more than one publishable root.
-    // Explicit `clearAfter` on the opts always wins.
-    const hasSubset = Array.isArray(opts?.rootEntities) && opts!.rootEntities!.length > 0;
-    const clearAfter = opts?.clearAfter ?? !hasSubset;
-    return this.post('/api/shared-memory/publish', {
-      contextGraphId: cgId,
-      selection: opts?.rootEntities ?? 'all',
-      clearAfter,
-      subGraphName: opts?.subGraphName,
-    });
-  }
-
-  // ---------------------------------------------------------------------------
   // Context Graphs
   // ---------------------------------------------------------------------------
 
@@ -1201,8 +1132,8 @@ export class DkgDaemonClient {
       signal: AbortSignal.timeout(this.timeoutMs),
     });
     if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new Error(`DKG daemon ${path} responded ${res.status}: ${body}`);
+      const text = await res.text().catch(() => '');
+      throw daemonHttpError(`DKG daemon ${path} responded ${res.status}: ${text}`, res.status, text);
     }
     return res.json() as Promise<T>;
   }
@@ -1216,7 +1147,7 @@ export class DkgDaemonClient {
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw new Error(`DKG daemon ${path} responded ${res.status}: ${text}`);
+      throw daemonHttpError(`DKG daemon ${path} responded ${res.status}: ${text}`, res.status, text);
     }
     return res.json() as Promise<T>;
   }
@@ -1230,24 +1161,39 @@ export class DkgDaemonClient {
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw new Error(`DKG daemon ${path} responded ${res.status}: ${text}`);
+      throw daemonHttpError(`DKG daemon ${path} responded ${res.status}: ${text}`, res.status, text);
     }
     return res.json() as Promise<T>;
   }
 
-  // ── OT-RFC-43 §10.5 — GitHub-shaped Knowledge Asset client ──────────────
+  // -- OT-RFC-43 Section 10.5 -- GitHub-shaped Knowledge Asset client --------------
   // Layer-explicit wrappers over the clean /api/knowledge-assets/... surface.
   // One file = one Knowledge Asset (Design B / OT-RFC-44), carrying any number
-  // of member entities. WM → SWM → VM via the git-shaped verbs write →
-  // finalize → share → publish.
+  // of member entities. WM -> SWM -> VM via the git-shaped verbs write ->
+  // finalize -> share -> publish.
 
-  /** Create a KA + open its WM draft. Pass `quads` to atomically write+finalize. */
+  /**
+   * Create a KA + open its WM draft. Pass `quads` to atomically write+seal.
+   * #1116 D5: this combined CLIENT function defaults `alsoShareSwm` to true when
+   * the draft will seal (quads present and `finalize !== false`), so the
+   * one-shot seals AND shares to SWM. Pass `alsoShareSwm: false` to stop at a
+   * sealed WM draft, or `finalize: false` to keep an unsealed editable WM draft.
+   * (The bare daemon route is a primitive -- seal-only -- and never auto-shares;
+   * the default-share lives here in the client.)
+   */
   async createKnowledgeAsset(
     contextGraphId: string,
     name: string,
     opts?: {
       subGraphName?: string;
       quads?: Array<{ subject: string; predicate: string; object: string; graph: string }>;
+      /**
+       * Seal the draft after writing `quads` (default true). `false` keeps an
+       * editable WM draft that never touches the chain -- the only lifecycle
+       * available to local-only / on-chain-unregistered CGs. Cannot be combined
+       * with `alsoShareSwm`/`alsoPublishVm` (those require a sealed assertion).
+       */
+      finalize?: boolean;
       authorAgentAddress?: string;
       preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
       schemeVersion?: number;
@@ -1262,6 +1208,18 @@ export class DkgDaemonClient {
       name,
       ...(opts ?? {}),
     };
+    // #1116 D5: the combined client SEALS AND SHARES TO SWM by default. When
+    // quads are present and the draft will seal (finalize !== false), default
+    // `alsoShareSwm` to true so the one-shot lands the asset in SWM. An explicit
+    // `alsoShareSwm` (true OR false, already copied by the spread) always wins;
+    // never default-on when there are no quads or `finalize:false`. The bare
+    // daemon route stays a primitive (seal-only); the default-share is a
+    // CLIENT-side convenience.
+    const sealsByDefault =
+      Array.isArray(opts?.quads) && opts.quads.length > 0 && opts?.finalize !== false;
+    if (opts?.alsoShareSwm === undefined && sealsByDefault) {
+      payload.alsoShareSwm = true;
+    }
     // Object form carries finalized-publish controls; translate to the daemon
     // body shape (mirrors the cli ApiClient). Booleans pass through.
     if (opts?.alsoPublishVm !== undefined) {
@@ -1287,17 +1245,26 @@ export class DkgDaemonClient {
   async knowledgeAssetWrite(
     contextGraphId: string,
     name: string,
-    quads: Array<{ subject: string; predicate: string; object: string; graph: string }>,
+    quads: Array<{ subject: string; predicate: string; object: string; graph?: string }>,
     opts?: { subGraphName?: string },
   ): Promise<{ written: number }> {
+    // Strip any per-quad `graph` at the client (CONTRACT Section A): the write wire
+    // shape is `{subject, predicate, object}` only and the daemon pins every
+    // quad to the per-KA WM graph (Section 0 invariant 2), so a caller-supplied or
+    // normalizer-emitted `graph` is dropped here -- not just in the tool schema.
+    const wireQuads = quads.map((q) => ({
+      subject: q.subject,
+      predicate: q.predicate,
+      object: q.object,
+    }));
     return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/write`, {
       contextGraphId: normalizeContextGraphId(contextGraphId),
-      quads,
+      quads: wireQuads,
       ...(opts ?? {}),
     });
   }
 
-  /** Seal the WM draft — computes the merkle root + signs the seal (git commit). */
+  /** Seal the WM draft -- computes the merkle root + signs the seal (git commit). */
   async knowledgeAssetFinalize(
     contextGraphId: string,
     name: string,
@@ -1306,6 +1273,9 @@ export class DkgDaemonClient {
       authorAgentAddress?: string;
       preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
       schemeVersion?: number;
+      // #1116: "wm" (default) seals the open WM draft; "swm" seals an asset
+      // already shared to SWM (recover-without-recreate).
+      layer?: 'wm' | 'swm';
     },
   ): Promise<{ merkleRoot: string; eip712Digest: string }> {
     assertExclusiveAuthorFields(opts ?? {});
@@ -1341,19 +1311,26 @@ export class DkgDaemonClient {
     });
   }
 
-  /** Advance the SWM pointer (WM → SWM; git push origin <branch>). */
+  /** Advance the SWM pointer (WM -> SWM; git push origin <branch>). */
   async knowledgeAssetShare(
     contextGraphId: string,
     name: string,
-    opts?: { subGraphName?: string; entities?: string[] | 'all' },
-  ): Promise<{ swmShared: boolean; promotedCount: number }> {
-    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/swm/share`, {
+    opts?: { subGraphName?: string; entities?: string[] | 'all'; skipSeal?: boolean },
+  ): Promise<{ swmShared: boolean; promotedCount: number; sealed: boolean; publishReady: boolean }> {
+    // Only include the optional fields when actually set -- don't spread the whole
+    // opts object (which would carry `entities: undefined` / `subGraphName:
+    // undefined` keys). Parity with MCP's knowledgeAssetShare body construction.
+    const body: Record<string, unknown> = {
       contextGraphId: normalizeContextGraphId(contextGraphId),
-      ...(opts ?? {}),
-    });
+    };
+    if (opts?.subGraphName) body.subGraphName = opts.subGraphName;
+    if (opts?.entities !== undefined) body.entities = opts.entities;
+    // #1116: a full share SEALS BY DEFAULT; `skipSeal:true` shares unsealed.
+    if (opts?.skipSeal !== undefined) body.skipSeal = opts.skipSeal;
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/swm/share`, body);
   }
 
-  /** Publish to VM — mint or update on chain (git push origin main). */
+  /** Publish to VM -- mint or update on chain (git push origin main). */
   async knowledgeAssetPublish(
     contextGraphId: string,
     name: string,

@@ -13,43 +13,11 @@ import type { DkgToolHost } from './tool-host.js';
 export function buildQueryTools(ctx: DkgToolHost): OpenClawTool[] {
   return [
     {
-      name: 'dkg_publish',
-      description:
-        'One-shot write + publish helper: writes the supplied quads to Shared Working Memory, then publishes ' +
-        'all SWM in the CG to Verified Memory (on-chain) and clears SWM. For the canonical stepwise flow ' +
-        '(write → promote → publish) use `dkg_assertion_create/write/promote` followed by ' +
-        '`dkg_shared_memory_publish`.',
-      parameters: {
-        type: 'object',
-        properties: {
-          context_graph_id: { type: 'string', description: `Target context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
-          quads: {
-            type: 'array',
-            items: {
-              type: 'object',
-              properties: {
-                subject: { type: 'string', description: 'Subject URI.' },
-                predicate: { type: 'string', description: 'Predicate URI.' },
-                object: { type: 'string', description: 'Object — URI or literal (URI auto-detected by prefix).' },
-                graph: { type: 'string', description: 'Optional named graph URI.' },
-              },
-              required: ['subject', 'predicate', 'object'],
-            },
-            description:
-              'Quads to publish. Example: `[{ subject: "https://example.org/a", predicate: "https://schema.org/name", object: "Alpha" }]`. ' +
-              'Object values starting with http://, https://, urn:, did: are passed as URIs; anything else becomes a literal.',
-          },
-        },
-        required: ['context_graph_id', 'quads'],
-      },
-      execute: async (_toolCallId, args) => ctx.handlePublish(args),
-    },
-    {
       name: 'dkg_query',
       description:
         'Read-only SPARQL query against the local triple store. Pass `view` to pick which memory ' +
         'layer to read: `working-memory` (WM — per-agent), `shared-working-memory` (SWM — gossip-' +
-        'replicated), or `verified-memory` (VM — on-chain anchored); when `view` is supplied, ' +
+        'replicated), or `verifiable-memory` (VM — on-chain anchored); when `view` is supplied, ' +
         '`context_graph_id` is also required. For WM reads, `agent_address` selects whose WM to ' +
         'read; prefer the injected `current_agent_address` from turn context when present. If a WM ' +
         'read looks unexpectedly empty, retry alternate identity forms before concluding there is no ' +
@@ -73,7 +41,7 @@ export function buildQueryTools(ctx: DkgToolHost): OpenClawTool[] {
             description:
               'Memory layer to read. Accepted values: `working-memory` (per-agent WM; uses ' +
               '`agent_address` or falls back to this node\'s agent address), `shared-working-memory` ' +
-              '(provisional, gossip-replicated), or `verified-memory` (on-chain anchored). Omit to ' +
+              '(provisional, gossip-replicated), or `verifiable-memory` (on-chain anchored). Omit to ' +
               'use the legacy cross-graph data-path routing (not layer-scoped). Validation is ' +
               'handler-side (not a JSON-schema enum) so strict-schema hosts still surface the ' +
               'tailored migration guidance on invalid values.',

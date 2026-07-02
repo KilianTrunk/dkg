@@ -99,25 +99,27 @@ async function submitWithCostMismatch(
   );
   const ackSig = ethers.Signature.from(await signer.signMessage(ackDigest));
 
-  // RFC-001 author attestation — independent of cost parameters; binds
-  // the author EOA to (cgId, merkleRoot, schemeVersion=1).
-  const authorTyped = buildAuthorAttestationTypedData({
-    chainId: CHAIN_ID,
-    kav10Address,
-    contextGraphId: cgId,
-    merkleRoot: MERKLE_ROOT,
-    authorAddress: signer.address,
-  });
-  const authorSig = ethers.Signature.from(
-    await signer.signTypedData(authorTyped.domain, authorTyped.types, authorTyped.message),
-  );
-
   // OT-RFC-43 Option-1 (variant 1a): the real adapter requires a packed
   // reservedKaId = (uint160(author) << 96) | number in the author's namespace.
   // Use a fresh per-call number so successful mints never collide on replay
   // attempts (only the FIRST valid-cost publish actually mints; cost-mismatch
   // publishes revert before _safeMint).
-  const reservedKaId = (BigInt(ethers.getAddress(signer.address)) << 96n) | BigInt(nextAckReplayKaNumber());
+  // §F2 — the AuthorAttestation digest now binds reservedKaId, so it must be
+  // allocated BEFORE the author signs over the typed data.
+  const reservedKaId = (BigInt(ethers.getAddress(signer.address)) << 96n) | BigInt(nextAckReplayKaNumber() + 1);
+
+  // RFC-001 author attestation — independent of cost parameters; binds
+  // the author EOA to (cgId, merkleRoot, schemeVersion=1, reservedKaId).
+  const authorTyped = buildAuthorAttestationTypedData({
+    chainId: CHAIN_ID,
+    kav10Address,
+    merkleRoot: MERKLE_ROOT,
+    authorAddress: signer.address,
+    reservedKaId,
+  });
+  const authorSig = ethers.Signature.from(
+    await signer.signTypedData(authorTyped.domain, authorTyped.types, authorTyped.message),
+  );
 
   const txParams: V10PublishParams = {
     publishOperationId: `op-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,

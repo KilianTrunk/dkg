@@ -60,9 +60,13 @@ describe('V10 Publish E2E', () => {
     // double-spends the setup path and reverts before the skipped shard tests run.
 
     const adapter = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+    // Public CG (accessPolicy 0 / publishPolicy 1): these E2E tests exercise ACK
+    // collection + createKnowledgeAssets round-trip mechanics with PLAINTEXT, not
+    // curated ciphertext, so a curated CG would revert with
+    // CuratedCGRequiresCiphertextCommitment (#1072).
     const cgResult = await adapter.createOnChainContextGraph({
-      accessPolicy: 1,
-      publishPolicy: 0,
+      accessPolicy: 0,
+      publishPolicy: 1,
     });
     if (!cgResult.success || cgResult.contextGraphId === 0n) {
       throw new Error(`Failed to create on-chain context graph: ${JSON.stringify(cgResult)}`);
@@ -284,22 +288,24 @@ describe('V10 Publish E2E', () => {
     expect(ackSignatures).toHaveLength(3);
 
     const pubWallet = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
-    const authorTyped = buildAuthorAttestationTypedData({
-      chainId: TEST_CHAIN_ID,
-      kav10Address: realKAV10Addr,
-      contextGraphId: chainCgId,
-      merkleRoot,
-      authorAddress: pubWallet.address,
-    });
-    const authorSig = ethers.Signature.from(
-      await pubWallet.signTypedData(authorTyped.domain, authorTyped.types, authorTyped.message),
-    );
-
     // OT-RFC-43 Option-1 (variant 1a): the real adapter requires a packed
     // reservedKaId = (uint160(author) << 96) | number in the author's namespace.
     // This is a direct adapter call (no DKGPublisher allocator), so pack one
     // explicitly for the CORE_OP author.
+    // §F2 — the AuthorAttestation digest now binds reservedKaId, so it must be
+    // allocated BEFORE the author signs over the typed data.
     const reservedKaId = (BigInt(ethers.getAddress(pubWallet.address)) << 96n) | 1n;
+
+    const authorTyped = buildAuthorAttestationTypedData({
+      chainId: TEST_CHAIN_ID,
+      kav10Address: realKAV10Addr,
+      merkleRoot,
+      authorAddress: pubWallet.address,
+      reservedKaId,
+    });
+    const authorSig = ethers.Signature.from(
+      await pubWallet.signTypedData(authorTyped.domain, authorTyped.types, authorTyped.message),
+    );
 
     const result = await adapter.createKnowledgeAssets!({
       publishOperationId: 'v10-e2e-test',

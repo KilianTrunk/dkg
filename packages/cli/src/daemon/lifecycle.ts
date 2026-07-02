@@ -14,7 +14,16 @@ import {
   type ServerResponse,
 } from "node:http";
 import { createHash, randomUUID } from "node:crypto";
-import { GET_TOTAL_TRIPLES_SPARQL, parseRdfInt } from "./metrics-queries.js";
+import {
+  buildContextGraphDeclarationsSparql,
+  contextGraphIdsFromDeclarationBindings,
+  contextGraphIdsFromLocalRootMetaGraphs,
+  contextGraphIdsFromMetricSubscriptionCandidates,
+  countContextGraphsFromGraphUris,
+  GET_TOTAL_TRIPLES_SPARQL,
+  parseRdfInt,
+  shadowContextGraphIdsFromMetricSubscriptionCandidates,
+} from "./metrics-queries.js";
 import {
   appendFile,
   chmod,
@@ -55,14 +64,18 @@ const daemonRequire = createRequire(import.meta.url);
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 import {
-  enrichEvmError,
   MockChainAdapter,
   type ApprovalPolicy,
 } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets, KaNumberAllocator } from '@origintrail-official/dkg-agent';
 import { isExternalBackend } from '@origintrail-official/dkg-storage';
-import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, DEFAULT_PROTOCOL_OUTBOX_BACKOFFS_MS, DEFAULT_PROTOCOL_OUTBOX_MAX_AGE_MS, pickNetworkTunables } from '@origintrail-official/dkg-core';
-import { findReservedSubjectPrefix, isSkolemizedUri } from '@origintrail-official/dkg-publisher';
+import { computeNetworkId, createOperationContext, createLogRedactor, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, DEFAULT_PROTOCOL_OUTBOX_BACKOFFS_MS, DEFAULT_PROTOCOL_OUTBOX_MAX_AGE_MS, pickNetworkTunables } from '@origintrail-official/dkg-core';
+import {
+  findReservedSubjectPrefix,
+  isSkolemizedUri,
+  type AsyncKnowledgeAssetVmPublishExecutionInput,
+  type AsyncLiftPublisherConfig,
+} from '@origintrail-official/dkg-publisher';
 import {
   DashboardDB,
   MetricsCollector,
@@ -70,9 +83,13 @@ import {
   handleNodeUIRequest,
   ChatMemoryManager,
   LogPushWorker,
+  OtlpLogWorker,
+  initTelemetry,
+  shutdownTelemetry,
   LlmClient,
   SqliteMessageIdempotencyStore,
   SqliteProtocolOutboxStore,
+  SqliteSyncCheckpointStore,
   SqliteKaNumberStore,
   type MetricsSource,
 } from "@origintrail-official/dkg-node-ui";
@@ -91,6 +108,7 @@ import {
   ensureDkgDir,
   TELEMETRY_ENDPOINTS,
   type DkgConfig,
+  type NetworkConfig,
   type AutoUpdateConfig,
   type LocalAgentIntegrationCapabilities,
   type LocalAgentIntegrationConfig,
@@ -100,6 +118,7 @@ import {
   type LocalAgentIntegrationTransport,
   resolveContextGraphs,
   resolveNetworkDefaultContextGraphs,
+  resolveNetworkConfigName,
   resolveApprovalPolicy,
   resolveSharedMemoryTtlMs,
   repoDir,
@@ -114,7 +133,10 @@ import {
   slotEntryPoint,
   CLI_NPM_PACKAGE,
   exitOnStoreConfigErrors,
+  validateNetworkConfigReadiness,
 } from '../config.js';
+import { resolveOtelSignals, resolveLogExporterMode, isUnknownLogExporter } from '../telemetry-config.js';
+import { createDaemonLogSink } from './log-sink.js';
 import { createPublicSnapshotStore, createPublisherControlFromStore, startPublisherRuntimeIfEnabled, type PublisherRuntime } from '../publisher-runner.js';
 import { createCatchupRunner, type CatchupJobResult, type CatchupRunner } from '../catchup-runner.js';
 import { loadTokens, httpAuthGuard } from '../auth.js';
@@ -205,8 +227,6 @@ import {
 } from './shutdown.js';
 import {
   resolveNameToPeerId,
-  isPublishQuad,
-  parsePublishRequestBody,
   jsonResponse,
   safeDecodeURIComponent,
   safeParseJson,
@@ -226,6 +246,11 @@ import {
   resolveCorsOrigin,
   corsHeaders,
   HttpRateLimiter,
+  InFlightLimiter,
+  type AdmissionStatsView,
+  admitRequest,
+  resolveIntSetting,
+  applyServerLimits,
   isLoopbackClientIp,
   isLoopbackRateLimitExemptPath,
   shouldBypassRateLimitForLoopbackTraffic,
@@ -233,6 +258,7 @@ import {
   shortId,
   sleep,
   deriveBlockExplorerUrl,
+  respondWithDaemonError,
 } from './http-utils.js';
 import {
   normalizeRepo,
@@ -253,13 +279,14 @@ import {
   getCurrentCliVersion,
   type NpmVersionStatus,
   checkForNpmVersionUpdate,
+  deriveUpdateCheckState,
   type UpdateStatus,
   acquireUpdateLock,
   releaseUpdateLock,
   performNpmUpdate,
   performNpmUpdateEdge,
 } from './auto-update.js';
-import { chainResetWipe, detectBackendSwitch } from './chain-reset-wipe.js';
+import { chainResetWipe, detectBackendSwitch, detectNetworkSwitch } from './chain-reset-wipe.js';
 import {
   checkExternalStoreReachable,
   checkOrSetStoreIdentity,
@@ -570,6 +597,26 @@ export function mergePreferredRelays(input: {
   };
 }
 
+export function shouldUseIncrementalChainDiscoveryScan(input: {
+  run: number;
+  watermarkSeeded: boolean;
+  fullScanEvery: number;
+}): boolean {
+  return (
+    input.watermarkSeeded &&
+    input.run !== 0 &&
+    input.run % input.fullScanEvery !== 0
+  );
+}
+
+export function chainDiscoveryScanOptions(incremental: boolean):
+  | { incremental: true }
+  | { seedIncrementalWatermark: true; throwOnChainScanFailure: true } {
+  return incremental
+    ? { incremental: true }
+    : { seedIncrementalWatermark: true, throwOnChainScanFailure: true };
+}
+
 export interface PromoteWorkerDaemonLifecycle {
   waitForStartup(): Promise<void>;
   stop(reason?: string | null): Promise<void>;
@@ -691,6 +738,73 @@ export function startPromoteWorkerDaemonLifecycle(input: {
   };
 }
 
+type StartupGenesisValidation =
+  | { ok: true; networkId: string }
+  | { ok: false; networkId: string; messages: string[] };
+
+type StartupGenesisValidationInput = Partial<Pick<NetworkConfig, '_status' | 'genesisId' | 'networkId' | 'networkName' | 'relays'>>;
+
+type KnowledgeAssetVmPublishExecutor = NonNullable<AsyncLiftPublisherConfig['knowledgeAssetVmPublishExecutor']>;
+type KnowledgeAssetVmPublishPreflight = NonNullable<AsyncLiftPublisherConfig['knowledgeAssetVmPublishPreflight']>;
+type QueuedKnowledgeAssetVmPublishOptions = Parameters<DKGAgent['publishQueuedKnowledgeAssetVmPublish']>[2];
+
+export function createKnowledgeAssetVmPublishExecutor(agent: DKGAgent): KnowledgeAssetVmPublishExecutor {
+  return async ({ request, publishOptions, publisher }: AsyncKnowledgeAssetVmPublishExecutionInput) => {
+    const publishOpts: QueuedKnowledgeAssetVmPublishOptions = {
+      ...(publisher ? { publisherOverride: publisher } : {}),
+    };
+    try {
+      return await agent.publishQueuedKnowledgeAssetVmPublish(
+        request,
+        publishOptions,
+        publishOpts,
+      );
+    } catch (firstErr: any) {
+      if (
+        firstErr?.code !== "CG_NOT_REGISTERED" &&
+        !/not registered on-chain/i.test(firstErr?.message ?? String(firstErr))
+      ) {
+        throw firstErr;
+      }
+      const defaultAgentAddress = request.agentAddress ?? agent.getDefaultAgentAddress();
+      await agent.ensureRegisteredForPublish(request.contextGraphId, {
+        ...(defaultAgentAddress ? { callerAgentAddress: defaultAgentAddress } : {}),
+      });
+      return await agent.publishQueuedKnowledgeAssetVmPublish(
+        request,
+        publishOptions,
+        publishOpts,
+      );
+    }
+  };
+}
+
+export function createKnowledgeAssetVmPublishPreflight(agent: DKGAgent): KnowledgeAssetVmPublishPreflight {
+  return async ({ request, publisher }) =>
+    agent.preflightQueuedKnowledgeAssetVmPublishExecution(
+      request,
+      publisher ? { publisherOverride: publisher } : undefined,
+    );
+}
+
+export async function validateStartupGenesis(
+  network: StartupGenesisValidationInput | null | undefined,
+): Promise<StartupGenesisValidation> {
+  const networkId = await computeNetworkId(network?.genesisId);
+  const readiness = validateNetworkConfigReadiness(network);
+  const messages = readiness.ok ? [] : [...readiness.messages];
+  if (network?.networkId && network.networkId !== networkId) {
+    messages.push(
+      `FATAL: genesis mismatch! Expected networkId ${network.networkId.slice(0, 16)}... but computed ${networkId.slice(0, 16)}...`,
+    );
+    messages.push(
+      `This node's genesis does not match ${network.networkName}. Rebuild or update the selected network config.`,
+    );
+  }
+  if (messages.length > 0) return { ok: false, networkId, messages };
+  return { ok: true, networkId };
+}
+
 export async function runDaemon(foreground: boolean): Promise<void> {
   await ensureDkgDir();
   const config = await loadConfig();
@@ -706,6 +820,44 @@ export async function runDaemon(foreground: boolean): Promise<void> {
     await removePid().catch(() => {});
     throw err;
   }
+}
+
+export async function resolveDaemonPublishEncryption(
+  agent: DKGAgent,
+  publishOptions: {
+    contextGraphId: string;
+    subGraphName?: string;
+    publishContextGraphId?: string;
+  },
+): Promise<{
+  encryptInlinePayload: Awaited<ReturnType<DKGAgent['_resolveEncryptInlinePayload']>>;
+  encryptInlineChunked: Awaited<ReturnType<DKGAgent['_resolveEncryptInlineChunked']>>;
+}> {
+  const requestedTarget = publishOptions.publishContextGraphId?.trim();
+  // Async lift resolves this from the source workspace slice before it reaches
+  // generic PublishOptions. Treat it as binding-only; future explicit async
+  // remaps need a separate provenance field.
+  const bindingOptions = requestedTarget
+    ? { aeadBindingContextGraphId: requestedTarget }
+    : undefined;
+  const encryptInlinePayload = await agent._resolveEncryptInlinePayload(
+    publishOptions.contextGraphId,
+    publishOptions.subGraphName,
+    undefined,
+    undefined,
+    bindingOptions,
+  );
+  const encryptInlineChunked = await agent._resolveEncryptInlineChunked(
+    publishOptions.contextGraphId,
+    publishOptions.subGraphName,
+    undefined,
+    undefined,
+    bindingOptions,
+  );
+  return {
+    encryptInlinePayload,
+    encryptInlineChunked,
+  };
 }
 
 export async function runDaemonInner(
@@ -832,7 +984,18 @@ export async function runDaemonInner(
     log(`[dkg-build-info] WARNING: failed to emit startup telemetry: ${String(err)}`);
   }
 
-  const network = await loadNetworkConfig();
+  const selectedNetworkConfig = config.networkConfig?.trim();
+  const network = await loadNetworkConfig(selectedNetworkConfig);
+  if (selectedNetworkConfig && !network) {
+    log(`FATAL: network config "${selectedNetworkConfig}" was not found (expected network/${selectedNetworkConfig}.json).`);
+    process.exit(1);
+  }
+  const genesisValidation = await validateStartupGenesis(network);
+  const networkId = genesisValidation.networkId;
+  if (!genesisValidation.ok) {
+    for (const message of genesisValidation.messages) log(message);
+    process.exit(1);
+  }
   const syncContextGraphs = [
     ...new Set([
       ...resolveContextGraphs(config),
@@ -860,6 +1023,23 @@ export async function runDaemonInner(
     log,
   });
   if (backendSwitch.aborted) {
+    process.exit(1);
+  }
+
+  // Detect a network switch (config.networkConfig repointed at a different
+  // network on an existing data dir). The store still holds the previous
+  // network's chain-derived state, which is meaningless on the new chain —
+  // and chainResetWipe won't catch it (mainnet overlays ship no
+  // chainResetMarker). Abort unless DKG_ACCEPT_NETWORK_SWITCH=1. Compare the
+  // RESOLVED name so a legacy config (no networkConfig) is treated as its
+  // 'testnet' fallback and never spuriously trips on a normal restart.
+  const networkSwitch = detectNetworkSwitch({
+    dataDir: dkgDir(),
+    currentNetworkConfig: resolveNetworkConfigName(config),
+    acceptNetworkSwitch: process.env.DKG_ACCEPT_NETWORK_SWITCH === '1',
+    log,
+  });
+  if (networkSwitch.aborted) {
     process.exit(1);
   }
 
@@ -1169,6 +1349,7 @@ export async function runDaemonInner(
       return DEFAULT_PROTOCOL_OUTBOX_BACKOFFS_MS[idx];
     },
   });
+  const syncCheckpointStore = new SqliteSyncCheckpointStore(dashDb);
 
   // OT-RFC-43 Option-1 deterministic KA identity (B2 allocator core).
   // Durable per-author KA-number sequence backing the off-chain
@@ -1188,6 +1369,7 @@ export async function runDaemonInner(
   const agent = await DKGAgent.create({
     kaNumberAllocator,
     name: config.name,
+    genesisId: network?.genesisId,
     framework: "DKG",
     listenPort: config.listenPort,
     dataDir: dkgDir(),
@@ -1206,13 +1388,23 @@ export async function runDaemonInner(
     ...pickNetworkTunables(config.network ?? {}),
     agentProfileHeartbeatMs: config.network?.agentProfileHeartbeatMs,
     syncContextGraphs: syncContextGraphs,
+    maxRehydratedContextGraphSubscriptions: config.maxRehydratedContextGraphSubscriptions,
+    // OT-RFC-38 LU-6 / OT-RFC-49 WS-A — plumb the host-mode block (eviction
+    // tiers, discovery rate limits, and the `stripCiphertext` private-ciphertext
+    // strip kill-switch) from config.json. Without this forward the whole
+    // `swmHostMode` config is inert and only in-agent defaults apply, so an
+    // operator could not toggle the strip via config (the rung-1 inert-flag bug).
+    swmHostMode: config.swmHostMode,
     storeConfig: runtimeStore ? {
       backend: runtimeStore.backend,
       options: runtimeStore.options,
+      graphSetIndex: runtimeStore.graphSetIndex,
     } : undefined,
     largeLiteralStorage: runtimeLargeLiteralStorage,
     sharedMemoryPublicSnapshotStorage: runtimeSnapshotStorage,
     syncSharedMemoryOnConnect: config.syncSharedMemoryOnConnect,
+    swmAwaitCuratorAck: config.swmAwaitCuratorAck,
+    syncAgentsMeta: role === 'core' ? true : config.syncAgentsMeta,
     queryAccess: config.queryAccess,
     chainAdapter: mockChainAdapter,
     // Only forward chain to the agent when both required fields resolved.
@@ -1229,11 +1421,15 @@ export async function runDaemonInner(
       operationalKeys: opWallets.wallets.map((w) => w.privateKey),
       chainId: chainBase.chainId,
       approvalPolicy: resolveApprovalPolicy(chainBase.approvalPolicy) as ApprovalPolicy | undefined,
+      cgRegistryScanPageSize: chainBase.cgRegistryScanPageSize,
     } : undefined,
     sharedMemoryTtlMs: resolveSharedMemoryTtlMs(config),
+    // RFC ka-metadata-trim P3.3 — lifecycle PROV event writes (default true).
+    metadataProvenanceEvents: config.metadata?.provenanceEvents,
     randomSamplingWalPath: config.randomSampling?.walPath,
     randomSamplingTickIntervalMs: config.randomSampling?.tickIntervalMs,
     randomSamplingUseWorkerThread: config.randomSampling?.useWorkerThread,
+    syncCheckpointStore,
     contextGraphSubscriptionStore: {
       loadAll: async () => dashDb.listContextGraphSubscriptions().map((row) => ({
         id: row.context_graph_id,
@@ -1248,6 +1444,22 @@ export async function runDaemonInner(
         coreHosted: row.core_hosted == null ? undefined : row.core_hosted === 1,
         syncScoped: row.sync_scoped === 1,
       })),
+      load: async (contextGraphId) => {
+        const row = dashDb.getContextGraphSubscription(contextGraphId);
+        return row ? {
+          id: row.context_graph_id,
+          name: row.name ?? undefined,
+          subscribed: row.subscribed === 1,
+          synced: row.synced === 1,
+          sharedMemorySynced: row.shared_memory_synced == null ? undefined : row.shared_memory_synced === 1,
+          metaSynced: row.meta_synced == null ? undefined : row.meta_synced === 1,
+          onChainId: row.on_chain_id ?? undefined,
+          onChainHash: row.on_chain_hash ?? undefined,
+          lastReconciledOrdinal: row.last_reconciled_ordinal ?? undefined,
+          coreHosted: row.core_hosted == null ? undefined : row.core_hosted === 1,
+          syncScoped: row.sync_scoped === 1,
+        } : null;
+      },
       save: async (record) => {
         dashDb.upsertContextGraphSubscription({
           context_graph_id: record.id,
@@ -1323,21 +1535,11 @@ export async function runDaemonInner(
   let promoteWorkerLifecycle: PromoteWorkerDaemonLifecycle | null = null;
   let shuttingDown = false;
 
-  const networkId = await computeNetworkId();
   const publisherControl = createPublisherControlFromStore(
     agent.store,
     createPublicSnapshotStore(dkgDir(), config),
   );
   log(`Network: ${networkId.slice(0, 16)}...`);
-  if (network?.networkId && network.networkId !== networkId) {
-    log(
-      `FATAL: genesis mismatch! Expected networkId ${network.networkId.slice(0, 16)}... but computed ${networkId.slice(0, 16)}...`,
-    );
-    log(
-      `This node's genesis does not match network/testnet.json. Rebuild or update the repo.`,
-    );
-    process.exit(1);
-  }
   if (network) {
     log(
       `Network config: ${network.networkName} (genesis v${network.genesisVersion})`,
@@ -1357,6 +1559,25 @@ export async function runDaemonInner(
       log,
     }),
   );
+
+  // GH #462 — skill_request authorization. Default-deny remote skill invocation
+  // (any connected peer could otherwise invoke any registered skill). Operators
+  // restore open skills with `messaging.openSkills: true`, or allowlist specific
+  // peers via `messaging.skillAllowedPeers`.
+  {
+    const openSkills = config.messaging?.openSkills === true;
+    const allowedSkillPeers = new Set(config.messaging?.skillAllowedPeers ?? []);
+    agent.setSkillAcl((senderPeerId: string) => {
+      if (openSkills) return { accept: true };
+      if (allowedSkillPeers.has(senderPeerId)) return { accept: true };
+      return {
+        accept: false,
+        reason:
+          'unauthorized: skill invocation is default-deny for remote peers; ' +
+          'set messaging.openSkills or add this peer to messaging.skillAllowedPeers (GH #462)',
+      };
+    });
+  }
 
   let chatDb: DashboardDB | null = null;
   agent.onChat((text, senderPeerId, _convId, senderContextGraphId, verifiedContextGraphId, messageId) => {
@@ -1618,6 +1839,9 @@ export async function runDaemonInner(
               },
               log,
             }),
+            publishEncryptionFactory: (publishOptions) => resolveDaemonPublishEncryption(agent, publishOptions),
+            knowledgeAssetVmPublishExecutor: createKnowledgeAssetVmPublishExecutor(agent),
+            knowledgeAssetVmPublishPreflight: createKnowledgeAssetVmPublishPreflight(agent),
             log,
           });
           publisherRuntime = runtime;
@@ -1696,24 +1920,27 @@ export async function runDaemonInner(
   // Run an initial chain scan for context graphs we might not know about,
   // then repeat every 30 minutes as a fallback discovery mechanism.
   const CHAIN_SCAN_INTERVAL_MS = 30 * 60 * 1000;
-  setTimeout(async () => {
+  const CHAIN_FULL_SCAN_EVERY = 48; // about once per day at the 30-minute cadence
+  let chainScanRuns = 0;
+  const runChainDiscoveryScan = async () => {
     try {
-      const found = await agent.discoverContextGraphsFromChain();
+      const run = chainScanRuns++;
+      const incremental = shouldUseIncrementalChainDiscoveryScan({
+        run,
+        watermarkSeeded: await agent.hasContextGraphRegistryScanWatermark(),
+        fullScanEvery: CHAIN_FULL_SCAN_EVERY,
+      });
+      const found = await agent.discoverContextGraphsFromChain(
+        chainDiscoveryScanOptions(incremental),
+      );
       if (found > 0)
         log(`Chain scan: discovered ${found} new context graph(s)`);
     } catch {
       /* non-critical */
     }
-  }, 15_000);
-  const chainScanTimer = setInterval(async () => {
-    try {
-      const found = await agent.discoverContextGraphsFromChain();
-      if (found > 0)
-        log(`Chain scan: discovered ${found} new context graph(s)`);
-    } catch {
-      /* non-critical */
-    }
-  }, CHAIN_SCAN_INTERVAL_MS);
+  };
+  setTimeout(runChainDiscoveryScan, 15_000);
+  const chainScanTimer = setInterval(runChainDiscoveryScan, CHAIN_SCAN_INTERVAL_MS);
   if (chainScanTimer.unref) chainScanTimer.unref();
 
   // Periodic peer health ping (every 2 minutes)
@@ -1750,19 +1977,33 @@ export async function runDaemonInner(
 
   if (standalone) {
     const checkIntervalMs = (au?.checkIntervalMinutes ?? 30) * 60_000;
-    const allowPre = au?.allowPrerelease ?? true;
+    // Even in version-check-only mode (au is null because auto-apply is
+    // disabled) the policy used for the check must reflect the operator's
+    // shipped intent, and must mirror resolveAutoUpdateConfig's precedence:
+    // local config BEFORE network default. A disabled node with a local
+    // channel / allowPrerelease pin must observe its own cohort, not the
+    // network's.
+    const allowPre = au?.allowPrerelease ?? config.autoUpdate?.allowPrerelease ?? network?.autoUpdate?.allowPrerelease ?? true;
+    const channel = au?.channel ?? config.autoUpdate?.channel ?? network?.autoUpdate?.channel;
 
     log(
-      `Auto-update (npm): ${au ? "enabled" : "disabled — version check only"} (every ${au?.checkIntervalMinutes ?? 30}min)`,
+      `Auto-update (npm): ${au ? "enabled" : "disabled — version check only"}${channel ? ` channel="${channel}"` : ""} (every ${au?.checkIntervalMinutes ?? 30}min)`,
     );
 
     const runCheck = async () => {
-      const npmStatus = await checkForNpmVersionUpdate(log, allowPre);
-      if (npmStatus.status !== "error") {
-        daemonState.lastUpdateCheck.upToDate = npmStatus.status === "up-to-date";
+      const npmStatus = await checkForNpmVersionUpdate(log, allowPre, channel);
+      const derived = deriveUpdateCheckState(npmStatus);
+      if (derived) {
         daemonState.lastUpdateCheck.checkedAt = Date.now();
-        if (npmStatus.version)
-          daemonState.lastUpdateCheck.latestVersion = npmStatus.version;
+        daemonState.lastUpdateCheck.upToDate = derived.upToDate;
+        daemonState.lastUpdateCheck.channelTargetMissing = derived.channelTargetMissing;
+        // Always write (including '') so a prior "available" version does not
+        // linger after the target disappears or the node catches up.
+        daemonState.lastUpdateCheck.latestVersion = derived.latestVersion;
+        if (npmStatus.status === "no-target")
+          log(
+            `Auto-update (npm): WARNING — channel "${npmStatus.channel}" has no acceptable target (tag missing or rejected by allowPrerelease); node will not update until it is published.`,
+          );
       }
       if (npmStatus.status !== "available" || !npmStatus.version) return;
       if (!au) return; // version check only — no auto-apply when polling disabled
@@ -1797,21 +2038,22 @@ export async function runDaemonInner(
   chatDb = dashDb;
   log("Dashboard DB initialized at " + join(dkgDir(), "node-ui.db"));
 
-  Logger.setSink((entry) => {
-    try {
-      dashDb.insertLog({
-        ts: Date.now(),
-        level: entry.level,
-        operation_name: entry.operationName,
-        operation_id: entry.operationId,
-        module: entry.module,
-        message: entry.message,
-      });
-    } catch {
-      /* DB write must never break the node */
-    }
-    logPusher?.push(entry);
-  });
+  // Redactor for the copy of each record that LEAVES the node. The local
+  // dashboard DB keeps full-fidelity records (it's the operator's own machine);
+  // redaction only protects data crossing the trust boundary to a collector.
+  const redactForRemote = createLogRedactor(config.telemetry?.logs?.redact);
+
+  // Local DB gets the FULL record; remote shippers get a single REDACTED copy.
+  // `remoteShippers` is evaluated per record so runtime enable/disable of the
+  // syslog/OTLP workers is reflected without re-wiring. Logic lives in
+  // createDaemonLogSink so this trust boundary is unit-tested (log-sink.test.ts).
+  Logger.setSink(
+    createDaemonLogSink({
+      insertLog: (rec) => dashDb.insertLog(rec),
+      redact: redactForRemote,
+      remoteShippers: () => [logPusher, otlpExporter],
+    }),
+  );
 
   // Extract the plain value from an RDF typed literal like "6"^^<xsd:integer>
   const metricsSource: MetricsSource = {
@@ -1840,20 +2082,77 @@ export async function runDaemonInner(
         return 0;
       }
     },
-    getContextGraphCount: async () => (await agent.listContextGraphs()).length,
+    getContextGraphCount: async () => {
+      const graphUris = await agent.store.listGraphs();
+      const knownContextGraphIds = new Set<string>();
+      const subscribedContextGraphs = agent.getSubscribedContextGraphs();
+      const shadowContextGraphIds = new Set(
+        shadowContextGraphIdsFromMetricSubscriptionCandidates(subscribedContextGraphs.entries()),
+      );
+      for (const contextGraphId of contextGraphIdsFromMetricSubscriptionCandidates(
+        subscribedContextGraphs.entries(),
+      )) {
+        knownContextGraphIds.add(contextGraphId);
+      }
+      for (const contextGraphId of contextGraphIdsFromLocalRootMetaGraphs(
+        graphUris,
+        subscribedContextGraphs.keys(),
+      )) {
+        if (!shadowContextGraphIds.has(contextGraphId)) knownContextGraphIds.add(contextGraphId);
+      }
+      const declarationQuery = buildContextGraphDeclarationsSparql(graphUris, knownContextGraphIds);
+      const declarationResult = declarationQuery
+        ? await agent.store.query(declarationQuery)
+        : null;
+      if (declarationResult?.type === "bindings") {
+        for (const contextGraphId of contextGraphIdsFromDeclarationBindings(
+          declarationResult.bindings as Record<string, string>[],
+        )) {
+          if (!shadowContextGraphIds.has(contextGraphId)) knownContextGraphIds.add(contextGraphId);
+        }
+      }
+      return countContextGraphsFromGraphUris(graphUris, knownContextGraphIds, shadowContextGraphIds);
+    },
+    // The count getters below each issue a data-proportional full-scan COUNT,
+    // but the only caller is the 30 s metrics tick (metricsSource is consumed
+    // solely by MetricsCollector — no on-demand /api/status path), so each tick
+    // already re-reads the store fresh and there is nothing concurrent to
+    // coalesce. They are intentionally left uncached so a snapshot never serves
+    // a stale count and can't mask a store outage. The context-graph count
+    // avoids the composite context-graph listing enrichment path. It uses the
+    // cached store graph inventory plus backed subscription/declaration evidence,
+    // then dedupes local layer graphs. It intentionally includes private CG graphs
+    // that are backed by local subscription/declaration state.
+    // These COUNTs are cheap (~0.015 CPU-s/tick on a 75k-triple store).
     getTotalTriples: async () => {
       const r = await agent.query(GET_TOTAL_TRIPLES_SPARQL);
       return parseRdfInt(r?.bindings?.[0]?.c);
     },
+    // RFC ka-metadata-trim (Phase 2 ⊕ / Phase 3 P3.1): the KC/KA counters are
+    // predicate-based, not rdf:type-based — `generateKCMetadata` no longer
+    // emits `rdf:type dkg:KnowledgeCollection` / `dkg:KnowledgeAsset` rows.
+    //   - KC ≙ a subject carrying `dkg:status` (every KC row, old shape or
+    //     new, has exactly one tentative/confirmed status quad).
+    //   - KA ≙ read-both: a legacy `<ual>/<n>` token row carrying
+    //     `dkg:partOf`, OR (collapsed shape, P3.1) a UAL subject carrying
+    //     `dkg:status` + the entity pair with NO token row pointing at it
+    //     (the NOT-EXISTS guard prevents double-counting old-shape rows,
+    //     whose aggregate UAL node also carries `dkg:rootEntity`).
     getTotalKCs: async () => {
       const r = await agent.query(
-        "SELECT (COUNT(DISTINCT ?kc) AS ?c) WHERE { GRAPH ?g { ?kc a <http://dkg.io/ontology/KnowledgeCollection> } }",
+        "SELECT (COUNT(DISTINCT ?kc) AS ?c) WHERE { GRAPH ?g { ?kc <http://dkg.io/ontology/status> ?s } }",
       );
       return parseRdfInt(r?.bindings?.[0]?.c);
     },
     getTotalKAs: async () => {
       const r = await agent.query(
-        "SELECT (COUNT(DISTINCT ?ka) AS ?c) WHERE { GRAPH ?g { ?ka a <http://dkg.io/ontology/KnowledgeAsset> } }",
+        `SELECT (COUNT(DISTINCT ?ka) AS ?c) WHERE { GRAPH ?g {
+          { ?ka <http://dkg.io/ontology/partOf> ?kc }
+          UNION
+          { ?ka <http://dkg.io/ontology/status> ?st .
+            ?ka <http://dkg.io/ontology/rootEntity> ?re .
+            FILTER NOT EXISTS { ?tok <http://dkg.io/ontology/partOf> ?ka } }
+        } }`,
       );
       return parseRdfInt(r?.bindings?.[0]?.c);
     },
@@ -1915,7 +2214,7 @@ export async function runDaemonInner(
     dkgDir(),
   );
   metricsCollector.start();
-  log("Metrics collector started (2min interval)");
+  log("Metrics collector started (30s interval)");
 
   // --- Telemetry: syslog log streaming (opt-in) ---
   const networkKey = network?.networkName?.toLowerCase().includes("testnet")
@@ -1923,6 +2222,7 @@ export async function runDaemonInner(
     : "mainnet";
   const syslogEndpoint = TELEMETRY_ENDPOINTS[networkKey]?.syslog;
   let logPusher: LogPushWorker | null = null;
+  let otlpExporter: OtlpLogWorker | null = null;
 
   function startLogPusher(): { ok: boolean; error?: string } {
     if (logPusher) return { ok: true };
@@ -1964,11 +2264,144 @@ export async function runDaemonInner(
     log("Telemetry: log streaming disabled");
   }
 
+  function startOtlpExporter(): { ok: boolean; error?: string } {
+    if (otlpExporter) return { ok: true };
+    // Resolve env-first, matching the traces/metrics precedence (resolveOtelSignals):
+    // the standard OTEL_EXPORTER_OTLP_LOGS_ENDPOINT, then OTEL_EXPORTER_OTLP_ENDPOINT
+    // + /v1/logs, then config. NO hardcoded per-network fallback — logs must never
+    // ship to a placeholder/TBD URL the operator never set.
+    const envBase = process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.replace(/\/$/, "");
+    const endpoint =
+      process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT ||
+      (envBase ? `${envBase}/v1/logs` : undefined) ||
+      config.telemetry?.logs?.endpoint;
+    if (!endpoint) {
+      return {
+        ok: false,
+        error: `OTLP log export is not configured for ${networkKey} (set config.telemetry.logs.endpoint or OTEL_EXPORTER_OTLP_ENDPOINT)`,
+      };
+    }
+    const minLevel = config.telemetry?.logs?.level ?? "info";
+    otlpExporter = new OtlpLogWorker({
+      endpoint,
+      token: config.telemetry?.logs?.token,
+      network: networkKey,
+      peerId: agent.peerId,
+      nodeName: config.name,
+      version: nodeVersion,
+      commit: nodeCommit,
+      role: config.nodeRole ?? "edge",
+      chainId: config.chain?.chainId,
+      minLevel,
+      bufferMaxEntries: config.telemetry?.logs?.bufferMaxEntries,
+      onError: (m) => log(`Telemetry(OTLP): ${m}`),
+    });
+    otlpExporter.start();
+    log(`Telemetry: OTLP log export enabled → ${endpoint} (level ≥ ${minLevel})`);
+    return { ok: true };
+  }
+
+  async function stopOtlpExporter(): Promise<void> {
+    if (!otlpExporter) return;
+    // Await the final flush so disable/shutdown can't return while logs are
+    // still in flight or stranded in the buffer.
+    await otlpExporter.shutdown();
+    otlpExporter = null;
+    log("Telemetry: OTLP log export disabled");
+  }
+
+  // OTel traces + metrics SDK (independent of the log-exporter path below).
+  // Endpoints resolve env-first (standard OTEL_EXPORTER_OTLP_* names) then
+  // config; a signal registers ONLY when its endpoint resolves — never a
+  // guessed prod default. Idempotent (initTelemetry no-ops once configured), so
+  // it is safe to call both at boot AND from the runtime enable toggle.
+  async function startOtelSdk(): Promise<void> {
+    const { tracesEndpoint, metricsEndpoint, tracesOn, metricsOn } = resolveOtelSignals(
+      config.telemetry,
+    );
+    if (!tracesOn && !metricsOn) return;
+    try {
+      await initTelemetry({
+        enabled: true,
+        resource: {
+          serviceName: "dkg-node",
+          serviceVersion: nodeVersion,
+          serviceInstanceId: config.name,
+          network: networkKey,
+          peerId: agent.peerId,
+          nodeName: config.name,
+          nodeRole: config.nodeRole ?? "edge",
+          commit: nodeCommit,
+          chainId: config.chain?.chainId,
+        },
+        traces: tracesOn
+          ? {
+              endpoint: tracesEndpoint,
+              token: config.telemetry?.traces?.token,
+              sampleRatio: config.telemetry?.traces?.sampleRatio,
+            }
+          : undefined,
+        metrics: metricsOn
+          ? {
+              endpoint: metricsEndpoint,
+              token: config.telemetry?.metrics?.token,
+              exportIntervalMs: config.telemetry?.metrics?.exportIntervalMs,
+            }
+          : undefined,
+      });
+      log(
+        `Telemetry: OTel SDK registered (traces=${tracesOn ? tracesEndpoint : "off"}, metrics=${metricsOn ? metricsEndpoint : "off"})`,
+      );
+    } catch (err) {
+      // Telemetry must never block startup.
+      log(`Telemetry: OTel init failed (non-fatal): ${String(err)}`);
+    }
+  }
+
+  // Start ALL telemetry signals under the master gate: OTel traces/metrics
+  // (SDK) AND the configured log exporter. Used at boot and from the runtime
+  // enable toggle so both behave identically (the bug fixed here: enabling from
+  // a boot-disabled state previously started only logs, never traces/metrics).
+  // The log-exporter result is returned separately — a failed log shipper must
+  // NOT tear down or disable the independent traces/metrics signals.
+  // Await the SDK init first (it is dynamically imported) so traces/metrics are
+  // fully registered before the log exporter result is returned — that ordering
+  // lets the runtime-enable path roll the SDK back if the log exporter fails.
+  async function startTelemetry(): Promise<{ ok: boolean; error?: string }> {
+    await startOtelSdk();
+    // Dispatch to the configured log exporter. 'syslog' is the default when
+    // unset (preserves prior behaviour); 'otlp' is the recommended path; 'none'
+    // keeps logs local-only even while telemetry is enabled. An UNKNOWN/typo'd
+    // value fails closed to 'none' (never silently syslog → off-node).
+    if (isUnknownLogExporter(config.telemetry)) {
+      log(
+        `Telemetry: unknown logs.exporter "${config.telemetry?.logs?.exporter}" — ` +
+          `keeping logs local-only (no off-node forwarding). Use 'otlp', 'syslog', or 'none'.`,
+      );
+    }
+    const mode = resolveLogExporterMode(config.telemetry);
+    if (mode === "none") return { ok: true };
+    if (mode === "otlp") return startOtlpExporter();
+    return startLogPusher();
+  }
+
+  // Stop ALL telemetry signals: log exporters AND the OTel SDK (flush + shut
+  // down + clear the API globals). Async so a runtime disable actually stops
+  // traces/metrics — not just logs — and callers can await an orderly teardown.
+  async function stopTelemetry(): Promise<void> {
+    stopLogPusher();
+    await stopOtlpExporter();
+    await shutdownTelemetry().catch(() => {});
+  }
+
   if (config.telemetry?.enabled) {
-    const r = startLogPusher();
+    const r = await startTelemetry();
     if (!r.ok) {
-      log(`Telemetry: ${r.error}`);
-      config.telemetry.enabled = false;
+      // Log forwarding failed to start (e.g. mainnet syslog port 0). Disable
+      // ONLY the log signal — leave the master gate and any registered
+      // traces/metrics intact; they are independent signals. (Boot path:
+      // best-effort per signal; the runtime toggle below rolls back instead.)
+      log(`Telemetry: log exporter not started — ${r.error} (traces/metrics unaffected)`);
     }
   }
 
@@ -2252,27 +2685,12 @@ export async function runDaemonInner(
         contextGraphId?: string;
         graphSuffix?: "_shared_memory";
         includeSharedMemory?: boolean;
-        view?: "working-memory" | "shared-working-memory" | "verified-memory";
+        view?: "working-memory" | "shared-working-memory" | "verifiable-memory";
         agentAddress?: string;
         assertionName?: string;
         subGraphName?: string;
       },
     ) => agent.query(sparql, opts),
-    share: (
-      contextGraphId: string,
-      quads: any[],
-      opts?: { localOnly?: boolean; subGraphName?: string },
-    ) => agent.share(contextGraphId, quads, opts).then((result: any) => {
-      emitMemoryGraphChanged({
-        contextGraphId,
-        layers: ["swm"],
-        subGraphName: opts?.subGraphName,
-        operation: "shared_memory_written",
-        source: opts?.localOnly ? "agent_tool_local" : "agent_tool",
-        counts: { triples: quads.length },
-      });
-      return result;
-    }),
     createAssertion: async (
       contextGraphId: string,
       name: string,
@@ -2313,40 +2731,6 @@ export async function runDaemonInner(
         counts: { triples: quads.length },
       });
       return { written: quads.length };
-    },
-    publishFromSharedMemory: (
-      contextGraphId: string,
-      selection: "all" | { rootEntities: string[] },
-      opts?: { clearSharedMemoryAfter?: boolean; subGraphName?: string },
-    ) => {
-      const publishOpts = {
-        ...opts,
-        clearSharedMemoryAfter: opts?.clearSharedMemoryAfter ?? false,
-      };
-      return agent.publishFromSharedMemory(contextGraphId, selection, publishOpts).then((result: any) => {
-        const clearAfter = publishOpts.clearSharedMemoryAfter;
-        const publishedSwmCleaned = result?.status === "confirmed";
-        const rootCount = Array.isArray(result?.kaManifest)
-          ? result.kaManifest.length
-          : undefined;
-        const publicTripleCount = Array.isArray(result?.publicQuads)
-          ? result.publicQuads.length
-          : undefined;
-        emitMemoryGraphChanged({
-          contextGraphId,
-          layers: publishedSwmCleaned ? ["swm", "vm"] : ["vm"],
-          subGraphName: opts?.subGraphName,
-          operation: "shared_memory_published",
-          source: "agent_tool",
-          clearSharedMemoryAfter: clearAfter,
-          status: typeof result?.status === "string" ? result.status : undefined,
-          counts: {
-            roots: rootCount,
-            triples: publicTripleCount,
-          },
-        });
-        return result;
-      });
     },
     createContextGraph: (opts: {
       id: string;
@@ -2393,10 +2777,17 @@ export async function runDaemonInner(
       enabled: boolean,
     ): Promise<{ ok: boolean; error?: string }> => {
       if (enabled) {
-        const r = startLogPusher();
-        if (!r.ok) return r;
+        const r = await startTelemetry();
+        if (!r.ok) {
+          // The OTel SDK may have started before the log exporter failed. Roll
+          // it back so we never leave traces/metrics exporting while we report
+          // failure and persist nothing — the API/UI state stays consistent
+          // (telemetry remains off) with what is actually running.
+          await stopTelemetry();
+          return r;
+        }
       } else {
-        stopLogPusher();
+        await stopTelemetry();
       }
       config.telemetry = { ...config.telemetry, enabled };
       await saveConfig(config);
@@ -2489,6 +2880,7 @@ export async function runDaemonInner(
   // --- File Store ---
 
   const fileStore = new FileStore(join(dkgDir(), "files"));
+  agent.registerImportedArtifactByteStore(fileStore);
 
   // --- Vector Store (optional, for tri-modal memory) ---
   const vectorStore = new VectorStore(dkgDir());
@@ -2531,6 +2923,42 @@ export async function runDaemonInner(
       "/.well-known/skill.md",
     ],
   );
+
+  // Admission control: cap concurrent in-flight requests so a burst (including
+  // loopback traffic, which bypasses the per-IP rate limiter) can't pile
+  // unbounded pending work onto the single event loop / store worker thread.
+  // IP-agnostic on purpose — local agents legitimately burst, so we shed by
+  // concurrency (503 + Retry-After) rather than by per-minute rate. Tunable via
+  // DKG_MAX_INFLIGHT (explicit 0 disables); default 64. Malformed/empty values
+  // fall back to the default instead of silently disabling the cap.
+  const maxInFlight = resolveIntSetting(
+    process.env.DKG_MAX_INFLIGHT,
+    config.maxInFlightRequests,
+    64,
+    { allowNonPositive: true },
+  );
+  const inFlightLimiter = new InFlightLimiter(maxInFlight);
+  // Read-only live view of the limiter's counters for the plugin-facing
+  // RequestContext / /api/status: only the three getters, never the mutating
+  // tryAcquire()/release(). The enforcement path (admitRequest, below) keeps the
+  // real limiter; route/plugin code can read shed stats but can't reach — even
+  // via a runtime cast — the methods that corrupt slot accounting.
+  const admissionStats: AdmissionStatsView = {
+    get inFlight() {
+      return inFlightLimiter.inFlight;
+    },
+    get max() {
+      return inFlightLimiter.max;
+    },
+    get rejectedTotal() {
+      return inFlightLimiter.rejectedTotal;
+    },
+  };
+  // Throttle the "shedding" warning so a sustained burst can't spam the log,
+  // while still letting operators see the limiter is active (per review).
+  let lastShedLogAt = 0;
+  const SHED_LOG_THROTTLE_MS = 10_000;
+
   let corsAllowed: CorsAllowlist = "*";
   daemonState.catchupRunner = createCatchupRunner(agent);
 
@@ -2550,6 +2978,25 @@ export async function runDaemonInner(
         res.end(JSON.stringify({ error: 'Too many requests' }));
         return;
       }
+
+      // Admission control — shed load (503 + Retry-After) when too many
+      // requests are already in flight. Applied to ALL traffic (not bypassed
+      // for loopback) so it also bounds local agents the per-IP rate limiter
+      // exempts; OPTIONS preflight and cheap health/liveness paths are exempt
+      // inside admitRequest so monitoring stays answerable under saturation.
+      const gate = admitRequest(inFlightLimiter, req.method, reqUrl.pathname, res, reqCorsOrigin);
+      if (!gate.admitted) {
+        const nowMs = Date.now();
+        if (nowMs - lastShedLogAt >= SHED_LOG_THROTTLE_MS) {
+          lastShedLogAt = nowMs;
+          log(
+            `admission-control: shedding requests (503) — inFlight=${inFlightLimiter.inFlight}/${inFlightLimiter.max} rejectedTotal=${inFlightLimiter.rejectedTotal}`,
+          );
+        }
+        return;
+      }
+      // (admitRequest registers slot release on the response's `close` event —
+      // covers streaming/plugin responses; nothing to release here.)
 
       // CORS preflight
       if (req.method === "OPTIONS") {
@@ -2713,30 +3160,31 @@ export async function runDaemonInner(
         apiHost,
         apiPortRef,
         routePlugins,
+        admissionStats,
         emitMemoryGraphChanged,
         emitNotification,
       );
     } catch (err: any) {
-      if (res.headersSent || res.writableEnded) return;
-      if (err instanceof PayloadTooLargeError) {
-        jsonResponse(res, 413, { error: err.message });
-      } else if (err instanceof SyntaxError) {
-        jsonResponse(res, 400, { error: err.message });
-      } else if (
-        // Round 9 Bug 25: user-authored quads with reserved URN prefixes
-        // map to 400 at the top-level catch so share/publish/conditionalShare
-        // routes (which rethrow for the top-level handler) get the correct
-        // status without each route having to match on the error shape.
-        err?.name === "ReservedNamespaceError" ||
-        (typeof err?.message === "string" &&
-          err.message.includes("reserved namespace"))
-      ) {
-        jsonResponse(res, 400, { error: err.message });
-      } else {
-        enrichEvmError(err);
-        jsonResponse(res, 500, { error: err.message });
-      }
+      // Single top-level error→HTTP mapping (in http-utils.ts
+      // respondWithDaemonError): 413 payload-too-large; 400 SyntaxError /
+      // reserved-namespace / NO_FUNDED_PUBLISHER_WALLET; 503/504 for a transient
+      // chain-RPC transport exhaustion (so rethrowing lifecycle publish routes
+      // get the retryable status); else 500.
+      respondWithDaemonError(res, err);
     }
+    // Note: the admission slot is released on the response's `close` event
+    // (registered above), not in a finally here — see the comment at acquire.
+  });
+
+  // Bound simultaneous sockets and slow-header connections so a flood of
+  // clients can't exhaust file descriptors or park half-open connections.
+  // Resolution + assignment live in applyServerLimits (unit-tested); tunable via
+  // DKG_MAX_CONNECTIONS / DKG_HEADERS_TIMEOUT_MS, with malformed/empty values
+  // falling back to defaults rather than becoming NaN.
+  applyServerLimits(server, {
+    maxConnectionsEnv: process.env.DKG_MAX_CONNECTIONS,
+    maxConnectionsConfig: config.maxConnections,
+    headersTimeoutEnv: process.env.DKG_HEADERS_TIMEOUT_MS,
   });
 
   const apiPort = config.apiPort || 0;
@@ -2811,6 +3259,8 @@ export async function runDaemonInner(
         clearInterval(pruneTimer);
         rateLimiter.destroy();
         metricsCollector.stop();
+        // Stops log exporters AND flushes + shuts down the OTel SDK.
+        await stopTelemetry();
         natStatusWatcherStop?.();
         resetNatStatus();
         await publisherRuntime

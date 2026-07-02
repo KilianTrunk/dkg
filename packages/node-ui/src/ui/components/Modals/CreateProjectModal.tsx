@@ -29,7 +29,7 @@ export function CreateProjectModal({ open, onClose }: CreateProjectModalProps) {
   // Codex PR #608 R1/R2 #5/#8: registration is opt-in. Default OFF
   // so unfunded / offline / no-RPC users can still create a project
   // locally and register later from Settings when they have gas + a
-  // working RPC. Verified Memory publish requires this to be on
+  // working RPC. Verifiable Memory publish requires this to be on
   // (or registered later via the per-project Settings tab).
   const [registerOnChain, setRegisterOnChain] = useState<boolean>(false);
   const [ontology, setOntology] = useState<'agent' | 'upload' | 'community'>('community');
@@ -58,7 +58,11 @@ export function CreateProjectModal({ open, onClose }: CreateProjectModalProps) {
   // Agent-identity load state drives the Retry affordance + the Create
   // button copy; added on v10-rc alongside the private-CG fix so the
   // modal degrades gracefully when /api/agent/current 401s during boot.
-  const [identityLoading, setIdentityLoading] = useState(false);
+  // Start in the loading state: the modal always kicks off an identity
+  // fetch on open (see effect below), and the fetch is dispatched from an
+  // effect that runs AFTER the first paint. Seeding `true` avoids a single
+  // frame where the button would otherwise read "Agent unavailable". (F4)
+  const [identityLoading, setIdentityLoading] = useState(true);
   const [identityError, setIdentityError] = useState(false);
 
   const { setContextGraphs, contextGraphs, setActiveProject } = useProjectsStore();
@@ -184,7 +188,7 @@ export function CreateProjectModal({ open, onClose }: CreateProjectModalProps) {
       if (registerOnChain && result.registered === false) {
         const registrationWarningMessage =
           `On-chain registration failed: ${result.registerError ?? 'unknown error'}. ` +
-          `Project is created locally and usable for everything except Verified Memory publishing. ` +
+          `Project is created locally and usable for everything except Verifiable Memory publishing. ` +
           `Retry registration from the project's Settings when ready.`;
         console.warn('[CreateProjectModal]', registrationWarningMessage);
         setRegistrationWarning(registrationWarningMessage);
@@ -446,17 +450,17 @@ export function CreateProjectModal({ open, onClose }: CreateProjectModalProps) {
             <div className="v10-form-radio-group">
               <label className="v10-form-radio">
                 <input type="radio" checked={publishPolicy === 'curator-only'} onChange={() => setPublishPolicy('curator-only')} />
-                Curators-only — only the curator may publish to Verified Memory
+                Curators-only — only the curator may publish to Verifiable Memory
               </label>
               <label className="v10-form-radio">
                 <input type="radio" checked={publishPolicy === 'open'} onChange={() => setPublishPolicy('open')} />
-                Open — any wallet may publish to Verified Memory (not just members)
+                Open — any wallet may publish to Verifiable Memory (not just members)
               </label>
             </div>
             {access === 'curated' && publishPolicy === 'open' && (
               <div style={{ marginTop: 6, fontSize: 11, color: 'var(--text-tertiary)' }}>
                 Note: an invite-only sharing graph with open contribution still lets <em>any</em> wallet
-                publish to Verified Memory — the on-chain publish check is not gated by the allowlist.
+                publish to Verifiable Memory — the on-chain publish check is not gated by the allowlist.
                 See SPEC_CG_MEMORY_MODEL §2.5.
               </div>
             )}
@@ -472,7 +476,7 @@ export function CreateProjectModal({ open, onClose }: CreateProjectModalProps) {
                 style={{ marginTop: 3 }}
               />
               <span>
-                Register on chain now (required for Verified Memory publishing)
+                Register on chain now (required for Verifiable Memory publishing)
                 <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4 }}>
                   Off by default — the project is created locally and can be registered later
                   from its Settings tab when your wallet is funded and a working RPC is configured.
@@ -572,7 +576,15 @@ export function CreateProjectModal({ open, onClose }: CreateProjectModalProps) {
             onClick={handleCreate}
             disabled={!name.trim() || !!validateCgName(name) || creating || !agentAddress || identityLoading}
           >
-            {creating ? progress || 'Creating…' : identityLoading ? 'Loading agent…' : !agentAddress ? 'Agent unavailable' : 'Create Context Graph'}
+            {creating
+              ? progress || 'Creating…'
+              : !agentAddress
+                // Only call the agent "unavailable" once the identity load
+                // has actually failed. Before that (initial open + in-flight
+                // fetch) the address is simply not resolved yet, so show a
+                // loading state instead of flashing an error label. (F4)
+                ? (identityError ? 'Agent unavailable' : 'Loading agent…')
+                : 'Create Context Graph'}
           </button>
         </div>
       </div>

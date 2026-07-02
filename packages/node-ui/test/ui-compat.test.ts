@@ -1,12 +1,42 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { readDaemonSources } from './helpers/read-cli-daemon';
 
 const UI_DIR = resolve(__dirname, '..', 'src', 'ui');
 
 function readFile(rel: string): string {
+  if (rel === 'styles.css') return readStylesSources();
+  return readRawFile(rel);
+}
+
+function readRawFile(rel: string): string {
   return readFileSync(resolve(UI_DIR, rel), 'utf-8');
+}
+
+function readTree(rel: string): string {
+  const dir = resolve(UI_DIR, rel);
+  return readdirSync(dir, { withFileTypes: true })
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((entry) => {
+      const child = `${rel}/${entry.name}`;
+      return entry.isDirectory() ? readTree(child) : readRawFile(child);
+    })
+    .join('\n');
+}
+
+function readStylesSources(): string {
+  return [
+    readRawFile('styles.css'),
+    readTree('styles'),
+  ].join('\n');
+}
+
+function readPanelRightSources(): string {
+  return [
+    readRawFile('components/Shell/PanelRight.tsx'),
+    readTree('components/Shell/PanelRight'),
+  ].join('\n');
 }
 
 describe('backward-compatible route redirects', () => {
@@ -161,7 +191,7 @@ describe('right-rail agent shell replaces Agent Hub', () => {
   const app = readFile('App.tsx');
   const panelLeft = readFile('components/Shell/PanelLeft.tsx');
   const panelCenter = readFile('components/Shell/PanelCenter.tsx');
-  const panelRight = readFile('components/Shell/PanelRight.tsx');
+  const panelRight = readPanelRightSources();
   const api = readFile('api.ts');
 
   it('App has no floating ChatPanel', () => {
@@ -385,7 +415,7 @@ describe('useMemoryEntities hook', () => {
   });
 
   it('queries WM, SWM, and VM in parallel', () => {
-    // Hook was refactored from `view: 'shared-working-memory' | 'verified-memory'`
+    // Hook was refactored from `view: 'shared-working-memory' | 'verifiable-memory'`
     // to per-layer SPARQL builders that walk the named-graph space directly
     // (see the rationale comment in useMemoryEntities.ts) so per-sub-graph
     // SWM/VM partitions are covered and each triple carries its source `?g`.

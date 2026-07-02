@@ -62,6 +62,10 @@ NUM_OP_WALLETS=3
 HARDHAT_BLOCK_INTERVAL_MS="${HARDHAT_BLOCK_INTERVAL_MS:-1000}"
 BLAZEGRAPH_PORT=9999
 BLAZEGRAPH_CONTAINER="devnet-blazegraph"
+# Webapp context path: the 2.1.5 Docker image serves under /bigdata; a native
+# 2.1.6 JAR (the Apple-silicon workaround) serves under /blazegraph. Override with
+# DEVNET_BLAZEGRAPH_CTX to match whichever Blazegraph is actually running.
+BLAZEGRAPH_CTX="${DEVNET_BLAZEGRAPH_CTX:-bigdata}"
 OXIGRAPH_SERVER_PORT_5=7878
 OXIGRAPH_SERVER_PORT_6=7879
 OXIGRAPH_CONTAINER_5="devnet-oxigraph-5"
@@ -262,6 +266,14 @@ deploy_contracts() {
 BLAZEGRAPH_AVAILABLE=false
 
 start_blazegraph() {
+  # Use an EXTERNAL Blazegraph already serving on the port (e.g. a native arm64 JAR
+  # started out-of-band because the amd64 Docker image only runs under glacial qemu
+  # on Apple silicon). Skips Docker entirely; namespaces are the operator's job here.
+  if curl -sf --max-time 4 "http://127.0.0.1:${BLAZEGRAPH_PORT}/${BLAZEGRAPH_CTX}/status" >/dev/null 2>&1; then
+    log "Blazegraph already serving on :${BLAZEGRAPH_PORT}/${BLAZEGRAPH_CTX} (external) — using it (skip Docker)"
+    BLAZEGRAPH_AVAILABLE=true
+    return 0
+  fi
   if ! docker_responsive 3; then
     log "Docker not responsive within 3s — nodes 3-4 will use Oxigraph instead of Blazegraph"
     return 0
@@ -367,6 +379,22 @@ start_oxigraph_servers() {
 }
 
 stop_oxigraph_servers() {
+  # Local daemon-managed oxigraph-server binaries (the `oxigraph-server` backend,
+  # nodes 1-N) are spawned as node children; a SIGKILL'd node can ORPHAN them,
+  # leaving the :79xx port bound so the NEXT `start` dies with "Address already
+  # in use" and those nodes silently fail to boot. Sweep any belonging to THIS
+  # devnet (path-scoped — unrelated oxigraph processes are untouched). Runs
+  # regardless of docker availability (the local binaries are not docker).
+  #
+  # DEVNET_DIR is user-configurable and may contain regex/glob metacharacters, so
+  # we do NOT feed it to `pkill -f` as a raw regex (where `.`/`[`/`+`/spaces would
+  # change the match and could over-match). Instead match the dir as a LITERAL
+  # substring of each process's command line via a quoted `case` glob.
+  ps axww -o pid=,command= 2>/dev/null | while read -r _pid _cmd; do
+    case "$_cmd" in
+      *"$DEVNET_DIR/node"*"oxigraph/oxigraph"*) kill "$_pid" 2>/dev/null || true ;;
+    esac
+  done
   if ! docker_responsive 3; then return 0; fi
   for name in $OXIGRAPH_CONTAINER_5 $OXIGRAPH_CONTAINER_6; do
     if docker inspect "$name" > /dev/null 2>&1; then
@@ -414,14 +442,33 @@ create_node_config() {
   # start_node() to point at node 1's local multiaddr.
   local relay_value='"relay": "none",'
 
-  # Backend assignment:
-  #   Node 1-2: oxigraph-worker  (worker thread, file-persisted — production default)
-  #   Node 3-4: oxigraph          (in-process, no worker thread — comparison baseline)
-  #   Node 5-6: blazegraph        (remote SPARQL, if Docker available — else oxigraph-worker)
+  # Backend assignment (production parity + hermetic — no Docker required for the
+  # primary coverage):
+  #   Node 1-2: oxigraph-server  (DAEMON-MANAGED local server — the actual
+  #             fresh-install production default since rc.12. The daemon
+  #             auto-downloads + SHA-256-verifies + caches the Oxigraph binary
+  #             and spawns it on its own port — NO Docker. Node 1 is the node the
+  #             UI/e2e suite drives, so the suite now exercises the REAL default
+  #             backend and deterministically reproduces SPARQL-over-HTTP-only
+  #             bugs such as #996 — which the old `oxigraph-worker` default hid.)
+  #   Node 3-4: blazegraph (if Docker) else oxigraph  (in-process baseline)
+  #   Node 5-6: sparql-http → external Dockerized Oxigraph  (EXTRA coverage of the
+  #             generic external-endpoint path; Docker-only, optional)
   local store_block=""
-  if [ "$node_num" -ge 3 ] && [ "$node_num" -le 4 ]; then
-    if [ "$BLAZEGRAPH_AVAILABLE" = true ]; then
-      store_block="\"store\": { \"backend\": \"blazegraph\", \"options\": { \"url\": \"http://127.0.0.1:${BLAZEGRAPH_PORT}/bigdata/namespace/node${node_num}/sparql\" } },"
+  if [ "$node_num" -ge 1 ] && [ "$node_num" -le 2 ]; then
+    # The managed oxigraph-server defaults to port 7878; multiple nodes on one
+    # host must pin DISTINCT ports or the second collides ("Address already in
+    # use"). Give each node its own (7900 + node_num), clear of the Dockerized
+    # external Oxigraph on 7878/7879 (nodes 5-6) and a real node's 7878.
+    store_block="\"store\": { \"backend\": \"oxigraph-server\", \"options\": { \"port\": $(( ${DEVNET_OXIGRAPH_BASE:-7900} + node_num )) } },"
+  elif [ "$node_num" -ge 3 ] && [ "$node_num" -le 4 ]; then
+    # DEVNET_BLAZEGRAPH_NS overrides the per-node namespace with a single shared one
+    # (e.g. the built-in "kb") — used when Blazegraph runs as a native arm64 JAR and
+    # offline namespace-creation is unavailable. To avoid two nodes colliding on one
+    # namespace, only node 3 goes to Blazegraph in that mode; node 4 stays oxigraph.
+    if [ "$BLAZEGRAPH_AVAILABLE" = true ] && { [ -z "${DEVNET_BLAZEGRAPH_NS:-}" ] || [ "$node_num" -eq 3 ]; }; then
+      local bz_ns="${DEVNET_BLAZEGRAPH_NS:-node${node_num}}"
+      store_block="\"store\": { \"backend\": \"blazegraph\", \"options\": { \"url\": \"http://127.0.0.1:${BLAZEGRAPH_PORT}/${BLAZEGRAPH_CTX}/namespace/${bz_ns}/sparql\" } },"
     else
       store_block="\"store\": { \"backend\": \"oxigraph\" },"
     fi
@@ -561,21 +608,51 @@ start_node() {
     relay_arg=$(cat "$DEVNET_DIR/node1/multiaddr")
   fi
 
-  # Update config with relay address if available
-  if [ -n "$relay_arg" ]; then
-    node -e "
-      const fs = require('fs');
-      const cfg = JSON.parse(fs.readFileSync('$node_dir/config.json','utf8'));
-      cfg.relay = '$relay_arg';
-      fs.writeFileSync('$node_dir/config.json', JSON.stringify(cfg, null, 2));
-    "
-  fi
+  # Core mesh (default topology): a CORE node directly dials every EARLIER core
+  # via `bootstrapPeers`, instead of every node hubbing through node 1. libp2p
+  # connections are bidirectional and `identify` exchanges listen addresses, so
+  # "dial all earlier cores" yields an all-core direct mesh once the last core is
+  # up. That keeps every core directly DIALABLE for SWM substrate fan-out (the
+  # StorageACK responders), so VM-publish quorum is delivered reliably point-to-
+  # point instead of riding best-effort gossip (which raced and dropped quorum on
+  # the all-hub-through-node-1 topology). EDGE nodes dial ALL cores — a scalable
+  # hub-and-spoke spoke (O(cores) connections per edge, never edge<->edge) — so
+  # an edge can still publish and reach quorum; edges never mesh with each other.
+  # Node 1 (first core) dials no one and meshes via inbound dials from the rest.
+  DEVNET_DIR="$DEVNET_DIR" NODE_DIR="$node_dir" NODE_NUM="$node_num" \
+  NUM_CORE_NODES="$NUM_CORE_NODES" RELAY_ARG="$relay_arg" node -e "
+    const fs = require('fs');
+    const dir = process.env.DEVNET_DIR;
+    const cfgPath = process.env.NODE_DIR + '/config.json';
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+    if (process.env.RELAY_ARG) cfg.relay = process.env.RELAY_ARG;
+    const n = Number(process.env.NODE_NUM);
+    // Bootstrap targets are the CORE nodes among 1..n-1, read from each node's
+    // authoritative nodeRole — NOT the ordinal 'first NUM_CORE_NODES are cores',
+    // since cmd_addnode can spawn a core beyond NUM_CORE_NODES (via
+    // DEVNET_NODE_ROLE_OVERRIDE). A core thus meshes with every earlier core; an
+    // edge spokes to every earlier core. Connections are bidirectional, so a
+    // later-added core dials the earlier cores and joins the mesh.
+    const peers = [];
+    for (let c = 1; c < n; c++) {
+      let cRole = 'edge';
+      try { cRole = JSON.parse(fs.readFileSync(dir + '/node' + c + '/config.json', 'utf8')).nodeRole || 'edge'; } catch {}
+      if (cRole !== 'core') continue;
+      try { const m = fs.readFileSync(dir + '/node' + c + '/multiaddr', 'utf8').trim(); if (m) peers.push(m); } catch {}
+    }
+    if (peers.length) cfg.bootstrapPeers = peers;
+    fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+  "
 
   # Remove any stale daemon.pid so the CLI doesn't think it's already running
   rm -f "$node_dir/daemon.pid"
 
   log "Starting node $node_num..."
-  DKG_HOME="$node_dir" DKG_NO_BLUE_GREEN=1 \
+  # DKG_WALLETS_NO_MIGRATE=1: this harness writes a plaintext wallets.json with
+  # RANDOM operational keys and the staking step (cmd_start) re-reads
+  # wallets[0].privateKey directly, so the daemon must NOT migrate it to an
+  # encrypted keystore (GH #11). Production daemons omit this and auto-migrate.
+  DKG_HOME="$node_dir" DKG_NO_BLUE_GREEN=1 DKG_WALLETS_NO_MIGRATE=1 \
     node "$REPO_ROOT/packages/cli/dist/cli.js" start --foreground \
     > "$node_dir/daemon.log" 2>&1 &
   local node_pid=$!
@@ -592,8 +669,8 @@ start_node() {
       auth_args=(-H "Authorization: Bearer $auth_token")
     fi
   fi
-  local max_wait=30
-  [ "$node_num" -eq 1 ] && max_wait=120
+  local max_wait=${DEVNET_NODE_READY_TIMEOUT:-30}
+  [ "$node_num" -eq 1 ] && max_wait=$(( max_wait > 120 ? max_wait : 120 ))
   local ready=false
   # CRITICAL: declare loop variable `local` so we don't clobber the OUTER
   # caller's `i` (cmd_start's `for ((i = 2; i <= NUM_NODES; i++))` calls
@@ -614,31 +691,43 @@ start_node() {
     log "WARNING: Node $node_num not ready after ${max_wait}s (check $node_dir/daemon.log)"
   fi
 
-  # For node 1 (relay), save its multiaddr so other nodes can connect.
-  # Retry a few times even if initial wait timed out — node may still be booting.
-  if [ "$node_num" -eq 1 ]; then
-    local peer_id=""
-    for attempt in $(seq 1 10); do
-      local peer_info
-      peer_info=$(curl -sf "${auth_args[@]}" "http://127.0.0.1:$api_port/api/status" 2>/dev/null || echo "{}")
-      peer_id=$(echo "$peer_info" | node -e "
-        let d=''; process.stdin.on('data',c=>d+=c);
-        process.stdin.on('end',()=>{
-          try{const j=JSON.parse(d);console.log(j.peerId||'')}catch{console.log('')}
-        })
-      " 2>/dev/null || echo "")
-      [ -n "$peer_id" ] && break
-      sleep 3
-    done
+  # Save THIS node's multiaddr so (a) node 1 serves as the universal relay and
+  # (b) later cores/edges can directly dial it to form the core mesh + spokes
+  # (see the bootstrapPeers block above). Node 1's multiaddr is REQUIRED (every
+  # node bootstraps off it; failure aborts); the rest are best-effort — a missing
+  # one only means that node isn't a direct-dial target, it still works via the
+  # relay + gossip. Retry a few times even if the initial wait timed out.
+  local peer_id=""
+  for attempt in $(seq 1 10); do
+    local peer_info
+    peer_info=$(curl -sf "${auth_args[@]}" "http://127.0.0.1:$api_port/api/status" 2>/dev/null || echo "{}")
+    peer_id=$(echo "$peer_info" | node -e "
+      let d=''; process.stdin.on('data',c=>d+=c);
+      process.stdin.on('end',()=>{
+        try{const j=JSON.parse(d);console.log(j.peerId||'')}catch{console.log('')}
+      })
+    " 2>/dev/null || echo "")
+    [ -n "$peer_id" ] && break
+    sleep 3
+  done
 
-    if [ -n "$peer_id" ]; then
-      local libp2p_port=$((LIBP2P_PORT_BASE))
-      echo "/ip4/127.0.0.1/tcp/${libp2p_port}/p2p/${peer_id}" > "$DEVNET_DIR/node1/multiaddr"
-      log "Relay multiaddr saved: /ip4/127.0.0.1/tcp/${libp2p_port}/p2p/${peer_id}"
-    else
-      log "ERROR: Could not extract relay multiaddr for node 1 — aborting devnet start"
+  if [ -n "$peer_id" ]; then
+    local libp2p_port=$((LIBP2P_PORT_BASE + node_num - 1))
+    echo "/ip4/127.0.0.1/tcp/${libp2p_port}/p2p/${peer_id}" > "$DEVNET_DIR/node${node_num}/multiaddr"
+    log "Node $node_num multiaddr saved: /ip4/127.0.0.1/tcp/${libp2p_port}/p2p/${peer_id}"
+  else
+    # A CORE that fails to publish its multiaddr is silently dropped from every
+    # later core's bootstrapPeers, degrading the mesh back to the gossip-only
+    # quorum path this topology exists to avoid — so abort on ANY core (not just
+    # node 1). Edges stay best-effort: a missing edge multiaddr just means it
+    # isn't a direct-dial target, and it still works via the relay + gossip.
+    local node_role="edge"
+    node_role=$(node -e "try{process.stdout.write(JSON.parse(require('fs').readFileSync('$node_dir/config.json','utf8')).nodeRole||'edge')}catch{process.stdout.write('edge')}" 2>/dev/null || echo edge)
+    if [ "$node_role" = "core" ]; then
+      log "ERROR: Could not extract multiaddr for CORE node $node_num — later cores would silently omit it from the direct mesh (gossip-only quorum). Aborting devnet start."
       return 1
     fi
+    log "WARNING: Could not extract multiaddr for edge node $node_num — not a direct-dial target (still reachable via gossip)."
   fi
 }
 
@@ -755,8 +844,50 @@ cmd_start() {
   start_blazegraph
   start_oxigraph_servers
 
+  # ── backend coverage summary + optional strict gate ───────────────────────
+  # Nodes 1-2 run the daemon-managed `oxigraph-server` (the production default)
+  # with NO Docker — the binary is auto-downloaded/cached by the daemon — so the
+  # SPARQL-over-HTTP path, AND the node the UI/e2e suite drives, is ALWAYS
+  # exercised. That closes the rc.16 gap where the matrix silently fell back to
+  # the embedded store and the blank-node DELETE-DATA bug slipped past devnet.
+  # The Docker-gated entries below (blazegraph on 3-4, an EXTERNAL Oxigraph
+  # server on 5-6) are EXTRA matrix coverage; DEVNET_REQUIRE_ALL_BACKENDS=1 makes
+  # their absence a hard failure for full-matrix CI.
+  local bg_state ox_extra
+  if [ "$BLAZEGRAPH_AVAILABLE" = true ]; then bg_state="blazegraph"; else bg_state="oxigraph in-process (blazegraph Docker unavailable)"; fi
+  if [ "$OXIGRAPH_SERVER_AVAILABLE" = true ]; then ox_extra="sparql-http → external Oxigraph"; else ox_extra="(skipped — external Oxigraph Docker unavailable)"; fi
+  log "Store-backend matrix:  nodes 1-2: oxigraph-server (managed, no Docker)  |  nodes 3-4: $bg_state  |  nodes 5-6: $ox_extra"
+  if [ "$BLAZEGRAPH_AVAILABLE" != true ] || [ "$OXIGRAPH_SERVER_AVAILABLE" != true ]; then
+    if [ "${DEVNET_REQUIRE_ALL_BACKENDS:-0}" = "1" ]; then
+      log "ERROR: DEVNET_REQUIRE_ALL_BACKENDS=1 but an EXTRA Docker backend (blazegraph and/or external Oxigraph) is missing. The core oxigraph-server path IS covered on nodes 1-2, but full-matrix CI also requires the Docker images. Aborting."
+      exit 1
+    fi
+    log "NOTE: EXTRA Docker backends (blazegraph / external Oxigraph) are not provisioned this run. The production-default oxigraph-server path IS covered on nodes 1-2; set DEVNET_REQUIRE_ALL_BACKENDS=1 to require the Docker extras too."
+  fi
+
   # Stop any already-running devnet nodes so they pick up the config we are about to write
   stop_devnet_nodes_only
+
+  # The chain was just freshly deployed (start_hardhat wiped the deployment
+  # artifacts + marker above), so ANY persisted per-node store state is STALE —
+  # it references the OLD chain. The critical case: a node's store still holds
+  # the `dkg:contextGraphOnChainId` triple from a previous run, so
+  # `registerContextGraph` below short-circuits on a stale "already registered"
+  # view and never creates the CG on the NEW chain. The CG then reads back
+  # `isContextGraphActive=false` / `publishPolicy=0`, the post-boot policy
+  # assertion fails, and every VM publish hits LU-5 ("publish access-policy is
+  # unknown"). Wipe each node's persisted state now that the nodes are stopped —
+  # but KEEP the cached Oxigraph binary (`oxigraph/`) so we don't re-download it.
+  # Nodes re-register identities + CGs and re-sync from scratch against the fresh
+  # chain, which is exactly the e2e seed-from-clean model.
+  if [ -d "$DEVNET_DIR" ]; then
+    local nd
+    for nd in "$DEVNET_DIR"/node*/; do
+      [ -d "$nd" ] || continue
+      find "$nd" -mindepth 1 -maxdepth 1 ! -name oxigraph -exec rm -rf {} + 2>/dev/null || true
+    done
+    log "Cleared stale per-node store state for the freshly-deployed chain (kept cached Oxigraph binaries)"
+  fi
 
   # Generate a shared auth token for all devnet nodes
   local shared_token
@@ -977,9 +1108,21 @@ cmd_start() {
         // awaits costs one extra eth_call per tx, which is negligible
         // for a 6-node devnet bootstrap.
         const sendWithFreshNonce = async (txFactory) => {
-          const freshNonce = await provider.getTransactionCount(opSigner.address, 'pending');
-          const tx = await txFactory(freshNonce);
-          return tx.wait();
+          // Retry on the daemon racing our nonce (it shares this op wallet and may
+          // submit between our 'pending' read and our send) or a transient revert:
+          // re-read 'pending' and resend, backing off, before giving up.
+          let lastErr;
+          for (let attempt = 0; attempt < 4; attempt++) {
+            try {
+              const freshNonce = await provider.getTransactionCount(opSigner.address, 'pending');
+              const tx = await txFactory(freshNonce);
+              return await tx.wait();
+            } catch (e) {
+              lastErr = e;
+              await new Promise(r => setTimeout(r, 800 + attempt * 600));
+            }
+          }
+          throw lastErr;
         };
         // Codex round 4 on PR #368: skip createConviction if the daemon
         // already opened a position. PR 366 wired EVMChainAdapter.ensureProfile()
@@ -1049,6 +1192,24 @@ cmd_start() {
         } catch (e) { console.log('Ask failed for node ' + (i+1) + ': ' + e.message); }
       }
       console.log('Staked 50k TRAC for ' + staked + '/' + coreCount + ' core node(s), ask set for ' + asked + '/' + coreCount);
+      // The daemon's own ensureProfile stake can land AFTER this loop (it shares the
+      // op wallet; our probe raced it, then our createConviction reverted as a duplicate
+      // 0x7000ca77). Re-probe all core identities (poll up to ~30s) before the FATAL gate
+      // so a daemon-side stake that won the race still counts and we don't abort the boot
+      // (and skip CG registration) over a timing artifact.
+      if (staked < coreCount) {
+        for (let poll = 0; poll < 15 && staked < coreCount; poll++) {
+          await new Promise(r => setTimeout(r, 2000));
+          let restaked = 0;
+          for (const i of coreIdxs) {
+            const idId2 = nodeIds[i] || await identity.getIdentityId(opSigners[i].address);
+            if (idId2 === 0n) continue;
+            try { if ((await css.getNodeStakeV10(idId2)) > 0n) restaked++; } catch (_) {}
+          }
+          staked = restaked;
+        }
+        console.log('Re-probed core stakes after settle: ' + staked + '/' + coreCount);
+      }
       // Defense-in-depth: a partial-stake bootstrap (probe failure +
       // skip, or createConviction revert + skip) currently logs
       // 'staked X/Y' and continues. Operators may miss the count

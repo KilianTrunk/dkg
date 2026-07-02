@@ -45,7 +45,9 @@ export class IdentityMethods extends EVMChainAdapterBase {
     }
 
     const onChainIds = await Promise.all(
-      uniqueAddresses.map((addr) => identityStorage.getIdentityId(addr).then(BigInt)),
+      uniqueAddresses.map((addr) => this.readContract(
+        identityStorage, 'identityStorage.getIdentityId', 'getIdentityId', addr,
+      ).then(BigInt)),
     );
     const missing: string[] = [];
     for (let i = 0; i < uniqueAddresses.length; i++) {
@@ -92,6 +94,128 @@ export class IdentityMethods extends EVMChainAdapterBase {
     return result;
   }
 
+  /**
+   * Add a single operational wallet to the node identity via
+   * `Profile.addOperationalWallets(identityId, [address])`. Signed by the
+   * configured admin key (the contract's `onlyAdmin` gate). Mirrors the
+   * preconditions of {@link ensureOperationalWalletsRegistered}: requires an
+   * admin key that is registered on-chain as an ADMIN_KEY for the identity.
+   */
+  async addOperationalWallet(address: string, options?: { identityId?: bigint }): Promise<TxResult> {
+    await this.init();
+    if (!ethers.isAddress(address)) {
+      throw new Error(`addOperationalWallet: invalid address ${address}`);
+    }
+    const wallet = ethers.getAddress(address);
+    const identityId = options?.identityId ?? (await this.getIdentityId());
+    if (identityId === 0n) {
+      throw new Error('addOperationalWallet: node has no on-chain profile (create a profile first).');
+    }
+    if (!this.adminSigner) {
+      throw new Error(
+        `Cannot add operational wallet to identity ${identityId}: adminPrivateKey is not configured.`,
+      );
+    }
+    const identityStorage = await this.getIdentityStorage();
+    if (!(await this.hasAdminPurpose(identityStorage, identityId, this.adminSigner.address))) {
+      throw new Error(
+        `Cannot add operational wallet to identity ${identityId}: configured admin wallet ` +
+        `${this.adminSigner.address} is not registered on-chain as an admin key for this identity.`,
+      );
+    }
+    const receipt = await this.sendContractTransaction(
+      this.contracts.profile!,
+      'addOperationalWallets',
+      [identityId, [wallet]],
+      this.adminSigner,
+      'addOperationalWallet',
+    );
+    return {
+      hash: receipt.hash,
+      blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
+      success: receipt.status === 1,
+    };
+  }
+
+  /**
+   * Remove a single operational wallet from the node identity via
+   * `Identity.removeKey(identityId, keccak(address))`. Profile exposes no
+   * remove path, so this calls Identity directly with the admin key
+   * (`onlyAdmin`). REFUSES to remove the bound primary operational wallet:
+   * `getIdentityId()` resolves the node's identity from `this.signer.address`,
+   * so removing it would orphan the node's own identity resolution while other
+   * keys remain — and the contract's only guard is `CannotDeleteOnlyOperationalKey`
+   * (the LAST key), which would not stop this.
+   */
+  async removeOperationalWallet(address: string, options?: { identityId?: bigint }): Promise<TxResult> {
+    await this.init();
+    if (!ethers.isAddress(address)) {
+      throw new Error(`removeOperationalWallet: invalid address ${address}`);
+    }
+    const wallet = ethers.getAddress(address);
+    if (wallet.toLowerCase() === this.signer.address.toLowerCase()) {
+      throw new Error(
+        `removeOperationalWallet: refusing to remove the node's primary operational wallet ` +
+        `${this.signer.address} — it anchors on-chain identity resolution.`,
+      );
+    }
+    const identityId = options?.identityId ?? (await this.getIdentityId());
+    if (identityId === 0n) {
+      throw new Error('removeOperationalWallet: node has no on-chain profile.');
+    }
+    if (!this.adminSigner) {
+      throw new Error(
+        `Cannot remove operational wallet from identity ${identityId}: adminPrivateKey is not configured.`,
+      );
+    }
+    const identityStorage = await this.getIdentityStorage();
+    if (!(await this.hasAdminPurpose(identityStorage, identityId, this.adminSigner.address))) {
+      throw new Error(
+        `Cannot remove operational wallet from identity ${identityId}: configured admin wallet ` +
+        `${this.adminSigner.address} is not registered on-chain as an admin key for this identity.`,
+      );
+    }
+    // Refuse to remove a wallet that is itself registered as an ADMIN key for this
+    // identity. `removeKey` deletes a key by hash regardless of its purpose, so
+    // without this guard the "remove operational wallet" path would strip an
+    // ADMIN_KEY (ERC-734 purpose 1) and could lock the operator out of admin
+    // control. Operational-key removal must touch operational keys only; admin-key
+    // rotation is a deliberate, separate action.
+    if (await this.hasAdminPurpose(identityStorage, identityId, wallet)) {
+      throw new Error(
+        `removeOperationalWallet: refusing to remove ${wallet} — it is registered on-chain as ` +
+        `an ADMIN key for identity ${identityId}, not an operational key. Removing it here would ` +
+        `strip admin control; rotate admin keys through admin-key management instead.`,
+      );
+    }
+    // Positive guard: only remove a wallet that IS registered as an OPERATIONAL
+    // key for this identity. `removeKey` deletes a key by its hash regardless of
+    // purpose, so without this an address attached with any other (non-admin,
+    // non-operational) purpose could be silently deleted through the
+    // operational-wallet endpoint. Operational-key removal must touch operational
+    // keys only — reject anything that is not one.
+    if (!(await this.hasOperationalPurpose(identityStorage, identityId, wallet))) {
+      throw new Error(
+        `removeOperationalWallet: refusing to remove ${wallet} — it is not registered on-chain as ` +
+        `an operational key for identity ${identityId}.`,
+      );
+    }
+    const receipt = await this.sendContractTransaction(
+      this.contracts.identity!,
+      'removeKey',
+      [identityId, this.walletKeyHash(wallet)],
+      this.adminSigner,
+      'removeOperationalWallet',
+    );
+    return {
+      hash: receipt.hash,
+      blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
+      success: receipt.status === 1,
+    };
+  }
+
   // =====================================================================
   // RFC 04 v0.3 / Issue #461 — Network State Registry surface (relay-capable).
   // Multiaddrs are NOT exposed here — they live in per-round attestation KCs
@@ -103,7 +227,9 @@ export class IdentityMethods extends EVMChainAdapterBase {
     if (!this.contracts.profileStorage) {
       throw new Error('getRelayCapable: ProfileStorage not deployed on this Hub.');
     }
-    return Boolean(await this.contracts.profileStorage.getRelayCapable(identityId));
+    return Boolean(await this.readContract(
+      this.contracts.profileStorage, 'profileStorage.getRelayCapable', 'getRelayCapable', identityId,
+    ));
   }
 
   async setRelayCapable(relayCapable: boolean): Promise<TxResult> {
@@ -144,7 +270,9 @@ export class IdentityMethods extends EVMChainAdapterBase {
     if (cached !== undefined) return cached;
     await this.init();
     const identityStorage = await this.resolveContract('IdentityStorage');
-    const id: bigint = await identityStorage.getIdentityId(checksum);
+    const id: bigint = await this.readContract(
+      identityStorage, 'identityStorage.getIdentityId', 'getIdentityId', checksum,
+    );
     if (id > 0n) {
       // Only memoise positive hits — a 0n result may flip to non-zero
       // once the operator registers, and we don't want to lock the
@@ -215,7 +343,9 @@ export class IdentityMethods extends EVMChainAdapterBase {
     if (stakeAmount > 0n && this.contracts.token) {
       try {
         const stakingNFT = await this.resolveContract('DKGStakingConvictionNFT');
-        const stakingV10Addr: string = await this.contracts.hub.getContractAddress('StakingV10');
+        const stakingV10Addr: string = await this.readContract(
+          this.contracts.hub, 'Hub.getContractAddress(StakingV10)', 'getContractAddress', 'StakingV10',
+        );
         if (stakingV10Addr === ethers.ZeroAddress) {
           throw new Error('StakingV10 not registered in Hub — V10 staking unavailable');
         }

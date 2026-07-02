@@ -1,8 +1,9 @@
 import {
   decodeFinalizationMessage,
   contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
+  sharedMemoryReadBothFilter,
   contextGraphDataUri, contextGraphMetaUri,
-  contextGraphSubGraphUri, validateSubGraphName,
+  contextGraphSubGraphUri, validateSubGraphName, validateContextGraphId,
   DKGEvent, Logger, createOperationContext,
   assertSafeIri, isSafeIri,
   type EventBus,
@@ -15,8 +16,11 @@ import { GraphManager, type TripleStore, type Quad } from '@origintrail-official
 import { type ChainAdapter, type EventFilter } from '@origintrail-official/dkg-chain';
 import {
   computeFlatKCRootV10 as computeFlatKCRoot, skolemizeByEntity,
-  generateConfirmedFullMetadata, getTentativeStatusQuad,
+  generatedPrivateCatalogFloorQuads,
+  generatedPrivateCatalogTripleKeys,
+  generateConfirmedFullMetadata, buildDeterministicTokenRows, compareRootIris, getTentativeStatusQuad,
   generateSubGraphRegistration,
+  splitTrustedGeneratedCatalogRootMap,
   shouldApplyMaterialization, writeMaterializedVersion, withMaterializationLock,
   type MaterializedVersion,
   type KCMetadata, type KAMetadata, type OnChainProvenance,
@@ -43,24 +47,56 @@ export type ResolveContextGraphOnChainId = (
   contextGraphId: string,
 ) => Promise<string | null | undefined>;
 
+export type MarkContextGraphMetaDirtyFromQuads = (quads: readonly Quad[]) => void;
+
+function stripOptionalLiteral(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  if (value.startsWith('"')) {
+    try {
+      return JSON.parse(value);
+    } catch {
+      const lastQuote = value.lastIndexOf('"');
+      return value.slice(1, lastQuote > 0 ? lastQuote : undefined);
+    }
+  }
+  return value;
+}
+
+function sameBigIntLiteral(left: string | bigint | null | undefined, right: string | bigint | null | undefined): boolean {
+  if (left === undefined || left === null || right === undefined || right === null) return false;
+  try {
+    return BigInt(left) === BigInt(right);
+  } catch {
+    return false;
+  }
+}
+
 export class FinalizationHandler {
   private readonly store: TripleStore;
   private readonly chain: ChainAdapter | undefined;
   private readonly eventBus: EventBus | undefined;
   private readonly resolveContextGraphOnChainId: ResolveContextGraphOnChainId | undefined;
+  private readonly markContextGraphMetaDirtyFromQuads: MarkContextGraphMetaDirtyFromQuads | undefined;
   private readonly log = new Logger('FinalizationHandler');
   private readonly processedUals = new Set<string>();
+  // Forward-prevention for the cgId-resolution race (RS heal): chain-authoritative
+  // kaId(batchId)->cgId bindings, cached POSITIVE-ONLY. A 0/miss is NEVER cached —
+  // caching a miss for a KC finalized before its on-chain KA->CG binding lands
+  // would pin it to the legacy `/_meta` fallback forever, re-opening the race.
+  private readonly chainCgIdByBatchId = new Map<string, string>();
 
   constructor(
     store: TripleStore,
     chain: ChainAdapter | undefined,
     eventBus?: EventBus,
     resolveContextGraphOnChainId?: ResolveContextGraphOnChainId,
+    markContextGraphMetaDirtyFromQuads?: MarkContextGraphMetaDirtyFromQuads,
   ) {
     this.store = store;
     this.chain = chain;
     this.eventBus = eventBus;
     this.resolveContextGraphOnChainId = resolveContextGraphOnChainId;
+    this.markContextGraphMetaDirtyFromQuads = markContextGraphMetaDirtyFromQuads;
   }
 
   async handleFinalizationMessage(data: Uint8Array, contextGraphId: string): Promise<void> {
@@ -72,7 +108,11 @@ export class FinalizationHandler {
       }
 
       if (msg.contextGraphId && msg.contextGraphId !== contextGraphId) {
-        this.log.warn(ctx, `Finalization: contextGraphId "${msg.contextGraphId}" does not match topic "${contextGraphId}", ignoring`);
+        // #1100: same guard as GossipPublishHandler — frames of other gossip
+        // message types decode "successfully" with garbage in this field, so
+        // only WARN when the mismatched value is a plausible CG id.
+        if (!validateContextGraphId(msg.contextGraphId).valid) return;
+        this.log.warn(ctx, `Finalization: contextGraphId "${msg.contextGraphId.slice(0, 120)}" does not match topic "${contextGraphId}", ignoring`);
         return;
       }
 
@@ -104,15 +144,45 @@ export class FinalizationHandler {
       // the id locally when the wire is empty; resolver failures or
       // not-on-chain CGs fall back to legacy behavior unchanged.
       let ctxGraphId = msg.targetContextGraphId || undefined;
-      if (!ctxGraphId && this.resolveContextGraphOnChainId) {
-        try {
-          const resolved = await this.resolveContextGraphOnChainId(contextGraphId);
-          if (resolved !== null && resolved !== undefined && String(resolved).length > 0) {
-            ctxGraphId = String(resolved);
-            this.log.info(ctx, `Finalization: gossip omitted targetContextGraphId; resolved locally to ${ctxGraphId} (defensive lookup)`);
+      if (!ctxGraphId) {
+        // Forward-prevention (RS cgId-race): resolve from CHAIN TRUTH first.
+        // `getKAContextGraphId(batchId)` is authoritative and immune to the
+        // local ontology-binding lag that strands KCs in legacy `/_meta` — the
+        // root cause the heal-sweep exists to repair. Caching POSITIVE results
+        // only (never a 0/miss) keeps a finalization that races ahead of its
+        // on-chain KA->CG binding from being pinned to legacy forever.
+        let batchIdForResolve = 0n;
+        try { batchIdForResolve = protoToBigInt(msg.batchId); } catch { batchIdForResolve = 0n; }
+        const cacheKey = batchIdForResolve > 0n ? batchIdForResolve.toString() : '';
+        if (cacheKey && this.chainCgIdByBatchId.has(cacheKey)) {
+          ctxGraphId = this.chainCgIdByBatchId.get(cacheKey);
+        } else if (
+          cacheKey && this.chain && this.chain.chainId !== 'none'
+          && typeof this.chain.getKAContextGraphId === 'function'
+        ) {
+          try {
+            const boundCg = await this.chain.getKAContextGraphId(batchIdForResolve);
+            if (boundCg !== null && boundCg !== undefined && BigInt(boundCg) > 0n) {
+              ctxGraphId = boundCg.toString();
+              this.chainCgIdByBatchId.set(cacheKey, ctxGraphId); // POSITIVE-only
+              this.log.info(ctx, `Finalization: resolved cgId from chain truth getKAContextGraphId(${batchIdForResolve})=${ctxGraphId}`);
+            }
+          } catch (err) {
+            this.log.info(ctx, `Finalization: chain getKAContextGraphId(${batchIdForResolve}) failed (RPC lag?), falling back to local resolve: ${err instanceof Error ? err.message : String(err)}`);
           }
-        } catch (err) {
-          this.log.warn(ctx, `Finalization: defensive on-chain CG id lookup failed for ${contextGraphId}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        // Local name-based resolver — the existing belt-and-braces for rolling
+        // upgrades when the chain method is absent/lagging.
+        if (!ctxGraphId && this.resolveContextGraphOnChainId) {
+          try {
+            const resolved = await this.resolveContextGraphOnChainId(contextGraphId);
+            if (resolved !== null && resolved !== undefined && String(resolved).length > 0) {
+              ctxGraphId = String(resolved);
+              this.log.info(ctx, `Finalization: gossip omitted targetContextGraphId; resolved locally to ${ctxGraphId} (defensive lookup)`);
+            }
+          } catch (err) {
+            this.log.warn(ctx, `Finalization: defensive on-chain CG id lookup failed for ${contextGraphId}: ${err instanceof Error ? err.message : String(err)}`);
+          }
         }
       }
 
@@ -128,11 +198,15 @@ export class FinalizationHandler {
         }
       }
 
-      // Dedup guard: skip if this batch was already promoted (e.g. by ChainEventPoller)
+      // Dedup guard: skip if this batch was already promoted (e.g. by ChainEventPoller).
+      // Read-both (review F5): also ASK the label `_meta` — the minimal
+      // per-cgId partition shape carries no `dkg:status` row.
       const targetMetaGraph = ctxGraphId
         ? contextGraphMetaUri(contextGraphId, ctxGraphId)
         : `did:dkg:context-graph:${contextGraphId}/_meta`;
-      const alreadyPromoted = await this.isAlreadyConfirmed(msg.ual, targetMetaGraph);
+      const alreadyPromoted = await this.isAlreadyConfirmed(
+        msg.ual, targetMetaGraph, `did:dkg:context-graph:${contextGraphId}/_meta`,
+      );
       if (alreadyPromoted) {
         this.markProcessed(dedupeKey);
         this.log.info(ctx, `Finalization: ${msg.ual} already confirmed in ${ctxGraphId ? `context graph ${ctxGraphId}` : 'context graph'}, skipping`);
@@ -143,9 +217,16 @@ export class FinalizationHandler {
 
       if (sharedMemoryQuads.length > 0) {
         const privateRoots = await this.getPrivateRootsFromMeta(contextGraphId, msg.rootEntities, subGraphName);
-        const merkleMatch = this.verifyMerkleMatch(sharedMemoryQuads, privateRoots, msg.kcMerkleRoot);
+        const allowGeneratedCatalogFloor = await this.allowsGeneratedCatalogFloor(contextGraphId, ctxGraphId);
+        const merkleMatchedQuads = this.sharedMemoryQuadsMatchingMerkle(
+          contextGraphId,
+          sharedMemoryQuads,
+          privateRoots,
+          msg.kcMerkleRoot,
+          allowGeneratedCatalogFloor,
+        );
 
-        if (merkleMatch) {
+        if (merkleMatchedQuads) {
           const batchId = protoToBigInt(msg.batchId);
           // PR #845 review #9: derive `txIndex` from the verified receipt
           // (via `verifyOnChain`), NOT from gossip-supplied `msg.txIndex`.
@@ -209,7 +290,7 @@ export class FinalizationHandler {
             // `shouldApplyMaterialization` and `writeMaterializedVersion`.
             const outcome = await this.applyVerifiedFinalization({
               contextGraphId,
-              sharedMemoryQuads,
+              sharedMemoryQuads: merkleMatchedQuads,
               ual: msg.ual,
               rootEntities: msg.rootEntities,
               publisherAddress: msg.publisherAddress,
@@ -264,11 +345,26 @@ export class FinalizationHandler {
     }
   }
 
-  private async isAlreadyConfirmed(ual: string, metaGraph: string): Promise<boolean> {
+  /**
+   * Read-both (adversarial review F5, RFC ka-metadata-trim): the REQUIRED
+   * `dkg:status "confirmed"` ASK used to target only the per-cgId partition
+   * meta graph — but the minimal partition shape (`restateKaPartition`, the
+   * publisher's own same-graph promote) no longer carries `dkg:status`; the
+   * status row lives in the LABEL `_meta` graph. Without the fallback the
+   * gossip/chain-reconcile dedup never fired on new-shape stores and the
+   * publisher's own broadcast echo re-promoted. Old-shape stores (and the
+   * replica full-move path, which still writes status into the partition)
+   * keep their original semantics via the first GRAPH clause; `labelMetaGraph`
+   * is only consulted as the UNION branch.
+   */
+  private async isAlreadyConfirmed(ual: string, metaGraph: string, labelMetaGraph?: string): Promise<boolean> {
     try {
-      const result = await this.store.query(
-        `ASK { GRAPH <${assertSafeIri(metaGraph)}> { <${assertSafeIri(ual)}> <http://dkg.io/ontology/status> "confirmed" } }`,
-      );
+      const safeUal = assertSafeIri(ual);
+      const partitionPattern = `GRAPH <${assertSafeIri(metaGraph)}> { <${safeUal}> <http://dkg.io/ontology/status> "confirmed" }`;
+      const ask = labelMetaGraph && labelMetaGraph !== metaGraph
+        ? `ASK { { ${partitionPattern} } UNION { GRAPH <${assertSafeIri(labelMetaGraph)}> { <${safeUal}> <http://dkg.io/ontology/status> "confirmed" } } }`
+        : `ASK { ${partitionPattern} }`;
+      const result = await this.store.query(ask);
       return result.type === 'boolean' && result.value === true;
     } catch {
       return false;
@@ -284,8 +380,18 @@ export class FinalizationHandler {
     if (safeRoots.length === 0) return [];
 
     const values = safeRoots.map(r => `<${r}>`).join(' ');
+    // #1098/#1099: replicas store gossiped SWM shares in the PER-KA graphs
+    // `…/_shared_memory/{author}/{number}` (workspace-handler.ts ~line 987),
+    // not the bare bucket. Reading only the bucket made every replica report
+    // "no shared memory data … peer missed SWM sharing" on finalization, so
+    // the published KA was never materialized into VM on subscribed peers
+    // (the VM-divergence half of #1098). Read-both: bucket + per-KA graphs.
+    // CONSTRUCT (not SELECT) so literal terms keep full datatype/lang
+    // fidelity for the merkle recompute, and so the same logical triple
+    // present in BOTH the bucket and a per-KA graph collapses to one
+    // (a constructed graph is a set).
     const sparql = `CONSTRUCT { ?s ?p ?o } WHERE {
-      GRAPH <${sharedMemoryGraph}> {
+      GRAPH ?g {
         VALUES ?root { ${values} }
         ?s ?p ?o .
         FILTER(
@@ -293,15 +399,105 @@ export class FinalizationHandler {
           || STRSTARTS(STR(?s), CONCAT(STR(?root), "/.well-known/genid/"))
         )
       }
+      ${sharedMemoryReadBothFilter(sharedMemoryGraph)}
     }`;
 
-    const result = await this.store.query(sparql);
+    const result = await this.store.query(sparql, { source: 'agent.finalization.sharedMemorySlice' });
     return result.type === 'quads' ? result.quads : [];
   }
 
   private verifyMerkleMatch(sharedMemoryQuads: Quad[], privateRoots: Uint8Array[], expectedMerkleRoot: Uint8Array): boolean {
     const computedRoot = computeFlatKCRoot(sharedMemoryQuads, privateRoots);
     return ethers.hexlify(computedRoot) === ethers.hexlify(expectedMerkleRoot);
+  }
+
+  private sharedMemoryQuadsMatchingMerkle(
+    contextGraphId: string,
+    sharedMemoryQuads: Quad[],
+    privateRoots: Uint8Array[],
+    expectedMerkleRoot: Uint8Array,
+    allowGeneratedCatalogFloor: boolean,
+  ): Quad[] | null {
+    if (this.verifyMerkleMatch(sharedMemoryQuads, privateRoots, expectedMerkleRoot)) {
+      return sharedMemoryQuads;
+    }
+
+    if (!allowGeneratedCatalogFloor) return null;
+
+    const withGeneratedCatalog = [
+      ...sharedMemoryQuads,
+      ...generatedPrivateCatalogFloorQuads(contextGraphId),
+    ];
+    if (this.verifyMerkleMatch(withGeneratedCatalog, privateRoots, expectedMerkleRoot)) {
+      return withGeneratedCatalog;
+    }
+
+    return null;
+  }
+
+  private async storedOnChainContextGraphId(contextGraphId: string): Promise<string | undefined> {
+    const ontologyGraph = contextGraphDataUri('ontology');
+    const contextGraphUri = contextGraphDataUri(contextGraphId);
+    const result = await this.store.query(
+      `SELECT ?id WHERE { GRAPH <${ontologyGraph}> { <${contextGraphUri}> <https://dkg.network/ontology#ContextGraphOnChainId> ?id } } LIMIT 1`,
+    );
+    if (result.type !== 'bindings' || result.bindings.length === 0) return undefined;
+    return stripOptionalLiteral(result.bindings[0]?.['id'])?.trim();
+  }
+
+  private async onChainContextGraphMatchesLocalId(
+    contextGraphId: string,
+    onChainCgId: string | bigint | undefined,
+  ): Promise<boolean> {
+    if (onChainCgId === undefined || onChainCgId === null) return false;
+    const normalizedOnChainId = String(onChainCgId).trim();
+    const normalizedContextGraphId = contextGraphId.trim();
+
+    if (/^\d+$/.test(normalizedContextGraphId) && normalizedContextGraphId === normalizedOnChainId) return true;
+
+    const liveNameHashMatches = async (): Promise<boolean> => {
+      if (typeof this.chain?.getContextGraphNameHash !== 'function') return false;
+      try {
+        const nameHash = await this.chain.getContextGraphNameHash(BigInt(normalizedOnChainId));
+        return typeof nameHash === 'string' &&
+          nameHash.toLowerCase() === ethers.keccak256(ethers.toUtf8Bytes(normalizedContextGraphId)).toLowerCase();
+      } catch {
+        return false;
+      }
+    };
+
+    let resolvedOnChainId: string | null | undefined;
+    try {
+      resolvedOnChainId = await this.resolveContextGraphOnChainId?.(contextGraphId);
+    } catch {
+      resolvedOnChainId = undefined;
+    }
+    if (sameBigIntLiteral(resolvedOnChainId, normalizedOnChainId)) {
+      return typeof this.chain?.getContextGraphNameHash === 'function'
+        ? liveNameHashMatches()
+        : true;
+    }
+
+    const storedOnChainId = await this.storedOnChainContextGraphId(contextGraphId);
+    if (sameBigIntLiteral(storedOnChainId, normalizedOnChainId)) {
+      return typeof this.chain?.getContextGraphNameHash === 'function'
+        ? liveNameHashMatches()
+        : true;
+    }
+
+    return liveNameHashMatches();
+  }
+
+  private async allowsGeneratedCatalogFloor(contextGraphId: string, onChainCgId: string | bigint | undefined): Promise<boolean> {
+    if (onChainCgId === undefined || onChainCgId === null) return false;
+    if (!this.chain || this.chain.chainId === 'none') return false;
+    if (typeof this.chain.getContextGraphAccessPolicy !== 'function') return false;
+    if (!await this.onChainContextGraphMatchesLocalId(contextGraphId, onChainCgId)) return false;
+    try {
+      return Number(await this.chain.getContextGraphAccessPolicy(BigInt(onChainCgId))) === 1;
+    } catch {
+      return false;
+    }
   }
 
   private async getPrivateRootsFromMeta(contextGraphId: string, rootEntities: string[], subGraphName?: string): Promise<Uint8Array[]> {
@@ -322,7 +518,7 @@ export class FinalizationHandler {
 
     const roots: Uint8Array[] = [];
     try {
-      const result = await this.store.query(sparql);
+      const result = await this.store.query(sparql, { source: 'agent.finalization.privateRoots' });
       if (result.type === 'bindings') {
         for (const row of result.bindings) {
           const hex = (row['root'] as string).replace(/^"(.*)".*$/, '$1').replace(/^0x/, '');
@@ -370,7 +566,7 @@ export class FinalizationHandler {
       }
     }`;
     try {
-      const result = await this.store.query(sparql);
+      const result = await this.store.query(sparql, { source: 'agent.finalization.keepRootCopySignal' });
       if (result.type !== 'bindings' || result.bindings.length === 0) return undefined;
       let sawFalse = false;
       for (const row of result.bindings) {
@@ -416,7 +612,7 @@ export class FinalizationHandler {
     } LIMIT 1`;
 
     try {
-      const result = await this.store.query(sparql);
+      const result = await this.store.query(sparql, { source: 'agent.finalization.publisherPeerId' });
       if (result.type === 'bindings' && result.bindings.length > 0) {
         const raw = result.bindings[0]['peerId'] as string;
         const peerId = raw.replace(/^"(.*)".*$/, '$1');
@@ -581,7 +777,9 @@ export class FinalizationHandler {
 
     // Idempotency — VM may already hold this (gossip beat the chain path, or a
     // prior sweep promoted it). Treat as success so the cursor can advance.
-    if (await this.isAlreadyConfirmed(ual, targetMetaGraph)) {
+    // Read-both (review F5): the minimal per-cgId partition shape carries no
+    // `dkg:status` row — the status lives in the label `_meta` graph.
+    if (await this.isAlreadyConfirmed(ual, targetMetaGraph, `did:dkg:context-graph:${contextGraphId}/_meta`)) {
       this.log.info(ctx, `Chain-reconcile: ${ual} already confirmed in VM, skipping`);
       return 'already-confirmed';
     }
@@ -601,7 +799,12 @@ export class FinalizationHandler {
     // KC root and comparing to the chain root. This is the same flat-KC root
     // the gossip path verifies against, so a match is an authoritative
     // merkle verification.
-    const snapshot = await this.findSwmSnapshotForMerkleRoot(contextGraphId, merkleRoot, subGraphName);
+    const snapshot = await this.findSwmSnapshotForMerkleRoot(
+      contextGraphId,
+      merkleRoot,
+      subGraphName,
+      onChainCgId,
+    );
     if (!snapshot) {
       this.log.info(ctx, `Chain-reconcile: no local SWM snapshot matches the published merkleRoot for ${ual}; deferring to sweep retry`);
       return 'no-swm';
@@ -701,10 +904,17 @@ export class FinalizationHandler {
     contextGraphId: string,
     merkleRoot: Uint8Array,
     subGraphName?: string,
+    onChainCgId?: string,
   ): Promise<{ rootEntities: string[]; sharedMemoryQuads: Quad[]; subGraphName?: string } | null> {
+    const allowGeneratedCatalogFloor = await this.allowsGeneratedCatalogFloor(contextGraphId, onChainCgId);
     // Caller knows the exact namespace → search only that one.
     if (subGraphName) {
-      const hit = await this.findSwmSnapshotInNamespace(contextGraphId, merkleRoot, subGraphName);
+      const hit = await this.findSwmSnapshotInNamespace(
+        contextGraphId,
+        merkleRoot,
+        subGraphName,
+        allowGeneratedCatalogFloor,
+      );
       return hit ? { ...hit, subGraphName } : null;
     }
 
@@ -714,7 +924,12 @@ export class FinalizationHandler {
     // forever because its SWM snapshot lives under a sub-graph meta graph,
     // not the root workspace meta. Return the namespace we matched in so the
     // caller promotes into the correct data graph.
-    const rootHit = await this.findSwmSnapshotInNamespace(contextGraphId, merkleRoot, undefined);
+    const rootHit = await this.findSwmSnapshotInNamespace(
+      contextGraphId,
+      merkleRoot,
+      undefined,
+      allowGeneratedCatalogFloor,
+    );
     if (rootHit) return { ...rootHit, subGraphName: undefined };
 
     let subGraphNames: string[] = [];
@@ -722,7 +937,12 @@ export class FinalizationHandler {
       subGraphNames = await new GraphManager(this.store).listSubGraphs(contextGraphId);
     } catch { /* no sub-graphs / store can't enumerate */ }
     for (const sg of subGraphNames) {
-      const hit = await this.findSwmSnapshotInNamespace(contextGraphId, merkleRoot, sg);
+      const hit = await this.findSwmSnapshotInNamespace(
+        contextGraphId,
+        merkleRoot,
+        sg,
+        allowGeneratedCatalogFloor,
+      );
       if (hit) return { ...hit, subGraphName: sg };
     }
     return null;
@@ -737,6 +957,7 @@ export class FinalizationHandler {
     contextGraphId: string,
     merkleRoot: Uint8Array,
     subGraphName?: string,
+    allowGeneratedCatalogFloor = false,
   ): Promise<{ rootEntities: string[]; sharedMemoryQuads: Quad[] } | null> {
     const graphManager = new GraphManager(this.store);
     const wsMetaGraph = subGraphName
@@ -766,12 +987,22 @@ export class FinalizationHandler {
 
     if (rootsByOp.size === 0) return null;
 
-    for (const roots of rootsByOp.values()) {
+    const opsSorted = [...rootsByOp.entries()].sort(
+      ([a], [b]) => (a < b ? -1 : a > b ? 1 : 0),
+    );
+    for (const [, roots] of opsSorted) {
       const sharedMemoryQuads = await this.getSharedMemoryQuadsForRoots(contextGraphId, roots, subGraphName);
       if (sharedMemoryQuads.length === 0) continue;
       const privateRoots = await this.getPrivateRootsFromMeta(contextGraphId, roots, subGraphName);
-      if (this.verifyMerkleMatch(sharedMemoryQuads, privateRoots, merkleRoot)) {
-        return { rootEntities: roots, sharedMemoryQuads };
+      const merkleMatchedQuads = this.sharedMemoryQuadsMatchingMerkle(
+        contextGraphId,
+        sharedMemoryQuads,
+        privateRoots,
+        merkleRoot,
+        allowGeneratedCatalogFloor,
+      );
+      if (merkleMatchedQuads) {
+        return { rootEntities: roots, sharedMemoryQuads: merkleMatchedQuads };
       }
     }
     return null;
@@ -928,12 +1159,14 @@ export class FinalizationHandler {
         } }`,
       );
       if (alreadyRegistered.type !== 'boolean' || !alreadyRegistered.value) {
-        await this.store.insert(generateSubGraphRegistration({
+        const regQuads = generateSubGraphRegistration({
           contextGraphId,
           subGraphName,
           createdBy: publisherAddress || 'finalization-discovery',
           timestamp: new Date(),
-        }));
+        });
+        await this.store.insert(regQuads);
+        this.markContextGraphMetaDirtyFromQuads?.(regQuads);
         this.log.info(ctx, `Finalization: auto-registered sub-graph "${subGraphName}" in context graph "${contextGraphId}"`);
       }
     }
@@ -1012,15 +1245,38 @@ export class FinalizationHandler {
     if (msgRootEntities.length > 0) {
       const msgSet = new Set(msgRootEntities);
       const extraInMsg = msgRootEntities.filter(r => !localRootSet.has(r));
-      const missingInMsg = [...localRootSet].filter(r => !msgSet.has(r));
+      let generatedCatalogRootSet = new Set<string>();
+      try {
+        generatedCatalogRootSet = new Set(
+          splitTrustedGeneratedCatalogRootMap(
+            partitioned,
+            generatedPrivateCatalogTripleKeys(contextGraphId),
+          ).generatedCatalogRootEntities,
+        );
+      } catch {
+        generatedCatalogRootSet = new Set<string>();
+      }
+      const missingInMsg = [...localRootSet].filter(
+        r => !msgSet.has(r) && !generatedCatalogRootSet.has(r),
+      );
       if (extraInMsg.length > 0 || missingInMsg.length > 0) {
         this.log.warn(ctx, `Finalization: root entity set mismatch — extra in msg: [${extraInMsg.join(', ')}], missing: [${missingInMsg.join(', ')}]`);
       }
     }
     const kaMetadata: KAMetadata[] = [];
 
-    for (let tokenIdx = 0; tokenIdx < rootEntities.length; tokenIdx++) {
-      const rootEntity = rootEntities[tokenIdx];
+    // GH #936 — assign per-root tokenIds over a CANONICAL (lexicographic) root
+    // order, NOT the SPARQL/gossip binding order. oxigraph binding order is
+    // store-history-dependent, so two replicas reconciling the same KC from
+    // chain would otherwise mint divergent root→tokenId maps. These tokenIds are
+    // local compatibility labels (the on-chain KA count is 1, no on-chain
+    // dependency — see dkg-publisher.ts), so a content-derived sort makes the
+    // map a pure function of the root SET: identical on every replica and on
+    // both the gossip and chain-reconcile promotion paths.
+    const orderedRoots = [...rootEntities].sort(compareRootIris);
+
+    for (let tokenIdx = 0; tokenIdx < orderedRoots.length; tokenIdx++) {
+      const rootEntity = orderedRoots[tokenIdx];
       const entityQuads = partitioned.get(rootEntity) ?? [];
       if (entityQuads.length === 0) continue;
       kaMetadata.push({
@@ -1035,22 +1291,12 @@ export class FinalizationHandler {
 
     const wsPeerId = await this.getPublisherPeerIdFromMeta(contextGraphId, msgRootEntities, subGraphName);
     // Round 5 review §10 — propagate the on-chain-attested author into the
-    // confirmed `_meta` block so replicas emit `dkg:Publication` /
-    // `dkg:authoredBy` triples matching the originator's. We treat
-    // `address(0)` (the unattributed-publish sentinel) as "no author" by
-    // skipping the field; the dkg:Publication block in
-    // `generateKCMetadata` only fires when both `authorAddress` and
-    // `publishOperationId` are present, so the legacy no-author behaviour
-    // is preserved verbatim.
-    //
-    // `publishOperationId`: replicas don't have access to the originator's
-    // session-scoped publish-operation-id (that's a publisher-internal
-    // identifier). Use the canonical, content-addressable `txHash` instead —
-    // every node observing the chain converges on the same publication URI
-    // (`urn:dkg:publication:<txHash>`), even when the originator's URI
-    // (`urn:dkg:publication:<sessionId>-<seq>`) is different. SPARQL
-    // queries that select on `dkg:authoredBy` work either way; cross-node
-    // URI fragmentation is the documented trade-off.
+    // confirmed `_meta` block so replicas emit a `prov:wasAttributedTo`
+    // matching the originator's. We treat `address(0)` (the
+    // unattributed-publish sentinel) as "no author" by skipping the field,
+    // so the legacy no-author behaviour is preserved verbatim. (The former
+    // `dkg:Publication` / `dkg:authoredBy` mirror was dropped — RFC
+    // ka-metadata-trim Phase 1, zero readers.)
     const isUnattributed = !authorAddress
       || authorAddress === '0x0000000000000000000000000000000000000000'
       || authorAddress.toLowerCase() === '0x0000000000000000000000000000000000000000';
@@ -1058,13 +1304,12 @@ export class FinalizationHandler {
       ual,
       contextGraphId,
       merkleRoot,
-      kaCount: kaMetadata.length > 0 ? 1 : 0,
       publisherPeerId: wsPeerId || publisherAddress,
       timestamp: new Date(),
       subGraphName,
       ...(isUnattributed
         ? {}
-        : { authorAddress, publishOperationId: txHash }),
+        : { authorAddress }),
     };
 
     let blockTimestamp = Math.floor(Date.now() / 1000);
@@ -1123,6 +1368,16 @@ export class FinalizationHandler {
     } catch { /* tentative status may not exist */ }
 
     let metaQuads = generateConfirmedFullMetadata(kcMeta, kaMetadata, provenance);
+
+    // GH #936 — append the SHARED deterministic per-root token rows (no-op for
+    // single-root). This is the SAME helper the publisher uses on the originator
+    // path, so a locally-published and a chain-reconciled multi-root KC expose
+    // an identical, queryable rootEntity→tokenId map. graph = the default
+    // `<cg>/_meta` so the ctxGraphId remap below routes them to the per-cgId
+    // `_meta` (and dual-writes a root copy when keepRootCopyOnLabel).
+    metaQuads.push(
+      ...buildDeterministicTokenRows(ual, kaMetadata, `did:dkg:context-graph:${contextGraphId}/_meta`),
+    );
     if (ctxGraphId) {
       const defaultMeta = `did:dkg:context-graph:${contextGraphId}/_meta`;
       const targetMeta = contextGraphMetaUri(contextGraphId, ctxGraphId);
@@ -1165,12 +1420,27 @@ export class FinalizationHandler {
     const swmMetaGraph = subGraphName
       ? graphManager.sharedMemoryMetaUri(contextGraphId, subGraphName)
       : contextGraphWorkspaceMetaGraphUri(contextGraphId);
+    // #1099: replicas hold the gossiped SWM copy in PER-KA graphs
+    // `…/_shared_memory/{author}/{number}` (workspace-handler.ts ~line 987),
+    // but this cleanup only drained the bare bucket. The stale per-KA copy
+    // survived every publish, kept being served to late subscribers via the
+    // PROTOCOL_SYNC SWM responder (which reads the whole `…/_shared_memory/`
+    // prefix), and re-poisoned even the publisher's own SWM on resync —
+    // publisher and replicas permanently disagreed about SWM content.
+    // Mirror DKGPublisher's `swmGraphsUnder`: drain the bucket AND every
+    // graph under its `/` prefix.
+    const allGraphs = await this.store.listGraphs();
+    const swmGraphsForClear = allGraphs.filter(
+      (g) => g === sharedMemoryGraph || g.startsWith(`${sharedMemoryGraph}/`),
+    );
     for (const rootEntity of rootEntities) {
-      await this.store.deleteByPattern({ graph: sharedMemoryGraph, subject: rootEntity });
-      await this.store.deleteBySubjectPrefix(sharedMemoryGraph, rootEntity + '/.well-known/genid/');
-      await this.store.deleteByPattern({
-        graph: sharedMemoryGraph, subject: rootEntity, predicate: 'http://dkg.io/ontology/workspaceOwner',
-      });
+      for (const g of swmGraphsForClear) {
+        await this.store.deleteByPattern({ graph: g, subject: rootEntity });
+        await this.store.deleteBySubjectPrefix(g, rootEntity + '/.well-known/genid/');
+        await this.store.deleteByPattern({
+          graph: g, subject: rootEntity, predicate: 'http://dkg.io/ontology/workspaceOwner',
+        });
+      }
       await this.store.deleteByPattern({
         graph: swmMetaGraph, subject: rootEntity, predicate: 'http://dkg.io/ontology/workspaceOwner',
       });
@@ -1205,7 +1475,7 @@ export class FinalizationHandler {
       contextGraphId,
       layers: ['swm', 'vm'],
       subGraphName,
-      operation: 'verified_memory_finalized',
+      operation: 'verifiable_memory_finalized',
       source: 'finalization',
       counts: {
         roots: rootEntities.length,

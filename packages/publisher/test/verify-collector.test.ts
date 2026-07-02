@@ -6,6 +6,12 @@ import {
 import { encodeVerifyApproval, decodeVerifyProposal } from '@origintrail-official/dkg-core';
 import { ethers } from 'ethers';
 
+function recorder<A extends unknown[], R>(impl: (...args: A) => R) {
+  const calls: A[] = [];
+  const fn = (...args: A): R => { calls.push(args); return impl(...args); };
+  return Object.assign(fn, { calls });
+}
+
 function makeApproval(proposalId: Uint8Array, wallet: ethers.Wallet, digest: Uint8Array) {
   const prefixedHash = ethers.hashMessage(digest);
   const sig = wallet.signingKey.sign(prefixedHash);
@@ -54,7 +60,7 @@ describe('VerifyCollector', () => {
     const result = await collector.collect({
       contextGraphId: 'test-cg',
       contextGraphIdOnChain: 42n,
-      verifiedMemoryId: 1n,
+      verifiableMemoryId: 1n,
       batchId: 100n,
       merkleRoot,
       entities: ['urn:entity:1'],
@@ -66,7 +72,7 @@ describe('VerifyCollector', () => {
     // requiredSignatures=2 means 1 remote needed (proposer already signed)
     expect(result.approvals).toHaveLength(1);
     expect(result.contextGraphId).toBe('test-cg');
-    expect(result.verifiedMemoryId).toBe(1n);
+    expect(result.verifiableMemoryId).toBe(1n);
     expect(result.requiredRemoteApprovals).toBe(1);
     expect(result.quorumReached).toBe(true);
   });
@@ -80,7 +86,7 @@ describe('VerifyCollector', () => {
     await expect(collector.collect({
       contextGraphId: 'test-cg',
       contextGraphIdOnChain: 42n,
-      verifiedMemoryId: 1n,
+      verifiableMemoryId: 1n,
       batchId: 100n,
       merkleRoot: new Uint8Array(32),
       entities: [],
@@ -99,7 +105,7 @@ describe('VerifyCollector', () => {
     await expect(collector.collect({
       contextGraphId: 'test-cg',
       contextGraphIdOnChain: 42n,
-      verifiedMemoryId: 1n,
+      verifiableMemoryId: 1n,
       batchId: 100n,
       merkleRoot: new Uint8Array(32),
       entities: [],
@@ -118,7 +124,7 @@ describe('VerifyCollector', () => {
     const result = await collector.collect({
       contextGraphId: 'test-cg',
       contextGraphIdOnChain: 42n,
-      verifiedMemoryId: 1n,
+      verifiableMemoryId: 1n,
       batchId: 100n,
       merkleRoot: new Uint8Array(32),
       entities: [],
@@ -134,7 +140,7 @@ describe('VerifyCollector', () => {
   });
 
   it('rejects oversized timeout values before sending proposals', async () => {
-    const sendP2P = vi.fn(async () => new Uint8Array(0));
+    const sendP2P = recorder(async () => new Uint8Array(0));
     const collector = new VerifyCollector({
       sendP2P,
       getParticipantPeers: () => ['peer-a'],
@@ -143,7 +149,7 @@ describe('VerifyCollector', () => {
     await expect(collector.collect({
       contextGraphId: 'test-cg',
       contextGraphIdOnChain: 42n,
-      verifiedMemoryId: 1n,
+      verifiableMemoryId: 1n,
       batchId: 100n,
       merkleRoot: new Uint8Array(32),
       entities: [],
@@ -152,7 +158,7 @@ describe('VerifyCollector', () => {
       timeoutMs: VERIFY_COLLECTION_TIMEOUT_MAX_MS + 1,
     })).rejects.toThrow(/verify_timeout_invalid/);
 
-    expect(sendP2P).not.toHaveBeenCalled();
+    expect(sendP2P.calls).toEqual([]);
   });
 
   it('clears the timeout timer after quorum resolves', async () => {
@@ -179,7 +185,7 @@ describe('VerifyCollector', () => {
     await collector.collect({
       contextGraphId: 'test-cg',
       contextGraphIdOnChain: 42n,
-      verifiedMemoryId: 1n,
+      verifiableMemoryId: 1n,
       batchId: 100n,
       merkleRoot,
       entities: [],
@@ -200,7 +206,7 @@ describe('VerifyCollector', () => {
     const baseCollectArgs = {
       contextGraphId: 'test-cg',
       contextGraphIdOnChain: 42n,
-      verifiedMemoryId: 1n,
+      verifiableMemoryId: 1n,
       batchId: 100n,
       merkleRoot: new Uint8Array(32),
       entities: [],
@@ -266,7 +272,7 @@ describe('VerifyCollector', () => {
     const baseCollectArgs = {
       contextGraphId: 'test-cg',
       contextGraphIdOnChain: 42n,
-      verifiedMemoryId: 1n,
+      verifiableMemoryId: 1n,
       batchId: 100n,
       merkleRoot: new Uint8Array(32),
       entities: [],
@@ -319,7 +325,7 @@ describe('VerifyCollector', () => {
   });
 
   // Codex PR #595 round-5: verify-proposal payloads include
-  // contextGraphId, verifiedMemoryId, batchId, and root entities — for
+  // contextGraphId, verifiableMemoryId, batchId, and root entities — for
   // curated CGs that's CG-visible metadata. The collector must accept
   // an async `getParticipantPeers` so the caller can await an
   // enumerator that returns only CG-member peers.
@@ -335,7 +341,7 @@ describe('VerifyCollector', () => {
     await expect(collector.collect({
       contextGraphId: 'cg-x',
       contextGraphIdOnChain: 42n,
-      verifiedMemoryId: 1n,
+      verifiableMemoryId: 1n,
       batchId: 100n,
       merkleRoot: new Uint8Array(32),
       entities: [],

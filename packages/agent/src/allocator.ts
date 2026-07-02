@@ -43,6 +43,112 @@ export interface KaAllocation {
   number: bigint;
 }
 
+/** Minimal chain surface the allocate helper needs (avoids a ChainAdapter import). */
+export interface KaAllocatorChain {
+  readonly chainId: string;
+  getMaxKaNumberForAuthor?: (author: string) => Promise<bigint>;
+}
+
+/**
+ * Transient chain/RPC failures (rate-limit, timeout, gateway, network blip) that
+ * a bounded retry can ride out — as opposed to a deterministic error (bad
+ * address, revert) where retrying is pointless. Public free RPCs in particular
+ * answer the node's poll load with 429 "over rate limit" / 408 / 503, and the
+ * one-time-per-author KA-number-floor reconcile read MUST NOT turn one of those
+ * into a hard publish-prep 500.
+ */
+const TRANSIENT_CHAIN_ERROR_RE =
+  /\b(408|425|429|500|502|503|504)\b|too many requests|over rate limit|rate.?limit|timeout|timed out|temporarily|service unavailable|bad gateway|gateway time-?out|network|fetch failed|socket hang|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|SERVER_ERROR|failed to detect network/i;
+
+export function isTransientChainError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return TRANSIENT_CHAIN_ERROR_RE.test(msg);
+}
+
+/**
+ * Thrown when the KA-number-floor reconcile can't reach the chain. Carries a
+ * stable `code` + `retryable` flag so the daemon HTTP layer maps it to a 503
+ * (retry) instead of a blanket 500. Keeps the legacy
+ * "failed to reconcile KA-number floor" message substring so existing matchers
+ * (dkg-agent.ts) keep working.
+ */
+export class KaFloorReconcileError extends Error {
+  readonly code = 'KA_FLOOR_RECONCILE_UNAVAILABLE';
+  readonly retryable: boolean;
+  constructor(author: string, cause: unknown) {
+    super(
+      `OT-RFC-43 A2: failed to reconcile KA-number floor for author ${author}: ` +
+        (cause instanceof Error ? cause.message : String(cause)),
+    );
+    this.name = 'KaFloorReconcileError';
+    this.retryable = isTransientChainError(cause);
+  }
+}
+
+/** Backoff schedule for the reconcile chain-read retry (ms). */
+const RECONCILE_RETRY_DELAYS_MS = [250, 750, 2000];
+
+/**
+ * Read the on-chain max KA-number for an author, retrying transient RPC errors
+ * (the read is idempotent). Deterministic errors throw immediately. Exposed for
+ * unit testing.
+ */
+export async function readMaxKaNumberWithRetry(
+  read: (author: string) => Promise<bigint>,
+  author: string,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+): Promise<bigint> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await read(author);
+    } catch (err) {
+      if (attempt >= RECONCILE_RETRY_DELAYS_MS.length || !isTransientChainError(err)) {
+        throw err;
+      }
+      await sleep(RECONCILE_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+}
+
+/**
+ * Reconcile the per-author KA-number floor against the chain (ONCE per author,
+ * cached in `reconciled`) then allocate the next number and derive its reserved
+ * UAL `did:dkg:{chainId}/{author}/{number}`.
+ *
+ * Shared by create (OT-RFC-46 D1 — identity-at-create) and finalize. Moving the
+ * call to create means the first KA per author pays the chain reconcile at create
+ * instead of finalize; every later create is a local counter bump.
+ */
+export async function reconcileAndAllocateKaNumber(
+  allocator: KaNumberAllocator,
+  chain: KaAllocatorChain,
+  reconciled: Set<string>,
+  author: string,
+  /** Injectable backoff sleep (tests pass a no-op); defaults to real setTimeout. */
+  sleep?: (ms: number) => Promise<void>,
+): Promise<{ number: bigint; reservedUal: string }> {
+  const key = author.toLowerCase();
+  if (!reconciled.has(key)) {
+    let chainMax = -1n;
+    if (typeof chain.getMaxKaNumberForAuthor === 'function') {
+      const read = chain.getMaxKaNumberForAuthor.bind(chain);
+      try {
+        // Retry transient RPC failures (429/timeout/5xx) before giving up — a
+        // rate-limited public RPC must not hard-fail a publish at the
+        // one-time-per-author floor reconcile (GH issue: KA create 500 on 429).
+        chainMax = await readMaxKaNumberWithRetry(read, author, sleep);
+      } catch (err) {
+        throw new KaFloorReconcileError(author, err);
+      }
+    }
+    if (chainMax >= 0n) allocator.reconcile(author, chainMax);
+    allocator.markReconciled();
+    reconciled.add(key);
+  }
+  const { number } = allocator.allocate(author);
+  return { number, reservedUal: `did:dkg:${chain.chainId}/${key}/${number}` };
+}
+
 export class KaNumberAllocator {
   private readonly store: KaNumberStore;
   /**

@@ -389,9 +389,9 @@ describe('V10 GET Protocol (spec §12)', () => {
     expect(swmQuads.every(q => q.graph === swmGraph)).toBe(true);
   });
 
-  it('view=verified-memory resolves to VM graph prefix', () => {
-    const vmGraph = `did:dkg:context-graph:${contextGraphId}/_verified_memory/`;
-    expect(vmGraph).toBe('did:dkg:context-graph:42/_verified_memory/');
+  it('view=verifiable-memory resolves to VM graph prefix', () => {
+    const vmGraph = `did:dkg:context-graph:${contextGraphId}/_verifiable_memory/`;
+    expect(vmGraph).toBe('did:dkg:context-graph:42/_verifiable_memory/');
     expect(vmGraph).not.toContain('_shared_memory');
   });
 });
@@ -1094,7 +1094,7 @@ describe('V10 Finalization (spec §9.0 Phase 6)', () => {
       publisherPeerId: 'QmPublisher12345',
       publicByteSize: 2048,
       isPrivate: true,
-      kaCount: 3,
+      kaCount: 1,
       rootEntities,
       stagingQuads: stagingBytes,
       merkleLeafCount: multiEntityLeafCount,
@@ -1109,7 +1109,7 @@ describe('V10 Finalization (spec §9.0 Phase 6)', () => {
     expect(decoded.publisherPeerId).toBe('QmPublisher12345');
     expect(Number(decoded.publicByteSize)).toBe(2048);
     expect(decoded.isPrivate).toBe(true);
-    expect(decoded.kaCount).toBe(3);
+    expect(decoded.kaCount).toBe(1);
     expect(decoded.rootEntities).toEqual(rootEntities);
 
     const decodedRoot = decoded.merkleRoot instanceof Uint8Array

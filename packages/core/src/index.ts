@@ -1,11 +1,19 @@
 export * from './types.js';
 export * from './constants.js';
+export * from './catalog.js';
 export { parseDotenvValue } from './dotenv.js';
 export * from './memory-model.js';
 export * from './trust.js';
 export * from './publisher-extension.js';
+export * from './imported-artifact-bytes.js';
+export * from './imported-artifact-metadata.js';
 export * from './event-bus.js';
-export { Logger, createOperationContext, type OperationContext, type OperationName, type LogSink } from './logger.js';
+export { Logger, createOperationContext, type OperationContext, type OperationName, type LogSink, type LogRecord } from './logger.js';
+export { createLogRedactor, redactLogEntry, redactMessage, DEFAULT_SENSITIVE_KEYS, REDACTED } from './log-redaction.js';
+export {
+  getTracer, withSpan, linkedSpan, currentTraceIds, activeSpanContext,
+  getMetrics, rebuildMetrics, type WithSpanOpts, type DkgMetrics,
+} from './telemetry-api.js';
 export * from './crypto/index.js';
 export * from './proto/index.js';
 export {
@@ -75,6 +83,7 @@ export {
 } from './network/index.js';
 export {
   ProtocolRouter,
+  QuietRetryableHandlerError,
   type ProtocolRouterOptions,
   type SendOptions,
   DEFAULT_MAX_READ_BYTES,
@@ -110,6 +119,7 @@ export {
   computeNetworkId,
   getGenesisRaw,
   SYSTEM_CONTEXT_GRAPHS,
+  isAgentRegistryContextGraph,
   DKG_ONTOLOGY,
   type GenesisQuad,
 } from './genesis.js';
@@ -172,10 +182,18 @@ export {
 } from './faucet-orchestration.js';
 export {
   ensureDkgNodeConfig,
+  readPersistedNetworkConfigName,
   type DkgNodeConfigOverrides,
   type DkgNodeNetworkConfig,
   type EnsureDkgNodeConfigOptions,
 } from './ensure-dkg-node-config.js';
+export {
+  DEFAULT_SETUP_NETWORK,
+  LEGACY_FALLBACK_NETWORK,
+  SELECTABLE_SETUP_NETWORKS,
+  resolveSetupNetworkName,
+  type ResolveSetupNetworkNameOptions,
+} from './setup-network.js';
 export { resolveCliPackageDir } from './resolve-cli-package-dir.js';
 export { resolveDkgCli, type ResolvedDkgCli } from './resolve-dkg-cli.js';
 export { startDaemon } from './daemon-lifecycle.js';
@@ -189,12 +207,29 @@ export {
   assertSafeRdfTerm,
 } from './sparql-safe.js';
 export {
+  JAVA_WRITE_UTF_MAX_BYTES,
+  DKG_RDF_LITERAL_SAFE_MUTF8_BYTES,
+  OVERSIZED_RDF_LITERAL_ERROR_CODE,
+  OversizedRdfLiteralError,
+  javaModifiedUtf8ByteLength,
+  rdfLiteralTermMutf8ByteLength,
+  isOversizedRdfLiteralError,
+  assertRdfLiteralMutf8Safe,
+  assertQuadLiteralsMutf8Safe,
+  type RdfLiteralSizeContext,
+  type QuadLiteralLike,
+} from './rdf-literal-size.js';
+export {
   DKGError,
   DKGUserError,
   DKGInternalError,
   PayloadTooLargeError,
+  SwmGossipPayloadTooLargeError,
   toErrorMessage,
   hasErrorCode,
+  NO_FUNDED_PUBLISHER_WALLET_CODE,
+  NO_FUNDED_PUBLISHER_WALLET_MESSAGE_PREFIX,
+  messageIndicatesNoFundedPublisherWallet,
 } from './errors.js';
 export {
   dkgHomeDir,

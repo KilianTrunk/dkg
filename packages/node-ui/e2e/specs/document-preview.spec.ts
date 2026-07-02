@@ -1,10 +1,14 @@
 import { test, expect } from '../fixtures/rich.js';
-import { PRIMARY_CG } from '../helpers/real-node.js';
+// Use the SECONDARY (isolation) CG: the global-setup seeds PRIMARY_CG and the
+// import specs upload documents into it on the shared devnet, so PRIMARY_CG's
+// Documents tab is no longer empty. SECONDARY_CG is registered but never seeded
+// or imported into, so the "no documents" empty state is deterministic.
+import { SECONDARY_CG } from '../helpers/real-node.js';
 
 test.describe('Document preview', () => {
   test.beforeEach(async ({ shell, leftPanel, page }) => {
     await shell.goto();
-    await leftPanel.expandProject(PRIMARY_CG);
+    await leftPanel.expandProject(SECONDARY_CG);
     await page.locator('[data-layer="wm"]').click();
     await page.locator('.v10-layer-expand-tab').filter({ hasText: 'Documents' }).click();
   });

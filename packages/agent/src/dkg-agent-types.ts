@@ -38,6 +38,7 @@ import type { ApprovalPolicy, ChainAdapter } from '@origintrail-official/dkg-cha
 import type { QueryAccessConfig } from '@origintrail-official/dkg-query';
 import type { SkillHandler } from './messaging.js';
 import type { CclFactResolutionMode } from './ccl-fact-resolution.js';
+import type { SyncCheckpointStore } from './sync/checkpoint/state.js';
 import type { JsonLdContent } from './dkg-agent-utils.js';
 import type { SwmHostModeStoreLimits } from './swm/host-mode-store.js';
 import type { KaNumberAllocator } from './allocator.js';
@@ -50,9 +51,9 @@ import type { SyncPhase } from './sync/auth/request-build.js';
  * self-sovereign agents whose private key isn't held by the daemon.
  * Compact ECDSA `(r, vs)` over the EIP-712 typed data
  * `buildAuthorAttestationTypedData({ chainId, kav10Address,
- * contextGraphId, merkleRoot, authorAddress: address })`. The agent
- * verifies the recovered signer matches `address` before stamping the
- * seal.
+ * merkleRoot, authorAddress: address, reservedKaId })` (#1116: the
+ * attestation no longer binds `contextGraphId`). The agent verifies the
+ * recovered signer matches `address` before stamping the seal.
  *
  * Lives at the agent layer (rather than as a publisher
  * `PublishOptions` field) since RFC-001 §9.x — Phase C — the
@@ -61,6 +62,13 @@ import type { SyncPhase } from './sync/auth/request-build.js';
  */
 export type PreSignedAuthorAttestation = {
   address: string;
+  /**
+   * OT-RFC-43 §F2 — the packed reservedKaId the self-sovereign author signed the
+   * AuthorAttestation over `(uint160(address)<<96)|uint96(number)`. Required: the
+   * digest now binds it, so the daemon must honour the author's reserved slot
+   * rather than re-allocating, or the recovered signer won't match.
+   */
+  reservedKaId: bigint;
   signature: { r: Uint8Array; vs: Uint8Array };
 };
 
@@ -137,10 +145,13 @@ export interface SyncRequestEnvelope {
   includeSharedMemory: boolean;
   phase?: SyncPhase;
   snapshotRef?: string;
+  authPurpose?: string;
+  authSelector?: string;
   targetPeerId?: string;
   requesterPeerId?: string;
   requestId?: string;
   issuedAtMs?: number;
+  syncSessionId?: string;
   requesterIdentityId?: string;
   requesterAgentAddress?: string;
   requesterSignatureR?: string;
@@ -152,6 +163,27 @@ export interface SyncRequestEnvelope {
    * like `phase`/`snapshotRef`), so it's additive and backward-compatible.
    */
   sinceBatchId?: string;
+  /**
+   * R9 (SECURITY) — UNSIGNED member-recovery marker. When set, the responder
+   * authorizes via the strict members-only `isMemberRecoveryAuthorized`
+   * hard-deny gate (a FRESH `_meta` agent-gate read) and MUST NOT fall through
+   * to the weaker participant/peer fallback. Unsigned because it only ever
+   * ESCALATES strictness (an attacker setting it faces the harder gate;
+   * stripping it reverts to the normal path the member already passes), and the
+   * responder decides on the cryptographically RECOVERED signer — never on this
+   * flag or the (forgeable) `requesterAgentAddress` claim. Kept in lockstep with
+   * the duplicate `SyncRequestEnvelope` in `sync/auth/request-build.ts`.
+   */
+  recovery?: boolean;
+}
+
+export type AssertionArtifactKind = 'source' | 'markdown' | 'original';
+
+export interface ImportedArtifactByteStore {
+  stat(hash: string): Promise<{ size: number } | null>;
+  readRange(hash: string, offset: number, length: number): Promise<Uint8Array | Buffer | null>;
+  has?(hash: string): Promise<boolean>;
+  get?(hash: string): Promise<Uint8Array | Buffer | null>;
 }
 
 // ── Public error classes ────────────────────────────────────────────
@@ -270,6 +302,10 @@ export interface PublishOpts {
   subGraphName?: string;
   /** Optional on-chain publish lifetime override in epochs. */
   publishEpochs?: number;
+  /** Optional known numeric on-chain context graph id for direct publish callers. */
+  onChainContextGraphId?: string;
+  /** RFC-001 §4 per-publish attribution override; `0n` = mode d. */
+  publisherNodeIdentityIdOverride?: bigint;
 }
 
 export interface PublishAsyncOpts extends PublishOpts {
@@ -281,8 +317,6 @@ export interface PublishAsyncOpts extends PublishOpts {
   priorVersion?: string;
   /** V10 selective-disclosure: per-entity kaRoot instead of flat-hash KC. */
   entityProofs?: boolean;
-  /** RFC-001 §4 per-publish attribution override; `0n` = mode d. */
-  publisherNodeIdentityIdOverride?: bigint;
   localOnly?: boolean;
   /** Registered local agent whose key signs the seal. Mirrors sync `assertionFinalize`. */
   authorAgentAddress?: string;
@@ -292,6 +326,13 @@ export interface PublishAsyncOpts extends PublishOpts {
     authorAddress: string;
     signature: { r: Uint8Array; vs: Uint8Array };
     schemeVersion: number;
+    /**
+     * OT-RFC-43 §F2 — the packed reservedKaId `(uint160(author) << 96) | number`
+     * the caller signed into the AuthorAttestation digest. Bound into the async
+     * lift seal so the deferred-broadcast mint reuses the exact attested id (the
+     * digest commits to it, so it cannot be re-derived server-side).
+     */
+    reservedKaId: bigint;
   };
   /** Caller signs typed-data built by the daemon. Requires `authorAgentAddress`. */
   authorSignTypedData?: (typedData: AuthorAttestationTypedData) => Promise<{ r: Uint8Array; vs: Uint8Array }>;
@@ -634,8 +675,38 @@ export interface ContextGraphSubscriptionRecord {
 
 export interface ContextGraphSubscriptionStore {
   loadAll(): Promise<ContextGraphSubscriptionRecord[]>;
+  load?(contextGraphId: string): Promise<ContextGraphSubscriptionRecord | null>;
   save(record: ContextGraphSubscriptionRecord): Promise<void>;
   delete(contextGraphId: string): Promise<void>;
+}
+
+export interface ContextGraphSubscriptionRehydrationStatus {
+  /** Non-system persisted rows governed by the rehydration cap. */
+  persistedTotal: number;
+  /** Persisted system rows seen during rehydration; excluded from cap math. */
+  systemExcluded: number;
+  hostedActivated: number;
+  hostedActivatedIds: string[];
+  activated: number;
+  dormant: number;
+  activationCap: number;
+  capDisabled: boolean;
+  dormantIds: string[];
+  /** Startup rehydration completion timestamp; remains stable after boot. */
+  completedAt: number;
+  /** Most recent timestamp for post-boot diagnostic count/id updates. */
+  updatedAt: number;
+}
+
+export interface ContextGraphWritePreflightProbe {
+  exists: boolean;
+  hasLocalContent: boolean;
+  inMemorySubscription?: Pick<ContextGraphSub, 'subscribed' | 'synced'>;
+  persistedSubscription?: Pick<ContextGraphSubscriptionRecord, 'subscribed' | 'synced'>;
+  declarationFound: boolean;
+  accessPolicy?: 'public' | 'private';
+  curator?: string;
+  callerAuthorized?: boolean;
 }
 
 export type ContextGraphMemberPrincipalType = 'node' | 'agent' | 'identity';
@@ -666,11 +737,16 @@ export interface DurableSyncDiagnostics {
   insertedDataTriples: number;
   bytesReceived: number;
   resumedPhases: number;
+  timedOutPhases: number;
+  completedPhases: number;
+  checkpointAdvances: number;
   emptyResponses: number;
   metaOnlyResponses: number;
   dataRejectedMissingMeta: number;
   rejectedKcs: number;
   failedPeers: number;
+  failedPhases: number;
+  backoffWorthyFailures?: number;
 }
 
 export interface SharedMemorySyncDiagnostics {
@@ -680,9 +756,14 @@ export interface SharedMemorySyncDiagnostics {
   insertedDataTriples: number;
   bytesReceived: number;
   resumedPhases: number;
+  timedOutPhases: number;
+  completedPhases: number;
+  checkpointAdvances: number;
   emptyResponses: number;
   droppedDataTriples: number;
   failedPeers: number;
+  failedPhases: number;
+  backoffWorthyFailures?: number;
 }
 
 export interface CatchupSyncDiagnostics {
@@ -745,6 +826,32 @@ export type ReplicationEventSink = (event: ReplicationEvent) => void;
 
 export interface DKGAgentConfig {
   name: string;
+  /** Selected genesis document. Defaults to the compatibility Base testnet genesis. */
+  genesisId?: string;
+  /**
+   * public-projection enable flag. When set, a private CG's confirmed VM
+   * publishes emit/refresh a verifiable public projection (the floor: existence,
+   * UAL, access class, committed root) into the SOURCE CG's OWN `_catalog` graph
+   * (`<source-cg>/_catalog`) — the exact named graph open-serve reads — binding
+   * the private CG into the public discovery surface without disclosing its
+   * contents. NB despite the name the projection is NOT written into the named
+   * target CG: the configured value acts only as (a) an on/off switch and (b) a
+   * self-projection guard (a publish whose own CG id equals this value is
+   * skipped). See `emitPublicProjectionAfterPublish` (B7/B8). Unset → off.
+   */
+  publicProjectionContextGraphId?: string;
+  /**
+   * STRICT curator-ack gate (OT-RFC-49 curator-leader), default OFF. When true,
+   * a non-`localOnly` write to a PRIVATE context graph must be applied+ack'd by
+   * the CG's curator (the authoritative replica) BEFORE it is committed locally;
+   * if the curator does not confirm, the write is rejected (`CuratorUnconfirmedError`
+   * → HTTP 503) and nothing is persisted — closing the silent same-root-update
+   * loss that otherwise hides until the next reconnect REPLACE. Public CGs,
+   * `localOnly` writes, and a node that IS the curator are unaffected. Phase-1
+   * default-off lets the gate soak before it becomes the default. Per-call
+   * `share({ awaitCuratorAck })` overrides this.
+   */
+  swmAwaitCuratorAck?: boolean;
   framework?: string;
   description?: string;
   listenPort?: number;
@@ -769,8 +876,16 @@ export interface DKGAgentConfig {
   largeLiteralStorage?: LargeLiteralStorageConfig;
   /** Out-of-Oxigraph immutable public SWM operation snapshots. Defaults on when dataDir is set. */
   sharedMemoryPublicSnapshotStorage?: SharedMemoryPublicSnapshotStorageConfig;
+  importedArtifactByteStore?: ImportedArtifactByteStore;
   /** When false, peer-connect sync skips SWM catch-up and relies on gossip for new SWM writes. */
   syncSharedMemoryOnConnect?: boolean;
+  /**
+   * When false, durable sync skips the large system `agents/_meta` graph while
+   * still syncing `agents` data as the phonebook. Defaults to true for
+   * compatibility; only honored for edge nodes that do not need full KA/KC
+   * lifecycle metadata for the system agents graph. Core nodes always sync it.
+   */
+  syncAgentsMeta?: boolean;
   /** Node deployment tier: 'core' (cloud, relay) or 'edge' (personal, behind NAT). Default: 'edge'. */
   nodeRole?: 'core' | 'edge';
   /**
@@ -780,6 +895,14 @@ export interface DKGAgentConfig {
    * the shared dashboard DB; omit for in-process tests / pre-Option-1 flows.
    */
   kaNumberAllocator?: KaNumberAllocator;
+  /**
+   * RFC ka-metadata-trim Phase 3 (P3.3) — daemon `metadata.provenanceEvents`
+   * config, forwarded into `DKGPublisherConfig.provenanceEvents`. Default
+   * `true`. When `false` ("lite mode"), the assertion-lifecycle writers skip
+   * the per-transition PROV event nodes (NOT the seal/state rows); the
+   * history API returns `events: []` gracefully.
+   */
+  metadataProvenanceEvents?: boolean;
   /**
    * Core Node relay-server capacity tuning. Forwarded straight into
    * `DKGNodeConfig.relayServerCapacity` — sets the maximum number of
@@ -834,7 +957,7 @@ export interface DKGAgentConfig {
    * Cadence at which the daemon re-publishes its own agent profile
    * (PR feat/chain-agents-cg-phonebook). Forwarded straight from
    * `DkgConfig.network.agentProfileHeartbeatMs`. Defaults to
-   * `AGENT_PROFILE_HEARTBEAT_MS` (5 min) when omitted; `0` disables
+   * `AGENT_PROFILE_HEARTBEAT_MS` (20 min) when omitted; `0` disables
    * the timer (the one-shot startup publish still fires).
    */
   agentProfileHeartbeatMs?: number;
@@ -901,6 +1024,8 @@ export interface DKGAgentConfig {
      * (`'per-publish'`, bounded-per-publish with on-chain 1n floor).
      */
     approvalPolicy?: ApprovalPolicy;
+    /** Optional ContextGraphNameRegistry `eth_getLogs` block-window tuning. */
+    cgRegistryScanPageSize?: number;
   };
   /** Cross-agent query access configuration. */
   queryAccess?: QueryAccessConfig;
@@ -919,6 +1044,8 @@ export interface DKGAgentConfig {
    *  - `registered`: TTL/byte-cap for on-chain registered CGs (typically larger).
    *  - `pruneIntervalMs`: how often the TTL/cap sweep runs.
    *  - `reconcileIntervalMs`: how often the host-mode subscription reconciler ensures cores are subscribed to all known curated CGs.
+   *  - `reconcileBatchSize`: max known CGs reconciled per tick. Default 32.
+   *  - `reconcileJitterRatio`: startup interval jitter ratio in [0, 1]. Default 0.15.
    */
   swmHostMode?: {
     enabled?: boolean;
@@ -926,6 +1053,8 @@ export interface DKGAgentConfig {
     registered?: SwmHostModeStoreLimits;
     pruneIntervalMs?: number;
     reconcileIntervalMs?: number;
+    reconcileBatchSize?: number;
+    reconcileJitterRatio?: number;
     /**
      * OT-RFC-38 / LU-6 Phase B — discovery-beacon rate limits for
      * pre-registration (freemium-tier) ciphertext writes. All three
@@ -940,9 +1069,46 @@ export interface DKGAgentConfig {
       perCuratorBytesPerHour?: number;
       coreAggregateBytes?: number;
     };
+    /**
+     * OT-RFC-49 WS-A — the irreversible private-ciphertext strip. When `true`
+     * (DEFAULT — `undefined` is treated as on), a core declines ALL
+     * private-ciphertext host-mode custody for CURATED context graphs:
+     * "hosting follows access". Concretely, for a curated CG the core
+     *
+     *   - DECLINES the auto-host subscribe (reconcile/beacon/chain-event +
+     *     the restart-restore path), starving both the `.meta` ingest and
+     *     the LU-11 chunk ingest at the single subscribe choke point;
+     *   - REFUSES the operator override (`enableSwmHostModeFor`) — unlike the
+     *     narrower rung-1 `stripNonParticipants`, WS-A CLOSES the operator
+     *     hatch, so there is no manual path back into private custody;
+     *   - RETIRES the private serve responders (`handleSwmHostCatchup`,
+     *     `handleGetCiphertextChunk`) so a stripped core serves nothing
+     *     private back over the wire.
+     *
+     * Random sampling now proves the PUBLIC `_catalog` subgraph, so cores no
+     * longer need the ciphertext; private data lives member-side and members
+     * backfill from the curator (REPLACE-recovery), not from cores. PUBLIC CGs
+     * are NEVER affected — the gate sits after the curated check on every path.
+     * Set `false` to restore legacy host-mode custody (the rolling-upgrade
+     * kill-switch / A/B baseline; backcompat is waived for V10 testnet).
+     */
+    stripCiphertext?: boolean;
   };
   /** Durable local store for subscribed context-graph runtime state. */
   contextGraphSubscriptionStore?: ContextGraphSubscriptionStore;
+  /** Durable local store for paged sync checkpoints. Defaults to in-memory. */
+  syncCheckpointStore?: SyncCheckpointStore;
+  /**
+   * Intentional cap on how many persisted context-graph subscriptions are
+   * *activated* (gossip-subscribed + sync-tracked) when rehydrating at startup.
+   * A large backlog of stale subscriptions otherwise fans out store-touching
+   * gossip/sync work that starves authenticated store-backed routes (issue
+   * #997). Rows beyond the cap stay persisted but inactive, are reported via
+   * subscription diagnostics, and can be pruned via
+   * `DELETE /api/context-graph/subscriptions`. Default
+   * `DEFAULT_MAX_REHYDRATED_SUBSCRIPTIONS`. `0` disables the cap.
+   */
+  maxRehydratedContextGraphSubscriptions?: number;
   /** Durable local cache for nodes/agents known to be members of a context graph. */
   contextGraphMembershipStore?: ContextGraphMembershipStore;
   /**

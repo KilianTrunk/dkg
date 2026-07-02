@@ -5,7 +5,7 @@ description: >
   memory in DKG Working Memory assertions — verifiable, sharable, and
   queryable via SPARQL. Connects to a running DKG V10 node via HTTP.
   Agent knowledge can be promoted to Shared Working Memory (team-visible)
-  or published to Verified Memory (chain-anchored, costs TRAC).
+  or published to Verifiable Memory (chain-anchored, costs TRAC).
 pip_dependencies: []
 hooks:
   - on_session_end

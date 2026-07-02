@@ -53,6 +53,16 @@
         "internalType": "bool",
         "name": "fullySwept",
         "type": "bool"
+      },
+      {
+        "internalType": "uint72",
+        "name": "primaryNode",
+        "type": "uint72"
+      },
+      {
+        "internalType": "uint40",
+        "name": "lastPrimaryNodeChangeEpoch",
+        "type": "uint40"
       }
     ],
     "stateMutability": "view",
@@ -91,12 +101,12 @@
       },
       {
         "internalType": "uint40",
-        "name": "kcStartEpoch",
+        "name": "kaStartEpoch",
         "type": "uint40"
       },
       {
         "internalType": "uint40",
-        "name": "kcEpochs",
+        "name": "kaEpochs",
         "type": "uint40"
       }
     ],

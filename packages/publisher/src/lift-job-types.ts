@@ -24,17 +24,49 @@ export interface LiftRequestAuthorSeal {
   readonly authorAddress: LiftJobHex;
   readonly signature: { readonly r: LiftJobHex; readonly vs: LiftJobHex };
   readonly schemeVersion: number;
+  /**
+   * OT-RFC-43 §F2 — the packed reservedKaId `(uint160(author) << 96) | number`
+   * the author signed into the AuthorAttestation digest at enqueue. The on-chain
+   * mint MUST `_safeMint` exactly this id (the publisher threads it through
+   * `precomputedAttestation.reservedKaId` → `ensureReservedKaId`, which reuses it
+   * verbatim rather than re-allocating). Stringified bigint so it survives the
+   * lift queue's JSON persistence and the full 256-bit packed value (never a JS
+   * `number`). Optional for backward-compat with seals persisted before §F2
+   * async binding landed; a missing value is read back as `0n` (the legacy
+   * sealless/0n behaviour — the on-chain mint then rejects it, which is exactly
+   * why those seals were never minted).
+   */
+  readonly reservedKaId?: LiftJobBigInt;
 }
 
-export interface LiftRequest {
-  readonly swmId: string;
+export interface KnowledgeAssetVmPublishRequest {
+  readonly contextGraphId: string;
+  readonly name: string;
+  readonly agentAddress?: string;
+  readonly subGraphName?: string;
+  readonly shareOperationId: string;
+  readonly roots: readonly string[];
+  /** Author seal captured with the queued SWM share snapshot. */
+  readonly seal: LiftRequestAuthorSeal;
+  readonly sealChainId: LiftJobBigInt;
+  readonly sealKav10Address: LiftJobHex;
+  readonly sealFinalizedAtIso: string;
+  readonly sealMerkleRoot: LiftJobHex;
+  readonly intentKey: string;
+  readonly wmCurrentAssertion?: string;
+  readonly swmCurrentAssertion?: string;
+  readonly vmCurrentAssertion?: string;
+  readonly kaNumber?: string;
+  readonly reservedUal?: string;
+  readonly publishEpochs?: number;
+  readonly clearSharedMemoryAfter?: boolean;
+  readonly publisherNodeIdentityIdOverride?: LiftJobBigInt;
+}
+
+export interface LiftPublishSnapshotRequest {
   readonly shareOperationId: string;
   readonly roots: readonly string[];
   readonly contextGraphId: string;
-  readonly namespace: string;
-  readonly scope: string;
-  readonly transitionType: LiftTransitionType;
-  readonly authority: LiftAuthorityProof;
   readonly priorVersion?: string;
   readonly subGraphName?: string;
   readonly accessPolicy?: LiftAccessPolicy;
@@ -49,23 +81,39 @@ export interface LiftRequest {
   readonly seal?: LiftRequestAuthorSeal;
 }
 
+export interface LiftPublishRequestMetadata {
+  readonly scope: string;
+  readonly transitionType: LiftTransitionType;
+  readonly authority: LiftAuthorityProof;
+}
+
+export interface LiftRequestBase extends LiftPublishSnapshotRequest, LiftPublishRequestMetadata {
+  readonly swmId: string;
+  readonly namespace: string;
+}
+
+export interface RawLiftRequest extends LiftRequestBase {
+  readonly jobType?: 'lift';
+}
+
+export type LiftRequest = RawLiftRequest;
+
+export interface RawLiftJobRequest {
+  readonly jobType: 'lift';
+  readonly lift: RawLiftRequest;
+}
+
+export interface KnowledgeAssetVmPublishJobRequest {
+  readonly jobType: 'knowledge-asset-vm-publish';
+  readonly knowledgeAssetVmPublish: KnowledgeAssetVmPublishRequest;
+}
+
+export type LiftJobRequest = RawLiftJobRequest | KnowledgeAssetVmPublishJobRequest;
+
 export const LIFT_REQUEST_IMMUTABLE_FIELDS = [
-  'swmId',
-  'shareOperationId',
-  'roots',
-  'contextGraphId',
-  'namespace',
-  'scope',
-  'transitionType',
-  'authority',
-  'priorVersion',
-  'subGraphName',
-  'accessPolicy',
-  'allowedPeers',
-  'entityProofs',
-  'publishEpochs',
-  'publisherNodeIdentityIdOverride',
-  'seal',
+  'jobType',
+  'lift',
+  'knowledgeAssetVmPublish',
 ] as const;
 
 export interface LiftJobTimestamps {
@@ -204,7 +252,7 @@ export const LIFT_JOB_MUTABLE_PERSISTED_FIELDS = [
 export interface LiftJobBase {
   readonly jobId: string;
   readonly jobSlug: string;
-  readonly request: LiftRequest;
+  readonly request: LiftJobRequest;
   readonly status: LiftJobState;
   readonly timestamps: LiftJobTimestamps;
   readonly retries: LiftJobRetryMetadata;

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { ethers } from 'ethers';
-import { NoChainAdapter } from '@origintrail-official/dkg-chain';
+import { NoChainAdapter, ChainRpcTransportError } from '@origintrail-official/dkg-chain';
 import { handlePcaRoutes } from '../src/daemon/routes/pca.js';
 import type { RequestContext } from '../src/daemon/routes/context.js';
 
@@ -19,7 +19,14 @@ function fakeReq(method: string, path: string, body?: unknown) {
   return req;
 }
 
-function runCtx(method: string, rawPath: string, agent: any, body?: unknown) {
+function runCtx(
+  method: string,
+  rawPath: string,
+  agent: any,
+  body?: unknown,
+  auth?: { authEnabled?: boolean; requestToken?: string; validTokens?: Set<string> },
+  opWallets?: { wallets: Array<{ address: string }>; adminWallet?: { address: string } },
+) {
   const res = fakeRes();
   // Mirror handle-request.ts: route on url.pathname, query lives on url.
   const url = new URL(`http://127.0.0.1${rawPath}`);
@@ -29,21 +36,147 @@ function runCtx(method: string, rawPath: string, agent: any, body?: unknown) {
     agent,
     path: url.pathname,
     url,
+    // opWallets is read at handler entry to compute PCA ownership; an empty
+    // pool is fine for most tests (no looked-up PCA is "owned by this node").
+    // The owned-flag describe block passes a populated pool to exercise it.
+    opWallets: opWallets ?? { wallets: [] },
+    // Default: auth disabled → isNodeAdminCaller short-circuits true, so the
+    // existing route-logic tests below exercise the handler without an admin
+    // token. The node-admin gating itself is covered by its own describe block.
+    config: { auth: { enabled: auth?.authEnabled ?? false } },
+    requestToken: auth?.requestToken,
+    validTokens: auth?.validTokens ?? new Set<string>(),
   } as unknown as RequestContext;
   return { res, done: handlePcaRoutes(ctx) };
 }
 
 describe('daemon /api/pca V10 caller contract', () => {
-  it('POST /api/pca accepts a V10 body with only tokens (no lockEpochs) → 200', async () => {
+  it('POST /api/pca with tokens + primaryNode → 200 and forwards the node (OT-RFC-51)', async () => {
+    const calls: Array<[bigint, bigint]> = [];
     const agent = {
-      createPublishingConvictionAccount: async () => ({
-        accountId: 1n, hash: '0xabc', blockNumber: 7, success: true,
-      }),
+      createPublishingConvictionAccount: async (committedTRAC: bigint, primaryNode: bigint) => {
+        calls.push([committedTRAC, primaryNode]);
+        return { accountId: 1n, hash: '0xabc', blockNumber: 7, success: true };
+      },
     };
-    const { res, done } = runCtx('POST', '/api/pca', agent, { tokens: '100' });
+    const { res, done } = runCtx('POST', '/api/pca', agent, { tokens: '100', primaryNode: '42' });
     await done;
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).accountId).toBe('1');
+    // The node identityId must reach the facade — otherwise the PCA seeds nobody.
+    expect(calls).toEqual([[ethers.parseEther('100'), 42n]]);
+  });
+
+  // Route-level coverage of the shared transport-status mapping (#1329 review):
+  // every PCA write catch routes through the SAME respondPcaTransportError /
+  // classifyChainRpcTransportStatus, placed after the feature-unavailable
+  // (503) branch and BEFORE the deterministic-revert / generic-500 branches.
+  // createPublishingConvictionAccount is the representative write path.
+  it('POST /api/pca → 503 when the on-chain create exhausts every configured RPC endpoint', async () => {
+    const agent = {
+      createPublishingConvictionAccount: async () => {
+        const err: any = new Error(
+          'createPublishingConvictionAccount transaction preparation failed on all configured ' +
+          'RPC endpoints (https://rpc.example/v2/SECRETKEY, https://backup.example): boom',
+        );
+        err.code = 'RPC_ENDPOINTS_EXHAUSTED';
+        err.rpcUrls = ['https://rpc.example/v2/SECRETKEY', 'https://backup.example'];
+        throw err;
+      },
+    };
+    const { res, done } = runCtx('POST', '/api/pca', agent, { tokens: '100', primaryNode: '42' });
+    await done;
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body).code).toBe('RPC_ENDPOINTS_EXHAUSTED');
+    // Sanitized: no RPC URL or embedded key leaks into the response body (R-2).
+    expect(res.body).not.toContain('://');
+    expect(res.body).not.toContain('SECRETKEY');
+  });
+
+  it('POST /api/pca → 504 when the on-chain create reports a bounded chain timeout', async () => {
+    const agent = {
+      createPublishingConvictionAccount: async () => {
+        // The adapter throws a ChainRpcTransportError instance for a receipt-wait
+        // timeout; the guard recognises TIMEOUT via the instance, not a bare code.
+        throw new ChainRpcTransportError('RPC_TIMEOUT', 'tx 0xabc timed out waiting for a receipt after 180000ms');
+      },
+    };
+    const { res, done } = runCtx('POST', '/api/pca', agent, { tokens: '100', primaryNode: '42' });
+    await done;
+    expect(res.statusCode).toBe(504);
+  });
+
+  it('POST /api/pca → 500 (NOT down-classified) for a genuine on-chain revert', async () => {
+    // The transport branch is strictly code-keyed, so a CALL_EXCEPTION revert
+    // (no transport code) must fall through to the deterministic/500 mapping.
+    const agent = {
+      createPublishingConvictionAccount: async () => {
+        const err: any = new Error('execution reverted');
+        err.code = 'CALL_EXCEPTION';
+        throw err;
+      },
+    };
+    const { res, done } = runCtx('POST', '/api/pca', agent, { tokens: '100', primaryNode: '42' });
+    await done;
+    expect(res.statusCode).toBe(500);
+  });
+
+  it('POST /api/pca WITHOUT primaryNode → 400, facade not called (no silently-inert PCA)', async () => {
+    let called = false;
+    const agent = { createPublishingConvictionAccount: async () => { called = true; return { accountId: 9n, hash: '0x', blockNumber: 1, success: true }; } };
+    const { res, done } = runCtx('POST', '/api/pca', agent, { tokens: '100' });
+    await done;
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/primaryNode is required/);
+    expect(called).toBe(false);
+  });
+
+  it('POST /api/pca with primaryNode 0 (the no-node sentinel) → 400, facade not called', async () => {
+    let called = false;
+    const agent = { createPublishingConvictionAccount: async () => { called = true; return { accountId: 9n, hash: '0x', blockNumber: 1, success: true }; } };
+    const { res, done } = runCtx('POST', '/api/pca', agent, { tokens: '100', primaryNode: '0' });
+    await done;
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/must be > 0/);
+    expect(called).toBe(false);
+  });
+
+  it('POST /api/pca with a non-integer primaryNode → 400, facade not called', async () => {
+    let called = false;
+    const agent = { createPublishingConvictionAccount: async () => { called = true; return { accountId: 9n, hash: '0x', blockNumber: 1, success: true }; } };
+    const { res, done } = runCtx('POST', '/api/pca', agent, { tokens: '100', primaryNode: 'not-a-node' });
+    await done;
+    expect(res.statusCode).toBe(400);
+    expect(called).toBe(false);
+  });
+
+  it('POST /api/pca with a numeric primaryNode beyond JSON safe-integer → 400, facade not called', async () => {
+    // A uint72 id can exceed 2^53-1; as a JSON *number* it is already rounded by
+    // JSON.parse, so it must be rejected (caller should pass it as a string).
+    let called = false;
+    const agent = { createPublishingConvictionAccount: async () => { called = true; return { accountId: 9n, hash: '0x', blockNumber: 1, success: true }; } };
+    // 2**53 is the first non-safe integer (MAX_SAFE_INTEGER is 2**53 - 1).
+    const { res, done } = runCtx('POST', '/api/pca', agent, { tokens: '100', primaryNode: 2 ** 53 });
+    await done;
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/safe-integer/);
+    expect(called).toBe(false);
+  });
+
+  it('POST /api/pca with a large string primaryNode (beyond safe-integer) is accepted losslessly', async () => {
+    // The string path must preserve a uint72 id exactly (no rounding).
+    const big = '4722366482869645213695'; // 2**72 - 1 (max uint72)
+    const calls: Array<[bigint, bigint]> = [];
+    const agent = {
+      createPublishingConvictionAccount: async (committedTRAC: bigint, primaryNode: bigint) => {
+        calls.push([committedTRAC, primaryNode]);
+        return { accountId: 5n, hash: '0xabc', blockNumber: 1, success: true };
+      },
+    };
+    const { res, done } = runCtx('POST', '/api/pca', agent, { tokens: '100', primaryNode: big });
+    await done;
+    expect(res.statusCode).toBe(200);
+    expect(calls).toEqual([[ethers.parseEther('100'), BigInt(big)]]);
   });
 
   it('POST /api/pca/:id/agent registers an agent → 200 with txHash', async () => {
@@ -243,7 +376,7 @@ describe('daemon /api/pca V10 caller contract', () => {
         '(rpcUrl, hubAddress, privateKey) when creating the agent, or set DKG_PRIVATE_KEY.',
       );
     };
-    const create = runCtx('POST', '/api/pca', { createPublishingConvictionAccount: noChainErr }, { tokens: '1' });
+    const create = runCtx('POST', '/api/pca', { createPublishingConvictionAccount: noChainErr }, { tokens: '1', primaryNode: '42' });
     await create.done;
     expect(create.res.statusCode).toBe(503);
 
@@ -254,7 +387,7 @@ describe('daemon /api/pca V10 caller contract', () => {
 
   it('maps a "NFT not deployed on this Hub" throw to HTTP 503 on write and GET, not 500/404', async () => {
     const undeployed = () => { throw new Error('DKGPublishingConvictionNFT not deployed on this Hub.'); };
-    const create = runCtx('POST', '/api/pca', { createPublishingConvictionAccount: undeployed }, { tokens: '1' });
+    const create = runCtx('POST', '/api/pca', { createPublishingConvictionAccount: undeployed }, { tokens: '1', primaryNode: '42' });
     await create.done;
     expect(create.res.statusCode).toBe(503);
 
@@ -307,7 +440,7 @@ describe('daemon /api/pca V10 caller contract', () => {
     const addr = '0x' + '4'.repeat(40);
     const inv = runCtx('POST', '/api/pca', {
       createPublishingConvictionAccount: async () => { throw new Error('execution reverted: InvalidAmount()'); },
-    }, { tokens: '1' });
+    }, { tokens: '1', primaryNode: '42' });
     await inv.done;
     expect(inv.res.statusCode).toBe(400);
     expect(JSON.parse(inv.res.body).error).toBe('InvalidAmount');
@@ -387,10 +520,21 @@ describe('daemon /api/pca V10 caller contract', () => {
   it('maps a TokenTransferFailed revert on POST /api/pca → 400', async () => {
     const { res, done } = runCtx('POST', '/api/pca', {
       createPublishingConvictionAccount: async () => { throw new Error('execution reverted: TokenTransferFailed()'); },
-    }, { tokens: '100' });
+    }, { tokens: '100', primaryNode: '42' });
     await done;
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toBe('TokenTransferFailed');
+  });
+
+  it('maps an OT-RFC-51 PrimaryNodeNotInShardingTable revert on POST /api/pca → 400, not 500', async () => {
+    // A syntactically valid but nonexistent node id passes parsePrimaryNode but
+    // reverts in createAccount — must be a caller-actionable 400, not a 500.
+    const { res, done } = runCtx('POST', '/api/pca', {
+      createPublishingConvictionAccount: async () => { throw new Error('execution reverted: PrimaryNodeNotInShardingTable(999999)'); },
+    }, { tokens: '100', primaryNode: '999999' });
+    await done;
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe('PrimaryNodeNotInShardingTable');
   });
 
   it('maps an AccountAlreadyFullySettled revert on POST /api/pca/:id/settle → 409', async () => {
@@ -447,5 +591,153 @@ describe('daemon /api/pca V10 caller contract', () => {
     const probe = JSON.parse(res.body).probedKey;
     expect(probe.registered).toBe(true);
     expect(probe).not.toHaveProperty('authorized');
+  });
+});
+
+describe('PCA write routes — node-admin caller gating', () => {
+  const ADMIN_TOKEN = 'node-admin-token';
+  const AGENT_TOKEN = 'dkg_at_agent';
+
+  // Resolves AGENT_TOKEN to an agent address, ADMIN_TOKEN (and anything else) to undefined.
+  const gateAgent = (extra: Record<string, any> = {}) => ({
+    resolveAgentByToken: (tok: string) => (tok === AGENT_TOKEN ? '0x' + 'a'.repeat(40) : undefined),
+    createPublishingConvictionAccount: async () => ({ accountId: 1n, hash: '0x', blockNumber: 1, success: true }),
+    setPublishingConvictionPrimaryNode: async () => ({ hash: '0x', blockNumber: 1, success: true }),
+    ...extra,
+  });
+
+  it('rejects an agent-scoped token with 403 (create)', async () => {
+    const { res, done } = runCtx('POST', '/api/pca', gateAgent(), { tokens: '100', primaryNode: '42' }, {
+      authEnabled: true,
+      requestToken: AGENT_TOKEN,
+      validTokens: new Set([AGENT_TOKEN]),
+    });
+    await done;
+    expect(res.statusCode).toBe(403);
+    expect(JSON.parse(res.body).error).toMatch(/admin token/i);
+  });
+
+  it('rejects an agent-scoped token with 403 (set primary-node)', async () => {
+    const { res, done } = runCtx('POST', '/api/pca/7/primary-node', gateAgent(), { node: '42' }, {
+      authEnabled: true,
+      requestToken: AGENT_TOKEN,
+      validTokens: new Set([AGENT_TOKEN]),
+    });
+    await done;
+    expect(res.statusCode).toBe(403);
+  });
+
+  it('allows a node-admin token (create)', async () => {
+    const { res, done } = runCtx('POST', '/api/pca', gateAgent(), { tokens: '100', primaryNode: '42' }, {
+      authEnabled: true,
+      requestToken: ADMIN_TOKEN,
+      validTokens: new Set([ADMIN_TOKEN]),
+    });
+    await done;
+    expect(res.statusCode).toBe(200);
+  });
+
+  it('does NOT gate the permissionless settle route', async () => {
+    const agent = gateAgent({ settlePublishingConvictionAccount: async () => ({ hash: '0x', blockNumber: 1, success: true }) });
+    const { res, done } = runCtx('POST', '/api/pca/7/settle', agent, undefined, {
+      authEnabled: true,
+      requestToken: AGENT_TOKEN,
+      validTokens: new Set([AGENT_TOKEN]),
+    });
+    await done;
+    expect(res.statusCode).toBe(200);
+  });
+});
+
+describe('GET /api/pca/contracts — wallet-connect address context', () => {
+  it('returns chainId + nft/token/hub + publishingConviction addresses', async () => {
+    const agent = {
+      getPcaContractContext: async () => ({
+        chainId: 31337,
+        hubAddress: '0x' + '1'.repeat(40),
+        nftAddress: '0x' + '2'.repeat(40),
+        tokenAddress: '0x' + '3'.repeat(40),
+        publishingConvictionAddress: '0x' + '4'.repeat(40),
+        clearAgentsSupported: true,
+      }),
+    };
+    const { res, done } = runCtx('GET', '/api/pca/contracts', agent);
+    await done;
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({
+      chainId: 31337,
+      hubAddress: '0x' + '1'.repeat(40),
+      nftAddress: '0x' + '2'.repeat(40),
+      tokenAddress: '0x' + '3'.repeat(40),
+      publishingConvictionAddress: '0x' + '4'.repeat(40),
+      clearAgentsSupported: true,
+    });
+  });
+
+  it('503 when the chain adapter has no surface', async () => {
+    const { res, done } = runCtx('GET', '/api/pca/contracts', { getPcaContractContext: async () => null });
+    await done;
+    expect(res.statusCode).toBe(503);
+  });
+
+  it('is NOT parsed as an accountId by the :id GET (ordering guard)', async () => {
+    // If the /:id GET matched first, "contracts" → parseAccountId → 400.
+    const agent = { getPcaContractContext: async () => ({ chainId: 1, hubAddress: '0x', nftAddress: '0x', tokenAddress: '0x' }) };
+    const { res, done } = runCtx('GET', '/api/pca/contracts', agent);
+    await done;
+    expect(res.statusCode).not.toBe(400);
+  });
+});
+
+// #1370 HIGH: `owned` on the lookup-by-id GET means SERVER-MANAGEABLE, i.e. the
+// PCA's ERC-721 owner is the daemon's PRIMARY operational wallet — the single
+// signer every server-side PCA write is signed with. Admin keys and secondary
+// operational wallets are local to the node but cannot drive those writes, so a
+// PCA they own must report owned:false (else the UI lights up owner-gated actions
+// whose writes revert on-chain instead of returning a clean 403/disabled state).
+describe('daemon /api/pca/:id — owned flag is primary-signer-scoped (#1370 HIGH)', () => {
+  const PRIMARY = ethers.getAddress('0x' + '1'.repeat(40));
+  const SECONDARY = ethers.getAddress('0x' + '2'.repeat(40));
+  const ADMIN = ethers.getAddress('0x' + '3'.repeat(40));
+  const opWallets = {
+    wallets: [{ address: PRIMARY }, { address: SECONDARY }],
+    adminWallet: { address: ADMIN },
+  };
+  const agentFor = (owner: string) => ({
+    supportsPublishingConvictionNft: true,
+    getPublishingConvictionAccountInfo: async () => ({
+      owner,
+      committedTRAC: 0n,
+      baseEpochAllowance: 0n,
+      topUpBuffer: 0n,
+      createdAtEpoch: 0,
+      expiresAtEpoch: 0,
+      createdAtTimestamp: 0,
+      expiresAtTimestamp: 0,
+      discountBps: 0,
+      agentCount: 0,
+      lastSettledWindow: 0,
+      fullySwept: false,
+    }),
+    getConvictionPrimaryNode: async () => null,
+    getNodeIdentityId: async () => 0n,
+  });
+  const ownedFor = async (owner: string) => {
+    const { res, done } = runCtx('GET', '/api/pca/7', agentFor(owner), undefined, undefined, opWallets);
+    await done;
+    expect(res.statusCode).toBe(200);
+    return JSON.parse(res.body).owned;
+  };
+
+  it('owned:true when the PCA owner is the PRIMARY operational wallet (server can sign)', async () => {
+    expect(await ownedFor(PRIMARY)).toBe(true);
+  });
+
+  it('owned:false when owned by a SECONDARY operational wallet (not the server signer)', async () => {
+    expect(await ownedFor(SECONDARY)).toBe(false);
+  });
+
+  it('owned:false when owned by the ADMIN wallet (admin key never server-signs PCA writes)', async () => {
+    expect(await ownedFor(ADMIN)).toBe(false);
   });
 });

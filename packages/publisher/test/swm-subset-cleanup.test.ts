@@ -72,7 +72,10 @@ describe('SWM subset publish cleanup', () => {
     const coreOp = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
     await mintTokens(_provider, hubAddress, HARDHAT_KEYS.DEPLOYER, coreOp.address, ethers.parseEther('50000000'));
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
-    const cgId = await createTestContextGraph();
+    // Public CG (accessPolicy 0): these tests publish PLAINTEXT to exercise SWM
+    // subset-cleanup mechanics, not curated/ciphertext semantics, so they must not
+    // trip CuratedCGRequiresCiphertextCommitment (PR #1072).
+    const cgId = await createTestContextGraph(undefined, undefined, 0);
     CONTEXT_GRAPH = String(cgId);
     WORKSPACE_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}/_shared_memory`;
     WORKSPACE_META_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}/_shared_memory_meta`;
@@ -216,12 +219,20 @@ describe('SWM subset publish cleanup', () => {
     ];
     await publisher.share(CONTEXT_GRAPH, allQuads, { publisherPeerId: 'peer1' });
 
-    await publisher.publishFromSharedMemory(CONTEXT_GRAPH, 'all', {
+    const result = await publisher.publishFromSharedMemory(CONTEXT_GRAPH, 'all', {
       precomputedAttestation: await sealForAll(allQuads),
       v10ACKProvider: hardhatACKProvider(_kav10Address),
     });
 
-    const subjects = await subjectsInGraph(store, DATA_GRAPH);
+    // rc.17 uniform per-KA layout: a confirmed publish writes the KA's public
+    // quads into the PER-KA verifiable-memory graph
+    // `did:dkg:context-graph:{cg}/_verifiable_memory/{author}/{number}` (author +
+    // number unpacked from the minted kaId), NOT the monolithic root data graph.
+    // Assert the published subject lands in the graph it actually lives in.
+    const vmNumber = result.kaId & ((1n << 96n) - 1n);
+    const vmAuthor = `0x${(result.kaId >> 96n).toString(16).padStart(40, '0')}`;
+    const vmGraph = `${DATA_GRAPH}/_verifiable_memory/${vmAuthor}/${vmNumber}`;
+    const subjects = await subjectsInGraph(store, vmGraph);
     expect(subjects.has(entity)).toBe(true);
   });
 

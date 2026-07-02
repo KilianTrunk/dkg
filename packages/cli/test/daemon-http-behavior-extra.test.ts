@@ -44,6 +44,7 @@
  */
 
 import { beforeAll, afterAll, describe, expect, it } from 'vitest';
+import { ChainRpcTransportError } from '@origintrail-official/dkg-chain';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdtemp, writeFile, rm, readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
@@ -55,6 +56,7 @@ import { ethers } from 'ethers';
 import { getSharedContext, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { ApiClient } from '../src/api-client.js';
 import { handleContextGraphRoutes } from '../src/daemon/routes/context-graph.js';
+import { daemonState } from '../src/daemon/state.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CLI_ENTRY = join(__dirname, '..', 'dist', 'cli.js');
@@ -799,14 +801,25 @@ describe('CLI-7 — SPARQL endpoint 4xx matrix', () => {
     }
   });
 
+  // NOTE: a direct-publish-route exhaustion is NOT exercised here. A
+  // local-only CG (created above) skips the on-chain publish entirely ("No
+  // positive on-chain context graph id resolved — skipping on-chain publish"),
+  // so a real 429-RPC daemon never reaches the mint, and a registered CG can't
+  // be created while the RPCs are rate-limited. The direct-publish 503 mapping
+  // is covered route-level by the shared-helper unit test + the PCA route
+  // transport tests (same classifyChainRpcTransportStatus), and the register
+  // route above proves the helper end-to-end through a real chain write.
+
   it('returns 504 when context graph register reports a bounded chain timeout', async () => {
     const contextGraphId = 'timeout-register-' + Math.random().toString(36).slice(2, 8);
     const txHash = '0x' + '77'.repeat(32);
-    const timeoutError = new Error(
+    // The adapter throws a ChainRpcTransportError instance for a receipt-wait
+    // timeout; the guard recognises TIMEOUT via the instance, not a bare code.
+    const timeoutError = new ChainRpcTransportError(
+      'RPC_TIMEOUT',
       `register context graph tx ${txHash} timed out waiting for a receipt after 180000ms`,
+      { txHash },
     );
-    (timeoutError as Error & { code?: string; txHash?: string }).code = 'TIMEOUT';
-    (timeoutError as Error & { code?: string; txHash?: string }).txHash = txHash;
 
     let routeServer: Server | null = null;
     try {
@@ -979,6 +992,152 @@ describe('CLI-7 — SPARQL endpoint 4xx matrix', () => {
     }
   });
 
+  it('marks timeout-after-response catchup as failed rather than unreachable', async () => {
+    const contextGraphId = 'catchup-timeout-response-' + Math.random().toString(36).slice(2, 8);
+    const catchupTracker = { jobs: new Map<string, any>(), latestByContextGraph: new Map<string, string>() };
+    const previousCatchupRunner = daemonState.catchupRunner;
+    daemonState.catchupRunner = {
+      run: async () => ({
+        connectedPeers: 1,
+        syncCapablePeers: 1,
+        peersTried: 1,
+        peersResponded: 1,
+        peersSucceeded: 0,
+        dataSynced: 0,
+        sharedMemorySynced: 0,
+        denied: false,
+        deniedPeers: 0,
+        diagnostics: {
+          noProtocolPeers: 0,
+          durable: {
+            fetchedMetaTriples: 0,
+            fetchedDataTriples: 0,
+            insertedMetaTriples: 0,
+            insertedDataTriples: 0,
+            bytesReceived: 0,
+            resumedPhases: 0,
+            timedOutPhases: 1,
+            completedPhases: 0,
+            checkpointAdvances: 0,
+            emptyResponses: 0,
+            metaOnlyResponses: 0,
+            dataRejectedMissingMeta: 0,
+            rejectedKcs: 0,
+            failedPeers: 0,
+          },
+          sharedMemory: {
+            fetchedMetaTriples: 0,
+            fetchedDataTriples: 0,
+            insertedMetaTriples: 0,
+            insertedDataTriples: 0,
+            bytesReceived: 0,
+            resumedPhases: 0,
+            timedOutPhases: 0,
+            completedPhases: 0,
+            checkpointAdvances: 0,
+            emptyResponses: 0,
+            droppedDataTriples: 0,
+            failedPeers: 0,
+          },
+        },
+      }),
+      close: async () => {},
+    };
+
+    let routeServer: Server | null = null;
+    try {
+      routeServer = createServer(async (req, res) => {
+        const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+        const agent = {
+          getContextGraphAllowedAgents: async () => [],
+          getSubscribedContextGraphs: () => new Map(),
+          subscribeToContextGraph: () => {},
+          contextGraphHasLocalContent: async () => false,
+          markContextGraphSubscriptionState: () => {
+            throw new Error('timeout-only catchup must not mark subscription synced');
+          },
+          resolveAgentByToken: () => undefined,
+          getDefaultAgentAddress: () => '0x0000000000000000000000000000000000000001',
+        };
+        await handleContextGraphRoutes({
+          req,
+          res,
+          agent,
+          publisherControl: {},
+          publisherRuntime: null,
+          config: {},
+          startedAt: Date.now(),
+          dashDb: {},
+          opWallets: {},
+          network: {},
+          tracker: {},
+          memoryManager: {},
+          bridgeAuthToken: undefined,
+          nodeVersion: 'test',
+          nodeCommit: 'test',
+          catchupTracker,
+          extractionRegistry: {},
+          fileStore: {},
+          extractionStatus: new Map(),
+          assertionImportLocks: new Map(),
+          vectorStore: {},
+          embeddingProvider: null,
+          validTokens: new Set(),
+          apiHost: '127.0.0.1',
+          apiPortRef: { value: 0 },
+          routePlugins: [],
+          url,
+          path: url.pathname,
+          requestToken: undefined,
+          requestAgentAddress: '0x0000000000000000000000000000000000000001',
+        } as any);
+        if (!res.writableEnded) {
+          res.statusCode = 404;
+          res.end();
+        }
+      });
+      await new Promise<void>((resolve) => routeServer!.listen(0, '127.0.0.1', resolve));
+      const address = routeServer.address();
+      if (!address || typeof address === 'string') {
+        throw new Error('context graph route test server did not bind to a TCP port');
+      }
+
+      const subscribe = await fetch(`http://127.0.0.1:${address.port}/api/context-graph/subscribe`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contextGraphId, includeSharedMemory: true }),
+      });
+      expect(subscribe.status).toBe(200);
+      const queued = await subscribe.json() as { catchup: { jobId: string } };
+      const jobId = queued.catchup.jobId;
+
+      for (let i = 0; i < 20; i++) {
+        const job = catchupTracker.jobs.get(jobId);
+        if (job?.finishedAt) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      const job = catchupTracker.jobs.get(jobId);
+      expect(job).toMatchObject({
+        status: 'failed',
+        error: 'Sync did not complete — all reachable peers failed (timeouts or transport errors). Retry once the network is healthier.',
+      });
+      expect(job?.status).not.toBe('unreachable');
+      expect(job?.result).toMatchObject({
+        peersResponded: 1,
+        peersSucceeded: 0,
+        denied: false,
+      });
+    } finally {
+      daemonState.catchupRunner = previousCatchupRunner;
+      if (routeServer) {
+        await new Promise<void>((resolve, reject) => {
+          routeServer!.close((err) => (err ? reject(err) : resolve()));
+        });
+      }
+    }
+  });
+
   // SPEC_CG_MEMORY_MODEL / Codex PR #595 round-4: per-CG hosting
   // committees and per-CG quorum overrides were removed end-to-end.
   // The on-chain contract no longer accepts those args, so silently
@@ -1029,8 +1188,8 @@ describe('CLI-7 — SPARQL endpoint 4xx matrix', () => {
   });
 });
 
-describe('context graph write-target validation', () => {
-  it('POST /api/shared-memory/write rejects unknown context graphs instead of creating them lazily', async () => {
+describe('removed shared-memory write route', () => {
+  it('legacy shared-memory write and raw publisher enqueue routes are no longer served', async () => {
     const d = daemon!;
     const contextGraphId = 'lazy-swm-http-' + Math.random().toString(36).slice(2, 8);
     const write = await fetch(urlFor(d, '/api/shared-memory/write'), {
@@ -1048,10 +1207,29 @@ describe('context graph write-target validation', () => {
         ],
       }),
     });
-    expect(write.status).toBe(400);
-    const writeBody = await write.json() as { code?: string; error?: string };
-    expect(writeBody.code).toBe('CONTEXT_GRAPH_NOT_FOUND');
-    expect(writeBody.error).toMatch(/Unknown contextGraphId/);
+    expect(write.status).toBe(404);
+
+    const conditionalWrite = await fetch(urlFor(d, '/api/shared-memory/conditional-write'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
+      body: JSON.stringify({ contextGraphId, quads: [], conditions: [] }),
+    });
+    expect(conditionalWrite.status).toBe(404);
+
+    const enqueue = await fetch(urlFor(d, '/api/publisher/enqueue'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
+      body: JSON.stringify({
+        contextGraphId,
+        shareOperationId: 'legacy-op',
+        roots: ['urn:legacy-root'],
+        namespace: 'legacy',
+        scope: 'legacy',
+        transitionType: 'CREATE',
+        authority: { type: 'owner', proofRef: 'proof:legacy' },
+      }),
+    });
+    expect(enqueue.status).toBe(404);
 
     const list = await fetch(urlFor(d, '/api/context-graph/list'), {
       headers: authHeaders(d),
@@ -1060,6 +1238,53 @@ describe('context graph write-target validation', () => {
     const body = await list.json() as { contextGraphs?: Array<Record<string, unknown>> };
     const entry = body.contextGraphs?.find((row) => row.id === contextGraphId);
     expect(entry).toBeUndefined();
+  }, 30_000);
+
+  it('batch rejection reports use the named KA lifecycle route, not the old shared-memory URL', async () => {
+    const d = daemon!;
+    const contextGraphId = 'batch-rejection-' + Math.random().toString(36).slice(2, 8);
+
+    const created = await fetch(urlFor(d, '/api/context-graph/create'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
+      body: JSON.stringify({ id: contextGraphId, name: contextGraphId }),
+    });
+    expect(created.status).toBeLessThan(300);
+
+    const oldRoute = await fetch(urlFor(d, '/api/shared-memory/report-batch-rejection'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
+      body: JSON.stringify({ contextGraphId, verifyResult: { ok: false } }),
+    });
+    expect(oldRoute.status).toBe(404);
+
+    const report = await fetch(urlFor(d, '/api/knowledge-assets/batch-rejections/report'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
+      body: JSON.stringify({
+        contextGraphId,
+        batchId: 'batch-1',
+        verifyResult: {
+          ok: false,
+          expectedRoot: `0x${'11'.repeat(32)}`,
+          actualRoot: `0x${'22'.repeat(32)}`,
+          leafCount: 1,
+          reason: 'test mismatch',
+        },
+      }),
+    });
+    expect(report.status).toBe(200);
+    const body = await report.json() as {
+      gossiped?: boolean;
+      assertionName?: string;
+      shareOperationId?: string;
+      record?: { digest?: string };
+      gossipError?: string;
+    };
+    expect(body.gossiped, JSON.stringify(body)).toBe(true);
+    expect(body.assertionName).toMatch(/^batch-rejection-/);
+    expect(body.shareOperationId).toMatch(/\S/);
+    expect(body.record?.digest).toBeTruthy();
   }, 30_000);
 });
 
@@ -1104,14 +1329,14 @@ describe('CLI-8 — CONSTRUCT/SELECT access control', () => {
 // ---------------------------------------------------------------------------
 
 describe('CLI-9 — /api/verify & /api/ccl error-code mapping', () => {
-  it('/api/verify on a non-existent verifiedMemoryId returns 4xx (ideally 404), NOT 500 (PROD-BUG)', async () => {
+  it('/api/verify on a non-existent verifiableMemoryId returns 4xx (ideally 404), NOT 500 (PROD-BUG)', async () => {
     const d = daemon!;
     const res = await fetch(urlFor(d, '/api/verify'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
       body: JSON.stringify({
         contextGraphId: 'does-not-exist-cg',
-        verifiedMemoryId: 'does-not-exist-vm',
+        verifiableMemoryId: 'does-not-exist-vm',
         batchId: '9999999999',
       }),
     });
@@ -1150,7 +1375,7 @@ describe('CLI-9 — /api/verify & /api/ccl error-code mapping', () => {
       headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
       body: JSON.stringify({
         contextGraphId: 'x',
-        verifiedMemoryId: 'y',
+        verifiableMemoryId: 'y',
         batchId: 'not-an-int',
       }),
     });
@@ -1353,7 +1578,7 @@ describe('A-1 — /api/query enforces working-memory isolation across agent toke
       // defaultAgentAddress, so this lands in default ("A")'s WM
       // namespace.
       const assertionName = 'a1-probe-' + Math.random().toString(36).slice(2, 8);
-      const createAssertionRes = await fetch(urlFor(d, '/api/assertion/create'), {
+      const createAssertionRes = await fetch(urlFor(d, '/api/knowledge-assets'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
         body: JSON.stringify({ contextGraphId: cgId, name: assertionName }),
@@ -1362,7 +1587,7 @@ describe('A-1 — /api/query enforces working-memory isolation across agent toke
 
       const seedSubject = 'urn:a1-seed:probe-' + Math.random().toString(36).slice(2, 8);
       const writeRes = await fetch(
-        urlFor(d, `/api/assertion/${encodeURIComponent(assertionName)}/write`),
+        urlFor(d, `/api/knowledge-assets/${encodeURIComponent(assertionName)}/wm/write`),
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
@@ -1518,7 +1743,7 @@ describe('A-1 — /api/query enforces working-memory isolation across agent toke
       // Seed one WM triple under the default agent so an unrestricted
       // query would return bindings if access control didn't apply.
       const assertionName = 'a1-denyshape-' + Math.random().toString(36).slice(2, 8);
-      const createAssertionRes = await fetch(urlFor(d, '/api/assertion/create'), {
+      const createAssertionRes = await fetch(urlFor(d, '/api/knowledge-assets'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
         body: JSON.stringify({ contextGraphId: cgId, name: assertionName }),
@@ -1526,7 +1751,7 @@ describe('A-1 — /api/query enforces working-memory isolation across agent toke
       expect([200, 201]).toContain(createAssertionRes.status);
       const seedSubject = 'urn:a1-denyshape:seed-' + Math.random().toString(36).slice(2, 8);
       const writeRes = await fetch(
-        urlFor(d, `/api/assertion/${encodeURIComponent(assertionName)}/write`),
+        urlFor(d, `/api/knowledge-assets/${encodeURIComponent(assertionName)}/wm/write`),
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...authHeaders(d) },

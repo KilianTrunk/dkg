@@ -114,7 +114,7 @@ const EMPTY: VerifiedEntityIdentity = {
 };
 
 /**
- * Fetch the Verified-Memory identity block for a single entity.
+ * Fetch the Verifiable-Memory identity block for a single entity.
  * Automatically no-ops (and returns a loading: false placeholder) when
  * the entity's trust level is not `verified` — callers still render
  * whatever they render without the banner in that case.

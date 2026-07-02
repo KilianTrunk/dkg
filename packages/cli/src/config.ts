@@ -3,12 +3,14 @@ import { join, dirname, basename } from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import yaml from 'js-yaml';
+import type { DKGAgentConfig } from '@origintrail-official/dkg-agent';
 import {
   blueGreenSlotEntryPoint,
   blueGreenSlotReady,
   findPackageRepoDir,
   isDkgMonorepoRoot,
   resolveDkgConfigHome,
+  SELECTABLE_SETUP_NETWORKS,
 } from '@origintrail-official/dkg-core';
 
 /**
@@ -43,6 +45,19 @@ export interface AutoUpdateConfig {
   branch?: string;
   /** Allow auto-updating to pre-release versions (e.g. 9.0.5-rc.1). */
   allowPrerelease?: boolean;
+  /**
+   * npm dist-tag this node tracks for auto-updates. When set, the updater
+   * follows ONLY `dist-tags[channel]` (e.g. "testnet", "mainnet", "latest")
+   * instead of the default `max(latest, dev, beta, next)`. This decouples a
+   * cohort from whatever `latest` happens to point at — e.g. testnet nodes
+   * pinned to `channel: "testnet"` keep tracking testnet releases even after
+   * `latest` is repurposed for mainnet. Omit to keep the legacy behaviour.
+   *
+   * Forward-only: a node updates only when the channel's target is a HIGHER
+   * semver than its current version (same gate as the default path), so
+   * re-pointing a tag at a LOWER version is a no-op, not a downgrade.
+   */
+  channel?: string;
   /** Optional SSH private key path for git-based update fetches/clones. */
   sshKeyPath?: string;
   /** Optional raw GIT_SSH_COMMAND override for git-based update fetches/clones. */
@@ -99,7 +114,9 @@ export type ResolvedAutoUpdateConfig = AutoUpdateConfig & {
 };
 
 export interface NetworkConfig {
+  _status?: string;
   networkName: string;
+  genesisId: string;
   networkId: string;
   genesisVersion: number;
   relays: string[];
@@ -111,6 +128,8 @@ export interface NetworkConfig {
     repo: string;
     branch: string;
     allowPrerelease?: boolean;
+    /** npm dist-tag this network's nodes track — see `AutoUpdateConfig.channel`. */
+    channel?: string;
     sshKeyPath?: string;
     sshCommand?: string;
     checkIntervalMinutes: number;
@@ -131,6 +150,11 @@ export interface NetworkConfig {
     hubAddress: string;
     tokenAddress?: string;
     chainId: string;
+    /**
+     * ContextGraphNameRegistry discovery scan `eth_getLogs` block-window.
+     * Defaults to the EVM adapter's 2,000-block common provider cap.
+     */
+    cgRegistryScanPageSize?: number;
   };
   faucet?: {
     url: string;
@@ -165,6 +189,8 @@ export interface NetworkConfig {
  * preparing for high-volume publishing should consider `replenishing`.
  * See `packages/cli/skills/dkg-node/SKILL.md` §8 for the operator guide.
  */
+export type ApprovalPolicyMode = 'per-publish' | 'replenishing' | 'unlimited';
+
 export interface ApprovalPolicyConfig {
   /**
    * Allowance sizing strategy. Defaults to `'per-publish'`:
@@ -180,7 +206,7 @@ export interface ApprovalPolicyConfig {
    *     Lowest gas, widest blast radius. Use only if you trust the V10 KA
    *     contract absolutely.
    */
-  mode?: 'per-publish' | 'replenishing' | 'unlimited';
+  mode?: ApprovalPolicyMode;
   /**
    * `replenishing` only. TRAC amount (decimal wei-TRAC string — `1000 *
    * 10^18 = '1000000000000000000000'` for 1000 TRAC) to approve up to.
@@ -194,6 +220,8 @@ export interface ApprovalPolicyConfig {
    */
   refillBelowFraction?: number;
 }
+
+export type ApprovalPolicyConfigInput = ApprovalPolicyConfig | ApprovalPolicyMode;
 
 export interface ChainConfig {
   /** 'evm' for real blockchain, omit or 'mock' for in-memory (testing only) */
@@ -216,11 +244,21 @@ export interface ChainConfig {
   /**
    * V10 TRAC auto-approve policy. Controls how the adapter sizes the
    * allowance it requests from each operational signer before a publish or
-   * update. See {@link ApprovalPolicyConfig} for the modes and
+   * update. The object form is preferred; a mode string shorthand is accepted
+   * for compatibility. See {@link ApprovalPolicyConfig} for the modes and
    * `packages/cli/skills/dkg-node/SKILL.md` §8 for the operator guide.
    */
-  approvalPolicy?: ApprovalPolicyConfig;
+  approvalPolicy?: ApprovalPolicyConfigInput;
+  /**
+   * ContextGraphNameRegistry discovery scan `eth_getLogs` block-window.
+   * Defaults to the EVM adapter's 2,000-block common provider cap.
+   */
+  cgRegistryScanPageSize?: number;
 }
+
+export type ResolvedChainConfig = Partial<Omit<ChainConfig, 'approvalPolicy'>> & {
+  approvalPolicy?: ApprovalPolicyConfig;
+};
 
 export interface LargeLiteralStorageConfig {
   enabled?: boolean;
@@ -347,8 +385,19 @@ export interface QueryAccessConfig {
   rateLimitPerMinute?: number;
 }
 
+export interface GraphSetIndexConfig {
+  enabled?: boolean;
+  /** Revalidate the named-graph index after this many milliseconds. 0 means every read. */
+  revalidateMs?: number;
+}
+
 export interface DkgConfig {
   name: string;
+  /**
+   * Selects which bundled network/<name>.json overlay this node should use.
+   * When omitted, runtime falls back to project.json#defaultNetwork.
+   */
+  networkConfig?: string;
   relay?: string;
   apiPort: number;
   /** Host to bind the API server (default '127.0.0.1', use '0.0.0.0' for external access). */
@@ -445,13 +494,38 @@ export interface DkgConfig {
   /** Block explorer URL for TX links (default: derived from chainId). */
   blockExplorerUrl?: string;
   /** Triple store backend override (default: oxigraph-worker with file persistence). */
-  store?: { backend: string; options?: Record<string, unknown> };
+  store?: { backend: string; options?: Record<string, unknown>; graphSetIndex?: boolean | GraphSetIndexConfig };
+  /**
+   * Intentional cap on how many persisted context-graph subscriptions a node
+   * ACTIVATES on boot (gossip + sync). A large stale backlog otherwise fans out
+   * store work and starves authenticated routes (#997). coreHosted graphs are
+   * always restored regardless of this cap. Rows beyond the cap stay persisted
+   * and are reported by GET /api/context-graph/subscriptions. Non-negative
+   * integer; 0 = no cap. Raise it on nodes that legitimately subscribe to more
+   * than the default (64).
+   */
+  maxRehydratedContextGraphSubscriptions?: number;
   /** Out-of-line storage for large public SWM RDF literal object terms. */
   largeLiteralStorage?: LargeLiteralStorageConfig;
   /** Out-of-line storage for immutable public SWM operation snapshots. */
   sharedMemoryPublicSnapshotStorage?: SharedMemoryPublicSnapshotStorageConfig;
   /** Disable expensive peer-connect SWM catch-up for bulk benchmark/devnet runs. */
   syncSharedMemoryOnConnect?: boolean;
+  /**
+   * STRICT curator-ack gate (OT-RFC-49 curator-leader), default OFF. When true,
+   * a non-`localOnly` write to a PRIVATE context graph must be applied+ack'd by
+   * the CG's curator before it commits locally; an unconfirmed write is rejected
+   * (HTTP 503) and not persisted, closing the silent same-root-update loss.
+   * Public CGs / `localOnly` / a node that IS the curator are unaffected.
+   */
+  swmAwaitCuratorAck?: boolean;
+  /**
+   * Keep durable sync of `did:dkg:context-graph:agents/_meta` enabled by
+   * default. Edge-node operators can set this to false to sync the `agents`
+   * phonebook data without pulling the large system KA/KC lifecycle metadata.
+   * Ignored on core nodes, which always sync system graph metadata.
+   */
+  syncAgentsMeta?: boolean;
   /**
    * Generic local agent integration registry used by node-owned connect/install
    * flows. Framework-specific bridges (OpenClaw now, Hermes next) should store
@@ -464,14 +538,85 @@ export interface DkgConfig {
    * on first start and stored in `<DKG_HOME>/auth.token`.
    */
   auth?: { enabled?: boolean; tokens?: string[] };
-  /** Opt-in telemetry streaming to central network dashboard. */
-  telemetry?: { enabled?: boolean };
+  /**
+   * Opt-in telemetry streaming to a central network dashboard.
+   * `enabled` is the master gate: when false, NOTHING is forwarded off the
+   * node (local logging — SQLite + daemon.log — is always on regardless).
+   */
+  telemetry?: {
+    enabled?: boolean;
+    /**
+     * Remote log forwarding (opt-in). Active only when `enabled` is true.
+     */
+    logs?: {
+      /**
+       * Outbound transport for logs. 'none' = local only; 'otlp' = OTLP/HTTP
+       * to an OpenTelemetry collector; 'syslog' = legacy RFC 5424 → Graylog.
+       * Defaults to 'syslog' when unset (preserves prior behaviour).
+       */
+      exporter?: 'none' | 'otlp' | 'syslog';
+      /**
+       * OTLP/HTTP logs endpoint, e.g. http://localhost:4318/v1/logs. Falls
+       * back to the per-network default (TELEMETRY_ENDPOINTS[network].otlpLogs).
+       */
+      endpoint?: string;
+      /** Bearer credential for the operator's collector. Treated as a secret. */
+      token?: string;
+      /** Minimum level forwarded remotely. Local sink keeps everything. Default 'info'. */
+      level?: 'debug' | 'info' | 'warn' | 'error';
+      /** Extra sensitive key names to redact from messages before they leave the node. */
+      redact?: string[];
+      /** Bounded in-memory buffer; drop-oldest on overflow. Default 500. */
+      bufferMaxEntries?: number;
+    };
+    /**
+     * OTel trace export (opt-in, independent of logs). Registers the tracer
+     * ONLY when an endpoint resolves (config or OTEL_EXPORTER_OTLP_* env);
+     * never falls back to a guessed prod URL.
+     */
+    traces?: {
+      enabled?: boolean;
+      /** OTLP traces endpoint, e.g. http://localhost:4318/v1/traces. */
+      endpoint?: string;
+      /** Bearer credential. Treated as a secret. */
+      token?: string;
+      /** Parent-based ratio sampler 0..1. Default 1.0. */
+      sampleRatio?: number;
+    };
+    /**
+     * OTel metric export (opt-in, independent of logs). Registers the meter
+     * ONLY when an endpoint resolves (config or OTEL_EXPORTER_OTLP_* env).
+     */
+    metrics?: {
+      enabled?: boolean;
+      /** OTLP metrics endpoint, e.g. http://localhost:4318/v1/metrics. */
+      endpoint?: string;
+      /** Bearer credential. Treated as a secret. */
+      token?: string;
+      /** PeriodicExportingMetricReader interval. Default 30000ms. */
+      exportIntervalMs?: number;
+    };
+  };
   /** Shared memory (workspace) data TTL in milliseconds. Default: 30 days (2592000000). Set to 0 to disable cleanup. */
   sharedMemoryTtlMs?: number;
   /** @deprecated Legacy alias for sharedMemoryTtlMs */
   workspaceTtlMs?: number;
   /** EPCIS plugin config. When set, POST /api/epcis/capture is enabled. */
   epcis?: { contextGraphId?: string };
+  /**
+   * Per-KA metadata writer tuning (RFC ka-metadata-trim Phase 3).
+   */
+  metadata?: {
+    /**
+     * P3.3 — write per-transition PROV event nodes (`dkg:AssertionCreated` /
+     * `dkg:AssertionPromoted` activities) into `_meta`. Default `true`.
+     * Set `false` ("lite mode") on high-throughput publishers / core nodes
+     * to skip the event rows: the seal, state and identity rows on the
+     * lifecycle subject are ALWAYS written regardless, and the history API
+     * simply returns `events: []` for ranges published while disabled.
+     */
+    provenanceEvents?: boolean;
+  };
   /** Async publisher runtime options. */
   publisher?: {
     enabled?: boolean;
@@ -482,7 +627,7 @@ export interface DkgConfig {
   /**
    * Async promote queue worker (WM → SWM). Unlike `publisher` which is
    * opt-in, the promote worker is **on by default** — without it, jobs
-   * enqueued via `POST /api/assertion/{name}/promote-async` sit in
+   * enqueued via `POST /api/knowledge-assets/{name}/swm/share-async` sit in
    * `queued` forever. Set `enabled: false` to disable when running a
    * read-only / forensic node where you don't want the worker mutating
    * SWM. See `docs/specs/SPEC_ASYNC_PROMOTE_QUEUE.md` and the
@@ -504,6 +649,17 @@ export interface DkgConfig {
   corsOrigins?: string | string[];
   /** HTTP rate limiting settings. */
   rateLimit?: { requestsPerMinute?: number; exempt?: string[] };
+  /**
+   * Max concurrent in-flight HTTP requests before the daemon sheds load with
+   * 503 (admission control, IP-agnostic). `<= 0` disables. Overridden by the
+   * `DKG_MAX_INFLIGHT` env var. Defaults to 64.
+   */
+  maxInFlightRequests?: number;
+  /**
+   * Max simultaneous TCP connections the HTTP server will accept. Overridden by
+   * the `DKG_MAX_CONNECTIONS` env var. Defaults to 256.
+   */
+  maxConnections?: number;
   /**
    * V10 Random Sampling prover (core-only). When the node is `core`
    * AND has an on-chain identity, the agent automatically schedules
@@ -566,6 +722,17 @@ export interface DkgConfig {
    * See {@link ChatConfig} / {@link ChatAclConfig}.
    */
   chat?: ChatConfig;
+  /**
+   * GH #462 — agent-to-agent messaging authorization. `skill_request` over
+   * `/dkg/message/1.0.0` is default-deny for remote peers (the Ed25519 check
+   * authenticates the caller but does not authorize skill invocation). Set
+   * `openSkills: true` to restore the legacy open behaviour, or list specific
+   * peer ids in `skillAllowedPeers`.
+   */
+  messaging?: {
+    openSkills?: boolean;
+    skillAllowedPeers?: string[];
+  };
   /** Route-plugin specs (absolute paths / package names) loaded at daemon startup. ADR 0001. */
   routePlugins?: string[];
   /**
@@ -599,7 +766,7 @@ export interface DkgConfig {
     dhtQuerySelfIntervalMs?: number;
     /**
      * Cadence at which the daemon re-publishes its own profile to the
-     * `agents` Context Graph (default 5min — see
+     * `agents` Context Graph (default 20min — see
      * `AGENT_PROFILE_HEARTBEAT_MS`). Set to `0` to disable; the
      * one-shot startup publish still fires.
      *
@@ -609,6 +776,16 @@ export interface DkgConfig {
      */
     agentProfileHeartbeatMs?: number;
   };
+  /**
+   * OT-RFC-38 LU-6 host-mode custody config — eviction tiers, discovery-beacon
+   * rate limits, and the OT-RFC-49 WS-A `stripCiphertext` kill-switch.
+   * Forwarded through to `DKGAgentConfig.swmHostMode` by the daemon lifecycle;
+   * WITHOUT this field (and the matching forward in `lifecycle.ts`) the whole
+   * block is INERT — only the in-agent defaults apply, so an operator could not
+   * toggle `swmHostMode.stripCiphertext` (or any host-mode tunable) from
+   * config.json. (This is exactly the inert-flag bug the rung-1 strip hit.)
+   */
+  swmHostMode?: DKGAgentConfig['swmHostMode'];
 }
 
 /**
@@ -616,16 +793,23 @@ export interface DkgConfig {
  * Nodes resolve the correct endpoints from the network they're on.
  * Operators only see a single toggle — no endpoint configuration.
  */
-export const TELEMETRY_ENDPOINTS: Record<string, { syslog: { host: string; port: number }; otlp: string }> = {
+export const TELEMETRY_ENDPOINTS: Record<
+  string,
+  { syslog: { host: string; port: number }; otlp: string }
+> = {
   testnet: {
     syslog: { host: 'loggly.origin-trail.network', port: 12201 },
     otlp: 'https://telemetry-testnet.origintrail.io/v1/metrics',
   },
   mainnet: {
-    syslog: { host: 'loggly.origin-trail.network', port: 0 }, // TODO: assign mainnet syslog port
+    syslog: { host: 'loggly.origin-trail.network', port: 0 }, // legacy syslog — OTLP is the mainnet path
     otlp: 'https://telemetry.origintrail.io/v1/metrics',
   },
 };
+// NOTE: there is intentionally NO per-network OTLP *logs* endpoint here. The
+// OTLP log exporter resolves its endpoint env-first (OTEL_EXPORTER_OTLP_*) then
+// from `config.telemetry.logs.endpoint` (see startOtlpExporter) — never from a
+// hardcoded default — so a node can't ship logs to a placeholder URL.
 
 const DEFAULT_CONFIG: DkgConfig = {
   name: 'dkg-node',
@@ -642,6 +826,42 @@ export function resolveContextGraphs(config: DkgConfig): string[] {
 /** Resolve context graphs from network config. */
 export function resolveNetworkDefaultContextGraphs(network: NetworkConfig | null | undefined): string[] {
   return network?.defaultContextGraphs ?? [];
+}
+
+type NetworkReadinessValidation =
+  | { ok: true; messages: [] }
+  | { ok: false; messages: string[] };
+
+type NetworkReadinessInput = Partial<Pick<NetworkConfig, '_status' | 'networkName' | 'relays'>>;
+
+export function validateNetworkConfigReadiness(
+  network: NetworkReadinessInput | null | undefined,
+): NetworkReadinessValidation {
+  const networkName = network?.networkName ?? 'selected network';
+  const messages: string[] = [];
+  if (network?._status?.toLowerCase().startsWith('pre-deployment')) {
+    messages.push(
+      `FATAL: network config ${networkName} is marked ${network._status}.`,
+    );
+  }
+  const placeholderRelays = network?.relays?.filter(relay => relay.includes('/p2p/PEER_ID_')) ?? [];
+  if (placeholderRelays.length > 0) {
+    messages.push(
+      `FATAL: network config ${networkName} contains placeholder relay peer IDs: ${placeholderRelays.join(', ')}`,
+    );
+    messages.push('Replace pre-deployment relay PeerIDs before selecting this network.');
+  }
+  if (messages.length > 0) return { ok: false, messages };
+  return { ok: true, messages: [] };
+}
+
+export function assertNetworkConfigReadiness(
+  network: NetworkReadinessInput | null | undefined,
+): void {
+  const readiness = validateNetworkConfigReadiness(network);
+  if (!readiness.ok) {
+    throw new Error(readiness.messages.join('\n'));
+  }
 }
 
 /** Resolve shared memory TTL from config, accepting both V10 and legacy keys. */
@@ -664,7 +884,7 @@ export function resolveSharedMemoryTtlMs(config: DkgConfig): number | undefined 
  */
 export function resolveApprovalPolicy(
   policy: ApprovalPolicyConfig | undefined,
-): { mode: 'per-publish' | 'replenishing' | 'unlimited'; targetAllowance?: bigint; refillBelowFraction?: number } | undefined {
+): { mode: ApprovalPolicyMode; targetAllowance?: bigint; refillBelowFraction?: number } | undefined {
   if (!policy) return undefined;
   const mode = policy.mode ?? 'per-publish';
   if (mode !== 'per-publish' && mode !== 'replenishing' && mode !== 'unlimited') {
@@ -811,6 +1031,30 @@ export function _resetProjectConfigCache(): void {
   _projectConfig = null;
 }
 
+function isPlainConfigObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+function isApprovalPolicyMode(value: unknown): value is ApprovalPolicyMode {
+  return value === 'per-publish' || value === 'replenishing' || value === 'unlimited';
+}
+
+function requireApprovalPolicyConfig(policy: unknown): ApprovalPolicyConfig | undefined {
+  if (policy === undefined || policy === null) return undefined;
+  if (typeof policy === 'string') {
+    if (isApprovalPolicyMode(policy)) return { mode: policy };
+    throw new Error(
+      `chain.approvalPolicy must be an object or a valid mode string (got: ${JSON.stringify(policy)})`,
+    );
+  }
+  if (!isPlainConfigObject(policy)) {
+    throw new Error(`chain.approvalPolicy must be an object (got: ${JSON.stringify(policy)})`);
+  }
+  return policy as ApprovalPolicyConfig;
+}
+
 /**
  * Field-level merge of the effective auto-update configuration.
  *
@@ -841,6 +1085,7 @@ export function resolveAutoUpdateConfig(
   const sshCommand = cfg?.sshCommand ?? net?.sshCommand;
   const checkIntervalMinutes = cfg?.checkIntervalMinutes ?? net?.checkIntervalMinutes ?? 30;
   const source = cfg?.source ?? net?.source;
+  const channel = cfg?.channel ?? net?.channel;
 
   // Merge build timeouts per-key so operators can override one step (e.g.
   // `contracts` on slow ARM hosts) without re-specifying the rest.
@@ -866,6 +1111,7 @@ export function resolveAutoUpdateConfig(
     checkIntervalMinutes,
     ...(buildTimeoutMs ? { buildTimeoutMs } : {}),
     ...(source ? { source } : {}),
+    ...(channel ? { channel } : {}),
   };
 }
 
@@ -874,6 +1120,31 @@ export function resolveAutoUpdateSource(
   network: Pick<NetworkConfig, 'autoUpdate'> | null | undefined,
 ): AutoUpdateConfig['source'] {
   return config?.autoUpdate?.source ?? network?.autoUpdate?.source;
+}
+
+/**
+ * True for a loopback / local-host RPC URL (localhost, 127.0.0.0/8, ::1,
+ * 0.0.0.0). Such a primary is a LOCAL chain (Hardhat / devnet), so the
+ * network's PUBLIC backup endpoints must NOT be auto-attached behind it:
+ * ethers' FallbackProvider hard-rejects mixing providers on different chains
+ * ("cannot mix providers on different networks"), which would break chain
+ * init. A real operator's private RPC is non-loopback and still inherits the
+ * public backups for failover.
+ */
+function isLoopbackRpcUrl(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return (
+      host === 'localhost' ||
+      host.endsWith('.localhost') ||
+      host === '0.0.0.0' ||
+      host === '::1' ||
+      host === '[::1]' ||
+      /^127\./.test(host)
+    );
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -892,11 +1163,14 @@ export function resolveAutoUpdateSource(
  * The return type is `Partial<ChainConfig>` because either source may be
  * partial; consumers that need both `rpcUrl` and `hubAddress` (lifecycle,
  * publisher-runner) MUST guard for those fields before passing to the agent.
+ *
+ * This is a raw field-merge helper. Call {@link resolveReadyChainConfig} at
+ * CLI/daemon activation boundaries that must reject pre-deployment networks.
  */
 export function resolveChainConfig(
   config: Pick<DkgConfig, 'chain'> | null | undefined,
   network: Pick<NetworkConfig, 'chain'> | null | undefined,
-): Partial<ChainConfig> | undefined {
+): ResolvedChainConfig | undefined {
   const cfg = config?.chain;
   const net = network?.chain;
   if (!cfg && !net) return undefined;
@@ -912,17 +1186,36 @@ export function resolveChainConfig(
   // / EVMChainAdapter against the live network in parallel. MockChainAdapter
   // only needs chainId; rpcUrl/hubAddress are meaningless in mock mode.
   if (cfg?.type === 'mock') {
-    const mockMerged: Partial<ChainConfig> = { type: 'mock' };
+    const mockMerged: ResolvedChainConfig = { type: 'mock' };
     if (cfg.chainId !== undefined) mockMerged.chainId = cfg.chainId;
     if (cfg.mockIdentityId !== undefined) mockMerged.mockIdentityId = cfg.mockIdentityId;
     return mockMerged;
   }
 
-  const merged: Partial<ChainConfig> = {
+  const merged: ResolvedChainConfig = {
     type: cfg?.type ?? net?.type ?? 'evm',
   };
   const primaryRpcUrl = cfg?.rpcUrl ?? net?.rpcUrl;
-  const backupRpcUrls = cfg?.rpcUrls ?? net?.rpcUrls ?? [];
+  // Don't inherit the network's PUBLIC backups when the operator pins their OWN
+  // PRIMARY rpcUrl on a DIFFERENT chain than the overlay — either a loopback/
+  // local primary (Hardhat/devnet) OR a custom primary whose `chainId` differs
+  // from the network's. Either would build a cross-chain FallbackProvider
+  // (e.g. local 31337 + public Base Sepolia 84532) that ethers rejects at init.
+  // The cross-chain risk only exists when the PRIMARY itself is off-overlay, so
+  // this requires a custom `rpcUrl`: a `chainId` override with NO custom rpcUrl
+  // leaves the primary on the network RPC (same chain as the backups), so the
+  // backups stay valid failover and must NOT be dropped. A non-loopback private
+  // primary on the SAME chain still inherits the public backups; explicit
+  // operator `rpcUrls` always win.
+  const operatorPinnedDifferentChain =
+    cfg?.rpcUrls === undefined &&
+    typeof cfg?.rpcUrl === 'string' &&
+    (
+      isLoopbackRpcUrl(cfg.rpcUrl) ||
+      (cfg?.chainId !== undefined && net?.chainId !== undefined && cfg.chainId !== net.chainId)
+    );
+  const backupRpcUrls =
+    cfg?.rpcUrls ?? (operatorPinnedDifferentChain ? [] : net?.rpcUrls) ?? [];
   const orderedRpcUrls: string[] = [];
   for (const candidate of [primaryRpcUrl, ...backupRpcUrls]) {
     if (typeof candidate !== 'string') continue;
@@ -940,14 +1233,28 @@ export function resolveChainConfig(
   if (tokenAddress !== undefined) merged.tokenAddress = tokenAddress;
   const chainId = cfg?.chainId ?? net?.chainId;
   if (chainId !== undefined) merged.chainId = chainId;
+  const approvalPolicy = requireApprovalPolicyConfig(cfg?.approvalPolicy);
+  if (approvalPolicy !== undefined) merged.approvalPolicy = approvalPolicy;
+  const cgRegistryScanPageSize = cfg?.cgRegistryScanPageSize ?? net?.cgRegistryScanPageSize;
+  if (cgRegistryScanPageSize !== undefined) merged.cgRegistryScanPageSize = cgRegistryScanPageSize;
   if (cfg?.mockIdentityId !== undefined) merged.mockIdentityId = cfg.mockIdentityId;
   return merged;
+}
+
+export function resolveReadyChainConfig(
+  config: Pick<DkgConfig, 'chain'> | null | undefined,
+  network: (Pick<NetworkConfig, 'chain'> & NetworkReadinessInput) | null | undefined,
+): ResolvedChainConfig | undefined {
+  if (config?.chain?.type !== 'mock') {
+    assertNetworkConfigReadiness(network);
+  }
+  return resolveChainConfig(config, network);
 }
 
 /**
  * Load a network config from network/<name>.json.
  *
- * @param network - Network name (e.g. 'testnet', 'mainnet'). Defaults to
+ * @param network - Network name (e.g. 'testnet', 'mainnet-base'). Defaults to
  *   the `defaultNetwork` value from project.json.
  *
  * Candidate paths (tried in order):
@@ -960,7 +1267,7 @@ export function resolveChainConfig(
  * without requiring a rebuild of the CLI package.
  */
 export async function loadNetworkConfig(network?: string): Promise<NetworkConfig | null> {
-  const name = network ?? loadProjectConfig().defaultNetwork;
+  const name = network?.trim() || loadProjectConfig().defaultNetwork;
   if (_networkConfig && _networkConfigName === name) return _networkConfig;
   try {
     const file = `${name}.json`;
@@ -976,6 +1283,35 @@ export async function loadNetworkConfig(network?: string): Promise<NetworkConfig
     return null;
   } catch {
     return null;
+  }
+}
+
+export function resolveNetworkConfigName(config?: Pick<DkgConfig, 'networkConfig'> | null): string {
+  return config?.networkConfig?.trim() || loadProjectConfig().defaultNetwork;
+}
+
+/**
+ * Validate an operator-supplied `--network <name>` value before a setup flow
+ * persists it. Rejects unknown overlay names and pre-deployment networks
+ * (e.g. `mainnet-neuroweb`, whose bundled config is still placeholder-gated)
+ * with a clear, early error — instead of letting the node FATAL at daemon
+ * boot. A blank/undefined value is a no-op (the caller falls back to the
+ * setup default). Shared by the openclaw/hermes/mcp setup actions.
+ */
+export async function assertSelectableNetwork(name: string | undefined | null): Promise<void> {
+  const trimmed = name?.trim();
+  if (!trimmed) return;
+  const network = await loadNetworkConfig(trimmed);
+  if (!network) {
+    throw new Error(
+      `No bundled network config named "${trimmed}". Common options: ${SELECTABLE_SETUP_NETWORKS.join(', ')}.`,
+    );
+  }
+  const readiness = validateNetworkConfigReadiness(network);
+  if (!readiness.ok) {
+    throw new Error(
+      `Network "${trimmed}" is not available yet:\n${readiness.messages.join('\n')}`,
+    );
   }
 }
 

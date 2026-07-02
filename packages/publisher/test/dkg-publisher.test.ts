@@ -49,6 +49,18 @@ function q(s: string, p: string, o: string, g = GRAPH): Quad {
   return { subject: s, predicate: p, object: o, graph: g };
 }
 
+// rc.17 uniform per-KA layout: a confirmed publish writes the KA's public
+// quads + SelfAttested trust stamp into a PER-KA verifiable-memory named graph
+// `did:dkg:context-graph:{cg}/_verifiable_memory/{author}/{number}`, where
+// author+number are unpacked from the on-chain kaId — NOT the monolithic root
+// data graph. Compute that graph from a publish result's kaId so tests can
+// assert against the graph the data actually lives in.
+function verifiableMemoryGraph(kaId: bigint): string {
+  const number = kaId & ((1n << 96n) - 1n);
+  const author = '0x' + (kaId >> 96n).toString(16).padStart(40, '0');
+  return `did:dkg:context-graph:${CONTEXT_GRAPH}/_verifiable_memory/${author}/${number}`;
+}
+
 describe('DKGPublisher', () => {
   let publisher: DKGPublisher;
   let store: OxigraphStore;
@@ -63,7 +75,11 @@ describe('DKGPublisher', () => {
     const coreOp = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
     await mintTokens(_provider, hubAddress, HARDHAT_KEYS.DEPLOYER, coreOp.address, ethers.parseEther('50000000'));
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
-    const cgId = await createTestContextGraph(chain);
+    // PR #1072: these tests publish PLAINTEXT to exercise lifecycle/mint/update/
+    // event/UAL/reserved-namespace/share mechanics (no ciphertext commitment),
+    // so use a PUBLIC CG (accessPolicy 0) — a curated CG would now revert with
+    // CuratedCGRequiresCiphertextCommitment.
+    const cgId = await createTestContextGraph(chain, undefined, 0);
     CONTEXT_GRAPH = String(cgId);
     GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
     _kav10Address = await chain.getKnowledgeAssetsLifecycleAddress();
@@ -153,11 +169,15 @@ describe('DKGPublisher', () => {
     expect(result.kaManifest[0].rootEntity).toBe(ENTITY);
     expect(result.status).toBe('confirmed');
 
-    const count = await store.countQuads(GRAPH);
+    // rc.17 per-KA layout: the 2 published data quads + the 1 SelfAttested
+    // trust stamp now live in the per-KA verifiable-memory graph, not the root
+    // data graph. Assert the same 3-quad count against that graph.
+    const vmGraph = verifiableMemoryGraph(result.kaId);
+    const count = await store.countQuads(vmGraph);
     expect(count).toBe(3);
     const trust = await store.query(
       `SELECT ?level WHERE {
-        GRAPH <${GRAPH}> {
+        GRAPH <${vmGraph}> {
           <${ENTITY}> <${TRUST_LEVEL_PREDICATE}> ?level .
         }
       }`,
@@ -211,8 +231,11 @@ describe('DKGPublisher', () => {
     expect(result.kaManifest).toHaveLength(1);
     expect(result.status).toBe('confirmed');
 
+    // rc.17 per-KA layout: published quads (skolemized blank nodes included)
+    // land in the per-KA verifiable-memory graph, not the root data graph.
+    const vmGraph = verifiableMemoryGraph(result.kaId);
     const queryResult = await store.query(
-      `SELECT ?s WHERE { GRAPH <${GRAPH}> { ?s ?p ?o } }`,
+      `SELECT ?s WHERE { GRAPH <${vmGraph}> { ?s ?p ?o } }`,
     );
     if (queryResult.type === 'bindings') {
       const subjects = queryResult.bindings.map((b) => b['s']);
@@ -273,8 +296,13 @@ describe('DKGPublisher', () => {
     expect(updated.merkleRoot).not.toEqual(initial.merkleRoot);
     expect(updated.status).toBe('confirmed');
 
+    // rc.17 per-KA layout: a KA update DELETE+REWRITEs the per-KA
+    // verifiable-memory graph (computed from the update's batchId, which equals
+    // the original publish's kaId), not the monolithic root data graph. Assert
+    // the post-update name against that per-KA graph.
+    const vmGraph = verifiableMemoryGraph(initial.kaId);
     const result = await store.query(
-      `SELECT ?name WHERE { GRAPH <${GRAPH}> { <${ENTITY}> <http://schema.org/name> ?name } }`,
+      `SELECT ?name WHERE { GRAPH <${vmGraph}> { <${ENTITY}> <http://schema.org/name> ?name } }`,
     );
     if (result.type === 'bindings') {
       expect(result.bindings).toHaveLength(1);
@@ -323,8 +351,10 @@ describe('DKGPublisher', () => {
     });
 
     const metaGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_meta`;
+    // RFC ka-metadata-trim: KC rows no longer carry `rdf:type
+    // dkg:KnowledgeCollection` — resolve the UAL by its `dkg:status` row.
     const metaResult = await store.query(
-      `SELECT ?ual WHERE { GRAPH <${metaGraph}> { ?ual <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://dkg.io/ontology/KnowledgeCollection> } }`,
+      `SELECT ?ual WHERE { GRAPH <${metaGraph}> { ?ual <http://dkg.io/ontology/status> ?status } }`,
     );
 
     expect(metaResult.type).toBe('bindings');

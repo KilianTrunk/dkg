@@ -704,7 +704,7 @@ describe('E2E: Edge node participates in context graph governance', () => {
      * confirmation OR an intentional-local-skip branch fires. A reject
      * is neither, so the pre-PR2 "triples still land in the data graph
      * on tentative" invariant this test used to validate is GONE on
-     * purpose (it was the LU-1 / PR2 verified-memory leak — see
+     * purpose (it was the LU-1 / PR2 verifiable-memory leak — see
      * `automated.test.ts §2`).
      *
      * What's still meaningful to check here is the inverse: the failed

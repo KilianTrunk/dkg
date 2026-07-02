@@ -45,7 +45,7 @@ test.describe('Memory Layer Views (rc.12 project layer switcher)', () => {
     });
   });
 
-  test.describe('Verified Memory', () => {
+  test.describe('Verifiable Memory', () => {
     test.beforeEach(async ({ shell, leftPanel }) => {
       await shell.goto();
       await leftPanel.expandProject(PRIMARY_CG);

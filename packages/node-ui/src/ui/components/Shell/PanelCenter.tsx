@@ -29,6 +29,10 @@ const SettingsView = React.lazy(() =>
   import('../../pages/Settings.js').then((m) => ({ default: m.SettingsPage }))
 );
 
+const AdminView = React.lazy(() =>
+  import('../../pages/Admin.js').then((m) => ({ default: m.AdminPage }))
+);
+
 const AgentProfilePage = React.lazy(() =>
   import('../AgentProfilePage.js').then((m) => ({ default: m.AgentProfilePage }))
 );
@@ -295,6 +299,14 @@ function ViewContainer() {
     return (
       <Suspense fallback={<div className="lazy-spinner">Loading settings...</div>}>
         <SettingsView />
+      </Suspense>
+    );
+  }
+
+  if (activeTabId === 'admin') {
+    return (
+      <Suspense fallback={<div className="lazy-spinner">Loading admin...</div>}>
+        <AdminView />
       </Suspense>
     );
   }

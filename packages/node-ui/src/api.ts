@@ -610,34 +610,34 @@ export async function handleNodeUIRequest(
         'as part of the openclaw-dkg-primary-memory workstream.',
       // Codex B64: callers following this pointer for the first write to
       // a fresh project CG need the create step before the write step —
-      // `POST /api/assertion/:name/write` fails if the assertion does not
-      // already exist. List both routes in order so the migration path is
-      // reachable for both existing and brand-new assertions. The previous
-      // `dkg_memory_import` adapter-tool replacement was retired along
-      // with this endpoint (see eccbe19d) and has been dropped from this
-      // list so non-OpenClaw callers do not chase a tool that no longer
+      // `POST /api/knowledge-assets/:name/wm/write` fails if the assertion
+      // does not already exist. List both routes in order so the migration
+      // path is reachable for both existing and brand-new assertions. The
+      // previous `dkg_memory_import` adapter-tool replacement was retired
+      // along with this endpoint (see eccbe19d) and has been dropped from
+      // this list so non-OpenClaw callers do not chase a tool that no longer
       // exists.
       replacements: [
         {
           surface: 'daemon HTTP route',
           method: 'POST',
-          path: '/api/assertion/create',
+          path: '/api/knowledge-assets',
           description:
             'One-time assertion bootstrap for a fresh project context graph. ' +
             'POST `{ contextGraphId, name: "memory" }` to create the WM assertion ' +
             'on first use. Idempotent: already-created assertions are a no-op. ' +
-            'Call this before the first `/api/assertion/:name/write` on a new CG; ' +
+            'Call this before the first `/api/knowledge-assets/:name/wm/write` on a new CG; ' +
             'subsequent writes do not need it.',
         },
         {
           surface: 'daemon HTTP route',
           method: 'POST',
-          path: '/api/assertion/:name/write',
+          path: '/api/knowledge-assets/:name/wm/write',
           description:
             'Direct V10 WM assertion write route on the daemon. Use when writing from ' +
             'a non-OpenClaw caller (CLI, external agent, MCP server) that already has a ' +
             'resolved context graph id and peer identity. The assertion at `:name` must ' +
-            'exist first — bootstrap it via `POST /api/assertion/create` on a fresh CG.',
+            'exist first — bootstrap it via `POST /api/knowledge-assets` on a fresh CG.',
         },
       ],
     });

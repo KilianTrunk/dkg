@@ -13,7 +13,7 @@ export interface VerifyCollectorDeps {
   /**
    * Returns peer IDs eligible to ACK a verify proposal for the given CG.
    * The collector forwards proposal payloads (with `contextGraphId`,
-   * `verifiedMemoryId`, `batchId`, root entities) to every returned
+   * `verifiableMemoryId`, `batchId`, root entities) to every returned
    * peer, so this set MUST be filtered to peers that legitimately can
    * see the CG — leaking proposals to unrelated peers is a privacy
    * regression (Codex PR #595 round-5). Async return is allowed so
@@ -45,7 +45,7 @@ export interface VerifyCollectionResult {
   approvals: CollectedApproval[];
   merkleRoot: Uint8Array;
   contextGraphId: string;
-  verifiedMemoryId: bigint;
+  verifiableMemoryId: bigint;
   requiredRemoteApprovals: number;
   quorumReached: boolean;
 }
@@ -88,7 +88,7 @@ export class VerifyCollector {
   async collect(params: {
     contextGraphId: string;
     contextGraphIdOnChain: bigint;
-    verifiedMemoryId: bigint;
+    verifiableMemoryId: bigint;
     batchId: bigint;
     merkleRoot: Uint8Array;
     entities: string[];
@@ -114,7 +114,7 @@ export class VerifyCollector {
     allowPartial?: boolean;
   }): Promise<VerifyCollectionResult> {
     const {
-      contextGraphId, contextGraphIdOnChain, verifiedMemoryId,
+      contextGraphId, contextGraphIdOnChain, verifiableMemoryId,
       batchId, merkleRoot, entities, proposerSignature,
       timeoutMs, allowPartial = false,
       proposerCountsTowardQuorum = true,
@@ -166,7 +166,7 @@ export class VerifyCollector {
     const toLong = (n: bigint) => ({ low: Number(n & 0xFFFFFFFFn), high: Number((n >> 32n) & 0xFFFFFFFFn), unsigned: true });
     const proposal: VerifyProposalMsg = {
       proposalId,
-      verifiedMemoryId: toLong(verifiedMemoryId),
+      verifiableMemoryId: toLong(verifiableMemoryId),
       batchId: toLong(batchId),
       merkleRoot,
       entities,
@@ -194,7 +194,7 @@ export class VerifyCollector {
           approvals: [],
           merkleRoot,
           contextGraphId,
-          verifiedMemoryId,
+          verifiableMemoryId,
           requiredRemoteApprovals: remoteRequired,
           quorumReached: false,
         };
@@ -214,7 +214,7 @@ export class VerifyCollector {
         approvals: [],
         merkleRoot,
         contextGraphId,
-        verifiedMemoryId,
+        verifiableMemoryId,
         requiredRemoteApprovals: 0,
         quorumReached: true,
       };
@@ -314,7 +314,7 @@ export class VerifyCollector {
       approvals: collected.slice(0, remoteRequired),
       merkleRoot,
       contextGraphId,
-      verifiedMemoryId,
+      verifiableMemoryId,
       requiredRemoteApprovals: remoteRequired,
       quorumReached,
     };

@@ -18,7 +18,7 @@ import {
   contextGraphPublishTopic, contextGraphWorkspaceTopic, contextGraphAppTopic, contextGraphUpdateTopic, contextGraphFinalizationTopic,
   contextGraphDataGraphUri, contextGraphMetaGraphUri, contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
   contextGraphSharedMemoryUri,
-  contextGraphVerifiedMemoryUri, contextGraphVerifiedMemoryMetaUri,
+  contextGraphVerifiableMemoryUri, contextGraphVerifiableMemoryMetaUri,
   contextGraphDataUri, contextGraphMetaUri, assertionLifecycleUri, contextGraphAssertionUri,
   deriveCuratorDidFromCgId,
   MemoryLayer,
@@ -416,7 +416,11 @@ export class ContextGraphRegistryMethods extends DKGAgentBase {
     return owned !== undefined && owned.size > 0;
   }
 
-  async getContextGraphOnChainId(this: DKGAgent, contextGraphId: string): Promise<string | null> {
+  async getContextGraphOnChainId(
+    this: DKGAgent,
+    contextGraphId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<string | null> {
     const subscribed = this.subscribedContextGraphs.get(contextGraphId)?.onChainId;
     if (subscribed) return subscribed;
 
@@ -424,6 +428,7 @@ export class ContextGraphRegistryMethods extends DKGAgentBase {
     const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
     const result = await this.store.query(
       `SELECT ?id WHERE { GRAPH <${ontologyGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId> ?id } } LIMIT 1`,
+      { signal: options.signal },
     );
     if (result.type !== 'bindings' || result.bindings.length === 0) return null;
     const value = result.bindings[0]?.['id'];
@@ -469,7 +474,26 @@ export class ContextGraphRegistryMethods extends DKGAgentBase {
    * unavailable, contract not deployed, transient errors) are logged
    * and the field is left undefined.
    */
-  async getContextGraphOnChainPolicy(this: DKGAgent, contextGraphId: string): Promise<{
+  async getContextGraphOnChainPolicy(this: DKGAgent, contextGraphId: string, options?: {
+    /**
+     * Cap the age (ms) of a cached `publishPolicy` entry this call will accept;
+     * default `ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS` (60s). `publishPolicy` is
+     * mutable on-chain (`PublishPolicyUpdated`) and the agent has no event
+     * watcher, so the cache can be stale-PERMISSIVE for up to its age after an
+     * owner downgrades open→curated publish. Most callers (e.g. the
+     * import-artifact owner guard) tolerate the full 60s. A SECURITY-POSITIVE
+     * admission decision (host-mode self-signed plaintext ingest, see
+     * `isConfirmedPublicForHostMode`) passes a SHORT window
+     * (`HOST_MODE_PUBLISH_POLICY_MAX_CACHE_AGE_MS` = 5s): an open→curated
+     * downgrade is then honored within seconds, AND — because the resolver
+     * writes through to this same cache — the chain RPC is rate-capped to ~1
+     * per window per CG instead of an `eth_call` on every admitted envelope
+     * (Branimir review #1239 follow-on). An RPC failure/timeout still leaves
+     * `publishPolicy` undefined → the caller fails closed. (`accessPolicy` is
+     * immutable on-chain, so its cache read below is left un-TTL'd.)
+     */
+    publishPolicyMaxCacheAgeMs?: number;
+  }): Promise<{
     accessPolicy?: number;
     publishPolicy?: number;
   }> {
@@ -487,7 +511,12 @@ export class ContextGraphRegistryMethods extends DKGAgentBase {
     const isPublishPolicyCacheFresh = (key: string): boolean => {
       const fetchedAt = this.onChainPublishPolicyCacheUpdatedAt.get(key);
       if (fetchedAt === undefined) return false;
-      return Date.now() - fetchedAt <= ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS;
+      // A security-positive caller can shrink the accepted cache age (e.g. the
+      // host-mode admission gate passes ~5s) so an open→curated downgrade is
+      // re-verified within seconds, while still rate-capping the chain RPC to
+      // ~1 per window per CG. Default is the general 60s TTL.
+      const maxAge = options?.publishPolicyMaxCacheAgeMs ?? ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS;
+      return Date.now() - fetchedAt <= maxAge;
     };
     let publishPolicy = isPublishPolicyCacheFresh(contextGraphId)
       ? this.onChainPublishPolicyCache.get(contextGraphId)
@@ -701,20 +730,7 @@ export class ContextGraphRegistryMethods extends DKGAgentBase {
     if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) {
       return undefined;
     }
-    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
-    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
-    const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
-    const result = await this.store.query(
-      `SELECT ?policy WHERE {
-        { GRAPH <${ontologyGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?policy } }
-        UNION
-        { GRAPH <${cgMetaGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?policy } }
-      } LIMIT 1`,
-    );
-    if (result.type !== 'bindings' || result.bindings.length === 0) return undefined;
-    const raw = result.bindings[0]?.['policy'];
-    if (typeof raw !== 'string') return undefined;
-    const stripped = raw.replace(/^"|"$/g, '');
+    const stripped = (await this.getCgMeta(contextGraphId)).accessPolicy;
     if (stripped === 'public') return 0;
     if (stripped === 'private') return 1;
     return undefined;
@@ -768,19 +784,13 @@ export class ContextGraphRegistryMethods extends DKGAgentBase {
    * Get the peer allowlist for a context graph (if curated).
    * Returns null if no allowlist is set (open CG).
    */
-  async getContextGraphAllowedPeers(this: DKGAgent, contextGraphId: string): Promise<string[] | null> {
-    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
-    const contextGraphUri = contextGraphDataGraphUri(contextGraphId);
-    const result = await this.store.query(
-      `SELECT ?peer WHERE { GRAPH <${cgMetaGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ALLOWED_PEER}> ?peer } }`,
-    );
-    if (result.type !== 'bindings' || result.bindings.length === 0) {
-      return null;
-    }
-    return result.bindings
-      .map(row => row['peer'])
-      .filter((v): v is string => typeof v === 'string')
-      .map(v => v.replace(/^"|"$/g, ''));
+  async getContextGraphAllowedPeers(
+    this: DKGAgent,
+    contextGraphId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<string[] | null> {
+    const peers = (await this.getCgMeta(contextGraphId, { signal: options.signal })).allowedPeers;
+    return peers.length > 0 ? peers : null;
   }
 
   // ── Sub-Graph Management ───────────────────────────────────────────────
@@ -837,6 +847,7 @@ export class ContextGraphRegistryMethods extends DKGAgentBase {
 
     await gm.ensureSubGraph(contextGraphId, subGraphName);
     await this.store.insert(registrationQuads);
+    this.contextGraphMetaProjection.markDirty(contextGraphId);
 
     this.log.info(
       createOperationContext('system'),
@@ -856,17 +867,7 @@ export class ContextGraphRegistryMethods extends DKGAgentBase {
     createdAt?: string;
     description?: string;
   }>> {
-    const { subGraphDiscoverySparql } = await import('@origintrail-official/dkg-publisher');
-    const sparql = subGraphDiscoverySparql(contextGraphId);
-    const result = await this.store.query(sparql);
-    if (result.type !== 'bindings') return [];
-    return result.bindings.map(row => ({
-      uri: row['subGraph'] ?? '',
-      name: stripLiteral(row['name'] ?? ''),
-      createdBy: row['createdBy'] ?? '',
-      createdAt: row['createdAt'] ? stripLiteral(row['createdAt']) : undefined,
-      description: row['description'] ? stripLiteral(row['description']) : undefined,
-    }));
+    return (await this.getCgMeta(contextGraphId)).subGraphs;
   }
 
   /**
@@ -901,7 +902,7 @@ export class ContextGraphRegistryMethods extends DKGAgentBase {
 
     // Drop assertion graphs under the sub-graph prefix
     const sgPrefix = `did:dkg:context-graph:${contextGraphId}/${subGraphName}/assertion/`;
-    const allGraphs = await this.store.listGraphs();
+    const allGraphs = await listGraphsByPrefix(this.store, sgPrefix);
     for (const g of allGraphs) {
       if (g.startsWith(sgPrefix)) {
         try { await this.store.dropGraph(g); } catch { /* graph may not exist */ }
@@ -911,6 +912,7 @@ export class ContextGraphRegistryMethods extends DKGAgentBase {
     // Clear SWM ownership cache for this sub-graph
     const ownershipKey = `${contextGraphId}\0${subGraphName}`;
     this.publisher.clearSubGraphOwnership(ownershipKey);
+    this.contextGraphMetaProjection.markDirty(contextGraphId);
 
     this.log.info(
       createOperationContext('system'),
@@ -1001,6 +1003,7 @@ export class ContextGraphRegistryMethods extends DKGAgentBase {
     }
 
     await this.store.insert(quads);
+    this.contextGraphMetaProjection.markDirtyFromQuads(quads);
     await gm.ensureContextGraph(opts.id);
 
     this.subscribeToContextGraph(opts.id);
@@ -1024,7 +1027,7 @@ export class ContextGraphRegistryMethods extends DKGAgentBase {
     const target = `<${targetUalOrRoot}>`;
     const namespaces = ['http://dkg.io/ontology/', 'https://dkg.network/ontology#'];
     const existsPatterns = [
-      `GRAPH <${dataGraph}> { ${target} ?p ?o } BIND(${target} AS ?hit)`,
+      `GRAPH ?vmg { ${target} ?p ?o } FILTER(STRSTARTS(STR(?vmg), "${dataGraph}/_verifiable_memory/") || STR(?vmg) = "${dataGraph}") BIND(${target} AS ?hit)`,
       `GRAPH <${metaGraph}> { ${target} ?p ?o } BIND(${target} AS ?hit)`,
       ...namespaces.flatMap((ns) => [
         `GRAPH <${metaGraph}> { ?ka <${ns}rootEntity> ${target} } BIND(${target} AS ?hit)`,
@@ -1041,6 +1044,10 @@ export class ContextGraphRegistryMethods extends DKGAgentBase {
       );
     }
 
+    // Read-both note (RFC ka-metadata-trim P3.1): the first pattern matches
+    // the collapsed shape (`rootEntity` directly on the UAL target), the
+    // second the legacy `<ual>/<n> partOf <ual>` token rows synced from older
+    // nodes. Both were already queried here — no migration needed.
     const rootPatterns = namespaces.flatMap((ns) => [
       `GRAPH <${metaGraph}> { ${target} <${ns}rootEntity> ?root . }`,
       `GRAPH <${metaGraph}> { ?ka <${ns}partOf> ${target} ; <${ns}rootEntity> ?root . }`,
@@ -1091,6 +1098,12 @@ export class ContextGraphRegistryMethods extends DKGAgentBase {
     return [...subjects];
   }
 
-  // ── ENDORSE ─���────────────────────────────────────────────────────────
+  // ENDORSE
 
+}
+
+async function listGraphsByPrefix(store: TripleStore, prefix: string): Promise<string[]> {
+  return store.listGraphsByPrefix
+    ? store.listGraphsByPrefix(prefix)
+    : (await store.listGraphs()).filter((graph) => graph.startsWith(prefix));
 }

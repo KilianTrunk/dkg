@@ -157,6 +157,39 @@ def _looks_already_exists(message: Any) -> bool:
     return "already exists" in lower or "already exist" in lower or "already registered" in lower
 
 
+def _client_result_failed(result: Any) -> bool:
+    """Canonical failure detector for daemon responses.
+
+    Mirrors ``_client_result_failed`` in ``__init__.py`` so the multi-root
+    publish loop can stop on the first failing root without importing the
+    plugin module (which would be circular). All ``_post``/``_get`` failure
+    shapes set ``success: False`` (and/or carry an ``error``), so the same
+    three-way check applies here.
+    """
+    if not isinstance(result, dict):
+        return False
+    return result.get("success") is False or result.get("ok") is False or bool(result.get("error"))
+
+
+def _to_write_quads(quads: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Map each quad to exactly {subject, predicate, object} for a WM write.
+
+    The write wire shape is {subject,predicate,object} only — the daemon pins
+    every triple to the per-KA WM graph itself and silently overrides any
+    client-supplied ``graph`` (CONTRACT §0 invariant 2 / §A). Strip ``graph``
+    (and any other extra key) HERE in the client, not just in the tool schema:
+    a hand-built quad object or a passthrough map can still carry ``graph``.
+    """
+    return [
+        {
+            "subject": q.get("subject"),
+            "predicate": q.get("predicate"),
+            "object": q.get("object"),
+        }
+        for q in quads
+    ]
+
+
 def _is_blocked_import_path(path: Path) -> bool:
     name = path.name.lower()
     if name in _BLOCKED_IMPORT_NAMES:
@@ -349,15 +382,36 @@ class DKGClient:
 
     # -- Assertions (Working Memory) -------------------------------------------
 
-    def create_assertion(self, context_graph_id: str, name: str, sub_graph_name: Optional[str] = None) -> Dict[str, Any]:
-        """POST /api/assertion/create — create a WM assertion. Returns { assertionUri }."""
+    def create_assertion(self, context_graph_id: str, name: str, sub_graph_name: Optional[str] = None,
+                          quads: Optional[List[Dict[str, str]]] = None,
+                          also_share_swm: bool = False) -> Dict[str, Any]:
+        """POST /api/knowledge-assets — create a WM assertion. Returns { assertionUri }.
+
+        [D3] When ``quads`` are supplied, the daemon's create route writes them
+        into the new draft and SEALS it in the same call (``finalize`` defaults
+        true when quads are present). Pass ``also_share_swm=True`` to additionally
+        SHARE the sealed asset to Shared Working Memory in that one call. The
+        create route stays a primitive otherwise (create-only, no quads) — the
+        share is opt-in and never defaulted, so a bare create still stops at an
+        empty WM draft (knowledge-assets.ts:705-722).
+        """
         payload: Dict[str, Any] = {
             "contextGraphId": _normalize_context_graph_id(context_graph_id),
             "name": name,
         }
         if sub_graph_name:
             payload["subGraphName"] = sub_graph_name
-        result = self._post("/api/assertion/create", payload)
+        if quads:
+            # Same write wire shape as write_assertion (CONTRACT §A): the daemon
+            # pins every triple to the per-KA WM graph, so strip any per-quad graph.
+            payload["quads"] = _to_write_quads(quads)
+            # alsoShareSwm only advances a SEALED asset; the daemon seals when
+            # quads are present (finalize default-true), then shares when this is
+            # true. Sent only when sharing is requested so a plain create+write
+            # is unaffected.
+            if also_share_swm:
+                payload["alsoShareSwm"] = True
+        result = self._post("/api/knowledge-assets", payload)
         if isinstance(result, dict) and result.get("success") is False and _looks_already_exists(result.get("error")):
             return {
                 "success": True,
@@ -369,32 +423,35 @@ class DKGClient:
 
     def write_assertion(self, assertion_name: str, context_graph_id: str, quads: List[Dict[str, str]],
                         sub_graph_name: Optional[str] = None) -> Dict[str, Any]:
-        """POST /api/assertion/{name}/write — write quads to the assertion graph."""
+        """POST /api/knowledge-assets/{name}/wm/write — write quads to the assertion graph."""
         payload: Dict[str, Any] = {
             "contextGraphId": _normalize_context_graph_id(context_graph_id),
-            "quads": quads,
+            # Strip any per-quad `graph` at the client (CONTRACT §A) — the wire
+            # shape is {subject,predicate,object} only, daemon-pinned.
+            "quads": _to_write_quads(quads),
         }
         if sub_graph_name:
             payload["subGraphName"] = sub_graph_name
-        return self._post(f"/api/assertion/{quote(assertion_name, safe='')}/write", payload)
+        return self._post(f"/api/knowledge-assets/{quote(assertion_name, safe='')}/wm/write", payload)
 
     def query_assertion(self, assertion_name: str, context_graph_id: str, sparql: str = "",
                         sub_graph_name: Optional[str] = None) -> Dict[str, Any]:
         """Query an assertion scope.
 
-        Returns assertion quads from ``/api/assertion/{name}/query``. When
-        SPARQL is supplied, pass it as a hint for daemons that support
-        assertion-local filtering; callers must tolerate full-assertion results
-        from current daemons.
+        Returns assertion quads from
+        ``GET /api/knowledge-assets/{name}/wm/quads``. This endpoint dumps the
+        full assertion graph; the ``sparql`` argument is accepted for API
+        compatibility but is not sent — callers must tolerate full-assertion
+        results.
         """
-        payload: Dict[str, Any] = {
+        params: Dict[str, str] = {
             "contextGraphId": _normalize_context_graph_id(context_graph_id),
         }
         if sub_graph_name:
-            payload["subGraphName"] = sub_graph_name
-        if sparql and sparql.strip():
-            payload["sparql"] = sparql
-        return self._post(f"/api/assertion/{quote(assertion_name, safe='')}/query", payload)
+            params["subGraphName"] = sub_graph_name
+        return self._get(
+            f"/api/knowledge-assets/{quote(assertion_name, safe='')}/wm/quads?{urlencode(params)}"
+        )
 
     def resolve_import_artifact(
         self,
@@ -414,7 +471,7 @@ class DKGClient:
             payload["fileHash"] = file_hash
         if sub_graph_name:
             payload["subGraphName"] = sub_graph_name
-        return self._post("/api/assertion/import-artifact/resolve", payload)
+        return self._post("/api/knowledge-assets/import-artifact/resolve", payload)
 
     def read_import_artifact_markdown(
         self,
@@ -437,7 +494,7 @@ class DKGClient:
             payload["subGraphName"] = sub_graph_name
         if max_bytes is not None:
             payload["maxBytes"] = max_bytes
-        return self._post("/api/assertion/import-artifact/read-markdown", payload)
+        return self._post("/api/knowledge-assets/import-artifact/read-markdown", payload)
 
     def write_semantic_enrichment(
         self,
@@ -470,12 +527,17 @@ class DKGClient:
             payload["generatedAt"] = generated_at
         if sub_graph_name:
             payload["subGraphName"] = sub_graph_name
-        return self._post("/api/assertion/semantic-enrichment/write", payload)
+        return self._post("/api/knowledge-assets/semantic-enrichment/write", payload)
 
     def promote_assertion(self, assertion_name: str, context_graph_id: str,
                           entities: Optional[Any] = None,
-                          sub_graph_name: Optional[str] = None) -> Dict[str, Any]:
-        """POST /api/assertion/{name}/promote — promote assertion to SWM."""
+                          sub_graph_name: Optional[str] = None,
+                          skip_seal: Optional[bool] = None) -> Dict[str, Any]:
+        """POST /api/knowledge-assets/{name}/swm/share — promote assertion to SWM.
+
+        A full share SEALS BY DEFAULT (publish-ready). ``skip_seal=True`` opts
+        out into an unsealed SWM share (camelCase ``skipSeal`` on the wire).
+        """
         payload: Dict[str, Any] = {
             "contextGraphId": _normalize_context_graph_id(context_graph_id),
         }
@@ -483,26 +545,98 @@ class DKGClient:
             payload["entities"] = entities
         if sub_graph_name:
             payload["subGraphName"] = sub_graph_name
-        return self._post(f"/api/assertion/{quote(assertion_name, safe='')}/promote", payload)
+        if skip_seal is not None:
+            payload["skipSeal"] = skip_seal
+        return self._post(f"/api/knowledge-assets/{quote(assertion_name, safe='')}/swm/share", payload)
 
-    def discard_assertion(self, assertion_name: str, context_graph_id: str,
-                          sub_graph_name: Optional[str] = None) -> Dict[str, Any]:
-        """POST /api/assertion/{name}/discard — discard a WM assertion."""
+    def finalize_assertion(self, assertion_name: str, context_graph_id: str,
+                           sub_graph_name: Optional[str] = None,
+                           author_agent_address: Optional[str] = None,
+                           scheme_version: Optional[int] = None,
+                           layer: Optional[str] = None) -> Dict[str, Any]:
+        """POST /api/knowledge-assets/{name}/wm/finalize — seal the WM draft.
+
+        Computes the merkle root and signs the EIP-712 AuthorAttestation
+        node-side. Finalize always seals the WHOLE draft (no subset parameter).
+        ``author_agent_address`` attributes the seal to a specific agent EOA;
+        omit it to let the daemon default the author to the request token's
+        agent. The pre-signed attestation path is intentionally NOT exposed —
+        Hermes relies on node-side signing, exactly like OpenClaw/MCP (no
+        client-side EIP-712, no raw preSignedAuthorAttestation). ``layer``
+        selects WHERE the content to seal lives: "wm" (default) seals the open
+        WM draft; "swm" seals an asset already shared to SWM.
+        """
         payload: Dict[str, Any] = {"contextGraphId": _normalize_context_graph_id(context_graph_id)}
         if sub_graph_name:
             payload["subGraphName"] = sub_graph_name
-        return self._post(f"/api/assertion/{quote(assertion_name, safe='')}/discard", payload)
+        if author_agent_address:
+            payload["authorAgentAddress"] = author_agent_address
+        if scheme_version is not None:
+            payload["schemeVersion"] = scheme_version
+        if layer is not None:
+            payload["layer"] = layer
+        return self._post(f"/api/knowledge-assets/{quote(assertion_name, safe='')}/wm/finalize", payload)
+
+    def publish_finalized_assertion(self, assertion_name: str, context_graph_id: str,
+                                    sub_graph_name: Optional[str] = None,
+                                    options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """POST /api/knowledge-assets/{name}/vm/publish — publish a sealed KA.
+
+        This is the Fork-1 (finalized-assertion) publish: multi-root safe, the
+        seal selects the author and the whole asset. The daemon REJECTS
+        ``assertionName``, author overrides, and any ``selection`` — never send
+        them (knowledge-assets.ts:307-343). ``options`` carries the nested
+        finalized-publish controls ({ publishEpochs?, clearSharedMemoryAfter?,
+        publisherNodeIdentityIdOverride? }). Surfaces { kaId, ual, txHash,
+        status } on success; 409 VM_PUBLISH_PRECONDITION when not finalized +
+        shared.
+        """
+        payload: Dict[str, Any] = {"contextGraphId": _normalize_context_graph_id(context_graph_id)}
+        if sub_graph_name:
+            payload["subGraphName"] = sub_graph_name
+        if options:
+            payload["options"] = options
+        return self._post(f"/api/knowledge-assets/{quote(assertion_name, safe='')}/vm/publish", payload)
+
+    def pull_from(self, assertion_name: str, context_graph_id: str, layer: str,
+                  on_conflict: Optional[str] = None,
+                  sub_graph_name: Optional[str] = None) -> Dict[str, Any]:
+        """POST /api/knowledge-assets/{name}/wm/pull-from — reseed a WM draft.
+
+        Seeds a fresh Working Memory draft from the asset's current Shared
+        Working Memory (``layer="swm"``) or Verifiable Memory (``layer="vm"``)
+        state — the edit-loop primitive (git checkout). ``on_conflict`` defaults
+        to "reject" server-side; pass "replace" to overwrite a dirty draft
+        (otherwise an open draft 409s WM_DRAFT_CONFLICT).
+        """
+        payload: Dict[str, Any] = {
+            "contextGraphId": _normalize_context_graph_id(context_graph_id),
+            "layer": layer,
+        }
+        if on_conflict:
+            payload["onConflict"] = on_conflict
+        if sub_graph_name:
+            payload["subGraphName"] = sub_graph_name
+        return self._post(f"/api/knowledge-assets/{quote(assertion_name, safe='')}/wm/pull-from", payload)
+
+    def discard_assertion(self, assertion_name: str, context_graph_id: str,
+                          sub_graph_name: Optional[str] = None) -> Dict[str, Any]:
+        """POST /api/knowledge-assets/{name}/wm/discard — discard a WM assertion."""
+        payload: Dict[str, Any] = {"contextGraphId": _normalize_context_graph_id(context_graph_id)}
+        if sub_graph_name:
+            payload["subGraphName"] = sub_graph_name
+        return self._post(f"/api/knowledge-assets/{quote(assertion_name, safe='')}/wm/discard", payload)
 
     def assertion_history(self, assertion_name: str, context_graph_id: str,
                           agent_address: Optional[str] = None,
                           sub_graph_name: Optional[str] = None) -> Dict[str, Any]:
-        """GET /api/assertion/{name}/history — read assertion lifecycle metadata."""
+        """GET /api/knowledge-assets/{name} — read assertion lifecycle metadata."""
         params: Dict[str, str] = {"contextGraphId": _normalize_context_graph_id(context_graph_id)}
         if agent_address:
             params["agentAddress"] = agent_address
         if sub_graph_name:
             params["subGraphName"] = sub_graph_name
-        return self._get(f"/api/assertion/{quote(assertion_name, safe='')}/history?{urlencode(params)}")
+        return self._get(f"/api/knowledge-assets/{quote(assertion_name, safe='')}?{urlencode(params)}")
 
     def import_assertion_file(
         self,
@@ -513,7 +647,7 @@ class DKGClient:
         ontology_ref: Optional[str] = None,
         sub_graph_name: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """POST /api/assertion/{name}/import-file — upload a local document."""
+        """POST /api/knowledge-assets/{name}/wm/import-file — upload a local document."""
         try:
             try:
                 path = Path(file_path).expanduser().resolve(strict=True)
@@ -546,7 +680,7 @@ class DKGClient:
                 files = {"file": (path.name, fh, guessed_type)}
                 import requests
                 r = requests.post(
-                    f"{self.base_url}/api/assertion/{quote(assertion_name, safe='')}/import-file",
+                    f"{self.base_url}/api/knowledge-assets/{quote(assertion_name, safe='')}/wm/import-file",
                     data=data,
                     files=files,
                     headers=headers,
@@ -561,32 +695,6 @@ class DKGClient:
         if not self._import_roots:
             return False
         return any(_path_is_relative_to(path, root) for root in self._import_roots)
-
-    # -- Shared Working Memory -------------------------------------------------
-
-    def share(self, context_graph_id: str, quads: List[Dict[str, str]],
-              sub_graph_name: Optional[str] = None) -> Dict[str, Any]:
-        """POST /api/shared-memory/write — write quads to SWM (team-visible)."""
-        payload: Dict[str, Any] = {
-            "contextGraphId": _normalize_context_graph_id(context_graph_id),
-            "quads": quads,
-        }
-        if sub_graph_name:
-            payload["subGraphName"] = sub_graph_name
-        return self._post("/api/shared-memory/write", payload)
-
-    def publish(self, context_graph_id: str, selection: Any = "all",
-                clear_after: bool = True,
-                sub_graph_name: Optional[str] = None) -> Dict[str, Any]:
-        """POST /api/shared-memory/publish — publish SWM to Verified Memory (costs TRAC)."""
-        payload: Dict[str, Any] = {
-            "contextGraphId": _normalize_context_graph_id(context_graph_id),
-            "selection": selection,
-            "clearAfter": clear_after,
-        }
-        if sub_graph_name:
-            payload["subGraphName"] = sub_graph_name
-        return self._post("/api/shared-memory/publish", payload)
 
     # -- Context Graphs --------------------------------------------------------
 

@@ -82,7 +82,7 @@ describe('subGraphOf — reserved-bookkeeping slug guards (fold-in #5)', () => {
   // internal bookkeeping prefixes, neither is a user-facing slug.
   it('returns undefined for `meta` bookkeeping graphs (GH #806)', () => {
     expect(subGraphOf('did:dkg:context-graph:cg-1/meta/_shared_memory', 'cg-1')).toBeUndefined();
-    expect(subGraphOf('did:dkg:context-graph:cg-1/meta/_verified_memory', 'cg-1')).toBeUndefined();
+    expect(subGraphOf('did:dkg:context-graph:cg-1/meta/_verifiable_memory', 'cg-1')).toBeUndefined();
     expect(subGraphOf('did:dkg:context-graph:cg-1/meta', 'cg-1')).toBeUndefined();
   });
 

@@ -183,30 +183,46 @@ http_post_capture() {
 q() { echo "{\"subject\":\"$1\",\"predicate\":\"$2\",\"object\":\"$3\",\"graph\":\"\"}"; }
 ql() { echo "{\"subject\":\"$1\",\"predicate\":\"$2\",\"object\":\"\\\"$3\\\"\",\"graph\":\"\"}"; }
 
-swm_publish() {
-  local port=$1 cg=$2
-  shift 2
+ka_create_share() {
+  local port=$1 cg=$2 name=$3 sub_graph=$4
+  shift 4
   local quads="$*"
-
-  local write_resp
-  write_resp=$(c -X POST "http://127.0.0.1:$port/api/shared-memory/write" -d "{
-    \"contextGraphId\":\"$cg\",
-    \"quads\":[$quads]
-  }")
-  local write_ok
-  write_ok=$(json_get "$write_resp" triplesWritten)
-  if [[ "$write_ok" == "__NONE__" || "$write_ok" == "0" ]]; then
-    echo "$write_resp"
-    return 1
+  local sub_graph_json=""
+  if [[ -n "$sub_graph" ]]; then
+    sub_graph_json=",\"subGraphName\":\"$sub_graph\""
   fi
+  c -X POST "http://127.0.0.1:$port/api/knowledge-assets" -d "{
+    \"contextGraphId\":\"$cg\",
+    \"name\":\"$name\"$sub_graph_json,
+    \"quads\":[$quads],
+    \"finalize\":true,
+    \"alsoShareSwm\":true
+  }"
+}
 
-  sleep 2
-
-  local pub_resp
-  pub_resp=$(c -X POST "http://127.0.0.1:$port/api/shared-memory/publish" -d "{
+ka_publish() {
+  local port=$1 cg=$2 name=$3
+  c -X POST "http://127.0.0.1:$port/api/knowledge-assets/$name/vm/publish" -d "{
     \"contextGraphId\":\"$cg\"
-  }")
-  echo "$pub_resp"
+  }"
+}
+
+ka_publish_async() {
+  local port=$1 cg=$2 name=$3
+  c -X POST "http://127.0.0.1:$port/api/knowledge-assets/$name/vm/publish-async" -d "{
+    \"contextGraphId\":\"$cg\"
+  }"
+}
+
+retired_post_assert() {
+  local desc="$1" port="$2" path="$3" body="$4"
+  local retired_body retired_code
+  http_post_capture "http://127.0.0.1:$port$path" "$body" retired_body retired_code
+  if [[ "$retired_code" == "404" || "$retired_code" == "410" ]]; then
+    ok "$desc retired (HTTP $retired_code)"
+  else
+    fail "$desc unexpectedly served (HTTP $retired_code): ${retired_body:0:200}"
+  fi
 }
 
 DEVNET_NODES="${DEVNET_NODES:-}"
@@ -297,23 +313,21 @@ echo "=== SECTION 2: Shared Memory Writes (free operations) ==="
 echo ""
 
 TRAC_BEFORE=$(c "http://127.0.0.1:9202/api/wallets/balances" | python3 -c "import sys,json; print(json.load(sys.stdin)['balances'][0]['trac'])" 2>/dev/null)
-echo "  Node2 TRAC before SWM write: $TRAC_BEFORE"
+echo "  Node2 TRAC before KA create/share: $TRAC_BEFORE"
 
-SWM_W=$(c -X POST "http://127.0.0.1:9202/api/shared-memory/write" -d "{
-  \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"quads\":[
+ALICE_BOB_KA="alice-bob-$(date +%s%N)"
+SWM_W=$(ka_create_share 9202 "$CONTEXT_GRAPH" "$ALICE_BOB_KA" "" \
     $(ql 'http://example.org/entity/alice' 'http://schema.org/name' 'Alice'),
     $(ql 'http://example.org/entity/alice' 'http://schema.org/age' '30'),
     $(q 'http://example.org/entity/alice' 'http://schema.org/knows' 'http://example.org/entity/bob'),
     $(ql 'http://example.org/entity/bob' 'http://schema.org/name' 'Bob'),
     $(ql 'http://example.org/entity/bob' 'http://schema.org/age' '25')
-  ]
-}")
-swm_written=$(json_get "$SWM_W" triplesWritten)
-[[ "$swm_written" != "__NONE__" && "$swm_written" != "0" ]] && ok "SWM write OK ($swm_written triples)" || fail "SWM write failed: $SWM_W"
+)
+swm_written=$(json_get "$SWM_W" promotedCount)
+[[ "$swm_written" != "__NONE__" && "$swm_written" != "0" ]] && ok "KA create/share OK ($swm_written triples)" || fail "KA create/share failed: $SWM_W"
 
 TRAC_AFTER=$(c "http://127.0.0.1:9202/api/wallets/balances" | python3 -c "import sys,json; print(json.load(sys.stdin)['balances'][0]['trac'])" 2>/dev/null)
-check "SWM write is FREE (TRAC unchanged)" "$TRAC_BEFORE" "$TRAC_AFTER"
+check "KA create/share is FREE (TRAC unchanged)" "$TRAC_BEFORE" "$TRAC_AFTER"
 
 echo ""
 echo "--- 2b: Query SWM locally ---"
@@ -350,42 +364,52 @@ echo "=== SECTION 3: PUBLISH via SWM-first flow (WM→SWM→VM) ==="
 echo ""
 
 echo "--- 3a: Write + Publish from Node1 (core) ---"
-c -X POST "http://127.0.0.1:9201/api/shared-memory/write" -d "{
-  \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"quads\":[
+CITY1_KA="city1-ka-$(date +%s%N)"
+CITY2_KA="city2-ka-$(date +%s%N)"
+CITY1_SHARE=$(ka_create_share 9201 "$CONTEXT_GRAPH" "$CITY1_KA" "" \
     $(ql 'http://example.org/entity/city1' 'http://schema.org/name' 'Ljubljana'),
     $(q 'http://example.org/entity/city1' 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/City'),
-    $(ql 'http://example.org/entity/city1' 'http://schema.org/population' '290000'),
+    $(ql 'http://example.org/entity/city1' 'http://schema.org/population' '290000')
+)
+CITY1_SHARED=$(json_get "$CITY1_SHARE" swmShared)
+[[ "$CITY1_SHARED" == "true" ]] && ok "$CITY1_KA shared to SWM" || fail "$CITY1_KA share failed: $CITY1_SHARE"
+CITY2_SHARE=$(ka_create_share 9201 "$CONTEXT_GRAPH" "$CITY2_KA" "" \
     $(ql 'http://example.org/entity/city2' 'http://schema.org/name' 'Maribor'),
     $(q 'http://example.org/entity/city2' 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/City'),
     $(ql 'http://example.org/entity/city2' 'http://schema.org/population' '95000')
-  ]
-}" > /dev/null
+)
+CITY2_SHARED=$(json_get "$CITY2_SHARE" swmShared)
+[[ "$CITY2_SHARED" == "true" ]] && ok "$CITY2_KA shared to SWM" || fail "$CITY2_KA share failed: $CITY2_SHARE"
 sleep 2
 
-PUB1=$(c -X POST "http://127.0.0.1:9201/api/shared-memory/publish" -d "{
-  \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"selection\":[\"http://example.org/entity/city1\",\"http://example.org/entity/city2\"]
-}")
+PUB1=$(ka_publish 9201 "$CONTEXT_GRAPH" "$CITY1_KA")
+PUB2=$(ka_publish 9201 "$CONTEXT_GRAPH" "$CITY2_KA")
 PUB1_ST=$(json_get "$PUB1" status)
 PUB1_KC=$(json_get "$PUB1" kaId)
 PUB1_TX=$(json_get "$PUB1" txHash)
 PUB1_BN=$(json_get "$PUB1" blockNumber)
-PUB1_KAS=$(echo "$PUB1" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('kas',[])))" 2>/dev/null)
+PUB2_ST=$(json_get "$PUB2" status)
+PUB2_KC=$(json_get "$PUB2" kaId)
+PUB2_TX=$(json_get "$PUB2" txHash)
+PUB1_KAS=0
+[[ "$PUB1_ST" == "confirmed" || "$PUB1_ST" == "finalized" ]] && PUB1_KAS=$((PUB1_KAS + 1))
+[[ "$PUB2_ST" == "confirmed" || "$PUB2_ST" == "finalized" ]] && PUB1_KAS=$((PUB1_KAS + 1))
 
-echo "  status=$PUB1_ST kaId=$PUB1_KC tx=$PUB1_TX block=$PUB1_BN KAs=$PUB1_KAS"
-[[ "$PUB1_ST" == "confirmed" || "$PUB1_ST" == "finalized" ]] && ok "Publish from SWM succeeded ($PUB1_ST)" || fail "Publish status=$PUB1_ST: $PUB1"
-[[ "$PUB1_TX" != "__NONE__" ]] && ok "On-chain tx: $PUB1_TX" || fail "No txHash"
-[[ "$PUB1_KAS" == "2" ]] && ok "Published 2 KAs (both selected roots)" || fail "Expected 2 KAs, got $PUB1_KAS"
+echo "  city1: status=$PUB1_ST kaId=$PUB1_KC tx=$PUB1_TX block=$PUB1_BN"
+echo "  city2: status=$PUB2_ST kaId=$PUB2_KC tx=$PUB2_TX"
+[[ "$PUB1_ST" == "confirmed" || "$PUB1_ST" == "finalized" ]] && ok "$CITY1_KA VM publish succeeded ($PUB1_ST)" || fail "$CITY1_KA publish status=$PUB1_ST: $PUB1"
+[[ "$PUB2_ST" == "confirmed" || "$PUB2_ST" == "finalized" ]] && ok "$CITY2_KA VM publish succeeded ($PUB2_ST)" || fail "$CITY2_KA publish status=$PUB2_ST: $PUB2"
+[[ "$PUB1_TX" != "__NONE__" && "$PUB2_TX" != "__NONE__" ]] && ok "On-chain txs: $PUB1_TX / $PUB2_TX" || fail "Missing city publish txHash"
+[[ "$PUB1_KAS" == "2" ]] && ok "Published 2 named KAs ($CITY1_KA, $CITY2_KA)" || fail "Expected 2 named KA publishes, got $PUB1_KAS"
 
 echo ""
-echo "--- 3b: Query Verified Memory for published city root entities on publisher ---"
+echo "--- 3b: Query Verifiable Memory for published city root entities on publisher ---"
 LTM_CT=0
 for i in $(seq 1 15); do
   LTM_Q=$(c -X POST "http://127.0.0.1:9201/api/query" -d "{
     \"sparql\":\"SELECT ?s ?name WHERE { VALUES ?s { <http://example.org/entity/city1> <http://example.org/entity/city2> } ?s <http://schema.org/name> ?name } LIMIT 10\",
     \"contextGraphId\":\"$CONTEXT_GRAPH\",
-    \"view\":\"verified-memory\"
+    \"view\":\"verifiable-memory\"
   }")
   LTM_CT=$(echo "$LTM_Q" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('result',{}).get('bindings',[])))" 2>/dev/null)
   [ "$LTM_CT" -ge 2 ] && break
@@ -400,7 +424,7 @@ for p in "${NODE_PORTS[@]}"; do
   R=$(c -X POST "http://127.0.0.1:$p/api/query" -d "{
     \"sparql\":\"SELECT ?s ?name WHERE { VALUES ?s { <http://example.org/entity/city1> <http://example.org/entity/city2> } ?s <http://schema.org/name> ?name } LIMIT 10\",
     \"contextGraphId\":\"$CONTEXT_GRAPH\",
-    \"view\":\"verified-memory\"
+    \"view\":\"verifiable-memory\"
   }")
   ct=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('result',{}).get('bindings',[])))" 2>/dev/null)
   [[ "$ct" -ge 2 ]] && ok "Node $p has $ct published city roots in VM" || warn "Node $p has $ct published city roots in VM (finalization pending?)"
@@ -412,61 +436,62 @@ echo "=== SECTION 4: Multi-node SWM contribution + open-CG VM publish ==="
 echo ""
 # Devnet bootstrap CGs are intentionally registered as open
 # (ContextGraphs publishPolicy=1). Any node may contribute to SWM and any
-# chain-capable node may promote selected SWM data to Verified Memory. Curated
+# chain-capable node may promote selected SWM data to Verifiable Memory. Curated
 # publish-authority rejection is covered by private/curated sharing tests.
 
 echo "--- 4a: Node2 (core) shares a Product triple-set to SWM ---"
-SWM2=$(c -X POST "http://127.0.0.1:9202/api/shared-memory/write" -d "{
-  \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"quads\":[
+PRODUCT1_KA="product1-ka-$(date +%s%N)"
+PRODUCT2_KA="product2-ka-$(date +%s%N)"
+PERSON1_KA="person1-ka-$(date +%s%N)"
+LAKE1_KA="lake1-ka-$(date +%s%N)"
+LAKE1_PUBLISH_KA="lake1-publish-ka-$(date +%s%N)"
+SWM2=$(ka_create_share 9202 "$CONTEXT_GRAPH" "$PRODUCT1_KA" "" \
     $(ql 'http://example.org/entity/product1' 'http://schema.org/name' 'Potica'),
     $(q 'http://example.org/entity/product1' 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/Product'),
     $(ql 'http://example.org/entity/product1' 'http://schema.org/description' 'Traditional Slovenian nut roll')
-  ]
-}")
-SWM2_W=$(json_get "$SWM2" triplesWritten)
-[[ "$SWM2_W" == "3" ]] && ok "Node2 SWM contribution accepted ($SWM2_W triples)" || fail "Node2 SWM write: $SWM2"
+)
+SWM2_W=$(json_get "$SWM2" promotedCount)
+[[ "$SWM2_W" == "3" ]] && ok "Node2 SWM contribution accepted ($SWM2_W triples)" || fail "Node2 KA create/share: $SWM2"
 
 echo "--- 4b: Node3 (core, oxigraph) shares a second Product triple-set ---"
-SWM3=$(c -X POST "http://127.0.0.1:9203/api/shared-memory/write" -d "{
-  \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"quads\":[
+SWM3=$(ka_create_share 9203 "$CONTEXT_GRAPH" "$PRODUCT2_KA" "" \
     $(ql 'http://example.org/entity/product2' 'http://schema.org/name' 'Carniolan Sausage'),
     $(q 'http://example.org/entity/product2' 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/Product'),
     $(ql 'http://example.org/entity/product2' 'http://schema.org/description' 'PGI sausage')
-  ]
-}")
-SWM3_W=$(json_get "$SWM3" triplesWritten)
-[[ "$SWM3_W" == "3" ]] && ok "Node3 SWM contribution accepted ($SWM3_W triples)" || fail "Node3 SWM write: $SWM3"
+)
+SWM3_W=$(json_get "$SWM3" promotedCount)
+[[ "$SWM3_W" == "3" ]] && ok "Node3 SWM contribution accepted ($SWM3_W triples)" || fail "Node3 KA create/share: $SWM3"
 
 echo "--- 4c: Node4 (core) shares a Person triple-set to SWM ---"
-SWM4=$(c -X POST "http://127.0.0.1:9204/api/shared-memory/write" -d "{
-  \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"quads\":[
+SWM4=$(ka_create_share 9204 "$CONTEXT_GRAPH" "$PERSON1_KA" "" \
     $(ql 'http://example.org/entity/person1' 'http://schema.org/name' 'France Prešeren'),
     $(q 'http://example.org/entity/person1' 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/Person'),
     $(ql 'http://example.org/entity/person1' 'http://schema.org/birthDate' '1800-12-03')
-  ]
-}")
-SWM4_W=$(json_get "$SWM4" triplesWritten)
-[[ "$SWM4_W" == "3" ]] && ok "Node4 SWM contribution accepted ($SWM4_W triples)" || fail "Node4 SWM write: $SWM4"
+)
+SWM4_W=$(json_get "$SWM4" promotedCount)
+[[ "$SWM4_W" == "3" ]] && ok "Node4 SWM contribution accepted ($SWM4_W triples)" || fail "Node4 KA create/share: $SWM4"
 
 echo "--- 4d: Node5 (edge) shares a Lake triple-set to SWM ---"
-SWM5=$(c -X POST "http://127.0.0.1:9205/api/shared-memory/write" -d "{
-  \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"quads\":[
+SWM5=$(ka_create_share 9205 "$CONTEXT_GRAPH" "$LAKE1_KA" "" \
     $(ql 'http://example.org/entity/lake1' 'http://schema.org/name' 'Lake Bled'),
     $(q 'http://example.org/entity/lake1' 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/LakeBodyOfWater'),
     $(ql 'http://example.org/entity/lake1' 'http://schema.org/description' 'Glacial lake in the Julian Alps')
-  ]
-}")
-SWM5_W=$(json_get "$SWM5" triplesWritten)
-[[ "$SWM5_W" == "3" ]] && ok "Node5 (edge) SWM contribution accepted ($SWM5_W triples)" || fail "Node5 SWM write: $SWM5"
+)
+SWM5_W=$(json_get "$SWM5" promotedCount)
+[[ "$SWM5_W" == "3" ]] && ok "Node5 (edge) SWM contribution accepted ($SWM5_W triples)" || fail "Node5 KA create/share: $SWM5"
+
+LAKE1_CORE_SHARE=$(ka_create_share 9201 "$CONTEXT_GRAPH" "$LAKE1_PUBLISH_KA" "" \
+    $(ql 'http://example.org/entity/lake1' 'http://schema.org/name' 'Lake Bled'),
+    $(q 'http://example.org/entity/lake1' 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/LakeBodyOfWater'),
+    $(ql 'http://example.org/entity/lake1' 'http://schema.org/description' 'Glacial lake in the Julian Alps')
+)
+LAKE1_CORE_SHARED=$(json_get "$LAKE1_CORE_SHARE" swmShared)
+[[ "$LAKE1_CORE_SHARED" == "true" ]] && ok "Curator-owned lake KA shared for VM publish" || fail "Curator lake KA share failed: ${LAKE1_CORE_SHARE:0:200}"
 
 echo "--- 4e: Open CG allows Node2 to publish its SWM contribution ---"
 sleep 2
-http_post_capture "http://127.0.0.1:9202/api/shared-memory/publish" \
-  "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"selection\":[\"http://example.org/entity/product1\"]}" \
+http_post_capture "http://127.0.0.1:9202/api/knowledge-assets/$PRODUCT1_KA/vm/publish" \
+  "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}" \
   NON_CURATOR_BODY NON_CURATOR_CODE
 NON_CURATOR_ST=$(json_get "$NON_CURATOR_BODY" status)
 if [[ "$NON_CURATOR_CODE" == "200" && ( "$NON_CURATOR_ST" == "confirmed" || "$NON_CURATOR_ST" == "finalized" ) ]]; then
@@ -475,26 +500,22 @@ else
   fail "Open-CG publish from Node2 failed, HTTP $NON_CURATOR_CODE status=$NON_CURATOR_ST: ${NON_CURATOR_BODY:0:200}"
 fi
 
-# Aggregated promote: Node1 picks up the remaining SWM contributions in a
-# single on-chain tx. Each entity becomes its own KA (rootEntity), but they
-# share one on-chain batch.
-echo "--- 4f: Node1 publishes the remaining aggregated multi-node SWM batch ---"
+# Named lifecycle publish: each chain-capable contributor promotes its KA name;
+# the edge payload is published through a curator-owned KA with the same triples.
+echo "--- 4f: Remaining named KA publishes succeed across contributors ---"
 sleep 2
-AGG_PUB=$(c -X POST "http://127.0.0.1:9201/api/shared-memory/publish" -d "{
-  \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"selection\":[
-    \"http://example.org/entity/product1\",
-    \"http://example.org/entity/product2\",
-    \"http://example.org/entity/person1\",
-    \"http://example.org/entity/lake1\"
-  ]
-}")
-AGG_ST=$(json_get "$AGG_PUB" status)
-AGG_TX=$(json_get "$AGG_PUB" txHash)
-if [[ "$AGG_ST" == "confirmed" || "$AGG_ST" == "finalized" ]]; then
-  ok "Curator aggregated publish OK (status=$AGG_ST, tx=${AGG_TX:0:18}…)"
+AGG_PRODUCT2=$(ka_publish 9203 "$CONTEXT_GRAPH" "$PRODUCT2_KA")
+AGG_PERSON1=$(ka_publish 9204 "$CONTEXT_GRAPH" "$PERSON1_KA")
+AGG_LAKE1=$(ka_publish 9201 "$CONTEXT_GRAPH" "$LAKE1_PUBLISH_KA")
+AGG_PRODUCT2_ST=$(json_get "$AGG_PRODUCT2" status)
+AGG_PERSON1_ST=$(json_get "$AGG_PERSON1" status)
+AGG_LAKE1_ST=$(json_get "$AGG_LAKE1" status)
+if [[ ( "$AGG_PRODUCT2_ST" == "confirmed" || "$AGG_PRODUCT2_ST" == "finalized" ) \
+   && ( "$AGG_PERSON1_ST" == "confirmed" || "$AGG_PERSON1_ST" == "finalized" ) \
+   && ( "$AGG_LAKE1_ST" == "confirmed" || "$AGG_LAKE1_ST" == "finalized" ) ]]; then
+  ok "Remaining named KA publishes OK (product2=$AGG_PRODUCT2_ST person1=$AGG_PERSON1_ST lake1=$AGG_LAKE1_ST)"
 else
-  fail "Curator aggregated publish=$AGG_ST: $AGG_PUB"
+  fail "Remaining named KA publishes failed: product2=$AGG_PRODUCT2_ST person1=$AGG_PERSON1_ST lake1=$AGG_LAKE1_ST"
 fi
 
 echo "--- 4g: ALL published entities replicate to ALL nodes ---"
@@ -504,7 +525,7 @@ for p in "${NODE_PORTS[@]}"; do
     R=$(c -X POST "http://127.0.0.1:$p/api/query" -d "{
       \"sparql\":\"ASK { <http://example.org/entity/$entity> <http://schema.org/name> ?name }\",
       \"contextGraphId\":\"$CONTEXT_GRAPH\",
-      \"view\":\"verified-memory\"
+      \"view\":\"verifiable-memory\"
     }")
     found=$(echo "$R" | python3 -c "import sys,json; b=json.load(sys.stdin).get('result',{}).get('bindings',[]); print('yes' if b and b[0].get('result','')=='true' else 'no')" 2>/dev/null)
     [[ "$found" == "yes" ]] && ok "Node $p has $entity" || warn "Node $p missing $entity (finalization pending?)"
@@ -520,22 +541,21 @@ echo ""
 # only node authorised to publish to VM per §2.2). Measuring against
 # Node5 as in the previous revision was invalid: Node5 can't publish
 # to `devnet-test` at all, so the balance delta would always be zero
-# for the wrong reason. This section therefore writes SWM from Node5
-# (any node may share), then has Node1 promote it to VM and checks
-# Node1's balance delta.
+# for the wrong reason. This section therefore has Node1 create/share a
+# publish-ready KA, promote it to VM, and checks Node1's balance delta.
 
 TRAC1_B=$(c "http://127.0.0.1:9201/api/wallets/balances" | python3 -c "import sys,json; print(json.load(sys.stdin)['balances'][0]['trac'])" 2>/dev/null)
 echo "  Node1 (curator) TRAC before: $TRAC1_B"
 
-c -X POST "http://127.0.0.1:9205/api/shared-memory/write" -d "{
-  \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"quads\":[
+COST_KA="cost-test-ka-$(date +%s%N)"
+COST_SHARE=$(ka_create_share 9201 "$CONTEXT_GRAPH" "$COST_KA" "" \
     $(ql 'http://example.org/entity/cost-test' 'http://schema.org/name' 'CostTest'),
     $(q 'http://example.org/entity/cost-test' 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/Thing')
-  ]
-}" > /dev/null
+)
+COST_SHARED=$(json_get "$COST_SHARE" swmShared)
+[[ "$COST_SHARED" == "true" ]] && ok "Cost-test KA shared by Node1" || fail "Cost-test KA share failed: ${COST_SHARE:0:200}"
 sleep 1
-COST_PUB=$(c -X POST "http://127.0.0.1:9201/api/shared-memory/publish" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"selection\":[\"http://example.org/entity/cost-test\"]}")
+COST_PUB=$(ka_publish 9201 "$CONTEXT_GRAPH" "$COST_KA")
 COST_ST=$(json_get "$COST_PUB" status)
 [[ "$COST_ST" == "confirmed" || "$COST_ST" == "finalized" ]] && ok "Cost-test publish OK ($COST_ST)" || fail "Cost-test publish failed: status=$COST_ST: ${COST_PUB:0:200}"
 
@@ -559,10 +579,7 @@ UPD=$(c -X POST "http://127.0.0.1:9201/api/update" -d "{
   \"quads\":[
     $(ql 'http://example.org/entity/city1' 'http://schema.org/name' 'Ljubljana'),
     $(q 'http://example.org/entity/city1' 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/City'),
-    $(ql 'http://example.org/entity/city1' 'http://schema.org/population' '295000'),
-    $(ql 'http://example.org/entity/city2' 'http://schema.org/name' 'Maribor'),
-    $(q 'http://example.org/entity/city2' 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/City'),
-    $(ql 'http://example.org/entity/city2' 'http://schema.org/population' '97000')
+    $(ql 'http://example.org/entity/city1' 'http://schema.org/population' '295000')
   ]
 }")
 UPD_ST=$(json_get "$UPD" status)
@@ -609,18 +626,19 @@ echo ""
 echo "=== SECTION 8: Triple Deduplication ==="
 echo ""
 
-c -X POST "http://127.0.0.1:9201/api/shared-memory/write" -d "{
-  \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"quads\":[
+DEDUP_KA="dedup1-ka-$(date +%s%N)"
+DEDUP_SHARE=$(ka_create_share 9201 "$CONTEXT_GRAPH" "$DEDUP_KA" "" \
     $(ql 'http://example.org/entity/dedup1' 'http://schema.org/name' 'DedupTest'),
     $(ql 'http://example.org/entity/dedup1' 'http://schema.org/name' 'DedupTest'),
     $(ql 'http://example.org/entity/dedup1' 'http://schema.org/name' 'DedupTest')
-  ]
-}" > /dev/null
+)
+DEDUP_SHARED=$(json_get "$DEDUP_SHARE" swmShared)
+[[ "$DEDUP_SHARED" == "true" ]] && ok "Dedup KA shared to SWM" || fail "Dedup share failed: ${DEDUP_SHARE:0:200}"
 sleep 1
-DEDUP=$(c -X POST "http://127.0.0.1:9201/api/shared-memory/publish" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"selection\":[\"http://example.org/entity/dedup1\"]}")
+DEDUP=$(ka_publish 9201 "$CONTEXT_GRAPH" "$DEDUP_KA")
 DD_ST=$(json_get "$DEDUP" status)
-DD_KAS=$(echo "$DEDUP" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('kas',[])))" 2>/dev/null)
+DD_KAS=0
+[[ "$DD_ST" == "confirmed" || "$DD_ST" == "finalized" ]] && DD_KAS=1
 [[ "$DD_ST" == "confirmed" || "$DD_ST" == "finalized" ]] && ok "Dedup publish OK" || fail "Dedup status=$DD_ST"
 check "1 KA (dedup: 3 identical → 1 entity)" "$DD_KAS" "1"
 
@@ -636,18 +654,17 @@ for i in $(seq 1 50); do
 done
 BATCH_QUADS="${BATCH_QUADS%,}"
 
-c -X POST "http://127.0.0.1:9201/api/shared-memory/write" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"quads\":[$BATCH_QUADS]}" > /dev/null
+BATCH_KA="batch-50-ka-$(date +%s%N)"
+BATCH_SHARE=$(ka_create_share 9201 "$CONTEXT_GRAPH" "$BATCH_KA" "" $BATCH_QUADS)
+BATCH_SHARED=$(json_get "$BATCH_SHARE" swmShared)
+[[ "$BATCH_SHARED" == "true" ]] && ok "Batch KA shared to SWM" || fail "Batch KA share failed: ${BATCH_SHARE:0:200}"
 sleep 2
-BATCH_SELECTION=""
-for i in $(seq 1 50); do BATCH_SELECTION="$BATCH_SELECTION\"http://example.org/entity/batch_$i\","; done
-BATCH_SELECTION="[${BATCH_SELECTION%,}]"
-BATCH=$(c -X POST "http://127.0.0.1:9201/api/shared-memory/publish" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"selection\":$BATCH_SELECTION}")
+BATCH=$(ka_publish 9201 "$CONTEXT_GRAPH" "$BATCH_KA")
 B_ST=$(json_get "$BATCH" status)
 B_TX=$(json_get "$BATCH" txHash)
-B_KAS=$(echo "$BATCH" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('kas',[])))" 2>/dev/null)
 [[ "$B_ST" == "confirmed" || "$B_ST" == "finalized" ]] && ok "Batch(50) publish OK ($B_ST)" || fail "Batch publish=$B_ST: $BATCH"
 [[ "$B_TX" != "__NONE__" ]] && ok "Batch tx: $B_TX" || fail "No batch txHash"
-[[ "$B_KAS" == "50" ]] && ok "Batch published 50 KAs" || fail "Expected 50 KAs, got $B_KAS"
+echo "  Batch named KA submitted 50 entities; replication checked below"
 
 echo ""
 echo "--- 9b: Batch entities replicate to ALL nodes ---"
@@ -674,26 +691,23 @@ echo ""
 echo "=== SECTION 10: Concurrent SWM Writers from Multiple Nodes ==="
 echo ""
 
-c -X POST "http://127.0.0.1:9202/api/shared-memory/write" -d "{
-  \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"quads\":[$(ql 'http://example.org/entity/song1' 'http://schema.org/name' 'Zdravljica'),$(q 'http://example.org/entity/song1' 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/MusicComposition')]
-}" > /dev/null 2>&1 &
+ka_create_share 9202 "$CONTEXT_GRAPH" "song1-ka-$(date +%s%N)" "" \
+  $(ql 'http://example.org/entity/song1' 'http://schema.org/name' 'Zdravljica'),$(q 'http://example.org/entity/song1' 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/MusicComposition') \
+  > /dev/null 2>&1 &
 PID1=$!
 
-c -X POST "http://127.0.0.1:9204/api/shared-memory/write" -d "{
-  \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"quads\":[$(ql 'http://example.org/entity/mountain1' 'http://schema.org/name' 'Triglav'),$(q 'http://example.org/entity/mountain1' 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/Mountain'),$(ql 'http://example.org/entity/mountain1' 'http://schema.org/elevation' '2864')]
-}" > /dev/null 2>&1 &
+ka_create_share 9204 "$CONTEXT_GRAPH" "mountain1-ka-$(date +%s%N)" "" \
+  $(ql 'http://example.org/entity/mountain1' 'http://schema.org/name' 'Triglav'),$(q 'http://example.org/entity/mountain1' 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/Mountain'),$(ql 'http://example.org/entity/mountain1' 'http://schema.org/elevation' '2864') \
+  > /dev/null 2>&1 &
 PID2=$!
 
-c -X POST "http://127.0.0.1:9203/api/shared-memory/write" -d "{
-  \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"quads\":[$(ql 'http://example.org/entity/river1' 'http://schema.org/name' 'Sava'),$(q 'http://example.org/entity/river1' 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/RiverBodyOfWater')]
-}" > /dev/null 2>&1 &
+ka_create_share 9203 "$CONTEXT_GRAPH" "river1-ka-$(date +%s%N)" "" \
+  $(ql 'http://example.org/entity/river1' 'http://schema.org/name' 'Sava'),$(q 'http://example.org/entity/river1' 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/RiverBodyOfWater') \
+  > /dev/null 2>&1 &
 PID3=$!
 
 wait $PID1 $PID2 $PID3
-ok "3 concurrent SWM writes completed"
+ok "3 concurrent KA create/share calls completed"
 
 sleep 6
 for entity in song1 mountain1 river1; do
@@ -719,7 +733,7 @@ for p in "${NODE_PORTS[@]}"; do
   R=$(c -X POST "http://127.0.0.1:$p/api/query" -d "{
     \"sparql\":\"SELECT (COUNT(DISTINCT ?s) AS ?c) WHERE { ?s a ?type . FILTER(CONTAINS(STR(?s),'example.org')) }\",
     \"contextGraphId\":\"$CONTEXT_GRAPH\",
-    \"view\":\"verified-memory\"
+    \"view\":\"verifiable-memory\"
   }")
   ct=$(echo "$R" | python3 -c "
 import sys,json,re
@@ -758,10 +772,8 @@ echo "--- 13a: Removed /api/publish returns 404 ---"
 REMOVED=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:9201/api/publish" -H "Authorization: Bearer $AUTH" -H "Content-Type: application/json" -d '{"contextGraphId":"devnet-test","quads":[]}')
 [[ "$REMOVED" == "404" ]] && ok "/api/publish correctly removed (404)" || warn "/api/publish returns $REMOVED (expected 404)"
 
-echo "--- 13b: Empty quads in SWM write ---"
-EMPTY=$(c -X POST "http://127.0.0.1:9201/api/shared-memory/write" -d '{"contextGraphId":"devnet-test","quads":[]}')
-echo "  Empty quads response: $(echo "$EMPTY" | head -c 200)"
-echo "$EMPTY" | grep -qi "error\|missing\|invalid" && ok "Empty quads rejected with error" || fail "Empty quads not rejected: $EMPTY"
+echo "--- 13b: Retired /api/shared-memory/write is not served ---"
+retired_post_assert "/api/shared-memory/write" 9201 "/api/shared-memory/write" '{"contextGraphId":"devnet-test","quads":[]}'
 
 echo "--- 13c: Malformed SPARQL ---"
 BAD_SPARQL=$(c -X POST "http://127.0.0.1:9201/api/query" -d '{
@@ -770,16 +782,13 @@ BAD_SPARQL=$(c -X POST "http://127.0.0.1:9201/api/query" -d '{
 }')
 echo "$BAD_SPARQL" | grep -qi "error" && ok "Malformed SPARQL returns error" || fail "Malformed SPARQL didn't error: $BAD_SPARQL"
 
-echo "--- 13d: Missing contextGraphId ---"
-NO_CG=$(c -X POST "http://127.0.0.1:9201/api/shared-memory/write" -d '{"quads":[]}')
-echo "$NO_CG" | grep -qi "error\|missing\|required" && ok "Missing contextGraphId rejected" || warn "Missing contextGraphId response: $NO_CG"
+echo "--- 13d: Retired /api/shared-memory/conditional-write is not served ---"
+retired_post_assert "/api/shared-memory/conditional-write" 9201 "/api/shared-memory/conditional-write" '{"contextGraphId":"devnet-test","quads":[],"conditions":[]}'
 
-echo "--- 13e: Publish from empty SWM ---"
+echo "--- 13e: Retired /api/shared-memory/publish is not served ---"
 EMPTY_CG="empty-swm-test-$$"
 c -X POST "http://127.0.0.1:9205/api/context-graph/create" -d "{\"id\":\"$EMPTY_CG\",\"name\":\"empty swm test\"}" >/dev/null 2>&1
-EMPTY_PUB=$(c -X POST "http://127.0.0.1:9205/api/shared-memory/publish" -d "{\"contextGraphId\":\"$EMPTY_CG\"}")
-echo "  Empty SWM publish: $(echo "$EMPTY_PUB" | head -c 200)"
-echo "$EMPTY_PUB" | grep -qi "error\|empty\|nothing\|no.*triple" && ok "Empty SWM publish rejected with error" || fail "Empty SWM publish not rejected: $(echo "$EMPTY_PUB" | head -c 200)"
+retired_post_assert "/api/shared-memory/publish" 9205 "/api/shared-memory/publish" "{\"contextGraphId\":\"$EMPTY_CG\"}"
 
 #------------------------------------------------------------
 echo ""
@@ -787,18 +796,19 @@ echo "=== SECTION 14: Assertion Lifecycle (Working Memory) ==="
 echo ""
 
 ASSERT_CG="devnet-test"
+ASSERT_NAME="devnet-draft-$(date +%s%N)"
 
 echo "--- 14a: Create an assertion ---"
-ASSERT_CREATE=$(c -X POST "http://127.0.0.1:9201/api/assertion/create" -d "{
+ASSERT_CREATE=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets" -d "{
   \"contextGraphId\":\"$ASSERT_CG\",
-  \"name\":\"devnet-draft\"
+  \"name\":\"$ASSERT_NAME\"
 }")
 ASSERT_URI=$(json_get "$ASSERT_CREATE" assertionUri)
 echo "  Assertion URI: $ASSERT_URI"
 [[ "$ASSERT_URI" != "__NONE__" && "$ASSERT_URI" != "__ERR__" ]] && ok "Assertion created: $ASSERT_URI" || fail "Assertion create failed: $ASSERT_CREATE"
 
 echo "--- 14b: Write triples to the assertion ---"
-ASSERT_WRITE=$(c -X POST "http://127.0.0.1:9201/api/assertion/devnet-draft/write" -d "{
+ASSERT_WRITE=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets/$ASSERT_NAME/wm/write" -d "{
   \"contextGraphId\":\"$ASSERT_CG\",
   \"quads\":[
     $(ql 'urn:devnet:assert:entity1' 'http://schema.org/name' 'Assertion Entity'),
@@ -809,9 +819,7 @@ echo "  Write response: $(echo "$ASSERT_WRITE" | head -c 200)"
 echo "$ASSERT_WRITE" | grep -qi "error" && fail "Assertion write failed: $ASSERT_WRITE" || ok "Assertion write OK"
 
 echo "--- 14c: Query the assertion ---"
-ASSERT_QUERY=$(c -X POST "http://127.0.0.1:9201/api/assertion/devnet-draft/query" -d "{
-  \"contextGraphId\":\"$ASSERT_CG\"
-}")
+ASSERT_QUERY=$(c "http://127.0.0.1:9201/api/knowledge-assets/$ASSERT_NAME/wm/quads?contextGraphId=$ASSERT_CG")
 ASSERT_Q_CT=$(safe_quads_count "$ASSERT_QUERY")
 if [[ "$ASSERT_Q_CT" == "PARSE_ERR" ]]; then
   fail "Assertion query returned unparseable response: ${ASSERT_QUERY:0:200}"
@@ -821,7 +829,7 @@ else
 fi
 
 echo "--- 14d: Promote the assertion to SWM ---"
-ASSERT_PROMOTE=$(c -X POST "http://127.0.0.1:9201/api/assertion/devnet-draft/promote" -d "{
+ASSERT_PROMOTE=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets/$ASSERT_NAME/swm/share" -d "{
   \"contextGraphId\":\"$ASSERT_CG\"
 }")
 PROMOTED_CT=$(json_get "$ASSERT_PROMOTE" promotedCount)
@@ -843,12 +851,12 @@ else
 fi
 
 echo "--- 14f: Create and immediately discard another assertion ---"
-c -X POST "http://127.0.0.1:9201/api/assertion/create" -d "{\"contextGraphId\":\"$ASSERT_CG\",\"name\":\"discard-me\"}" > /dev/null
-c -X POST "http://127.0.0.1:9201/api/assertion/discard-me/write" -d "{
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets" -d "{\"contextGraphId\":\"$ASSERT_CG\",\"name\":\"discard-me\"}" > /dev/null
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets/discard-me/wm/write" -d "{
   \"contextGraphId\":\"$ASSERT_CG\",
   \"quads\":[$(ql 'urn:devnet:assert:discard' 'http://schema.org/name' 'Discard Me')]
 }" > /dev/null
-DISCARD_RESP=$(c -X POST "http://127.0.0.1:9201/api/assertion/discard-me/discard" -d "{\"contextGraphId\":\"$ASSERT_CG\"}")
+DISCARD_RESP=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets/discard-me/wm/discard" -d "{\"contextGraphId\":\"$ASSERT_CG\"}")
 echo "$DISCARD_RESP" | grep -qi "error" && fail "Discard failed: $DISCARD_RESP" || ok "Assertion discard OK"
 
 echo "--- 14g: Promoted assertion gossips to other nodes ---"
@@ -884,20 +892,12 @@ PUB_JOBS=$(c "http://127.0.0.1:9201/api/publisher/jobs")
 echo "  Jobs: $(echo "$PUB_JOBS" | head -c 300)"
 echo "$PUB_JOBS" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(len(d) if isinstance(d,list) else len(d.get("jobs",[])))' 2>/dev/null && ok "Publisher jobs endpoint works" || warn "Publisher jobs: $PUB_JOBS"
 
-echo "--- 15c: Enqueue a publish job ---"
-ENQUEUE_OP_ID="devnet-enqueue-test-$(date +%s)"
-PUB_ENQUEUE=$(c -X POST "http://127.0.0.1:9201/api/publisher/enqueue" -d "{
-  \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"shareOperationId\":\"$ENQUEUE_OP_ID\",
-  \"roots\":[{\"rootEntity\":\"urn:devnet:assert:entity1\",\"privateMerkleRoot\":null,\"privateTripleCount\":0}],
-  \"namespace\":\"did:dkg:context-graph:$CONTEXT_GRAPH\",
-  \"scope\":\"full\",
-  \"authorityType\":\"owner\",
-  \"authorityProofRef\":\"urn:dkg:proof:devnet-test\"
-}")
+echo "--- 15c: Enqueue a named KA VM publish job ---"
+PUB_ENQUEUE=$(ka_publish_async 9201 "$CONTEXT_GRAPH" "$ASSERT_NAME")
 echo "  Enqueue: $(echo "$PUB_ENQUEUE" | head -c 300)"
 PUB_JOB_ID=$(json_get "$PUB_ENQUEUE" jobId)
-[[ "$PUB_JOB_ID" != "__NONE__" && "$PUB_JOB_ID" != "__ERR__" ]] && ok "Publisher job enqueued: $PUB_JOB_ID" || warn "Enqueue response: $PUB_ENQUEUE"
+PUB_ENQUEUE_ST=$(json_get "$PUB_ENQUEUE" status)
+[[ "$PUB_JOB_ID" != "__NONE__" && "$PUB_JOB_ID" != "__ERR__" ]] && ok "Named KA VM publish job enqueued: $PUB_JOB_ID (status=$PUB_ENQUEUE_ST)" || warn "Enqueue response: $PUB_ENQUEUE"
 
 if [[ "$PUB_JOB_ID" != "__NONE__" && "$PUB_JOB_ID" != "__ERR__" && -n "$PUB_JOB_ID" ]]; then
   echo "--- 15d: Check job status ---"
@@ -927,12 +927,12 @@ echo "  Sub-graph create: $(echo "$SG_CREATE" | head -c 200)"
 echo "$SG_CREATE" | grep -qi "error" && warn "Sub-graph create: $SG_CREATE" || ok "Sub-graph 'test-assertions' created"
 
 echo "--- 16b: Write assertion to sub-graph ---"
-c -X POST "http://127.0.0.1:9201/api/assertion/create" -d "{
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets" -d "{
   \"contextGraphId\":\"$CONTEXT_GRAPH\",
   \"name\":\"sg-draft\",
   \"subGraphName\":\"test-assertions\"
 }" > /dev/null
-SG_AW=$(c -X POST "http://127.0.0.1:9201/api/assertion/sg-draft/write" -d "{
+SG_AW=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets/sg-draft/wm/write" -d "{
   \"contextGraphId\":\"$CONTEXT_GRAPH\",
   \"subGraphName\":\"test-assertions\",
   \"quads\":[$(ql 'urn:sg:assert:item1' 'http://schema.org/name' 'Sub-graph Assertion')]
@@ -940,7 +940,7 @@ SG_AW=$(c -X POST "http://127.0.0.1:9201/api/assertion/sg-draft/write" -d "{
 echo "$SG_AW" | grep -qi "error" && fail "Sub-graph assertion write failed: $SG_AW" || ok "Sub-graph assertion write OK"
 
 echo "--- 16c: Promote sub-graph assertion ---"
-SG_PROMOTE=$(c -X POST "http://127.0.0.1:9201/api/assertion/sg-draft/promote" -d "{
+SG_PROMOTE=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets/sg-draft/swm/share" -d "{
   \"contextGraphId\":\"$CONTEXT_GRAPH\",
   \"subGraphName\":\"test-assertions\"
 }")
@@ -1001,10 +1001,9 @@ $SYNC_COMPLETED && ok "Sync catch-up reported completion on Node5 (status=$SYNC_
 
 echo "--- 18b: Write fresh post-subscribe SWM data on Node1 for sync verification ---"
 SYNC_ENTITY="urn:sync-verify:post-sub-$(date +%s)"
-c -X POST "http://127.0.0.1:9201/api/shared-memory/write" -d "{
-  \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"quads\":[$(ql "$SYNC_ENTITY" 'http://schema.org/name' 'Post-Subscribe Sync Test')]
-}" > /dev/null
+ka_create_share 9201 "$CONTEXT_GRAPH" "sync-verify-$(date +%s%N)" "" \
+  $(ql "$SYNC_ENTITY" 'http://schema.org/name' 'Post-Subscribe Sync Test') \
+  > /dev/null
 sleep "$LOCAL_SETTLE_S"
 
 echo "--- 18c: Verify post-subscribe SWM data synced to Node5 ---"
@@ -1037,19 +1036,19 @@ echo ""
 echo "=== SECTION 19: Memory Layer View Queries ==="
 echo ""
 
-echo "--- 19a: Verified memory view ---"
+echo "--- 19a: Verifiable memory view ---"
 VM_VIEW=$(c -X POST "http://127.0.0.1:9201/api/query" -d "{
   \"sparql\":\"SELECT ?name WHERE { <http://example.org/entity/city1> <http://schema.org/name> ?name }\",
   \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"view\":\"verified-memory\"
+  \"view\":\"verifiable-memory\"
 }")
 VM_CT=$(safe_bindings_count "$VM_VIEW")
 if [[ "$VM_CT" == "PARSE_ERR" ]]; then
-  fail "Verified memory view returned unparseable response: ${VM_VIEW:0:200}"
+  fail "Verifiable memory view returned unparseable response: ${VM_VIEW:0:200}"
 elif [[ "$VM_CT" -ge 1 ]]; then
-  ok "Verified memory view returns published data"
+  ok "Verifiable memory view returns published data"
 else
-  warn "Verified memory view empty ($VM_CT) — VM finalization may be pending"
+  warn "Verifiable memory view empty ($VM_CT) — VM finalization may be pending"
 fi
 
 echo "--- 19b: Shared memory view ---"
@@ -1083,13 +1082,13 @@ fi
 echo "--- 19c: Working memory assertion visible only locally ---"
 WM_NAME="wm-view-test-$(date +%s)"
 WM_SUBJECT="urn:wm-view:${WM_NAME}"
-c -X POST "http://127.0.0.1:9201/api/assertion/create" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$WM_NAME\"}" > /dev/null
-c -X POST "http://127.0.0.1:9201/api/assertion/$WM_NAME/write" -d "{
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$WM_NAME\"}" > /dev/null
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets/$WM_NAME/wm/write" -d "{
   \"contextGraphId\":\"$CONTEXT_GRAPH\",
   \"quads\":[$(ql "$WM_SUBJECT" 'http://schema.org/name' 'WM Only Data')]
 }" > /dev/null
 
-WM_LOCAL=$(c -X POST "http://127.0.0.1:9201/api/assertion/$WM_NAME/query" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}")
+WM_LOCAL=$(c "http://127.0.0.1:9201/api/knowledge-assets/$WM_NAME/wm/quads?contextGraphId=$CONTEXT_GRAPH")
 WM_LOCAL_CT=$(safe_quads_count "$WM_LOCAL")
 if [[ "$WM_LOCAL_CT" == "PARSE_ERR" ]]; then
   fail "WM assertion query returned unparseable response: ${WM_LOCAL:0:200}"
@@ -1099,19 +1098,19 @@ else
   fail "WM assertion not visible locally"
 fi
 
-echo "--- 19d: WM data NOT in verified memory ---"
+echo "--- 19d: WM data NOT in verifiable memory ---"
 WM_IN_VM=$(c -X POST "http://127.0.0.1:9201/api/query" -d "{
   \"sparql\":\"SELECT ?name WHERE { <$WM_SUBJECT> <http://schema.org/name> ?name }\",
   \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"view\":\"verified-memory\"
+  \"view\":\"verifiable-memory\"
 }")
 WM_IN_VM_CT=$(safe_bindings_count "$WM_IN_VM")
 if [[ "$WM_IN_VM_CT" == "PARSE_ERR" ]]; then
   fail "WM/VM isolation query returned unparseable response: ${WM_IN_VM:0:200}"
 elif [[ "$WM_IN_VM_CT" -eq 0 ]]; then
-  ok "WM data correctly absent from verified memory"
+  ok "WM data correctly absent from verifiable memory"
 else
-  fail "WM data leaked into verified memory ($WM_IN_VM_CT)"
+  fail "WM data leaked into verifiable memory ($WM_IN_VM_CT)"
 fi
 
 echo "--- 19e: WM data NOT visible on Node2 (including SWM) ---"
@@ -1129,7 +1128,7 @@ else
   fail "WM data leaked to Node2 ($WM_REMOTE_CT)"
 fi
 
-c -X POST "http://127.0.0.1:9201/api/assertion/$WM_NAME/discard" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}" > /dev/null 2>&1
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets/$WM_NAME/wm/discard" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}" > /dev/null 2>&1
 
 #------------------------------------------------------------
 echo ""
@@ -1180,7 +1179,7 @@ echo ""
 
 IMPORT_NAME="import-extract-$(date +%s)"
 echo "--- 21a: Create assertion for import ---"
-c -X POST "http://127.0.0.1:9201/api/assertion/create" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$IMPORT_NAME\"}" > /dev/null
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$IMPORT_NAME\"}" > /dev/null
 
 echo "--- 21b: Import markdown file ---"
 # P2-3: honor $TMPDIR for CI runners with non-/tmp tmp roots.
@@ -1199,14 +1198,14 @@ The Decentralized Knowledge Graph enables verifiable knowledge sharing.
 
 - Sub-graphs for scoped data organization
 - Async publisher queue for reliable chain anchoring
-- Memory layers: Working Memory, Shared Memory, Verified Memory
+- Memory layers: Working Memory, Shared Memory, Verifiable Memory
 MDEOF
 
 IMPORT_RESP=$(curl -sS --max-time "$DEVNET_CURL_TIMEOUT" --connect-timeout "$DEVNET_CURL_CONNECT_TIMEOUT" \
   -H "Authorization: Bearer $AUTH" \
   -F "file=@${TMPMD};type=text/markdown" \
   -F "contextGraphId=$CONTEXT_GRAPH" \
-  "http://127.0.0.1:9201/api/assertion/${IMPORT_NAME}/import-file" 2>&1)
+  "http://127.0.0.1:9201/api/knowledge-assets/${IMPORT_NAME}/wm/import-file" 2>&1)
 rm -f "$TMPMD"
 IMPORT_URI=$(json_get "$IMPORT_RESP" assertionUri)
 IMPORT_HASH=$(json_get "$IMPORT_RESP" fileHash)
@@ -1222,13 +1221,13 @@ else
 fi
 
 echo "--- 21c: Check extraction status endpoint ---"
-EXTRACT_ST=$(c "http://127.0.0.1:9201/api/assertion/${IMPORT_NAME}/extraction-status?contextGraphId=$CONTEXT_GRAPH")
+EXTRACT_ST=$(c "http://127.0.0.1:9201/api/knowledge-assets/${IMPORT_NAME}/wm/extraction-status?contextGraphId=$CONTEXT_GRAPH")
 EXT_STATUS=$(json_get "$EXTRACT_ST" status)
 echo "  Extraction status: $EXT_STATUS"
 [[ "$EXT_STATUS" == "completed" ]] && ok "Extraction status endpoint reports completed" || warn "Extraction status: $EXT_STATUS (${EXTRACT_ST:0:200})"
 
 echo "--- 21d: Query imported assertion ---"
-IMPORT_Q=$(c -X POST "http://127.0.0.1:9201/api/assertion/${IMPORT_NAME}/query" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}")
+IMPORT_Q=$(c "http://127.0.0.1:9201/api/knowledge-assets/${IMPORT_NAME}/wm/quads?contextGraphId=$CONTEXT_GRAPH")
 IMPORT_Q_CT=$(safe_quads_count "$IMPORT_Q")
 if [[ "$IMPORT_Q_CT" == "PARSE_ERR" ]]; then
   fail "Imported assertion query returned unparseable response: ${IMPORT_Q:0:200}"
@@ -1239,7 +1238,7 @@ else
 fi
 
 echo "--- 21e: Promote imported assertion to SWM ---"
-IMPORT_PROMOTE=$(c -X POST "http://127.0.0.1:9201/api/assertion/${IMPORT_NAME}/promote" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}")
+IMPORT_PROMOTE=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets/${IMPORT_NAME}/swm/share" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}")
 IMPORT_PC=$(json_get "$IMPORT_PROMOTE" promotedCount)
 echo "  Promoted count: $IMPORT_PC"
 # P1-10: also exclude __ERR__ (and keep the 0 guard) so parse failures don't
@@ -1344,7 +1343,7 @@ echo "--- 21i: Unsupported content type gracefully degrades (§6.5) ---"
 # extraction.status="skipped", tripleCount=0, no linkage triples written.
 # Required by 05_PROTOCOL_EXTENSIONS.md §6.5 but previously uncovered.
 PNG_NAME="import-degrade-$(date +%s)"
-c -X POST "http://127.0.0.1:9201/api/assertion/create" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$PNG_NAME\"}" > /dev/null
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$PNG_NAME\"}" > /dev/null
 TMPPNG=$(mktemp "$DEVNET_TMPDIR/devnet-png-XXXXXX.png")
 # 8-byte PNG magic header — enough to look like a real image to the server
 # while keeping the test body small. No converter is registered for image/png
@@ -1354,7 +1353,7 @@ PNG_RESP=$(curl -sS --max-time "$DEVNET_CURL_TIMEOUT" --connect-timeout "$DEVNET
   -H "Authorization: Bearer $AUTH" \
   -F "file=@${TMPPNG};type=image/png" \
   -F "contextGraphId=$CONTEXT_GRAPH" \
-  "http://127.0.0.1:9201/api/assertion/${PNG_NAME}/import-file" 2>&1)
+  "http://127.0.0.1:9201/api/knowledge-assets/${PNG_NAME}/wm/import-file" 2>&1)
 rm -f "$TMPPNG"
 PNG_STATUS=$(json_get "$PNG_RESP" extraction.status)
 PNG_PIPELINE=$(json_get "$PNG_RESP" extraction.pipelineUsed)
@@ -1374,49 +1373,40 @@ else
   fail "§6.5 graceful degrade failed: status=$PNG_STATUS pipeline=$PNG_PIPELINE count=$PNG_COUNT (${PNG_RESP:0:200})"
 fi
 # Clean up the degraded assertion so it doesn't pollute later tests.
-c -X POST "http://127.0.0.1:9201/api/assertion/$PNG_NAME/discard" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}" > /dev/null 2>&1
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets/$PNG_NAME/wm/discard" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}" > /dev/null 2>&1
 
 #------------------------------------------------------------
 echo ""
 echo "=== SECTION 22: Publisher Queue End-to-End ==="
 echo ""
 
-echo "--- 22a: Write SWM data for publisher test ---"
+echo "--- 22a: Create/share named KA data for publisher test ---"
 PQ_ENTITY="http://example.org/entity/pub-queue-$(date +%s)"
-PQ_WRITE=$(c -X POST "http://127.0.0.1:9201/api/shared-memory/write" -d "{
-  \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"quads\":[
+PQ_NAME="pub-queue-ka-$(date +%s%N)"
+PQ_WRITE=$(ka_create_share 9201 "$CONTEXT_GRAPH" "$PQ_NAME" "" \
     $(q "$PQ_ENTITY" 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/Thing'),
     $(ql "$PQ_ENTITY" 'http://schema.org/name' 'Publisher Queue Test')
-  ]
-}")
-PQ_OP_ID=$(json_get "$PQ_WRITE" shareOperationId)
-echo "  SWM write shareOperationId=$PQ_OP_ID"
-[[ "$PQ_OP_ID" != "__NONE__" && "$PQ_OP_ID" != "__ERR__" ]] && ok "SWM write for publisher test" || fail "SWM write failed: ${PQ_WRITE:0:200}"
+)
+PQ_SHARED=$(json_get "$PQ_WRITE" swmShared)
+PQ_PROMOTED=$(json_get "$PQ_WRITE" promotedCount)
+echo "  KA share swmShared=$PQ_SHARED promotedCount=$PQ_PROMOTED"
+[[ "$PQ_SHARED" == "true" ]] && ok "Named KA shared for publisher test" || fail "KA share failed: ${PQ_WRITE:0:200}"
 
-# P1-9: also assert triplesWritten >= 2. A silent zero-write pipeline would
+# P1-9: also assert promotedCount >= 2. A silent zero-share pipeline would
 # let the publisher enqueue an empty payload and 22c would "pass" with no
 # actual data to publish.
-PQ_TW=$(json_get "$PQ_WRITE" triplesWritten)
+PQ_TW="$PQ_PROMOTED"
 if [[ "$PQ_TW" != "__NONE__" && "$PQ_TW" != "__ERR__" && "$PQ_TW" -ge 2 ]] 2>/dev/null; then
-  ok "SWM write persisted $PQ_TW triples (>= 2)"
+  ok "KA share persisted $PQ_TW triples (>= 2)"
 else
-  fail "SWM write triplesWritten=$PQ_TW (expected >= 2) — publisher queue test will be meaningless"
+  fail "KA share promotedCount=$PQ_TW (expected >= 2) — publisher queue test will be meaningless"
 fi
 
-echo "--- 22b: Enqueue publish job ---"
-PQ_ENQUEUE=$(c -X POST "http://127.0.0.1:9201/api/publisher/enqueue" -d "{
-  \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"shareOperationId\":\"$PQ_OP_ID\",
-  \"roots\":[\"$PQ_ENTITY\"],
-  \"namespace\":\"did:dkg:context-graph:$CONTEXT_GRAPH\",
-  \"scope\":\"full\",
-  \"authorityType\":\"owner\",
-  \"authorityProofRef\":\"urn:dkg:proof:devnet-pub-queue\"
-}")
+echo "--- 22b: Enqueue named KA VM publish job ---"
+PQ_ENQUEUE=$(ka_publish_async 9201 "$CONTEXT_GRAPH" "$PQ_NAME")
 PQ_JOB_ID=$(json_get "$PQ_ENQUEUE" jobId)
 echo "  Enqueue jobId=$PQ_JOB_ID"
-[[ "$PQ_JOB_ID" != "__NONE__" && "$PQ_JOB_ID" != "__ERR__" ]] && ok "Publisher job enqueued: $PQ_JOB_ID" || warn "Enqueue response: ${PQ_ENQUEUE:0:200}"
+[[ "$PQ_JOB_ID" != "__NONE__" && "$PQ_JOB_ID" != "__ERR__" && -n "$PQ_JOB_ID" ]] && ok "Named KA VM publish job enqueued: $PQ_JOB_ID" || fail "Named KA VM publish enqueue failed: ${PQ_ENQUEUE:0:200}"
 
 if [[ "$PQ_JOB_ID" != "__NONE__" && "$PQ_JOB_ID" != "__ERR__" && -n "$PQ_JOB_ID" ]]; then
   echo "--- 22c: Poll job status ---"
@@ -1480,9 +1470,7 @@ except Exception:
   echo "  Cleared: $PQ_CLEARED jobs"
   [[ "$PQ_CLEARED" != "__ERR__" ]] && ok "Publisher clear returned ($PQ_CLEARED)" || warn "Publisher clear: $PQ_CLEAR"
 else
-  # P2-2: silent no-op was confusing when 22a succeeds but the job id is
-  # missing. Emit an explicit [SKIP] so the test log carries the reason.
-  skip "22c-22f skipped: publisher enqueue did not return a usable jobId (PQ_JOB_ID=$PQ_JOB_ID)"
+  fail "22c-22f skipped: publisher enqueue did not return a usable jobId (PQ_JOB_ID=$PQ_JOB_ID)"
 fi
 
 #------------------------------------------------------------
@@ -1534,7 +1522,7 @@ fi
 echo "--- 23c: Create assertion with empty name ---"
 # P0-3: capture HTTP status — a 500 with body `{"error":"internal"}` used
 # to silently pass the substring check. Require a 4xx AND an error token.
-http_post_capture "http://127.0.0.1:9201/api/assertion/create" \
+http_post_capture "http://127.0.0.1:9201/api/knowledge-assets" \
   "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"\"}" \
   EMPTY_NAME EMPTY_CODE
 if [[ "$EMPTY_CODE" =~ ^4 ]] && echo "$EMPTY_NAME" | grep -qiE 'error|invalid'; then
@@ -1545,9 +1533,9 @@ fi
 
 echo "--- 23d: Duplicate assertion name reuses same URI ---"
 DUP_NAME="dup-test-$(date +%s)"
-DUP_FIRST=$(c -X POST "http://127.0.0.1:9201/api/assertion/create" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$DUP_NAME\"}")
+DUP_FIRST=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$DUP_NAME\"}")
 DUP_URI1=$(json_get "$DUP_FIRST" assertionUri)
-DUP_SECOND=$(c -X POST "http://127.0.0.1:9201/api/assertion/create" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$DUP_NAME\"}")
+DUP_SECOND=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$DUP_NAME\"}")
 DUP_URI2=$(json_get "$DUP_SECOND" assertionUri)
 if echo "$DUP_SECOND" | grep -qi "error\|exists\|already\|duplicate"; then
   ok "Duplicate assertion name rejected"
@@ -1556,10 +1544,10 @@ elif [[ "$DUP_URI1" == "$DUP_URI2" ]]; then
 else
   warn "Duplicate assertion name created different URI (URI1=$DUP_URI1, URI2=$DUP_URI2)"
 fi
-c -X POST "http://127.0.0.1:9201/api/assertion/$DUP_NAME/discard" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}" > /dev/null 2>&1
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets/$DUP_NAME/wm/discard" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}" > /dev/null 2>&1
 
 echo "--- 23e: Promote nonexistent assertion ---"
-GHOST_PROMOTE=$(c -X POST "http://127.0.0.1:9201/api/assertion/does-not-exist-$(date +%s)/promote" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}")
+GHOST_PROMOTE=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets/does-not-exist-$(date +%s)/swm/share" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}")
 GHOST_PC=$(json_get "$GHOST_PROMOTE" promotedCount)
 if echo "$GHOST_PROMOTE" | grep -qi "error\|not found\|not exist"; then
   ok "Promote nonexistent assertion rejected with error"
@@ -1571,30 +1559,21 @@ fi
 
 echo "--- 23f: Double discard ---"
 DD_NAME="discard-twice-$(date +%s)"
-c -X POST "http://127.0.0.1:9201/api/assertion/create" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$DD_NAME\"}" > /dev/null
-c -X POST "http://127.0.0.1:9201/api/assertion/$DD_NAME/write" -d "{
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$DD_NAME\"}" > /dev/null
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets/$DD_NAME/wm/write" -d "{
   \"contextGraphId\":\"$CONTEXT_GRAPH\",
   \"quads\":[$(ql 'urn:dd:test' 'http://schema.org/name' 'Double Discard')]
 }" > /dev/null
-c -X POST "http://127.0.0.1:9201/api/assertion/$DD_NAME/discard" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}" > /dev/null
-DD_SECOND=$(c -X POST "http://127.0.0.1:9201/api/assertion/$DD_NAME/discard" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}")
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets/$DD_NAME/wm/discard" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}" > /dev/null
+DD_SECOND=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets/$DD_NAME/wm/discard" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}")
 if echo "$DD_SECOND" | grep -qi "error\|not found\|not exist\|already"; then
   ok "Double discard rejected with error"
 else
   ok "Double discard is idempotent (${DD_SECOND:0:80})"
 fi
 
-echo "--- 23g: Publisher enqueue missing fields ---"
-# P0-3: same treatment as 23c — must return a real 4xx, not just a 500
-# with an "error" string in the body.
-http_post_capture "http://127.0.0.1:9201/api/publisher/enqueue" \
-  "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}" \
-  BAD_ENQ BAD_ENQ_CODE
-if [[ "$BAD_ENQ_CODE" =~ ^4 ]] && echo "$BAD_ENQ" | grep -qiE 'error|missing|required'; then
-  ok "Publisher enqueue missing fields rejected (HTTP $BAD_ENQ_CODE)"
-else
-  fail "Bad enqueue not cleanly rejected (HTTP $BAD_ENQ_CODE): ${BAD_ENQ:0:200}"
-fi
+echo "--- 23g: Retired /api/publisher/enqueue is not served ---"
+retired_post_assert "/api/publisher/enqueue" 9201 "/api/publisher/enqueue" "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}"
 
 #------------------------------------------------------------
 echo ""
@@ -1611,24 +1590,16 @@ SG_B_CREATE=$(c -X POST "http://127.0.0.1:9201/api/sub-graph/create" -d "{\"cont
 echo "$SG_B_CREATE" | grep -qi "error" && fail "Sub-graph B create failed: $SG_B_CREATE" || ok "Sub-graph '$SG_B' created"
 
 echo "--- 24b: Write distinct data to each sub-graph ---"
-c -X POST "http://127.0.0.1:9201/api/shared-memory/write" -d "{
-  \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"subGraphName\":\"$SG_A\",
-  \"quads\":[
+ka_create_share 9201 "$CONTEXT_GRAPH" "isolation-alpha-ka" "$SG_A" \
     $(ql 'urn:iso:alpha1' 'http://schema.org/name' 'Alpha Only Entity'),
     $(q 'urn:iso:alpha1' 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/Thing')
-  ]
-}" > /dev/null
-c -X POST "http://127.0.0.1:9201/api/shared-memory/write" -d "{
-  \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"subGraphName\":\"$SG_B\",
-  \"quads\":[
+  > /dev/null
+ka_create_share 9201 "$CONTEXT_GRAPH" "isolation-beta-ka" "$SG_B" \
     $(ql 'urn:iso:beta1' 'http://schema.org/name' 'Beta Only Entity'),
     $(q 'urn:iso:beta1' 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/Thing')
-  ]
-}" > /dev/null
+  > /dev/null
 
-# P2-1: brief settle window for the local SWM write to hit the triple
+# P2-1: brief settle window for the local KA share to hit the triple
 # store before we query it. Round 8 Bug 24: this is a LOCAL write→query
 # settle, NOT a cross-node gossip wait, so it uses its own env var.
 # Otherwise a dev running with `GOSSIP_WAIT_S=0` to speed up a local-only
@@ -1749,13 +1720,13 @@ echo "--- 24g: Write to unregistered sub-graph rejected (negative test) ---"
 # timestamp to avoid collisions with anything a previous test run might
 # have created.
 UNREG_SG="never-created-$(date +%s%N)"
-http_post_capture "http://127.0.0.1:9201/api/shared-memory/write" \
-  "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"subGraphName\":\"$UNREG_SG\",\"quads\":[$(ql 'urn:unreg:x' 'http://schema.org/name' 'nope')]}" \
+http_post_capture "http://127.0.0.1:9201/api/knowledge-assets" \
+  "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"unreg-subgraph-ka\",\"subGraphName\":\"$UNREG_SG\",\"quads\":[$(ql 'urn:unreg:x' 'http://schema.org/name' 'nope')],\"finalize\":true,\"alsoShareSwm\":true}" \
   UNREG_BODY UNREG_CODE
 if [[ "$UNREG_CODE" =~ ^4 ]]; then
-  ok "Write to unregistered sub-graph rejected (HTTP $UNREG_CODE)"
+  ok "KA create/share to unregistered sub-graph rejected (HTTP $UNREG_CODE)"
 else
-  fail "Write to unregistered sub-graph not rejected (HTTP $UNREG_CODE): ${UNREG_BODY:0:200}"
+  fail "KA create/share to unregistered sub-graph not rejected (HTTP $UNREG_CODE): ${UNREG_BODY:0:200}"
 fi
 
 #------------------------------------------------------------
@@ -1767,7 +1738,7 @@ echo "--- 25a: VM query returns published data (§16.1 root content graph) ---"
 VM_REG=$(c -X POST "http://127.0.0.1:9201/api/query" -d "{
   \"sparql\":\"SELECT ?s ?name WHERE { ?s <http://schema.org/name> ?name } LIMIT 5\",
   \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"view\":\"verified-memory\"
+  \"view\":\"verifiable-memory\"
 }")
 VM_REG_CT=$(safe_bindings_count "$VM_REG")
 if [[ "$VM_REG_CT" == "PARSE_ERR" ]]; then
@@ -1775,7 +1746,7 @@ if [[ "$VM_REG_CT" == "PARSE_ERR" ]]; then
 elif [[ "$VM_REG_CT" -ge 1 ]]; then
   ok "VM view returns $VM_REG_CT bindings from root content graph (§16.1)"
 else
-  fail "VM view returns 0 bindings — root content graph not included in verified-memory view"
+  fail "VM view returns 0 bindings — root content graph not included in verifiable-memory view"
 fi
 
 echo "--- 25b: ABI error decoding — UPDATE to non-existent KC returns decoded error ---"
@@ -1787,17 +1758,17 @@ UPDATE_ERR=$(c -X POST "http://127.0.0.1:9201/api/update" -d "{
 echo "  Update error response: $(echo "$UPDATE_ERR" | head -c 200)"
 echo "$UPDATE_ERR" | grep -qi "error\|BatchNotFound\|NotBatchPublisher\|does not exist" && ok "UPDATE to non-existent KC returned meaningful error" || warn "UPDATE error not decoded: ${UPDATE_ERR:0:200}"
 
-echo "--- 25c: SWM write to unregistered sub-graph returns 400 ---"
+echo "--- 25c: KA create/share to unregistered sub-graph returns 400 ---"
 UNREG_SG2="regression-unreg-$(date +%s%N)"
-http_post_capture "http://127.0.0.1:9201/api/shared-memory/write" \
-  "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"subGraphName\":\"$UNREG_SG2\",\"quads\":[{\"subject\":\"urn:unreg:x\",\"predicate\":\"http://schema.org/name\",\"object\":\"\\\"nope\\\"\",\"graph\":\"\"}]}" \
+http_post_capture "http://127.0.0.1:9201/api/knowledge-assets" \
+  "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"regression-unreg-ka\",\"subGraphName\":\"$UNREG_SG2\",\"quads\":[{\"subject\":\"urn:unreg:x\",\"predicate\":\"http://schema.org/name\",\"object\":\"\\\"nope\\\"\",\"graph\":\"\"}],\"finalize\":true,\"alsoShareSwm\":true}" \
   UNREG2_BODY UNREG2_CODE
 if [[ "$UNREG2_CODE" == "400" ]]; then
-  ok "Unregistered sub-graph write returns HTTP 400"
+  ok "Unregistered sub-graph KA create/share returns HTTP 400"
 elif [[ "$UNREG2_CODE" =~ ^4 ]]; then
-  ok "Unregistered sub-graph write returns HTTP $UNREG2_CODE"
+  ok "Unregistered sub-graph KA create/share returns HTTP $UNREG2_CODE"
 else
-  fail "Unregistered sub-graph write not rejected properly (HTTP $UNREG2_CODE): ${UNREG2_BODY:0:200}"
+  fail "Unregistered sub-graph KA create/share not rejected properly (HTTP $UNREG2_CODE): ${UNREG2_BODY:0:200}"
 fi
 
 echo "--- 25d: Dynamic node count — NUM_NODES matches expected ---"
@@ -2041,18 +2012,16 @@ except: print('false')
 [[ "$LIST_HAS_CG" == "true" ]] && ok "Free CG found in context-graph list" || fail "Free CG not in list"
 
 echo "--- 27c: Write to SWM on free CG (should work without chain) ---"
-SWM_FREE_RESP=$(c -X POST "http://127.0.0.1:9201/api/shared-memory/write" -d "{
-  \"contextGraphId\":\"$FREE_CG_ID\",
-  \"quads\":[
+FREE_CG_KA="free-test-ka"
+SWM_FREE_RESP=$(ka_create_share 9201 "$FREE_CG_ID" "$FREE_CG_KA" "" \
     $(ql "http://example.org/entity/free-test-1" "http://schema.org/name" "FreeCGEntity"),
     $(q  "http://example.org/entity/free-test-1" "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" "http://schema.org/Thing")
-  ]
-}")
-SWM_FREE_OK=$(json_get "$SWM_FREE_RESP" triplesWritten)
+)
+SWM_FREE_OK=$(json_get "$SWM_FREE_RESP" promotedCount)
 if [[ "$SWM_FREE_OK" != "__NONE__" && "$SWM_FREE_OK" != "0" && "$SWM_FREE_OK" != "__ERR__" ]]; then
-  ok "SWM write to free CG succeeded ($SWM_FREE_OK triples)"
+  ok "KA create/share to free CG succeeded ($SWM_FREE_OK triples)"
 else
-  fail "SWM write to free CG failed: $SWM_FREE_RESP"
+  fail "KA create/share to free CG failed: $SWM_FREE_RESP"
 fi
 
 echo "--- 27d: Query SWM on free CG ---"
@@ -2071,17 +2040,8 @@ else
   fail "SWM query on free CG returns 0 bindings"
 fi
 
-echo "--- 27e: VM publish on unregistered CG should fail ---"
-http_post_capture "http://127.0.0.1:9201/api/shared-memory/publish" \
-  "{\"contextGraphId\":\"$FREE_CG_ID\"}" \
-  VM_GUARD_BODY VM_GUARD_CODE
-if [[ "$VM_GUARD_CODE" == "500" ]] && echo "$VM_GUARD_BODY" | grep -qi "not registered"; then
-  ok "VM publish blocked on unregistered CG (HTTP $VM_GUARD_CODE)"
-elif [[ "$VM_GUARD_CODE" =~ ^[45] ]]; then
-  ok "VM publish blocked on unregistered CG (HTTP $VM_GUARD_CODE)"
-else
-  fail "VM publish should be blocked on unregistered CG (HTTP $VM_GUARD_CODE): ${VM_GUARD_BODY:0:200}"
-fi
+echo "--- 27e: Retired /api/shared-memory/publish is not served on free CG ---"
+retired_post_assert "/api/shared-memory/publish on free CG" 9201 "/api/shared-memory/publish" "{\"contextGraphId\":\"$FREE_CG_ID\"}"
 
 echo "--- 27f: Register CG on-chain ---"
 REG_RESP=$(c -X POST "http://127.0.0.1:9201/api/context-graph/register" -d "{
@@ -2106,9 +2066,7 @@ else
 fi
 
 echo "--- 27h: VM publish after registration should work ---"
-PUB_RESP=$(c -X POST "http://127.0.0.1:9201/api/shared-memory/publish" -d "{
-  \"contextGraphId\":\"$FREE_CG_ID\"
-}")
+PUB_RESP=$(ka_publish 9201 "$FREE_CG_ID" "$FREE_CG_KA")
 PUB_ST=$(json_get "$PUB_RESP" status)
 if [[ "$PUB_ST" == "confirmed" || "$PUB_ST" == "finalized" || "$PUB_ST" == "tentative" ]]; then
   ok "VM publish after registration succeeded (status=$PUB_ST)"
@@ -2723,9 +2681,9 @@ except Exception:
 
     echo "--- 31d: N1 publishes data into the CG (so N2 has something to sync after approval) ---"
     INV_ASSERTION_NAME="widget-info-$(date +%s)"
-    c -X POST "http://127.0.0.1:$N1_PORT/api/assertion/create" \
+    c -X POST "http://127.0.0.1:$N1_PORT/api/knowledge-assets" \
       -d "{\"contextGraphId\":\"$INVITE_CG_ID\",\"name\":\"$INV_ASSERTION_NAME\"}" >/dev/null
-    INV_WRITE_RESP=$(c -X POST "http://127.0.0.1:$N1_PORT/api/assertion/$INV_ASSERTION_NAME/write" \
+    INV_WRITE_RESP=$(c -X POST "http://127.0.0.1:$N1_PORT/api/knowledge-assets/$INV_ASSERTION_NAME/wm/write" \
       -d "{\"contextGraphId\":\"$INVITE_CG_ID\",\"quads\":[{\"subject\":\"did:example:widget\",\"predicate\":\"http://www.w3.org/2000/01/rdf-schema#label\",\"object\":\"\\\"Widget\\\"\"},{\"subject\":\"did:example:widget\",\"predicate\":\"http://schema.org/price\",\"object\":\"\\\"42\\\"\"}]}")
     INV_WRITTEN=$(json_get "$INV_WRITE_RESP" written)
     if [[ "$INV_WRITTEN" == "2" ]]; then
@@ -3190,7 +3148,7 @@ elif [[ "$NUM_NODES" -lt 2 ]]; then
 else
   N1_PORT=${NODE_PORTS[0]}
   # `delivered` is keyed by contextGraphId (a literal cgId string,
-  # the same value passed to /api/shared-memory/write). Codex PR #588
+  # the same value passed to KA create/share). Codex PR #588
   # round 3: summing across ALL cgIds let unrelated background traffic
   # (retries on other CGs) make the canary pass; compare the delta
   # for $CONTEXT_GRAPH specifically so this section actually proves
@@ -3233,13 +3191,11 @@ except Exception:
   FAILED_BEFORE=$(cg_substrate_counter "$SLO_BEFORE" "$CONTEXT_GRAPH" failed)
 
   TAG="urn:rc9-fanout:$(date +%s%N)"
-  WRITE=$(c -X POST "http://127.0.0.1:$N1_PORT/api/shared-memory/write" -d "{
-    \"contextGraphId\":\"$CONTEXT_GRAPH\",
-    \"quads\":[$(ql "$TAG" "http://schema.org/name" "rc9-substrate-fanout-canary")]
-  }")
-  WRITE_OK=$(json_get "$WRITE" triplesWritten)
+  WRITE=$(ka_create_share "$N1_PORT" "$CONTEXT_GRAPH" "rc9-fanout-$(date +%s%N)" "" \
+    $(ql "$TAG" "http://schema.org/name" "rc9-substrate-fanout-canary"))
+  WRITE_OK=$(json_get "$WRITE" promotedCount)
   if [[ "$WRITE_OK" != "1" ]]; then
-    fail "N1 SWM write for substrate fan-out canary failed (triplesWritten=$WRITE_OK)"
+    fail "N1 KA create/share for substrate fan-out canary failed (promotedCount=$WRITE_OK)"
   else
     ok "N1 wrote canary $TAG to '$CONTEXT_GRAPH'"
     sleep $((GOSSIP_WAIT_S + 3))
@@ -3286,7 +3242,7 @@ section_done
 section_start "SECTION 35: rc.9 — SWM ack-quorum reaches steady state (PR-D)"
 # rc.9 PR-D + PR-H added an ack-quorum watchdog that tracks per-share
 # delivery quorum and re-arms substrate top-ups on stalls. After the
-# §34 write (or any earlier SWM write in this run), the tracker
+# §34 KA share (or any earlier SWM share in this run), the tracker
 # should show `pending ≈ 0` on a healthy mesh — every started share
 # either completed or got dropped via deadline/watchdog.
 if [[ "$SKIP_RC9_SUBSTRATE" == "1" ]]; then

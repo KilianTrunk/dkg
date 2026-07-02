@@ -23,6 +23,7 @@ import type {
   CreateChallengeResult,
   OperationalWalletRegistrationResult,
   V10PublishingConvictionAccountInfo,
+  NodePublishingConvictionAccount,
   VerifyACKIdentityResult,
 } from './chain-adapter.js';
 import {
@@ -87,12 +88,12 @@ export class MockChainAdapter implements ChainAdapter {
     /** Token amount paid for the KC lifetime. Used to model per-epoch CG value. */
     tokenAmount: bigint;
     /**
-     * OT-RFC-38 LU-11 / OT-RFC-39 — ciphertext-chunks commitment for
-     * curated KCs. `bytes32(0)` + 0 when omitted (default for legacy
-     * and public-CG entries; matches Solidity default-zero mapping).
+     * OT-RFC-49 — curated `_catalog` commitment (REPLACED the ciphertext-chunks
+     * pair). `bytes32(0)` + 0 when omitted (default for legacy and public-CG
+     * entries; matches the Solidity default-zero mapping).
      */
-    ciphertextChunksRoot: Uint8Array;
-    ciphertextChunkCount: number;
+    catalogRoot: Uint8Array;
+    catalogLeafCount: number;
   }>();
   private contextGraphRegistry = new Map<string, Record<string, string>>();
   private events: ChainEvent[] = [];
@@ -388,8 +389,8 @@ export class MockChainAdapter implements ChainAdapter {
       startEpoch: this.rsEpoch,
       endEpoch: this.rsEpoch + 1n,
       tokenAmount: 0n,
-      ciphertextChunksRoot: new Uint8Array(32),
-      ciphertextChunkCount: 0,
+      catalogRoot: new Uint8Array(32),
+      catalogLeafCount: 0,
     });
 
     this.pushEvent('KCCreated', {
@@ -463,8 +464,15 @@ export class MockChainAdapter implements ChainAdapter {
     return this.txResult(true);
   }
 
-  async listContextGraphsFromChain(): Promise<import('./chain-adapter.js').ContextGraphOnChain[]> {
+  async listContextGraphsFromChain(
+    _fromBlock?: number,
+    _options?: import('./chain-adapter.js').ContextGraphChainScanOptions,
+  ): Promise<import('./chain-adapter.js').ContextGraphOnChain[]> {
     return [];
+  }
+
+  async hasContextGraphRegistryScanWatermark(): Promise<boolean> {
+    return false;
   }
 
   // --- V10 Publishing Conviction NFT (DKGPublishingConvictionNFT) ---
@@ -479,6 +487,8 @@ export class MockChainAdapter implements ChainAdapter {
     discountBps: number;
     /** Monotonic mock epoch captured at creation (no chronos in mock). */
     createdAtEpoch: number;
+    /** OT-RFC-51 designated node identityId this PCA funds (0n = none). */
+    primaryNode: bigint;
     agents: Set<string>;
   }>();
   private agentToConvictionAccount = new Map<string, bigint>();
@@ -521,6 +531,7 @@ export class MockChainAdapter implements ChainAdapter {
       lockDurationEpochs: MockChainAdapter.MOCK_LOCK_DURATION_EPOCHS,
       discountBps: MockChainAdapter.convictionDiscountBps(0n),
       createdAtEpoch: this.mockConvictionEpoch++,
+      primaryNode: 0n,
       agents: new Set<string>(),
     });
     return accountId;
@@ -535,7 +546,10 @@ export class MockChainAdapter implements ChainAdapter {
     }
   }
 
-  async createPublishingConvictionAccount(committedTRAC: bigint): Promise<{ accountId: bigint } & TxResult> {
+  // `primaryNode` (RFC-51) is recorded so the node-association reads
+  // (getConvictionPrimaryNode / listNodePublishingConvictionAccounts) have
+  // parity; per-node publishing-allocation accrual is still out of mock scope.
+  async createPublishingConvictionAccount(committedTRAC: bigint, primaryNode: bigint = 0n): Promise<{ accountId: bigint } & TxResult> {
     this.requireValidConvictionAmount(committedTRAC);
     const accountId = this.nextConvictionAccountId++;
     this.convictionAccounts.set(accountId, {
@@ -546,6 +560,7 @@ export class MockChainAdapter implements ChainAdapter {
       // Tier fixed at creation, identical formula to the contract.
       discountBps: MockChainAdapter.convictionDiscountBps(committedTRAC),
       createdAtEpoch: this.mockConvictionEpoch++,
+      primaryNode,
       agents: new Set<string>(),
     });
     return { accountId, ...this.txResult(true) };
@@ -637,6 +652,43 @@ export class MockChainAdapter implements ChainAdapter {
     return this.txResult(true);
   }
 
+  // Owner-gated bulk reset. Mirrors PublishingConviction.clearAgents: clears the
+  // whole allow-list (preserved across transfer; this is the explicit reset).
+  async clearPublishingConvictionAgents(accountId: bigint): Promise<TxResult> {
+    const acct = this.requireConvictionOwner(accountId);
+    for (const key of acct.agents) {
+      this.agentToConvictionAccount.delete(key);
+    }
+    acct.agents.clear();
+    return this.txResult(true);
+  }
+
+  // Owner-gated bulk add. Mirrors PublishingConviction.registerAgents: validates
+  // the WHOLE batch (zero / duplicate / cap) before any mutation — all-or-nothing.
+  async registerPublishingConvictionAgents(accountId: bigint, agents: string[]): Promise<TxResult> {
+    const acct = this.requireConvictionOwner(accountId);
+    const cap = MockChainAdapter.MOCK_MAX_AGENTS_PER_ACCOUNT;
+    const toAdd: string[] = [];
+    for (const agent of agents) {
+      if (agent === ethers.ZeroAddress) {
+        throw new Error('Mock: ZeroAgentAddress()');
+      }
+      const key = ethers.getAddress(agent).toLowerCase();
+      if (this.agentToConvictionAccount.has(key) || toAdd.includes(key)) {
+        throw new Error(`Mock: AgentAlreadyRegistered(${agent})`);
+      }
+      if (acct.agents.size + toAdd.length >= cap) {
+        throw new Error(`Mock: AgentCapReached(${accountId}, ${cap})`);
+      }
+      toAdd.push(key);
+    }
+    for (const key of toAdd) {
+      acct.agents.add(key);
+      this.agentToConvictionAccount.set(key, accountId);
+    }
+    return this.txResult(true);
+  }
+
   async isPublishingConvictionAgent(accountId: bigint, agent: string): Promise<boolean> {
     if (!ethers.isAddress(agent)) return false;
     const acct = this.convictionAccounts.get(accountId);
@@ -656,6 +708,27 @@ export class MockChainAdapter implements ChainAdapter {
   }
 
   /**
+   * Mock parity for the publisher SDK's fundability gate. Mirrors
+   * `PublishingConviction.coverPublishingCost`: discount the base cost by the
+   * account's tier (with the 1-wei post-discount floor), then compare against
+   * the per-epoch base allowance (`committedTRAC / lockDurationEpochs`,
+   * integer-divided so a few-wei squat floors to 0) plus the top-up buffer.
+   * The mock doesn't track per-window publish spend, so this is the account's
+   * nominal current capacity — enough to tell a genuinely-funding account
+   * from a squatted/underfunded one for THIS publish's cost.
+   */
+  async convictionAccountCanCover(accountId: bigint, baseCost: bigint): Promise<boolean> {
+    if (baseCost <= 0n) return true;
+    const acct = this.convictionAccounts.get(accountId);
+    if (!acct || acct.lockDurationEpochs <= 0) return false;
+    const BPS_DENOMINATOR = 10_000n;
+    let discountedCost = (baseCost * (BPS_DENOMINATOR - BigInt(acct.discountBps))) / BPS_DENOMINATOR;
+    if (discountedCost === 0n && baseCost > 0n) discountedCost = 1n;
+    const baseEpochAllowance = acct.committedTRAC / BigInt(acct.lockDurationEpochs);
+    return baseEpochAllowance + acct.topUpBuffer >= discountedCost;
+  }
+
+  /**
    * Mock owner-lookup for the daemon's curated-CG registration
    * preflight (`local curator == ownerOf(pcaAccountId)`).
    */
@@ -665,6 +738,48 @@ export class MockChainAdapter implements ChainAdapter {
       throw new Error(`Mock: PCA account ${accountId} does not exist`);
     }
     return acct.owner;
+  }
+
+  async getConvictionPrimaryNode(accountId: bigint): Promise<bigint> {
+    return this.convictionAccounts.get(accountId)?.primaryNode ?? 0n;
+  }
+
+  async getPcaContractContext(): Promise<{ chainId: number; hubAddress: string; nftAddress: string; tokenAddress: string; publishingConvictionAddress: string; clearAgentsSupported: boolean }> {
+    // Mock has no real contracts; return deterministic placeholders so the
+    // wallet-connect endpoint stays shaped-correctly on a no-chain node.
+    return {
+      chainId: 31337,
+      hubAddress: '0x' + '0'.repeat(40),
+      nftAddress: '0x' + '0'.repeat(40),
+      tokenAddress: '0x' + '0'.repeat(40),
+      publishingConvictionAddress: '0x' + '0'.repeat(40),
+      clearAgentsSupported: true,
+    };
+  }
+
+  async listNodePublishingConvictionAccounts(): Promise<NodePublishingConvictionAccount[]> {
+    const owner = ethers.getAddress(this.signerAddress);
+    const myIdentity = await this.getIdentityId();
+    const out: NodePublishingConvictionAccount[] = [];
+    for (const [accountId, acct] of this.convictionAccounts) {
+      if (acct.owner.toLowerCase() !== owner.toLowerCase()) continue;
+      const info = await this.getPublishingConvictionAccountInfo(accountId);
+      if (!info) continue;
+      out.push({
+        accountId,
+        primaryNode: acct.primaryNode,
+        fundsThisNode: myIdentity !== 0n && acct.primaryNode === myIdentity,
+        info,
+      });
+    }
+    out.sort((a, b) => Number(b.fundsThisNode) - Number(a.fundsThisNode));
+    return out;
+  }
+
+  async setPublishingConvictionPrimaryNode(accountId: bigint, primaryNode: bigint): Promise<TxResult> {
+    const acct = this.requireConvictionOwner(accountId);
+    acct.primaryNode = primaryNode;
+    return this.txResult(true);
   }
 
   // --- On-Chain Context Graphs (ContextGraphs contract) ---
@@ -921,6 +1036,33 @@ export class MockChainAdapter implements ChainAdapter {
     return result;
   }
 
+  async addOperationalWallet(address: string, options?: { identityId?: bigint }): Promise<TxResult> {
+    if (!ethers.isAddress(address)) throw new Error(`Mock: invalid address ${address}`);
+    const wallet = ethers.getAddress(address);
+    const identityId = options?.identityId ?? (await this.getIdentityId());
+    if (identityId === 0n) throw new Error('Mock: node has no on-chain profile');
+    const existing = [...this.identities.entries()].find(([addr]) => addr.toLowerCase() === wallet.toLowerCase());
+    if (existing && existing[1] !== identityId) {
+      throw new Error(`Mock: OperationalKeyTaken(${wallet})`);
+    }
+    this.identities.set(wallet, identityId);
+    return this.txResult(true);
+  }
+
+  async removeOperationalWallet(address: string, options?: { identityId?: bigint }): Promise<TxResult> {
+    if (!ethers.isAddress(address)) throw new Error(`Mock: invalid address ${address}`);
+    const wallet = ethers.getAddress(address);
+    if (wallet.toLowerCase() === ethers.getAddress(this.signerAddress).toLowerCase()) {
+      throw new Error(`Mock: refusing to remove the primary operational wallet ${wallet}`);
+    }
+    const identityId = options?.identityId ?? (await this.getIdentityId());
+    if (identityId === 0n) throw new Error('Mock: node has no on-chain profile');
+    const match = [...this.identities.entries()].find(([addr]) => addr.toLowerCase() === wallet.toLowerCase());
+    if (!match) throw new Error(`Mock: KeyNotAttached(${wallet})`);
+    this.identities.delete(match[0]);
+    return this.txResult(true);
+  }
+
   async verifySyncIdentity(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean> {
     return this.verifyACKIdentity(recoveredAddress, claimedIdentityId);
   }
@@ -1159,7 +1301,7 @@ export class MockChainAdapter implements ChainAdapter {
    * OT-RFC-43 Option 1 — highest per-author KA number minted in this mock, or
    * -1n if none. Scans the in-memory collections (keyed by kaId; reservedKaId
    * publishes store the packed id) and returns `max(kaId & ((1<<96)-1))` for
-   * the author. Mirrors the EVM adapter's KnowledgeAssetCreated-by-author scan.
+   * the author. Mirrors the EVM adapter's reconciled chain high-water semantics.
    */
   async getMaxKaNumberForAuthor(author: string): Promise<bigint> {
     const target = author.toLowerCase();
@@ -1252,10 +1394,10 @@ export class MockChainAdapter implements ChainAdapter {
       startEpoch: this.rsEpoch,
       endEpoch: this.rsEpoch + BigInt(params.epochs),
       tokenAmount: params.tokenAmount,
-      ciphertextChunksRoot: params.ciphertextChunksRoot && params.ciphertextChunksRoot.length === 32
-        ? params.ciphertextChunksRoot
+      catalogRoot: params.catalogRoot && params.catalogRoot.length === 32
+        ? params.catalogRoot
         : new Uint8Array(32),
-      ciphertextChunkCount: params.ciphertextChunkCount ?? 0,
+      catalogLeafCount: params.catalogLeafCount ?? 0,
     });
     this.rsKCs.set(kaId, {
       merkleRootHex: toHex(params.merkleRoot),
@@ -1466,8 +1608,8 @@ export class MockChainAdapter implements ChainAdapter {
       startEpoch: input.startEpoch ?? this.rsEpoch,
       endEpoch: input.endEpoch ?? ((input.startEpoch ?? this.rsEpoch) + 1n),
       tokenAmount: input.tokenAmount ?? 1n,
-      ciphertextChunksRoot: new Uint8Array(32),
-      ciphertextChunkCount: 0,
+      catalogRoot: new Uint8Array(32),
+      catalogLeafCount: 0,
     });
   }
 
@@ -1551,6 +1693,12 @@ export class MockChainAdapter implements ChainAdapter {
     }
     const chunkId = chunkIds[0];
 
+    // OT-RFC-49 — pin (isCurated, challengeLeafCount, challengeRoot) on the
+    // challenge, mirroring the contract's `_generateChallenge` snapshot. The
+    // mock's RS bridge is the public flat-KC path (curated catalog-path tests
+    // set their own pinned root via `__registerKC`-style setup), so default
+    // isCurated=false and pin the public merkle (root, leafCount).
+    const challengeCollection = this.collections.get(kaId);
     const challenge: NodeChallenge = {
       knowledgeAssetId: kaId,
       chunkId,
@@ -1559,6 +1707,9 @@ export class MockChainAdapter implements ChainAdapter {
       activeProofPeriodStartBlock: this.rsPeriodCursor,
       proofingPeriodDurationInBlocks: MockChainAdapter.RS_MOCK_PERIOD_DURATION_IN_BLOCKS,
       solved: false,
+      isCurated: false,
+      challengeLeafCount: BigInt(challengeCollection?.merkleLeafCount ?? chunkIds.length),
+      challengeRoot: fromHex(kcEntry.merkleRootHex),
     };
     this.rsChallenges.set(identityId, challenge);
 
@@ -1579,7 +1730,7 @@ export class MockChainAdapter implements ChainAdapter {
     };
   }
 
-  async submitProof(leaf: Uint8Array | `0x${string}`, _merkleProof: Uint8Array[]): Promise<TxResult> {
+  async submitProof(content: Uint8Array | `0x${string}`, _merkleProof: Uint8Array[]): Promise<TxResult> {
     const identityId = await this.getIdentityId();
     if (identityId === 0n) {
       throw new Error('Mock: cannot submitProof without an identity (call ensureProfile first)');
@@ -1604,10 +1755,11 @@ export class MockChainAdapter implements ChainAdapter {
     if (expectedLeaf === undefined) {
       throw new Error(`Mock: KC ${challenge.knowledgeAssetId} has no leaf at index ${challenge.chunkId}`);
     }
-    const leafHex = (typeof leaf === 'string' ? leaf : ethers.hexlify(leaf)).toLowerCase();
-    if (!/^0x[0-9a-f]{64}$/.test(leafHex)) {
-      throw new Error('Mock: submitProof leaf must be a 32-byte hex string (bytes32)');
-    }
+    // CONTENT-BINDING: derive the leaf from the submitted content, exactly as the
+    // chain does (`leaf = keccak256(content)`). The prover submits the N-Triple /
+    // catalog content bytes; an attacker can no longer echo the public root.
+    const contentBytes = typeof content === 'string' ? ethers.getBytes(content) : content;
+    const leafHex = ethers.keccak256(contentBytes).toLowerCase();
     if (expectedLeaf.toLowerCase() !== leafHex) {
       const computed = '0x' + 'cc'.repeat(32);
       throw new MerkleRootMismatchError(computed, kcEntry.merkleRootHex);
@@ -1667,16 +1819,16 @@ export class MockChainAdapter implements ChainAdapter {
     return entry.merkleLeafCount;
   }
 
-  async getLatestCiphertextChunksRoot(kaId: bigint): Promise<Uint8Array> {
+  async getCatalogRoot(kaId: bigint): Promise<Uint8Array> {
     const entry = this.collections.get(kaId);
     if (!entry) throw new Error(`Mock: unknown kaId ${kaId}`);
-    return entry.ciphertextChunksRoot;
+    return entry.catalogRoot;
   }
 
-  async getCiphertextChunkCount(kaId: bigint): Promise<number> {
+  async getCatalogLeafCount(kaId: bigint): Promise<number> {
     const entry = this.collections.get(kaId);
     if (!entry) throw new Error(`Mock: unknown kaId ${kaId}`);
-    return entry.ciphertextChunkCount;
+    return entry.catalogLeafCount;
   }
 
   async getLatestMerkleRootPublisher(kaId: bigint): Promise<string> {

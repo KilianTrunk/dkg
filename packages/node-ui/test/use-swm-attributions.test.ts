@@ -25,6 +25,18 @@ describe('useSwmAttributions — SPARQL query shape', () => {
     // the new DESC and the old `ORDER BY ?publishedAt` both present.
     expect(q).not.toMatch(/ORDER BY \?publishedAt\s+LIMIT/);
   });
+
+  // Codex review (PR #1055) — with contextGraphId removed from the request
+  // (B2), scoping rests entirely on this STRSTARTS prefix, so it MUST end in
+  // "/" to be exact. A bare "did:dkg:context-graph:cg-1" prefix would also
+  // match a sibling CG like cg-10 / cg-1-foo and merge its _shared_memory_meta
+  // attribution rows into the legend.
+  it('scopes via an exact "<cgUri>/" STRSTARTS prefix so sibling CGs do not leak in', () => {
+    const q = buildAttributionsQuery('cg-1');
+    expect(q).toContain('STRSTARTS(STR(?g), "did:dkg:context-graph:cg-1/")');
+    // The slash-less prefix would over-match cg-10 / cg-1-foo.
+    expect(q).not.toMatch(/STRSTARTS\(STR\(\?g\), "did:dkg:context-graph:cg-1"\)/);
+  });
 });
 
 // Codex Code7 (PR #656) — the hook returns its previous-graph result
@@ -49,7 +61,14 @@ describe('useSwmAttributions — stale-on-switch protection', () => {
     originalFetch = globalThis.fetch;
     globalThis.fetch = vi.fn(async (_url: any, init?: any) => {
       const body = init?.body ? JSON.parse(String(init.body)) : {};
-      const cgId: string = body.contextGraphId;
+      // B2: the POST body no longer carries contextGraphId (it scoped the
+      // engine to CG-direct graphs and dropped per-sub-graph attribution).
+      // Recover the cgId from the SPARQL's exact STRSTARTS prefix
+      // ("did:dkg:context-graph:<cgId>/") to route the deferred promise.
+      // Capture up to the trailing `/"` (non-greedy) rather than `[^"/]+`, so
+      // canonical slash-containing ids like `<wallet>/project` route under the
+      // full key instead of being truncated at the first `/`.
+      const cgId: string = String(body.sparql).match(/context-graph:(.+?)\/"/)?.[1] ?? '';
       const p = new Promise<any[]>((resolve) => {
         pending.set(cgId, { resolve });
       });
@@ -89,39 +108,85 @@ describe('useSwmAttributions — stale-on-switch protection', () => {
       return null;
     }
 
-    // Initial render for cg-A.
+    // Initial render for acme/alpha.
     await act(async () => {
-      root.render(React.createElement(Probe, { id: 'cg-A' }));
+      root.render(React.createElement(Probe, { id: 'acme/alpha' }));
     });
     await flushMicrotasks();
     expect(latest!.resultContextGraphId).toBeUndefined();
     expect(latest!.events).toHaveLength(0);
 
-    // Resolve cg-A's fetch.
-    pending.get('cg-A')!.resolve(rowsFor('cg-A'));
+    // Resolve acme/alpha's fetch.
+    pending.get('acme/alpha')!.resolve(rowsFor('acme/alpha'));
     await flushMicrotasks();
-    expect(latest!.resultContextGraphId).toBe('cg-A');
+    expect(latest!.resultContextGraphId).toBe('acme/alpha');
     expect(latest!.events).toHaveLength(1);
-    expect(latest!.events[0].rootUri).toBe('urn:e:cg-A');
+    expect(latest!.events[0].rootUri).toBe('urn:e:acme/alpha');
 
-    // Switch to cg-B. The hook still holds cg-A's events until the
+    // Switch to acme/beta. The hook still holds acme/alpha's events until the
     // new SPARQL lands — that's the pre-existing behaviour. The fix
     // is the discriminator: callers can detect the mismatch and
     // suppress downstream rendering until it clears.
     await act(async () => {
-      root.render(React.createElement(Probe, { id: 'cg-B' }));
+      root.render(React.createElement(Probe, { id: 'acme/beta' }));
     });
     await flushMicrotasks();
-    // Before cg-B's fetch resolves, the result still describes cg-A.
+    // Before acme/beta's fetch resolves, the result still describes acme/alpha.
     // A consumer that gates on `resultContextGraphId === currentId`
     // would now suppress these events (they're for the wrong graph).
-    expect(latest!.resultContextGraphId).toBe('cg-A');
+    expect(latest!.resultContextGraphId).toBe('acme/alpha');
 
-    // Resolve cg-B; the discriminator catches up.
-    pending.get('cg-B')!.resolve(rowsFor('cg-B'));
+    // Resolve acme/beta; the discriminator catches up.
+    pending.get('acme/beta')!.resolve(rowsFor('acme/beta'));
     await flushMicrotasks();
-    expect(latest!.resultContextGraphId).toBe('cg-B');
+    expect(latest!.resultContextGraphId).toBe('acme/beta');
     expect(latest!.events).toHaveLength(1);
-    expect(latest!.events[0].rootUri).toBe('urn:e:cg-B');
+    expect(latest!.events[0].rootUri).toBe('urn:e:acme/beta');
+  });
+});
+
+// B2 (DKG-NODE-ISSUES-FOR-RC17) — the attribution fetch MUST NOT send
+// contextGraphId. The SPARQL scopes itself to the CG via STRSTARTS(?g, …)
+// and must read every sub-graph's <cg>/<sg>/_shared_memory_meta partition;
+// sending contextGraphId makes the daemon constrain GRAPH ?g to CG-direct
+// graphs only, so the legend under-counted agents (showed 1 of 5 agents live).
+describe('useSwmAttributions — B2 POST body scoping', () => {
+  let root: Root;
+  let container: HTMLDivElement;
+  let originalFetch: typeof globalThis.fetch | undefined;
+
+  beforeEach(() => {
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+    originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ result: { bindings: [] } }),
+    } as any)) as any;
+  });
+
+  afterEach(async () => {
+    await act(async () => { root.unmount(); });
+    container.remove();
+    if (originalFetch) globalThis.fetch = originalFetch;
+  });
+
+  it('omits contextGraphId from the /api/query POST body so all sub-graph partitions are reached', async () => {
+    function Probe({ id }: { id: string }) {
+      useSwmAttributions(id);
+      return null;
+    }
+    await act(async () => {
+      root.render(React.createElement(Probe, { id: 'cg-1' }));
+    });
+    await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+
+    const calls = vi.mocked(fetch).mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    const body = JSON.parse(String((calls[0][1] as any)?.body ?? '{}'));
+    expect(body.sparql).toContain('_shared_memory_meta');
+    expect(body).not.toHaveProperty('contextGraphId');
   });
 });

@@ -16,6 +16,7 @@ import {
   decodePublishAck,
   createOperationContext,
   V10MerkleTree as MerkleTree,
+  structuredKARootV10,
 } from '@origintrail-official/dkg-core';
 import { OxigraphStore, type Quad } from '@origintrail-official/dkg-storage';
 import { EVMChainAdapter } from '@origintrail-official/dkg-chain';
@@ -41,6 +42,19 @@ const TEST_WALLET = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
 
 function q(s: string, p: string, o: string, g = GRAPH): Quad {
   return { subject: s, predicate: p, object: o, graph: g };
+}
+
+// rc.17 uniform per-KA layout: a confirmed publish (and a subsequent
+// KA update, which DELETE+REWRITEs the same graph) writes the KA's
+// public quads into a PER-KA verifiable-memory named graph
+// `did:dkg:context-graph:{cg}/_verifiable_memory/{author}/{number}`, where
+// author+number are unpacked from the on-chain kaId (= the update's
+// batchId) — NOT the monolithic root data graph. Compute that graph from
+// a result's kaId so tests assert against the graph the data lives in.
+function verifiableMemoryGraph(kaId: bigint): string {
+  const number = kaId & ((1n << 96n) - 1n);
+  const author = '0x' + (kaId >> 96n).toString(16).padStart(40, '0');
+  return `did:dkg:context-graph:${CONTEXT_GRAPH}/_verifiable_memory/${author}/${number}`;
 }
 
 // Phase C made the publisher require a precomputedAttestation for
@@ -79,7 +93,11 @@ beforeAll(async () => {
   const coreOp = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
   await mintTokens(_provider, hubAddress, HARDHAT_KEYS.DEPLOYER, coreOp.address, ethers.parseEther('50000000'));
   const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
-  const cgId = await createTestContextGraph(chain);
+  // PR #1072: these lifecycle/merkle/update/tentative tests publish PLAINTEXT
+  // (no encrypt hook) to exercise publish mechanics — not curated/ciphertext
+  // semantics. A curated CG now reverts plaintext publishes
+  // (CuratedCGRequiresCiphertextCommitment), so use a PUBLIC CG (accessPolicy 0).
+  const cgId = await createTestContextGraph(chain, undefined, 0);
   CONTEXT_GRAPH = String(cgId);
   GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
   _kav10Address = await chain.getKnowledgeAssetsLifecycleAddress();
@@ -128,7 +146,7 @@ describe('Publish lifecycle (aligned with diagram)', () => {
     expect(result.status).toBe('confirmed');
 
     const hashes = triples.map(computeTripleHash);
-    const flatTree = new MerkleTree(hashes);
+    const flatTree = { root: structuredKARootV10(hashes, []).root };
     expect(Buffer.from(result.merkleRoot).toString('hex'))
       .toBe(Buffer.from(flatTree.root).toString('hex'));
   });
@@ -167,7 +185,7 @@ describe('Publish lifecycle (aligned with diagram)', () => {
     expect(result.merkleRoot).toHaveLength(32);
 
     const hashes = triples.map(computeTripleHash);
-    const flatTree = new MerkleTree(hashes);
+    const flatTree = { root: structuredKARootV10(hashes, []).root };
     expect(Buffer.from(result.merkleRoot).toString('hex'))
       .toBe(Buffer.from(flatTree.root).toString('hex'));
   });
@@ -207,9 +225,11 @@ describe('Publish lifecycle (aligned with diagram)', () => {
     });
 
     const actualHex = Buffer.from(result.merkleRoot).toString('hex');
-    const goldenHex =
-      '0a3a66a345e5e8a25c50dd01be3373ae3d6b242807b62cbe7ada5ec208812a16';
-    expect(actualHex).toBe(goldenHex);
+    // Structured root over the fixed quads (no blank nodes → no skolemization).
+    const expectedHex = Buffer.from(
+      structuredKARootV10(fixedQuads.map(computeTripleHash), []).root,
+    ).toString('hex');
+    expect(actualHex).toBe(expectedHex);
   });
 
   it('same quads in different order produce the same merkle root', async () => {
@@ -285,7 +305,7 @@ describe('Publish lifecycle (aligned with diagram)', () => {
 
     const publicHashes = [q(ENTITY, 'http://schema.org/name', '"PrivBot"')].map(computeTripleHash);
     const privateRoot = result.kaManifest[0].privateMerkleRoot!;
-    const expectedRoot = new MerkleTree([...publicHashes, privateRoot]).root;
+    const expectedRoot = structuredKARootV10(publicHashes, [privateRoot]).root;
     expect(Buffer.from(result.merkleRoot).toString('hex'))
       .toBe(Buffer.from(expectedRoot).toString('hex'));
   });
@@ -366,7 +386,7 @@ describe('Publisher ↔ Receiver merkle consistency (regression)', () => {
       const publisherHex = Buffer.from(result.merkleRoot).toString('hex');
 
       const receiverHashes = result.publicQuads!.map(computeTripleHash);
-      const receiverRoot = new MerkleTree(receiverHashes).root;
+      const receiverRoot = structuredKARootV10(receiverHashes, []).root;
       const receiverHex = Buffer.from(receiverRoot).toString('hex');
 
       expect(receiverHex).toBe(publisherHex);
@@ -398,7 +418,7 @@ describe('Publisher ↔ Receiver merkle consistency (regression)', () => {
 
     const publisherHex = Buffer.from(result.merkleRoot).toString('hex');
     const receiverHashes = result.publicQuads!.map(computeTripleHash);
-    const receiverRoot = new MerkleTree(receiverHashes).root;
+    const receiverRoot = structuredKARootV10(receiverHashes, []).root;
     const receiverHex = Buffer.from(receiverRoot).toString('hex');
 
     expect(receiverHex).toBe(publisherHex);
@@ -439,7 +459,7 @@ describe('Publisher ↔ Receiver merkle consistency (regression)', () => {
     const privateRoots = result.kaManifest
       .filter(m => m.privateMerkleRoot)
       .map(m => m.privateMerkleRoot!);
-    const receiverRoot = new MerkleTree([...receiverHashes, ...privateRoots]).root;
+    const receiverRoot = structuredKARootV10(receiverHashes, privateRoots).root;
     const receiverHex = Buffer.from(receiverRoot).toString('hex');
 
     expect(receiverHex).toBe(publisherHex);
@@ -467,7 +487,7 @@ describe('Tentative data and chain event confirmation', () => {
 
     const triples = [q('did:dkg:agent:QmTentative', 'http://schema.org/name', '"TentBot"')];
     const hashes = triples.map(computeTripleHash);
-    const merkleRoot = new MerkleTree(hashes).root;
+    const merkleRoot = structuredKARootV10(hashes, []).root;
 
     const ntriples = triples.map(t =>
       `<${t.subject}> <${t.predicate}> ${t.object} .`,
@@ -546,7 +566,7 @@ describe('Tentative data and chain event confirmation', () => {
 
     const triples = [q('did:dkg:agent:QmMisAddr', 'http://schema.org/name', '"MisAddrBot"')];
     const hashes = triples.map(computeTripleHash);
-    const merkleRoot = new MerkleTree(hashes).root;
+    const merkleRoot = structuredKARootV10(hashes, []).root;
 
     const ntriples = triples.map(t =>
       `<${t.subject}> <${t.predicate}> ${t.object} .`,
@@ -627,7 +647,7 @@ describe('Tentative data and chain event confirmation', () => {
 
     const triples = [q('did:dkg:agent:QmByRoot', 'http://schema.org/name', '"RootBot"')];
     const hashes = triples.map(computeTripleHash);
-    const merkleRoot = new MerkleTree(hashes).root;
+    const merkleRoot = structuredKARootV10(hashes, []).root;
 
     const ntriples = triples.map(t =>
       `<${t.subject}> <${t.predicate}> ${t.object} .`,
@@ -693,7 +713,7 @@ describe('Tentative data and chain event confirmation', () => {
     // The handler computes its own merkle root from the autoPartition of received quads,
     // so we need to ensure the merkle root matches what the chain event carries.
     const hashes = triples.map(computeTripleHash);
-    const expectedMerkleRoot = new MerkleTree(hashes).root;
+    const expectedMerkleRoot = structuredKARootV10(hashes, []).root;
 
     const ntriples = triples.map(t =>
       `<${t.subject}> <${t.predicate}> ${t.object} .`,
@@ -793,7 +813,7 @@ describe('Update flow', () => {
     await revertSnapshot(_fileSnapshot);
   });
 
-  it('updates existing KC with new triples and new merkle root', async () => {
+  it('updates existing KC with new triples and new merkle root (publisher.update now writes per-KA VM — verify read-both returns exactly the updated row)', async () => {
     const store = new OxigraphStore();
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const bus = new TypedEventBus();
@@ -819,8 +839,14 @@ describe('Update flow', () => {
     expect(publishResult.status).toBe('confirmed');
     const kaId = publishResult.kaId;
 
+    // rc.17 per-KA layout: the confirmed publish wrote the original quads
+    // into the per-KA verifiable-memory graph (computed from kaId), and the
+    // KA update DELETE+REWRITEs that SAME graph (its batchId === kaId).
+    // Assert read-both against that graph, not the monolithic root data graph.
+    const vmGraph = verifiableMemoryGraph(kaId);
+
     const before = await store.query(
-      `SELECT ?name WHERE { GRAPH <${GRAPH}> { <${ENTITY}> <http://schema.org/name> ?name } }`,
+      `SELECT ?name WHERE { GRAPH <${vmGraph}> { <${ENTITY}> <http://schema.org/name> ?name } }`,
     );
     expect(before.type).toBe('bindings');
     if (before.type === 'bindings') {
@@ -843,7 +869,7 @@ describe('Update flow', () => {
       .not.toBe(Buffer.from(publishResult.merkleRoot).toString('hex'));
 
     const after = await store.query(
-      `SELECT ?name WHERE { GRAPH <${GRAPH}> { <${ENTITY}> <http://schema.org/name> ?name } }`,
+      `SELECT ?name WHERE { GRAPH <${vmGraph}> { <${ENTITY}> <http://schema.org/name> ?name } }`,
     );
     expect(after.type).toBe('bindings');
     if (after.type === 'bindings') {
@@ -1038,9 +1064,12 @@ describe('Tentative publish UAL uniqueness', () => {
       });
     }
 
+    // RFC ka-metadata-trim: KC rows no longer carry `rdf:type
+    // dkg:KnowledgeCollection` — a KC is identified by its `dkg:status` row
+    // (the same predicate the daemon counters use).
     const result = await store.query(
       `SELECT (COUNT(DISTINCT ?kc) AS ?c) WHERE {
-        GRAPH ?g { ?kc a <http://dkg.io/ontology/KnowledgeCollection> }
+        GRAPH ?g { ?kc <http://dkg.io/ontology/status> ?s }
       }`,
     );
 
@@ -1056,17 +1085,21 @@ describe('Tentative publish UAL uniqueness', () => {
   // `finalizeIntentionalLocalPublish` helper that handles the three
   // intentional-local branches MUST preserve the same provenance and
   // meta-graph-remap behaviour the pre-PR2 catch-block had. Without
-  // this, intentional-local publishes silently drop their RFC-001 §3.5
-  // `dkg:Publication` / `dkg:authoredBy` quads and (when the caller
-  // supplies a `targetMetaGraphUri`) write their `_meta` triples into
-  // the wrong graph. These two regressions pin the fix.
+  // this, intentional-local publishes silently drop their author
+  // attribution and (when the caller supplies a `targetMetaGraphUri`)
+  // write their `_meta` triples into the wrong graph. These two
+  // regressions pin the fix.
+  //
+  // RFC ka-metadata-trim Phase 1: the `dkg:Publication` / `dkg:authoredBy`
+  // mirror was dropped (zero readers); author attribution is now carried
+  // solely by `prov:wasAttributedTo` on the KC row, which this test pins.
   //
   // Both tests use the "private data — no ACKs collectable" intentional-
   // local branch: a numeric on-chain CG + V10-ready chain means the
   // publisher resolves a real `publisherSigner`, so the conditional
-  // spread of `authorAddress`/`publishOperationId` (gated on either a
-  // precomputedAttestation or a resolved signer) is exercised end-to-end.
-  it('intentional-local tentative publish (private-data branch) emits dkg:Publication + dkg:authoredBy provenance (RC11 / PR-A)', async () => {
+  // spread of `authorAddress` (gated on either a precomputedAttestation
+  // or a resolved signer) is exercised end-to-end.
+  it('intentional-local tentative publish (private-data branch) attributes the author via prov:wasAttributedTo (RC11 / PR-A)', async () => {
     const store = new OxigraphStore();
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const bus = new TypedEventBus();
@@ -1092,6 +1125,7 @@ describe('Tentative publish UAL uniqueness', () => {
 
     expect(result.status).toBe('tentative');
 
+    // RFC ka-metadata-trim: no dkg:Publication subjects are emitted anymore.
     const pubResult = await store.query(
       `SELECT ?pub WHERE {
         GRAPH ?g { ?pub a <http://dkg.io/ontology/Publication> }
@@ -1099,14 +1133,16 @@ describe('Tentative publish UAL uniqueness', () => {
     );
     expect(pubResult.type).toBe('bindings');
     if (pubResult.type === 'bindings') {
-      expect(pubResult.bindings.length).toBeGreaterThan(0);
+      expect(pubResult.bindings.length).toBe(0);
     }
 
+    // Author attribution survives on the KC row as prov:wasAttributedTo
+    // (agent DID with lowercased EVM address).
     const authorResult = await store.query(
       `SELECT ?author WHERE {
         GRAPH ?g {
-          ?pub a <http://dkg.io/ontology/Publication> .
-          ?pub <http://dkg.io/ontology/authoredBy> ?author .
+          ?kc <http://dkg.io/ontology/status> ?s .
+          ?kc <http://www.w3.org/ns/prov#wasAttributedTo> ?author .
         }
       }`,
     );
@@ -1115,7 +1151,7 @@ describe('Tentative publish UAL uniqueness', () => {
       expect(authorResult.bindings.length).toBeGreaterThan(0);
       const expectedAddr = new ethers.Wallet(HARDHAT_KEYS.CORE_OP).address;
       const authors = authorResult.bindings.map((b) => b['author'].replace(/^"|"$/g, ''));
-      expect(authors).toContain(expectedAddr);
+      expect(authors).toContain(`did:dkg:agent:${expectedAddr.toLowerCase()}`);
     }
   });
 

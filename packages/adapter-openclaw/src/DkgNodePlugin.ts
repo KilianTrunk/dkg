@@ -12,7 +12,7 @@
  *     upstream `MemoryPluginCapability` via `api.registerMemoryCapability`.
  *     No adapter-side write tool: memory writes flow through daemon HTTP
  *     routes documented in `packages/cli/skills/dkg-node/SKILL.md`
- *     (`POST /api/assertion/create` + `POST /api/assertion/:name/write`),
+ *     (`POST /api/knowledge-assets` + `POST /api/knowledge-assets/:name/wm/write`),
  *     which the agent reads from `GET /.well-known/skill.md` on startup.
  */
 import {
@@ -24,9 +24,11 @@ import {
   normalizeDkgPublisherQuads,
   resolveDkgHome,
   toEip55Checksum,
+  validateAssertionName,
 } from '@origintrail-official/dkg-core';
 import {
   DkgDaemonClient,
+  DkgDaemonHttpError,
   normalizeContextGraphId,
   type LocalAgentIntegrationRecord,
   type LocalAgentIntegrationTransport,
@@ -99,6 +101,80 @@ import { buildQueryTools } from './tools/query-tools.js';
 import { buildMessagingTools } from './tools/messaging-tools.js';
 import { buildAssertionTools } from './tools/assertion-tools.js';
 import { buildMemoryTools } from './tools/memory-tools.js';
+
+// #1116 share-outcome warnings. These three constants + classifyShareWarning are
+// duplicated byte-identical across the MCP, OpenClaw, and Hermes adapters. There
+// is intentionally NO shared runtime module: MCP has no dkg-core dependency
+// (dependency-light by design) and OpenClaw cannot import from dkg-mcp, so the
+// only "shared home" would be a new package (out of scope). Drift is caught by a
+// TEST: this adapter's suite asserts these values are byte-identical to the
+// canonical fixture at `tests/fixtures/share-seal-warnings.json`. Update the
+// fixture + all three adapters together; the parity tests flag any mismatch.
+
+// publishReady:false after a FULL share that opted out of sealing (skip_seal:true)
+// — a later finalize(layer:swm) DOES seal it.
+export const SHARE_NOT_PUBLISH_READY_WARNING =
+  'Shared to SWM but NOT publish-ready (sealed:false). Seal it with ' +
+  'dkg_knowledge_asset_finalize (layer:swm works after sharing), then publish.';
+
+// A SUBSET share is publishReady:false too, but unlike a skip_seal full share it
+// is NOT sealable — finalize(layer:swm) now REJECTS it with SWM_SUBSET_NOT_SEALABLE.
+// Surface the real recovery (full share / new asset) instead of "seal it".
+export const SHARE_SUBSET_NOT_PUBLISH_READY_WARNING =
+  'Shared a SUBSET to SWM for peer visibility. A subset is NOT sealable/' +
+  'publishable (finalize layer:swm will reject it). To publish on-chain, share ' +
+  'the full asset (entities:"all"), or model this subset as its own knowledge asset.';
+
+// A FULL share can come back sealed:true but publishReady:false when NOT every
+// sealed root reached SWM (promotedAllRoots false — e.g. foreign-owned roots were
+// skipped). The engine did NOT set the swmShareComplete marker, so finalize(layer:
+// swm) would REJECT — do NOT recommend it here. Re-sharing the full asset recovers.
+export const SHARE_INCOMPLETE_PROMOTE_WARNING =
+  'Sealed, but not all roots reached SWM (some roots may be owned by other ' +
+  'agents) — not yet publishable; re-share the full asset so every sealed root ' +
+  'is in SWM.';
+
+/**
+ * #1116: pick the not-publish-ready share warning from the share outcome. Returns
+ * `undefined` when the share IS publish-ready (no warning). Precedence:
+ *  1. sealed:true + publishReady:false → incomplete full promote (marker NOT set;
+ *     finalize layer:swm would reject) → re-share the full asset.
+ *  2. sealed:false + SUBSET → not sealable.
+ *  3. sealed:false + FULL (skip_seal) → sealable later (finalize layer:swm works).
+ * Duplicated byte-identical on MCP (TS) + Hermes (Python).
+ */
+export function classifyShareWarning(outcome: {
+  sealed?: boolean;
+  publishReady?: boolean;
+  isSubset: boolean;
+}): string | undefined {
+  if (outcome.publishReady !== false) return undefined;
+  if (outcome.sealed === true) return SHARE_INCOMPLETE_PROMOTE_WARNING;
+  if (outcome.isSubset) return SHARE_SUBSET_NOT_PUBLISH_READY_WARNING;
+  return SHARE_NOT_PUBLISH_READY_WARNING;
+}
+
+/**
+ * #1116: extract the daemon's recovery hint from a 409 UNSEALED_SHARE_BLOCKED
+ * share failure. The DkgDaemonClient throws a typed {@link DkgDaemonHttpError}
+ * carrying the response `status` and parsed JSON `body`, so branch structurally
+ * on the status + body code (no JSON-from-message parsing). Returns undefined
+ * for any other error (caller falls back to the generic daemonError).
+ */
+function extractUnsealedShareRecovery(err: unknown): string | undefined {
+  if (
+    err instanceof DkgDaemonHttpError &&
+    err.status === 409 &&
+    typeof err.body === 'object' &&
+    err.body !== null
+  ) {
+    const body = err.body as { code?: string; recovery?: string };
+    if (body.code === 'UNSEALED_SHARE_BLOCKED' && typeof body.recovery === 'string' && body.recovery) {
+      return body.recovery;
+    }
+  }
+  return undefined;
+}
 
 export class DkgNodePlugin {
   private config: DkgOpenClawConfig;
@@ -2379,6 +2455,28 @@ export class DkgNodePlugin {
     return this.error(msg);
   }
 
+  /**
+   * Register a context graph on-chain, tolerating the idempotent
+   * "already registered" case (returns `undefined` so callers don't claim a
+   * fresh registration). Any OTHER failure rethrows — the caller surfaces it as
+   * a tool error and must NOT proceed. Used by handleAssertionPublish (CONTRACT
+   * §G) for the register-then-publish path of the canonical per-KA publish tool.
+   */
+  private async registerContextGraphIfNeeded(
+    contextGraphId: string,
+    accessPolicy?: number,
+  ): Promise<Record<string, unknown> | undefined> {
+    try {
+      return await this.client.registerContextGraph(contextGraphId, { accessPolicy });
+    } catch (err: any) {
+      const message = err?.message ?? String(err);
+      if (message.includes('already registered')) {
+        return undefined;
+      }
+      throw err;
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Tools
   // ---------------------------------------------------------------------------
@@ -2403,7 +2501,6 @@ export class DkgNodePlugin {
       handleJoinRequestApprove: this.handleJoinRequestApprove.bind(this),
       handleJoinRequestReject: this.handleJoinRequestReject.bind(this),
       handleSubscribe: this.handleSubscribe.bind(this),
-      handlePublish: this.handlePublish.bind(this),
       handleQuery: this.handleQuery.bind(this),
       handleQueryCatalogList: this.handleQueryCatalogList.bind(this),
       handleQueryCatalogRun: this.handleQueryCatalogRun.bind(this),
@@ -2414,7 +2511,10 @@ export class DkgNodePlugin {
       handleInvokeSkill: this.handleInvokeSkill.bind(this),
       handleAssertionCreate: this.handleAssertionCreate.bind(this),
       handleAssertionWrite: this.handleAssertionWrite.bind(this),
+      handleAssertionFinalize: this.handleAssertionFinalize.bind(this),
       handleAssertionPromote: this.handleAssertionPromote.bind(this),
+      handleAssertionPublish: this.handleAssertionPublish.bind(this),
+      handleAssertionPullFrom: this.handleAssertionPullFrom.bind(this),
       handleAssertionDiscard: this.handleAssertionDiscard.bind(this),
       handleAssertionImportFile: this.handleAssertionImportFile.bind(this),
       handleAssertionQuery: this.handleAssertionQuery.bind(this),
@@ -2424,8 +2524,6 @@ export class DkgNodePlugin {
       handleAssertionHistory: this.handleAssertionHistory.bind(this),
       handleSubGraphCreate: this.handleSubGraphCreate.bind(this),
       handleSubGraphList: this.handleSubGraphList.bind(this),
-      handleSharedMemoryPublish: this.handleSharedMemoryPublish.bind(this),
-      handleShare: this.handleShare.bind(this),
       handleMemorySearch: this.handleMemorySearch.bind(this),
     };
   }
@@ -2703,25 +2801,6 @@ export class DkgNodePlugin {
     }
   }
 
-  private async handlePublish(args: Record<string, unknown>): Promise<OpenClawToolResult> {
-    try {
-      const contextGraphId = typeof args.context_graph_id === 'string' ? args.context_graph_id.trim() : '';
-      if (!contextGraphId) {
-        return this.error('"context_graph_id" is required.');
-      }
-      const rawQuads = args.quads;
-
-      if (!Array.isArray(rawQuads) || rawQuads.length === 0) {
-        return this.error('"quads" must be a non-empty array of {subject, predicate, object} objects.');
-      }
-
-      const result = await this.publisher.publishVerifiedMemory({ contextGraphId, quads: rawQuads });
-      return this.json({ kaId: result.kaId, kaCount: result.kas?.length ?? 0, quadsPublished: rawQuads.length });
-    } catch (err: any) {
-      return this.daemonError(err);
-    }
-  }
-
   private async handleQuery(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const sparql = String(args.sparql);
@@ -2738,7 +2817,7 @@ export class DkgNodePlugin {
       // both graphs and merges), while `false` used the legacy data-graph
       // path alone. `view: "shared-working-memory"` reads ONLY SWM and
       // would drop data-graph-only triples for `true` callers; `view:
-      // "verified-memory"` has different semantics entirely. Surface the
+      // "verifiable-memory"` has different semantics entirely. Surface the
       // break explicitly rather than pretending a clean migration exists.
       if (args.include_shared_memory !== undefined) {
         return this.error(
@@ -2746,7 +2825,7 @@ export class DkgNodePlugin {
             'for the legacy union-semantics: `true` previously queried the data graph ∪ SWM ' +
             '(no single `view` reproduces this union). Closest-intent replacements: omit `view` ' +
             'for the legacy data-graph path, or `view: "shared-working-memory"` for SWM-only, or ' +
-            '`view: "verified-memory"` for on-chain data. If you need the original union exactly, ' +
+            '`view: "verifiable-memory"` for on-chain data. If you need the original union exactly, ' +
             'call POST /api/query directly with `includeSharedMemory: true`.',
         );
       }
@@ -3395,11 +3474,81 @@ export class DkgNodePlugin {
       const name = String(args.name ?? '').trim();
       if (!contextGraphId) return this.error('"context_graph_id" is required.');
       if (!name) return this.error('"name" is required.');
+      // Validate against the daemon's ACTUAL rule (`validateAssertionName`,
+      // core/src/constants.ts) — any IRI-safe name up to 256 chars, NOT a
+      // lowercase-hyphen slug. Fail fast at the boundary with the daemon's exact
+      // reason rather than letting the daemon 400.
+      const nameValidation = validateAssertionName(name);
+      if (!nameValidation.valid) {
+        return this.error(`"name" is invalid: ${nameValidation.reason}`);
+      }
       const subGraphName = args.sub_graph_name ? String(args.sub_graph_name) : undefined;
-      // Create stays on the legacy assertion route: it preserves the
-      // `{ assertionUri, alreadyExists }` contract and name validation that the
-      // KA create route (an idempotent get-or-create) can't yet provide. Only
-      // the WM/SWM mutation verbs (write / promote / discard) move to KA.
+
+      // [D3] One-shot path: when `quads` are supplied, create → write → seal in a
+      // single call via the combined KA route, optionally sharing to SWM. Stops at
+      // a sealed WM draft by default; `also_share_swm:true` lands a publish-ready KA
+      // in SWM. This NEVER mints to VM — there is no `alsoPublishVm` here (publish is
+      // the separate dkg_knowledge_asset_publish step).
+      // Validate also_share_swm's shape uniformly (parity with MCP + Hermes) — even on the
+      // bare-create path where it is IGNORED — since the shared tool schema advertises a
+      // boolean. Done BEFORE the quads branch so the runtime contract is consistent.
+      if (args.also_share_swm !== undefined && typeof args.also_share_swm !== 'boolean') {
+        return this.error('"also_share_swm" must be a boolean.');
+      }
+      const rawQuads = args.quads;
+      if (rawQuads !== undefined) {
+        if (!Array.isArray(rawQuads) || rawQuads.length === 0) {
+          return this.error('"quads" must be a non-empty array of {subject, predicate, object} objects.');
+        }
+        // Default FALSE, passed EXPLICITLY so the createKnowledgeAsset client helper's
+        // internal seal-true default (dkg-client.ts) cannot leak and silently auto-share.
+        const alsoShareSwm = args.also_share_swm === true;
+        // Strip surrounding <…> on subject/predicate/object before normalizing (parity
+        // with the MCP + Hermes create one-shots) so a bracketed URI stays a URI rather
+        // than being quoted as a literal. Then auto-type objects + pin the per-KA `graph`
+        // via normalizeDkgPublisherQuads, so a one-shot create lands identical triples
+        // across all three adapters.
+        const stripBrackets = (t: unknown): unknown =>
+          typeof t === 'string' && t.length >= 2 && t.startsWith('<') && t.endsWith('>')
+            ? t.slice(1, -1)
+            : t;
+        const strippedQuads = (rawQuads as Array<Record<string, unknown>>).map((q) => ({
+          ...q,
+          subject: stripBrackets(q.subject),
+          predicate: stripBrackets(q.predicate),
+          object: stripBrackets(q.object),
+        }));
+        const quads = normalizeDkgPublisherQuads(
+          strippedQuads as Parameters<typeof normalizeDkgPublisherQuads>[0],
+        );
+        const result = await this.client.createKnowledgeAsset(contextGraphId, name, {
+          subGraphName,
+          quads,
+          alsoShareSwm,
+        });
+        // The daemon returns 207 + errors:[{phase:'swm-share'}] when create+seal lands
+        // but the opt-in SWM share fails; the client treats 207 as success. Judge from
+        // the OUTCOME, not the requested flag, so agents don't publish an asset that
+        // never reached SWM (parity with the MCP adapter's 207 handling).
+        const r = result as Record<string, unknown>;
+        const resultErrors = Array.isArray(r.errors)
+          ? (r.errors as Array<{ phase?: string; error?: string }>)
+          : [];
+        const shareError = resultErrors.find((e) => e?.phase === 'swm-share');
+        if (alsoShareSwm && (shareError || r.publishReady === false)) {
+          return this.error(
+            `Created and sealed knowledge asset "${name}" in "${contextGraphId}", but the opt-in ` +
+            `Shared Working Memory share FAILED${shareError?.error ? `: ${shareError.error}` : ''}. ` +
+            `The asset did NOT reach Shared Working Memory and is NOT publish-ready — do not publish yet; ` +
+            `retry the share with dkg_knowledge_asset_share, then publish.`,
+          );
+        }
+        return this.json(result);
+      }
+
+      // No quads → the unchanged bare create. Stays on the legacy assertion route: it
+      // preserves the `{ assertionUri, alreadyExists }` contract and name validation
+      // that the KA create route (an idempotent get-or-create) can't yet provide.
       const result = await this.publisher.createLocalWorkspace({
         contextGraphId,
         assertionName: name,
@@ -3438,6 +3587,54 @@ export class DkgNodePlugin {
     }
   }
 
+  private async handleAssertionFinalize(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+    try {
+      const contextGraphId = String(args.context_graph_id ?? '').trim();
+      const name = String(args.name ?? '').trim();
+      if (!contextGraphId) return this.error('"context_graph_id" is required.');
+      if (!name) return this.error('"name" is required.');
+      const subGraphName = args.sub_graph_name ? String(args.sub_graph_name) : undefined;
+      const authorAgentAddress = args.author_agent_address ? String(args.author_agent_address) : undefined;
+      // CONTRACT §C: present-but-invalid is a tool error, never silent-default.
+      // `scheme_version` must be a POSITIVE integer (daemon Number.isInteger && >= 1).
+      let schemeVersion: number | undefined;
+      if (args.scheme_version !== undefined) {
+        const raw = typeof args.scheme_version === 'string' ? Number(args.scheme_version.trim()) : args.scheme_version;
+        if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 1) {
+          return this.error('"scheme_version" must be a positive integer.');
+        }
+        schemeVersion = raw;
+      }
+      // #1116: optional `layer` selects WHERE the content to seal lives. Default
+      // (omitted) seals the open WM draft; "swm" seals an asset already shared to
+      // SWM. Present-but-invalid is a tool error, never a silent default. Check
+      // `typeof === 'string'` BEFORE trimming/enum-checking — `String(args.layer)`
+      // would coerce a non-string like ['swm'] to "swm" and FORWARD it (parity
+      // with the Hermes direct-validation fix; not a String() coercion bypass).
+      let layer: 'wm' | 'swm' | undefined;
+      if (args.layer !== undefined) {
+        const raw = typeof args.layer === 'string' ? args.layer.trim() : args.layer;
+        if (raw !== 'wm' && raw !== 'swm') {
+          return this.error('"layer" must be "wm" or "swm".');
+        }
+        layer = raw;
+      }
+      // Seal the WHOLE WM draft (CONTRACT §1 Stage3 — there is no subset scope on
+      // finalize). The author defaults to the request token's agent when
+      // `author_agent_address` is omitted; pre-signed attestations are not surfaced
+      // on this tool (they require the packed reservedKaId — out of scope here).
+      const result = await this.client.knowledgeAssetFinalize(contextGraphId, name, {
+        subGraphName,
+        authorAgentAddress,
+        schemeVersion,
+        layer,
+      });
+      return this.json(result);
+    } catch (err: any) {
+      return this.daemonError(err);
+    }
+  }
+
   private async handleAssertionPromote(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = String(args.context_graph_id ?? '').trim();
@@ -3445,24 +3642,195 @@ export class DkgNodePlugin {
       if (!contextGraphId) return this.error('"context_graph_id" is required.');
       if (!name) return this.error('"name" is required.');
       const subGraphName = args.sub_graph_name ? String(args.sub_graph_name) : undefined;
-      // Public contract: omit `entities` → promote everything (daemon defaults `entities ?? "all"`).
-      // Provided → must be a non-empty array of URIs. The previous string-"all" shortcut was dropped
-      // because strict JSON-schema validators rejected it (schema says `type: 'array'`) while
-      // `entities: ["all"]` would silently 400 at the daemon — a confusing no-signal failure mode.
-      let entities: string[] | undefined;
+      // CONTRACT §B: `entities` accepts "all" | string[] | omitted. Omitted ⇒
+      // undefined (daemon defaults to a full share); the "all" string sentinel is
+      // passed through unchanged (the daemon reads parsed.entities and treats
+      // "all" as a full share). A non-empty string[] passes through as the subset.
+      // An empty array is rejected client-side (the daemon REST 400s "all"→[] /
+      // empty selections) — fail fast with a clear message, never coerce.
+      let entities: string[] | 'all' | undefined;
       const raw = args.entities;
       if (raw === undefined || raw === null) {
         entities = undefined;
+      } else if (raw === 'all') {
+        entities = 'all';
       } else if (Array.isArray(raw) && raw.length > 0 && raw.every((e) => typeof e === 'string')) {
-        entities = raw.map((e) => String(e));
+        // FIX K: trim each root-entity URI before forwarding — a whitespace-padded
+        // entity (" urn:a ") would otherwise reach the daemon with the spaces and
+        // resolve to the wrong (or no) root. Parity with Hermes.
+        entities = raw.map((e) => String(e).trim());
       } else {
-        return this.error('"entities" must be omitted or a non-empty array of root entity URIs.');
+        return this.error('"entities" must be omitted, the string "all", or a non-empty array of root entity URIs.');
+      }
+      // #1116: a full share SEALS BY DEFAULT; `skip_seal:true` shares unsealed.
+      // Present-but-invalid is a tool error, never a silent default.
+      let skipSeal: boolean | undefined;
+      if (args.skip_seal !== undefined) {
+        if (typeof args.skip_seal !== 'boolean') {
+          return this.error('"skip_seal" must be a boolean.');
+        }
+        skipSeal = args.skip_seal;
       }
       // WM → SWM. The KA `swm/share` route is the same engine call
       // (`agent.assertion.promote`) the legacy promote used.
       const result = await this.client.knowledgeAssetShare(contextGraphId, name, {
         entities,
         subGraphName,
+        skipSeal,
+      });
+      // #1116: surface the seal outcome. `sealed`/`publishReady` flow through the
+      // JSON; ALSO add the explicit warning when the share is NOT publish-ready.
+      // classifyShareWarning picks the right of the three warnings from
+      // {sealed, publishReady, isSubset}. A subset is a non-empty specific array
+      // (an empty array was rejected above; "all"/undefined is a full share).
+      const seal = result as { publishReady?: boolean; sealed?: boolean };
+      const warning = result
+        ? classifyShareWarning({ sealed: seal.sealed, publishReady: seal.publishReady, isSubset: Array.isArray(entities) })
+        : undefined;
+      if (warning) {
+        return this.json({ ...result, warning });
+      }
+      return this.json(result);
+    } catch (err: any) {
+      // #1116: a default (sealing) share that cannot seal fails CLOSED — the
+      // daemon returns 409 UNSEALED_SHARE_BLOCKED with a recovery hint and WM
+      // preserved. The client throws an Error whose message carries the response
+      // body; surface the recovery text verbatim when present.
+      const recovery = extractUnsealedShareRecovery(err);
+      if (recovery) return this.error(recovery);
+      return this.daemonError(err);
+    }
+  }
+
+  private async handleAssertionPublish(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+    try {
+      const contextGraphId = String(args.context_graph_id ?? '').trim();
+      const name = String(args.name ?? '').trim();
+      if (!contextGraphId) return this.error('"context_graph_id" is required.');
+      if (!name) return this.error('"name" is required.');
+      const subGraphName = args.sub_graph_name ? String(args.sub_graph_name) : undefined;
+
+      // CONTRACT §C: a present-but-invalid numeric is a tool error, never a
+      // silent default. `publish_epochs` must be a POSITIVE integer (daemon
+      // /^[1-9]\d*$/ + MAX_PUBLISH_EPOCHS cap).
+      let publishEpochs: number | undefined;
+      if (args.publish_epochs !== undefined) {
+        const raw = typeof args.publish_epochs === 'string' ? Number(args.publish_epochs.trim()) : args.publish_epochs;
+        if (typeof raw !== 'number' || !Number.isInteger(raw) || raw <= 0) {
+          return this.error('"publish_epochs" must be a positive integer.');
+        }
+        publishEpochs = raw;
+      }
+      // CONTRACT §C: `publisher_node_identity_id_override` must be a NON-NEGATIVE
+      // integer (daemon /^\d+$/). BigInt() alone accepts "-1" / "0x.." — validate
+      // explicitly first, then carry as a bigint.
+      let publisherNodeIdentityIdOverride: bigint | undefined;
+      if (args.publisher_node_identity_id_override !== undefined) {
+        const raw = String(args.publisher_node_identity_id_override).trim();
+        if (!/^\d+$/.test(raw)) {
+          return this.error('"publisher_node_identity_id_override" must be a non-negative integer (decimal string).');
+        }
+        publisherNodeIdentityIdOverride = BigInt(raw);
+      }
+
+      // CONTRACT §D: `clear_shared_memory_after` is NOT exposed on the per-asset
+      // publish tool — on vm/publish it is graph-wide destructive (wipes every
+      // other agent's unpublished SWM in the CG/sub-graph). The this-asset SWM
+      // cleanup runs unconditionally regardless; there is no agent-facing CG-wide
+      // SWM clear (the legacy bridge tools that carried it were removed in #1087).
+
+      if (args.register_if_needed !== undefined && typeof args.register_if_needed !== 'boolean') {
+        return this.error('"register_if_needed" must be a boolean.');
+      }
+      const registerIfNeeded = args.register_if_needed === true;
+      if (args.access_policy !== undefined && args.access_policy !== 0 && args.access_policy !== 1) {
+        return this.error('"access_policy" must be 0 (open) or 1 (private).');
+      }
+      // FIX S: `access_policy` only applies when registering the CG — reject it
+      // (rather than silently drop the privacy setting) when register_if_needed
+      // is not true.
+      if (args.access_policy !== undefined && !registerIfNeeded) {
+        return this.error('"access_policy" requires "register_if_needed": true — it only applies when registering the context graph.');
+      }
+
+      // CONTRACT §G: vm/publish AUTO-registers an unregistered CG transparently
+      // (#1116) at gas/TRAC cost regardless of `register_if_needed`. When
+      // `register_if_needed` is true we run an EXPLICIT register first (idempotent —
+      // "already registered" is success) so the caller can choose the registration's
+      // access_policy. A hard registration failure is a tool error: do NOT publish.
+      // When false/omitted, publish directly — the daemon auto-registers and defaults
+      // the policy.
+      const registration = registerIfNeeded
+        ? await this.registerContextGraphIfNeeded(contextGraphId, args.access_policy as number | undefined)
+        : undefined;
+
+      // Per-KA sealed publish (CONTRACT §1 Stage5). The seal selects the author and
+      // the whole asset, so author/selection overrides are never sent. The daemon
+      // returns the UAL plus kaId/txHash/status/kas; 409 VM_PUBLISH_PRECONDITION
+      // (not finalized / empty SWM) and 502 (on-chain not-confirmed) surface
+      // verbatim through daemonError.
+      const result = await this.client.knowledgeAssetPublish(contextGraphId, name, {
+        subGraphName,
+        publishEpochs,
+        publisherNodeIdentityIdOverride,
+      });
+      const merged = registration ? { ...result, registration } : result;
+
+      // CONTRACT §1 Stage5 / §7: vm/publish returns HTTP 207 (treated as success by
+      // the HTTP client) when the KA minted on-chain but the context-graph binding
+      // FAILED — `contextGraphError` is present in the body. The UAL/kaId are valid
+      // and the asset IS published on-chain, so this is NOT a hard failure and must
+      // NOT be reported as full success — but the agent must NOT re-publish: a
+      // confirmed publish clears SWM, so a re-publish 409s VM_PUBLISH_PRECONDITION
+      // (and never re-binds the CG). The CG-binding retry is an operator/daemon
+      // concern; surface the partial for a human to follow up.
+      const contextGraphError =
+        merged && typeof merged === 'object'
+          ? (merged as Record<string, unknown>).contextGraphError
+          : undefined;
+      if (typeof contextGraphError === 'string' && contextGraphError.length > 0) {
+        return this.json({
+          ...(merged as Record<string, unknown>),
+          partial: true,
+          warning:
+            'Partial publish: the knowledge asset IS published on-chain (the UAL/kaId are valid and final) ' +
+            `— only the context-graph binding failed (${contextGraphError}). Do NOT re-publish: the asset is ` +
+            'already minted, the publish cleared Shared Working Memory, and a retry will fail the VM ' +
+            'precondition without re-binding the context graph. Surface this to the operator to re-attempt the ' +
+            'context-graph binding.',
+        });
+      }
+      return this.json(merged);
+    } catch (err: any) {
+      return this.daemonError(err);
+    }
+  }
+
+  private async handleAssertionPullFrom(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+    try {
+      const contextGraphId = String(args.context_graph_id ?? '').trim();
+      const name = String(args.name ?? '').trim();
+      if (!contextGraphId) return this.error('"context_graph_id" is required.');
+      if (!name) return this.error('"name" is required.');
+      const layer = String(args.layer ?? '').trim();
+      if (layer !== 'swm' && layer !== 'vm') {
+        return this.error('"layer" is required and must be "swm" or "vm".');
+      }
+      let onConflict: 'reject' | 'replace' | undefined;
+      if (args.on_conflict !== undefined) {
+        const raw = String(args.on_conflict).trim();
+        if (raw !== 'reject' && raw !== 'replace') {
+          return this.error('"on_conflict" must be "reject" or "replace".');
+        }
+        onConflict = raw;
+      }
+      const subGraphName = args.sub_graph_name ? String(args.sub_graph_name) : undefined;
+      // Seed a fresh WM draft from SWM/VM (CONTRACT §1 side-verbs). A dirty draft
+      // → 409 WM_DRAFT_CONFLICT, surfaced verbatim through daemonError; the agent
+      // can retry with on_conflict:"replace".
+      const result = await this.client.knowledgeAssetPullFrom(contextGraphId, name, layer, {
+        subGraphName,
+        onConflict,
       });
       return this.json(result);
     } catch (err: any) {
@@ -3665,147 +4033,6 @@ export class DkgNodePlugin {
       if (!contextGraphId) return this.error('"context_graph_id" is required.');
       const result = await this.client.listSubGraphs(contextGraphId);
       return this.json(result);
-    } catch (err: any) {
-      return this.daemonError(err);
-    }
-  }
-
-  private async handleSharedMemoryPublish(args: Record<string, unknown>): Promise<OpenClawToolResult> {
-    try {
-      const contextGraphId = String(args.context_graph_id ?? '').trim();
-      if (!contextGraphId) return this.error('"context_graph_id" is required.');
-      // Mirror handleAssertionPromote's `entities` validation shape: omit → daemon-side default
-      // (selection="all"), explicit array → must be non-empty and all strings. No other values
-      // allowed; a bogus scalar would silently 400 at the daemon.
-      const raw = args.root_entities;
-      let rootEntities: string[] | undefined;
-      if (raw === undefined || raw === null) {
-        rootEntities = undefined;
-      } else if (Array.isArray(raw) && raw.length > 0 && raw.every((e) => typeof e === 'string')) {
-        rootEntities = raw.map((e) => String(e));
-      } else {
-        return this.error('"root_entities" must be omitted or a non-empty array of root entity URIs.');
-      }
-      const subGraphName = args.sub_graph_name ? String(args.sub_graph_name) : undefined;
-      const registerIfNeeded = args.register_if_needed === true;
-      if (args.register_if_needed !== undefined && typeof args.register_if_needed !== 'boolean') {
-        return this.error('"register_if_needed" must be a boolean.');
-      }
-      if (args.reveal_on_chain !== undefined && typeof args.reveal_on_chain !== 'boolean') {
-        return this.error('"reveal_on_chain" must be a boolean.');
-      }
-      if (args.access_policy !== undefined && args.access_policy !== 0 && args.access_policy !== 1) {
-        return this.error('"access_policy" must be 0 (open) or 1 (private).');
-      }
-      let registration: Record<string, unknown> | undefined;
-      if (registerIfNeeded) {
-        try {
-          registration = await this.client.registerContextGraph(contextGraphId, {
-            accessPolicy: args.access_policy as number | undefined,
-          });
-        } catch (err: any) {
-          const message = err?.message ?? String(err);
-          if (!message.includes('already registered')) {
-            throw err;
-          }
-        }
-      }
-      const result = await this.publisher.publishSharedMemory({ contextGraphId, rootEntities, subGraphName });
-      return this.json(registration ? { ...result, registration } : result);
-    } catch (err: any) {
-      return this.daemonError(err);
-    }
-  }
-
-  private async handleShare(args: Record<string, unknown>): Promise<OpenClawToolResult> {
-    try {
-      // Type-validate at the runtime boundary. Without this, a malformed MCP
-      // call passing `content: {}` or `false` would coerce via String(...) to
-      // `"[object Object]"` / `"false"` and pollute SWM with garbage. Reject
-      // up front instead.
-      if (args.content !== undefined && typeof args.content !== 'string') {
-        return this.error('"content" must be a string.');
-      }
-      if (args.context_graph_id !== undefined && typeof args.context_graph_id !== 'string') {
-        return this.error('"context_graph_id" must be a string.');
-      }
-      if (
-        args.sub_graph_name !== undefined &&
-        args.sub_graph_name !== null &&
-        typeof args.sub_graph_name !== 'string'
-      ) {
-        return this.error('"sub_graph_name" must be a string.');
-      }
-      // Use the raw content for serialization so leading/trailing whitespace
-      // and terminal newlines are preserved verbatim — agents sharing code
-      // snippets or exact transcripts depend on this. Validate against the
-      // trimmed form so a whitespace-only payload still rejects as "empty".
-      const content = (args.content as string | undefined) ?? '';
-      const contextGraphId = ((args.context_graph_id as string | undefined) ?? '').trim();
-      if (!content.trim()) return this.error('"content" is required.');
-      if (!contextGraphId) return this.error('"context_graph_id" is required.');
-      const rawSub = args.sub_graph_name as string | undefined | null;
-      const subGraphName = rawSub === undefined || rawSub === null
-        ? undefined
-        : (rawSub.trim() || undefined);
-
-      // Best-effort node-identity attribution. Try the gated probes first
-      // (these warm the cache when the memory resolver API is attached),
-      // then fall back to a direct /api/agent/identity probe so dkg_share
-      // works in `memory.enabled: false` configurations too. If neither
-      // path resolves, we still mint a unique-per-call subject under an
-      // `anon` namespace — the share itself doesn't require identity
-      // (the daemon's /api/shared-memory/write doesn't), so refusing to
-      // write would over-couple the tool to a startup race.
-      await Promise.all([this.ensureNodeAgentAddress(), this.ensureNodePeerId()]);
-      let addr = this.resolveDefaultAgentAddress();
-      if (!addr) {
-        const probe = await this.client.getAgentIdentity().catch(() => null);
-        if (probe?.ok && probe.identity) {
-          if (probe.identity.agentAddress) this.nodeAgentAddress = probe.identity.agentAddress;
-          if (probe.identity.peerId) this.nodePeerId = probe.identity.peerId;
-          addr = this.resolveDefaultAgentAddress();
-        }
-      }
-      // Unique per call — the publisher's delete-then-insert upsert
-      // (dkg-publisher.ts:422-429) keys off the root entity, so a stable
-      // subject would replace the prior share. Random shareId guarantees
-      // a fresh root every time, regardless of attribution.
-      const shareId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-      const subject = addr
-        ? `urn:openclaw:${addr}:shared:${shareId}`
-        : `urn:openclaw:anon:shared:${shareId}`;
-      // Serialize content as an N-Triples literal. The canonical
-      // escapeDkgRdfLiteral from @origintrail-official/dkg-core handles
-      // the ECHAR set (\\, ", \n, \r, \t, \f, \b), but leaves other ASCII
-      // control bytes (0x00-0x07, 0x0B, 0x0E-0x1F, 0x7F) raw — those
-      // would still produce an invalid N-Triples literal. Defensive
-      // post-pass UCHAR-encodes the remaining bytes. (A canonical fix
-      // belongs in the core helper itself; tracked separately.)
-      const escaped = escapeDkgRdfLiteral(content).replace(
-        new RegExp(
-          '[' +
-            String.fromCharCode(0x00) + '-' + String.fromCharCode(0x1F) +
-            String.fromCharCode(0x7F) +
-          ']',
-          'g',
-        ),
-        (ch) => '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0').toUpperCase(),
-      );
-      const literal = `"${escaped}"`;
-      const quads = [{
-        subject,
-        predicate: 'urn:openclaw:sharedContent',
-        object: literal,
-      }];
-      const result = await this.client.share(contextGraphId, quads, { subGraphName });
-      // Surface the minted subject so callers can target THIS share in a
-      // follow-up `dkg_shared_memory_publish({ root_entities: [...] })` or
-      // inspect it precisely. Field name is snake_case to match the
-      // consuming tool's argument shape — agents chaining `dkg_share` →
-      // `dkg_shared_memory_publish` can pass the value through without
-      // case translation.
-      return this.json({ ...result, subject, root_entities: [subject] });
     } catch (err: any) {
       return this.daemonError(err);
     }

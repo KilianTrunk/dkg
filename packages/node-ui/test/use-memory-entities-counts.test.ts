@@ -73,7 +73,7 @@ describe('useMemoryEntities canonical layer counts', () => {
     vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
       const { sparql = '', contextGraphId = 'cg' } =
         JSON.parse(String(init?.body ?? '{}')) as { sparql?: string; contextGraphId?: string };
-      const isVm = sparql.includes('_verified_memory_meta');
+      const isVm = sparql.includes('_verifiable_memory_meta');
       // PR #818 sweep 3 — WM SPARQL now contains `STRENDS(...,
       // "/_meta")` for the meta-exclusion filter, so the SWM
       // detection needs the discriminating clause that's still
@@ -133,7 +133,7 @@ describe('useMemoryEntities canonical layer counts', () => {
 
     const vmRequest = vi.mocked(fetch).mock.calls
       .map(([, init]) => JSON.parse(String(init?.body ?? '{}')) as { sparql?: string })
-      .find(body => body.sparql?.includes('_verified_memory_meta'));
+      .find(body => body.sparql?.includes('_verifiable_memory_meta'));
     expect(vmRequest?.sparql).toContain('STR(?g) != "did:dkg:context-graph:cg-counts/meta"');
     expect(vmRequest?.sparql).toContain('!CONTAINS(STR(?g), "/meta/")');
 

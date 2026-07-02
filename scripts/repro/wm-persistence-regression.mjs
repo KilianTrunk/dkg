@@ -4,7 +4,7 @@
  * ===============================
  *
  * Reproduces the symptom called out in PR #602 / issue #596: WM (working-memory)
- * assertions written via /api/assertion/<name>/{create,write} sometimes do NOT
+ * assertions written via /api/knowledge-assets (create) + /api/knowledge-assets/<name>/wm/write sometimes do NOT
  * survive a daemon stop → start cycle. The script writes a parameterised pile
  * of triples into a throwaway context graph, snapshots the sub-graph counts,
  * cycles the daemon (clean SIGTERM via /api/shutdown OR hard SIGKILL on the
@@ -624,7 +624,7 @@ async function writeAssertionBatch(cgId, name, quads, subGraph) {
   // Create + write in two calls (mirrors the protocol importers use).
   // Some shapes prefer the one-shot /create with quads; we use the explicit
   // two-call shape since that's what PR #602's failing path used.
-  await apiFetch('POST', '/api/assertion/create', {
+  await apiFetch('POST', '/api/knowledge-assets', {
     contextGraphId: cgId,
     name,
     subGraphName: subGraph,
@@ -633,7 +633,7 @@ async function writeAssertionBatch(cgId, name, quads, subGraph) {
   const CHUNK = 5000;
   for (let i = 0; i < quads.length; i += CHUNK) {
     const batch = quads.slice(i, i + CHUNK);
-    await apiFetch('POST', `/api/assertion/${encodeURIComponent(name)}/write`, {
+    await apiFetch('POST', `/api/knowledge-assets/${encodeURIComponent(name)}/wm/write`, {
       contextGraphId: cgId,
       quads: batch,
       subGraphName: subGraph,

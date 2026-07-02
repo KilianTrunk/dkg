@@ -11,6 +11,11 @@
     "type": "constructor"
   },
   {
+    "inputs": [],
+    "name": "ChallengeDrawPaused",
+    "type": "error"
+  },
+  {
     "inputs": [
       {
         "internalType": "bytes32",
@@ -121,7 +126,7 @@
   },
   {
     "inputs": [],
-    "name": "MAX_KC_RETRIES",
+    "name": "MAX_KA_RETRIES",
     "outputs": [
       {
         "internalType": "uint8",
@@ -172,6 +177,19 @@
         "internalType": "uint256",
         "name": "",
         "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "cgWeightTreeStorage",
+    "outputs": [
+      {
+        "internalType": "contract CGWeightTreeStorage",
+        "name": "",
+        "type": "address"
       }
     ],
     "stateMutability": "view",
@@ -402,11 +420,6 @@
         "internalType": "bytes32",
         "name": "seed",
         "type": "bytes32"
-      },
-      {
-        "internalType": "uint256",
-        "name": "targetEpoch",
-        "type": "uint256"
       }
     ],
     "name": "previewChallengeForSeed",
@@ -441,6 +454,35 @@
       }
     ],
     "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "cgId",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "startIndex",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "maxScan",
+        "type": "uint256"
+      }
+    ],
+    "name": "pruneExpiredKnowledgeAssets",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "removed",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
     "type": "function"
   },
   {
@@ -511,9 +553,9 @@
   {
     "inputs": [
       {
-        "internalType": "bytes32",
-        "name": "leaf",
-        "type": "bytes32"
+        "internalType": "bytes",
+        "name": "content",
+        "type": "bytes"
       },
       {
         "internalType": "bytes32[]",

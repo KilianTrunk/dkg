@@ -2,7 +2,7 @@ import type { TripleStore, Quad } from '@origintrail-official/dkg-storage';
 import { GraphManager } from '@origintrail-official/dkg-storage';
 import type { EventBus } from '@origintrail-official/dkg-core';
 import type { ChainAdapter, KAUpdateVerification } from '@origintrail-official/dkg-chain';
-import { Logger, createOperationContext, DKGEvent, sparqlInt, contextGraphMetaUri } from '@origintrail-official/dkg-core';
+import { Logger, createOperationContext, DKGEvent, sparqlInt, contextGraphMetaUri, contextGraphLayerUri, MemoryLayer } from '@origintrail-official/dkg-core';
 import { decodeKAUpdateRequest } from '@origintrail-official/dkg-core';
 import { parseSimpleNQuads } from './publish-handler.js';
 import { skolemizeByEntity } from './auto-partition.js';
@@ -164,7 +164,16 @@ export class UpdateHandler {
       // root's privateMerkleRoot in the same order the publisher used to build
       // the KC root, so we just forward them.
       await this.graphManager.ensureContextGraph(contextGraphId);
-      const dataGraph = this.graphManager.dataGraphUri(contextGraphId);
+      // Uniform layout: a KA update replaces the published data in the SAME per-KA
+      // verifiable-memory graph the original publish wrote (…/_verifiable_memory/{author}/{number}),
+      // keyed by the on-chain batchId (= the packed kaId). restate/delete/write all target it.
+      const vmBatch = BigInt(batchId);
+      const dataGraph = contextGraphLayerUri(
+        contextGraphId,
+        MemoryLayer.VerifiableMemory,
+        '0x' + (vmBatch >> 96n).toString(16).padStart(40, '0'),
+        vmBatch & ((1n << 96n) - 1n),
+      );
       const nquadsStr = new TextDecoder().decode(nquads);
       const quads = parseSimpleNQuads(nquadsStr);
 
@@ -266,6 +275,51 @@ export class UpdateHandler {
         const flat: Quad[] = [];
         for (const qs of payloadByRoot.values()) for (const q of qs) flat.push({ ...q, graph: dataGraph });
         await this.store.insert(flat);
+      }
+
+      // #1099: drain this replica's SWM copy of the updated roots — same
+      // contract as the finalization path. The publisher cleans its own SWM
+      // after a confirmed update, but replicas that mirrored the edit-loop
+      // share kept the stale copy forever and re-served it to late
+      // subscribers via the PROTOCOL_SYNC SWM responder.
+      try {
+        const swmBucket = this.graphManager.sharedMemoryUri(contextGraphId);
+        const swmMeta = this.graphManager.sharedMemoryMetaUri(contextGraphId);
+        const allGraphs = await this.store.listGraphs();
+        const swmGraphs = allGraphs.filter((g) => g === swmBucket || g.startsWith(`${swmBucket}/`));
+        for (const m of manifest) {
+          for (const g of swmGraphs) {
+            await this.deleteEntityTriples(g, m.rootEntity);
+          }
+          await this.store.deleteByPattern({ graph: swmMeta, subject: m.rootEntity });
+          // Detach the root from its WorkspaceOperation rows (and drop ops
+          // that reference nothing else) so the PROTOCOL_SYNC TTL branch
+          // stops serving the drained content to late subscribers.
+          const ops = await this.store.query(
+            `SELECT DISTINCT ?op WHERE { GRAPH <${swmMeta}> { ?op (<http://dkg.io/ontology/rootEntity>|<http://dkg.io/ontology/entity>) <${m.rootEntity}> } }`,
+          );
+          if (ops.type === 'bindings') {
+            for (const row of ops.bindings) {
+              const op = row['op'];
+              if (!op) continue;
+              await this.store.delete([
+                { subject: op, predicate: 'http://dkg.io/ontology/rootEntity', object: m.rootEntity, graph: swmMeta },
+                { subject: op, predicate: 'http://dkg.io/ontology/entity', object: m.rootEntity, graph: swmMeta },
+              ]);
+              const remaining = await this.store.query(
+                `ASK { GRAPH <${swmMeta}> { <${op}> (<http://dkg.io/ontology/rootEntity>|<http://dkg.io/ontology/entity>) ?r } }`,
+              );
+              if (remaining.type === 'boolean' && remaining.value === false) {
+                await this.store.deleteByPattern({ graph: swmMeta, subject: op });
+              }
+            }
+          }
+        }
+      } catch (err) {
+        this.log.warn(
+          ctx,
+          `SWM drain after applied update failed for batchId=${batchId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
 
       // Record applied update for ordering + context graph binding

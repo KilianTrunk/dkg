@@ -6,7 +6,18 @@ export {
   canonicalPublishPayload,
   type CanonicalPublishPayload,
   type CanonicalManifestEntry,
+  type CanonicalPublishPayloadOptions,
 } from './canonical-publish-payload.js';
+export {
+  assertTrustedCatalogTriplesAreGeneratedFloor,
+  catalogTripleKey,
+  generatedPrivateCatalogFloorQuads,
+  generatedPrivateCatalogTripleKeys,
+  splitTrustedGeneratedCatalogRootMap,
+  trustedCatalogTripleKeySet,
+  type TrustedCatalogTripleKeys,
+  type TrustedCatalogRootSplit,
+} from './catalog-trust.js';
 export { resolveLiftWorkspaceSlice } from './workspace-resolution.js';
 export {
   computeTripleHash,
@@ -18,18 +29,21 @@ export {
   computeTripleHashV10,
   computePublicRootV10,
   computePrivateRootV10,
+  computeStructuredKCRootV10,
   computeFlatKCRootV10,
   computeFlatKCMerkleLeafCountV10,
   computeKARootV10,
   computeKCRootV10,
 } from './merkle.js';
 export { validatePublishRequest, type ValidationResult, type ValidationOptions } from './validation.js';
-export { generateKCMetadata, generateTentativeMetadata, generateConfirmedFullMetadata, getTentativeStatusQuad, getConfirmedStatusQuad, generateOwnershipQuads, generateAuthorshipProof, generateShareTransitionMetadata, generateShareMetadata, generateWorkspaceMetadata, generateSubGraphRegistration, subGraphDeregistrationSparql, subGraphDiscoverySparql, subGraphWritersSparql, toHex, resolveUalByBatchId, updateMetaMerkleRoot, promoteUpdatedKaToPerCgId, restateKaPartition, restateLabelGraphForUpdate, readMaterializedVersion, shouldApplyMaterialization, writeMaterializedVersion, withMaterializationLock, compareMaterializedVersion, type MaterializedVersion, generateAssertionCreatedMetadata, generateAssertionPromotedMetadata, generateAssertionPublishedMetadata, generateAssertionUpdatedMetadata, generateAssertionDiscardedMetadata, assertionStateQuad, assertionLayerQuad, deriveStatus, assertionLayerPointerQuad, stampLayerPointerSparql, WM_CURRENT_ASSERTION_PRED, SWM_CURRENT_ASSERTION_PRED, VM_CURRENT_ASSERTION_PRED, KA_ID_PRED, RESERVED_UAL_PRED, PROV_WAS_REVISION_OF, type KaStatus, type StatusPointers, type KCMetadata, type KAMetadata, type OnChainProvenance, type AuthorshipProof, type ShareTransitionMetadata, type ShareMetadata, type WorkspaceMetadata, type SubGraphRegistration, type AssertionCreatedMeta, type AssertionPromotedMeta, type AssertionPublishedMeta, type AssertionUpdatedMeta, type AssertionDiscardedMeta } from './metadata.js';
+export { generateKCMetadata, generateTentativeMetadata, generateConfirmedFullMetadata, buildDeterministicTokenRows, compareRootIris, getTentativeStatusQuad, getConfirmedStatusQuad, generateOwnershipQuads, generateShareMetadata, generateWorkspaceMetadata, generateSubGraphRegistration, subGraphDeregistrationSparql, subGraphDiscoverySparql, subGraphWritersSparql, toHex, resolveUalByBatchId, updateMetaMerkleRoot, promoteUpdatedKaToPerCgId, restateKaPartition, restateLabelGraphForUpdate, readMaterializedVersion, shouldApplyMaterialization, writeMaterializedVersion, withMaterializationLock, compareMaterializedVersion, type MaterializedVersion, generateAssertionCreatedMetadata, generateAssertionPromotedMetadata, generateAssertionUpdatedMetadata, generateAssertionDiscardedMetadata, assertionStateQuad, assertionLayerQuad, deriveStatus, assertionLayerPointerQuad, stampLayerPointerSparql, type LifecycleMetadataOptions, WM_CURRENT_ASSERTION_PRED, SWM_CURRENT_ASSERTION_PRED, VM_CURRENT_ASSERTION_PRED, KA_ID_PRED, RESERVED_UAL_PRED, PROV_WAS_REVISION_OF, type KaStatus, type StatusPointers, type KCMetadata, type KAMetadata, type OnChainProvenance, type ShareMetadata, type WorkspaceMetadata, type SubGraphRegistration, type AssertionCreatedMeta, type AssertionPromotedMeta, type AssertionUpdatedMeta, type AssertionDiscardedMeta } from './metadata.js';
 export {
   DKGPublisher,
   StaleWriteError,
   AssertionNotPersistedError,
   MultiRootPublishNotAtomicError,
+  CuratorUnconfirmedError,
+  CuratorRejectedError,
   type DKGPublisherConfig,
   type WorkspaceSenderKeyEncryptInput,
   type WorkspaceSenderKeyEncryptor,
@@ -47,6 +61,7 @@ export {
 } from './workspace-agent-recipients.js';
 export {
   ACKCollector,
+  DEFAULT_REQUIRED_ACKS,
   type ACKCollectorDeps,
   type CollectedACK,
   type ACKCollectionResult,
@@ -103,9 +118,12 @@ export {
   type LiftJobChainRecoverableState,
   type LiftJobHex,
   type LiftJobBigInt,
+  type KnowledgeAssetVmPublishRequest,
   type LiftJobTimeoutMetadata,
   type LiftJobFailurePolicy,
   type LiftAuthorityProof,
+  type LiftPublishRequestMetadata,
+  type LiftPublishSnapshotRequest,
   type LiftRequest,
   type LiftRequestAuthorSeal,
   type LiftJobTimestamps,
@@ -151,9 +169,13 @@ export {
   isTimeoutLiftJobFailure,
 } from './lift-job.js';
 export {
+  AsyncLiftJobConflictError,
   TripleStoreAsyncLiftPublisher,
   type AsyncLiftPublisher,
   type AsyncLiftPublisherConfig,
+  type AsyncKnowledgeAssetVmPublishExecutionInput,
+  type AsyncKnowledgeAssetVmPublishPreflightInput,
+  type AsyncKnowledgeAssetVmPublishPreflightResult,
   type AsyncLiftPublishExecutionInput,
   type AsyncLiftPublisherRecoveryResult,
   type AsyncLiftPublisherRecoveryResolver,
@@ -187,6 +209,9 @@ export {
 } from './async-lift-runner.js';
 export {
   mapLiftRequestToPublishOptions,
+  prepareAsyncPublishPayload,
+  isFailClosedInlineEncrypt,
+  type AsyncPreparedPublishPayload,
   type LiftResolvedPublishSlice,
   type LiftPublishMappingInput,
 } from './async-lift-publish-options.js';
@@ -205,6 +230,10 @@ export {
   type AsyncLiftPublishSuccess,
   type AsyncLiftPublishFailureInput,
 } from './async-lift-publish-result.js';
+export {
+  createKnowledgeAssetVmPublishSnapshotMetadata,
+  createKnowledgeAssetVmPublishSnapshotRequest,
+} from './async-lift-publisher-utils.js';
 export { SharedMemoryHandler, WorkspaceHandler } from './workspace-handler.js';
 export {
   FileWorkspacePublicSnapshotStore,

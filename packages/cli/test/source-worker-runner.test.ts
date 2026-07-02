@@ -1,35 +1,56 @@
+/**
+ * Source-worker runner - REAL daemon round-trip, NO mocks.
+ *
+ * The dynamic handler receives the lifecycle client and drives a real named KA
+ * create/share plus named async VM publish through the daemon.
+ */
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { runConfiguredSourceWorker } from '../src/source-worker-runner.js';
+import { startLiveDaemon, stopLiveDaemon, postJson, type LiveDaemon } from './helpers/live-daemon.js';
 
 declare global {
+  // eslint-disable-next-line no-var
   var __sourceWorkerRunnerContext: any;
+  // eslint-disable-next-line no-var
   var __sourceWorkerRunnerProcessed: any;
 }
 
-const originalFetch = globalThis.fetch;
+const CG = `swr-${Date.now().toString(36)}`;
 const cleanup: string[] = [];
+const originalConsoleLog = console.log;
 
-afterEach(async () => {
-  globalThis.fetch = originalFetch;
-  delete globalThis.__sourceWorkerRunnerContext;
-  delete globalThis.__sourceWorkerRunnerProcessed;
-  vi.restoreAllMocks();
-  await Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true, force: true })));
-});
+describe('source worker runner (real daemon)', () => {
+  let daemon: LiveDaemon;
 
-describe('source worker runner', () => {
-  it('dynamically imports the handler and wires daemon clients into its context', async () => {
-    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+  beforeAll(async () => {
+    console.log = () => undefined;
+    daemon = await startLiveDaemon();
+    const created = await postJson(daemon, '/api/context-graph/create', { id: CG, name: CG, accessPolicy: 0 });
+    expect(created.status, `CG create failed: ${JSON.stringify(created.body)}`).toBeLessThan(300);
+    const sg = await postJson(daemon, '/api/sub-graph/create', { contextGraphId: CG, subGraphName: 'sg-1' });
+    expect(sg.status, `sub-graph create failed: ${JSON.stringify(sg.body)}`).toBeLessThan(500);
+  }, 120_000);
 
+  afterAll(async () => {
+    console.log = originalConsoleLog;
+    await stopLiveDaemon(daemon);
+  });
+
+  afterEach(async () => {
+    delete globalThis.__sourceWorkerRunnerContext;
+    delete globalThis.__sourceWorkerRunnerProcessed;
+    await Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+  });
+
+  it('dynamically imports the handler, wires REAL lifecycle clients, and persists the real job state', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'source-worker-runner-'));
     cleanup.push(dir);
     const configPath = join(dir, 'worker.json');
     const handlerPath = join(dir, 'handler.mjs');
     const statePath = join(dir, 'state.json');
-    const requests: Array<{ url: string; headers: Record<string, string>; body: any }> = [];
 
     await writeFile(handlerPath, `
 export const namedHandler = {
@@ -39,29 +60,24 @@ export const namedHandler = {
       daemonToken: context.config.daemonToken,
       stateFile: context.config.stateFile,
       sourceIds: context.config.sources.map((source) => source.id),
-      hasSharedMemory: typeof context.sharedMemory.share === 'function',
-      hasAsyncLift: typeof context.asyncLift.lift === 'function',
+      hasKnowledgeAssets: typeof context.knowledgeAssets.createAndShare === 'function'
+        && typeof context.knowledgeAssets.publishAsync === 'function',
     };
     return {
       getFingerprint: async (source) => \`fp-\${source.version}\`,
       processSource: async (source, fingerprint) => {
-        const share = await context.sharedMemory.share('cg-1', [
-          { subject: 'urn:src', predicate: 'urn:hasId', object: \`"\${source.id}"\` },
+        const name = \`source-worker-\${source.id}\`;
+        const share = await context.knowledgeAssets.createAndShare('${CG}', name, [
+          { subject: 'urn:src', predicate: 'urn:hasId', object: \`"\${source.id}"\`, graph: '' },
         ], { subGraphName: 'sg-1' });
-        const jobId = await context.asyncLift.lift({
-          swmId: 'swm-1',
-          shareOperationId: share.shareOperationId,
-          roots: ['urn:src'],
-          contextGraphId: 'cg-1',
-          namespace: 'ns',
-          scope: 'scope',
-          transitionType: 'CREATE',
-          authority: { type: 'owner', proofRef: 'proof' },
-        });
+        const publish = await context.knowledgeAssets.publishAsync('${CG}', name, { subGraphName: 'sg-1' });
+        const jobId = publish.jobId;
         globalThis.__sourceWorkerRunnerProcessed = {
           sourceId: source.id,
           fingerprint,
+          name,
           shareOperationId: share.shareOperationId,
+          intentKey: publish.intentKey,
           jobId,
         };
         return {
@@ -72,6 +88,9 @@ export const namedHandler = {
           status: 'queued',
           nextState: {
             fingerprint,
+            assertionName: name,
+            shareOperationId: share.shareOperationId,
+            intentKey: publish.intentKey,
             lastStatus: 'queued',
             lastJobIds: [jobId],
             lastJobStatuses: { [jobId]: 'queued' },
@@ -85,67 +104,50 @@ export const namedHandler = {
     await writeFile(configPath, JSON.stringify({
       pollIntervalMs: 1,
       stateFile: 'state.json',
-      daemonUrl: 'http://127.0.0.1:9200/',
-      daemonToken: 'secret-token',
+      daemonUrl: `${daemon.base}/`,
+      daemonToken: daemon.token,
       handlerModule: 'handler.mjs',
       handlerExport: 'namedHandler',
       sources: [{ id: 'src-1', version: 'v1' }],
     }), 'utf8');
 
-    globalThis.fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-      const url = String(input);
-      const headers = init?.headers as Record<string, string>;
-      requests.push({
-        url,
-        headers,
-        body: init?.body ? JSON.parse(String(init.body)) : undefined,
-      });
-      if (url.endsWith('/api/shared-memory/write')) {
-        return new Response(JSON.stringify({ shareOperationId: 'swm-1' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-      }
-      if (url.endsWith('/api/publisher/enqueue')) {
-        return new Response(JSON.stringify({ jobId: 'job-1' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-      }
-      return new Response(JSON.stringify({ error: 'unexpected request' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
-    }) as any;
-
     await runConfiguredSourceWorker(configPath, { once: true });
 
     expect(globalThis.__sourceWorkerRunnerContext).toMatchObject({
-      daemonUrl: 'http://127.0.0.1:9200',
-      daemonToken: 'secret-token',
+      daemonUrl: daemon.base,
+      daemonToken: daemon.token,
       stateFile: statePath,
       sourceIds: ['src-1'],
-      hasSharedMemory: true,
-      hasAsyncLift: true,
+      hasKnowledgeAssets: true,
     });
-    expect(globalThis.__sourceWorkerRunnerProcessed).toEqual({
-      sourceId: 'src-1',
-      fingerprint: 'fp-v1',
-      shareOperationId: 'swm-1',
-      jobId: 'job-1',
+
+    const processed = globalThis.__sourceWorkerRunnerProcessed;
+    expect(processed.sourceId).toBe('src-1');
+    expect(processed.fingerprint).toBe('fp-v1');
+    expect(processed.name).toBe('source-worker-src-1');
+    expect(processed.shareOperationId).toMatch(/^[0-9a-z]+-[0-9a-z]+$/);
+    expect(processed.intentKey).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(processed.jobId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+
+    const jobRes = await fetch(`${daemon.base}/api/publisher/job?id=${processed.jobId}`, {
+      headers: { Authorization: `Bearer ${daemon.token}` },
     });
-    expect(requests.map((request) => request.url)).toEqual([
-      'http://127.0.0.1:9200/api/shared-memory/write',
-      'http://127.0.0.1:9200/api/publisher/enqueue',
-    ]);
-    expect(requests.every((request) => request.headers.Authorization === 'Bearer secret-token')).toBe(true);
-    expect(requests[0].body).toMatchObject({
-      contextGraphId: 'cg-1',
-      subGraphName: 'sg-1',
-      quads: [{ subject: 'urn:src', predicate: 'urn:hasId', object: '"src-1"' }],
-    });
-    expect(requests[1].body).toMatchObject({
-      swmId: 'swm-1',
-      shareOperationId: 'swm-1',
-      contextGraphId: 'cg-1',
-    });
+    expect(jobRes.status).toBe(200);
+    const jobBody: any = await jobRes.json();
+    expect(jobBody.job.request.jobType).toBe('knowledge-asset-vm-publish');
+    expect(jobBody.job.request.knowledgeAssetVmPublish.contextGraphId).toBe(CG);
+    expect(jobBody.job.request.knowledgeAssetVmPublish.name).toBe(processed.name);
+    expect(jobBody.job.request.knowledgeAssetVmPublish.shareOperationId).toBe(processed.shareOperationId);
+    expect(jobBody.job.request.knowledgeAssetVmPublish.intentKey).toBe(processed.intentKey);
 
     const state = JSON.parse(await readFile(statePath, 'utf8'));
     expect(state.sources['src-1']).toMatchObject({
       fingerprint: 'fp-v1',
+      assertionName: 'source-worker-src-1',
+      shareOperationId: processed.shareOperationId,
+      intentKey: processed.intentKey,
       lastStatus: 'queued',
-      lastJobIds: ['job-1'],
+      lastJobIds: [processed.jobId],
     });
   });
 });

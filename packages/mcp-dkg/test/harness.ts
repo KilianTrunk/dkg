@@ -112,15 +112,23 @@ type ClientMethods = Partial<{
 
 export class FakeClient {
   // Round-trip storage for the assertion quintet.
+  //
+  // `finalized` models the rc.17 seal (CONTRACT §1 Stage3): finalize seals the
+  // WHOLE draft; a FULL share auto-seals best-effort; a SUBSET share does NOT
+  // auto-seal; and vm/publish reconstructs the seal's full root set, so it
+  // hard-fails (409 VM_PUBLISH_PRECONDITION) unless the draft is finalized.
   readonly assertions = new Map<string, {
     quads: Array<{ subject: string; predicate: string; object: string }>;
     promotedRoots: Set<string>;
     discarded: boolean;
+    finalized: boolean;
   }>();
   readonly contextGraphs = new Set<string>();
   readonly subGraphs = new Set<string>();
   readonly subscribed = new Set<string>();
-  readonly publishCalls: Array<Record<string, unknown>> = [];
+  // [D3] records each createKnowledgeAsset wire call (one-shot create-with-quads)
+  // so tests can assert the EXPLICIT alsoShareSwm value the tool forwarded.
+  readonly createKnowledgeAssetCalls: Array<Record<string, unknown>> = [];
   readonly queryCalls: Array<Record<string, unknown>> = [];
 
   /** Per-layer hits used by memory-search tests. Keys are
@@ -167,7 +175,7 @@ export class FakeClient {
     if (this.assertions.has(key)) {
       return { assertionUri: null, alreadyExists: true };
     }
-    this.assertions.set(key, { quads: [], promotedRoots: new Set(), discarded: false });
+    this.assertions.set(key, { quads: [], promotedRoots: new Set(), discarded: false, finalized: false });
     return {
       assertionUri: `urn:dkg:assertion:${args.contextGraphId}:${args.assertionName}`,
       alreadyExists: false,
@@ -305,18 +313,98 @@ export class FakeClient {
   async knowledgeAssetShare(args: {
     contextGraphId: string;
     name: string;
-    entities?: string[];
+    entities?: string[] | 'all';
   }) {
     if (this.overrides.knowledgeAssetShare) return this.overrides.knowledgeAssetShare.call(this, args);
     const key = `${args.contextGraphId}::${args.name}`;
     const cell = this.assertions.get(key);
     if (!cell) throw new Error(`assertion not created: ${key}`);
-    if (args.entities && args.entities.length > 0) {
-      for (const e of args.entities) cell.promotedRoots.add(e);
+    const isSubset = Array.isArray(args.entities) && args.entities.length > 0;
+    if (isSubset) {
+      const entitySet = new Set(args.entities as string[]);
+      for (const e of args.entities as string[]) cell.promotedRoots.add(e);
+      // Production promote MOVES the promoted triples WM → SWM and DELETES them
+      // from the WM draft (`dkg-publisher.ts:4665-4669`, `store.delete(... graph:
+      // wmGraphUri)`). A SELECTIVE share deletes ONLY the shared subset's quads
+      // (production filters `quadsToPromote` to the subset at :4518-4526); the
+      // rest stay in WM. Model that so a post-share WM `query` reflects reality.
+      cell.quads = cell.quads.filter((q) => !entitySet.has(q.subject));
+      // CONTRACT §5 / §1 Stage4: a SUBSET share is NOT auto-sealed.
     } else {
       for (const q of cell.quads) cell.promotedRoots.add(q.subject);
+      // A FULL share promotes every root, so production empties the WM draft
+      // entirely (every quad is deleted from the WM graph). Clear WM here too.
+      cell.quads = [];
+      // CONTRACT §1 Stage4: a FULL share ("all"/omitted) auto-seals best-effort
+      // and is publish-ready.
+      cell.finalized = true;
     }
     return { swmShared: true, promotedCount: cell.promotedRoots.size };
+  }
+
+  // ── Seal / publish / pull-from (rc.17 lifecycle) ────────────────
+  async knowledgeAssetFinalize(args: {
+    contextGraphId: string;
+    name: string;
+    subGraphName?: string;
+    authorAgentAddress?: string;
+    schemeVersion?: number;
+  }) {
+    if (this.overrides.knowledgeAssetFinalize) return this.overrides.knowledgeAssetFinalize.call(this, args);
+    const key = `${args.contextGraphId}::${args.name}`;
+    const cell = this.assertions.get(key);
+    if (!cell) throw new Error(`assertion not created: ${key}`);
+    // Finalize always seals the WHOLE draft (CONTRACT §1 Stage3 — no subset).
+    cell.finalized = true;
+    return { merkleRoot: '0xroot', eip712Digest: '0xdigest', authorAddress: args.authorAgentAddress ?? '0xtoken' };
+  }
+
+  async knowledgeAssetPublish(args: {
+    contextGraphId: string;
+    name: string;
+    subGraphName?: string;
+    clearAfter?: boolean;
+    publishEpochs?: number;
+    publisherNodeIdentityIdOverride?: string;
+  }) {
+    if (this.overrides.knowledgeAssetPublish) return this.overrides.knowledgeAssetPublish.call(this, args);
+    const key = `${args.contextGraphId}::${args.name}`;
+    const cell = this.assertions.get(key);
+    if (!cell) throw new Error(`assertion not created: ${key}`);
+    // vm/publish reconstructs the seal's full root set; an unsealed draft hard-
+    // fails with the daemon's 409 VM_PUBLISH_PRECONDITION (CONTRACT §1 Stage5 /
+    // §5). This is the seal-before-share/publish invariant the mock enforces.
+    if (!cell.finalized) {
+      throw new Error('DKG daemon /vm/publish responded 409: VM_PUBLISH_PRECONDITION assertion is not finalized');
+    }
+    if (args.clearAfter) cell.promotedRoots.clear();
+    return {
+      kaId: 'ka-published',
+      status: 'confirmed',
+      ual: `did:dkg:31337/0xauthor/7`,
+      txHash: '0xpub',
+      kas: [{ tokenId: '7', rootEntity: cell.quads[0]?.subject ?? 'urn:x' }],
+    };
+  }
+
+  async knowledgeAssetPullFrom(args: {
+    contextGraphId: string;
+    name: string;
+    layer: 'swm' | 'vm';
+    subGraphName?: string;
+    onConflict?: 'reject' | 'replace';
+  }) {
+    if (this.overrides.knowledgeAssetPullFrom) return this.overrides.knowledgeAssetPullFrom.call(this, args);
+    const key = `${args.contextGraphId}::${args.name}`;
+    const existing = this.assertions.get(key);
+    // A dirty (non-discarded) open draft + onConflict:"reject" → 409
+    // WM_DRAFT_CONFLICT (CONTRACT §1 side-verbs / §7).
+    if (existing && !existing.discarded && args.onConflict !== 'replace') {
+      throw new Error('DKG daemon /wm/pull-from responded 409: WM_DRAFT_CONFLICT an open draft already exists');
+    }
+    // Seed a fresh WM draft from the named layer (unsealed).
+    this.assertions.set(key, { quads: [], promotedRoots: new Set(), discarded: false, finalized: false });
+    return { wmDraft: 'open', seededFrom: { layer: args.layer } };
   }
 
   async knowledgeAssetDiscard(args: { contextGraphId: string; name: string }) {
@@ -445,17 +533,19 @@ export class FakeClient {
     } as unknown as ReturnType<DkgClient['getPeerInfo']> extends Promise<infer T> ? T : never;
   }
 
-  // ── Publish ─────────────────────────────────────────────────────
-  async publishQuads(args: Record<string, unknown>) {
-    if (this.overrides.publishQuads) return this.overrides.publishQuads.call(this, args);
-    this.publishCalls.push({ kind: 'publishQuads', ...args });
-    return { kaId: 'kc-1', kas: [], txHash: '0xdead' };
-  }
-
-  async publishSharedMemory(args: Record<string, unknown>) {
-    if (this.overrides.publishSharedMemory) return this.overrides.publishSharedMemory.call(this, args);
-    this.publishCalls.push({ kind: 'publishSharedMemory', ...args });
-    return { kaId: 'kc-2', kas: [{ tokenId: '1', rootEntity: 'urn:x' }], txHash: '0xbeef' };
+  // ── [D3] One-shot create→write→seal→share (create with quads) ──────
+  // Mirrors the route's three combined statuses. Records the exact wire args
+  // (incl. the EXPLICIT `alsoShareSwm`) on `createKnowledgeAssetCalls` so the D3
+  // tests can assert the tool never lets the client helper's seal-true default
+  // leak. `status` follows the route: quads + share → swm-shared (publish-ready);
+  // quads only → wm-sealed; (the no-quads path uses createAssertion, not this).
+  async createKnowledgeAsset(args: Record<string, unknown>) {
+    if (this.overrides.createKnowledgeAsset) return this.overrides.createKnowledgeAsset.call(this, args);
+    this.createKnowledgeAssetCalls.push({ ...args });
+    const shared = args.alsoShareSwm === true;
+    return shared
+      ? { status: 'swm-shared', sealed: true, publishReady: true }
+      : { status: 'wm-sealed', sealed: true, publishReady: false };
   }
 
   async registerContextGraph(args: { id: string }) {

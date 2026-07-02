@@ -8,12 +8,12 @@
 #
 # Exit code is non-zero when any sub-test fails — orchestrators key off this.
 #
-# Wire shapes assumed (rc.12+):
-#   - publish:    POST /api/shared-memory/write  +  POST /api/shared-memory/publish
+# Wire shapes assumed:
+#   - publish:    POST /api/knowledge-assets + POST /api/knowledge-assets/<name>/vm/publish
 #   - update/private quads: POST /api/update     (legacy is intentionally retained)
-#   - SWM:        POST /api/shared-memory/{write,publish}
-#   - assertion:  POST /api/assertion/{create,/<name>/write,/<name>/query,/<name>/promote}
-#   - CAS:        POST /api/shared-memory/conditional-write  (conditions REQUIRED non-empty)
+#   - SWM:        POST /api/knowledge-assets/<name>/swm/share
+#   - knowledge-assets: POST /api/knowledge-assets (create), POST /api/knowledge-assets/<name>/wm/write, GET /api/knowledge-assets/<name>/wm/quads (query), POST /api/knowledge-assets/<name>/swm/share (promote)
+#   - CAS:        retired with loose SWM writes
 #   - chat:       POST /api/chat { to, text }
 #   - identity:   GET  /api/identity      (replaces deprecated /api/profile)
 #   - status:     GET  /api/status        (carries peerId, name, nodeRole — covers profile cases)
@@ -112,27 +112,22 @@ CG="${CG:-devnet-test}"
 # split on the first two `|` and treat the rest as the raw response.
 publish_swm() {
   local port=$1 cgid=$2 quads_json=$3 sgname=${4:-} root_entity=${5:-}
+  local name="rc-${RUN_TAG}-${port}-${RANDOM:-0}"
   local write_body=$(cat <<JSON
-{"contextGraphId":"$cgid","quads":[$quads_json]$([ -n "$sgname" ] && echo ",\"subGraphName\":\"$sgname\"")}
+{"contextGraphId":"$cgid","name":"$name","quads":[$quads_json],"finalize":true,"alsoShareSwm":true$([ -n "$sgname" ] && echo ",\"subGraphName\":\"$sgname\"")}
 JSON
 )
-  local w=$(post "$port" /api/shared-memory/write -H "Content-Type: application/json" -d "$write_body")
-  local op=$(echo "$w" | pyfield "d.get('shareOperationId','?')")
-  if [ -z "$op" ] || [ "$op" = "?" ]; then
+  local w=$(post "$port" /api/knowledge-assets -H "Content-Type: application/json" -d "$write_body")
+  local shared=$(echo "$w" | pyfield "1 if d.get('swmShared') or d.get('status') in ('swm-shared','vm-confirmed') else 0")
+  if [ "$shared" != "1" ]; then
     echo "WRITE_FAILED||$w"
     return 1
   fi
-  local selection_json
-  if [ -n "$root_entity" ]; then
-    selection_json="{\"rootEntities\":[\"$root_entity\"]}"
-  else
-    selection_json='"all"'
-  fi
   local pub_body=$(cat <<JSON
-{"contextGraphId":"$cgid","selection":$selection_json$([ -n "$sgname" ] && echo ",\"subGraphName\":\"$sgname\"")}
+{"contextGraphId":"$cgid"$([ -n "$sgname" ] && echo ",\"subGraphName\":\"$sgname\""),"options":{"clearAfter":false}}
 JSON
 )
-  local p=$(post "$port" /api/shared-memory/publish -H "Content-Type: application/json" -d "$pub_body")
+  local p=$(post "$port" "/api/knowledge-assets/$name/vm/publish" -H "Content-Type: application/json" -d "$pub_body")
   local st=$(echo "$p" | pyfield "d.get('status','?')")
   local kc=$(echo "$p" | pyfield "d.get('kaId','?')")
   echo "${st}|${kc}|${p}"
@@ -227,6 +222,14 @@ JSON
   PRIV_STATUS=$(echo "$PRIV_RESULT" | pyfield "d.get('status','?')")
   if [ "$PRIV_STATUS" = "confirmed" ] || [ "$PRIV_STATUS" = "finalized" ]; then
     ok "Update with private triples confirmed, status=$PRIV_STATUS"
+  elif echo "$PRIV_RESULT" | grep -q 'NO_DATA_IN_SWM'; then
+    # OT-RFC-49 (Rung-1 strip): cores hold ZERO private SWM ciphertext, so a
+    # private-quad update on a curated CG cannot draw its ACK quorum FROM the
+    # cores — that decline is the privacy model working as intended, not a
+    # failure. The durable private-update path now routes through the curator
+    # and is covered by scripts/devnet-test-curator-ack-gate.sh. Treat as an
+    # expected post-RFC-49 outcome here.
+    warn "Private update declined NO_DATA_IN_SWM — expected post-RFC-49 (cores don't host private SWM; curator path covered by devnet-test-curator-ack-gate.sh)"
   else
     fail "Private update status=$PRIV_STATUS: $PRIV_RESULT"
   fi
@@ -321,23 +324,27 @@ done
 section "6. SHARED WORKING MEMORY (SWM) — direct write"
 
 DRAFT_URI="urn:v10:draft-report-$RUN_TAG"
+SWM_NAME="draft-report-$RUN_TAG"
 SWM_BODY=$(cat <<JSON
 {
   "contextGraphId": "$CG",
+  "name": "$SWM_NAME",
   "quads": [
     $(q "$DRAFT_URI" "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" "http://schema.org/Report"),
     $(ql "$DRAFT_URI" "http://schema.org/name" "Q1 Analysis Draft $RUN_TAG"),
     $(ql "$DRAFT_URI" "http://schema.org/description" "Work in progress analysis")
-  ]
+  ],
+  "finalize": true,
+  "alsoShareSwm": true
 }
 JSON
 )
-SWM_RESULT=$(post 9201 /api/shared-memory/write -H "Content-Type: application/json" -d "$SWM_BODY")
-SWM_OP=$(echo "$SWM_RESULT" | pyfield "d.get('shareOperationId','?')")
-if [ -n "$SWM_OP" ] && [ "$SWM_OP" != "?" ]; then
-  ok "SWM write succeeded, opId=$SWM_OP"
+SWM_RESULT=$(post 9201 /api/knowledge-assets -H "Content-Type: application/json" -d "$SWM_BODY")
+SWM_SHARED=$(echo "$SWM_RESULT" | pyfield "1 if d.get('swmShared') or d.get('status') in ('swm-shared','vm-confirmed') else 0")
+if [ "$SWM_SHARED" = "1" ]; then
+  ok "Named KA shared to SWM: $SWM_NAME"
 else
-  fail "SWM write failed: $SWM_RESULT"
+  fail "Named KA share failed: $SWM_RESULT"
 fi
 
 sleep 2
@@ -379,7 +386,7 @@ section "7. WORKING MEMORY ASSERTIONS"
 ASSERT_NAME="research-notes-$RUN_TAG"
 
 echo "--- 7a: Create assertion ---"
-WM_CREATE=$(post 9201 /api/assertion/create -H "Content-Type: application/json" -d "{
+WM_CREATE=$(post 9201 /api/knowledge-assets -H "Content-Type: application/json" -d "{
   \"contextGraphId\": \"$CG\",
   \"name\": \"$ASSERT_NAME\"
 }")
@@ -393,7 +400,7 @@ fi
 FINDING_URI="urn:v10:finding-$RUN_TAG"
 
 echo "--- 7b: Write to assertion ---"
-WM_WRITE=$(post 9201 "/api/assertion/$ASSERT_NAME/write" -H "Content-Type: application/json" -d "{
+WM_WRITE=$(post 9201 "/api/knowledge-assets/$ASSERT_NAME/wm/write" -H "Content-Type: application/json" -d "{
   \"contextGraphId\": \"$CG\",
   \"quads\": [
     $(q "$FINDING_URI" "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" "http://schema.org/ScholarlyArticle"),
@@ -409,9 +416,7 @@ else
 fi
 
 echo "--- 7c: Query assertion ---"
-WM_QUERY=$(post 9201 "/api/assertion/$ASSERT_NAME/query" -H "Content-Type: application/json" -d "{
-  \"contextGraphId\": \"$CG\"
-}")
+WM_QUERY=$(api "http://127.0.0.1:9201/api/knowledge-assets/$ASSERT_NAME/wm/quads?contextGraphId=$CG")
 WM_COUNT=$(echo "$WM_QUERY" | pyfield "(len(d) if isinstance(d,list) else d.get('count', len(d.get('quads',[]))))")
 [ -z "$WM_COUNT" ] && WM_COUNT=0
 if [ "$WM_COUNT" != "0" ]; then
@@ -436,7 +441,7 @@ fi
 # ────────────────────────────────────────────────────────────────────────────
 section "8. PROMOTE WM → SWM"
 
-WM_PROMOTE=$(post 9201 "/api/assertion/$ASSERT_NAME/promote" -H "Content-Type: application/json" -d "{
+WM_PROMOTE=$(post 9201 "/api/knowledge-assets/$ASSERT_NAME/swm/share" -H "Content-Type: application/json" -d "{
   \"contextGraphId\": \"$CG\"
 }")
 PROMOTE_COUNT=$(echo "$WM_PROMOTE" | pyfield "d.get('promotedCount', d.get('triplesPromoted','?'))")
@@ -450,12 +455,9 @@ fi
 section "9. PUBLISH FROM SWM → VM"
 
 sleep 2
-# Target ONLY the promoted finding URI — `selection: "all"` would also
-# try to publish any leftover SWM content from prior runs and trip the
-# rc.12 rootEntity-uniqueness rule.
-ENSHRINE=$(post 9201 /api/shared-memory/publish -H "Content-Type: application/json" -d "{
+ENSHRINE=$(post 9201 "/api/knowledge-assets/$ASSERT_NAME/vm/publish" -H "Content-Type: application/json" -d "{
   \"contextGraphId\": \"$CG\",
-  \"selection\": { \"rootEntities\": [\"$FINDING_URI\"] }
+  \"options\": { \"clearAfter\": false }
 }")
 ENS_STATUS=$(echo "$ENSHRINE" | pyfield "d.get('status','?')")
 ENS_KCID=$(echo "$ENSHRINE" | pyfield "d.get('kaId','?')")
@@ -528,17 +530,17 @@ fi
 # ────────────────────────────────────────────────────────────────────────────
 section "11. QUERY VIEWS"
 
-echo "--- 11a: Query with view=verified-memory ---"
+echo "--- 11a: Query with view=verifiable-memory ---"
 VM_Q=$(post 9201 /api/query -H "Content-Type: application/json" -d "{
   \"sparql\": \"SELECT ?name WHERE { <$ALICE_URI> <http://schema.org/name> ?name }\",
   \"contextGraphId\": \"$CG\",
-  \"view\": \"verified-memory\"
+  \"view\": \"verifiable-memory\"
 }")
 VM_FOUND=$(echo "$VM_Q" | pyfield "(lambda b: (b[0].get('name') if b else 'EMPTY'))(d.get('result',{}).get('bindings',[]))")
 if echo "$VM_FOUND" | grep -q "Alice"; then
-  ok "Verified-memory view: Alice data found"
+  ok "Verifiable-memory view: Alice data found"
 else
-  fail "Verified-memory view: Alice data missing (got: $VM_FOUND)"
+  fail "Verifiable-memory view: Alice data missing (got: $VM_FOUND)"
 fi
 
 echo "--- 11b: Query with view=shared-working-memory ---"
@@ -569,33 +571,13 @@ fi
 # ────────────────────────────────────────────────────────────────────────────
 section "12. CONDITIONAL SHARE (CAS)"
 
-# rc.12: conditions are REQUIRED and must be non-empty. Each condition is
-# {subject, predicate, expectedValue: string|null}. Pick a fresh URI so the
-# "must not exist" check (expectedValue=null) is always satisfied first call.
-COUNTER_URI="urn:v10:counter-$RUN_TAG"
-
-CAS_BODY=$(cat <<JSON
-{
-  "contextGraphId": "$CG",
-  "quads": [
-    $(ql "$COUNTER_URI" "http://schema.org/value" "initial-value")
-  ],
-  "conditions": [
-    {
-      "subject": "$COUNTER_URI",
-      "predicate": "http://schema.org/value",
-      "expectedValue": null
-    }
-  ]
-}
-JSON
-)
-CAS_RESULT=$(post 9201 /api/shared-memory/conditional-write -H "Content-Type: application/json" -d "$CAS_BODY")
-CAS_OP=$(echo "$CAS_RESULT" | pyfield "d.get('shareOperationId','?')")
-if [ -n "$CAS_OP" ] && [ "$CAS_OP" != "?" ]; then
-  ok "Conditional share succeeded, opId=$CAS_OP"
+# Loose SWM CAS was retired with the anonymous SWM write surface. Keep a small
+ # contract check so the route does not silently come back.
+CAS_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $AUTH" -H "Content-Type: application/json" "http://127.0.0.1:9201/api/shared-memory/conditional-write" -d '{"contextGraphId":"devnet-test","quads":[],"conditions":[]}')
+if [ "$CAS_CODE" = "404" ] || [ "$CAS_CODE" = "410" ]; then
+  ok "Retired conditional-write route is not served (HTTP $CAS_CODE)"
 else
-  fail "Conditional share failed: $CAS_RESULT"
+  fail "Retired conditional-write route unexpectedly returned HTTP $CAS_CODE"
 fi
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -620,12 +602,21 @@ fi
 # ────────────────────────────────────────────────────────────────────────────
 section "14. SKILL.MD ENDPOINT"
 
-SKILL=$(get 9201 /.well-known/skill.md 2>/dev/null || echo '')
-if echo "$SKILL" | grep -q "assertion"; then
-  ok "SKILL.md served and contains 'assertion' terminology"
+# Fetch to a temp FILE and grep the file (not an 83KB shell variable, which was
+# brittle under the runner's shell state). Case-insensitive for any current
+# KA/memory term — the #1116 SKILL.md rewrite changed exact wording, so the old
+# literal `grep -q "assertion"` on a piped variable was stale. One retry — the
+# static route can lag on a cold daemon.
+SKILL_FILE=$(mktemp "${TMPDIR:-/tmp}/v10rc-skill-XXXXXX")
+get 9201 /.well-known/skill.md > "$SKILL_FILE" 2>/dev/null
+[ -s "$SKILL_FILE" ] || get 9201 /.well-known/skill.md > "$SKILL_FILE" 2>/dev/null
+SKILL_BYTES=$(wc -c < "$SKILL_FILE" | tr -d ' ')
+if [ "${SKILL_BYTES:-0}" -gt 1000 ] && grep -qiE 'assertion|knowledge asset|verifiable memory|working memory' "$SKILL_FILE"; then
+  ok "SKILL.md served ($SKILL_BYTES bytes) with current KA/memory terminology"
 else
-  fail "SKILL.md missing or doesn't contain assertion terminology"
+  fail "SKILL.md missing or stale ($SKILL_BYTES bytes)"
 fi
+rm -f "$SKILL_FILE"
 
 # ────────────────────────────────────────────────────────────────────────────
 section "15. IDENTITY / AGENT PROFILE"

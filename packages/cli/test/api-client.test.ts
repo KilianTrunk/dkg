@@ -247,17 +247,33 @@ describe('ApiClient', () => {
       expect(body).toEqual({ to: 'peer1', text: 'hello' });
     });
 
-    it('publish() sends context graph id and quads', async () => {
-      const expected = { kaId: 'kc1', status: 'tentative', kas: [] };
-      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body: expected });
+    it('does not expose the retired direct explicit-quads publish helper', () => {
+      expect((client as any).publish).toBeUndefined();
+    });
+
+    it('createKnowledgeAsset() forwards finalize:false for a draft-only write', async () => {
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 201, body: { name: 'draft', written: 1, status: 'draft-open' } });
       globalThis.fetch = fetch;
-      const quads = [{ subject: 'urn:s', predicate: 'urn:p', object: '"v"', graph: 'urn:g' }];
-      const result = await client.publish('test-contextGraph', quads);
-      expect(result.kaId).toBe('kc1');
+      await client.createKnowledgeAsset('cg-1', 'draft', {
+        finalize: false,
+        quads: [{ subject: 'urn:s', predicate: 'urn:p', object: 'urn:o', graph: 'urn:g' }],
+      });
+
+      expect(calls[0].url).toBe(`http://127.0.0.1:${PORT}/api/knowledge-assets`);
+      const body = JSON.parse(calls[0].opts.body as string);
+      expect(body).toMatchObject({ contextGraphId: 'cg-1', name: 'draft', finalize: false });
+      expect(body.quads).toHaveLength(1);
+    });
+
+    it('createKnowledgeAsset() omits finalize when unspecified (server default seals)', async () => {
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 201, body: { name: 'draft', status: 'wm-sealed' } });
+      globalThis.fetch = fetch;
+      await client.createKnowledgeAsset('cg-1', 'draft', {
+        quads: [{ subject: 'urn:s', predicate: 'urn:p', object: 'urn:o', graph: 'urn:g' }],
+      });
 
       const body = JSON.parse(calls[0].opts.body as string);
-      expect(body.contextGraphId).toBe('test-contextGraph');
-      expect(body.quads).toHaveLength(1);
+      expect(body).not.toHaveProperty('finalize');
     });
 
     it('query() sends sparql, optional context graph id, and partition opt-in', async () => {
@@ -514,6 +530,70 @@ describe('ApiClient', () => {
       await expect(client.shutdown()).resolves.toBeUndefined();
     });
   });
+
+  describe('Admin: operational wallets + PCA list/primary-node + agent keys', () => {
+    it('listOperationalWallets() GETs /api/operational-wallets', async () => {
+      const body = { identityId: '5', hasProfile: true, adminKeyConfigured: true, canManage: true, wallets: [] };
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body });
+      globalThis.fetch = fetch;
+      const result = await client.listOperationalWallets();
+      expect(result).toEqual(body);
+      expect(calls[0].url).toBe(`http://127.0.0.1:${PORT}/api/operational-wallets`);
+      expect(calls[0].opts.method ?? 'GET').toBe('GET');
+    });
+
+    it('addOperationalWallet() POSTs the address', async () => {
+      const body = { address: '0x' + '1'.repeat(40), added: true, txHash: '0xabc', blockNumber: 1 };
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body });
+      globalThis.fetch = fetch;
+      const result = await client.addOperationalWallet('0x' + '1'.repeat(40));
+      expect(result).toEqual(body);
+      expect(calls[0].url).toBe(`http://127.0.0.1:${PORT}/api/operational-wallets`);
+      expect(calls[0].opts.method).toBe('POST');
+      expect(JSON.parse(calls[0].opts.body as string)).toEqual({ address: '0x' + '1'.repeat(40) });
+    });
+
+    it('removeOperationalWallet() DELETEs the address route', async () => {
+      const addr = '0x' + '2'.repeat(40);
+      const body = { address: addr, removed: true, txHash: '0xdef', blockNumber: 2 };
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body });
+      globalThis.fetch = fetch;
+      const result = await client.removeOperationalWallet(addr);
+      expect(result).toEqual(body);
+      expect(calls[0].url).toBe(`http://127.0.0.1:${PORT}/api/operational-wallets/${addr}`);
+      expect(calls[0].opts.method).toBe('DELETE');
+    });
+
+    it('listPcas() GETs /api/pca', async () => {
+      const body = { accounts: [] };
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body });
+      globalThis.fetch = fetch;
+      const result = await client.listPcas();
+      expect(result).toEqual(body);
+      expect(calls[0].url).toBe(`http://127.0.0.1:${PORT}/api/pca`);
+    });
+
+    it('setPcaPrimaryNode() POSTs { node } to the primary-node route', async () => {
+      const body = { accountId: '7', primaryNode: '42', txHash: '0xabc', blockNumber: 3 };
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body });
+      globalThis.fetch = fetch;
+      const result = await client.setPcaPrimaryNode('7', '42');
+      expect(result).toEqual(body);
+      expect(calls[0].url).toBe(`http://127.0.0.1:${PORT}/api/pca/7/primary-node`);
+      expect(calls[0].opts.method).toBe('POST');
+      expect(JSON.parse(calls[0].opts.body as string)).toEqual({ node: '42' });
+    });
+
+    it('getAgentEncryptionKeys() GETs the agent keys route', async () => {
+      const addr = '0x' + 'a'.repeat(40);
+      const body = { agentAddress: addr, agentDid: `did:dkg:agent:${addr}`, keys: [] };
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body });
+      globalThis.fetch = fetch;
+      const result = await client.getAgentEncryptionKeys(addr);
+      expect(result).toEqual(body);
+      expect(calls[0].url).toBe(`http://127.0.0.1:${PORT}/api/agent/${addr}/encryption-keys`);
+    });
+  });
 });
 
 describe('ApiClient — GitHub-shaped knowledge-assets SDK (OT-RFC-43 §10.5)', () => {
@@ -543,6 +623,7 @@ describe('ApiClient — GitHub-shaped knowledge-assets SDK (OT-RFC-43 §10.5)', 
     const calls = track({ name: 'f', status: 'vm-confirmed' });
     const preSignedAuthorAttestation = {
       address: '0x1111111111111111111111111111111111111111',
+      reservedKaId: ((BigInt('0x1111111111111111111111111111111111111111') << 96n) | 1n).toString(),
       signature: { r: `0x${'22'.repeat(32)}`, vs: `0x${'33'.repeat(32)}` },
     };
     await client.createKnowledgeAsset('cg', 'f', {
@@ -605,6 +686,7 @@ describe('ApiClient — GitHub-shaped knowledge-assets SDK (OT-RFC-43 §10.5)', 
     const calls = track({ merkleRoot: '0xabc', eip712Digest: '0xdig' });
     const preSignedAuthorAttestation = {
       address: '0x1111111111111111111111111111111111111111',
+      reservedKaId: ((BigInt('0x1111111111111111111111111111111111111111') << 96n) | 1n).toString(),
       signature: { r: `0x${'22'.repeat(32)}`, vs: `0x${'33'.repeat(32)}` },
     };
     await client.knowledgeAssetFinalize('cg', 'f', {
@@ -626,6 +708,7 @@ describe('ApiClient — GitHub-shaped knowledge-assets SDK (OT-RFC-43 §10.5)', 
         authorAgentAddress: '0x1111111111111111111111111111111111111111',
         preSignedAuthorAttestation: {
           address: '0x2222222222222222222222222222222222222222',
+          reservedKaId: '1',
           signature: { r: `0x${'22'.repeat(32)}`, vs: `0x${'33'.repeat(32)}` },
         },
       }),
@@ -646,6 +729,24 @@ describe('ApiClient — GitHub-shaped knowledge-assets SDK (OT-RFC-43 §10.5)', 
       publisherNodeIdentityIdOverride: 123n,
     });
     expect(calls[0].url).toBe(`${base}/api/knowledge-assets/f/vm/publish`);
+    expect(JSON.parse(calls[0].opts.body as string)).toMatchObject({
+      contextGraphId: 'cg',
+      subGraphName: 'notes',
+      options: {
+        clearSharedMemoryAfter: true,
+        publishEpochs: 12,
+        publisherNodeIdentityIdOverride: '123',
+      },
+    });
+
+    calls = track({ jobId: 'job-1', status: 'accepted' });
+    await client.knowledgeAssetPublishAsync('cg', 'f', {
+      subGraphName: 'notes',
+      clearAfter: true,
+      publishEpochs: 12,
+      publisherNodeIdentityIdOverride: 123n,
+    });
+    expect(calls[0].url).toBe(`${base}/api/knowledge-assets/f/vm/publish-async`);
     expect(JSON.parse(calls[0].opts.body as string)).toMatchObject({
       contextGraphId: 'cg',
       subGraphName: 'notes',
@@ -676,5 +777,52 @@ describe('ApiClient — GitHub-shaped knowledge-assets SDK (OT-RFC-43 §10.5)', 
     const calls = track({ state: 'created' });
     await client.getKnowledgeAsset('cg', 'f');
     expect(calls[0].url).toBe(`${base}/api/knowledge-assets/f?contextGraphId=cg`);
+  });
+
+  // #1087 migration guard: the compatibility wrapper used by `dkg shared-memory
+  // publish`/`dkg index`/benchmarks must POST the per-KA vm/publish route and
+  // translate `clearAfter` → `options.clearSharedMemoryAfter` (a typo/drop here
+  // would leave the higher-level validation green while breaking CLI/bench callers).
+  it('publishFromFinalizedAssertion POSTs /:name/vm/publish and translates clearAfter → options.clearSharedMemoryAfter', async () => {
+    const calls = track({ kaId: '1', status: 'confirmed', kas: [] });
+    await client.publishFromFinalizedAssertion('cg', 'my-asset', { clearAfter: true, subGraphName: 'sg1' });
+    expect(calls[0].opts.method).toBe('POST');
+    expect(calls[0].url).toBe(`${base}/api/knowledge-assets/my-asset/vm/publish`);
+    const sent = JSON.parse(calls[0].opts.body as string);
+    expect(sent.contextGraphId).toBe('cg');
+    expect(sent.subGraphName).toBe('sg1');
+    expect(sent.options).toEqual({ clearSharedMemoryAfter: true });
+    expect(sent.clearAfter).toBeUndefined();
+  });
+
+  it('publishFromFinalizedAssertion omits the options object when no finalized-publish flags are set', async () => {
+    const calls = track({ kaId: '1', status: 'confirmed', kas: [] });
+    await client.publishFromFinalizedAssertion('cg', 'plain');
+    expect(calls[0].url).toBe(`${base}/api/knowledge-assets/plain/vm/publish`);
+    expect(JSON.parse(calls[0].opts.body as string)).toEqual({ contextGraphId: 'cg' });
+  });
+
+  it('publishAssertion runs the create → per-KA /vm/publish two-call sequence', async () => {
+    const calls = track({ kaId: '1', status: 'confirmed', kas: [], assertionUri: 'urn:a' });
+    await client.publishAssertion(
+      'cg',
+      'asset2',
+      [{ subject: 'urn:s', predicate: 'urn:p', object: '"o"', graph: '' }],
+      { clearAfter: false, subGraphName: 'sg2' },
+    );
+    // 1st call creates (finalize+share to SWM); the sequence ENDS at the per-KA vm/publish route
+    expect(calls[0].url).toBe(`${base}/api/knowledge-assets`);
+    expect(JSON.parse(calls[0].opts.body as string)).toMatchObject({
+      contextGraphId: 'cg',
+      name: 'asset2',
+      finalize: true,
+      alsoShareSwm: true,
+    });
+    const last = calls[calls.length - 1];
+    expect(last.url).toBe(`${base}/api/knowledge-assets/asset2/vm/publish`);
+    expect(last.opts.method).toBe('POST');
+    const published = JSON.parse(last.opts.body as string);
+    expect(published.subGraphName).toBe('sg2');
+    expect(published.options).toEqual({ clearSharedMemoryAfter: false });
   });
 });

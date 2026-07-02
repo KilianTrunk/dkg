@@ -1,5 +1,17 @@
 import type { ethers } from 'ethers';
 
+/**
+ * The Publishing-Conviction-Account read methods the funded-wallet selector
+ * needs from the conviction mixin. Declared as a shared interface so a rename or
+ * signature change in `ConvictionMethods` (which `implements ConvictionReader`)
+ * is caught at compile time, rather than only at runtime through the base-class
+ * structural cast in `isConvictionFundedAgent`.
+ */
+export interface ConvictionReader {
+  getConvictionAgentAccountId(agent: string): Promise<bigint>;
+  convictionAccountCanCover(accountId: bigint, baseCost: bigint): Promise<boolean>;
+}
+
 export interface IdentityProof {
   publicKey: Uint8Array;
   signature: Uint8Array;
@@ -248,6 +260,63 @@ export interface ContextGraphOnChain {
   description?: string;
 }
 
+export class ContextGraphChainScanPartialError extends Error {
+  readonly partialResults: ContextGraphOnChain[];
+  readonly scannedToBlock: number;
+  readonly failedFromBlock: number;
+  readonly failedToBlock: number;
+
+  constructor(
+    message: string,
+    opts: {
+      partialResults: ContextGraphOnChain[];
+      scannedToBlock: number;
+      failedFromBlock: number;
+      failedToBlock: number;
+      cause?: unknown;
+    },
+  ) {
+    super(message);
+    this.name = 'ContextGraphChainScanPartialError';
+    this.partialResults = opts.partialResults;
+    this.scannedToBlock = opts.scannedToBlock;
+    this.failedFromBlock = opts.failedFromBlock;
+    this.failedToBlock = opts.failedToBlock;
+    if (opts.cause !== undefined) {
+      (this as Error & { cause?: unknown }).cause = opts.cause;
+    }
+  }
+}
+
+export function isContextGraphChainScanPartialError(
+  err: unknown,
+): err is ContextGraphChainScanPartialError {
+  return (
+    err instanceof ContextGraphChainScanPartialError ||
+    (
+      typeof err === 'object' &&
+      err !== null &&
+      (err as { name?: unknown }).name === 'ContextGraphChainScanPartialError' &&
+      Array.isArray((err as { partialResults?: unknown }).partialResults)
+    )
+  );
+}
+
+export interface ContextGraphChainScanOptions {
+  /**
+   * When true and `fromBlock` is omitted, adapters may resume from an
+   * in-memory watermark with a reorg buffer. The default preserves public
+   * list-all semantics for SDK callers.
+   */
+  incremental?: boolean;
+  /**
+   * When true on a successful full scan, adapters may seed the in-memory
+   * incremental watermark for later daemon background scans. This is opt-in so
+   * public SDK list-all calls remain side-effect free by default.
+   */
+  seedIncrementalWatermark?: boolean;
+}
+
 // ----- On-Chain Context Graph types (ContextGraphs contract) -----
 
 /**
@@ -348,6 +417,19 @@ export interface V10PublishingConvictionAccountInfo {
   fullySwept: boolean;
 }
 
+/**
+ * A PCA owned by the bound node's operational wallet, annotated with its
+ * OT-RFC-51 node association. `primaryNode` is the node identityId whose
+ * publishing allocation this account's committed TRAC funds (0 = none);
+ * `fundsThisNode` is true when that equals the bound node's own identity.
+ */
+export interface NodePublishingConvictionAccount {
+  accountId: bigint;
+  primaryNode: bigint;
+  fundsThisNode: boolean;
+  info: V10PublishingConvictionAccountInfo;
+}
+
 // ----- V10 publish types -----
 
 /**
@@ -422,20 +504,21 @@ export interface V10PublishParams {
    */
   reservedKaId?: bigint;
   /**
-   * RFC-39 Phase A.5 — OPTIONAL Merkle root over `[keccak256(ct_i)]` in
-   * `swmMessageIndex` order for this batch's ciphertext chunks. Required
-   * by the contract to be `bytes32(0)` for public CGs; for curated CGs
-   * either zero (legacy/transitional — picker skips this KC in the
-   * curated draw) OR paired with a non-zero `ciphertextChunkCount`.
-   * Defaults to `bytes32(0)` when omitted.
+   * OT-RFC-49 — OPTIONAL V10 Merkle root over the curated PUBLIC `_catalog`
+   * triples (each leaf `hashTripleV10(s,p,o)`; see `computeCatalogRoot`).
+   * This is the curated random-sampling commitment that REPLACED the stripped
+   * ciphertext commitment (same on-chain struct slot / byte width). Required
+   * by the contract to be `bytes32(0)` for public CGs; for curated CGs either
+   * zero (legacy/transitional — picker skips this KC in the curated draw) OR
+   * paired with a non-zero `catalogLeafCount`. Defaults to `bytes32(0)`.
    */
-  ciphertextChunksRoot?: Uint8Array;
+  catalogRoot?: Uint8Array;
   /**
-   * RFC-39 Phase A.5 — OPTIONAL number of ciphertext chunks in this
-   * batch (== curated leaf count for random sampling). Same zero-or-paired
-   * constraints as `ciphertextChunksRoot`. Defaults to `0` when omitted.
+   * OT-RFC-49 — OPTIONAL post sort+dedupe catalog leaf count (== the curated
+   * `chunkId` draw modulus for random sampling). Same zero-or-paired
+   * constraints as `catalogRoot`. Defaults to `0` when omitted.
    */
-  ciphertextChunkCount?: number;
+  catalogLeafCount?: number;
   /**
    * Write-ahead hook invoked by the adapter *immediately before the
    * concrete publish tx is broadcast* — i.e. after `approve()` and any
@@ -503,19 +586,18 @@ export interface V10UpdateKAParams {
   publisherNodeIdentityId?: bigint;
   ackSignatures?: Array<{ identityId: bigint; r: Uint8Array; vs: Uint8Array }>;
   /**
-   * RFC-39 Phase A.5 — OPTIONAL refreshed Merkle root over the new
-   * batch's ciphertext chunks. Same zero-or-paired contract as
-   * {@link V10PublishParams.ciphertextChunksRoot}: zero on metadata-only
-   * updates and public CGs; both non-zero on curated commitment
-   * rotation. Defaults to `bytes32(0)`.
+   * OT-RFC-49 — OPTIONAL refreshed V10 Merkle root over the new batch's
+   * curated `_catalog` triples. Same zero-or-paired contract as
+   * {@link V10PublishParams.catalogRoot}: zero on metadata-only updates and
+   * public CGs; both non-zero on curated commitment rotation. Defaults to
+   * `bytes32(0)`.
    */
-  newCiphertextChunksRoot?: Uint8Array;
+  newCatalogRoot?: Uint8Array;
   /**
-   * RFC-39 Phase A.5 — OPTIONAL refreshed ciphertext chunk count for the
-   * new batch. Defaults to `0`. Paired with
-   * {@link newCiphertextChunksRoot}.
+   * OT-RFC-49 — OPTIONAL refreshed catalog leaf count for the new batch.
+   * Defaults to `0`. Paired with {@link newCatalogRoot}.
    */
-  newCiphertextChunkCount?: number;
+  newCatalogLeafCount?: number;
   /**
    * Write-ahead hook fired just before the concrete update tx is
    * broadcast, carrying the signed tx hash. See
@@ -550,6 +632,26 @@ export interface NodeChallenge {
   activeProofPeriodStartBlock: bigint;
   proofingPeriodDurationInBlocks: bigint;
   solved: boolean;
+  /**
+   * OT-RFC-43 / R3 — curation branch PINNED at issuance. `true` selects the
+   * curated proof path (prove the public `_catalog`); `false` the public flat-KC
+   * path. Sourced from the challenge, not a live `getAccessPolicy` probe.
+   */
+  isCurated: boolean;
+  /**
+   * OT-RFC-49 / WS-B Trap 1 — leaf count PINNED at issuance (== on-chain
+   * `getCatalogLeafCount`/`getMerkleLeafCount` at draw time). This is the
+   * `chunkId` index space the prover must build its proof against; reading it
+   * live would diverge if the KA updated mid-period.
+   */
+  challengeLeafCount: bigint;
+  /**
+   * OT-RFC-49 / WS-B Trap 1 — the 32-byte Merkle root PINNED at issuance. The
+   * prover MUST rebuild a tree whose root equals THIS value (not a live
+   * `getCatalogRoot`/`getLatestMerkleRoot`), else a mid-period update makes an
+   * honest proof fail. `submitProof` verifies against this same pinned root.
+   */
+  challengeRoot: Uint8Array;
 }
 
 /** Result of `getActiveProofPeriodStatus()` (V10 RandomSampling.sol). */
@@ -753,7 +855,9 @@ export interface ChainAdapter {
   /** Reveal cleartext name+description on-chain for a context graph you created. Optional. */
   revealContextGraphMetadata?(contextGraphId: string, name: string, description: string): Promise<TxResult>;
   /** List context graphs from chain via `NameClaimed` events. Optional; not supported on no-chain/mock. */
-  listContextGraphsFromChain?(fromBlock?: number): Promise<ContextGraphOnChain[]>;
+  listContextGraphsFromChain?(fromBlock?: number, options?: ContextGraphChainScanOptions): Promise<ContextGraphOnChain[]>;
+  /** True when the adapter has a registry scan watermark for its currently bound ContextGraphNameRegistry. */
+  hasContextGraphRegistryScanWatermark?(): Promise<boolean>;
 
   /**
    * Live owner lookup for a PCA NFT — wraps `DKGPublishingConvictionNFT.ownerOf(accountId)`.
@@ -797,17 +901,71 @@ export interface ChainAdapter {
    */
   getConvictionAccountLockDurationEpochs?(accountId: bigint): Promise<number>;
 
+  /**
+   * Whether the PCA `accountId` can cover the DISCOUNTED cost of a publish
+   * whose undiscounted base cost is `baseCost`, right now (discount tier
+   * applied, compared against the account's remaining current-window
+   * allowance + top-up buffer; `false` when expired/exhausted/missing).
+   *
+   * The publisher SDK gates the `publishEpochs → lockDurationEpochs`
+   * coercion on this, so a registered-but-unfundable agent (a consent-free
+   * squat, or any account short for this specific publish) keeps the
+   * caller's requested lifetime instead of snapping to the PCA lock and
+   * direct-spending at that lifetime/full price. Adapters that omit this
+   * method preserve the legacy unconditional coercion.
+   */
+  convictionAccountCanCover?(accountId: bigint, baseCost: bigint): Promise<boolean>;
+
   // ----- V10 Publishing Conviction NFT write+read surface -----
   // Wraps `DKGPublishingConvictionNFT`. Optional; owner-gated writes
   // MUST surface the owner revert (→ 403), never swallow it.
 
-  createPublishingConvictionAccount?(committedTRAC: bigint): Promise<{ accountId: bigint } & TxResult>;
+  createPublishingConvictionAccount?(committedTRAC: bigint, primaryNode?: bigint): Promise<{ accountId: bigint } & TxResult>;
   topUpPublishingConvictionAccount?(accountId: bigint, amount: bigint): Promise<TxResult>;
   registerPublishingConvictionAgent?(accountId: bigint, agent: string): Promise<TxResult>;
   deregisterPublishingConvictionAgent?(accountId: bigint, agent: string): Promise<TxResult>;
+  clearPublishingConvictionAgents?(accountId: bigint): Promise<TxResult>;
+  registerPublishingConvictionAgents?(accountId: bigint, agents: string[]): Promise<TxResult>;
   isPublishingConvictionAgent?(accountId: bigint, agent: string): Promise<boolean>;
   settlePublishingConvictionAccount?(accountId: bigint): Promise<TxResult>;
   getPublishingConvictionAccountInfo?(accountId: bigint): Promise<V10PublishingConvictionAccountInfo | null>;
+
+  /**
+   * OT-RFC-51 designated primary node for a PCA — `accounts(accountId).primaryNode`.
+   * The node identityId whose publishing allocation this account's committed TRAC
+   * funds. Returns `0n` when unset, the account is missing, or the NFT is undeployed.
+   */
+  getConvictionPrimaryNode?(accountId: bigint): Promise<bigint>;
+
+  /**
+   * Addresses + numeric chain id for the browser wallet-connect path (so a PCA
+   * owner can sign owner-gated txs client-side). Excludes the node RPC URL by
+   * design — the browser uses its own wallet provider for reads + signing.
+   */
+  getPcaContractContext?(): Promise<{
+    chainId: number;
+    hubAddress: string;
+    nftAddress: string;
+    tokenAddress: string;
+    publishingConvictionAddress: string;
+    clearAgentsSupported: boolean;
+  }>;
+
+  /**
+   * Enumerate the PCAs owned by the bound operational wallet (ERC721Enumerable
+   * `balanceOf` + `tokenOfOwnerByIndex`), each annotated with its OT-RFC-51
+   * `primaryNode` association and whether it funds this node's own identity.
+   * These are exactly the accounts the bound wallet can manage (owner-gated
+   * writes). Throws {@link PcaUnavailableError} (→ 503) when the NFT is undeployed.
+   */
+  listNodePublishingConvictionAccounts?(): Promise<NodePublishingConvictionAccount[]>;
+
+  /**
+   * OT-RFC-51 owner-gated re-designation of a PCA's primary node (moves FUTURE
+   * epochs' publishing allocation to `primaryNode`). Owner revert MUST surface
+   * (→ 403); the on-chain rate-limit (once per epoch) surfaces as a revert too.
+   */
+  setPublishingConvictionPrimaryNode?(accountId: bigint, primaryNode: bigint): Promise<TxResult>;
 
   /**
    * Sign an arbitrary message hash using the node's primary operational key.
@@ -911,10 +1069,11 @@ export interface ChainAdapter {
    * for `author`, or `-1n` if the author has never minted. Used by the allocator's
    * cold-start reconciliation (`nextNumber = max(local, chainMax) + 1`) so a
    * stale-local-DB / fresh device never re-hands a burned `(author, number)`.
-   * Derived by enumerating `KnowledgeAssetCreated(id, author, ...)` logs filtered
-   * by the indexed `author` topic and taking `max(id & ((1<<96)-1))`. Optional:
-   * adapters that cannot enumerate logs may omit it (the allocator then trusts
-   * its local store and relies on the contract's `_safeMint` revert as backstop).
+   * EVM adapters prefer the O(1) `DKGKnowledgeAssets.getMaxKaNumberForAuthor`
+   * view when available and may fall back to a bounded historical
+   * `KnowledgeAssetCreated` scan for older deployments. Optional: adapters that
+   * cannot reconcile chain state may omit it (the allocator then trusts its local
+   * store and relies on the contract's `_safeMint` revert as backstop).
    */
   getMaxKaNumberForAuthor?(author: string): Promise<bigint>;
 
@@ -962,6 +1121,27 @@ export interface ChainAdapter {
     identityId?: bigint;
     additionalAddresses?: string[];
   }): Promise<OperationalWalletRegistrationResult>;
+
+  /**
+   * Add a single operational wallet to the node identity via
+   * `Profile.addOperationalWallets(identityId, [address])`. Signed by the
+   * configured admin key (the on-chain `onlyAdmin` gate). Throws when no admin
+   * key is configured, the configured admin is not an on-chain ADMIN_KEY for
+   * the identity, or the identity has no profile. `identityId` defaults to the
+   * bound node's own identity.
+   */
+  addOperationalWallet?(address: string, options?: { identityId?: bigint }): Promise<TxResult>;
+
+  /**
+   * Remove a single operational wallet from the node identity via
+   * `Identity.removeKey(identityId, keccak(address))` (Profile has no remove
+   * path). Signed by the configured admin key. REFUSES to remove the bound
+   * primary operational wallet (the one that resolves the node's identityId) —
+   * the contract's only guard is `CannotDeleteOnlyOperationalKey`, which would
+   * not stop orphaning the node's own identity resolution while other keys
+   * remain. `identityId` defaults to the bound node's own identity.
+   */
+  removeOperationalWallet?(address: string, options?: { identityId?: bigint }): Promise<TxResult>;
 
   // ----- Network State Registry (RFC 04 v0.3 / Issue #461) -----
   //
@@ -1113,8 +1293,8 @@ export interface ChainAdapter {
    * {@link ChallengeNoLongerActiveError} when the proof window has
    * already closed (also non-retryable; rebuild on next period).
    */
-  /** @param leaf 32-byte leaf (`hashTripleV10` or private sub-root), hex string or raw bytes */
-  submitProof?(leaf: Uint8Array | `0x${string}`, merkleProof: Uint8Array[]): Promise<TxResult>;
+  /** @param content raw bytes the chain hashes to the leaf (`leaf = keccak256(content)`): public N-Triple / curated `_catalog` triple bytes */
+  submitProof?(content: Uint8Array | `0x${string}`, merkleProof: Uint8Array[]): Promise<TxResult>;
 
   /**
    * Read the active proof-period state without writing. Cheap; safe to
@@ -1166,36 +1346,36 @@ export interface ChainAdapter {
   getMerkleLeafCount?(kaId: bigint): Promise<number>;
 
   /**
-   * OT-RFC-38 LU-11 / OT-RFC-39 — latest on-chain ciphertext-chunks
-   * Merkle root for `kaId`. Read from
-   * `KnowledgeCollectionStorage.getLatestCiphertextChunksRoot(uint256)`.
+   * OT-RFC-49 — on-chain curated `_catalog` Merkle root for `kaId`. Read
+   * from `DKGKnowledgeAssets.getCatalogRoot(uint256)`. This REPLACED the
+   * stripped `getLatestCiphertextChunksRoot` reader (same on-chain slot).
    *
-   * Returns 32 raw bytes. Returns `bytes32(0)` (all-zero) when the KC
-   * has no chunked-ciphertext commitment set — either because it is
-   * a public KC (legacy V10 plaintext path) or because it is a
-   * pre-LU-11 transitional curated KC that predates the chunked
-   * substrate. RFC-39 random-sampling treats both as unsampleable
-   * via the picker's per-KC commitment check.
+   * Returns 32 raw bytes. Returns `bytes32(0)` (all-zero) when the KC has
+   * no catalog commitment set — either because it is a public KC (legacy
+   * V10 plaintext path) or a transitional curated KC published before the
+   * catalog commitment existed. RFC-39 random-sampling treats both as
+   * unsampleable via the picker's per-KC commitment check. The off-chain
+   * prover rebuilds a tree whose root MUST equal this value (or the pinned
+   * `challenge.challengeRoot`, which is sourced from it at issuance).
    *
    * Optional so non-V10 / no-chain adapters can stub the surface.
    */
-  getLatestCiphertextChunksRoot?(kaId: bigint): Promise<Uint8Array>;
+  getCatalogRoot?(kaId: bigint): Promise<Uint8Array>;
 
   /**
-   * OT-RFC-38 LU-11 / OT-RFC-39 — number of ciphertext chunks
-   * committed on chain for `kaId`. Read from
-   * `KnowledgeCollectionStorage.getCiphertextChunkCount(uint256)`.
+   * OT-RFC-49 — post sort+dedupe catalog leaf count committed on chain for
+   * `kaId`. Read from `DKGKnowledgeAssets.getCatalogLeafCount(uint256)`.
+   * REPLACED the stripped `getCiphertextChunkCount` reader.
    *
-   * Returns `0` for KCs without a chunked commitment (see
-   * `getLatestCiphertextChunksRoot` for the bisection). Matches the
-   * Solidity default-zero mapping. The prover uses this as the
-   * curated counterpart of `getMerkleLeafCount` for the on-chain
-   * `chunkId = leafIndex` bounds check and for sanity-checking the
-   * local chunk-store extraction before building a proof.
+   * Returns `0` for KCs without a catalog commitment (see `getCatalogRoot`
+   * for the bisection). Matches the Solidity default-zero mapping. The
+   * prover uses this as the curated counterpart of `getMerkleLeafCount`
+   * for the on-chain `chunkId = leafIndex` bounds check and to sanity-check
+   * the local `_catalog` extraction before building a proof.
    *
    * Optional so non-V10 / no-chain adapters can stub the surface.
    */
-  getCiphertextChunkCount?(kaId: bigint): Promise<number>;
+  getCatalogLeafCount?(kaId: bigint): Promise<number>;
 
   /**
    * Address that signed the latest merkle root for `kaId` (the EOA that
@@ -1307,6 +1487,9 @@ export interface ChainAdapter {
    * so the protected/encrypted path is kept). Adapters that implement
    * `getContextGraphAccessPolicy` SHOULD also implement this so they don't
    * silently strand on-chain-public CGs on the encrypted path.
+   * A resolved `false` must mean the chain successfully proved the slot is
+   * inactive; transient RPC/read failures should reject so callers can choose
+   * their own fail-closed or ACK-backed fallback behavior.
    */
   isContextGraphActiveOnChain?(contextGraphId: bigint): Promise<boolean>;
 

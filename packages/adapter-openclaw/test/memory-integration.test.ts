@@ -71,8 +71,8 @@ describe('Memory integration round-trip (issue #199 Phase 1 + Phase 2)', () => {
   });
 
   describe('Phase 1 — canonical write contract', () => {
-    it('dkg_assertion_write tool is registered with the expected shape', () => {
-      const tool = tools.find((t) => t.name === 'dkg_assertion_write');
+    it('dkg_knowledge_asset_write tool is registered with the expected shape', () => {
+      const tool = tools.find((t) => t.name === 'dkg_knowledge_asset_write');
       expect(tool).toBeDefined();
       const params = tool!.parameters as any;
       expect(params.required).toContain('context_graph_id');
@@ -80,8 +80,8 @@ describe('Memory integration round-trip (issue #199 Phase 1 + Phase 2)', () => {
       expect(params.required).toContain('quads');
     });
 
-    it('calling dkg_assertion_write flows to client.knowledgeAssetWrite', async () => {
-      const tool = tools.find((t) => t.name === 'dkg_assertion_write')!;
+    it('calling dkg_knowledge_asset_write flows to client.knowledgeAssetWrite', async () => {
+      const tool = tools.find((t) => t.name === 'dkg_knowledge_asset_write')!;
       const client = (plugin as any).client;
       client.knowledgeAssetWrite = vi.fn().mockResolvedValue({ written: 1 });
       await tool.execute('t1', {
@@ -124,7 +124,7 @@ describe('Memory integration round-trip (issue #199 Phase 1 + Phase 2)', () => {
         .map((c) => c[1].view);
       expect(agentContextViews).toContain('working-memory');
       expect(agentContextViews).toContain('shared-working-memory');
-      expect(agentContextViews).toContain('verified-memory');
+      expect(agentContextViews).toContain('verifiable-memory');
     });
 
     it('memory_search finds the tatooine memory that Phase 1 wrote (round-trip alignment)', async () => {
@@ -170,7 +170,7 @@ describe('Memory integration round-trip (issue #199 Phase 1 + Phase 2)', () => {
         (c) => c[1].contextGraphId === 'agent-context',
       );
       const views = agentContextCalls.map((c) => c[1].view).sort();
-      expect(views).toEqual(['shared-working-memory', 'verified-memory', 'working-memory']);
+      expect(views).toEqual(['shared-working-memory', 'verifiable-memory', 'working-memory']);
     });
 
     it('memory_search sends agentAddress on WM reads (required by A-1 isolation at query boundary)', async () => {

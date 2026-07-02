@@ -135,14 +135,39 @@ const PINNED_DIGESTS: Record<string, string> = {
   // rotates the commitment.
 
   // Greenfield rename (rc.12): logic + storage pair replaces the legacy names.
-  KnowledgeAssetsLifecycle:     '45957310345c8cc8dd027ccf006bd0730e47510d72f8d14857de251788b10a52',
+  // Updated PR #1072 (RFC-39): the chain-local ABI now declares the new
+  // `CuratedCGRequiresCiphertextCommitment(uint256)` error. evm-adapter-abi
+  // resolves this contract from packages/chain/abi/ first (the evm-module copy
+  // is only a fallback), so the error had to be added here for chain-side revert
+  // decoding to name it instead of "unknown custom error". Digest now matches
+  // the evm-module ABI surface.
+  // Re-pinned for OT-RFC-49 (catalog-sampling strip): the curated random-sampling
+  // commitment moved from the private ciphertext to the public `_catalog`. ABI
+  // surface changes: errors `PublicCGCannotHaveCatalogCommitment` /
+  // `CuratedCGRequiresCatalogCommitment` / `IncompleteCatalogCommitment` (renamed
+  // from the `*Ciphertext*` set), and `PublishParams`/`UpdateParams` now carry
+  // `catalogRoot`/`catalogLeafCount` (was `ciphertextChunksRoot`/`ciphertextChunkCount`).
+  // OT-RFC-53 (CG registration deposit): +event RegistrationEscrowConsumed on
+  // KnowledgeAssetsLifecycle; +events ContextGraphRegistrationDeposited /
+  // ContextGraphEscrowSwept + deposit accounting on ContextGraphs/ContextGraphStorage;
+  // +contextGraphRegistrationDeposit getter/setter on ParametersStorage. Chain-local
+  // ABIs refreshed in lockstep with evm-module/abi.
+  KnowledgeAssetsLifecycle:     '409efa6a580e3d374c0f53c70cd21dd6e78cd904b2f103edc9737803f0829820',
 
   // Re-pinned for OT-RFC-43 Option-1 (variant 1a, PR #975): deterministic
   // author-namespaced KA identity. `createKnowledgeAsset` now takes an explicit
   // caller-supplied `uint256 kaId` (the packed author-namespaced id), and two
   // guard errors were added — `KaIdAlreadyMinted(uint256)` and
   // `KaIdNamespaceMismatch(uint256,address)` — plus a deprecated accessor.
-  DKGKnowledgeAssets:           'da5e46f24dd410b30c90bad66060b9da240aa4b0426c24a1550b0e1b6168b5ea',
+  // Re-pinned again (#1080): added the O(1) `getMaxKaNumberForAuthor(address)
+  // -> int256` view so the off-chain allocator reconciles its floor with one
+  // eth_call instead of an unbounded `KnowledgeAssetCreated` log scan. Pure
+  // function-only ABI addition (events + errors unchanged); the chain-local
+  // copy is refreshed in lockstep with the evm-module ABI in the same PR.
+  // Re-pinned for OT-RFC-49 (catalog-sampling strip): `setCatalogCommitment` /
+  // `getCatalogRoot` / `getCatalogLeafCount` + event `KnowledgeAssetCatalogCommitmentSet`
+  // (replacing the `*Ciphertext*` setter/getters/event, now removed from the ABI).
+  DKGKnowledgeAssets:           '4b0adb51db38c7e11de0692f77bd322e2f01ac3dc393d0ed9ca7a7bfcdd2d358',
   // V8 `KnowledgeCollection` ABI was moved to `abi/archive/` in
   // `archive-non-v10-contracts`; the pin entry is intentionally dropped.
   // Updated for SPEC_CG_MEMORY_MODEL: per-CG hosting committees and
@@ -160,8 +185,21 @@ const PINNED_DIGESTS: Record<string, string> = {
   // identifier so hosting cores can derive the SWM gossip topic directly
   // from chain events — no off-chain discovery channel required for
   // registered CGs.
-  ContextGraphs:                'a27718118b5d03626b0e3389ad854451caf3ed0c702cea1b770953bb439d589e',
-  ContextGraphStorage:          '3c020eecc06c6332738f80358be922d6837d9332fed194e4e2bdf87eec6050a0',
+  // Merged surface: OT-RFC-53 deposit events/functions + main's KC→KA getter
+  // rename (getContextGraphKCCount/At/List → getContextGraphKaCount/At/List).
+  // Digests recomputed post-merge from the combined ABI.
+  ContextGraphs:                '54583e20167c37f4356247cb6bc657b0dccf6f17f99a3267427674a35a151bcf',
+  // Repinned: decoupled sampling list (10.0.6). Adds getSamplingKaCount/At
+  // (the compacted per-CG list the within-CG draw + keeper use) alongside the
+  // RandomSampling-gated `swapRemoveSamplingKnowledgeAssetAt` pruning primitive
+  // (targets that sampling list) + its `KnowledgeAssetPrunedFromSamplingList`
+  // event and `OnlyRandomSampling` error. `_contextGraphKAList` stays append-only
+  // as the reconciler's registration ordinal; `kaToContextGraph` is left intact.
+  ContextGraphStorage:          '7d106670764438acd8d54875b77a279b3fb73484933e3bc76124730a008a0c96',
+  // RandomSampling — resolved by the chain adapter (challenge creation + runtime
+  // error decoding), so its ABI surface is pinned too. Carries the permissionless
+  // keeper `pruneExpiredKnowledgeAssets` added in #1268.
+  RandomSampling:               '22b0f5b837e03f061826026abbd09a747acdc2c269b32eb43d354ae06c719b43',
   // Identity / staking — consulted on every publish.
   Hub:                          '36976cc71bb87963b8b715791b32e4eb6b7bb85c712998afd6184221289a506b',
   Identity:                     'ca39efe9bd9ec4fd8ae67dccdf9eb888bf91232341c3a56216624477620ff4d8',
@@ -180,7 +218,10 @@ const PINNED_DIGESTS: Record<string, string> = {
   // from staker-bound TRAC on every paid publish / update / extend by
   // `KnowledgeAssetsLifecycle` + `PublishingConviction` (no ABI change on
   // those two — internal logic + version bump only).
-  ParametersStorage:            'a152ef475986c81b4077648980156aeaa2b91541057a9ad9bfcfd969ee7feb63',
+  //
+  // Updated PR #1083: added `ZeroShardingTableSizeLimit()` for the
+  // governance guard that rejects `setShardingTableSizeLimit(0)`.
+  ParametersStorage:            'da6f8b6435f709e02d3730d04d79abe9a2ed27e04ad1a1d058ba00ebccc82aa9',
   // Added PR #470 round 3: pin the V10 NFT-backed PCA contract so that
   // any drift in its events (CostCovered / WindowSettled /
   // AccountFinalSwept / TokensAddedToEpochRange consumers) or errors
@@ -207,13 +248,43 @@ const PINNED_DIGESTS: Record<string, string> = {
   // `ERROR_ABI_CONTRACTS` list update in the same file. This
   // intentional break is documented as the v2.x → v3.0.0 wrapper
   // bump in the wrapper NatSpec.
-  DKGPublishingConvictionNFT:   '80a2d5c1962624fc3f7b7e475daaf86a41542a1641d84783c8d4f969d4d86188',
+  //
+  // Updated OT-RFC-51 (publishing allocation): INTENTIONAL drift across the
+  // three conviction pins below — the conviction account now designates a
+  // primary node that receives the PCA's per-epoch publishing allocation.
+  // ABI surface changes synced into packages/chain/abi/ and re-pinned here:
+  //   - createAccount gained a `uint72 primaryNode` arg (new arity) — wrapper
+  //     forwarder + logic entrypoint.
+  //   - new `setPrimaryNode(accountId, primaryNode)` to (re)designate the node,
+  //     with a `ZeroPrimaryNode` revert guard; `moveEpochPublishingAllocation`
+  //     shifts the seeded allocation when the designation changes.
+  //   - the PCA Account tuple widened to carry the designated primaryNode.
+  //   - the old per-publish "realized-publish credit" path (which credited a
+  //     node's allocation per publish) was removed; allocation is now seeded
+  //     prorated at account creation. The legacy "publishingAllocation" naming
+  //     was renamed accordingly. The KAL/KCS pins did NOT drift (verified) —
+  //     this RFC touched only the conviction contracts.
+  DKGPublishingConvictionNFT:   '5bf5638221eb973bf4ba084378cfdaf6211decb6b68dd0b9bce2f93842bd7fca',
   // Updated (protocol treasury fee): added the public
   // `convictionStakingStorage()` getter (the TRAC vault the fee is paid out
   // of via `transferStake`). No event/error surface change — `settle()`,
   // `coverPublishingCost`, and the PCA business events/errors are unchanged.
-  PublishingConviction:         '55ceb341b2c8df35cd7cbebe5950b7673766c935ad7954b80187bef9f414a5a7',
-  PublishingConvictionStorage:  '42d2aae17b575a8e024b7c4503d4b44109ba6eb8a9c2e26bea36192c969a4508',
+  // Updated OT-RFC-51: see the conviction-pin note above — createAccount arity,
+  // setPrimaryNode/ZeroPrimaryNode/PrimaryNodeUnchanged/moveEpochPublishingAllocation,
+  // widened Account tuple, realized-publish credit removed / publishingAllocation rename.
+  // Repinned: KC→KA rename of error InvalidConvictionKcEpochs → InvalidConvictionKaEpochs
+  // (error selector change; contract bumped to 10.0.5).
+  // Repinned (preserve-agents-on-transfer, 10.0.6): added the owner-gated bulk
+  // `clearAgents(uint256)` + event `AgentsCleared(uint256,address,uint256)` +
+  // error `NotAccountOwner(uint256,address)` for the explicit allow-list reset
+  // (transfers now PRESERVE agents).
+  // Repinned (bulk-register-agents, 10.0.7): added owner-gated
+  // `registerAgents(uint256,address[])` (no new event/error — reuses
+  // AgentRegistered). Function surface change → new digest.
+  PublishingConviction:         '2f35f06c94b14f4137b5602d5fc58793bfe812bb5263c6545d9da50f479bdb29',
+  // Updated OT-RFC-51: storage surface for the above — primaryNode field on the
+  // widened Account tuple + the seeded per-epoch publishing allocation getters.
+  PublishingConvictionStorage:  '7eeae71f0efd9183fce232ccc669227dfd70fe4f93b4663392a0a52c1ccba859',
 };
 
 describe('ABI pin digest — detects silent contract surface drift [CH-5]', () => {

@@ -807,7 +807,7 @@ describe('DkgMemoryPlugin.register', () => {
     expect(sections.join('\n')).toContain('current_agent_address');
     expect(sections.join('\n')).toContain('working-memory');
     expect(sections.join('\n')).toContain('shared-working-memory');
-    expect(sections.join('\n')).toContain('verified-memory');
+    expect(sections.join('\n')).toContain('verifiable-memory');
     expect(sections.join('\n')).toContain('retry with alternate identity forms');
     expect(sections.join('\n')).toContain('generate an invite code first');
     expect(sections.join('\n')).toContain('allowlisting is not the full UI join flow');
@@ -992,7 +992,7 @@ describe('DkgMemorySearchManager', () => {
       }
       const views = allOpts.map(o => o.view).sort();
       expect(views).toEqual(
-        ['shared-working-memory', 'verified-memory', 'working-memory'],
+        ['shared-working-memory', 'verifiable-memory', 'working-memory'],
       );
     });
 
@@ -1016,13 +1016,13 @@ describe('DkgMemorySearchManager', () => {
       const agentContextOpts = allOpts.filter(o => o.contextGraphId === AGENT_CONTEXT_GRAPH);
       expect(agentContextOpts).toHaveLength(3);
       expect(agentContextOpts.map(o => o.view).sort()).toEqual(
-        ['shared-working-memory', 'verified-memory', 'working-memory'],
+        ['shared-working-memory', 'verifiable-memory', 'working-memory'],
       );
 
       const projectOpts = allOpts.filter(o => o.contextGraphId === 'research-x');
       expect(projectOpts).toHaveLength(3);
       expect(projectOpts.map(o => o.view).sort()).toEqual(
-        ['shared-working-memory', 'verified-memory', 'working-memory'],
+        ['shared-working-memory', 'verifiable-memory', 'working-memory'],
       );
     });
 
@@ -1198,7 +1198,7 @@ describe('DkgMemorySearchManager', () => {
         .mockResolvedValueOnce({
           result: { bindings: [{ uri: { value: 'urn:m:pswm' }, text: { value: 'match project swm body' } }] },
         }) // project SWM
-        .mockRejectedValueOnce(new Error('verified-memory view offline')); // project VM
+        .mockRejectedValueOnce(new Error('verifiable-memory view offline')); // project VM
 
       const warnSpy = vi.fn();
       const manager = new DkgMemorySearchManager({
@@ -1222,7 +1222,7 @@ describe('DkgMemorySearchManager', () => {
       );
       expect(vmWarns).toHaveLength(1);
       expect(vmWarns[0][0]).toContain('research-x');
-      expect(vmWarns[0][0]).toContain('verified-memory');
+      expect(vmWarns[0][0]).toContain('verifiable-memory');
     });
 
     it('emits a single info-level observability log per search call showing query, project, layers, and per-layer raw hits', async () => {

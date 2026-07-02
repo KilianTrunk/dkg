@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { readDaemonSources } from './helpers/read-cli-daemon';
 
@@ -8,6 +8,24 @@ const CLI_DIR = resolve(__dirname, '..', '..', 'cli', 'src');
 
 function readUiFile(rel: string): string {
   return readFileSync(resolve(UI_DIR, rel), 'utf-8');
+}
+
+function readUiTree(rel: string): string {
+  const dir = resolve(UI_DIR, rel);
+  return readdirSync(dir, { withFileTypes: true })
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((entry) => {
+      const child = `${rel}/${entry.name}`;
+      return entry.isDirectory() ? readUiTree(child) : readUiFile(child);
+    })
+    .join('\n');
+}
+
+function readPanelRightSources(): string {
+  return [
+    readUiFile('components/Shell/PanelRight.tsx'),
+    readUiTree('components/Shell/PanelRight'),
+  ].join('\n');
 }
 
 // Sub-module sources (daemon.ts was split into daemon/*.ts + daemon/routes/*.ts in PR #258/#259).
@@ -87,8 +105,8 @@ describe('OpenClaw bridge API contract', () => {
     expect(apiSrc).toContain('attachments?: LocalAgentChatAttachmentRef[]');
     expect(apiSrc).toContain('attachmentRefs');
     expect(apiSrc).toContain("extractionStatus?: 'completed';");
-    expect(readUiFile('components/Shell/PanelRight.tsx')).toContain("if (draft.status !== 'completed' || !draft.result) return null;");
-    expect(readUiFile('components/Shell/PanelRight.tsx')).toContain("extractionStatus: 'completed'");
+    expect(readPanelRightSources()).toContain("if (draft.status !== 'completed' || !draft.result) return null;");
+    expect(readPanelRightSources()).toContain("extractionStatus: 'completed'");
   });
 });
 
@@ -141,12 +159,24 @@ describe('OpenClaw daemon endpoints', () => {
   });
 
   it('discarding an imported assertion evicts its cached extraction status', () => {
+    // KA migration: the legacy `// POST /api/assertion/:name/discard` handler
+    // (routes/assertion.ts, deleted) evicted the daemon's in-memory
+    // extraction-status cache. The unified KA route handles discard via the
+    // `verb === "discard"` dispatch in routes/knowledge-assets.ts. Slice that
+    // block (between the discard and pull-from verb branches) and assert the
+    // same eviction guarantee is carried through.
+    const discardStart = daemonSrc.indexOf('verb === "discard"');
     const discardBlock = daemonSrc.slice(
-      daemonSrc.indexOf("// POST /api/assertion/:name/discard"),
-      daemonSrc.indexOf("// POST /api/assertion/:name/import-file"),
+      discardStart,
+      daemonSrc.indexOf('verb === "pull-from"', discardStart),
     );
-    expect(discardBlock).toContain('const assertionUri = contextGraphAssertionUri(');
-    expect(discardBlock).toContain('extractionStatus.delete(assertionUri);');
+    // The eviction must be keyed by the assertion's content-addressed URI
+    // (so a same-name re-import re-extracts). The unified KA handler inlines
+    // it as `extractionStatus.delete(contextGraphAssertionUri(...))` rather
+    // than the legacy two-statement form — assert the guarantee, not the
+    // exact variable shape.
+    expect(discardBlock).toContain('extractionStatus.delete(');
+    expect(discardBlock).toContain('contextGraphAssertionUri(');
   });
 
   it('chat-openclaw persists outbound messages', () => {
@@ -160,7 +190,7 @@ describe('OpenClaw daemon endpoints', () => {
 });
 
 describe('PanelRight UI - connected agent flow', () => {
-  const panelRight = readUiFile('components/Shell/PanelRight.tsx');
+  const panelRight = readPanelRightSources();
 
   it('imports local-agent wrapper functions', () => {
     expect(panelRight).toContain('fetchLocalAgentIntegrations');
@@ -300,8 +330,11 @@ describe('PanelRight UI - connected agent flow', () => {
   });
 
   it('keeps attachment-only summary text UI-only instead of sending it back through the bridge', () => {
-    expect(panelRight).toContain('content: message.text || buildAttachmentSummary(message.attachmentRefs ?? [])');
-    expect(panelRight).toContain('const messageText = text');
+    expect(panelRight).toContain('buildAttachmentSummary(message.attachmentRefs ?? [])');
+    expect(panelRight).toContain('const hasAgentText = Boolean(message.text);');
+    expect(panelRight).toContain("let messageText = '';");
+    expect(panelRight).toContain('messageText = text');
+    expect(panelRight).toContain(': buildAttachmentTurnSummary(attachments, importContext.results);');
     expect(panelRight).toContain("const outboundText = text ? textWithImportSummary : '';");
     expect(panelRight).toContain('streamLocalAgentChat(integrationId, outboundText, {');
   });
@@ -537,7 +570,7 @@ describe('OpenClaw bridge behavioral tests', () => {
   });
 
   it('UI sends via local channel bridge (not P2P)', () => {
-    const panelRight = readUiFile('components/Shell/PanelRight.tsx');
+    const panelRight = readPanelRightSources();
     expect(panelRight).toContain('streamLocalAgentChat');
     expect(panelRight).toContain('Connect OpenClaw');
   });

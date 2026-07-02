@@ -145,11 +145,17 @@ export type ClassifiedPromoteError = {
 export function classifyPromoteError(err: unknown): ClassifiedPromoteError {
   const raw = err instanceof Error ? err.message : String(err);
   const message = (raw ?? '').toLowerCase();
+  const code =
+    err && typeof err === 'object' && 'code' in err
+      ? String((err as { code?: unknown }).code ?? '').toLowerCase()
+      : '';
 
   // 1. 10 MB gossip cap — surfaced as
   //    "Promoted assertion too large for gossip (XXXX KB, limit 10 MB)"
   //    by the daemon's promote pipeline.
   if (
+    code === 'swm_gossip_payload_too_large' ||
+    code === 'payload_too_large' ||
     (message.includes('gossip') && (message.includes('limit') || message.includes('too large'))) ||
     message.includes('promoted assertion too large')
   ) {
@@ -408,6 +414,8 @@ export function createPromoteWorkerSupervisor(config: PromoteWorkerConfig): Prom
             return config.agent.assertion.promote(request.contextGraphId, request.assertionName, {
               entities,
               subGraphName: request.subGraphName,
+              ...(request.agentAddress ? { agentAddress: request.agentAddress } : {}),
+              ...(request.authorAgentAddress ? { authorAgentAddress: request.authorAgentAddress } : {}),
             });
           },
           now,

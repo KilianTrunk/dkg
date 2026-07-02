@@ -19,7 +19,7 @@ import {
 //      so ('a'+'bc') and ('ab'+'c') cannot produce the same signed bytes.
 //
 // C-7  Existing v10-proto.test.ts round-trips do NOT assert nodeIdentityId
-//      on StorageACK or verifiedMemoryId/batchId on VerifyProposal. A proto
+//      on StorageACK or verifiableMemoryId/batchId on VerifyProposal. A proto
 //      field reorder/wrong-tag regression would not fail. Add full-field
 //      round-trip tests + tag-pin tests.
 //
@@ -131,10 +131,10 @@ describe('StorageACK proto — full-field round-trip [C-7]', () => {
 });
 
 describe('VerifyProposal proto — full-field round-trip [C-7]', () => {
-  it('encode/decode preserves verifiedMemoryId AND batchId', () => {
+  it('encode/decode preserves verifiableMemoryId AND batchId', () => {
     const proposal: VerifyProposalMsg = {
       proposalId: bytes(16, 0x01),
-      verifiedMemoryId: 7,
+      verifiableMemoryId: 7,
       batchId: 42,
       merkleRoot: bytes(32, 0x02),
       entities: ['urn:e:1', 'urn:e:2'],
@@ -144,22 +144,22 @@ describe('VerifyProposal proto — full-field round-trip [C-7]', () => {
       contextGraphId: 'cg-1',
     };
     const decoded = decodeVerifyProposal(encodeVerifyProposal(proposal));
-    const vmId = typeof decoded.verifiedMemoryId === 'number'
-      ? decoded.verifiedMemoryId
-      : (decoded.verifiedMemoryId.high * 2 ** 32) + decoded.verifiedMemoryId.low;
+    const vmId = typeof decoded.verifiableMemoryId === 'number'
+      ? decoded.verifiableMemoryId
+      : (decoded.verifiableMemoryId.high * 2 ** 32) + decoded.verifiableMemoryId.low;
     // batchId is a KA id: the wire type is now the 256-bit-safe decimal
     // string (OT-RFC-43 §9), not a uint64/Long. Assert the new contract and
-    // that the value still round-trips. (verifiedMemoryId stays uint64/Long.)
+    // that the value still round-trips. (verifiableMemoryId stays uint64/Long.)
     expect(typeof decoded.batchId).toBe('string');
     const bId = Number(decoded.batchId);
     expect(vmId).toBe(7);
     expect(bId).toBe(42);
   });
 
-  it('changing verifiedMemoryId changes encoded bytes (tag pinned at 2)', () => {
+  it('changing verifiableMemoryId changes encoded bytes (tag pinned at 2)', () => {
     const base: VerifyProposalMsg = {
       proposalId: bytes(16, 0x01),
-      verifiedMemoryId: 1,
+      verifiableMemoryId: 1,
       batchId: 1,
       merkleRoot: bytes(32, 0x02),
       entities: [],
@@ -169,14 +169,14 @@ describe('VerifyProposal proto — full-field round-trip [C-7]', () => {
       contextGraphId: 'cg',
     };
     const a = encodeVerifyProposal(base);
-    const b = encodeVerifyProposal({ ...base, verifiedMemoryId: 2 });
+    const b = encodeVerifyProposal({ ...base, verifiableMemoryId: 2 });
     expect(a).not.toEqual(b);
   });
 
   it('changing batchId changes encoded bytes (tag pinned at 3)', () => {
     const base: VerifyProposalMsg = {
       proposalId: bytes(16, 0x01),
-      verifiedMemoryId: 1,
+      verifiableMemoryId: 1,
       batchId: 1,
       merkleRoot: bytes(32, 0x02),
       entities: [],

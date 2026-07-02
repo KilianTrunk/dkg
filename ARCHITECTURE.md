@@ -48,9 +48,9 @@ classDiagram
     <<test double>>
     +writeWorkingMemory()
     +liftWorkingMemoryToSharedMemory()
-    +sharedMemoryWrite()
-    +publishFromSharedMemory()
-    +publisherEnqueue()
+    +createKnowledgeAsset()
+    +publishAssertion()
+    +knowledgeAssetPublishAsync()
     +publisherJob()
     +query()
   }
@@ -81,7 +81,7 @@ classDiagram
 
   class PublisherRuntime {
     <<runtime>>
-    +publishFromSharedMemory()
+    +knowledgeAssetPublishAsync()
     +enqueue()
     +processNext()
     +finalize()
@@ -165,18 +165,18 @@ sequenceDiagram
 
   loop warmups and measured iterations
     Script->>Script: create unique sync payload
-    Script->>Client: sharedMemoryWrite(sync quads)
-    Client->>Daemon: POST shared memory write
-    Daemon->>Agent: write benchmark triples
-    Agent->>Store: persist SWM payload
+    Script->>Client: createKnowledgeAsset(sync quads, alsoShareSwm)
+    Client->>Daemon: POST /api/knowledge-assets
+    Daemon->>Agent: create + write + finalize + share
+    Agent->>Store: persist named KA and SWM share
     Store-->>Agent: share operation recorded
-    Agent-->>Daemon: write accepted
-    Daemon-->>Client: share operation id
+    Agent-->>Daemon: named KA shared
+    Daemon-->>Client: assertion + share metadata
 
-    Script->>Client: publishFromSharedMemory(sync root)
-    Client->>Daemon: POST shared memory publish
-    Daemon->>Publisher: publish synchronously
-    Publisher->>Store: read staged triples
+    Script->>Client: publishAssertion(sync name)
+    Client->>Daemon: POST /api/knowledge-assets/:name/vm/publish
+    Daemon->>Publisher: publish finalized named KA
+    Publisher->>Store: read sealed SWM share
     Publisher->>Chain: anchor knowledge asset
     Chain-->>Publisher: commitment finalized
     Publisher-->>Daemon: kc id
@@ -192,17 +192,17 @@ sequenceDiagram
     Script->>Script: validate returned marker
 
     Script->>Script: create unique async payload
-    Script->>Client: sharedMemoryWrite(async quads)
-    Client->>Daemon: POST shared memory write
-    Daemon->>Agent: write benchmark triples
-    Agent->>Store: persist SWM payload
+    Script->>Client: createKnowledgeAsset(async quads, alsoShareSwm)
+    Client->>Daemon: POST /api/knowledge-assets
+    Daemon->>Agent: create + write + finalize + share
+    Agent->>Store: persist named KA and SWM share
     Store-->>Agent: share operation recorded
-    Agent-->>Daemon: write accepted
-    Daemon-->>Client: share operation id
+    Agent-->>Daemon: named KA shared
+    Daemon-->>Client: assertion + share metadata
 
-    Script->>Client: publisherEnqueue(share operation id)
-    Client->>Daemon: POST publisher enqueue
-    Daemon->>Publisher: enqueue job
+    Script->>Client: knowledgeAssetPublishAsync(name)
+    Client->>Daemon: POST /api/knowledge-assets/:name/vm/publish-async
+    Daemon->>Publisher: enqueue named KA VM publish job
     Publisher-->>Daemon: job id
     Daemon-->>Client: enqueue result
 
@@ -253,7 +253,7 @@ sequenceDiagram
   participant Client as Layered DKG Client
   participant WM as Working Memory
   participant SWM as Shared Working Memory
-  participant VM as Verified Memory
+  participant VM as Verifiable Memory
   participant Jobs as Publisher Jobs
   participant Reports as HTML Reporters
 
@@ -268,18 +268,18 @@ sequenceDiagram
       Client->>WM: write payload
       Client->>SWM: lift payload
       Client->>VM: finalize sync publish
-      Suite->>Client: query verified-memory marker
+      Suite->>Client: query verifiable-memory marker
       Client-->>Suite: binding with marker
     else synchronous publish with finalization
       Client->>WM: write payload
       Client->>SWM: lift payload
-      Suite->>Client: publishFromSharedMemory(root)
+      Suite->>Client: publishAssertion(name)
       Client->>VM: promote root with kc id
       Client-->>Suite: finalized publish result
     else asynchronous publish enqueue and finalization
       Client->>WM: write payload
       Client->>SWM: lift payload
-      Suite->>Client: publisherEnqueue(share operation)
+      Suite->>Client: knowledgeAssetPublishAsync(name)
       Client->>Jobs: create queued job
       Suite->>Client: publisherJob(job id)
       Client->>VM: promote queued roots
@@ -358,6 +358,54 @@ contracts. The chain-adapter SDK targets the V10 contract family
 `DKGPublishingConvictionNFT`, `RandomSampling`, `StakingKPI`,
 `ContextGraphs`, V10 storages, plus shared `Hub` / `Token` / `Profile` /
 `Identity` / `Ask`). Trust model: `Hub.owner` = TracLabs multisig.
+
+## CLI Chain Configuration Resolution
+
+Daemon startup resolves chain configuration through a small CLI boundary before
+constructing the agent. `packages/cli/src/config.ts#resolveChainConfig()` merges
+the persisted operator config layer (`~/.dkg/config.json#chain` or
+`~/.dkg/config.yaml#chain`) over `network/<env>.json#chain` per field, so an
+operator can override one field such as `rpcUrl` while inheriting the network
+`hubAddress`, backup RPCs, token address, and `chainId`. The returned
+`chainBase` may still be partial, so daemon consumers guard for both `rpcUrl`
+and `hubAddress` before constructing EVM-backed runtime config.
+
+Mock mode is the exception: an operator `chain.type = "mock"` short-circuits the
+merge and strips inherited EVM endpoint fields so no daemon consumer can
+accidentally open a real JSON-RPC provider while a `MockChainAdapter` is wired.
+
+`chain.approvalPolicy` is the exception to network inheritance. It belongs only
+to operator-owned chain config because it changes TRAC allowance sizing and
+therefore wallet authorization blast radius. The resolved local policy flows to
+`packages/cli/src/daemon/lifecycle.ts`, which converts it with
+`resolveApprovalPolicy()` and passes the runtime `ApprovalPolicy` into
+`DKGAgent.chainConfig`; the agent then forwards it to `EVMChainAdapter`, where
+allowance sizing is applied. `resolveApprovalPolicy()` is the only conversion
+point from YAML/JSON string numerics to runtime `bigint` fields.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Local as Operator config chain
+  participant Network as network env chain
+  participant Resolver as resolveChainConfig
+  participant Lifecycle as daemon lifecycle
+  participant Policy as resolveApprovalPolicy
+  participant Agent as DKGAgent
+  participant Chain as EVMChainAdapter
+
+  Local->>Resolver: operator overrides, including approvalPolicy
+  Network->>Resolver: default rpcUrl, rpcUrls, hubAddress, tokenAddress, chainId
+  Resolver-->>Lifecycle: chainBase field-merged view
+  alt chainBase has rpcUrl and hubAddress
+    Lifecycle->>Policy: convert chainBase.approvalPolicy
+    Policy-->>Lifecycle: runtime ApprovalPolicy or undefined
+    Lifecycle->>Agent: chainConfig with endpoints, wallets, chainId, approvalPolicy
+    Agent->>Chain: construct adapter with approvalPolicy
+  else chainBase partial or absent
+    Lifecycle->>Agent: omit chainConfig
+  end
+```
 
 ## Component Model
 
@@ -478,7 +526,7 @@ class AsyncPublisher {
 }
 class WorkingMemory
 class SharedWorkingMemory
-class VerifiedMemory
+class VerifiableMemory
 
 CLI --> SourceWorkerRunner : invokes
 SourceWorkerRunner --> SourceWorkerConfig : loads
@@ -508,7 +556,7 @@ SharedMemoryHandler --> SharedWorkingMemory : stores accepted writes
 PrivateContentStore --> WorkingMemory : stages async private lift payloads
 PrivateContentStore --> StorageAdapters : writes plaintext private RDF terms
 AsyncPublisher --> SharedWorkingMemory : reads source data
-AsyncPublisher --> VerifiedMemory : publishes
+AsyncPublisher --> VerifiableMemory : publishes
 ```
 
 ## Shared Memory Gossip Authentication
@@ -667,10 +715,11 @@ decision to keep private-store RDF plaintext after message decryption.
   daemon-reserved metadata, partitions root entities, inserts the promoted quads
   into `_shared_memory`, removes the promoted rows from the assertion graph, and
   updates lifecycle metadata in `_meta`.
-- **SWM writes** from `/api/shared-memory/write`,
-  `/api/shared-memory/conditional-write`, and assertion promotion persist
-  normalized quads directly in `did:dkg:context-graph:<cg>/_shared_memory` or
-  the sub-graph equivalent. SWM operation metadata and ownership live in
+- **SWM substrate writes** are produced by named KA sharing, gossip receive,
+  catch-up, and host-mode replication. Product callers share through
+  `POST /api/knowledge-assets/:name/swm/share` or `/swm/share-async`; those
+  paths persist normalized quads in `did:dkg:context-graph:<cg>/_shared_memory`
+  or the sub-graph equivalent. SWM operation metadata and ownership live in
   `_shared_memory_meta`; the public snapshot store records the same public quads
   for replay and catch-up. The store rows are not `enc:gcm:v1` envelopes.
 - **Private content** lives in `_private` graphs through `PrivateContentStore`.
@@ -766,9 +815,9 @@ loop each configured source
     Runner-->>Runner: skip processSource
   else source content changed or retry is needed
     Runner->>Handler: processSource(source, fingerprint, priorState)
-    Handler->>SWM: POST /api/shared-memory/write
-    SWM-->>Handler: shareOperationId
-    Handler->>Publisher: POST /api/publisher/enqueue
+    Handler->>KA: POST /api/knowledge-assets
+    KA-->>Handler: name + shareOperationId
+    Handler->>Publisher: POST /api/knowledge-assets/:name/vm/publish-async
     Publisher-->>Handler: jobId
     Handler-->>Runner: nextState
   end

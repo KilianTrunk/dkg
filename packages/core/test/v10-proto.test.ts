@@ -39,7 +39,7 @@ function randomBytes(n: number): Uint8Array {
 describe('VerifyProposalMsg', () => {
   const proposal: VerifyProposalMsg = {
     proposalId: randomBytes(16),
-    verifiedMemoryId: 7,
+    verifiableMemoryId: 7,
     batchId: 42,
     merkleRoot: randomBytes(32),
     entities: ['http://example.org/alice', 'http://example.org/bob'],
@@ -63,12 +63,12 @@ describe('VerifyProposalMsg', () => {
     expect(new Uint8Array(decoded.agentSignatureR)).toEqual(proposal.agentSignatureR);
     expect(new Uint8Array(decoded.agentSignatureVS)).toEqual(proposal.agentSignatureVS);
     // The title claims "all fields"; the previous assertion set silently
-    // skipped verifiedMemoryId and batchId, so a wire-tag drift or
+    // skipped verifiableMemoryId and batchId, so a wire-tag drift or
     // field-drop on those two ints would land green. Pin them here so
     // the round-trip guarantee matches the name.
     // protobufjs decodes uint64 fields as a Long object; normalise
     // before comparing against the plain JS-number input values.
-    expect(Number(decoded.verifiedMemoryId)).toBe(proposal.verifiedMemoryId);
+    expect(Number(decoded.verifiableMemoryId)).toBe(proposal.verifiableMemoryId);
     expect(Number(decoded.batchId)).toBe(proposal.batchId);
   });
 
@@ -331,7 +331,7 @@ describe('binary compatibility', () => {
   it('messages with empty optional fields encode gracefully', () => {
     const proposal: VerifyProposalMsg = {
       proposalId: new Uint8Array(0),
-      verifiedMemoryId: 0,
+      verifiableMemoryId: 0,
       batchId: 0,
       merkleRoot: new Uint8Array(0),
       entities: [],
@@ -479,6 +479,27 @@ describe('PublishIntent — LU-11 fields (ciphertextChunksRoot, ciphertextChunkC
     expect(decoded.contextGraphId).toBe('42');
     expect(decoded.isEncryptedPayload).toBe(true);
     expect(decoded.kaCount).toBe(1);
+  });
+
+  it('OT-RFC-49: catalogRoot/catalogLeafCount (fields 18/19) round-trip and default to zero', () => {
+    // Public-CG intents omit the catalog fields → proto3 zero defaults.
+    const pub = decodePublishIntent(encodePublishIntent(baseIntent()));
+    expect(pub.catalogRoot?.length ?? 0).toBe(0);
+    expect(pub.catalogLeafCount ?? 0).toBe(0);
+
+    // Curated intents carry the catalog commitment inline.
+    const catalogRoot = new Uint8Array(32).fill(0x49);
+    const curated: PublishIntentMsg = {
+      ...baseIntent(),
+      isEncryptedPayload: true,
+      catalogRoot,
+      catalogLeafCount: 3,
+    };
+    const decoded = decodePublishIntent(encodePublishIntent(curated));
+    expect(new Uint8Array(decoded.catalogRoot!)).toEqual(catalogRoot);
+    expect(decoded.catalogLeafCount).toBe(3);
+    // Additive: the legacy LU-11 fields still decode at their zero defaults.
+    expect(decoded.ciphertextChunkCount ?? 0).toBe(0);
   });
 
   it('ackProtocolVersion constants are stable wire values', () => {

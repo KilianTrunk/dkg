@@ -36,7 +36,7 @@ describe('V10 proto e2e: VERIFY flow simulation', () => {
     const merkleRoot = randomBytes(32);
     const proposal: VerifyProposalMsg = {
       proposalId,
-      verifiedMemoryId: 7,
+      verifiableMemoryId: 7,
       batchId: 42,
       merkleRoot,
       entities: ['http://example.org/alice', 'http://example.org/bob'],
@@ -250,7 +250,7 @@ describe('V10 proto e2e: cross-message interop', () => {
 
     const proposal: VerifyProposalMsg = {
       proposalId: randomBytes(16),
-      verifiedMemoryId: 1,
+      verifiableMemoryId: 1,
       batchId: 1,
       merkleRoot,
       entities: ['http://example.org/e'],

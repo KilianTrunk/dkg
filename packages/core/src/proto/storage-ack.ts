@@ -82,8 +82,32 @@ export const STORAGE_ACK_DECLINE_CODES = {
    * present locally but the recomputed `ciphertextChunksRoot` does
    * not match the publisher's claim. Permanent (a content-integrity
    * lie); the publisher MUST republish with a corrected commitment.
+   *
+   * @deprecated OT-RFC-49 stripped the ciphertext-chunk ACK path; the
+   * curated ACK now uses {@link CATALOG_ROOT_MISMATCH}. Kept for wire
+   * stability so a mixed-version publisher still decodes the string.
    */
   CIPHERTEXT_ROOT_MISMATCH: 'CIPHERTEXT_ROOT_MISMATCH',
+  /**
+   * OT-RFC-49 / WS-D — curated ACK: the core rebuilt the catalog root
+   * over the publisher's inline catalog `stagingQuads` (via
+   * `computeCatalogRoot(catalogCommittedLeaves(...))`) and it does NOT
+   * match the publisher's claimed `catalogRoot`/`catalogLeafCount`.
+   * Permanent (a content-integrity lie); the publisher MUST republish
+   * with a corrected commitment.
+   */
+  CATALOG_ROOT_MISMATCH: 'CATALOG_ROOT_MISMATCH',
+  /**
+   * The publisher claimed a `publicByteSize` below the lower bound the core
+   * derives from the actual public quads it would attest to. `byteSize` is
+   * signed into the ACK digest and prices the publish on-chain
+   * (`ask · byteSize · epochs`); the contract can't see the content, so a core
+   * MUST refuse to sign an under-stated footprint — otherwise the on-chain cost
+   * can be driven toward zero (e.g. `byteSize = 1` for real content) regardless
+   * of the ask. Permanent (a content/economic-shape lie); the publisher MUST
+   * republish with a `byteSize` that reflects the real content.
+   */
+  BYTESIZE_UNDERCLAIM: 'BYTESIZE_UNDERCLAIM',
 } as const;
 
 export type StorageACKDeclineCode =
@@ -114,6 +138,23 @@ export const TRANSIENT_STORAGE_ACK_DECLINE_CODES: ReadonlySet<string> = new Set<
 /** True iff `code` names a decline the publisher should retry rather than treat as permanent. */
 export function isTransientStorageACKDeclineCode(code: string | undefined): boolean {
   return typeof code === 'string' && TRANSIENT_STORAGE_ACK_DECLINE_CODES.has(code);
+}
+
+/** The fixed, known decline-code enum values — the ONLY values permitted as a metric label. */
+const KNOWN_STORAGE_ACK_DECLINE_CODES: ReadonlySet<string> = new Set<string>(
+  Object.values(STORAGE_ACK_DECLINE_CODES),
+);
+
+/**
+ * Bound a decline code to the known enum for use as a low-cardinality METRIC
+ * label. A `declineCode` read off a peer's StorageACK is UNTRUSTED — a malicious
+ * or buggy peer could emit endless unique codes and explode metric cardinality —
+ * so anything outside the fixed enum maps to `'other'`. The full (sanitized)
+ * code still rides logs and the `declines` diagnostic map; only the metric
+ * dimension is bounded.
+ */
+export function boundedDeclineCodeLabel(code: string | undefined | null): string {
+  return typeof code === 'string' && KNOWN_STORAGE_ACK_DECLINE_CODES.has(code) ? code : 'other';
 }
 
 /**

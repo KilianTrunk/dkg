@@ -99,7 +99,7 @@ describe.skipIf(!markitdownAvailable)('MarkItDown E2E — real file conversion',
         <ul>
           <li>Working Memory</li>
           <li>Shared Working Memory</li>
-          <li>Verified Memory</li>
+          <li>Verifiable Memory</li>
         </ul>
       </body>
       </html>

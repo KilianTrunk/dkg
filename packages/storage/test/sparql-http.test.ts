@@ -1,11 +1,13 @@
 import { createServer, type Server } from 'node:http';
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { SparqlHttpStore, createTripleStore, type Quad } from '../src/index.js';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import { SparqlHttpStore, createTripleStore, type Quad, type SparqlHttpSlowQueryEvent } from '../src/index.js';
 
 let server: Server;
 let queryUrl: string;
 let updateUrl: string;
 const insertedQuads: string[] = [];
+/** How many times the server received the `SELECT DISTINCT ?g` listGraphs scan. */
+let listGraphsHits = 0;
 
 function startTestServer(): Promise<void> {
   return new Promise((resolve) => {
@@ -20,7 +22,7 @@ function startTestServer(): Promise<void> {
           res.end();
           return;
         }
-        if (req.url === '/query') {
+        if (req.url?.startsWith('/query')) {
           if (decoded.includes('ASK')) {
             res.writeHead(200, { 'Content-Type': 'application/sparql-results+json' });
             res.end(JSON.stringify({ boolean: true }));
@@ -35,11 +37,15 @@ function startTestServer(): Promise<void> {
             return;
           }
           if (decoded.includes('DISTINCT') && decoded.includes('?g')) {
-            res.writeHead(200, { 'Content-Type': 'application/sparql-results+json' });
-            res.end(JSON.stringify({
-              head: { vars: ['g'] },
-              results: { bindings: [{ g: { type: 'uri', value: 'http://ex.org/g1' } }] },
-            }));
+            listGraphsHits++;
+            const respond = () => {
+              res.writeHead(200, { 'Content-Type': 'application/sparql-results+json' });
+              res.end(JSON.stringify({
+                head: { vars: ['g'] },
+                results: { bindings: [{ g: { type: 'uri', value: 'http://ex.org/g1' } }] },
+              }));
+            };
+            respond();
             return;
           }
           res.writeHead(200, { 'Content-Type': 'application/sparql-results+json' });
@@ -96,6 +102,19 @@ describe('SparqlHttpStore (test server)', () => {
     expect(insertedQuads.some(q => q.includes('INSERT'))).toBe(true);
   });
 
+  it('rejects RDF literals above the Java MUTF-8 hard limit before update POST', async () => {
+    insertedQuads.length = 0;
+    await expect(store.insert([{
+      subject: 'http://ex.org/s',
+      predicate: 'http://schema.org/text',
+      object: `"${'x'.repeat(70_000)}"`,
+      graph: 'http://ex.org/g',
+    }])).rejects.toMatchObject({
+      code: 'OVERSIZED_RDF_LITERAL',
+    });
+    expect(insertedQuads).toHaveLength(0);
+  });
+
   it('query SELECT sends query to query endpoint and parses bindings', async () => {
     const result = await store.query(
       'SELECT ?name WHERE { GRAPH <http://ex.org/g1> { <http://ex.org/alice> <http://schema.org/name> ?name } }',
@@ -105,6 +124,158 @@ describe('SparqlHttpStore (test server)', () => {
       expect(result.bindings.length).toBe(1);
       expect(result.bindings[0]['name']).toBe('"Alice"');
     }
+  });
+
+  it('composes caller abort signals into SELECT and CONSTRUCT fetches', async () => {
+    const originalFetch = globalThis.fetch;
+    const seenSignals: AbortSignal[] = [];
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      if (init?.signal instanceof AbortSignal) seenSignals.push(init.signal);
+      const accept = String((init?.headers as Record<string, string> | undefined)?.Accept ?? '');
+      if (accept.includes('n-quads')) {
+        return new Response('', { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        head: { vars: [] },
+        results: { bindings: [] },
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/sparql-results+json' },
+      });
+    }) as typeof fetch;
+    try {
+      const signalController = new AbortController();
+      const signalStore = new SparqlHttpStore({ queryEndpoint: 'http://example.test/query', timeout: 30_000 });
+
+      await signalStore.query('SELECT ?s WHERE { ?s ?p ?o }', { signal: signalController.signal });
+      await signalStore.query('CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }', { signal: signalController.signal });
+
+      expect(seenSignals).toHaveLength(2);
+      expect(seenSignals.every((signal) => !signal.aborted)).toBe(true);
+      signalController.abort(new Error('caller aborted'));
+      expect(seenSignals.every((signal) => signal.aborted)).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('rejects in-flight queries when the caller aborts', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+      })) as typeof fetch;
+    try {
+      const signalController = new AbortController();
+      const signalStore = new SparqlHttpStore({ queryEndpoint: 'http://example.test/query', timeout: 30_000 });
+      const query = signalStore.query('SELECT ?s WHERE { ?s ?p ?o }', { signal: signalController.signal });
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      signalController.abort(new Error('caller aborted'));
+
+      await expect(query).rejects.toThrow(/caller aborted/);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('emits sampled slow-query events with source tags and query fingerprints', async () => {
+    let clock = 0;
+    const events: SparqlHttpSlowQueryEvent[] = [];
+    const taggedStore = new SparqlHttpStore({
+      queryEndpoint: queryUrl,
+      updateEndpoint: updateUrl,
+      slowQueryThresholdMs: 10,
+      onSlowQuery: (event) => events.push(event),
+      now: () => clock,
+    });
+
+    const pending = taggedStore.query(
+      'SELECT ?name WHERE { GRAPH <http://ex.org/g1> { <http://ex.org/alice> <http://schema.org/name> ?name } }',
+      { source: 'unit test/source' },
+    );
+    clock = 25;
+    await pending;
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      source: 'unit_test/source',
+      operation: 'select',
+      elapsedMs: 25,
+      thresholdMs: 10,
+      endpoint: queryUrl,
+    });
+    expect(events[0].queryHash).toMatch(/^[a-f0-9]{16}$/);
+    expect(events[0].queryBytes).toBeGreaterThan(0);
+    expect(events[0]).not.toHaveProperty('sparql');
+  });
+
+  it('honors slow-query sample rate zero', async () => {
+    let clock = 0;
+    const events: SparqlHttpSlowQueryEvent[] = [];
+    const sampledOutStore = new SparqlHttpStore({
+      queryEndpoint: queryUrl,
+      updateEndpoint: updateUrl,
+      slowQueryThresholdMs: 1,
+      slowQuerySampleRate: 0,
+      onSlowQuery: (event) => events.push(event),
+      now: () => clock,
+    });
+
+    const pending = sampledOutStore.query('ASK { GRAPH <http://ex.org/g> { ?s ?p ?o } }', {
+      source: 'sampled-out',
+    });
+    clock = 50;
+    await pending;
+
+    expect(events).toHaveLength(0);
+  });
+
+  it('does not let slow-query hook failures fail the query', async () => {
+    let clock = 0;
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new SparqlHttpStore({
+      queryEndpoint: queryUrl,
+      updateEndpoint: updateUrl,
+      slowQueryThresholdMs: 1,
+      onSlowQuery: () => { throw new Error('sink down'); },
+      now: () => clock,
+    });
+
+    try {
+      const pending = store.query('ASK { GRAPH <http://ex.org/g> { ?s ?p ?o } }', {
+        source: 'throwing-hook',
+      });
+      clock = 50;
+      const result = await pending;
+      expect(result.type).toBe('boolean');
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('slow query hook failed'));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('redacts endpoint query strings from slow-query telemetry', async () => {
+    let clock = 0;
+    const events: SparqlHttpSlowQueryEvent[] = [];
+    const store = new SparqlHttpStore({
+      queryEndpoint: `${queryUrl}?token=secret#fragment`,
+      updateEndpoint: updateUrl,
+      slowQueryThresholdMs: 1,
+      onSlowQuery: (event) => events.push(event),
+      now: () => clock,
+    });
+
+    const pending = store.query('ASK { GRAPH <http://ex.org/g> { ?s ?p ?o } }', {
+      source: 'secret-endpoint',
+    });
+    clock = 50;
+    await pending;
+
+    expect(events).toHaveLength(1);
+    expect(events[0].endpoint).toBe(queryUrl);
+    expect(events[0].endpoint).not.toContain('secret');
+    expect(events[0].endpoint).not.toContain('#fragment');
   });
 
   it('query ASK returns boolean', async () => {
@@ -197,6 +368,105 @@ describe('SparqlHttpStore (test server)', () => {
 
     const result = await store.query('SELECT ?x WHERE { ?x ?y ?z } LIMIT 1');
     expect(result.type).toBe('bindings');
+  });
+
+  describe('listGraphs()', () => {
+    it('preserves adapter-local listGraphs caching for direct managedByDkg callers', async () => {
+      listGraphsHits = 0;
+      const store = new SparqlHttpStore({
+        queryEndpoint: queryUrl,
+        updateEndpoint: updateUrl,
+        managedByDkg: true,
+      });
+      const a = await store.listGraphs();
+      const b = await store.listGraphs();
+      expect(a).toContain('http://ex.org/g1');
+      expect(b).toContain('http://ex.org/g1');
+      expect(listGraphsHits).toBe(1);
+
+      await store.insert([{
+        subject: 'http://ex.org/s',
+        predicate: 'http://ex.org/p',
+        object: '"v"',
+        graph: 'http://ex.org/g2',
+      }]);
+      await expect(store.listGraphs()).resolves.toContain('http://ex.org/g1');
+      expect(listGraphsHits).toBe(2);
+    });
+
+    it('does not let one aborted managed listGraphs caller poison the shared refresh', async () => {
+      const originalFetch = globalThis.fetch;
+      let fetchStarted!: () => void;
+      let resolveFetch!: (response: Response) => void;
+      let rejectFetch!: (reason?: unknown) => void;
+      const started = new Promise<void>((resolve) => {
+        fetchStarted = resolve;
+      });
+      const pendingFetch = new Promise<Response>((resolve, reject) => {
+        resolveFetch = resolve;
+        rejectFetch = reject;
+      });
+      globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+        fetchStarted();
+        init?.signal?.addEventListener('abort', () => {
+          // If the shared refresh is incorrectly wired to the first caller's
+          // signal, this makes the second caller observe the poisoned promise.
+          rejectFetch(init.signal?.reason);
+        }, { once: true });
+        return pendingFetch;
+      }) as typeof fetch;
+      try {
+        const store = new SparqlHttpStore({
+          queryEndpoint: 'http://example.test/query',
+          managedByDkg: true,
+          timeout: 30_000,
+        });
+        const firstCaller = new AbortController();
+        const first = store.listGraphs({ signal: firstCaller.signal });
+        await started;
+
+        firstCaller.abort(new Error('first caller aborted'));
+        await expect(first).rejects.toThrow(/first caller aborted/);
+
+        const second = store.listGraphs();
+        resolveFetch(new Response(JSON.stringify({
+          head: { vars: ['g'] },
+          results: { bindings: [{ g: { type: 'uri', value: 'http://ex.org/g1' } }] },
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/sparql-results+json' },
+        }));
+
+        await expect(second).resolves.toEqual(['http://ex.org/g1']);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
+    it('uses GraphSetIndexStore as the only cache owner for managed factory stores', async () => {
+      listGraphsHits = 0;
+      const store = await createTripleStore({
+        backend: 'sparql-http',
+        options: {
+          queryEndpoint: queryUrl,
+          updateEndpoint: updateUrl,
+          managedByDkg: true,
+        },
+        graphSetIndex: { revalidateMs: 0 },
+      });
+      try {
+        expect(typeof store.listGraphsByPrefix).toBe('function');
+        await expect(store.listGraphsByPrefix!('http://ex.org/')).resolves.toEqual([
+          'http://ex.org/g1',
+        ]);
+        await expect(store.listGraphsByPrefix!('http://ex.org/')).resolves.toEqual([
+          'http://ex.org/g1',
+        ]);
+        expect(listGraphsHits).toBe(2);
+      } finally {
+        await store.close();
+      }
+    });
   });
 });
 

@@ -188,13 +188,17 @@ export class PublishHandler {
     try {
       const swmGraph = this.graphManager.sharedMemoryUri(pending.contextGraphId);
       const swmMetaGraph = this.graphManager.sharedMemoryMetaUri(pending.contextGraphId);
+      // Uniform layout: span the per-KA …/_shared_memory/{addr}/{number} graphs + the bucket.
+      const swmGraphs = await listGraphFamily(this.store, swmGraph);
       const rootEntities = new Set(pending.dataQuads.map(q => q.subject));
       for (const rootEntity of rootEntities) {
-        await this.store.deleteByPattern({ graph: swmGraph, subject: rootEntity });
-        await this.store.deleteBySubjectPrefix(swmGraph, rootEntity + '/.well-known/genid/');
-        await this.store.deleteByPattern({
-          graph: swmGraph, subject: rootEntity, predicate: 'http://dkg.io/ontology/workspaceOwner',
-        });
+        for (const g of swmGraphs) {
+          await this.store.deleteByPattern({ graph: g, subject: rootEntity });
+          await this.store.deleteBySubjectPrefix(g, rootEntity + '/.well-known/genid/');
+          await this.store.deleteByPattern({
+            graph: g, subject: rootEntity, predicate: 'http://dkg.io/ontology/workspaceOwner',
+          });
+        }
         await this.store.deleteByPattern({
           graph: swmMetaGraph, subject: rootEntity, predicate: 'http://dkg.io/ontology/workspaceOwner',
         });
@@ -299,7 +303,6 @@ export class PublishHandler {
           ual: request.ual,
           contextGraphId,
           merkleRoot: computedMerkleRoot,
-          kaCount: kaMetadata.length > 0 ? 1 : 0,
           publisherPeerId: fromPeerId,
           timestamp: new Date(),
         },
@@ -570,6 +573,20 @@ export class PublishHandler {
       rejectionReason: reason,
     });
   }
+}
+
+async function listGraphFamily(store: TripleStore, rootGraph: string): Promise<string[]> {
+  const graphs = await listGraphsByPrefix(store, `${rootGraph}/`);
+  if (await store.hasGraph(rootGraph)) {
+    graphs.unshift(rootGraph);
+  }
+  return graphs;
+}
+
+async function listGraphsByPrefix(store: TripleStore, prefix: string): Promise<string[]> {
+  return store.listGraphsByPrefix
+    ? store.listGraphsByPrefix(prefix)
+    : (await store.listGraphs()).filter((graph) => graph.startsWith(prefix));
 }
 
 // ── Helpers ──

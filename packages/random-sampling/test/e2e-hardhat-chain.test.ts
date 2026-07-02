@@ -35,6 +35,7 @@ import { ethers } from 'ethers';
 import {
   V10MerkleTree,
   hashTripleV10,
+  structuredKARootV10,
   computePublishACKDigest,
   buildAuthorAttestationTypedData,
 } from '@origintrail-official/dkg-core';
@@ -76,9 +77,19 @@ describe('Random Sampling E2E (Hardhat)', () => {
   const rawLeaves = publishQuads.map((q) =>
     hashTripleV10(q.subject, q.predicate, q.object),
   );
-  const tree = new V10MerkleTree(rawLeaves);
-  const merkleRoot = tree.root;
-  const merkleLeafCount = tree.leafCount;
+  // structured public commitment (no private payload here): hashPair(publicRoot, sentinel).
+  const { root: merkleRoot, leafCount: merkleLeafCount } = structuredKARootV10(rawLeaves, []);
+
+  // Since rc.12 the contract mints exactly ONE knowledge asset per publish
+  // tx — `KnowledgeAssetsLifecycle.publish` reverts `InvalidKnowledgeAssetsAmount`
+  // unless `knowledgeAssetsAmount == 1` (#956). The three `publishQuads`
+  // above all describe the SAME root entity (`urn:experiment:wsd`), so this
+  // is one KA carrying three triples — `merkleLeafCount` (3) is the triple
+  // count, `knowledgeAssetsAmount` (1) is the KA count. The ACK digest the
+  // receivers sign and the publish params MUST use the same value (the
+  // contract rebuilds the digest from `p.knowledgeAssetsAmount`), so this
+  // single constant feeds both.
+  const knowledgeAssetsAmount = 1;
 
   let snapshotId: string;
   let kaId: bigint;
@@ -150,7 +161,7 @@ describe('Random Sampling E2E (Hardhat)', () => {
           kav10Address,
           cgId,
           merkleRoot,
-          BigInt(publishQuads.length),
+          BigInt(knowledgeAssetsAmount),
           byteSize,
           epochs,
           tokenAmount,
@@ -164,12 +175,23 @@ describe('Random Sampling E2E (Hardhat)', () => {
         };
       }),
     );
+    // OT-RFC-43 Option 1 (variant 1a): the real adapter requires a packed
+    // reservedKaId = (uint160(author) << 96) | number. Mirror the publisher's
+    // allocator cold-start (DKGPublisher.ensureReservedKaId): read the author's
+    // highest minted number from chain (-1n on a fresh deploy) and reserve the
+    // next one. CORE_OP has minted nothing in this snapshot, so this is number 0.
+    // §F2 — the AuthorAttestation digest binds reservedKaId as its 5th field, so it
+    // must be reserved BEFORE the typed data is built and signed (otherwise the
+    // EIP-712 message's reservedKaId is null and ethers throws at encodeData).
+    const authorChainMax = await publisherAdapter.getMaxKaNumberForAuthor!(coreOpWallet.address);
+    const reservedKaId =
+      (BigInt(ethers.getAddress(coreOpWallet.address)) << 96n) | (authorChainMax + 1n);
     const authorTyped = buildAuthorAttestationTypedData({
       chainId: TEST_CHAIN_ID,
       kav10Address,
-      contextGraphId: cgId,
       merkleRoot,
       authorAddress: coreOpWallet.address,
+      reservedKaId,
     });
     const authorSig = ethers.Signature.from(
       await coreOpWallet.signTypedData(authorTyped.domain, authorTyped.types, authorTyped.message),
@@ -178,7 +200,7 @@ describe('Random Sampling E2E (Hardhat)', () => {
       publishOperationId: 'rs-e2e-publish',
       contextGraphId: cgId,
       merkleRoot,
-      knowledgeAssetsAmount: publishQuads.length,
+      knowledgeAssetsAmount,
       byteSize,
       epochs: Number(epochs),
       tokenAmount,
@@ -194,6 +216,7 @@ describe('Random Sampling E2E (Hardhat)', () => {
         schemeVersion: 1,
       },
       ackSignatures,
+      reservedKaId,
     });
     kaId = publishResult.batchId;
     if (kaId === 0n) {
@@ -324,4 +347,50 @@ describe('Random Sampling E2E (Hardhat)', () => {
       await store.close();
     }
   }, 90_000);
+
+  // Bounty Finding #3 + audit F01 regression — empty-proof AND root-preimage
+  // forgeries are dead ON-CHAIN. Uses REC2 (an independent sharded node) so it
+  // never disturbs REC1's honest challenge above.
+  it('reverts empty-proof + root-preimage forgeries on the real RandomSampling.sol (content-binding + proof-length binding)', async () => {
+    const ctx = getSharedContext();
+    const attacker = createEVMAdapter(HARDHAT_KEYS.REC2_OP);
+    const attackerId = BigInt(ctx.receiverIds[1]!);
+
+    // Draw a real challenge (the single valued CG holds our published KC).
+    const { challenge } = await attacker.createChallenge!();
+    const root = challenge.challengeRoot; // the public structured merkle root
+
+    // THE BYPASS: echo the public root as `content` with an EMPTY proof.
+    // Pre-fix this verified (the caller-supplied leaf == root). Now the chain
+    // derives leaf = keccak256(content) != root, so the merkle verify reverts.
+    await expect(attacker.submitProof!(root, [])).rejects.toThrow();
+
+    // Arbitrary content + empty proof also reverts — no triple's keccak256
+    // equals the stored 32-byte root (preimage resistance).
+    await expect(
+      attacker.submitProof!(ethers.toUtf8Bytes('<urn:x> <urn:y> <urn:z> .'), []),
+    ).rejects.toThrow();
+
+    // F01 (root-preimage / proof-length binding): the 32-byte echo above is the
+    // weak variant. The structured root is keccak256(publicRoot ‖ privateDataHash);
+    // this KA is public with NO private data, so privateDataHash is the known
+    // SENTINEL and publicRoot is recomputable from public triples — i.e. the
+    // root's 64-byte PREIMAGE is fully attacker-derivable. Submitting it as
+    // `content` with an EMPTY proof gives keccak256(content) == root, which
+    // pre-fix folded zero times → leaf == root → accepted with ZERO stored data.
+    // The proof-length binding (proof.length == height(leafCount)+1 on the public
+    // path) rejects the empty proof.
+    const { root: rebuilt, publicTree, privateDataHash } = structuredKARootV10(
+      rawLeaves,
+      [],
+    );
+    expect(ethers.hexlify(rebuilt)).toBe(ethers.hexlify(root)); // attacker recomputes R
+    const rootPreimage = ethers.concat([publicTree.root, privateDataHash]); // 64 bytes
+    expect(ethers.keccak256(rootPreimage)).toBe(ethers.hexlify(root)); // valid forgery
+    await expect(attacker.submitProof!(rootPreimage, [])).rejects.toThrow();
+
+    // No credit: the challenge stays unsolved after the failed attacks.
+    const after = await attacker.getNodeChallenge!(attackerId);
+    expect(after?.solved).toBe(false);
+  }, 60_000);
 });

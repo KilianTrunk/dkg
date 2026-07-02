@@ -396,7 +396,7 @@ async function detectDevnet(maxNodes = 6): Promise<DevnetState | null> {
   const nft = new ethers.Contract(
     addrs.nftAddress,
     [
-      'function createAccount(uint96) external returns (uint256)',
+      'function createAccount(uint96, uint72) external returns (uint256)',
       'function registerAgent(uint256, address) external',
       'function agentToAccountId(address) view returns (uint256)',
       'function windowSpent(uint256, uint40) view returns (uint96)',
@@ -417,7 +417,7 @@ async function detectDevnet(maxNodes = 6): Promise<DevnetState | null> {
   const eps = new ethers.Contract(
     addrs.epsAddress,
     [
-      'function getNodeEpochProducedKnowledgeValue(uint72, uint256) view returns (uint96)',
+      'function getNodeEpochPublishingAllocation(uint72, uint256) view returns (uint96)',
     ],
     provider,
   );
@@ -801,7 +801,7 @@ describe('V10 chain — stress + scenario validation', () => {
   //                         on-chain work, no SWM pollution.
   //   25 × WM → SWM → VM (custodial / mode B):
   //                         Custodial agent registered on core2 publishes via
-  //                         /api/shared-memory/publish { assertionName }. KC
+  //                         /api/knowledge-assets/:name/vm/publish. KC
   //                         author == agent.address, attribution → core2.
   //   25 × WM → SWM → VM (third-party / mode A):
   //                         CLI publish from edge node 5 routed through
@@ -930,9 +930,9 @@ describe('V10 chain — stress + scenario validation', () => {
 
     const epochAtStart: bigint = await s.chronos.getCurrentEpoch();
     const beforeEpsCore1: bigint =
-      await s.eps.getNodeEpochProducedKnowledgeValue(core1.identityId, epochAtStart);
+      await s.eps.getNodeEpochPublishingAllocation(core1.identityId, epochAtStart);
     const beforeEpsCore2: bigint =
-      await s.eps.getNodeEpochProducedKnowledgeValue(core2.identityId, epochAtStart);
+      await s.eps.getNodeEpochPublishingAllocation(core2.identityId, epochAtStart);
     // Lazy-settlement bookkeeping uses billing-window index, not chain
     // epoch. Sum the window at-snapshot plus the next 2 windows so a
     // long-running stress phase that walks past one or two boundaries
@@ -949,52 +949,21 @@ describe('V10 chain — stress + scenario validation', () => {
     };
     const beforeSpentPca: bigint = await windowSpentSum(beforeWindow, 2n);
 
-    // ── 2d: drain SWM on every core that named-publishes from ─────────────
-    // See FINDINGS.md — `publishFromFinalizedAssertion` ignores the named
-    // assertion's identity and publishes whatever sits in SWM. If a prior
-    // run left content in SWM, the first named publish here would bundle
-    // it. Issue a one-shot selection-based publish-with-clear to drain.
-    // Empty SWM is a no-op (returns 0 KAs / errors which we swallow).
-    for (const node of [core1, core2]) {
-      try {
-        const drainRes = await fetch(
-          `http://127.0.0.1:${node.apiPort}/api/shared-memory/publish`,
-          {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              ...(node.authToken
-                ? { Authorization: `Bearer ${node.authToken}` }
-                : {}),
-            },
-            body: JSON.stringify({
-              contextGraphId: CONTEXT_GRAPH,
-              selection: 'all',
-              clearAfter: true,
-            }),
-          },
-        );
-        if (drainRes.ok) {
-          const j = (await drainRes.json()) as { kas?: unknown[]; status?: string };
-          const drainedCount = Array.isArray(j.kas) ? j.kas.length : 0;
-          if (drainedCount > 0) {
-            console.log(
-              `phase 2: drained ${drainedCount} residual KAs from core${node.num} SWM (status=${j.status})`,
-            );
-          }
-        }
-      } catch {
-        // SWM was empty / drain failed — ignore, the per-iteration
-        // clearAfter:true will keep things clean from here.
-      }
-    }
+    // ── 2d: (retired) residual-SWM drain ──────────────────────────────────
+    // Previously a one-shot selection-based publish-with-clear evicted any
+    // loose SWM left by a prior run before the named publishes below. That
+    // legacy loose publish-by-selection bridge was removed (#1087) — there is
+    // no loose-SWM-publish path anymore, and the named-KA create+share+publish
+    // flow used below does not produce the un-named loose SWM this drained, so
+    // there is nothing to pre-drain. No drain step needed.
 
     // ── 2e: WM-only batch (25) ─────────────────────────────────────────────
     console.log(`phase 2: WM-only batch (${wmOnly} assertions on core1)...`);
     for (let i = 0; i < wmOnly; i++) {
       const name = `wm-only-${runTag}-${i}`;
+      // KA create auto-finalizes (seals to WM) when `quads` are supplied.
       const r = await fetch(
-        `http://127.0.0.1:${core1.apiPort}/api/assertion/create`,
+        `http://127.0.0.1:${core1.apiPort}/api/knowledge-assets`,
         {
           method: 'POST',
           headers: {
@@ -1005,7 +974,6 @@ describe('V10 chain — stress + scenario validation', () => {
             name,
             contextGraphId: CONTEXT_GRAPH,
             quads: buildQuads(name),
-            finalize: true,
           }),
         },
       );
@@ -1045,8 +1013,10 @@ describe('V10 chain — stress + scenario validation', () => {
     console.log(`phase 2: VM custodial (mode B) batch (${vmCustodial} assertions via core2)...`);
     for (let i = 0; i < vmCustodial; i++) {
       const name = `vm-custodial-${runTag}-${i}`;
+      // KA create auto-finalizes when `quads` are supplied; `alsoShareSwm`
+      // performs the WM→SWM transition (legacy `promote: true`).
       const createRes = await fetch(
-        `http://127.0.0.1:${core2.apiPort}/api/assertion/create`,
+        `http://127.0.0.1:${core2.apiPort}/api/knowledge-assets`,
         {
           method: 'POST',
           headers: {
@@ -1057,8 +1027,7 @@ describe('V10 chain — stress + scenario validation', () => {
             name,
             contextGraphId: CONTEXT_GRAPH,
             quads: buildQuads(name),
-            finalize: true,
-            promote: true,
+            alsoShareSwm: true,
           }),
         },
       );
@@ -1081,7 +1050,7 @@ describe('V10 chain — stress + scenario validation', () => {
       // succeeds. Persistent tentative is still a hard failure.
       const doPublish = async () => {
         const r = await fetch(
-          `http://127.0.0.1:${core2.apiPort}/api/shared-memory/publish`,
+          `http://127.0.0.1:${core2.apiPort}/api/knowledge-assets/${encodeURIComponent(name)}/vm/publish`,
           {
             method: 'POST',
             headers: {
@@ -1090,18 +1059,22 @@ describe('V10 chain — stress + scenario validation', () => {
             },
             body: JSON.stringify({
               contextGraphId: CONTEXT_GRAPH,
-              assertionName: name,
             }),
           },
         );
-        if (!r.ok) {
-          throw new Error(`HTTP ${r.status}: ${await r.text()}`);
-        }
-        return (await r.json()) as {
+        // /vm/publish returns a NON-OK status (e.g. 502) for a TENTATIVE publish
+        // (publisher nonce race). Read the body before throwing so a tentative
+        // result reaches the retry below; only a genuine hard failure throws.
+        const j = (await r.json().catch(() => null)) as {
           kaId?: string;
           status?: string;
           txHash?: string;
-        };
+        } | null;
+        const tentative = !!j && (j.status === 'tentative' || j.kaId === '0');
+        if (!r.ok && !tentative) {
+          throw new Error(`HTTP ${r.status}: ${j ? JSON.stringify(j) : ''}`);
+        }
+        return j ?? {};
       };
 
       let publishJson = await doPublish();
@@ -1140,10 +1113,14 @@ describe('V10 chain — stress + scenario validation', () => {
       }
     }
 
-    // Attribution to core2 must have grown.
+    // RFC-51: the original "attribution to core2 grew" invariant (core2's K_n
+    // grows per publish) has no new-model analog — a realized publish never
+    // credits K_n (that getter tracks committed PCA allocation only). The
+    // surviving proof for this VM-custodial batch is per-publish author ==
+    // agentC2 (asserted in the loop above). Eps must simply not move.
     const afterEpsCore2: bigint =
-      await s.eps.getNodeEpochProducedKnowledgeValue(core2.identityId, epochAtStart);
-    expect(afterEpsCore2).toBeGreaterThan(beforeEpsCore2);
+      await s.eps.getNodeEpochPublishingAllocation(core2.identityId, epochAtStart);
+    expect(afterEpsCore2).toBe(beforeEpsCore2);
 
     // ── 2g: WM → SWM → VM third-party publisher (25 via edge → core1 PCA) ──
     console.log(`phase 2: VM third-party (mode A) batch (${vmThirdParty} assertions via edge → core1 PCA)...`);
@@ -1192,12 +1169,13 @@ describe('V10 chain — stress + scenario validation', () => {
       }
     }
 
-    // Attribution to core1 grew + PCA windowSpent grew (billing-window
-    // bookkeeping; sum the same window range we sampled at-snapshot so
-    // window crossings during the stress phase are still counted).
+    // RFC-51: a realized publish no longer credits core1's K_n (committed-
+    // allocation getter only). The surviving proof for this VM third-party
+    // (mode A) batch is per-publish author == edge op-wallet (asserted in the
+    // loop above) + PCA windowSpent growth (below). Eps must simply not move.
     const afterEpsCore1: bigint =
-      await s.eps.getNodeEpochProducedKnowledgeValue(core1.identityId, epochAtStart);
-    expect(afterEpsCore1).toBeGreaterThan(beforeEpsCore1);
+      await s.eps.getNodeEpochPublishingAllocation(core1.identityId, epochAtStart);
+    expect(afterEpsCore1).toBe(beforeEpsCore1);
     const afterWindow: bigint = BigInt(
       await s.nft.getCurrentBillingWindow(pcaAccountId),
     );
@@ -1211,8 +1189,10 @@ describe('V10 chain — stress + scenario validation', () => {
     console.log(`phase 2: WM→SWM batch (${wmSwm} assertions on core1)...`);
     for (let i = 0; i < wmSwm; i++) {
       const name = `wm-swm-${runTag}-${i}`;
+      // KA create auto-finalizes when `quads` are supplied; `alsoShareSwm`
+      // performs the WM→SWM transition (legacy `promote: true`).
       const r = await fetch(
-        `http://127.0.0.1:${core1.apiPort}/api/assertion/create`,
+        `http://127.0.0.1:${core1.apiPort}/api/knowledge-assets`,
         {
           method: 'POST',
           headers: {
@@ -1223,8 +1203,7 @@ describe('V10 chain — stress + scenario validation', () => {
             name,
             contextGraphId: CONTEXT_GRAPH,
             quads: buildQuads(name),
-            finalize: true,
-            promote: true,
+            alsoShareSwm: true,
           }),
         },
       );
@@ -1293,8 +1272,8 @@ describe('V10 chain — stress + scenario validation', () => {
       `\`publishFromFinalizedAssertion\` (\`packages/agent/src/dkg-agent.ts:4383\`) calls ` +
         `\`publishFromSharedMemory(contextGraphId, 'all', ...)\` with the literal selection \`'all'\`. ` +
         `It does NOT filter SWM content to the named assertion's quads. ` +
-        `Reproduction: promote N assertions (\`POST /api/assertion/create { ..., finalize: true, promote: true }\` × N) ` +
-        `then publish ONE of them by name (\`POST /api/shared-memory/publish { assertionName }\`). ` +
+        `Reproduction: promote N assertions (\`POST /api/knowledge-assets { ..., quads, alsoShareSwm: true }\` × N) ` +
+        `then publish ONE of them by name (\`POST /api/knowledge-assets/:name/vm/publish\`). ` +
         `The publish bundles all N assertions' quads into one KC and the response status is \`tentative\` ` +
         `with \`kaId: "0"\` (sentinel), because the merkle root the publisher derives over the actual ` +
         `bundled SWM content does not match the seal's merkle root computed at finalize time. ` +
@@ -1883,7 +1862,9 @@ async function ensurePcaAccountForOpWallets(
       nonce: await nextNonceFor(s.provider, nftAdmin.address),
     })
   ).wait();
-  const createTx = await nftAsAdmin.createAccount(committed, {
+  // primaryNode = 0n: no designated node → no committed K_n seeded. This PCA
+  // exercises discount-publishing (windowSpent), not committed allocation.
+  const createTx = await nftAsAdmin.createAccount(committed, 0n, {
     nonce: await nextNonceFor(s.provider, nftAdmin.address),
   });
   const createReceipt = await createTx.wait();

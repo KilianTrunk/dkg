@@ -19,7 +19,7 @@ const engine = new DKGQueryEngine(store);
 
 const results = await engine.query(
   'SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 10',
-  { contextGraphId: 'example', view: 'verified-memory' },
+  { contextGraphId: 'example', view: 'verifiable-memory' },
 );
 
 // Inspect allowed named graphs without expanding the selected scope.

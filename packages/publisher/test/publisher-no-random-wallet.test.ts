@@ -90,6 +90,18 @@ async function sealForWallet(
 const TEST_KEY = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
 const TEST_KEY_ALT = '0x5de4111a56f4c24611d9ed4d5318a7e03f9b9a9d73f3a5f3f6324a2a0e6fbb36';
 
+// rc.17 uniform per-KA layout: a confirmed publish (and any later update)
+// stores the KA's public quads in the PER-KA verifiable-memory graph
+// `…/_verifiable_memory/{author}/{number}`, where `author` + `number` are
+// unpacked from the KA's on-chain id by the same bit math the publisher uses
+// (`dkg-publisher.ts`). The update's batchId === the original kaId, so the
+// graph an update targets is derived from the kaId passed to `update()`.
+function perKaVerifiableMemoryGraph(contextGraphId: string, kaId: bigint): string {
+  const number = kaId & ((1n << 96n) - 1n);
+  const author = '0x' + (kaId >> 96n).toString(16).padStart(40, '0');
+  return `did:dkg:context-graph:${contextGraphId}/_verifiable_memory/${author}/${number}`;
+}
+
 // Greenfield (PR #815): on-chain updates require an owner seal
 // (`precomputedUpdateAttestation`). The adapter-managed update tests below
 // assert publisher *attribution* resolution, not seal ceremony, so this
@@ -233,8 +245,12 @@ class AsyncAddressSigningChain implements ChainAdapter {
     if (params.publisherAddress?.toLowerCase() !== this.wallet.address.toLowerCase()) {
       throw new Error('publisher did not await async signer address');
     }
+    // §F2 — echo the packed reservedKaId the publisher signed over so the
+    // mint matches the reservation (the real contract _safeMints exactly it);
+    // returning a fixed `1n` would trip the publisher's UAL/chain-split guard.
+    const kaId = params.reservedKaId ?? 1n;
     return {
-      batchId: 1n,
+      batchId: kaId,
       startKAId: 101n,
       endKAId: 101n,
       txHash: `0x${'78'.repeat(32)}`,
@@ -969,6 +985,106 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(chain.capturedCreateParams?.tokenAmount).toBe(5n);
   });
 
+  it('does NOT coerce the lifetime when the signer is registered against an unfundable PCA (consent-free squat)', async () => {
+    // Audit regression: agent registration is consent-free (RFC-001 §3.6),
+    // so a third party can register this signer against a 1-wei PCA. Since
+    // the contract's conviction branch now falls through to direct spend
+    // (instead of reverting), an unconditional coercion would publish at the
+    // PCA-lock lifetime AND full price. The SDK must instead detect the
+    // account can't cover this publish's discounted cost and keep the
+    // caller's requested/default lifetime.
+    const wallet = new ethers.Wallet(TEST_KEY);
+    const chain = new EpochCapturingChain(wallet);
+    chain.pcaLockDurationEpochs = 24; // would be the coerced lifetime if it fired
+    // 1-wei commit → baseEpochAllowance = 1 / lockDurationEpochs = 0 → unfundable.
+    const { accountId } = await chain.createPublishingConvictionAccount(1n);
+    await chain.registerPublishingConvictionAgent(accountId, wallet.address);
+    expect(await chain.convictionAccountCanCover(accountId, 1n)).toBe(false);
+
+    const publisher = await makeEpochPublisher(chain, wallet);
+    const ack: AckEpochCapture = {};
+
+    const result = await publisher.publish({
+      contextGraphId: '1',
+      quads: epochTestQuads('pca-squat-no-coercion'),
+      v10ACKProvider: captureACKInputs(ack),
+    });
+
+    expect(result.status).toBe('confirmed');
+    // Lifetime stays at the default — NOT snapped to the PCA lock (24).
+    expect(ack.epochs).toBe(DEFAULT_PUBLISH_EPOCHS);
+    expect(ack.tokenAmount).toBe(BigInt(DEFAULT_PUBLISH_EPOCHS));
+    expect(chain.capturedCreateParams?.epochs).toBe(DEFAULT_PUBLISH_EPOCHS);
+    expect(chain.capturedCreateParams?.tokenAmount).toBe(BigInt(DEFAULT_PUBLISH_EPOCHS));
+  });
+
+  it('does NOT coerce when a nonzero-but-insufficient PCA cannot cover this publish (Codex follow-up)', async () => {
+    // The earlier `spendable > 0` gate let a partially-funded (or few-wei
+    // squat) account slip through: it would coerce to the lock lifetime and
+    // then fall through to full-price direct spend anyway. The cost-aware
+    // gate must reject an account whose remaining allowance is > 0 but
+    // smaller than THIS publish's discounted cost.
+    const wallet = new ethers.Wallet(TEST_KEY);
+    const chain = new EpochCapturingChain(wallet);
+    chain.pcaLockDurationEpochs = 24;
+    // committedTRAC = 24 wei → baseEpochAllowance = 24/24 = 1 wei (nonzero!),
+    // discountBps = 0 (below the lowest tier) → can cover a 1-wei cost but
+    // nothing larger. The real publish costs far more than 1 wei.
+    const { accountId } = await chain.createPublishingConvictionAccount(24n);
+    await chain.registerPublishingConvictionAgent(accountId, wallet.address);
+    // Nonzero floor, but cannot cover a realistic publish cost.
+    expect(await chain.convictionAccountCanCover(accountId, 1n)).toBe(true);
+    expect(await chain.convictionAccountCanCover(accountId, ethers.parseEther('1'))).toBe(false);
+
+    const publisher = await makeEpochPublisher(chain, wallet);
+    const ack: AckEpochCapture = {};
+
+    const result = await publisher.publish({
+      contextGraphId: '1',
+      quads: epochTestQuads('pca-underfunded-no-coercion'),
+      v10ACKProvider: captureACKInputs(ack),
+    });
+
+    expect(result.status).toBe('confirmed');
+    // Cost at lock lifetime (24) exceeds the 1-wei allowance → no coercion.
+    expect(ack.epochs).toBe(DEFAULT_PUBLISH_EPOCHS);
+    expect(chain.capturedCreateParams?.epochs).toBe(DEFAULT_PUBLISH_EPOCHS);
+  });
+
+  it('does NOT coerce when the publish cannot be priced (unverifiable funding)', async () => {
+    // Codex follow-up: if the prospective publish cost cannot be quoted, the
+    // coverage probe has no real price to check against. Falling back to the
+    // protocol minimum (lockEpochs wei) would let an underfunded/squatted PCA
+    // pass against that lower bound and coerce, then fall through to
+    // full-price direct spend. An unpriceable publish must be treated as
+    // "funding unverifiable" → keep the caller's requested lifetime.
+    const wallet = new ethers.Wallet(TEST_KEY);
+    const chain = new EpochCapturingChain(wallet);
+    chain.pcaLockDurationEpochs = 24;
+    // Fully funded — coercion WOULD fire if the gate fell back to the minimum.
+    const { accountId } = await chain.createPublishingConvictionAccount(ethers.parseEther('10000'));
+    await chain.registerPublishingConvictionAgent(accountId, wallet.address);
+    // Pricing oracle is down for this publish.
+    (chain as unknown as { getRequiredPublishTokenAmount: () => Promise<bigint> }).getRequiredPublishTokenAmount =
+      async () => {
+        throw new Error('pricing oracle unavailable');
+      };
+
+    const publisher = await makeEpochPublisher(chain, wallet);
+    const ack: AckEpochCapture = {};
+
+    const result = await publisher.publish({
+      contextGraphId: '1',
+      quads: epochTestQuads('pca-unpriceable-no-coercion'),
+      v10ACKProvider: captureACKInputs(ack),
+    });
+
+    expect(result.status).toBe('confirmed');
+    // Funded, but unpriceable → no coercion; caller's default lifetime stands.
+    expect(ack.epochs).toBe(DEFAULT_PUBLISH_EPOCHS);
+    expect(chain.capturedCreateParams?.epochs).toBe(DEFAULT_PUBLISH_EPOCHS);
+  });
+
   it('initializes V10 readiness before resolving adapter-backed signer addresses', async () => {
     const keypair = await generateEd25519Keypair();
     const wallet = new ethers.Wallet(TEST_KEY);
@@ -1291,9 +1407,14 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(updated.onChainResult).toBeUndefined();
     await expectUalEmbedsStorageAddress(updated.ual, chain, 13);
 
+    // rc.17 uniform per-KA layout: the update rewrites the KA's data into the
+    // per-KA verifiable-memory graph (…/_verifiable_memory/{author}/{number}, keyed
+    // by kaId), not the monolithic root data graph. Assert the post-update data
+    // in that per-KA graph (author/number unpacked from kaId 13n).
+    const vmGraph = perKaVerifiableMemoryGraph('1', 13n);
     const stored = await store.query(`
       SELECT ?p ?o WHERE {
-        GRAPH <did:dkg:context-graph:1> {
+        GRAPH <${vmGraph}> {
           <urn:test:adapter-managed-update-local-attribution> ?p ?o .
         }
       }
@@ -1328,9 +1449,14 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(updated.onChainResult).toBeUndefined();
     await expectUalEmbedsStorageAddress(updated.ual, chain, 12);
 
+    // rc.17 uniform per-KA layout: the update rewrites the KA's data into the
+    // per-KA verifiable-memory graph (…/_verifiable_memory/{author}/{number}, keyed
+    // by kaId), not the monolithic root data graph. Assert the post-update data
+    // in that per-KA graph (author/number unpacked from kaId 12n).
+    const vmGraph = perKaVerifiableMemoryGraph('1', 12n);
     const stored = await store.query(`
       SELECT ?p ?o WHERE {
-        GRAPH <did:dkg:context-graph:1> {
+        GRAPH <${vmGraph}> {
           <urn:test:adapter-managed-update-without-address> ?p ?o .
         }
       }

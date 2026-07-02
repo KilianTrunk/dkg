@@ -14,9 +14,9 @@ name: CI
 #     or trigger the workflow manually via `workflow_dispatch`.
 on:
   push:
-    branches: [main, v10-rc, release/rc.12]
+    branches: [main, v10-rc, release/rc.12, rc17-vm-wip]
   pull_request:
-    branches: [main, v10-rc, release/rc.12]
+    branches: [main, v10-rc, release/rc.12, rc17-vm-wip]
   workflow_dispatch:
 
 concurrency:
@@ -332,7 +332,12 @@ jobs:
           # Stock image ships the default `kb` namespace; that's all the
           # adapter needs (it isolates per-test via unique GRAPH IRIs).
           BLAZEGRAPH_TEST_URL: http://127.0.0.1:9999/bigdata/namespace/kb/sparql
-        run: pnpm --filter @origintrail-official/dkg-storage exec vitest run test/blazegraph.integration.test.ts
+        # term-canon-blazegraph-oracle: cross-backend V10 leaf agreement (OT-RFC-57)
+        # — proves an oxigraph node and a Blazegraph node compute the SAME merkle
+        # leaf for the same typed literal (else RandomSampling forks). dateTime/time
+        # are fixed here; date/gregorian/double/escaping remain it.fails pending
+        # the rest of the backend-independent canon.
+        run: pnpm --filter @origintrail-official/dkg-storage exec vitest run test/blazegraph.integration.test.ts test/term-canon-blazegraph-oracle.test.ts
 
   # ------------------------------------------------------------------
   # Tornado publisher lane — sharded across 4 parallel runners.
@@ -631,6 +636,20 @@ jobs:
         with:
           node-version-file: .nvmrc
           cache: pnpm
+      # The Hermes adapter's `test` script runs the Python plugin's pytest suite
+      # after vitest (pytests/run-pytest.mjs), so this lane needs a Python
+      # interpreter + the plugin's runtime/test deps.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          # Pin a concrete interpreter for reproducibility (matches the other CI
+          # lanes' pins and the version pytests/requirements.txt was validated
+          # against), rather than a floating '3.x'. NOTE: the finalize EIP-55
+          # checksum failure was NOT a Python-version issue — it was a missing
+          # eth-hash keccak backend (now pinned in requirements.txt); this pin is
+          # hygiene, not the fix.
+          python-version: '3.13'
+      - name: Install Hermes plugin Python test deps
+        run: python -m pip install -r packages/adapter-hermes/pytests/requirements.txt
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -640,6 +659,12 @@ jobs:
       - name: Restore build outputs
         run: tar -xzf /tmp/build-outputs.tgz
       - name: "Supporting Kosava packages"
+        # DKG_REQUIRE_PYTEST=1 makes the adapter-hermes Python suite REQUIRED in
+        # CI: run-pytest.mjs fails (not skips) if no interpreter/pytest is found,
+        # so CI never silently loses Python coverage. Local `pnpm test` (flag
+        # unset) skips gracefully when Python is absent.
+        env:
+          DKG_REQUIRE_PYTEST: '1'
         run: |
           pnpm \
             --filter @origintrail-official/dkg-epcis \
@@ -650,6 +675,54 @@ jobs:
             --filter @origintrail-official/dkg-adapter-hermes \
             --filter @origintrail-official/dkg-adapter-openclaw \
             run test
+
+  # ------------------------------------------------------------------
+  # Hardhat-backed Kosava lane — `random-sampling` and `kafka-plugin`.
+  # These two packages were never run by any CI job (#955), so broken
+  # tests in them (e.g. the rc.12 `knowledgeAssetsAmount == 1` contract
+  # gate that #956 fixes) shipped unnoticed. They can't ride in the
+  # `kosava-supporting` lane above because both spawn a REAL Hardhat
+  # node via the shared `../chain/test/hardhat-global-setup.ts`
+  # (hardhat-harness deploys with `hardhat.node.config.ts`) on every
+  # vitest run — that needs the Solidity artifacts the shared `build`
+  # deliberately skips (DKG_SKIP_EVM_BUILD=1). So they get their own
+  # lane with an explicit compile step, mirroring the node-ui e2e lane.
+  # No mocks: real contracts, real chain.
+  # ------------------------------------------------------------------
+  kosava-hardhat-plugins:
+    name: "Kosava: random-sampling + kafka-plugin (real Hardhat)"
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: build-outputs
+          path: /tmp
+      - name: Restore build outputs
+        run: tar -xzf /tmp/build-outputs.tgz
+      # The shared build skips the Solidity compile (DKG_SKIP_EVM_BUILD=1),
+      # so the artifacts the Hardhat globalSetup's `hardhat deploy` needs
+      # aren't present. Compile them HERE — same config the harness deploys
+      # with — in a dedicated, observable step so the globalSetup reuses
+      # cached artifacts and a compile failure is localised here rather
+      # than buried inside a test timeout.
+      - name: Compile EVM contracts (for the Hardhat globalSetup)
+        run: pnpm --filter @origintrail-official/dkg-evm-module exec hardhat compile --config hardhat.node.config.ts
+      - name: "random-sampling tests (real Hardhat, no mocks)"
+        run: pnpm --filter @origintrail-official/dkg-random-sampling test
+      - name: "kafka-plugin tests (real Hardhat, no mocks)"
+        run: pnpm --filter @origintrail-official/kafka-plugin test
 
   # ------------------------------------------------------------------
   # ABI freshness gate — guards the contract `auto-update.ts` deliberately
@@ -1019,7 +1092,7 @@ jobs:
           && hashFiles('slither.sarif') != ''
           && (github.event_name != 'pull_request'
               || github.event.pull_request.head.repo.full_name == github.repository)
-        uses: github/codeql-action/upload-sarif@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
+        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
         continue-on-error: true
         with:
           sarif_file: ${{ steps.slither.outputs.sarif }}
@@ -1040,7 +1113,7 @@ jobs:
           && hashFiles('packages/evm-module/aderyn.sarif') != ''
           && (github.event_name != 'pull_request'
               || github.event.pull_request.head.repo.full_name == github.repository)
-        uses: github/codeql-action/upload-sarif@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
+        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
         continue-on-error: true
         with:
           sarif_file: packages/evm-module/aderyn.sarif
@@ -1060,7 +1133,7 @@ jobs:
           && hashFiles('packages/evm-module/solhint.sarif') != ''
           && (github.event_name != 'pull_request'
               || github.event.pull_request.head.repo.full_name == github.repository)
-        uses: github/codeql-action/upload-sarif@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
+        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
         continue-on-error: true
         with:
           sarif_file: packages/evm-module/solhint.sarif

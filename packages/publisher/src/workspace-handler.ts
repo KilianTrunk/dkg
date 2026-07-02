@@ -1,7 +1,7 @@
 import type { TripleStore, Quad } from '@origintrail-official/dkg-storage';
 import { GraphManager } from '@origintrail-official/dkg-storage';
 import type { EventBus } from '@origintrail-official/dkg-core';
-import { DKGEvent, Logger, createOperationContext, contextGraphDataUri, contextGraphMetaUri, DKG_ONTOLOGY, SYSTEM_CONTEXT_GRAPHS, DKG_ENTITY, DKG_ROOT_ENTITY_LEGACY, ENTITY_PRED_ALT } from '@origintrail-official/dkg-core';
+import { DKGEvent, Logger, createOperationContext, contextGraphDataUri, contextGraphMetaUri, contextGraphLayerUri, MemoryLayer, DKG_ONTOLOGY, SYSTEM_CONTEXT_GRAPHS, DKG_ENTITY, DKG_ROOT_ENTITY_LEGACY, ENTITY_PRED_ALT } from '@origintrail-official/dkg-core';
 import type { PhaseCallback } from './publisher.js';
 import {
   decodeGossipEnvelope,
@@ -46,6 +46,14 @@ export type WorkspaceSenderKeyDecryptor = (
   contextGraphId: string,
   ctx: OperationContext,
 ) => Promise<Uint8Array>;
+
+export interface ContextGraphMetaOracleRecord {
+  allowedPeers?: readonly string[];
+  allowedAgents?: readonly string[];
+  participantAgents?: readonly string[];
+  revokedAgents?: readonly string[];
+  accessPolicy?: string;
+}
 
 /**
  * Outcome of one `SharedMemoryHandler.handle()` invocation. Added
@@ -133,6 +141,25 @@ export type SharedMemoryApplyOutcome =
   | { applied: false; reason: string; retryable: boolean };
 
 /**
+ * Structured rejection code for {@link SharedMemoryHandler.verifyHostModeEnvelopeAuthority}.
+ * Callers (e.g. the host-mode ingest path's #1124 public-CG exception) key off
+ * this stable code rather than the free-form `reason` text, so a wording change
+ * to a log message can never silently flip a behavioral branch.
+ */
+export type HostModeRejectionCode =
+  | 'DECODE_FAILED'
+  | 'UNSIGNED'
+  | 'NO_AGENT_ALLOWLIST'
+  | 'PEER_NOT_IN_ALLOWLIST'
+  | 'SIG_VERIFY_FAILED'
+  | 'CG_MISMATCH'
+  | 'PUBLISHER_PEER_MISMATCH';
+
+export type HostModeEnvelopeAuthorityVerdict =
+  | { accepted: true }
+  | { accepted: false; reasonCode: HostModeRejectionCode; reason: string };
+
+/**
  * Unambiguous composite key for `seenShareOps`.
  *
  * **Why not `${cgId}|${shareOperationId}` (rc.9 PR-A codex follow-up
@@ -170,6 +197,10 @@ export class SharedMemoryHandler {
   private readonly sharedMemoryOwnedEntities: Map<string, Map<string, string>> = new Map();
   private readonly writeLocks: Map<string, Promise<void>>;
   private readonly localAgentAddresses?: () => readonly string[] | Promise<readonly string[]>;
+  private readonly contextGraphMetaOracle?: (
+    contextGraphId: string,
+  ) => Promise<ContextGraphMetaOracleRecord | null>;
+  private readonly markContextGraphMetaDirtyFromQuads?: (quads: readonly Quad[]) => void;
   /**
    * OT-RFC-38 / LU-6 Phase B — chain-backed fallback for the agent
    * allowlist read. Returns the participant-agent EOA set for a
@@ -285,6 +316,10 @@ export class SharedMemoryHandler {
       sharedMemoryOwnedEntities?: Map<string, Map<string, string>>;
       writeLocks?: Map<string, Promise<void>>;
       localAgentAddresses?: () => readonly string[] | Promise<readonly string[]>;
+      contextGraphMetaOracle?: (
+        contextGraphId: string,
+      ) => Promise<ContextGraphMetaOracleRecord | null>;
+      markContextGraphMetaDirtyFromQuads?: (quads: readonly Quad[]) => void;
       /**
        * OT-RFC-38 / LU-6 Phase B chain-backed agent-allowlist
        * fallback. See {@link SharedMemoryHandler#chainAgentGateOracle}.
@@ -340,6 +375,8 @@ export class SharedMemoryHandler {
     }
     this.writeLocks = options?.writeLocks ?? new Map();
     this.localAgentAddresses = options?.localAgentAddresses;
+    this.contextGraphMetaOracle = options?.contextGraphMetaOracle;
+    this.markContextGraphMetaDirtyFromQuads = options?.markContextGraphMetaDirtyFromQuads;
     this.chainAgentGateOracle = options?.chainAgentGateOracle;
     this.beaconCuratorOracle = options?.beaconCuratorOracle;
     this.workspaceRecipientPrivateKeys = options?.workspaceRecipientPrivateKeys;
@@ -824,6 +861,42 @@ export class SharedMemoryHandler {
           // become good on retry.
           return { applied: false, reason: 'agent envelope verification failed', retryable: false };
         }
+      } else if (trustedReplay && !hasPrivateAccessPolicy && !decoded.senderKeyMessage && !decoded.encryptedPayload) {
+        // GH #1124 (otReviewAgent #1239) — PUBLIC-CG host-catchup forgery gate.
+        // A public CG has no agent allowlist, so the curated branch above is
+        // skipped and a plaintext public envelope was previously applied with
+        // ZERO signature verification. That is acceptable on the LIVE gossip path
+        // (sender == publisher, bound by `publisherPeerId === fromPeerId` at the
+        // guard further below), but NOT on the `trustedReplay` host-catchup path:
+        // there the sender is an UNTRUSTED relaying host, the transport bind is
+        // skipped, and a malicious host can FABRICATE brand-new public bytes that
+        // never traversed any member's live ingest gate. So when replaying, the
+        // envelope MUST be self-signed and that signature MUST verify — otherwise
+        // a forged / unsigned / tampered public envelope would be applied.
+        //
+        // Self-consistency: the claimed signer is its own one-entry allowlist —
+        // a pure crypto check (no chain read). The signed payload
+        // (computeGossipSigningPayload over {type, contextGraphId, timestamp,
+        // encoded WorkspacePublishRequest}) authenticates the inner request
+        // (contextGraphId / publisherPeerId / nquads) as a unit, and
+        // verifyAgentEnvelope's `envelope.contextGraphId === contextGraphId`
+        // check is the cross-CG bind. Freshness is skipped (aged catchup), but
+        // the signature still must hold. Scoped to `trustedReplay` so the LIVE
+        // public path — including the legacy unsigned-public producer — is
+        // unchanged. (publisherPeerId OWNERSHIP attribution is NOT recoverable on
+        // catchup for an open-publish CG — see the residual note on the PR.)
+        if (!envelope || !envelope.agentAddress || !ethers.isAddress(envelope.agentAddress)) {
+          const reason = `public context graph "${contextGraphId}" host-catchup envelope is unsigned — refusing to replay`;
+          this.log.warn(ctx, `SWM write rejected: ${reason}`);
+          return { applied: false, reason, retryable: false };
+        }
+        const selfConsistent = await this.verifyAgentEnvelope(
+          envelope, signedPayload, contextGraphId, [ethers.getAddress(envelope.agentAddress)], ctx,
+          { requireLocalMembership: false, skipTimestampFreshness: true },
+        );
+        if (!selfConsistent) {
+          return { applied: false, reason: 'public-CG host-catchup envelope failed signature verification', retryable: false };
+        }
       }
 
       const requiresEncryptedPayload = hasPrivateAccessPolicy || agentGateAddresses !== null;
@@ -900,7 +973,7 @@ export class SharedMemoryHandler {
       if (request.operationId) {
         ctx = createOperationContext('share', request.operationId);
       }
-      const { nquads, manifest, publisherPeerId, timestampMs, casConditions, subGraphName } = request;
+      const { nquads, manifest, publisherPeerId, timestampMs, casConditions, subGraphName, agentAddress: kaAuthorAddress, kaNumber } = request;
       const shareOperationId = request.shareOperationId?.trim();
       const sgLabel = subGraphName ? `/${subGraphName}` : '';
       this.log.info(ctx, `SWM write from ${fromPeerId} for context graph ${contextGraphId}${sgLabel} op=${shareOperationId}`);
@@ -966,6 +1039,7 @@ export class SharedMemoryHandler {
             timestamp: new Date(),
           });
           await this.store.insert(regQuads);
+          this.markContextGraphMetaDirtyFromQuads?.(regQuads);
           this.log.info(ctx, `Auto-registered sub-graph "${subGraphName}" in context graph "${contextGraphId}" from SWM`);
         }
       }
@@ -982,7 +1056,11 @@ export class SharedMemoryHandler {
         privateTripleCount: m.privateTripleCount ?? 0,
       }));
 
-      const swmGraph = this.graphManager.sharedMemoryUri(contextGraphId, subGraphName);
+      // Uniform layout: write the gossiped KA into its per-KA SWM graph
+      // …/_shared_memory/{author}/{number} (carried on the wire); else legacy bucket.
+      const swmGraph = (kaAuthorAddress && kaNumber)
+        ? contextGraphLayerUri(contextGraphId, MemoryLayer.SharedWorkingMemory, kaAuthorAddress, kaNumber, subGraphName)
+        : this.graphManager.sharedMemoryUri(contextGraphId, subGraphName);
       const swmMetaGraph = this.graphManager.sharedMemoryMetaUri(contextGraphId, subGraphName);
 
       const swmOwnershipKey = subGraphName ? `${contextGraphId}\0${subGraphName}` : contextGraphId;
@@ -1287,28 +1365,112 @@ export class SharedMemoryHandler {
     rawBytes: Uint8Array,
     contextGraphId: string,
     fromPeerId: string,
-  ): Promise<{ accepted: true } | { accepted: false; reason: string }> {
+    options?: {
+      /**
+       * GH #1124 — resolver the host-mode ingest caller injects to prove this CG
+       * is FULLY OPEN (`accessPolicy === 0` AND `publishPolicy === 1`). This
+       * verifier CALLS it and enforces BOTH axes itself, so the self-signed
+       * exception cannot be taken by merely passing a flag — it requires the
+       * caller's actual (forced-fresh, fail-closed) on-chain policy. Any
+       * undefined/throw → treated as NOT open (fail-closed). When the policy
+       * resolves open, the self-signed public path is taken REGARDLESS of
+       * whether a (possibly STALE) participant/agent allowlist still exists on
+       * the CG, because an open-publish CG admits ANY authorized publisher — the
+       * contract's `isAuthorizedPublisher` ignores `participantAgents` for open
+       * publish, so a CG flipped to open publish without clearing its old
+       * allowlist must NOT fall into the curated branch and drop valid open
+       * publishers (otReviewAgent #1239). When unset, only curated/allowlisted
+       * traffic is accepted (a no-allowlist CG is dropped defensively). Callers
+       * SHOULD skip passing this for obviously-ciphertext envelopes so the
+       * dominant curated path pays no chain read.
+       */
+      resolveOpenPublishPolicy?: () => Promise<{ accessPolicy?: number; publishPolicy?: number }>;
+    },
+  ): Promise<HostModeEnvelopeAuthorityVerdict> {
     const ctx = createOperationContext('share');
     let decoded: WorkspaceGossipDecodeResult;
     try {
       decoded = this.decodeWorkspaceGossipMessage(rawBytes);
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
-      return { accepted: false, reason: `decode failed: ${reason}` };
+      return { accepted: false, reasonCode: 'DECODE_FAILED', reason: `decode failed: ${reason}` };
     }
-    const { envelope, signedPayload } = decoded;
+    const { envelope, signedPayload, request } = decoded;
     if (!envelope) {
-      return { accepted: false, reason: 'unsigned envelope (host mode requires agent-signed gossip)' };
+      return { accepted: false, reasonCode: 'UNSIGNED', reason: 'unsigned envelope (host mode requires agent-signed gossip)' };
     }
     const agentGateAddresses = await this.getContextGraphAgentGateAddresses(contextGraphId);
     const allowedPeers = await this.getContextGraphAllowedPeers(contextGraphId);
+
+    // GH #1124 — resolve "fully-open (self-publishable) CG" HERE rather than
+    // trusting a caller flag: the caller injects the (forced-fresh, fail-closed)
+    // on-chain policy resolver and THIS verifier enforces BOTH axes
+    // (accessPolicy === 0 AND publishPolicy === 1). Any undefined/throw → not
+    // open (fail-closed). Gated INDEPENDENTLY of `agentGateAddresses`: an
+    // open-publish CG admits ANY authorized publisher (the contract's
+    // `isAuthorizedPublisher` ignores `participantAgents` for open publish), so a
+    // CG that retains a STALE participant allowlist after being flipped open must
+    // NOT fall into the curated branch and drop valid open publishers.
+    let confirmedOpenPublish = false;
+    if (options?.resolveOpenPublishPolicy) {
+      try {
+        const { accessPolicy, publishPolicy } = await options.resolveOpenPublishPolicy();
+        confirmedOpenPublish = accessPolicy === 0 && publishPolicy === 1;
+      } catch {
+        confirmedOpenPublish = false;
+      }
+    }
+
+    if (confirmedOpenPublish) {
+      // Self-signed public path — verify through the SAME `verifyAgentEnvelope`
+      // the curated path uses (signature + 5-minute timestamp-freshness window:
+      // replay / store-eviction guard), with the claimed signer as its own
+      // one-entry allowlist (self-consistency). Accepted regardless of any
+      // (stale) participant gate, per the open-publish rationale above.
+      if (!envelope.agentAddress || !ethers.isAddress(envelope.agentAddress)) {
+        return { accepted: false, reasonCode: 'SIG_VERIFY_FAILED', reason: 'public-CG envelope missing a valid signer address' };
+      }
+      const selfConsistent = await this.verifyAgentEnvelope(
+        envelope, signedPayload, contextGraphId, [ethers.getAddress(envelope.agentAddress)], ctx, { requireLocalMembership: false },
+      );
+      if (!selfConsistent) {
+        return { accepted: false, reasonCode: 'SIG_VERIFY_FAILED', reason: 'public-CG envelope failed signature/freshness verification' };
+      }
+      // A public self-signed host-mode entry is later applied via host catchup
+      // with `trustedReplay` (which SKIPS the publisherPeerId↔sender transport
+      // binding at apply time — see the `!trustedReplay && publisherPeerId !==
+      // fromPeerId` guard below). So bind it HERE, before it is ever stored:
+      //   1. REQUIRE a decoded WorkspacePublishRequest — a ciphertext / garbage
+      //      payload has no verifiable inner identity, so reject it (don't fall
+      //      through to accept as the prior `request && …` check did).
+      //   2. Bind the inner request to THIS CG (the apply path derives the target
+      //      from `request.contextGraphId`) — block cross-CG injection on the
+      //      open host-mode topic.
+      //   3. Bind `request.publisherPeerId` to the actual sender. Without this a
+      //      peer could relay an honestly-signed public envelope naming a
+      //      DIFFERENT publisherPeerId and have catchup apply the write under that
+      //      spoofed publisher/ownership identity (otReviewAgent #1239-r4).
+      if (!request) {
+        return { accepted: false, reasonCode: 'CG_MISMATCH', reason: 'public-CG envelope carries no decodable WorkspacePublishRequest' };
+      }
+      if (request.contextGraphId !== contextGraphId) {
+        return { accepted: false, reasonCode: 'CG_MISMATCH', reason: `inner request contextGraphId "${request.contextGraphId}" != envelope CG "${contextGraphId}"` };
+      }
+      if (request.publisherPeerId !== fromPeerId) {
+        return { accepted: false, reasonCode: 'PUBLISHER_PEER_MISMATCH', reason: `public-CG inner publisherPeerId "${request.publisherPeerId}" does not match sender "${fromPeerId}"` };
+      }
+      return { accepted: true };
+    }
+
     if (agentGateAddresses === null) {
-      // No agent gate → not curated → host mode shouldn't be
-      // active for this CG. Drop defensively.
-      return { accepted: false, reason: 'no agent allowlist on context graph' };
+      // Not confirmed open-publish AND no curated allowlist → curated mid-race or
+      // unknown → drop defensively. (The host-mode ingest caller keys its
+      // transient-race log off `reasonCode === 'NO_AGENT_ALLOWLIST'` — keep the
+      // code stable.)
+      return { accepted: false, reasonCode: 'NO_AGENT_ALLOWLIST', reason: 'no agent allowlist on context graph' };
     }
     if (allowedPeers !== null && !allowedPeers.includes(fromPeerId)) {
-      return { accepted: false, reason: `peer ${fromPeerId} not in peer allowlist` };
+      return { accepted: false, reasonCode: 'PEER_NOT_IN_ALLOWLIST', reason: `peer ${fromPeerId} not in peer allowlist` };
     }
     const verified = await this.verifyAgentEnvelope(
       envelope,
@@ -1319,7 +1481,7 @@ export class SharedMemoryHandler {
       { requireLocalMembership: false },
     );
     if (!verified) {
-      return { accepted: false, reason: 'agent envelope verification failed (see preceding WARN log)' };
+      return { accepted: false, reasonCode: 'SIG_VERIFY_FAILED', reason: 'agent envelope verification failed (see preceding WARN log)' };
     }
     return { accepted: true };
   }
@@ -1444,10 +1606,42 @@ export class SharedMemoryHandler {
   }
 
   /**
+   * Read a single agent-list predicate (allowed / participant / revoked)
+   * for a context graph from the local `_meta` graph. Used as the per-field
+   * store fallback when the (partial) projection did not carry that field.
+   */
+  private async queryMetaAgents(contextGraphId: string, predicate: string): Promise<string[]> {
+    const cgMeta = contextGraphMetaUri(contextGraphId);
+    const cgData = contextGraphDataUri(contextGraphId);
+    const result = await this.store.query(
+      `SELECT ?agent WHERE { GRAPH <${cgMeta}> { <${cgData}> <${predicate}> ?agent } }`,
+    );
+    if (result.type !== 'bindings') return [];
+    return result.bindings
+      .map(row => row['agent'])
+      .filter((v): v is string => typeof v === 'string')
+      .map(stripRdfLiteral);
+  }
+
+  /**
    * Returns the peer allowlist for a context graph, or null if no allowlist
    * is set (open CG — all peers allowed).
    */
   private async getContextGraphAllowedPeers(contextGraphId: string): Promise<string[] | null> {
+    // The oracle record is intentionally PARTIAL (OT-RFC-49 public
+    // projection): a populated record does NOT imply every gate field
+    // was projected. Short-circuit on the projection ONLY for the
+    // `allowedPeers` field, and ONLY when that field was actually
+    // projected (`!== undefined`). Treating the whole record as a
+    // complete snapshot here would let a projection that carried only
+    // `accessPolicy`/agent fields skip the peer allowlist entirely
+    // (returns null ⇒ "open CG — all peers allowed").
+    const projected = await this.contextGraphMetaOracle?.(contextGraphId);
+    if (projected?.allowedPeers !== undefined) {
+      const peers = [...new Set(projected.allowedPeers.filter((v): v is string => typeof v === 'string'))];
+      return peers.length > 0 ? peers : null;
+    }
+
     const cgMeta = contextGraphMetaUri(contextGraphId);
     const cgData = contextGraphDataUri(contextGraphId);
     const result = await this.store.query(
@@ -1468,23 +1662,62 @@ export class SharedMemoryHandler {
    * DKG_PARTICIPANT_AGENT metadata.
    */
   private async getContextGraphAgentGateAddresses(contextGraphId: string): Promise<string[] | null> {
-    const cgMeta = contextGraphMetaUri(contextGraphId);
-    const cgData = contextGraphDataUri(contextGraphId);
-    const result = await this.store.query(
-      `SELECT ?agent WHERE { GRAPH <${cgMeta}> {
-        { <${cgData}> <${DKG_ONTOLOGY.DKG_ALLOWED_AGENT}> ?agent }
-        UNION
-        { <${cgData}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT}> ?agent }
-      } }`,
+    // The oracle record is intentionally PARTIAL (OT-RFC-49 public
+    // projection): each gate field is resolved INDEPENDENTLY from the
+    // projection-if-present-else-store, so a projection that carried
+    // only `revokedAgents` (or only `accessPolicy`) cannot silently
+    // discard revocations or skip the allowlist. The allowlist
+    // (allowed + participant) and the revoked tombstone set are
+    // resolved separately and then subtracted — short-circuiting on a
+    // whole truthy record here would let a partial projection fall
+    // back to a *stale store allowlist with no revocation applied*.
+    const projected = await this.contextGraphMetaOracle?.(contextGraphId);
+
+    // Revoked tombstones: prefer the projection when it carried the
+    // field, otherwise read `_meta`. Applied to whichever source the
+    // allowlist comes from, so a projected revocation kicks a store-
+    // resolved member and vice versa.
+    const revoked = new Set<string>(
+      (projected?.revokedAgents !== undefined
+        ? projected.revokedAgents
+        : await this.queryMetaAgents(contextGraphId, DKG_ONTOLOGY.DKG_REVOKED_AGENT)
+      )
+        .filter((v): v is string => typeof v === 'string' && ethers.isAddress(v))
+        .map((v) => v.toLowerCase()),
     );
-    if (result.type === 'bindings' && result.bindings.length > 0) {
-      const agents = result.bindings
-        .map(row => row['agent'])
-        .filter((v): v is string => typeof v === 'string')
-        .map(stripRdfLiteral)
-        .filter((v) => ethers.isAddress(v))
+
+    // Resolve EACH allowlist field (allowed, participant) INDEPENDENTLY:
+    // projection-if-that-specific-field-was-projected, else `_meta` store
+    // fallback for that one field. A partial projection that carried only
+    // `allowedAgents` must NOT suppress the store fallback for
+    // `participantAgents` (and vice versa) — otherwise the gate would be
+    // built from a half-empty allowlist and silently drop legitimate
+    // writers whose membership lives only in the field the oracle omitted.
+    const allowedResolved = projected?.allowedAgents !== undefined
+      ? projected.allowedAgents
+      : await this.queryMetaAgents(contextGraphId, DKG_ONTOLOGY.DKG_ALLOWED_AGENT);
+    const participantResolved = projected?.participantAgents !== undefined
+      ? projected.participantAgents
+      : await this.queryMetaAgents(contextGraphId, DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT);
+
+    // The CG is agent-gated iff EITHER field resolved to any member (from
+    // projection or store). `null` ⇒ not curated (caller falls through);
+    // an empty-but-non-null list ⇒ curated-then-fully-revoked (rejects all).
+    const allowlist: string[] | null =
+      allowedResolved.length > 0 || participantResolved.length > 0
+        ? [...allowedResolved, ...participantResolved]
+        : null;
+
+    if (allowlist !== null) {
+      const agents = allowlist
+        .filter((v): v is string => typeof v === 'string' && ethers.isAddress(v) && !revoked.has(v.toLowerCase()))
         .map((v) => ethers.getAddress(v));
-      return [...new Set(agents)];
+      const unique = [...new Set(agents)];
+      if (unique.length > 0) return unique;
+      // The CG IS agent-gated (an allowlist field was present) but every
+      // member is revoked — return an empty gate (rejects all writers),
+      // NOT null (which the caller reads as "not curated → fall through").
+      if (allowlist.length > 0) return [];
     }
 
     // OT-RFC-38 / LU-6 Phase B: chain-backed fallback when the local
@@ -1546,6 +1779,15 @@ export class SharedMemoryHandler {
   private async contextGraphHasPrivateAccessPolicy(contextGraphId: string): Promise<boolean> {
     if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) {
       return false;
+    }
+
+    // Field-specific short-circuit: only when `accessPolicy` was actually
+    // projected (`!== undefined`). The oracle record is PARTIAL, so a
+    // record carrying only agent/peer fields must NOT be read as
+    // "accessPolicy absent ⇒ not private"; fall back to the store.
+    const projected = await this.contextGraphMetaOracle?.(contextGraphId);
+    if (projected?.accessPolicy !== undefined) {
+      return projected.accessPolicy.trim().toLowerCase() === 'private';
     }
 
     const ontologyGraph = contextGraphDataUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);

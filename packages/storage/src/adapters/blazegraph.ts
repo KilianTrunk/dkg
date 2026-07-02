@@ -1,12 +1,16 @@
 import type {
   TripleStore,
   Quad as DKGQuad,
+  QueryOptions,
+  TripleStoreQueryOptions,
   QueryResult,
   SelectResult,
   ConstructResult,
   AskResult,
 } from '../triple-store.js';
 import { registerTripleStoreAdapter } from '../triple-store.js';
+import { buildBlankNodeSafeDelete } from './sparql-http.js';
+import { assertQuadLiteralsMutf8Safe, JAVA_WRITE_UTF_MAX_BYTES } from '@origintrail-official/dkg-core';
 
 /**
  * BlazegraphStore — TripleStore adapter backed by a remote Blazegraph
@@ -17,6 +21,8 @@ import { registerTripleStoreAdapter } from '../triple-store.js';
  * plus Blazegraph's N-Quads bulk-insert endpoint.
  */
 export class BlazegraphStore implements TripleStore {
+  readonly queryCancellation = 'interruptible' as const;
+
   private readonly url: string;
 
   constructor(url: string) {
@@ -29,8 +35,11 @@ export class BlazegraphStore implements TripleStore {
 
   async insert(quads: DKGQuad[]): Promise<void> {
     if (quads.length === 0) return;
-    const safe = rejectOversizedLiterals(quads, BLAZEGRAPH_MUTF8_LIMIT);
-    const nquads = safe.map(quadToNQuad).join('\n') + '\n';
+    assertQuadLiteralsMutf8Safe(quads, {
+      maxBytes: JAVA_WRITE_UTF_MAX_BYTES,
+      label: 'BlazegraphStore.insert',
+    });
+    const nquads = quads.map(quadToNQuad).join('\n') + '\n';
     const res = await fetch(this.url, {
       method: 'POST',
       headers: { 'Content-Type': 'text/x-nquads' },
@@ -44,12 +53,12 @@ export class BlazegraphStore implements TripleStore {
 
   async delete(quads: DKGQuad[]): Promise<void> {
     if (quads.length === 0) return;
-    const body = quads.map((q) => {
-      const g = q.graph ? `GRAPH <${escapeUri(q.graph)}>` : '';
-      const triple = `${formatTerm(q.subject)} <${q.predicate}> ${formatTerm(q.object)} .`;
-      return g ? `${g} { ${triple} }` : triple;
-    }).join('\n');
-    await this.sparqlUpdate(`DELETE DATA {\n${body}\n}`);
+    // Blazegraph is SPARQL 1.1, so blank nodes are illegal in `DELETE DATA`
+    // (same constraint as Oxigraph). Reuse the shared blank-node-safe builder
+    // so blank-node quads are removed via `DELETE { … } WHERE { … }`.
+    const update = buildBlankNodeSafeDelete(quads);
+    if (!update) return;
+    await this.sparqlUpdate(update);
   }
 
   async deleteByPattern(pattern: Partial<DKGQuad>): Promise<number> {
@@ -63,8 +72,10 @@ export class BlazegraphStore implements TripleStore {
         `DELETE { GRAPH <${escapeUri(pattern.graph)}> { ${triple} } } WHERE { GRAPH <${escapeUri(pattern.graph)}> { ${triple} } }`,
       );
     } else {
+      // `DELETE { ?g_ctx { … } }` is a syntax error — the template needs the
+      // `GRAPH` keyword. Rejected with HTTP 400 by a spec-compliant endpoint.
       await this.sparqlUpdate(
-        `DELETE { ?g_ctx { ${triple} } } WHERE { GRAPH ?g_ctx { ${triple} } }`,
+        `DELETE { GRAPH ?g_ctx { ${triple} } } WHERE { GRAPH ?g_ctx { ${triple} } }`,
       );
     }
     const after = await this.countQuads(pattern.graph);
@@ -84,14 +95,18 @@ export class BlazegraphStore implements TripleStore {
   // Queries
   // -------------------------------------------------------------------
 
-  async query(sparql: string): Promise<QueryResult> {
+  async query(sparql: string, options?: TripleStoreQueryOptions): Promise<QueryResult> {
+    if (options?.signal?.aborted) {
+      const reason = options.signal.reason;
+      throw reason instanceof Error ? reason : new Error(String(reason ?? 'aborted'));
+    }
     const trimmed = sparql.trim();
     const upper = trimmed.toUpperCase();
     const isAsk = upper.startsWith('ASK');
     const isConstruct = upper.startsWith('CONSTRUCT') || upper.startsWith('DESCRIBE');
 
     if (isConstruct) {
-      return this.queryConstruct(trimmed);
+      return this.queryConstruct(trimmed, options);
     }
 
     // Direct POST (W3C SPARQL 1.1 Protocol): send the query as the raw
@@ -108,6 +123,7 @@ export class BlazegraphStore implements TripleStore {
         Accept: 'application/sparql-results+json',
       },
       body: trimmed,
+      signal: options?.signal,
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
@@ -133,7 +149,7 @@ export class BlazegraphStore implements TripleStore {
     return { type: 'bindings', bindings } satisfies SelectResult;
   }
 
-  private async queryConstruct(sparql: string): Promise<ConstructResult> {
+  private async queryConstruct(sparql: string, options?: QueryOptions): Promise<ConstructResult> {
     const res = await fetch(this.url, {
       method: 'POST',
       headers: {
@@ -141,6 +157,7 @@ export class BlazegraphStore implements TripleStore {
         Accept: 'text/x-nquads, application/n-quads',
       },
       body: sparql,
+      signal: options?.signal,
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
@@ -170,9 +187,10 @@ export class BlazegraphStore implements TripleStore {
     await this.sparqlUpdate(`DROP SILENT GRAPH <${escapeUri(graphUri)}>`);
   }
 
-  async listGraphs(): Promise<string[]> {
+  async listGraphs(options?: TripleStoreQueryOptions): Promise<string[]> {
     const r = await this.query(
       'SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }',
+      options,
     );
     if (r.type !== 'bindings') return [];
     return r.bindings.map((b) => b.g).filter(Boolean);

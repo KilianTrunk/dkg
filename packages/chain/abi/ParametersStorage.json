@@ -21,6 +21,11 @@
     "type": "error"
   },
   {
+    "inputs": [],
+    "name": "ZeroShardingTableSizeLimit",
+    "type": "error"
+  },
+  {
     "anonymous": false,
     "inputs": [
       {
@@ -99,6 +104,19 @@
         "internalType": "uint256",
         "name": "",
         "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "contextGraphRegistrationDeposit",
+    "outputs": [
+      {
+        "internalType": "uint96",
+        "name": "",
+        "type": "uint96"
       }
     ],
     "stateMutability": "view",
@@ -282,6 +300,19 @@
       }
     ],
     "name": "setAskUpperBoundFactor",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint96",
+        "name": "amount",
+        "type": "uint96"
+      }
+    ],
+    "name": "setContextGraphRegistrationDeposit",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"
